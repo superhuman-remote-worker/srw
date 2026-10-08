@@ -557,8 +557,25 @@ class TestDriver:
                 {"token_request": OPTIONS},
                 {"token_request": {**OPTIONS, "namespace": "kube-system"}},
             ),
+            # Tokens for other services.
+            (
+                {"token_request": OPTIONS},
+                {"token_request": {**OPTIONS, "audiences": ["vault"]}},
+            ),
+            (
+                {"token_request": {**OPTIONS, "audiences": ["vault"]}},
+                {"token_request": OPTIONS},
+            ),
         ],
-        ids=["on", "off-empty", "off-null", "other-account", "other-namespace"],
+        ids=[
+            "on",
+            "off-empty",
+            "off-null",
+            "other-account",
+            "other-namespace",
+            "audiences-added",
+            "audiences-dropped",
+        ],
     )
     async def test_an_edit_may_not_retarget_the_stored_kubeconfig(self, stored, edited):
         driver = KubeconfigDriver()
@@ -581,21 +598,21 @@ class TestDriver:
         assert normalized.credentials is not None
 
     @pytest.mark.asyncio
-    async def test_a_lifetime_or_audience_edit_keeps_the_stored_kubeconfig(self):
+    async def test_a_lifetime_edit_keeps_the_stored_kubeconfig(self):
         normalized = await KubeconfigDriver().validate(
             _draft(
                 config={
                     "token_request": {
                         **OPTIONS,
                         "expiration_seconds": 900,
-                        "audiences": ["api"],
+                        "audiences": ["api", "b"],
                     }
                 }
             ),
             existing={
                 "id": CONNECTOR,
                 "name": "cluster",
-                "config": {"token_request": OPTIONS},
+                "config": {"token_request": {**OPTIONS, "audiences": ["b", "api"]}},
                 "credentials": _files(minting_kubeconfig_yaml("tok-0123456789abcdef")),
             },
             ctx=_ctx(),
@@ -658,6 +675,7 @@ class TestDriver:
         assert entry["minted"] == {
             "provider": "kubernetes",
             "connector_id": CONNECTOR,
+            "read_only": False,
             "file": {
                 "name": "cluster.yaml",
                 "target_path": "/home/srw/.kube/configs/cluster.yaml",

@@ -34,6 +34,10 @@ CREATE TABLE public.connector_minted_credentials (
     owner_id               UUID NOT NULL,
     connector_id           UUID NOT NULL,
     provider               TEXT NOT NULL,
+    -- The provider's host[:port] (the API server's, GitHub's API's): the
+    -- revoke sweep takes one row per host at a time, so one dead host
+    -- never holds every revoke slot. Not secret.
+    provider_host          TEXT NOT NULL,
     access                 TEXT NOT NULL,
     config_digest          TEXT NOT NULL,
     status                 TEXT NOT NULL DEFAULT 'minting',

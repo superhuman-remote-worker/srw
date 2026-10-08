@@ -625,7 +625,10 @@ async def stop_application(
     4. stateless workspace reconciles (``stateless_workspace_ensure_registry``);
     5. late session-folder provisioning (``late_cloud_setup_tasks``);
     6. protected-cloud engages and cloud stages (``cloud_task_registry``);
-    7. background project repairs (``project_repair_state``).
+    7. background project repairs (``project_repair_state``);
+    8. provider mints still running (C5,
+       ``connector_minted_credentials.settle_background_mints``), waited for
+       a bounded time so what a provider minted is recorded for its revoke.
 
     Work that provisions or awaits other work is stopped before the leaf work
     it may be waiting on. A drain that fails is logged and the next one still
@@ -633,6 +636,7 @@ async def stop_application(
     once every store is closed.
     """
 
+    from orchestrator.services import connector_minted_credentials
     from orchestrator.services.application_tasks import drain_task_mapping
 
     # Signal shutdown to background tasks and wait for each of them. A task
@@ -669,6 +673,12 @@ async def stop_application(
         ),
         ("cloud engage and stage tasks", lambda: resources.cloud_task_registry.drain()),
         ("background project repairs", lambda: resources.project_repair_state.drain()),
+        (
+            "provider mints",
+            lambda: connector_minted_credentials.settle_background_mints(
+                timeout=connector_minted_credentials.SHUTDOWN_SETTLE_SECONDS
+            ),
+        ),
     )
     for label, drain in drains:
         try:

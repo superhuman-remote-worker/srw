@@ -298,8 +298,10 @@ class KubeconfigDriver(CredentialFileDriver):
     def _same_use(stored: Any, effective: Mapping[str, Any]) -> None:
         """An edit that keeps the stored kubeconfig may not change what it is
         used for: minting turned on or off (a minting credential would be
-        delivered as it is, or a delivered one start minting), or another
-        target ServiceAccount. Those need the kubeconfig sent again."""
+        delivered as it is, or a delivered one start minting), another
+        target ServiceAccount, or other audiences (tokens for other
+        services). Those need the kubeconfig sent again; a lifetime edit
+        does not."""
         options = token_request_options(effective)
         if stored is None and options is None:
             return
@@ -320,6 +322,14 @@ class KubeconfigDriver(CredentialFileDriver):
                 detail=(
                     "Changing the target ServiceAccount points the stored minting "
                     "kubeconfig elsewhere: send the kubeconfig again"
+                ),
+            )
+        if sorted(stored.audiences) != sorted(options.audiences):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Changing the audiences mints the stored minting kubeconfig's "
+                    "tokens for other services: send the kubeconfig again"
                 ),
             )
 
@@ -347,11 +357,17 @@ class KubeconfigDriver(CredentialFileDriver):
         config = stored_json_object(row.get("config"))
         if config.get(TOKEN_REQUEST_KEY) is None:
             return await super().check(row, credentials, ctx=ctx)
-        return await probe_token_request(row, config, credentials)
+        return await probe_token_request(
+            row, config, credentials, requester=getattr(ctx, "requester", None)
+        )
 
 
 async def probe_token_request(
-    row: Mapping[str, Any], config: Mapping[str, Any], credentials: Mapping[str, Any]
+    row: Mapping[str, Any],
+    config: Mapping[str, Any],
+    credentials: Mapping[str, Any],
+    *,
+    requester: str | None = None,
 ) -> dict[str, Any]:
     """Test a minting kubeconfig connector: mint a token for the target
     ServiceAccount, bound to a Secret, and delete the Secret again. The mint
@@ -379,7 +395,8 @@ async def probe_token_request(
                 "type": KUBECONFIG_SPEC.legacy_type,
                 "config": config,
                 "credentials": credentials,
-            }
+            },
+            requester=requester,
         )
     except MintFailure as exc:
         return {"status": "error", "message": str(exc)}

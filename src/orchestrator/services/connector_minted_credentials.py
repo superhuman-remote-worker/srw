@@ -44,15 +44,26 @@ provider until its own expiry (another work item on the same workspace may
 still hold it), then revoked by the sweep. A change of access level or of
 the connector's minting inputs revokes the old one at once instead.
 :func:`prepare_minted_entries` (or :func:`prepare_thread_minted`) mints
-before the delivery's transaction; :func:`deliver_minted_entries` fills
-the entries inside it and never calls a provider: a connector its
-preparation could not mint for is skipped with the preparation's reason (a
-session's notice; a job waits for a provider that did not answer, or fails
-on one that refused, as D6's binds do), and one no preparation looked at
-(a live update) is minted in the background for a later delivery (a live
-credential past half its life, still valid, is handed out meanwhile). Two
-mints for one owner and connector are serialised: the second one's token is
-revoked, never dropped.
+before the delivery's transaction, waiting at most the caller's bound: a
+dispatch or a job's claim passes ``0`` and never waits on a provider (the
+mint runs in the background, for a later dispatch); :func:`deliver_minted_entries`
+fills the entries inside the transaction and never calls a provider: a
+connector its preparation could not mint for is skipped with the
+preparation's reason (a session's notice; a job waits for a provider that
+did not answer, or fails on one that refused, as D6's binds do), and one no
+preparation looked at (a live update) is minted in the background for a
+later delivery (a live credential past half its life, still valid, is
+handed out meanwhile). At most one mint per owner and connector runs in a
+process, and a recent failure is not tried again until it is stale
+(:data:`PREPARED_OUTCOME_SECONDS`, :data:`TRANSIENT_OUTCOME_SECONDS`). Two
+mints for one owner and connector in different processes are serialised:
+the second one's token is revoked, never dropped.
+
+**Access.** A credential is minted at the most restrictive of the
+connector's own ``read_only`` (a public connector's is always set), its
+project link's (``project_read_only``, every link of a session's projects)
+and the driver's level for it: preparation, delivery and the exchange read
+it the same way, so a read-only connector never gets a write token.
 
 **Renewal reaches a running execution only where SRW delivers again**: a
 stateless session at every turn's claim, a stateless job at every worker
@@ -74,8 +85,9 @@ and right after a connector's minting inputs change
 (:func:`connector_changed`). A request is an UPDATE to ``revoking`` that
 commits with the decision and NOTIFYs; the leader's
 :func:`connector_minted_credential_sweeper` then makes the provider calls,
-a few at a time, each bounded, retrying with backoff up to an hour apart
-until the credential has expired. A Secret SRW could not delete by then is
+a few at a time and one provider host at a time (a dead host takes one
+slot, never the pass), each bounded, retrying with backoff up to an hour
+apart until the credential has expired. A Secret SRW could not delete by then is
 ``abandoned`` (logged and audited); so is a record SRW cannot read. The same
 sweep revokes credentials whose execution is terminal or gone (a backstop),
 expired ones (a paused job's lapse: its bound Secret is deleted so nothing
@@ -153,6 +165,12 @@ MIN_REMAINING_SECONDS = 60
 PREPARE_MINT_SECONDS = 20.0
 #: How long a preparation's failure answers a delivery that finds nothing.
 PREPARED_OUTCOME_SECONDS = 120.0
+#: How long a transient failure (the provider did not answer) is remembered.
+TRANSIENT_OUTCOME_SECONDS = 30.0
+#: The shortest time between two Tests of one connector by one user.
+TEST_MINT_INTERVAL_SECONDS = 10.0
+#: How long shutdown waits for background mints to record what they made.
+SHUTDOWN_SETTLE_SECONDS = 20.0
 #: A ``minting`` row older than this was abandoned (a crash, a cancel).
 MINT_ABANDON_SECONDS = 300
 REVOKES_PER_PASS = 20
@@ -197,6 +215,10 @@ _state: dict[str, Any] = {"runtime": None, "enabled": True}
 _prepared: dict[tuple[str, str, str], tuple[float, MintFailure]] = {}
 _PREPARED_MAX = 4096
 _background: set[asyncio.Task[Any]] = set()
+#: (owner kind, owner id, connector id) -> the mint running for it.
+_inflight: dict[tuple[str, str, str], asyncio.Task[Any]] = {}
+#: (requester, connector id) -> when its last Test minted.
+_test_mints: dict[tuple[str, str], float] = {}
 
 
 def configure_minted_credentials(
@@ -207,6 +229,7 @@ def configure_minted_credentials(
     _state["runtime"] = runtime
     _state["enabled"] = bool(enabled)
     _prepared.clear()
+    _test_mints.clear()
 
 
 def minted_runtime() -> MintedRuntime | None:
@@ -288,12 +311,27 @@ def kubeconfig_marker(row: Mapping[str, Any], credentials: Any) -> dict[str, Any
     return {
         "provider": PROVIDER_KUBERNETES,
         "connector_id": str(row.get("id") or ""),
+        "read_only": connector_read_only(row),
         "file": target,
     }
 
 
 def github_app_marker(row: Mapping[str, Any]) -> dict[str, Any]:
-    return {"provider": PROVIDER_GITHUB_APP, "connector_id": str(row.get("id") or "")}
+    return {
+        "provider": PROVIDER_GITHUB_APP,
+        "connector_id": str(row.get("id") or ""),
+        "read_only": connector_read_only(row),
+    }
+
+
+def connector_read_only(row: Mapping[str, Any]) -> bool:
+    """The connector's own read-only rule: its ``read_only``, always set on
+    a public one (checked too, should a row lack it)."""
+    return bool(row.get("read_only")) or bool(row.get("is_global"))
+
+
+def clamped_access(access: str, *, read_only: bool) -> str:
+    return "ReadOnly" if read_only else access
 
 
 # =============================================================================
@@ -305,6 +343,8 @@ def github_app_marker(row: Mapping[str, Any]) -> dict[str, Any]:
 class _Plan:
     provider: str
     digest: str
+    #: The provider's host (``host[:port]``): the sweep's fairness key.
+    host: str
     #: What delivery and revoke need, encrypted on the row (secret).
     material: dict[str, Any] = field(repr=False)
     kubernetes: Any = field(default=None, repr=False)
@@ -318,6 +358,12 @@ def _digest(value: Mapping[str, Any]) -> str:
 
 def _secret_digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _host_of(url: str) -> str:
+    from urllib.parse import urlsplit
+
+    return urlsplit(url).netloc.lower()
 
 
 def plan_for(row: Mapping[str, Any]) -> _Plan:
@@ -359,6 +405,7 @@ def plan_for(row: Mapping[str, Any]) -> _Plan:
         return _Plan(
             PROVIDER_KUBERNETES,
             _digest(inputs),
+            _host_of(minting.server),
             material,
             kubernetes=(minting, options),
         )
@@ -388,7 +435,11 @@ def plan_for(row: Mapping[str, Any]) -> _Plan:
             "ca": ca,
         }
         return _Plan(
-            PROVIDER_GITHUB_APP, _digest(inputs), material, github=(options, key, ca)
+            PROVIDER_GITHUB_APP,
+            _digest(inputs),
+            _host_of(options.api_base),
+            material,
+            github=(options, key, ca),
         )
     raise MintFailure("The connector mints no credential", permanent=True)
 
@@ -585,15 +636,16 @@ async def _insert_minting(
     await conn.execute(
         """
         INSERT INTO connector_minted_credentials
-            (id, owner_kind, owner_id, connector_id, provider, access,
-             config_digest, material_ciphertext)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            (id, owner_kind, owner_id, connector_id, provider, provider_host,
+             access, config_digest, material_ciphertext)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         """,
         credential_id,
         owner_kind,
         owner_id,
         connector,
         plan.provider,
+        plan.host,
         access,
         plan.digest,
         _encrypt(json.dumps(material)),
@@ -635,6 +687,7 @@ async def ensure_minted(
         if row is None:
             raise MintFailure("The connector no longer exists", permanent=True)
     plan = plan_for(row)
+    access = clamped_access(access, read_only=connector_read_only(row))
     async with store.acquire() as conn:
         current = await _live_row(conn, owner, connector)
         if _usable(current, access, plan.digest):
@@ -671,7 +724,7 @@ async def ensure_minted(
             access=access,
         )
     except ProviderError as exc:
-        await _settle_failed_mint(store, credential_id, plan.provider, str(exc))
+        await _settle_failed_mint(store, credential_id, plan, material, exc)
         raise MintFailure(str(exc), permanent=not exc.transient) from None
     if plan.provider == PROVIDER_KUBERNETES:
         material["secret"]["uid"] = minted.handle
@@ -691,13 +744,44 @@ async def ensure_minted(
 
 
 async def _settle_failed_mint(
-    store: Any, credential_id: UUID, provider: str, message: str
+    store: Any,
+    credential_id: UUID,
+    plan: _Plan,
+    material: Mapping[str, Any],
+    exc: ProviderError,
 ) -> None:
-    """A refused mint: a Kubernetes one may have left its Secret (the
-    sweep deletes it by name, at once); a GitHub one minted nothing."""
+    """A refused mint's record. A Kubernetes one that may have left its
+    bound Secret (the create's answer was lost, or the clean-up failed) is
+    revoked by name by the sweep, at once; one whose Secret was refused,
+    never reached the server or was deleted again is done. A GitHub one
+    minted nothing, unless GitHub granted more than asked and the token
+    could not be revoked at once: that token is kept, for the sweep to
+    revoke until it expires."""
+    from orchestrator.services.connector_drivers.provider_http import UnrevokedToken
+
+    message = str(exc)[:500]
     try:
         async with store.acquire() as conn:
-            if provider == PROVIDER_KUBERNETES:
+            if isinstance(exc, UnrevokedToken):
+                await conn.execute(
+                    """
+                    UPDATE connector_minted_credentials
+                       SET status = 'revoking', revoke_requested_at = now(),
+                           revoke_reason = 'overbroad', revoke_next_at = now(),
+                           revoke_error = $2, token_ciphertext = $3,
+                           token_last_four = $4, expires_at = $5, minted_at = now()
+                     WHERE id = $1 AND status = 'minting'
+                    """,
+                    credential_id,
+                    message,
+                    _encrypt(exc.minted.token),
+                    last_four(exc.minted.token),
+                    exc.minted.expires_at,
+                )
+                await _notify(conn)
+            elif plan.provider == PROVIDER_KUBERNETES and getattr(
+                exc, "left_secret", True
+            ):
                 await conn.execute(
                     """
                     UPDATE connector_minted_credentials
@@ -707,20 +791,22 @@ async def _settle_failed_mint(
                      WHERE id = $1 AND status = 'minting'
                     """,
                     credential_id,
-                    message[:500],
+                    message,
                 )
                 await _notify(conn)
             else:
+                # Nothing is left at the provider: done, with no secret.
                 await conn.execute(
                     """
                     UPDATE connector_minted_credentials
                        SET status = 'revoked', revoke_requested_at = now(),
                            revoke_reason = 'mint_failed', revoked_at = now(),
-                           revoke_error = $2
+                           revoke_error = $2, material_ciphertext = $3
                      WHERE id = $1 AND status = 'minting'
                     """,
                     credential_id,
-                    message[:500],
+                    message,
+                    _stripped(material),
                 )
     except Exception:
         logger.warning(
@@ -902,18 +988,38 @@ async def _retire_raced(conn: Any, recorded_args: tuple) -> None:
 # =============================================================================
 
 
+def _test_slot(requester: str | None, connector: UUID) -> None:
+    """One Test mint per user and connector at a time, and at most one
+    every :data:`TEST_MINT_INTERVAL_SECONDS` (this process's count)."""
+    key = (str(requester or ""), str(connector))
+    now = time.monotonic()
+    last = _test_mints.get(key)
+    if last is not None and now - last < TEST_MINT_INTERVAL_SECONDS:
+        wait = int(TEST_MINT_INTERVAL_SECONDS - (now - last)) + 1
+        raise MintFailure(
+            f"This connector was tested a moment ago; test again in {wait} s",
+            permanent=False,
+        )
+    if len(_test_mints) >= _PREPARED_MAX:
+        _test_mints.clear()
+    _test_mints[key] = now
+
+
 async def mint_for_test(
-    row: Mapping[str, Any], access: str = "ReadOnly"
+    row: Mapping[str, Any], access: str = "ReadOnly", *, requester: str | None = None
 ) -> tuple[MintedCredential, Any]:
     """Mint one credential for a connector's Test, recorded under the owner
     ``test`` (the connector itself), so a revoke that fails is retried by
     the sweep. Returns the credential and a coroutine function that revokes
     it (and records the outcome). Without a store (no runtime), the mint is
-    not recorded. Raises :class:`MintFailure`."""
+    not recorded. ``requester`` (the user testing) is limited to one Test
+    of the connector every :data:`TEST_MINT_INTERVAL_SECONDS`. Raises
+    :class:`MintFailure`."""
     if not minting_enabled():
         raise MintFailure(DISABLED_DETAIL, permanent=True)
     plan = plan_for(row)
     connector = UUID(str(row.get("id")))
+    _test_slot(requester, connector)
     credential_id = uuid4()
     runtime = minted_runtime()
     store = runtime.store if runtime is not None else None
@@ -945,7 +1051,7 @@ async def mint_for_test(
         )
     except ProviderError as exc:
         if store is not None:
-            await _settle_failed_mint(store, credential_id, plan.provider, str(exc))
+            await _settle_failed_mint(store, credential_id, plan, material, exc)
         raise MintFailure(str(exc), permanent=not exc.transient) from None
     if plan.provider == PROVIDER_KUBERNETES:
         material["secret"]["uid"] = minted.handle
@@ -1007,9 +1113,14 @@ async def mint_for_test(
 # =============================================================================
 
 
-def _entry_access(entry: Mapping[str, Any]) -> str:
+def _entry_access(entry: Mapping[str, Any], marker: Mapping[str, Any]) -> str:
+    """The level a minting entry is minted at: the driver's level for it
+    (clamped by its project link), clamped by the connector's own rule."""
     spec = driver_spec_for_row(entry) or REPOSITORY_SPEC
-    return effective_access(entry, spec) or "ReadOnly"
+    return clamped_access(
+        effective_access(entry, spec) or "ReadOnly",
+        read_only=bool(marker.get("read_only")),
+    )
 
 
 def _refused_by_swap(entry: Mapping[str, Any]) -> bool:
@@ -1017,33 +1128,12 @@ def _refused_by_swap(entry: Mapping[str, Any]) -> bool:
     return isinstance(block, Mapping) and "unavailable" in block
 
 
-def _settled(task: asyncio.Task[Any]) -> None:
-    _background.discard(task)
-    if not task.cancelled() and task.exception() is not None:
-        logger.info(
-            "A minting that outlasted its delivery failed: %s", task.exception()
-        )
-
-
-async def _bounded(awaitable: Any, seconds: float) -> Any:
-    """Wait at most ``seconds`` for a mint. One that takes longer is not
-    cancelled (a provider may already have minted, and only the mint itself
-    records what it made): it finishes in the background, each provider
-    call under its own deadline, for a later delivery."""
-    task = asyncio.ensure_future(awaitable)
-    done, _ = await asyncio.wait({task}, timeout=seconds)
-    if task in done:
-        return task.result()
-    _background.add(task)
-    task.add_done_callback(_settled)
-    raise MintFailure(
-        "minting the credential took too long; it arrives at a later delivery",
-        permanent=False,
-    )
+def _key(owner: LeaseOwner, connector_id: str) -> tuple[str, str, str]:
+    return (owner.kind, owner.id, str(connector_id).lower())
 
 
 def _remember(owner: LeaseOwner, connector_id: str, result: Any) -> None:
-    key = (owner.kind, owner.id, str(connector_id).lower())
+    key = _key(owner, connector_id)
     if isinstance(result, MintFailure):
         if len(_prepared) >= _PREPARED_MAX:
             _prepared.clear()
@@ -1053,24 +1143,33 @@ def _remember(owner: LeaseOwner, connector_id: str, result: Any) -> None:
 
 
 def _remembered(owner: LeaseOwner, connector_id: str) -> MintFailure | None:
-    found = _prepared.get((owner.kind, owner.id, str(connector_id).lower()))
-    if found is None or time.monotonic() - found[0] > PREPARED_OUTCOME_SECONDS:
+    found = _prepared.get(_key(owner, connector_id))
+    if found is None:
         return None
-    return found[1]
+    since, failure = found
+    stale = PREPARED_OUTCOME_SECONDS if failure.permanent else TRANSIENT_OUTCOME_SECONDS
+    return None if time.monotonic() - since > stale else failure
 
 
-async def _prepare_one(
+def forget_connector(connector_id: Any) -> None:
+    """A connector changed: what this process remembers of its mints'
+    failures no longer holds."""
+    wanted = str(connector_id).lower()
+    for key in [key for key in _prepared if key[2] == wanted]:
+        _prepared.pop(key, None)
+
+
+async def _mint_and_remember(
     store: Any, owner: LeaseOwner, connector_id: str, access: str
-) -> None:
+) -> Any:
     try:
-        result: Any = await _bounded(
-            ensure_minted(store, owner=owner, connector_id=connector_id, access=access),
-            PREPARE_MINT_SECONDS,
+        result: Any = await ensure_minted(
+            store, owner=owner, connector_id=connector_id, access=access
         )
     except MintFailure as exc:
         result = exc
         logger.warning(
-            "Preparing connector %s's credential for %s %s: %s",
+            "Minting connector %s's credential for %s %s: %s",
             connector_id,
             owner.kind,
             owner.id,
@@ -1078,21 +1177,85 @@ async def _prepare_one(
         )
     except Exception as exc:  # a store failure: the delivery says "later"
         logger.warning(
-            "Preparing connector %s's credential failed", connector_id, exc_info=True
+            "Minting connector %s's credential failed", connector_id, exc_info=True
         )
         result = MintFailure(
             f"the credential could not be prepared ({type(exc).__name__})",
             permanent=False,
         )
     _remember(owner, connector_id, result)
+    return result
+
+
+def _start_mint(
+    store: Any, owner: LeaseOwner, connector_id: str, access: str
+) -> asyncio.Task[Any]:
+    """The mint of ``owner``'s credential for the connector: the one already
+    running in this process, or a new one. Never cancelled by a waiter (a
+    provider may already have minted, and only the mint records what it
+    made); each provider call has its own deadline."""
+    key = _key(owner, connector_id)
+    loop = asyncio.get_running_loop()
+    running = _inflight.get(key)
+    if running is not None and not running.done() and running.get_loop() is loop:
+        return running
+    task = loop.create_task(_mint_and_remember(store, owner, connector_id, access))
+    _inflight[key] = task
+    _background.add(task)
+
+    def settled(done: asyncio.Task[Any]) -> None:
+        _background.discard(done)
+        if _inflight.get(key) is done:
+            del _inflight[key]
+        if not done.cancelled() and done.exception() is not None:
+            logger.info("A background mint failed: %s", done.exception())
+
+    task.add_done_callback(settled)
+    return task
+
+
+async def _prepare_one(
+    store: Any,
+    owner: LeaseOwner,
+    connector_id: str,
+    access: str,
+    *,
+    wait: float | None,
+) -> None:
+    """Start (or join) the mint, unless a recent one failed, and wait for it
+    at most ``wait`` seconds (``None``: :data:`PREPARE_MINT_SECONDS`; ``0``:
+    not at all)."""
+    if _remembered(owner, connector_id) is not None:
+        # The delivery reports it; no new provider call until it is stale.
+        return
+    task = _start_mint(store, owner, connector_id, access)
+    seconds = PREPARE_MINT_SECONDS if wait is None else min(wait, PREPARE_MINT_SECONDS)
+    if seconds <= 0:
+        return
+    done, _ = await asyncio.wait({task}, timeout=seconds)
+    if not done:
+        _remember(
+            owner,
+            connector_id,
+            MintFailure(
+                "minting the credential took too long; it arrives at a later delivery",
+                permanent=False,
+            ),
+        )
 
 
 async def prepare_minted_entries(
-    store: Any, entries: Sequence[Any] | None, *, owner: LeaseOwner
+    store: Any,
+    entries: Sequence[Any] | None,
+    *,
+    owner: LeaseOwner,
+    wait: float | None = None,
 ) -> None:
     """Mint what the delivery of ``entries`` will hand out, before its
-    caller opens a transaction (each at most :data:`PREPARE_MINT_SECONDS`),
-    and remember a failure for the delivery. Never raises."""
+    caller opens a transaction, waiting at most ``wait`` seconds for each
+    (``None``: :data:`PREPARE_MINT_SECONDS`; ``0``, a dispatch or a job's
+    claim: never, the mint runs in the background for a later delivery).
+    A failure is remembered for the delivery. Never raises."""
     wanted = [
         (marker, entry)
         for entry in entries or ()
@@ -1103,7 +1266,11 @@ async def prepare_minted_entries(
     await asyncio.gather(
         *(
             _prepare_one(
-                store, owner, str(marker["connector_id"]), _entry_access(entry)
+                store,
+                owner,
+                str(marker["connector_id"]),
+                _entry_access(entry, marker),
+                wait=wait,
             )
             for marker, entry in wanted
         )
@@ -1112,9 +1279,10 @@ async def prepare_minted_entries(
 
 _THREAD_TARGETS = f"""
 SELECT d.id,
-       COALESCE((SELECT BOOL_OR(pd.read_only) FROM project_datasources AS pd
-                  WHERE pd.datasource_id = d.id
-                    AND pd.project_id = ANY($2::uuid[])), false) AS read_only
+       COALESCE(d.read_only, false) OR COALESCE(d.is_global, false)
+       OR COALESCE((SELECT BOOL_OR(pd.read_only) FROM project_datasources AS pd
+                     WHERE pd.datasource_id = d.id
+                       AND pd.project_id = ANY($2::uuid[])), false) AS read_only
   FROM datasources AS d
  WHERE d.id = ANY($1::uuid[])
    AND ((d.type = '{KUBECONFIG_SPEC.legacy_type}' AND d.config ? '{TOKEN_REQUEST_KEY}')
@@ -1136,8 +1304,9 @@ async def prepare_thread_minted(store: Any, thread_id: str) -> None:
     """:func:`prepare_minted_entries` for a session's stored selection, for
     the delivery paths that build their payload under the thread's
     datasource lock. The access level is read as the delivery reads it
-    (``resolve_datasources_for_thread``): read-only when any link of the
-    connector to the session's projects is. Never raises."""
+    (``resolve_datasources_for_thread`` and the entry's marker): read-only
+    when the connector is, or any link of it to the session's projects is.
+    Never raises."""
     from orchestrator.services.thread_mount_rows import durable_project_ids
 
     try:
@@ -1162,6 +1331,7 @@ async def prepare_thread_minted(store: Any, thread_id: str) -> None:
                     owner,
                     str(target["id"]),
                     "ReadOnly" if target["read_only"] else "ReadWrite",
+                    wait=None,
                 )
                 for target in targets
             )
@@ -1176,13 +1346,12 @@ async def prepare_thread_minted(store: Any, thread_id: str) -> None:
 
 def _mint_in_background(owner: LeaseOwner, connector_id: str, access: str) -> None:
     """A delivery found nothing prepared (a live update): mint for the next
-    delivery, on the store's own connections, never this delivery's."""
+    delivery, on the store's own connections, never this delivery's (one
+    mint per owner and connector at a time)."""
     runtime = minted_runtime()
     if runtime is None:
         return
-    task = asyncio.create_task(_prepare_one(runtime.store, owner, connector_id, access))
-    _background.add(task)
-    task.add_done_callback(_background.discard)
+    _start_mint(runtime.store, owner, connector_id, access)
 
 
 def _still_valid(row: Any, access: str) -> bool:
@@ -1250,6 +1419,9 @@ def _fill(
             "auth_method": "token",
             "token": minted.token,
             "username": TOKEN_USERNAME,
+            # Only a minted credential names its username (the agent honours
+            # it for these alone).
+            "minted": True,
         }
 
 
@@ -1317,7 +1489,9 @@ async def deliver_minted_entries(
         try:
             if not minting_enabled():
                 raise MintFailure(DISABLED_DETAIL, permanent=True)
-            minted = await _deliverable(conn, owner, connector_id, _entry_access(entry))
+            minted = await _deliverable(
+                conn, owner, connector_id, _entry_access(entry, marker)
+            )
         except MintFailure as exc:
             if owner.kind == "thread":
                 entry["credentials"] = {}
@@ -1337,11 +1511,26 @@ async def deliver_minted_entries(
     return filled
 
 
-async def settle_background_mints() -> None:
-    """Wait for the background mints this process started (tests, and a
-    shutdown that wants them recorded)."""
-    while _background:
-        await asyncio.gather(*list(_background), return_exceptions=True)
+async def settle_background_mints(timeout: float | None = None) -> None:
+    """Wait for the background mints this process started to record what
+    they made: at shutdown, before the store closes, for at most
+    ``timeout`` seconds (a mint still running then is cut off; its
+    ``minting`` record is swept as an abandoned mint), and in tests."""
+    loop = asyncio.get_running_loop()
+    deadline = None if timeout is None else loop.time() + timeout
+    while True:
+        running = [task for task in _background if task.get_loop() is loop]
+        if not running:
+            return
+        left = None if deadline is None else deadline - loop.time()
+        if left is not None and left <= 0:
+            logger.warning(
+                "%d background mints still run at shutdown; their records are "
+                "swept as abandoned mints",
+                len(running),
+            )
+            return
+        await asyncio.wait(running, timeout=left)
 
 
 async def minted_lease_upstream(
@@ -1424,6 +1613,7 @@ async def revoke_connector_credentials(
 async def connector_changed(conn: Any, connector_id: Any) -> int:
     """A connector's minting inputs changed: what was minted with the old
     ones is revoked, and each execution's next delivery mints anew."""
+    forget_connector(connector_id)
     return await revoke_connector_credentials(
         conn, connector_id=connector_id, reason="connector_changed"
     )
@@ -1629,7 +1819,7 @@ async def _retry_or_give_up(
     why: str,
     attempts: int,
     report: SweepReport,
-) -> None:
+) -> str:
     """A revoke that failed and may pass later. While the credential is
     valid at the provider SRW keeps trying (at most an hour apart); once it
     has expired (or was never minted), what is left is housekeeping: a
@@ -1640,7 +1830,7 @@ async def _retry_or_give_up(
         row["provider"] == PROVIDER_GITHUB_APP or attempts >= MAX_REVOKE_ATTEMPTS
     ):
         await _give_up(store, row, material, why=why, attempts=attempts, report=report)
-        return
+        return "given_up"
     async with store.acquire() as conn:
         await conn.execute(
             """
@@ -1662,9 +1852,12 @@ async def _retry_or_give_up(
         attempts,
         why,
     )
+    return "retried"
 
 
-async def _revoke_one(store: Any, row: Mapping[str, Any], report: SweepReport) -> None:
+async def _revoke_one(store: Any, row: Mapping[str, Any], report: SweepReport) -> str:
+    """One revoke: ``revoked``, ``retried`` (later, with backoff) or
+    ``given_up``."""
     material = _material(row)
     attempts = int(row["revoke_attempts"]) + 1
     try:
@@ -1681,20 +1874,18 @@ async def _revoke_one(store: Any, row: Mapping[str, Any], report: SweepReport) -
         await _give_up(
             store, row, material, why=str(exc), attempts=attempts, report=report
         )
-        return
+        return "given_up"
     except ProviderError as exc:
         if exc.reason in _NEVER_RETRIED:
             await _give_up(
                 store, row, material, why=str(exc), attempts=attempts, report=report
             )
-        else:
-            await _retry_or_give_up(store, row, material, str(exc), attempts, report)
-        return
+            return "given_up"
+        return await _retry_or_give_up(store, row, material, str(exc), attempts, report)
     except (asyncio.TimeoutError, TimeoutError):
-        await _retry_or_give_up(
+        return await _retry_or_give_up(
             store, row, material, "the revoke took too long", attempts, report
         )
-        return
     async with store.acquire() as conn:
         done = await _mark_done(conn, row["id"], material, status="revoked")
         if done and row["revoke_reason"] not in ("expired", "test"):
@@ -1713,6 +1904,7 @@ async def _revoke_one(store: Any, row: Mapping[str, Any], report: SweepReport) -
             )
     if done:
         report.revoked += 1
+    return "revoked"
 
 
 async def pending(store: Any) -> bool:
@@ -1773,34 +1965,52 @@ async def sweep_minted_once(store: Any, *, prune_too: bool = True) -> SweepRepor
         )
         # A row still minting (its provider call in flight) is left to the
         # minter, which records what the provider made and keeps it revoking.
+        # Fair across provider hosts: each host's longest-due first, then
+        # each host's next, so one host's backlog never fills the window.
         due = await conn.fetch(
             """
-            SELECT id, owner_kind, owner_id, connector_id, provider,
-                   material_ciphertext, token_ciphertext, token_last_four,
-                   expires_at, revoke_reason, revoke_attempts
-              FROM connector_minted_credentials
-             WHERE status = 'revoking'
-               AND COALESCE(revoke_next_at, now()) <= now()
-               AND (minted_at IS NOT NULL
-                    OR created_at < now() - make_interval(secs => $1::int))
-             ORDER BY revoke_next_at NULLS FIRST, id
+            SELECT * FROM (
+                SELECT id, owner_kind, owner_id, connector_id, provider,
+                       provider_host, material_ciphertext, token_ciphertext,
+                       token_last_four, expires_at, revoke_reason,
+                       revoke_attempts, revoke_next_at, created_at,
+                       row_number() OVER (
+                           PARTITION BY provider_host
+                           ORDER BY revoke_next_at NULLS FIRST, created_at, id
+                       ) AS host_rank
+                  FROM connector_minted_credentials
+                 WHERE status = 'revoking'
+                   AND COALESCE(revoke_next_at, now()) <= now()
+                   AND (minted_at IS NOT NULL
+                        OR created_at < now() - make_interval(secs => $1::int))
+            ) AS ranked
+             ORDER BY host_rank, revoke_next_at NULLS FIRST, created_at, id
              LIMIT $2
             """,
             MINT_ABANDON_SECONDS,
             REVOKES_PER_PASS,
         )
+    by_host: dict[str, list[Mapping[str, Any]]] = {}
+    for row in due:
+        by_host.setdefault(str(row["provider_host"]), []).append(row)
     gate = asyncio.Semaphore(REVOKE_CONCURRENCY)
 
-    async def one(row: Mapping[str, Any]) -> None:
+    async def host(rows: list[Mapping[str, Any]]) -> None:
+        # One revoke per host at a time; a host that did not answer keeps
+        # its other rows for the next pass.
         async with gate:
-            try:
-                await _revoke_one(store, row, report)
-            except Exception:
-                logger.warning(
-                    "Revoking minted credential %s failed", row["id"], exc_info=True
-                )
+            for row in rows:
+                try:
+                    outcome = await _revoke_one(store, row, report)
+                except Exception:
+                    logger.warning(
+                        "Revoking minted credential %s failed", row["id"], exc_info=True
+                    )
+                    return
+                if outcome == "retried":
+                    return
 
-    await asyncio.gather(*(one(row) for row in due))
+    await asyncio.gather(*(host(rows) for rows in by_host.values()))
     if prune_too:
         report.pruned = await prune(store)
     return report
@@ -1880,9 +2090,12 @@ __all__ = [
     "SweepReport",
     "configure_minted_credentials",
     "connector_changed",
+    "clamped_access",
     "connector_minted_credential_sweeper",
+    "connector_read_only",
     "deliver_minted_entries",
     "ensure_minted",
+    "forget_connector",
     "fresh",
     "github_app_marker",
     "kubeconfig_marker",

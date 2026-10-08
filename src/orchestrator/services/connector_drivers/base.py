@@ -150,6 +150,9 @@ class NormalizedConnector:
 @dataclass(frozen=True)
 class CheckContext:
     environment: DriverEnvironment
+    #: The user running Test (a probe that mints at a provider limits how
+    #: often one user may, C5).
+    requester: str | None = None
 
 
 @dataclass(frozen=True)

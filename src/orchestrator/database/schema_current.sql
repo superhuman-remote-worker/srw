@@ -27035,6 +27035,7 @@ CREATE TABLE public.connector_minted_credentials (
     owner_id uuid NOT NULL,
     connector_id uuid NOT NULL,
     provider text NOT NULL,
+    provider_host text NOT NULL,
     access text NOT NULL,
     config_digest text NOT NULL,
     status text DEFAULT 'minting'::text NOT NULL,

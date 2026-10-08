@@ -807,6 +807,8 @@ async def prepare_lease_delivery(
     C3), and a registered image driver's connector is bound, in its own pod
     (D6), waiting for a new bind at most ``bind_wait`` seconds (the
     installation's bind wait when ``None``; ``0`` never blocks the caller).
+    A credential SRW mints at a provider (C5) is minted here too, within the
+    same bound (``0``: in the background, for a later delivery).
     The bind wait and the service part run concurrently: one budget, not
     their sum. No-op without such an entry; never raises (the delivery
     applies the outcome).
@@ -837,8 +839,9 @@ async def prepare_lease_delivery(
     await asyncio.gather(
         prepare_bind_time_bindings(entries, owner=owner, wait=bind_wait),
         service_part(),
-        # What SRW mints at a provider (C5), on db's own connections.
-        prepare_minted_entries(db, entries, owner=owner),
+        # What SRW mints at a provider (C5), on db's own connections, within
+        # the same bound: 0 starts it in the background and never waits.
+        prepare_minted_entries(db, entries, owner=owner, wait=bind_wait),
     )
 
 

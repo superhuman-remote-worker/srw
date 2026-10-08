@@ -9,8 +9,11 @@ connector, so every call is held to the same rules:
   request and the whole answer run under one ``asyncio.timeout``
   (:data:`DEFAULT_DEADLINE_SECONDS`): a host that trickles its answer a byte
   at a time cannot hold a delivery, a claim or the leader's revoke sweep.
-* **A capped answer.** The body is streamed and refused past
-  :data:`MAX_BODY_BYTES`.
+* **A capped answer.** SRW asks for no content coding
+  (``Accept-Encoding: identity``), refuses an answer that names one anyway
+  (a compressed body is never decoded: a few kilobytes of zstd or gzip can
+  expand to gigabytes), and reads the raw body as it streams, refusing it
+  past :data:`MAX_BODY_BYTES`.
 * **A pinned, checked address.** The host is resolved once and every answer
   must be one the connector's projects may reach
   (``connector_egress.refusal``: never loopback, link-local, cloud metadata
@@ -26,6 +29,10 @@ connector, so every call is held to the same rules:
   (an HTTP status SRW names, never the provider's own words, an address or
   an exception's text), so the error a connector's owner reads is no oracle
   for what lies behind an address; the raw detail goes to the server log.
+* **Its own resolver threads.** A lookup runs on a small pool of its own
+  (:data:`RESOLVER_THREADS`); a lookup the system resolver never answers
+  holds one of those threads, never one of the process's shared executor,
+  and with every thread busy a call fails at once.
 
 Tests replace the client factory and the network (resolver) with
 :func:`configure_provider_http` and :func:`configure_provider_network`.
@@ -37,8 +44,11 @@ import asyncio
 import ipaddress
 import json
 import logging
+import socket
 import ssl
-from collections.abc import Callable, Iterable
+import threading
+from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -51,7 +61,6 @@ from orchestrator.services.connector_egress import (
     EgressPolicy,
     Resolver,
     refusal,
-    system_resolver,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,8 +68,10 @@ logger = logging.getLogger(__name__)
 #: One provider call's deadline: resolution, connection, request and answer.
 DEFAULT_DEADLINE_SECONDS = 15.0
 #: The most of an answer SRW reads (a token or an error is a few hundred
-#: bytes).
+#: bytes), on the wire: no content coding is ever decoded.
 MAX_BODY_BYTES = 64 * 1024
+#: Threads the provider calls' name lookups run on (and lookups at once).
+RESOLVER_THREADS = 4
 
 ClientFactory = Callable[..., httpx.AsyncClient]
 
@@ -85,18 +96,69 @@ _TEXTS: dict[str, str] = {
 class ProviderError(Exception):
     """A provider refused or did not answer. ``transient``: trying again
     later can help (a timeout, a 5xx, a rate limit). The text is fixed;
-    ``reason`` names it for code and tests."""
+    ``reason`` names it for code and tests. ``reached``: the request may have
+    reached the provider (``False`` only when it surely did not: the name
+    did not resolve, the address was refused, the connection or its TLS
+    handshake failed)."""
 
-    def __init__(self, message: str, *, transient: bool, reason: str = "") -> None:
+    def __init__(
+        self, message: str, *, transient: bool, reason: str = "", reached: bool = True
+    ) -> None:
         super().__init__(message)
         self.transient = transient
         self.reason = reason
+        self.reached = reached
 
 
-def failure(reason: str, who: str, *, transient: bool) -> ProviderError:
+class UnrevokedToken(ProviderError):
+    """A credential the provider minted but SRW refused (it grants more
+    than was asked) and could not revoke at once: ``minted`` is kept, so its
+    record is revoked again until it expires, never dropped."""
+
+    def __init__(self, message: str, *, minted: MintedToken) -> None:
+        super().__init__(message, transient=False, reason="overbroad")
+        self.minted = minted
+
+
+def failure(
+    reason: str, who: str, *, transient: bool, reached: bool = True
+) -> ProviderError:
     return ProviderError(
-        _TEXTS[reason].format(who=who), transient=transient, reason=reason
+        _TEXTS[reason].format(who=who),
+        transient=transient,
+        reason=reason,
+        reached=reached,
     )
+
+
+_RESOLVER_POOL = ThreadPoolExecutor(
+    max_workers=RESOLVER_THREADS, thread_name_prefix="srw-provider-resolve"
+)
+_RESOLVER_SLOTS = threading.BoundedSemaphore(RESOLVER_THREADS)
+
+
+def _lookup(host: str, family: int) -> list[str]:
+    try:
+        infos = socket.getaddrinfo(host, None, family, socket.SOCK_STREAM)
+    finally:
+        _RESOLVER_SLOTS.release()
+    return [str(info[4][0]) for info in infos]
+
+
+async def provider_resolver(host: str, ipv6: bool) -> Sequence[str]:
+    """A and (on dual-stack) AAAA answers, on the provider calls' own
+    threads; ``OSError`` at once when all of them are taken (a hung system
+    resolver), never a queue behind them."""
+    if not _RESOLVER_SLOTS.acquire(blocking=False):
+        raise OSError("every provider resolver thread is busy")
+    family = socket.AF_UNSPEC if ipv6 else socket.AF_INET
+    loop = asyncio.get_running_loop()
+    try:
+        future = loop.run_in_executor(_RESOLVER_POOL, _lookup, host, family)
+    except BaseException:
+        _RESOLVER_SLOTS.release()
+        raise
+    return await future
 
 
 @dataclass(frozen=True)
@@ -124,7 +186,7 @@ class ProviderNetwork:
     private_tiers: frozenset[str] = DEFAULT_PRIVATE_TIERS
     ipv6: bool = False
     private_hosts: frozenset[str] = frozenset()
-    resolver: Resolver = field(default=system_resolver, repr=False)
+    resolver: Resolver = field(default=provider_resolver, repr=False)
 
     def listed(self, url: httpx.URL) -> bool:
         """Whether the operator listed this host (``host``, or ``host:port``
@@ -185,7 +247,7 @@ def tls_context(ca_pem: str | None) -> ssl.SSLContext:
     try:
         return ssl.create_default_context(cadata=ca_pem)
     except (ssl.SSLError, ValueError):
-        raise failure("ca_unusable", "", transient=False) from None
+        raise failure("ca_unusable", "", transient=False, reached=False) from None
 
 
 def clean(text: Any, limit: int = 200) -> str:
@@ -219,6 +281,16 @@ def status_transient(status: int) -> bool:
     return status == 429 or status >= 500
 
 
+def status_class(status: int) -> str:
+    """How an answer SRW did not expect is named to a connector's owner:
+    the status class, never the provider's words."""
+    if 300 <= status < 400:
+        return "a redirect, which SRW does not follow"
+    if 400 <= status < 500:
+        return "an HTTP 4xx answer"
+    return f"an unexpected HTTP {status} answer"
+
+
 def parse_time(value: Any) -> datetime:
     """An RFC 3339 timestamp, as an aware datetime."""
     if not isinstance(value, str) or not value:
@@ -245,7 +317,9 @@ async def _targets(
             answers = await network.resolver(host, network.ipv6)
         except (OSError, UnicodeError) as exc:
             logger.info("Provider host %s does not resolve: %s", netloc, clean(exc))
-            raise failure("does_not_resolve", who, transient=True) from None
+            raise failure(
+                "does_not_resolve", who, transient=True, reached=False
+            ) from None
         addresses = sorted(
             {ipaddress.ip_address(answer.split("%")[0]) for answer in answers},
             key=lambda a: (a.version, int(a)),
@@ -254,21 +328,23 @@ async def _targets(
             addresses = [a for a in addresses if a.version == 4]
     addresses = list(addresses)
     if not addresses:
-        raise failure("does_not_resolve", who, transient=True)
+        raise failure("does_not_resolve", who, transient=True, reached=False)
     for address in addresses:
         reason = refusal(address, policy)
         if reason is not None:
             logger.warning(
                 "Provider call to %s refused: %s %s", netloc, address, reason
             )
-            raise failure("address_refused", who, transient=False)
+            raise failure("address_refused", who, transient=False, reached=False)
     extensions: dict[str, Any] = {"sni_hostname": sni_hostname} if sni_hostname else {}
+    # No content coding: SRW never decodes one (see the module docstring).
+    plain = {"Connection": "close", "Accept-Encoding": "identity"}
     if literal:
-        return [(url, {"Connection": "close"}, extensions)]
+        return [(url, plain, extensions)]
     return [
         (
             url.copy_with(host=str(address)),
-            {"Host": netloc, "Connection": "close"},
+            {"Host": netloc, **plain},
             {"sni_hostname": sni_hostname or host},
         )
         for address in addresses
@@ -288,8 +364,19 @@ async def _exchange(
     async with client.stream(
         method, url, headers=headers, json=json_body, extensions=extensions
     ) as response:
+        coding = response.headers.get("content-encoding", "").strip().lower()
+        if coding not in ("", "identity"):
+            # Asked for identity, answered with a coding: never decoded.
+            logger.warning(
+                "Provider answer from %s has Content-Encoding %s",
+                headers.get("Host") or url.host,
+                clean(coding, 40),
+            )
+            raise failure("malformed", who, transient=False)
         body = bytearray()
-        async for chunk in response.aiter_bytes():
+        # The raw bytes on the wire (chunked framing removed, no content
+        # decoding): the cap holds for what SRW holds in memory.
+        async for chunk in _raw(response):
             body.extend(chunk)
             if len(body) > MAX_BODY_BYTES:
                 logger.warning(
@@ -301,6 +388,17 @@ async def _exchange(
         return ProviderAnswer(response.status_code, bytes(body))
 
 
+async def _raw(response: httpx.Response) -> AsyncIterator[bytes]:
+    """The answer's raw bytes as they stream. A transport that read the
+    whole answer itself (an in-memory one, in tests) has nothing left to
+    stream: its bytes are the identity-coded body already checked."""
+    if response.is_stream_consumed:
+        yield response.content
+        return
+    async for chunk in response.aiter_raw():
+        yield chunk
+
+
 def transport_error(exc: Exception, who: str) -> ProviderError:
     """A request that got no answer: an untrusted certificate is final,
     anything else may pass. The exception's text is logged, never shown."""
@@ -309,10 +407,12 @@ def transport_error(exc: Exception, who: str) -> ProviderError:
     if "CERTIFICATE_VERIFY_FAILED" in text or isinstance(
         getattr(exc, "__cause__", None), ssl.SSLCertVerificationError
     ):
-        return failure("certificate", who, transient=False)
+        # The TLS handshake failed: nothing was sent.
+        return failure("certificate", who, transient=False, reached=False)
+    connected = not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
     if isinstance(exc, httpx.TimeoutException):
-        return failure("timeout", who, transient=True)
-    return failure("unreachable", who, transient=True)
+        return failure("timeout", who, transient=True, reached=connected)
+    return failure("unreachable", who, transient=True, reached=connected)
 
 
 async def provider_request(
@@ -334,11 +434,13 @@ async def provider_request(
         deadline = DEFAULT_DEADLINE_SECONDS
     verify = tls_context(ca_pem)
     target = httpx.URL(url)
+    resolving = True
     try:
         async with asyncio.timeout(deadline):
             candidates = await _targets(
                 target, who=who, allow_private=allow_private, sni_hostname=sni_hostname
             )
+            resolving = False
             async with _state["factory"](verify=verify, timeout=deadline) as client:
                 for index, (dial, pinned, extensions) in enumerate(candidates):
                     try:
@@ -358,7 +460,7 @@ async def provider_request(
                 raise failure("unreachable", who, transient=True)
     except TimeoutError:
         logger.info("Provider call to %s exceeded its %.0fs deadline", who, deadline)
-        raise failure("timeout", who, transient=True) from None
+        raise failure("timeout", who, transient=True, reached=not resolving) from None
     except httpx.HTTPError as exc:
         raise transport_error(exc, who) from None
 
@@ -367,10 +469,12 @@ __all__ = [
     "ClientFactory",
     "DEFAULT_DEADLINE_SECONDS",
     "MAX_BODY_BYTES",
+    "RESOLVER_THREADS",
     "MintedToken",
     "ProviderAnswer",
     "ProviderError",
     "ProviderNetwork",
+    "UnrevokedToken",
     "clean",
     "configure_provider_http",
     "configure_provider_network",
@@ -378,6 +482,8 @@ __all__ = [
     "parse_time",
     "provider_network",
     "provider_request",
+    "provider_resolver",
+    "status_class",
     "status_transient",
     "tls_context",
     "transport_error",

@@ -159,8 +159,9 @@ class RepositoryDriver(WorkspaceSshDriver):
     def _same_targets(
         existing: Mapping[str, Any] | None, options: Any, connection_url: Any
     ) -> None:
-        """The stored key keeps signing for the API base and the repository
-        host it was saved for."""
+        """The stored key keeps signing for what it was saved for: the same
+        App, installation, API base, repository host and repository
+        (``owner/name``, as GitHub compares them, case-insensitively)."""
         if existing is None:
             return
         try:
@@ -170,14 +171,42 @@ class RepositoryDriver(WorkspaceSshDriver):
             )
         except GitHubAppConfigError:
             return  # no stored App: check_key would be on
-        stored_host = urlsplit(str(existing.get("connection_url") or "")).hostname or ""
-        host = urlsplit(str(connection_url or "")).hostname or ""
-        if stored.api_base != options.api_base or stored_host.lower() != host.lower():
+
+        def target(app: Any, url: Any) -> tuple[str, ...]:
+            return (
+                str(app.app_id),
+                str(app.installation_id),
+                app.api_base,
+                (urlsplit(str(url or "")).hostname or "").lower(),
+                f"{app.owner}/{app.repository}".lower(),
+            )
+
+        if target(stored, existing.get("connection_url")) != target(
+            options, connection_url
+        ):
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "Moving a GitHub App connector to another API base or "
-                    "repository host needs the App's private key again"
+                    "Pointing a GitHub App connector at another App, "
+                    "installation, API base or repository needs the App's "
+                    "private key again"
+                ),
+            )
+
+    @staticmethod
+    def static_keys_checked(credentials: Mapping[str, Any] | None) -> None:
+        """A token or SSH key repository stores no ``username``: the forge
+        token is presented as ``oauth2``, and only a credential SRW minted
+        (a GitHub App's installation token) names another (C5)."""
+        if not isinstance(credentials, Mapping) or uses_github_app(credentials):
+            return
+        named = sorted({"username", "minted"} & set(credentials))
+        if named:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "A repository connector's credentials carry no "
+                    f"{' or '.join(named)}: a token is presented as oauth2"
                 ),
             )
 
@@ -199,6 +228,7 @@ class RepositoryDriver(WorkspaceSshDriver):
         if existing is None:
             config = normalize_repository_config(draft.config, draft.connection_url)
             credentials = self.stored_credentials(draft, existing)
+            self.static_keys_checked(credentials)
             config = self.validate_endpoint(
                 connection_url=draft.connection_url,
                 config=config,
@@ -219,6 +249,7 @@ class RepositoryDriver(WorkspaceSshDriver):
             )
 
         credentials = self.stored_credentials(draft, existing)
+        self.static_keys_checked(credentials)
         config = draft.config
         if config is not None:
             config = normalize_repository_config(
@@ -263,7 +294,9 @@ class RepositoryDriver(WorkspaceSshDriver):
         self, row: Mapping[str, Any], credentials: dict[str, Any], *, ctx: CheckContext
     ) -> dict[str, Any]:
         if uses_github_app(credentials):
-            result = await probe_github_app(dict(row), credentials)
+            result = await probe_github_app(
+                dict(row), credentials, requester=getattr(ctx, "requester", None)
+            )
             if result.get("status") != "ok":
                 return result
         else:
@@ -442,7 +475,10 @@ async def probe_repository(
 
 
 async def probe_github_app(
-    ds: dict[str, Any], credentials: Mapping[str, Any]
+    ds: dict[str, Any],
+    credentials: Mapping[str, Any],
+    *,
+    requester: str | None = None,
 ) -> dict[str, Any]:
     """Test a GitHub App connector (C5): mint a read token for its one
     repository, read the repository with it, and revoke it again. The mint
@@ -467,7 +503,8 @@ async def probe_github_app(
         return {"status": "error", "message": str(exc)}
     try:
         minted, revoke = await mint_for_test(
-            {**ds, "type": "repository", "config": config, "credentials": credentials}
+            {**ds, "type": "repository", "config": config, "credentials": credentials},
+            requester=requester,
         )
     except MintFailure as exc:
         return {"status": "error", "message": str(exc)}

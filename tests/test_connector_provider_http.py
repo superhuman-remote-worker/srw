@@ -392,3 +392,204 @@ class TestReasons:
         )
         assert (await _call()).status == 302
         assert len(seen) == 1
+
+
+def _gzip_bomb(megabytes: int) -> bytes:
+    import gzip
+
+    return gzip.compress(b"\0" * (megabytes << 20), compresslevel=9)
+
+
+def _zstd_bomb(megabytes: int) -> bytes:
+    zstandard = pytest.importorskip("zstandard")
+    return zstandard.ZstdCompressor(level=19).compress(b"\0" * (megabytes << 20))
+
+
+class TestContentCoding:
+    @pytest.mark.asyncio
+    async def test_srw_asks_for_no_content_coding(self, monkeypatch):
+        seen = _route(monkeypatch, _ok)
+        await _call()
+        assert seen[0].headers["accept-encoding"] == "identity"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("coding", ["gzip", "zstd", "deflate", "br", "x-custom"])
+    async def test_a_coded_answer_is_refused_and_never_decoded(
+        self, monkeypatch, coding
+    ):
+        body = {
+            "gzip": lambda: _gzip_bomb(8),
+            "zstd": lambda: _zstd_bomb(8),
+        }.get(coding, lambda: b"\x00" * 64)()
+        assert len(body) < MAX_BODY_BYTES  # small on the wire
+
+        decoded = []
+
+        def handler(request):
+            # A stream, as a network transport hands it over (content= would
+            # be read, and decoded, when the test builds the answer).
+            return httpx.Response(
+                201,
+                headers={"content-encoding": coding},
+                stream=httpx.ByteStream(body),
+            )
+
+        _route(monkeypatch, handler)
+        real_decoders = dict(httpx._decoders.SUPPORTED_DECODERS)
+        for name, decoder in real_decoders.items():
+
+            class Spy(decoder):  # type: ignore[valid-type, misc]
+                def decode(self, data: bytes) -> bytes:
+                    decoded.append(len(data))
+                    return super().decode(data)
+
+            monkeypatch.setitem(httpx._decoders.SUPPORTED_DECODERS, name, Spy)
+        with pytest.raises(ProviderError) as caught:
+            await _call()
+        assert caught.value.reason == "malformed"
+        assert caught.value.transient is False
+        assert decoded == []
+
+    @pytest.mark.asyncio
+    async def test_identity_named_explicitly_is_read(self, monkeypatch):
+        _route(
+            monkeypatch,
+            lambda request: httpx.Response(
+                200, headers={"content-encoding": "identity"}, content=b"{}"
+            ),
+        )
+        assert (await _call()).json() == {}
+
+
+async def _serve(handler) -> tuple[asyncio.AbstractServer, int]:
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    return server, server.sockets[0].getsockname()[1]
+
+
+class TestOnTheWire:
+    """The real client over a real socket (loopback let through: these test
+    the reading, not the address policy)."""
+
+    @pytest.fixture
+    def loopback(self, monkeypatch):
+        async def local(host: str, ipv6: bool):
+            return ("127.0.0.1",)
+
+        monkeypatch.setattr(provider_http, "refusal", lambda address, policy: None)
+        monkeypatch.setitem(
+            provider_http._state, "factory", provider_http._default_client
+        )
+        monkeypatch.setitem(
+            provider_http._state, "network", ProviderNetwork(resolver=local)
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("coding", ["gzip", "zstd"])
+    async def test_a_compression_bomb_is_refused_before_it_is_inflated(
+        self, loopback, coding
+    ):
+        import resource
+
+        body = _gzip_bomb(64) if coding == "gzip" else _zstd_bomb(256)
+        requests: list[bytes] = []
+
+        async def handle(reader, writer):
+            requests.append(await reader.readuntil(b"\r\n\r\n"))
+            writer.write(
+                b"HTTP/1.1 201 Created\r\nContent-Encoding: %s\r\n"
+                b"Content-Length: %d\r\n\r\n" % (coding.encode(), len(body)) + body
+            )
+            try:
+                await writer.drain()
+            except ConnectionError:
+                pass
+            writer.close()
+
+        server, port = await _serve(handle)
+        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        try:
+            with pytest.raises(ProviderError) as caught:
+                await _call(f"http://bomb.test:{port}/x")
+        finally:
+            server.close()
+        grown_mib = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before) / 1024
+        assert caught.value.reason == "malformed"
+        assert grown_mib < 32, grown_mib
+        assert b"accept-encoding: identity" in requests[0].lower()
+
+    @pytest.mark.asyncio
+    async def test_a_large_plain_answer_is_cut_at_the_cap_on_the_wire(self, loopback):
+        async def handle(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            try:
+                for _ in range(256):
+                    writer.write(b"4000\r\n" + b"x" * 0x4000 + b"\r\n")
+                    await writer.drain()
+                writer.write(b"0\r\n\r\n")
+                await writer.drain()
+            except ConnectionError:
+                pass
+            writer.close()
+
+        server, port = await _serve(handle)
+        try:
+            with pytest.raises(ProviderError) as caught:
+                await _call(f"http://big.test:{port}/x")
+        finally:
+            server.close()
+        assert caught.value.reason == "too_large"
+
+    @pytest.mark.asyncio
+    async def test_a_plain_answer_is_read_from_the_wire(self, loopback):
+        async def handle(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(
+                b"HTTP/1.1 201 Created\r\nContent-Length: 12\r\n\r\n" + b'{"ok": true}'
+            )
+            await writer.drain()
+            writer.close()
+
+        server, port = await _serve(handle)
+        try:
+            answer = await _call(f"http://plain.test:{port}/x")
+        finally:
+            server.close()
+        assert answer.status == 201 and answer.json() == {"ok": True}
+
+
+class TestResolver:
+    @pytest.mark.asyncio
+    async def test_lookups_run_on_their_own_bounded_threads(self, monkeypatch):
+        import socket
+        import threading
+
+        release = threading.Event()
+        names: list[str] = []
+
+        def hung(*args, **kwargs):
+            names.append(threading.current_thread().name)
+            release.wait(10)
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.5", 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", hung)
+        try:
+            lookups = [
+                asyncio.ensure_future(provider_http.provider_resolver("x.test", False))
+                for _ in range(provider_http.RESOLVER_THREADS)
+            ]
+            await asyncio.sleep(0.2)
+            # Every resolver thread is held: the next lookup fails at once,
+            # and the loop's shared executor was never used.
+            started = time.monotonic()
+            with pytest.raises(OSError, match="busy"):
+                await provider_http.provider_resolver("y.test", False)
+            assert time.monotonic() - started < 0.5
+            assert all(name.startswith("srw-provider-resolve") for name in names)
+        finally:
+            release.set()
+        assert [await lookup for lookup in lookups] == [
+            ["203.0.113.5"]
+        ] * provider_http.RESOLVER_THREADS
+        # The threads are free again.
+        assert await provider_http.provider_resolver("z.test", False) == ["203.0.113.5"]

@@ -27,9 +27,11 @@ from orchestrator.services.connector_drivers.provider_http import (
     MintedToken,
     ProviderAnswer,
     ProviderError,
+    UnrevokedToken,
     failure,
     parse_time,
     provider_request,
+    status_class,
     status_transient,
 )
 from shared.connectors.github_app import (
@@ -113,7 +115,7 @@ def _refusal(answer: ProviderAnswer, action: str) -> ProviderError:
     elif status >= 500:
         text = f"{_WHO} failed to {action} (a server error)"
     else:
-        text = f"{_WHO} refused to {action} (an HTTP 4xx answer)"
+        text = f"{_WHO} refused to {action} ({status_class(status)})"
     return ProviderError(text, transient=status_transient(status), reason="refused")
 
 
@@ -211,19 +213,25 @@ async def mint_installation_token(
         body.get("repositories"), options.owner, options.repository
     ):
         # More, other permissions or other repositories than asked: never
-        # deliver it.
+        # deliver it. One SRW could not revoke at once is handed back, so
+        # its record keeps revoking it.
+        refused = (
+            f"{_WHO} granted other permissions or repositories than SRW asked "
+            f"for ({sorted(wanted.items())} on "
+            f"{options.owner}/{options.repository})"
+        )
         try:
             await revoke_installation_token(
                 options.api_base, token, ca_pem=ca_pem, allow_private=allow_private
             )
         except ProviderError:
             logger.warning("An over-broad installation token could not be revoked")
+            raise UnrevokedToken(
+                refused + "; SRW keeps revoking the token",
+                minted=MintedToken(token=token, expires_at=expires_at),
+            ) from None
         raise ProviderError(
-            f"{_WHO} granted other permissions or repositories than SRW asked "
-            f"for ({sorted(wanted.items())} on "
-            f"{options.owner}/{options.repository}); the token was revoked",
-            transient=False,
-            reason="overbroad",
+            refused + "; the token was revoked", transient=False, reason="overbroad"
         )
     return MintedToken(token=token, expires_at=expires_at)
 

@@ -980,7 +980,7 @@ async def test_datasource(
     owner may always use, or from the row where the resource has none yet.
     """
     try:
-        _, ds = await resolve_datasource()
+        user, ds = await resolve_datasource()
         if dependencies.connector_credentials is not None:
             await dependencies.connector_credentials([ds], authorized=[str(ds["id"])])
         driver = await dependencies.driver_for(ds)
@@ -994,7 +994,14 @@ async def test_datasource(
             return {"status": "error", "message": f"Unknown connector type: {ds_type}"}
         environment = dependencies.driver_environment()
         driver.require_enabled(environment.gates)
-        return await driver.check(ds, creds, ctx=CheckContext(environment))
+        return await driver.check(
+            ds,
+            creds,
+            ctx=CheckContext(
+                environment,
+                requester=str(user.get("id")) if isinstance(user, dict) else None,
+            ),
+        )
 
     except HTTPException:
         raise

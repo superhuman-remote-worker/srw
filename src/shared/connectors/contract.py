@@ -287,7 +287,10 @@ def effective_access(entry: Mapping[str, Any], spec: DriverSpec) -> str | None:
 
     The one rule for the agent (a binding's ``access``) and SRW (the level a
     credential lease is issued at). A read-only project link clamps to the
-    lowest level. Otherwise the level the connector's config names (a driver
+    lowest level, and so does the connector's own ``read_only`` (always set
+    on a public connector; ``is_global`` is read too) where the mapping
+    carries it, as a stored row does (a payload entry carries the link's
+    only). Otherwise the level the connector's config names (a driver
     whose config has an ``access`` property, such as email), else the
     driver's default, else its highest; a name the driver does not offer
     fails closed to the lowest.
@@ -295,7 +298,11 @@ def effective_access(entry: Mapping[str, Any], spec: DriverSpec) -> str | None:
     levels = spec.ranked_access_ids()
     if not levels:
         return None
-    if entry.get("project_read_only", False):
+    if (
+        entry.get("project_read_only", False)
+        or entry.get("read_only", False)
+        or entry.get("is_global", False)
+    ):
         return levels[0]
     requested = None
     properties = spec.config_schema.get("properties")

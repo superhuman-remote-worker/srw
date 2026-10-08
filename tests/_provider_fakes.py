@@ -32,8 +32,13 @@ GITHUB_API = "https://api.github.com"
 #: provider calls pass the egress check on any project tier.
 ADDRESSES: dict[str, tuple[str, ...]] = {
     "kube.test": ("203.0.113.10",),
+    "kube2.test": ("203.0.113.11",),
+    "kube3.test": ("203.0.113.12",),
     "api.github.com": ("203.0.113.20",),
 }
+#: The names the fake API server answers on (one server, several hosts: the
+#: revoke sweep is fair per host).
+KUBE_HOSTS = frozenset({"kube.test", "kube2.test", "kube3.test"})
 
 
 def _self_signed_ca() -> str:
@@ -377,7 +382,7 @@ class ProviderRouter:
         host = (request.headers.get("host") or request.url.host).split(":")[0]
         self.hosts.append(host)
         self.dialled.append((request.url.host, request.extensions.get("sni_hostname")))
-        if self.kube is not None and host == urlsplit(KUBE_SERVER).hostname:
+        if self.kube is not None and host in KUBE_HOSTS:
             return self.kube.handle(request)
         if self.github is not None and host == urlsplit(GITHUB_API).hostname:
             return self.github.handle(request)
@@ -426,6 +431,10 @@ def install(
 
     monkeypatch.setitem(minted._state, "runtime", None)
     monkeypatch.setitem(minted._state, "enabled", True)
+    # This process's memory of mints: failures, mints in flight, Tests.
+    monkeypatch.setattr(minted, "_prepared", {})
+    monkeypatch.setattr(minted, "_inflight", {})
+    monkeypatch.setattr(minted, "_test_mints", {})
     monkeypatch.setitem(provider_http._state, "factory", router.factory())
     monkeypatch.setitem(
         provider_http._state,

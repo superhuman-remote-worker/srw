@@ -42,6 +42,7 @@ from orchestrator.services.connector_drivers.credential_files import KubeconfigD
 from orchestrator.services.connector_lease_exchange import ConnectorLeaseExchange
 from shared.connectors.builtin import GIT_SWAP_SPEC
 from tests._provider_fakes import (
+    KUBE_SERVER,
     FakeGitHubApi,
     FakeKubeApi,
     ProviderRouter,
@@ -135,13 +136,17 @@ def github(router):
 # =============================================================================
 
 
-async def _kube_connector(db, api: FakeKubeApi, *, token: str | None = None) -> str:
+async def _kube_connector(
+    db, api: FakeKubeApi, *, token: str | None = None, server: str = KUBE_SERVER
+) -> str:
     connector_id = uuid4()
     credentials = {
         "files": [
             {
                 "name": "cluster.yaml",
-                "contents": minting_kubeconfig_yaml(token or api.minting_token),
+                "contents": minting_kubeconfig_yaml(
+                    token or api.minting_token, server=server
+                ),
                 "target_path": "/home/srw/.kube/configs/cluster.yaml",
                 "mode": "0600",
             }
@@ -160,13 +165,13 @@ async def _kube_connector(db, api: FakeKubeApi, *, token: str | None = None) -> 
     return str(connector_id)
 
 
-async def _github_connector(db) -> str:
+async def _github_connector(db, *, read_only: bool = False) -> str:
     connector_id = uuid4()
     async with db.acquire() as conn:
         await conn.execute(
             "INSERT INTO datasources (id, name, type, scope_mode, policy_revision, "
-            "connection_url, credentials, config) VALUES ($1, $2, 'repository', "
-            "'all', 1, $3, $4::jsonb, $5::jsonb)",
+            "connection_url, credentials, config, read_only) VALUES ($1, $2, "
+            "'repository', 'all', 1, $3, $4::jsonb, $5::jsonb, $6)",
             connector_id,
             f"repo-{str(connector_id)[:8]}",
             URL,
@@ -176,6 +181,7 @@ async def _github_connector(db) -> str:
                 )
             ),
             json.dumps({"forge": "github", "github_app": APP}),
+            read_only,
         )
     return str(connector_id)
 
@@ -399,6 +405,124 @@ async def test_a_delivery_never_mints_and_carries_the_preparations_outcome(db, k
         await _deliver_only(db, [copy.deepcopy(entry)], refused_job)
     await minted.settle_background_mints()
     assert len(kube.requests) == calls
+
+
+async def _hanging_kube(kube, monkeypatch, *, hang_host: str = "kube.test"):
+    """The fake API server, except that ``hang_host`` accepts and never
+    answers; returns the event that releases it."""
+    import httpx
+
+    from orchestrator.services.connector_drivers import provider_http
+
+    release = asyncio.Event()
+    router = ProviderRouter(kube=kube)
+
+    async def handler(request):
+        if (request.headers.get("host") or "").split(":")[0] == hang_host:
+            await release.wait()
+        return router(request)
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setitem(
+        provider_http._state,
+        "factory",
+        lambda *, verify=True, timeout=10.0: httpx.AsyncClient(transport=transport),
+    )
+    return release
+
+
+@pytest.mark.asyncio
+async def test_a_dispatch_never_waits_on_a_provider(db, kube, monkeypatch):
+    import time
+
+    connector = await _kube_connector(db, kube)
+    owner = leases.LeaseOwner.job(await _job(db))
+    entries = [copy.deepcopy(_kube_entry(connector))]
+    release = await _hanging_kube(kube, monkeypatch)
+    for _ in range(3):
+        started = time.monotonic()
+        # The pinned dispatch's and the job claim's preparation (bind_wait=0).
+        await leases.prepare_lease_delivery(db, entries, owner=owner, bind_wait=0)
+        with pytest.raises(BindTimePending, match="being minted|took too long"):
+            await _deliver_only(db, copy.deepcopy(entries), owner)
+        assert time.monotonic() - started < 1
+    # One mint in flight for the job and connector, one record.
+    assert len(minted._inflight) == 1 and len(await _rows(db)) == 1
+    release.set()
+    await minted.settle_background_mints()
+    delivered = copy.deepcopy(entries)
+    assert await _deliver_only(db, delivered, owner) == 1
+    assert kube.authenticates(_delivered_token(delivered[0]))
+
+
+@pytest.mark.asyncio
+async def test_a_dead_providers_job_never_stalls_another_jobs_dispatch(
+    db, kube, monkeypatch
+):
+    import time
+
+    dead = await _kube_connector(db, kube)
+    alive = await _kube_connector(db, kube, server="https://kube2.test:6443")
+    stuck = leases.LeaseOwner.job(await _job(db))
+    other = leases.LeaseOwner.job(await _job(db))
+    release = await _hanging_kube(kube, monkeypatch)
+    dispatch_lock = asyncio.Lock()  # the dispatcher's global lock
+
+    async def dispatch(owner, connector) -> bool:
+        entries = [copy.deepcopy(_kube_entry(connector))]
+        async with dispatch_lock:
+            await leases.prepare_lease_delivery(db, entries, owner=owner, bind_wait=0)
+            try:
+                await _deliver_only(db, entries, owner)
+            except BindTimePending:
+                return False
+            return True
+
+    started = time.monotonic()
+    assert not await dispatch(stuck, dead)
+    assert not await dispatch(other, alive)
+    # The other job's mint finishes in the background; the next tick
+    # dispatches it while the dead provider's mint still hangs.
+    for _ in range(50):
+        if any(r["status"] == "live" for r in await _rows(db, alive)):
+            break
+        await asyncio.sleep(0.05)
+    assert not await dispatch(stuck, dead)
+    assert await dispatch(other, alive)
+    assert time.monotonic() - started < 5
+    release.set()
+    await minted.settle_background_mints()
+
+
+@pytest.mark.asyncio
+async def test_settling_background_mints_is_bounded(db, kube, monkeypatch):
+    import time
+
+    connector = await _kube_connector(db, kube)
+    owner = leases.LeaseOwner.job(await _job(db))
+    release = await _hanging_kube(kube, monkeypatch)
+    await leases.prepare_lease_delivery(
+        db, [copy.deepcopy(_kube_entry(connector))], owner=owner, bind_wait=0
+    )
+    started = time.monotonic()
+    await minted.settle_background_mints(timeout=0.2)
+    assert time.monotonic() - started < 1 and minted._inflight
+    release.set()
+    await minted.settle_background_mints()
+
+
+@pytest.mark.asyncio
+async def test_a_connector_change_forgets_the_remembered_failure(db, kube):
+    connector = await _kube_connector(db, kube)
+    owner = leases.LeaseOwner.job(await _job(db))
+    kube.forbidden.add("token")
+    await minted.prepare_minted_entries(
+        db, [copy.deepcopy(_kube_entry(connector))], owner=owner
+    )
+    assert minted._remembered(owner, connector) is not None
+    async with db.acquire() as conn:
+        await minted.connector_changed(conn, connector)
+    assert minted._remembered(owner, connector) is None
 
 
 @pytest.mark.asyncio
@@ -762,8 +886,69 @@ async def test_a_mint_the_provider_refuses_leaves_nothing_behind(db, kube):
             db, owner=owner, connector_id=connector, access="ReadWrite"
         )
     assert caught.value.permanent
+    # Its Secret was deleted again: nothing is left, so the record is done
+    # (no revoke, no "may be left" warning), and keeps no secret.
     [row] = await _rows(db)
-    assert row["status"] == "revoking" and row["revoke_reason"] == "mint_failed"
+    assert row["status"] == "revoked" and row["revoke_reason"] == "mint_failed"
+    assert "token" not in _material_of(row)
+    assert kube.secrets == {}
+    assert (await minted.sweep_minted_once(db)).any() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["refused", "never-reached"])
+async def test_a_secret_create_that_made_nothing_leaves_a_done_record(
+    db, kube, monkeypatch, caplog, how
+):
+    connector = await _kube_connector(db, kube)
+    owner = leases.LeaseOwner.thread(await _thread(db))
+    if how == "refused":
+        kube.forbidden.add("create-secret")
+    else:
+        from tests._provider_fakes import install
+
+        # The API server's name resolves to a refused address.
+        install(
+            monkeypatch,
+            ProviderRouter(kube=kube),
+            addresses={"kube.test": ("169.254.169.254",)},
+        )
+        minted.configure_minted_credentials(minted.MintedRuntime(store=db))
+    with caplog.at_level(logging.WARNING, logger=minted.__name__):
+        with pytest.raises(minted.MintFailure):
+            await minted.ensure_minted(
+                db, owner=owner, connector_id=connector, access="ReadWrite"
+            )
+        await minted.sweep_minted_once(db)
+    [row] = await _rows(db)
+    assert row["status"] == "revoked" and row["revoke_reason"] == "mint_failed"
+    assert "Giving up" not in caplog.text
+    assert await _events(db, "connector_minted_revoke_abandoned") == []
+
+
+@pytest.mark.asyncio
+async def test_a_secret_create_whose_answer_was_lost_is_swept_by_name(
+    db, kube, monkeypatch
+):
+    connector = await _kube_connector(db, kube)
+    owner = leases.LeaseOwner.thread(await _thread(db))
+    real = kube.handle
+
+    def lost(request):
+        answer = real(request)
+        if request.method == "POST" and request.url.path.endswith("/secrets"):
+            raise __import__("httpx").ReadError("connection reset", request=request)
+        return answer
+
+    kube.handle = lost
+    with pytest.raises(minted.MintFailure):
+        await minted.ensure_minted(
+            db, owner=owner, connector_id=connector, access="ReadWrite"
+        )
+    [row] = await _rows(db)
+    assert row["status"] == "revoking" and len(kube.secrets) == 1
+    kube.handle = real
+    assert (await minted.sweep_minted_once(db)).revoked == 1
     assert kube.secrets == {}
 
 
@@ -829,11 +1014,21 @@ async def test_each_revoke_is_bounded_and_a_few_run_at_once(db, kube, monkeypatc
     from orchestrator.services.connector_drivers import provider_http
 
     owners = []
-    for _ in range(3):
+    # Three API server hosts, the first with two credentials.
+    for server in (
+        KUBE_SERVER,
+        KUBE_SERVER,
+        "https://kube2.test:6443",
+        "https://kube3.test:6443",
+    ):
         thread = await _thread(db)
         await _deliver(
             db,
-            [copy.deepcopy(_kube_entry(await _kube_connector(db, kube)))],
+            [
+                copy.deepcopy(
+                    _kube_entry(await _kube_connector(db, kube, server=server))
+                )
+            ],
             leases.LeaseOwner.thread(thread),
         )
         owners.append(thread)
@@ -866,11 +1061,64 @@ async def test_each_revoke_is_bounded_and_a_few_run_at_once(db, kube, monkeypatc
     started = time.monotonic()
     report = await minted.sweep_minted_once(db)
     assert time.monotonic() - started < 3
+    # One per host at a time, the hosts at once: the dead first host's
+    # second credential waits for the next pass instead of a second slot.
+    assert most[0] == 3
     assert report.retried == 3 and report.revoked == 0
-    assert most[0] > 1  # concurrently, not one after another
     rows = await _rows(db)
     assert all(r["status"] == "revoking" for r in rows)
-    assert all(r["revoke_error"] == "the revoke took too long" for r in rows)
+    tried = [r for r in rows if r["revoke_attempts"] == 1]
+    assert len(tried) == 3
+    assert all(r["revoke_error"] == "the revoke took too long" for r in tried)
+    assert sorted(r["provider_host"] for r in rows) == [
+        "kube.test:6443",
+        "kube.test:6443",
+        "kube2.test:6443",
+        "kube3.test:6443",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_one_dead_hosts_backlog_never_fills_the_sweep_window(
+    db, kube, monkeypatch
+):
+    from orchestrator.services.connector_drivers import provider_http
+
+    monkeypatch.setattr(minted, "REVOKES_PER_PASS", 5)
+    dead = await _kube_connector(db, kube)
+    healthy = await _kube_connector(db, kube, server="https://kube2.test:6443")
+    owners = []
+    for connector in [dead] * 8 + [healthy]:
+        thread = await _thread(db)
+        await _deliver(
+            db,
+            [copy.deepcopy(_kube_entry(connector))],
+            leases.LeaseOwner.thread(thread),
+        )
+        owners.append(thread)
+    # kube.test stops resolving; kube2.test still answers.
+    from tests._provider_fakes import fake_resolver
+
+    monkeypatch.setitem(
+        provider_http._state,
+        "network",
+        provider_http.ProviderNetwork(
+            resolver=fake_resolver({"kube2.test": ("203.0.113.11",)})
+        ),
+    )
+    async with db.acquire() as conn:
+        for thread in owners:
+            await leases.revoke_execution_leases(
+                conn, thread_id=thread, reason="session_end"
+            )
+    report = await minted.sweep_minted_once(db)
+    # The healthy host's revoke runs in the first pass, beside one of the
+    # dead host's; the dead host's others wait, untried.
+    assert report.revoked == 1 and report.retried == 1
+    [done] = [r for r in await _rows(db, healthy)]
+    assert done["status"] == "revoked"
+    attempts = sorted(r["revoke_attempts"] for r in await _rows(db, dead))
+    assert attempts == [0] * 7 + [1]
 
 
 @pytest.mark.asyncio
@@ -966,9 +1214,10 @@ async def test_an_abandoned_mint_is_revoked_by_name(db, kube):
     async with db.acquire() as conn:
         await conn.execute(
             "INSERT INTO connector_minted_credentials (id, owner_kind, owner_id, "
-            "connector_id, provider, access, config_digest, material_ciphertext, "
-            "created_at) VALUES ($1, 'job', $2, $3, 'kubernetes', 'ReadWrite', $4, "
-            "$5, now() - interval '1 hour')",
+            "connector_id, provider, provider_host, access, config_digest, "
+            "material_ciphertext, created_at) VALUES ($1, 'job', $2, $3, "
+            "'kubernetes', 'kube.test:6443', 'ReadWrite', $4, $5, "
+            "now() - interval '1 hour')",
             credential_id,
             UUID(job),
             UUID(connector),
@@ -1004,9 +1253,9 @@ async def test_revoked_rows_are_pruned_after_the_retention(db, kube):
 async def test_constraints_reject_malformed_rows(db):
     base = (
         "INSERT INTO connector_minted_credentials (id, owner_kind, owner_id, "
-        "connector_id, provider, access, config_digest, material_ciphertext, "
-        "status, token_ciphertext, expires_at, minted_at) VALUES ($1, $2, $3, $3, "
-        "$4, 'ReadOnly', $5, 'x', $6, $7, $8, $8)"
+        "connector_id, provider, provider_host, access, config_digest, "
+        "material_ciphertext, status, token_ciphertext, expires_at, minted_at) "
+        "VALUES ($1, $2, $3, $3, $4, 'h', 'ReadOnly', $5, 'x', $6, $7, $8, $8)"
     )
     digest = "sha256:" + "0" * 64
     bad = [
@@ -1052,13 +1301,20 @@ async def test_a_session_skips_a_connector_it_cannot_mint_for_with_a_notice(db, 
 
 @pytest.mark.asyncio
 async def test_a_job_waits_for_a_provider_that_did_not_answer_and_fails_on_a_refusal(
-    db, kube
+    db, kube, monkeypatch
 ):
     connector = await _kube_connector(db, kube)
     owner = leases.LeaseOwner.job(await _job(db))
     kube.fail["create-secret"] = [503]
     with pytest.raises(BindTimePending, match="server error"):
         await _deliver(db, [copy.deepcopy(_kube_entry(connector))], owner)
+    # A retry while the failure is fresh asks the provider nothing.
+    calls = len(kube.requests)
+    with pytest.raises(BindTimePending, match="server error"):
+        await _deliver(db, [copy.deepcopy(_kube_entry(connector))], owner)
+    assert len(kube.requests) == calls and len(await _rows(db)) == 1
+    # Once stale, it is tried again.
+    monkeypatch.setattr(minted, "TRANSIENT_OUTCOME_SECONDS", 0.0)
     kube.forbidden.add("create-secret")
     with pytest.raises(BindTimeRefused, match="403"):
         await _deliver(db, [copy.deepcopy(_kube_entry(connector))], owner)
@@ -1264,6 +1520,63 @@ async def test_a_sessions_stored_selection_is_minted_at_its_project_links_level(
 
 
 @pytest.mark.asyncio
+async def test_a_read_only_connector_never_gets_a_write_token(db, github):
+    """A public (or read-only) GitHub App connector is minted contents: read
+    in preparation, delivery and the exchange alike, whatever the project
+    link says."""
+    connector = await _github_connector(db, read_only=True)
+    row = await db.get_datasource(connector)
+    entry = _github_entry(connector, block={"fallback": "why"})
+    entry["minted"] = minted.github_app_marker(row)
+    assert entry["minted"]["read_only"] is True
+    owner = leases.LeaseOwner.job(await _job(db))
+    assert await _deliver(db, [entry], owner) == 1
+    token = entry["credentials"]["token"]
+    assert github.live(token)["permissions"]["contents"] == "read"
+    [record] = await _rows(db)
+    assert record["access"] == "ReadOnly"
+    # The exchange asks for ReadWrite (the lease's level): still read.
+    exchange_owner = leases.LeaseOwner.thread(await _thread(db))
+    upstream = await minted.minted_lease_upstream(
+        db, row, owner=exchange_owner, access="ReadWrite"
+    )
+    assert github.live(upstream.token)["permissions"]["contents"] == "read"
+    # A session's preparation reads the connector's own rule too.
+    thread = await _thread(db, metadata={"datasource_ids": [connector]})
+    await minted.prepare_thread_minted(db, thread)
+    access = {r["owner_id"]: r["access"] for r in await _rows(db)}
+    assert access[UUID(thread)] == "ReadOnly"
+
+
+@pytest.mark.asyncio
+async def test_an_overbroad_token_that_did_not_revoke_is_kept_for_the_sweep(db, github):
+    import httpx
+
+    connector = await _github_connector(db)
+    owner = leases.LeaseOwner.job(await _job(db))
+    github.grant_extra = {"administration": "write"}
+    real = github.handle
+
+    def no_revoke(request):
+        if request.method == "DELETE":
+            return httpx.Response(503, json={"message": "unavailable"})
+        return real(request)
+
+    github.handle = no_revoke
+    with pytest.raises(minted.MintFailure):
+        await minted.ensure_minted(
+            db, owner=owner, connector_id=connector, access="ReadOnly"
+        )
+    [record] = await _rows(db)
+    assert record["status"] == "revoking" and record["revoke_reason"] == "overbroad"
+    assert record["token_ciphertext"] is not None
+    [token] = github.tokens
+    github.handle = real
+    assert (await minted.sweep_minted_once(db)).revoked == 1
+    assert github.live(token) is None
+
+
+@pytest.mark.asyncio
 async def test_a_legacy_multi_project_session_reads_its_strictest_link(db, github):
     connector = await _github_connector(db)
     writable, read_only, elsewhere = uuid4(), uuid4(), uuid4()
@@ -1307,7 +1620,10 @@ async def test_a_legacy_multi_project_session_reads_its_strictest_link(db, githu
 
 
 @pytest.mark.asyncio
-async def test_tests_mint_is_recorded_and_its_failed_revoke_is_swept(db, kube):
+async def test_tests_mint_is_recorded_and_its_failed_revoke_is_swept(
+    db, kube, monkeypatch
+):
+    monkeypatch.setattr(minted, "TEST_MINT_INTERVAL_SECONDS", 0.0)
     connector = await _kube_connector(db, kube)
     row = await db.get_datasource(connector)
     result = await KubeconfigDriver().check(row, row["credentials"], ctx=None)
@@ -1327,6 +1643,22 @@ async def test_tests_mint_is_recorded_and_its_failed_revoke_is_swept(db, kube):
     assert report.revoked == 1 and kube.secrets == {}
     # Test's revokes are no revoke event.
     assert await _events(db, "connector_minted_credential_revoked") == []
+
+
+@pytest.mark.asyncio
+async def test_one_user_tests_a_connector_at_most_every_few_seconds(db, kube):
+    from types import SimpleNamespace
+
+    connector = await _kube_connector(db, kube)
+    row = await db.get_datasource(connector)
+    alice, bob = SimpleNamespace(requester="alice"), SimpleNamespace(requester="bob")
+    first = await KubeconfigDriver().check(row, row["credentials"], ctx=alice)
+    assert first["status"] == "ok", first
+    again = await KubeconfigDriver().check(row, row["credentials"], ctx=alice)
+    assert again["status"] == "error" and "tested a moment ago" in again["message"]
+    other = await KubeconfigDriver().check(row, row["credentials"], ctx=bob)
+    assert other["status"] == "ok", other
+    assert len(await _rows(db)) == 2
 
 
 # =============================================================================

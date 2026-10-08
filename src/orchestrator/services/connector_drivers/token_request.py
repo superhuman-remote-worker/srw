@@ -36,6 +36,7 @@ from orchestrator.services.connector_drivers.provider_http import (
     failure,
     parse_time,
     provider_request,
+    status_class,
     status_transient,
 )
 from shared.connectors.token_request import (
@@ -105,7 +106,7 @@ def _refusal(answer: ProviderAnswer, action: str) -> ProviderError:
     elif status >= 500:
         text = f"{_WHO} failed to {action} (a server error)"
     else:
-        text = f"{_WHO} refused to {action} (an HTTP 4xx answer)"
+        text = f"{_WHO} refused to {action} ({status_class(status)})"
     return ProviderError(text, transient=status_transient(status), reason="refused")
 
 
@@ -144,24 +145,39 @@ async def mint_token(
 
     The answer's ``handle`` is the Secret's uid. A token request that fails
     after the Secret exists deletes it again, best effort and bounded (the
-    caller's record names it, so a sweep deletes it otherwise).
+    caller's record names it, so a sweep deletes it otherwise). Every
+    ``ProviderError`` raised here says in ``left_secret`` whether the Secret
+    may be left at the API server: not when its create was refused or never
+    reached the server, nor when the clean-up deleted it.
     """
     namespace = options.namespace
-    created = await _call(
-        minting,
-        "POST",
-        _path("api", "v1", "namespaces", namespace, "secrets"),
-        allow_private=allow_private,
-        json_body=bound_secret(
-            name=secret, credential_id=credential_id, annotations=annotations
-        ),
-    )
+    try:
+        created = await _call(
+            minting,
+            "POST",
+            _path("api", "v1", "namespaces", namespace, "secrets"),
+            allow_private=allow_private,
+            json_body=bound_secret(
+                name=secret, credential_id=credential_id, annotations=annotations
+            ),
+        )
+    except ProviderError as exc:
+        # A lost answer may follow a create the server made.
+        exc.left_secret = exc.reached
+        raise
     if created.status != 201:
-        raise _refusal(created, "create the bound Secret")
+        refused = _refusal(created, "create the bound Secret")
+        refused.left_secret = False
+        raise refused
     try:
         uid = str(created.json()["metadata"]["uid"])
     except (ValueError, KeyError, TypeError, UnicodeDecodeError):
-        raise failure("malformed", _WHO, transient=True) from None
+        # Created, with an answer SRW cannot read: deleted by name.
+        malformed = failure("malformed", _WHO, transient=True)
+        malformed.left_secret = not await _cleanup(
+            minting, namespace, secret, None, allow_private=allow_private
+        )
+        raise malformed from None
     try:
         answer = await _call(
             minting,
@@ -188,22 +204,39 @@ async def mint_token(
             raise failure("malformed", _WHO, transient=True) from None
         if not token:
             raise failure("malformed", _WHO, transient=True)
-    except ProviderError:
+    except ProviderError as exc:
         # The Secret exists and no token is recorded: delete it now, under
         # a deadline of its own. A cancel skips this; the record remains.
-        try:
-            await _delete(
-                minting,
-                namespace,
-                secret,
-                uid,
-                allow_private=allow_private,
-                deadline=CLEANUP_DEADLINE_SECONDS,
-            )
-        except ProviderError:
-            logger.info("The bound Secret %s is left for the sweep", secret)
+        exc.left_secret = not await _cleanup(
+            minting, namespace, secret, uid, allow_private=allow_private
+        )
         raise
     return MintedToken(token=token, expires_at=expires_at, handle=uid)
+
+
+async def _cleanup(
+    minting: MintingKubeconfig,
+    namespace: str,
+    name: str,
+    uid: str | None,
+    *,
+    allow_private: bool,
+) -> bool:
+    """Delete a bound Secret a failed mint left, under
+    :data:`CLEANUP_DEADLINE_SECONDS`; whether it is gone."""
+    try:
+        await _delete(
+            minting,
+            namespace,
+            name,
+            uid,
+            allow_private=allow_private,
+            deadline=CLEANUP_DEADLINE_SECONDS,
+        )
+    except ProviderError:
+        logger.info("The bound Secret %s is left for the sweep", name)
+        return False
+    return True
 
 
 async def _delete(

@@ -189,6 +189,21 @@ class TestRules:
         )
         assert not granted_as_asked(None, wanted)
 
+    def test_the_connectors_own_read_only_clamps_the_level(self):
+        from shared.connectors.contract import effective_access
+
+        assert (
+            effective_access(
+                {"project_read_only": None, "read_only": True}, REPOSITORY_SPEC
+            )
+            == "ReadOnly"
+        )
+        assert effective_access({"is_global": True}, REPOSITORY_SPEC) == "ReadOnly"
+        assert (
+            effective_access({"project_read_only": True}, REPOSITORY_SPEC) == "ReadOnly"
+        )
+        assert effective_access({"read_only": False}, REPOSITORY_SPEC) == "ReadWrite"
+
     def test_the_answer_must_cover_the_one_repository(self):
         assert covers_only([{"full_name": "Acme/Repo"}], "acme", "repo")
         assert covers_only(
@@ -329,6 +344,46 @@ class TestCalls:
                 _options(), PRIVATE, "ReadOnly", ca_pem="not a certificate"
             )
         assert caught.value.reason == "ca_unusable"
+
+    @pytest.mark.asyncio
+    async def test_an_overbroad_token_that_will_not_revoke_is_handed_back(self, github):
+        from orchestrator.services.connector_drivers.provider_http import (
+            UnrevokedToken,
+        )
+
+        github.grant_extra = {"administration": "write"}
+        real = github.handle
+
+        def no_revoke(request):
+            if request.method == "DELETE":
+                import httpx
+
+                return httpx.Response(503, json={"message": "unavailable"})
+            return real(request)
+
+        github.handle = no_revoke
+        with pytest.raises(UnrevokedToken) as caught:
+            await mint_installation_token(_options(), PRIVATE, "ReadOnly")
+        [token] = github.tokens
+        assert caught.value.minted.token == token and github.live(token)
+        assert "keeps revoking" in str(caught.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status", "words"),
+        [
+            (302, "a redirect"),
+            (409, "an HTTP 4xx answer"),
+            (200, "unexpected HTTP 200"),
+        ],
+    )
+    async def test_an_unexpected_status_is_named_by_its_class(
+        self, github, status, words
+    ):
+        github.fail = [status]
+        with pytest.raises(ProviderError) as caught:
+            await mint_installation_token(_options(), PRIVATE, "ReadOnly")
+        assert words in str(caught.value)
 
     @pytest.mark.asyncio
     async def test_github_trouble_is_transient(self, github):
@@ -477,8 +532,32 @@ class TestRepositoryDriver:
                 {"connection_url": "https://other.corp.example/acme/repo.git"},
                 "https://ghe.corp.example/acme/repo.git",
             ),
+            # Another installation, App or repository on the same host.
+            (
+                {
+                    "config": {
+                        "forge": "github",
+                        "github_app": {**APP, "installation_id": "999999"},
+                    }
+                },
+                URL,
+            ),
+            (
+                {"config": {"forge": "github", "github_app": {**APP, "app_id": "7"}}},
+                URL,
+            ),
+            ({"connection_url": "https://github.com/other-org/secrets.git"}, URL),
+            ({"connection_url": "https://github.com/acme/other.git"}, URL),
         ],
-        ids=["api-base", "github-to-ghe-cloud", "ghes-to-ghes"],
+        ids=[
+            "api-base",
+            "github-to-ghe-cloud",
+            "ghes-to-ghes",
+            "installation",
+            "app",
+            "other-org",
+            "other-repository",
+        ],
     )
     async def test_an_edit_may_not_move_the_stored_key(self, edit, stored_url):
         existing = {
@@ -501,6 +580,49 @@ class TestRepositoryDriver:
             ctx=_ctx(),
         )
         assert normalized.credentials["private_key"] == PRIVATE
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("key", ["username", "minted"])
+    async def test_a_static_token_carries_no_username(self, key):
+        credentials = {"auth_method": "token", "token": "t" * 20, key: "x"}
+        with pytest.raises(HTTPException, match="carry no") as caught:
+            await RepositoryDriver().validate(
+                _draft(credentials=credentials, config={"forge": "github"}),
+                existing=None,
+                ctx=_ctx(),
+            )
+        assert caught.value.status_code == 400
+        existing = {
+            "id": CONNECTOR,
+            "name": "repo",
+            "type": "repository",
+            "connection_url": URL,
+            "config": {"forge": "github"},
+            "credentials": {"auth_method": "token", "token": "t" * 20},
+        }
+        with pytest.raises(HTTPException, match="carry no"):
+            await RepositoryDriver().validate(
+                _draft(credentials=credentials), existing=existing, ctx=_ctx()
+            )
+
+    def test_a_public_or_read_only_connector_marks_its_entry(self):
+        for over in ({"read_only": True}, {"is_global": True}):
+            row = {
+                "id": CONNECTOR,
+                "type": "repository",
+                "name": "repo",
+                "connection_url": URL,
+                "config": {"forge": "github", "github_app": APP},
+                **over,
+            }
+            ctx = BindContext(
+                gates=DeploymentGates(lambda: True, lambda: True),
+                logger=logging.getLogger("test"),
+                default_known_hosts="",
+                git_swap=None,
+            )
+            entry = RepositoryDriver().bind(row, _app_credentials(), ctx=ctx)
+            assert entry["minted"]["read_only"] is True
 
     @pytest.mark.asyncio
     async def test_dropping_the_app_needs_new_credentials(self):
@@ -542,12 +664,20 @@ class TestRepositoryDriver:
             "config": {"forge": "github", "github_app": APP},
             "credentials": _app_credentials(),
         }
+        # The same repository (a .git suffix, another case): the key stays.
         normalized = await RepositoryDriver().validate(
-            _draft(connection_url="https://github.com/acme/repo2.git"),
+            _draft(connection_url="https://github.com/Acme/Repo"),
             existing=existing,
             ctx=_ctx(),
         )
         assert normalized.credentials is None
+        # Another repository needs the key again.
+        with pytest.raises(HTTPException, match="private key again"):
+            await RepositoryDriver().validate(
+                _draft(connection_url="https://github.com/acme/repo2.git"),
+                existing=existing,
+                ctx=_ctx(),
+            )
         with pytest.raises(HTTPException, match="one repository"):
             await RepositoryDriver().validate(
                 _draft(connection_url="https://github.com/acme"),
@@ -575,7 +705,11 @@ class TestRepositoryDriver:
     def test_bind_never_carries_the_key_and_names_the_provider(self):
         entry = self._bind(git_swap=GitSwapDriver("img"))
         assert entry["credentials"] == {"auth_method": "github_app"}
-        assert entry["minted"] == {"provider": "github_app", "connector_id": CONNECTOR}
+        assert entry["minted"] == {
+            "provider": "github_app",
+            "connector_id": CONNECTOR,
+            "read_only": False,
+        }
         assert "PRIVATE KEY" not in repr(entry)
         # A swap candidate, served by the driver's spec.
         assert entry["git_swap"] == {}
