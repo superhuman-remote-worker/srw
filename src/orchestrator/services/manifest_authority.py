@@ -17,6 +17,7 @@ from orchestrator.services.connector_secrets import (
     is_connector_secret_name,
     is_own_connector_secret,
 )
+from orchestrator.services.datasource_policy import GENERIC_UNAVAILABLE_DETAIL
 from orchestrator.services.project_status import project_is_archived
 
 
@@ -25,6 +26,7 @@ class ManifestAuthority:
         self.db, self.user, self.request = db, user, request
         self.account = {"kind": "Account", "name": str(user["id"])}
         self.new_projects = set()
+        self._connector_policies = {}
 
     async def deny(self, detail):
         raise await _denied(
@@ -144,25 +146,44 @@ class ManifestAuthority:
         # Reading the manifest is weaker than attaching credentials to a process.
         return await self.scope(scope, write=True)
 
-    async def connector_secret(self, ref, connector, *, project_ids=()):
+    async def connector_secret(self, ref, connector, *, project_ids=(), edit=False):
         """Authority to use a linked Connector's own credentials (decision 11).
 
         A connector shared with other users (public, or linked to their
         project) lends its creator's credentials to their executions, as a
         datasource always did.  So when ``ref`` names ``connector``'s own
         resource secret, in the Connector's own scope, the connector policy
-        decides: the secret is usable by work in ``project_ids`` the policy
-        authorizes this caller to attach the connector to, although the
-        caller cannot write the secret's scope.  Otherwise the ordinary
-        rule (:meth:`secret`) decides, so the owner and an administrator
-        keep their access.  A Catalog secret is refused either way.
+        is the authority, and the only one: the secret is usable by work in
+        ``project_ids`` the policy authorizes this caller to attach the
+        connector to, whoever can write the secret's scope.  The owner's
+        ``scope_mode=projects`` connector outside its projects and a
+        project's knowledge base outside its project are refused, as their
+        delivery is.
+
+        ``edit`` is a manifest apply of the Connector's own document: the
+        store refuses that edit itself (a datasource's Connector is written
+        from its row), and the ordinary rule (:meth:`secret`) lets the
+        caller who could write it reach that refusal.  A reference to any
+        other secret is :meth:`secret`'s, which refuses a connector's; a
+        Catalog secret is refused either way.
         """
         scope = ref["scope"]
         if scope["kind"] == "Catalog":
             await self.deny(CATALOG_SECRET_DETAIL)
-        own = is_own_connector_secret(ref, connector)
-        if own and await connector_policy_authorizes(
-            self.db, self.user, connector["linked_id"], project_ids
-        ):
+        if not is_own_connector_secret(ref, connector):
+            return await self.secret(scope, name=ref.get("name"))
+        if await self._connector_policy(connector["linked_id"], project_ids):
             return dict(scope)
-        return await self.secret(scope, name=None if own else ref.get("name"))
+        if edit:
+            return await self.secret(scope)
+        return await self.deny(GENERIC_UNAVAILABLE_DETAIL)
+
+    async def _connector_policy(self, connector_id, project_ids):
+        """The connector policy's answer for this caller, once per connector
+        and set of projects."""
+        key = (str(connector_id), tuple(sorted(str(p) for p in project_ids)))
+        if key not in self._connector_policies:
+            self._connector_policies[key] = await connector_policy_authorizes(
+                self.db, self.user, connector_id, project_ids
+            )
+        return self._connector_policies[key]

@@ -365,7 +365,10 @@ async def connector_policy_authorizes(
     """Whether the connector policy lets ``user``'s work in ``project_ids``
     use the connector: its own, public, linked to every one of those
     projects, or a project's own knowledge base in that project.  An access
-    check only, like a session's attach (no workspace tier)."""
+    check only, like a session's attach (no workspace tier), and with the
+    same administrator override a session's or a job's own selection gets
+    (``authorize_thread_datasource_selection``): an administrator's work
+    may use any connector, as its delivery does."""
     from orchestrator.services.datasource_policy import (
         DatasourceUnavailableError,
         classify_datasource_selection,
@@ -379,6 +382,7 @@ async def connector_policy_authorizes(
             [str(datasource_id)],
             [str(project) for project in project_ids],
             None,
+            allow_admin_explicit_override=True,
         )
     except DatasourceUnavailableError:
         return False

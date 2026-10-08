@@ -53,6 +53,7 @@ from orchestrator.services.connector_secrets import (
     secret_values,
     stored_credentials,
 )
+from orchestrator.services.datasource_policy import GENERIC_UNAVAILABLE_DETAIL
 from orchestrator.services.manifest_authority import ManifestAuthority
 from orchestrator.services.manifest_connectors import (
     connector_document,
@@ -799,13 +800,45 @@ class TestTheConnectorSecretAuthority:
         authority.secret.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_a_refusal_falls_back_to_the_ordinary_rule(self, monkeypatch):
-        authority, _policy = self._authority(monkeypatch, allows=False, user_id="u-2")
+    async def test_a_refusal_of_the_policy_is_final(self, monkeypatch):
+        """Write access to the secret's scope lends nothing the policy
+        refused: not the owner's connector outside its projects, not a
+        project's knowledge base to an editor's work outside the project."""
+        authority, _policy = self._authority(monkeypatch, allows=False)
+        authority.secret = AsyncMock(return_value=ACCOUNT)
         with pytest.raises(HTTPException) as refused:
             await authority.connector_secret(_own_ref(), _connector())
-        assert refused.value.status_code == 403
-        # Its own secret: no foreign-reference refusal, only the scope rule.
-        authority.secret.assert_awaited_once_with(ACCOUNT, name=None)
+        assert (refused.value.status_code, refused.value.detail) == (
+            403,
+            GENERIC_UNAVAILABLE_DETAIL,
+        )
+        authority.secret.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_edit_of_its_own_document_falls_back_to_the_scope_rule(
+        self, monkeypatch
+    ):
+        """A manifest apply of the Connector's own document reaches the
+        store's refusal when the caller could write it."""
+        authority, _policy = self._authority(monkeypatch, allows=False)
+        authority.secret = AsyncMock(return_value=ACCOUNT)
+        assert (
+            await authority.connector_secret(_own_ref(), _connector(), edit=True)
+            == ACCOUNT
+        )
+        authority.secret.assert_awaited_once_with(ACCOUNT)
+
+    @pytest.mark.asyncio
+    async def test_the_policy_is_asked_once_per_connector_and_projects(
+        self, monkeypatch
+    ):
+        authority, policy = self._authority(monkeypatch, allows=True)
+        for key in ("url", "shape", "password"):
+            await authority.connector_secret(
+                {**_own_ref(), "key": key}, _connector(), project_ids=["p-1"]
+            )
+        await authority.connector_secret(_own_ref(), _connector(), project_ids=[])
+        assert policy.await_count == 2
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -876,13 +909,19 @@ class TestNoOtherResourceUsesAConnectorSecret:
         assert refused.value.detail == FOREIGN_CONNECTOR_SECRET_DETAIL
 
     @pytest.mark.asyncio
-    async def test_the_owner_keeps_the_scope_rule_for_its_own(self, monkeypatch):
+    async def test_only_an_edit_keeps_the_scope_rule_for_its_own(self, monkeypatch):
         authority = self._authority()
         monkeypatch.setattr(
             "orchestrator.services.manifest_authority.connector_policy_authorizes",
             AsyncMock(return_value=False),
         )
-        assert await authority.connector_secret(_own_ref(), _connector()) == ACCOUNT
+        with pytest.raises(HTTPException) as refused:
+            await authority.connector_secret(_own_ref(), _connector())
+        assert refused.value.detail == GENERIC_UNAVAILABLE_DETAIL
+        assert (
+            await authority.connector_secret(_own_ref(), _connector(), edit=True)
+            == ACCOUNT
+        )
 
 
 @pytest.mark.asyncio
@@ -891,8 +930,8 @@ async def test_the_policy_check_is_one_classification_of_one_id(monkeypatch):
 
     seen = {}
 
-    async def classify(db, actor, owner, ids, projects, backend):
-        seen.update(owner=owner, ids=ids, projects=projects, backend=backend)
+    async def classify(db, actor, owner, ids, projects, backend, **kwargs):
+        seen.update(owner=owner, ids=ids, projects=projects, backend=backend, **kwargs)
         return [datasource_policy.ItemVerdict(ids[0], False)], {ids[0]: 1}
 
     monkeypatch.setattr(datasource_policy, "classify_datasource_selection", classify)
@@ -904,9 +943,11 @@ async def test_the_policy_check_is_one_classification_of_one_id(monkeypatch):
         "ids": [str(CONNECTOR_ID)],
         "projects": ["p-1"],
         "backend": None,
+        # The override a session's or a job's own selection gets.
+        "allow_admin_explicit_override": True,
     }
 
-    async def unavailable(*_args):
+    async def unavailable(*_args, **_kwargs):
         raise datasource_policy.DatasourceUnavailableError()
 
     monkeypatch.setattr(datasource_policy, "classify_datasource_selection", unavailable)

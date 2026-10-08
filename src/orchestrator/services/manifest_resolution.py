@@ -117,7 +117,8 @@ class LiveManifestResolver:
             self.observe(row)
             if row["kind"] == "Connector" and row.get("linked_id"):
                 # An edit of a datasource's Connector names that Connector's
-                # own secret; the store then refuses the edit itself.
+                # own secret; the store then refuses the edit itself, and the
+                # caller who could write it is let through to that refusal.
                 self.linked_connectors[key] = row
 
     def observe(self, row):
@@ -209,7 +210,9 @@ class LiveManifestResolver:
             )
         }
 
-    async def secret_values(self, values, scope, *, connector=None, project_ids=()):
+    async def secret_values(
+        self, values, scope, *, connector=None, project_ids=(), edit=False
+    ):
         for value in values.values():
             if not isinstance(value, dict) or "secretRef" not in value:
                 continue
@@ -220,7 +223,7 @@ class LiveManifestResolver:
             else:
                 ref["scope"] = deepcopy(ref.get("scope", scope))
                 await self.authority.connector_secret(
-                    ref, connector, project_ids=project_ids
+                    ref, connector, project_ids=project_ids, edit=edit
                 )
             row = await self.store.db.fetchrow(
                 "SELECT id,version,keys FROM srw_resource_secrets WHERE scope_kind=$1 AND scope_name=$2 AND name=$3",
@@ -275,6 +278,7 @@ class LiveManifestResolver:
         project_id=None,
         connector=None,
         project_ids=(),
+        edit=False,
     ):
         if kind == "Expert":
             await self.secret_values(spec["runtime"].get("env", {}), scope)
@@ -284,6 +288,7 @@ class LiveManifestResolver:
                 scope,
                 connector=connector,
                 project_ids=project_ids,
+                edit=edit,
             )
         elif kind == "WorkspaceTemplate":
             if "network" in spec:
@@ -397,6 +402,7 @@ class LiveManifestResolver:
             project_id=project_id,
             connector=self.linked_connectors.get(key),
             project_ids=[scope["name"]] if scope["kind"] == "Project" else [],
+            edit=key in self.linked_connectors,
         )
         result = {
             "document": deepcopy(doc),

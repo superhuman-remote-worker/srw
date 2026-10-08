@@ -613,6 +613,7 @@ async def _connector_secret(db, user, datasource_id, project_ids=(), *, scope=No
 async def test_decision_11_the_connector_policy_lends_its_secret(database):
     db = database
     world = await _shared_connectors(db)
+    admin = await _user(db, "Administrator", admin=True)
     owner_scope = {"kind": "Account", "name": str(world.owner["id"])}
     allowed = [
         (world.owner, "private", ()),
@@ -620,14 +621,19 @@ async def test_decision_11_the_connector_policy_lends_its_secret(database):
         (world.member, "public", ()),
         (world.member, "public", (world.project,)),
         (world.member, "linked", (world.project,)),
+        # An administrator who is not the owner: the override a session's or
+        # a job's own selection gets, so its delivery would carry it too.
+        (admin, "private", ()),
     ]
     for user, label, projects in allowed:
         scope = await _connector_secret(db, user, world.ids[label], projects)
         assert scope == owner_scope, (user["display_name"], label)
 
     refused = [
-        # Not linked to work outside the project.
+        # Not linked to work outside the project, the owner's included: write
+        # access to the secret's scope lends nothing the policy refuses.
         (world.member, "linked", ()),
+        (world.owner, "linked", ()),
         # Never shared.
         (world.member, "private", (world.project,)),
         # Not a member of the linked project.
@@ -638,6 +644,16 @@ async def test_decision_11_the_connector_policy_lends_its_secret(database):
         with pytest.raises(HTTPException) as denied:
             await _connector_secret(db, user, world.ids[label], projects)
         assert denied.value.status_code == 403, (user["display_name"], label)
+
+    # A member removed after the connector was linked loses it.
+    await db.execute(
+        "DELETE FROM project_members WHERE project_id=$1 AND user_id=$2",
+        UUID(world.project),
+        world.member["id"],
+    )
+    with pytest.raises(HTTPException) as removed:
+        await _connector_secret(db, world.member, world.ids["linked"], (world.project,))
+    assert removed.value.status_code == 403
 
     with pytest.raises(HTTPException) as catalog:
         await _connector_secret(
@@ -656,8 +672,15 @@ async def test_a_project_member_resolves_the_projects_knowledge_base(database):
     db = database
     owner = await _user(db, "Owner")
     viewer = await _user(db, "Viewer")
+    editor = await _user(db, "Editor")
     project = await _project(
-        db, "Alpha", {str(owner["id"]): "owner", str(viewer["id"]): "viewer"}
+        db,
+        "Alpha",
+        {
+            str(owner["id"]): "owner",
+            str(viewer["id"]): "viewer",
+            str(editor["id"]): "editor",
+        },
     )
     kb = await _raw_row(
         db,
@@ -680,12 +703,16 @@ async def test_a_project_member_resolves_the_projects_knowledge_base(database):
     assert refs[URL_KEY]["secretRef"]["scope"] == project_scope
     assert list(resolver.secrets.values()) == [1]
 
-    # Work in the viewer's own Account is not work in the project.
-    personal = {"kind": "Account", "name": str(viewer["id"])}
-    resolver = LiveManifestResolver(ManifestStore(db), ManifestAuthority(db, viewer))
-    with pytest.raises(HTTPException) as refused:
-        await resolver.selection("Connector", selection, personal, [])
-    assert refused.value.status_code == 403
+    # Work in a member's own Account is not work in the project, also for an
+    # editor, who could write the project's secrets.
+    for member in (viewer, editor):
+        personal = {"kind": "Account", "name": str(member["id"])}
+        resolver = LiveManifestResolver(
+            ManifestStore(db), ManifestAuthority(db, member)
+        )
+        with pytest.raises(HTTPException) as refused:
+            await resolver.selection("Connector", selection, personal, [])
+        assert refused.value.status_code == 403, member["display_name"]
 
 
 @pytest.mark.asyncio
