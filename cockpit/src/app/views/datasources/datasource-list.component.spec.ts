@@ -1267,13 +1267,23 @@ describe('DatasourceListComponent access levels from the capability matrix', () 
     return created;
   }
 
-  it('offers both levels for a driver that has both, each with what enforces it', () => {
+  it('offers both levels for a driver that has both, and says the flag is only declared', () => {
     const {component} = create('postgresql');
     expect(component.offersReadOnly()).toBe(true);
     expect(component.offersReadWrite()).toBe(true);
-    expect(component.publicAccessLevel()?.enforced_by).toContain('READ ONLY transaction');
+    // A public connector's read-only binds nothing: no "enforced by" claim,
+    // the old advice to scope the credentials instead.
+    expect(component.publicHintKey()).toBe('datasources.form.visibilityCredentialHint');
+    expect('publicAccessLevel' in component).toBe(false);
     component.formData.read_only = false;
-    expect(component.publicAccessLevel()?.id).toBe('ReadWrite');
+    expect(component.publicReadOnly()).toBe(false);
+  });
+
+  it('keeps the credential hint for every driver that is not forced read-only', () => {
+    for (const type of ['generic', 'repository', 'neo4j', 'mongodb', 'webdav', 'mcp', 'kubeconfig', 'ssh_key'] as const) {
+      expect(create(type).component.publicHintKey()).toBe('datasources.form.visibilityCredentialHint');
+    }
+    expect(create('kb').component.publicHintKey()).toBe('datasources.form.visibilityKbHint');
   });
 
   it('hides read-write for a driver forced read-only and saves it read-only', () => {
@@ -1295,25 +1305,49 @@ describe('DatasourceListComponent access levels from the capability matrix', () 
     expect(component.formData.read_only).toBe(true);
     expect(component.publicReadOnly()).toBe(false);
     expect(component.publishConfirmTier()).toBe('name');
-    expect(component.publicAccessLevel()?.tools).toBe('*');
     component.formData.mcpTransport = 'http';
     component.formData.connection_url = 'https://mcp.example.com';
     component.doSave();
     expect(api.createDatasource.mock.calls[0][0].read_only).toBe(false);
   });
 
-  it('marks an advisory read-only level', () => {
-    const {component} = create('generic');
-    expect(component.publicAccessLevel()?.advisory).toBe(true);
+  it('edits a stored public MCP row without the read-write gate, though its flag is fixed up', () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm({
+      ...kbDatasource(),
+      id: 'mcp-1',
+      type: 'mcp',
+      connection_url: 'https://mcp.example.com',
+      config: {},
+      is_global: true,
+      read_only: true,
+    });
+    component.formData.description = 'Only the description changed';
+    expect(component.publishConfirmTier()).toBeNull();
+    component.saveForm();
+    expect(component.showPublishConfirm()).toBe(false);
+    expect(api.updateDatasource.mock.calls[0][1].read_only).toBe(false);
+  });
+
+  it('badges a listed public row by what its driver binds, not a contradicting flag', () => {
+    const {component} = createComponent(false, null, BUILTIN_DRIVERS);
+    const row = (type: Datasource['type'], readOnly: boolean) => ({
+      ...kbDatasource(), type, is_global: true, read_only: readOnly,
+    });
+    expect(component.isPublicReadWrite(row('mcp', true))).toBe(true);
+    expect(component.isPublicReadWrite(row('kb', false))).toBe(false);
+    expect(component.isPublicReadWrite(row('postgresql', true))).toBe(false);
+    expect(component.isPublicReadWrite(row('postgresql', false))).toBe(true);
   });
 
   it('keeps the pre-matrix rule until the matrix loads', () => {
     const kb = create('kb', null).component;
     expect(kb.offersReadWrite()).toBe(false);
-    expect(kb.publicAccessLevel()).toBeNull();
+    expect(kb.publicHintKey()).toBe('datasources.form.visibilityKbHint');
     const mcp = create('mcp', null).component;
     expect(mcp.offersReadOnly()).toBe(true);
     expect(mcp.offersReadWrite()).toBe(true);
+    expect(mcp.isPublicReadWrite({...kbDatasource(), type: 'mcp', read_only: true})).toBe(false);
   });
 });
 

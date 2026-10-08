@@ -785,15 +785,31 @@ describe('ProjectDetailPageComponent link access from the capability matrix', ()
     expect(component.linkAccess({type: 'kb'})).toBe('read_only');
     // An MCP server binds every tool it lists: there is no read-only level.
     expect(component.linkAccess({type: 'mcp'})).toBe('read_write');
-    expect(component.linkAccessHint({type: 'mcp'})).toContain('MCP server');
-    expect(component.linkAccessHint({type: 'kb'})).toContain('never the URL');
+  });
+
+  it('names what enforces the level a link binds, which is where it is true', () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const level = (type: Datasource['type'], readOnly: boolean | null, config?: object) =>
+      component.linkAccessLevel({type, project_read_only: readOnly, config});
+    // A read-only link floors the connector: Postgres's READ ONLY transaction.
+    expect(level('postgresql', true)?.enforced_by).toContain('READ ONLY transaction');
+    expect(level('postgresql', null)?.id).toBe('ReadWrite');
+    expect(level('postgresql', false)?.id).toBe('ReadWrite');
+    expect(level('mcp', null)?.enforced_by).toContain('MCP server');
+    expect(level('kb', null)?.enforced_by).toContain('never the URL');
+    // The read-only of a declared-only driver is advisory, and says so.
+    expect(level('generic', true)?.advisory).toBe(true);
+    // A tiered driver keeps its stored tier, else the driver's default.
+    expect(level('email', true)?.id).toBe('read');
+    expect(level('email', null, {access: 'send'})?.id).toBe('send');
+    expect(level('email', null)?.id).toBe('draft');
   });
 
   it('keeps the KB rule until the matrix loads', () => {
     const {component} = createComponent({drivers: null});
     expect(component.linkAccess({type: 'kb'})).toBe('read_only');
     expect(component.linkAccess({type: 'mcp'})).toBe('choice');
-    expect(component.linkAccessHint({type: 'kb'})).toBe('');
+    expect(component.linkAccessLevel({type: 'kb'})).toBeNull();
   });
 
   it('ignores a read-only change for a link with one level', () => {

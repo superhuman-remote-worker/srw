@@ -38,10 +38,10 @@ import {UserService} from '../../core/services/user.service';
 import {ActivatedRoute, RouterLink} from '@angular/router';
 import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
 import {
-  ConnectorAccessLevel,
   ConnectorDriver,
   OfferedAccess,
   offeredAccess,
+  publicReadWrite,
 } from '../../core/models/connector-driver.model';
 import {GenericConnectorFormComponent} from './connector-forms/generic-connector-form.component';
 import {bespokeFormFor} from './connector-forms/connector-form-registry';
@@ -1363,15 +1363,11 @@ type KeyValueRow = {key: string; value: string};
             }
             @if (capabilities.canPublishDatasources() && formData.type !== 'email' && formData.type !== 'credentials') {
               <div class="form-row">
-                <!-- Full width: the enforced-by line below the choice is a sentence. -->
+                <!-- Full width: the hint below the choice is a sentence. -->
                 <app-form-field
                   class="flex-1"
                   [label]="'datasources.form.visibilityLabel' | transloco"
-                  [hint]="formData.is_global && !publicAccessLevel()
-                    ? ((offersReadWrite()
-                        ? 'datasources.form.visibilityCredentialHint'
-                        : 'datasources.form.visibilityKbHint') | transloco)
-                    : ''"
+                  [hint]="formData.is_global ? (publicHintKey() | transloco) : ''"
                 >
                   <div class="visibility-controls">
                     <label class="visibility-toggle">
@@ -1384,7 +1380,10 @@ type KeyValueRow = {key: string; value: string};
                       {{ 'datasources.form.visibilityPublic' | transloco }}
                     </label>
                     <!-- Only the levels the driver offers (its spec's access
-                         levels and forced_read_only), each with what enforces it. -->
+                         levels and forced_read_only). A public connector's
+                         read-only is declared, never enforced, so no
+                         "enforced by" line here: a project link's read-only
+                         is what the drivers enforce (project-detail). -->
                     @if (formData.is_global) {
                       <div class="access-radio">
                         @if (offersReadOnly()) {
@@ -1406,12 +1405,6 @@ type KeyValueRow = {key: string; value: string};
                           </label>
                         }
                       </div>
-                      @if (publicAccessLevel(); as level) {
-                        <div class="access-enforced" [class.access-advisory]="level.advisory">
-                          <strong>{{ (level.advisory ? 'datasources.form.accessAdvisory' : 'datasources.form.accessEnforcedBy') | transloco }}</strong>
-                          {{ level.enforced_by }}
-                        </div>
-                      }
                     }
                   </div>
                 </app-form-field>
@@ -1580,7 +1573,7 @@ type KeyValueRow = {key: string; value: string};
                         <app-badge class="ds-scope-inline" [tone]="scopeTone(ds)" size="xs">
                           {{ scopeLabelKey(ds) | transloco }}
                         </app-badge>
-                        @if (ds.is_global && ds.read_only === false) {
+                        @if (ds.is_global && isPublicReadWrite(ds)) {
                           <app-badge class="ds-scope-inline" tone="warning" size="xs">
                             {{ 'datasources.table.badgeRw' | transloco }}
                           </app-badge>
@@ -1602,7 +1595,7 @@ type KeyValueRow = {key: string; value: string};
                       <app-badge [tone]="scopeTone(ds)" size="xs">
                         {{ scopeLabelKey(ds) | transloco }}
                       </app-badge>
-                      @if (ds.is_global && ds.read_only === false) {
+                      @if (ds.is_global && isPublicReadWrite(ds)) {
                         <app-badge tone="warning" size="xs">
                           {{ 'datasources.table.badgeRw' | transloco }}
                         </app-badge>
@@ -2138,16 +2131,6 @@ type KeyValueRow = {key: string; value: string};
       .access-radio {
         display: flex;
         gap: 20px;
-      }
-
-      .access-enforced {
-        margin-top: 6px;
-        font-size: 12px;
-        color: var(--text-secondary);
-      }
-
-      .access-enforced.access-advisory {
-        color: var(--warning);
       }
 
       .generic-preview-toggle {
@@ -2715,18 +2698,26 @@ export class DatasourceListComponent implements OnInit {
   }
 
   /** The `read_only` a public connector saves: the user's choice when the
-   *  driver offers both, else the only one it offers. */
+   *  driver offers both, else the only one it offers. The flag is declared:
+   *  only a project link's read-only changes what an execution binds. */
   publicReadOnly(): boolean {
     if (!this.offersReadWrite()) return true;
     if (!this.offersReadOnly()) return false;
     return this.formData.read_only;
   }
 
-  /** The level a public connector binds at, with what enforces it. */
-  publicAccessLevel(): ConnectorAccessLevel | null {
-    const access = this.formAccess();
-    if (!access) return null;
-    return this.publicReadOnly() ? access.readOnly : access.readWrite;
+  /** The hint under a public connector's access: always-read-only drivers
+   *  (the KB) are read-only for everyone; for the rest the flag is only
+   *  declared, so the credentials must be scoped. */
+  publicHintKey(): string {
+    return this.offersReadWrite()
+      ? 'datasources.form.visibilityCredentialHint'
+      : 'datasources.form.visibilityKbHint';
+  }
+
+  /** Whether a listed public connector reads as read-write. */
+  isPublicReadWrite(ds: Datasource): boolean {
+    return publicReadWrite(ds, this.connectorDrivers.forType(ds.type));
   }
 
   hasBespokeForm(): boolean {
@@ -3991,7 +3982,9 @@ export class DatasourceListComponent implements OnInit {
     if (!this.formData.is_global) return null;
     const prev = this.editingId() ? this.editingOriginal : null;
     const wasPublic = prev?.is_global === true;
-    const wasRw = wasPublic && prev?.read_only === false;
+    // A driver with no read-only level (an MCP server) was read-write
+    // whatever its stored flag says; saving the flag to match needs no gate.
+    const wasRw = wasPublic && (prev?.read_only === false || !this.offersReadOnly());
     const isRw = !this.publicReadOnly();
     if (isRw && !wasRw) return 'name';
     if (!wasPublic) return 'warn';

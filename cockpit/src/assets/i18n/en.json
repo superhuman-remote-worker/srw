@@ -1701,6 +1701,8 @@
       "accessReadOnly": "Read-only",
       "accessReadWrite": "Read-write",
       "accessKbReadOnlyHint": "External OKF Knowledge Bases are read-only to agents in this release.",
+      "accessEnforcedBy": "Enforced by:",
+      "accessAdvisory": "Advisory only:",
       "unlink": "Unlink"
     },
     "repos": {
@@ -2829,8 +2831,6 @@
       "visibilityPublic": "Public — visible to all users",
       "accessReadOnly": "Read-only",
       "accessReadWrite": "Read-write",
-      "accessEnforcedBy": "Enforced by:",
-      "accessAdvisory": "Advisory only:",
       "visibilityCredentialHint": "Read-only is declared, not enforced — use read-only credentials (deploy token / restricted DB account).",
       "visibilityKbHint": "Knowledge-base connectors are always read-only; credentials never reach agents.",
       "availabilityTitle": "Availability",

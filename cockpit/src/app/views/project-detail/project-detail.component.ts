@@ -9,7 +9,7 @@ import {effectiveJobStatus} from '../../core/util/job-status';
 import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
-import {offeredAccess} from '../../core/models/connector-driver.model';
+import {ConnectorAccessLevel, offeredAccess} from '../../core/models/connector-driver.model';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
@@ -656,19 +656,21 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                         </td>
                         <td>
                           <!-- Only the levels the connector's driver offers
-                               (capability matrix): one level is shown, not chosen. -->
+                               (capability matrix): one level is shown, not
+                               chosen. A link's read-only is what drivers
+                               enforce, so the bound level's line shows here. -->
                           @switch (linkAccess(ds)) {
                             @case ('read_only') {
                               <app-badge
                                 tone="info"
                                 size="sm"
-                                [title]="linkAccessHint(ds) || ('projectDetail.datasources.accessKbReadOnlyHint' | transloco)"
+                                [title]="linkAccessLevel(ds) ? '' : ('projectDetail.datasources.accessKbReadOnlyHint' | transloco)"
                               >
                                 {{ 'projectDetail.datasources.accessReadOnly' | transloco }}
                               </app-badge>
                             }
                             @case ('read_write') {
-                              <app-badge tone="neutral" size="sm" [title]="linkAccessHint(ds)">
+                              <app-badge tone="neutral" size="sm">
                                 {{ 'projectDetail.datasources.accessReadWrite' | transloco }}
                               </app-badge>
                             }
@@ -683,6 +685,12 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                                 <option value="false">{{ 'projectDetail.datasources.accessReadWrite' | transloco }}</option>
                               </app-select>
                             }
+                          }
+                          @if (linkAccessLevel(ds); as level) {
+                            <div class="link-enforced" [class.link-advisory]="level.advisory" [attr.data-level]="level.id">
+                              <strong>{{ (level.advisory ? 'projectDetail.datasources.accessAdvisory' : 'projectDetail.datasources.accessEnforcedBy') | transloco }}</strong>
+                              {{ level.enforced_by }}
+                            </div>
                           }
                         </td>
                         <td>
@@ -1518,6 +1526,17 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .role-jobs { background: var(--accent-color); color: var(--app-bg); }
     .role-source { background: var(--success-tint); color: var(--success); }
     .role-reference { background: var(--warning-tint); color: var(--warning); }
+
+    /* What a connector link's access level is enforced by (capability matrix). */
+    .link-enforced {
+      max-width: 36ch;
+      margin-top: 4px;
+      font-size: 11px;
+      line-height: 1.35;
+      color: var(--text-muted);
+    }
+
+    .link-enforced.link-advisory { color: var(--warning); }
 
     /* Inline form */
     .inline-form {
@@ -2528,10 +2547,25 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     return access.readOnly ? 'read_only' : 'choice';
   }
 
-  /** What enforces a fixed level, from the driver's spec. */
-  linkAccessHint(ds: Pick<Datasource, 'type'>): string {
-    const access = offeredAccess(this.connectorDrivers.forType(ds.type));
-    return (access?.readOnly ?? access?.readWrite)?.enforced_by ?? '';
+  /** The level a link binds the connector at, with what enforces it; null
+   *  until the matrix loads. A read-only link floors the connector at its
+   *  lowest level. Otherwise it keeps its own: the top one for a
+   *  read/read-write driver, or, for a tiered one (email), the tier its
+   *  config stores, else the driver's default. */
+  linkAccessLevel(
+    ds: Pick<Datasource, 'type' | 'config'> & {project_read_only?: boolean | null},
+  ): ConnectorAccessLevel | null {
+    const driver = this.connectorDrivers.forType(ds.type);
+    const access = offeredAccess(driver);
+    if (!driver || !access) return null;
+    if (access.readOnly && (!access.readWrite || ds.project_read_only === true)) {
+      return access.readOnly;
+    }
+    if (driver.access_levels.length > 2) {
+      const own = (ds.config as {access?: unknown} | undefined)?.access ?? driver.default_access;
+      return driver.access_levels.find((level) => level.id === own) ?? access.readWrite;
+    }
+    return access.readWrite;
   }
 
   updateDatasourceReadOnly(datasourceId: string, value: string): void {

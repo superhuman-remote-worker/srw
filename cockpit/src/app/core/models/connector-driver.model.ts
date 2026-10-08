@@ -138,13 +138,16 @@ export interface ConnectorDriverMatrix {
 }
 
 /**
- * The choices of today's read-only switch (a public connector's access, a
- * project link's access) that a driver offers, each with the level it binds.
+ * The choices of the read-only switch that a driver offers, each with the
+ * level it stands for.
  *
- * Read-only floors the connector at its lowest level, so it is offered only
- * when a lower level exists to floor to; read-write leaves the connector at
- * its own level, so a driver that is forced read-only has none. A driver
- * with no access levels (env and file delivery) offers neither.
+ * On a project link the switch is real: a read-only link floors the
+ * connector at its lowest level (the level's `enforced_by` says how), so
+ * read-only is offered only when a lower level exists to floor to, and
+ * read-write leaves the connector at its own level, so a driver forced
+ * read-only has none. A public connector's read-only flag is only declared:
+ * nothing binds by it, so its levels' `enforced_by` lines never describe it.
+ * A driver with no access levels (env and file delivery) offers neither.
  */
 export interface OfferedAccess {
   readOnly: ConnectorAccessLevel | null;
@@ -159,6 +162,22 @@ export function offeredAccess(driver: ConnectorDriver | null | undefined): Offer
   if (driver.forced_read_only) return {readOnly: lowest, readWrite: null};
   if (levels.length === 1) return {readOnly: null, readWrite: lowest};
   return {readOnly: lowest, readWrite: levels[levels.length - 1]};
+}
+
+/**
+ * Whether a public connector reads as read-write: its declared flag, unless
+ * its driver offers one level only — an MCP server binds every tool it lists
+ * whatever the flag says, and a KB is read-only whatever it says. Rows
+ * stored before the matrix keep their flag; nothing is migrated.
+ */
+export function publicReadWrite(
+  row: {read_only?: boolean | null},
+  driver: ConnectorDriver | null | undefined,
+): boolean {
+  const access = offeredAccess(driver);
+  if (access?.readWrite && !access.readOnly) return true;
+  if (access?.readOnly && !access.readWrite) return false;
+  return row.read_only === false;
 }
 
 /** The installed driver serving a stored connector type. */

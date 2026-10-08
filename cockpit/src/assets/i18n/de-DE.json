@@ -1701,6 +1701,8 @@
       "accessReadOnly": "Nur lesen",
       "accessReadWrite": "Lesen/Schreiben",
       "accessKbReadOnlyHint": "Externe OKF Knowledge Bases sind in dieser Version für Agenten schreibgeschützt.",
+      "accessEnforcedBy": "Durchgesetzt durch:",
+      "accessAdvisory": "Nur ein Hinweis:",
       "unlink": "Trennen"
     },
     "repos": {
@@ -2829,8 +2831,6 @@
       "visibilityPublic": "Öffentlich — für alle Benutzer sichtbar",
       "accessReadOnly": "Nur Lesen",
       "accessReadWrite": "Lesen & Schreiben",
-      "accessEnforcedBy": "Durchgesetzt durch:",
-      "accessAdvisory": "Nur ein Hinweis:",
       "visibilityCredentialHint": "Nur-Lesen ist deklariert, nicht erzwungen — verwenden Sie Nur-Lese-Zugangsdaten (Deploy-Token / eingeschränktes DB-Konto).",
       "visibilityKbHint": "Wissensdatenbank-Konnektoren sind immer schreibgeschützt; Zugangsdaten erreichen die Agenten nie.",
       "availabilityTitle": "Verfügbarkeit",

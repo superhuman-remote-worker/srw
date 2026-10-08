@@ -1,5 +1,11 @@
 import {describe, expect, it} from 'vitest';
-import {ConnectorDriver, ConnectorDriverMatrix, driverForType, offeredAccess} from './connector-driver.model';
+import {
+  ConnectorDriver,
+  ConnectorDriverMatrix,
+  driverForType,
+  offeredAccess,
+  publicReadWrite,
+} from './connector-driver.model';
 // The API's own response for the built-in drivers
 // (tests/test_connector_capability_matrix.py pins it).
 import fixture from './fixtures/connector-drivers.json';
@@ -47,6 +53,24 @@ describe('offeredAccess', () => {
     for (const name of ['srw.generic/v1', 'srw.credentials/v1', 'srw.ssh-key/v1', 'srw.repository/v1']) {
       expect(offeredAccess(byName(name))!.readOnly!.advisory).toBe(true);
     }
+  });
+});
+
+describe('publicReadWrite', () => {
+  it("follows a public connector's declared flag when the driver has both levels", () => {
+    const postgres = byName('srw.postgresql/v1');
+    expect(publicReadWrite({read_only: false}, postgres)).toBe(true);
+    expect(publicReadWrite({read_only: true}, postgres)).toBe(false);
+  });
+
+  it("shows a one-level driver's only level, whatever the stored flag says", () => {
+    expect(publicReadWrite({read_only: true}, byName('srw.mcp/v1'))).toBe(true);
+    expect(publicReadWrite({read_only: false}, byName('srw.kb/v1'))).toBe(false);
+  });
+
+  it('reads the stored flag without a driver', () => {
+    expect(publicReadWrite({read_only: false}, null)).toBe(true);
+    expect(publicReadWrite({read_only: null}, null)).toBe(false);
   });
 });
 

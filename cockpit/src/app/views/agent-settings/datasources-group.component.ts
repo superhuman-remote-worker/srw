@@ -3,6 +3,8 @@ import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {ApiService} from '../../core/services/api.service';
+import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
+import {publicReadWrite} from '../../core/models/connector-driver.model';
 import {
   Datasource,
   DatasourceIndexStatus,
@@ -229,8 +231,8 @@ export function allDatasourcesSelected(
                 {{ (ds.unavailable ? 'agentSettings.datasources.unavailableBadge' : 'datasources.filter.' + ds.type) | transloco }}
               </span>
               @if (ds.is_global) {
-                <span class="ds-type-badge" [class.ds-rw-badge]="ds.read_only === false">
-                  {{ (ds.read_only === false
+                <span class="ds-type-badge" [class.ds-rw-badge]="isPublicReadWrite(ds)">
+                  {{ (isPublicReadWrite(ds)
                     ? 'datasources.table.badgeRw'
                     : 'datasources.table.badgeRo') | transloco }}
                 </span>
@@ -504,6 +506,8 @@ export function allDatasourcesSelected(
 export class DatasourcesGroupComponent {
   // Optional so the picker still renders in bare unit tests without an injector.
   private readonly api = inject(ApiService, {optional: true});
+  // The capability matrix, for the access badge of public connectors only.
+  private readonly connectorDrivers = inject(ConnectorDriversService, {optional: true});
 
   datasources = input<Datasource[]>([]);
   loading = input(false);
@@ -568,6 +572,16 @@ export class DatasourcesGroupComponent {
         if (ds.type === 'kb') this.loadIndexStatus(ds.id);
       }
     });
+    // Only a public row's badge needs the matrix; read it once, when one shows.
+    effect(() => {
+      if (this.datasources().some((ds) => ds.is_global)) this.connectorDrivers?.load();
+    });
+  }
+
+  /** A public row's badge: its declared flag, unless its driver offers one
+   *  level only (an MCP server binds every tool it lists). */
+  isPublicReadWrite(ds: Datasource): boolean {
+    return publicReadWrite(ds, this.connectorDrivers?.forType(ds.type));
   }
 
   readonly modifiedCount = computed(() =>
