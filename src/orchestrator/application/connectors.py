@@ -229,6 +229,7 @@ def connector_service_reconciler_builder(
     client (again only if the provisioner replaced its core API).
     """
     cached: dict[str, Any] = {}
+    strikes: dict[str, int] = {}
 
     def build() -> ServiceHostingReconciler | None:
         from kubernetes.client import NetworkingV1Api
@@ -255,6 +256,7 @@ def connector_service_reconciler_builder(
             ),
             drivers=resources.connector_drivers,
             settings=hosting,
+            strikes=strikes,
         )
 
     return build

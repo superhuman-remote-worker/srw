@@ -98,6 +98,8 @@ POD_LOST = "pod_lost"
 NOT_READY = "not_ready"
 HOSTING_REFUSED = "hosting_refused"
 HOSTING_DISABLED = "hosting_disabled"
+#: Passes in a row the cluster check must fail before every pod stops.
+CLUSTER_STRIKES = 2
 EGRESS_WITHDRAWN = "egress_withdrawn"
 #: Stops that back the key off before the next start.
 _BACKOFF_REASONS = (LAUNCH_REFUSED, LAUNCH_FAILED, START_TIMEOUT, CAPACITY)
@@ -281,6 +283,23 @@ class ServicePodRuntime:
                 except Exception:
                     logger.debug("owner reference patch failed", exc_info=True)
         return str(uid) if uid else None
+
+    async def service_cluster_ip(self, name: str, namespace: str) -> str:
+        """A Service's ClusterIP as the API reports it (no DNS involved)."""
+        try:
+            service = await run_bounded_k8s_call(
+                self.core_api.read_namespaced_service, name=name, namespace=namespace
+            )
+        except Exception:
+            raise ServiceRuntimeError(
+                f"reading the Service {namespace}/{name} failed"
+            ) from None
+        address = _field(_field(service, "spec"), "clusterIP")
+        if not address or address == "None":
+            raise ServiceRuntimeError(
+                f"the Service {namespace}/{name} has no ClusterIP"
+            )
+        return str(address)
 
     async def observe(self, identity: ServicePodIdentity) -> PodState:
         try:
@@ -695,6 +714,7 @@ class ServiceHostingReconciler:
         settings: ServiceHostingSettings,
         resolver: Callable[[str, bool], Any] = system_resolver,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        strikes: dict[str, int] | None = None,
     ) -> None:
         self.store = store
         self.runtime = runtime
@@ -702,6 +722,9 @@ class ServiceHostingReconciler:
         self.settings = settings
         self.resolver = resolver
         self.clock = clock
+        #: Passes in a row the cluster check failed; shared across the
+        #: per-pass reconcilers of one loop.
+        self.strikes = strikes if strikes is not None else {}
 
     def _service_specs(self) -> dict[str, DriverSpec]:
         return {
@@ -711,19 +734,19 @@ class ServiceHostingReconciler:
         }
 
     async def _exchange_address(self) -> str:
+        """The exchange Service's ClusterIP, read from the API: a relative
+        name through the resolver's search path could answer otherwise."""
+        name, _, rest = self.settings.exchange_host.partition(".")
+        namespace = rest.split(".", 1)[0] or self.settings.release_namespace
         try:
-            answers = await self.resolver(self.settings.exchange_host, False)
-        except OSError as exc:
+            address = await self.runtime.service_cluster_ip(name, namespace)
+        except ServiceRuntimeError as exc:
+            raise ServiceLaunchError(str(exc)) from None
+        if ":" in address:
             raise ServiceLaunchError(
-                f"the lease exchange host {self.settings.exchange_host} does not "
-                f"resolve ({exc})"
-            ) from exc
-        for answer in answers:
-            if ":" not in answer:
-                return answer
-        raise ServiceLaunchError(
-            f"the lease exchange host {self.settings.exchange_host} does not resolve"
-        )
+                f"the lease exchange Service {namespace}/{name} has no IPv4 ClusterIP"
+            )
+        return address
 
     async def _bindings(self, conn: Any, names: Iterable[str]) -> dict:
         grouped: dict[tuple[str, str], _Binding] = {}
@@ -1078,7 +1101,20 @@ class ServiceHostingReconciler:
             logger.warning("Driver pods not started this pass: %s", exc)
         else:
             problem = self.settings.cluster_problem(exchange)
-            if problem is not None:
+            if problem is None:
+                self.strikes.pop("cluster", None)
+            else:
+                strikes = self.strikes["cluster"] = self.strikes.get("cluster", 0) + 1
+                report.refused.append(("installation", problem))
+                if strikes < CLUSTER_STRIKES:
+                    # One bad pass may be a moment's misreading: start
+                    # nothing, stop nothing yet.
+                    logger.warning(
+                        "Service-pod hosting check failed (%s); no driver pod "
+                        "starts, and every one stops if it fails again",
+                        problem,
+                    )
+                    return report
                 logger.error(
                     "Service-pod hosting refused: %s. Every driver pod is "
                     "stopped and none starts.",
@@ -1086,7 +1122,6 @@ class ServiceHostingReconciler:
                 )
                 for row in live:
                     await self._stop(row, HOSTING_REFUSED, report)
-                report.refused.append(("installation", problem))
                 report.swept = await self._sweep()
                 return report
 

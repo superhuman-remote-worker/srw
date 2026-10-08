@@ -236,6 +236,24 @@ async def test_observe_reads_a_terminal_phase_and_when_the_pod_turned_unready(
 
 
 @pytest.mark.asyncio
+async def test_the_exchange_cluster_ip_comes_from_the_api(api, runtime):
+    """No DNS: the Service object says where the exchange is."""
+    api.objects[("service", "srw-orchestrator")] = {
+        "metadata": {"name": "srw-orchestrator"},
+        "spec": {"clusterIP": "10.43.0.20"},
+    }
+    assert await runtime.service_cluster_ip("srw-orchestrator", "srw") == "10.43.0.20"
+    name, kwargs = api.calls[-1]
+    assert name == "read_namespaced_service"
+    assert kwargs == {"name": "srw-orchestrator", "namespace": "srw"}
+    api.objects[("service", "srw-orchestrator")]["spec"]["clusterIP"] = "None"
+    with pytest.raises(hosting.ServiceRuntimeError, match="no ClusterIP"):
+        await runtime.service_cluster_ip("srw-orchestrator", "srw")
+    with pytest.raises(hosting.ServiceRuntimeError):
+        await runtime.service_cluster_ip("absent", "srw")
+
+
+@pytest.mark.asyncio
 async def test_observe_reads_why_an_init_container_last_failed(api, runtime):
     """The canary wait's verdict (its last log line, the termination
     message with FallbackToLogsOnError) is what the pod is stopped with."""

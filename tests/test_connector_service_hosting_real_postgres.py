@@ -32,6 +32,7 @@ from orchestrator.services.connector_lease_exchange import (
     DenialLimiter,
 )
 from orchestrator.services.connector_service_hosting import (
+    ServiceRuntimeError,
     PodState,
     ServiceHostingReconciler,
     ServiceHostingSettings,
@@ -706,7 +707,13 @@ class FakeRuntime:
         self.removed: list[str] = []
         self.binding_policies: dict[str, set[str]] = {}
         self.objects: list[tuple[object, str, str]] = []
+        self.cluster_ips = {("srw-orchestrator", "srw"): "10.43.0.20"}
         self.deleted: list[str] = []
+
+    async def service_cluster_ip(self, name, namespace):
+        if (name, namespace) not in self.cluster_ips:
+            raise ServiceRuntimeError(f"reading the Service {namespace}/{name} failed")
+        return self.cluster_ips[(name, namespace)]
 
     async def launch(self, plan):
         identity = plan.identity.identity_id
@@ -1125,6 +1132,11 @@ async def test_a_cluster_with_other_ranges_refuses_to_host(db, reconciler):
     reconciler.settings = dataclasses.replace(
         reconciler.settings, cluster_cidrs=("10.96.0.0/12", "10.244.0.0/16")
     )
+    # One bad pass may be a misreading: nothing starts, nothing stops yet.
+    report = await reconciler.reconcile_once()
+    assert report.stopped == [] and report.started == []
+    assert report.refused[0][0] == "installation"
+    # The second in a row stops every pod.
     report = await reconciler.reconcile_once()
     assert report.stopped == [(str(pod["id"]), "hosting_refused")]
     assert report.refused[0][0] == "installation"
@@ -1136,6 +1148,21 @@ async def test_a_cluster_with_other_ranges_refuses_to_host(db, reconciler):
     report = await reconciler.reconcile_once()
     assert report.started == []
     assert len(await _pods(db)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_good_pass_between_two_bad_ones_resets_the_count(db, reconciler):
+    connector = await _echo_connector(db)
+    await _echo_image(db)
+    await _bind_echo(db, connector, await _thread(db))
+    await reconciler.reconcile_once()
+    (pod,) = await _pods(db)
+    reconciler.fake.ready(str(pod["id"]))
+    good = reconciler.settings
+    bad = dataclasses.replace(good, cluster_cidrs=("10.96.0.0/12",))
+    for settings in (bad, good, bad):
+        reconciler.settings = settings
+        assert (await reconciler.reconcile_once()).stopped == []
 
 
 @pytest.mark.asyncio
@@ -1171,16 +1198,12 @@ async def test_an_unknown_pod_or_an_exchange_outside_refuses_to_host(
     db, reconciler, pod_ip, addresses, fragment
 ):
     reconciler.settings = dataclasses.replace(reconciler.settings, pod_ip=pod_ip)
-    saved = ADDRESSES["srw-orchestrator.srw.svc"]
     if addresses is not None:
-        ADDRESSES["srw-orchestrator.srw.svc"] = addresses
-    try:
-        connector = await _echo_connector(db)
-        await _echo_image(db)
-        await _bind_echo(db, connector, await _thread(db))
-        report = await reconciler.reconcile_once()
-    finally:
-        ADDRESSES["srw-orchestrator.srw.svc"] = saved
+        reconciler.fake.cluster_ips[("srw-orchestrator", "srw")] = addresses[0]
+    connector = await _echo_connector(db)
+    await _echo_image(db)
+    await _bind_echo(db, connector, await _thread(db))
+    report = await reconciler.reconcile_once()
     assert report.started == []
     assert fragment in report.refused[0][1]
     assert await _pods(db) == []
@@ -1190,19 +1213,20 @@ async def test_an_unknown_pod_or_an_exchange_outside_refuses_to_host(
 async def test_an_unresolvable_exchange_starts_nothing_and_stops_nothing(
     db, reconciler
 ):
-    """A resolver blip is not a misconfiguration: live pods keep serving."""
+    """An API blip reading the exchange Service is not a misconfiguration:
+    live pods keep serving."""
     connector = await _echo_connector(db)
     await _echo_image(db)
     await _bind_echo(db, connector, await _thread(db))
     await reconciler.reconcile_once()
     (pod,) = await _pods(db)
     reconciler.fake.ready(str(pod["id"]))
-    saved = ADDRESSES.pop("srw-orchestrator.srw.svc")
+    saved = reconciler.fake.cluster_ips.pop(("srw-orchestrator", "srw"))
     try:
         await _bind_echo(db, await _echo_connector(db), await _thread(db))
         report = await reconciler.reconcile_once()
     finally:
-        ADDRESSES["srw-orchestrator.srw.svc"] = saved
+        reconciler.fake.cluster_ips[("srw-orchestrator", "srw")] = saved
     assert report.started == [] and report.stopped == []
     live = [row for row in await _pods(db) if row["revoked_at"] is None]
     assert [str(row["id"]) for row in live] == [str(pod["id"])]
