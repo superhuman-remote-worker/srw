@@ -207,7 +207,13 @@ func (p *prober) run(ctx context.Context) (string, int, error) {
 func (p *prober) call(ctx context.Context, method string, message any, session string) (map[string]json.RawMessage, string, error) {
 	var body io.Reader = http.NoBody
 	if message != nil {
-		body = bytes.NewReader(marshal(message))
+		// In the form the front forwards every message (the stdio bridge
+		// accepts no other), not encoding/json's sorted keys.
+		raw := marshal(message)
+		if _, forwarded, err := parseMessage(raw); err == nil {
+			raw = forwarded
+		}
+		body = bytes.NewReader(raw)
 	}
 	request, err := http.NewRequestWithContext(ctx, method, p.cfg.upstream.String(), body)
 	if err != nil {

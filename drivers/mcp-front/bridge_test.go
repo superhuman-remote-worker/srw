@@ -257,6 +257,22 @@ func TestAStdioServersReadinessIsProbedInTheBackground(t *testing.T) {
 	if initialize.Header.Get(bridgeBindingHeader) != "" || initialize.Header.Get(bridgeCredentialHeader) != "" {
 		t.Fatal("the probe named a binding or carried a credential")
 	}
+	// Its messages are in the form the front forwards (the bridge accepts
+	// no other).
+	h.server.mu.Lock()
+	sent := append([]string(nil), h.server.bodies...)
+	h.server.mu.Unlock()
+	for _, body := range sent {
+		if body == "" {
+			continue
+		}
+		if _, forwarded, err := parseMessage([]byte(body)); err != nil || string(forwarded) != body {
+			t.Fatalf("the probe sent %s", body)
+		}
+	}
+	if !strings.HasPrefix(sent[0], `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{`) {
+		t.Fatalf("initialize: %s", sent[0])
+	}
 	probes := h.server.count()
 	if code := ready(); code != http.StatusOK {
 		t.Fatalf("after a probe: %d", code)
