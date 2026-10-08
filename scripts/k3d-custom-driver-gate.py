@@ -2221,13 +2221,14 @@ class CustomDriverGate:
         return dispatched_at(logs, job, self.args.job_lane) if rc == 0 else None
 
     def answered(self, thread: str) -> bool:
-        """Whether the session answered a turn (an assistant message)."""
+        """Whether the session answered a turn (a message SRW stores with
+        role ``ai``)."""
         try:
             wait_for(
                 f"session {thread} answers",
                 lambda: sql(
                     "SELECT count(*) FROM thread_messages WHERE thread_id = "
-                    f"{lit(thread)} AND role = 'assistant'"
+                    f"{lit(thread)} AND role = 'ai'"
                 )
                 not in ("", "0"),
                 timeout=self.args.turn_timeout,
