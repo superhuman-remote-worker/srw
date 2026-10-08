@@ -70,7 +70,12 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
   cockpit    Playwright logs in as the test account, presses Test on a
              kubeconfig row and finds the neutral ``unsupported`` result
   cleanup    nothing this run created is left (rows, pods, Gitea
-             repositories and token, Nextcloud user, database and role)
+             repositories and token, Nextcloud user, database and role),
+             including any session titled with the gate id whose create
+             timed out before its id came back
+
+Every program the gate runs in a pod caps its own memory (cap_memory, as in
+the C0 and C1 gates), and the live WebSocket reader bounds its frames.
 
 Neo4j is not deployed on k3d (the gate checks and says so); its read-only
 enforcement is covered by tests/test_neo4j_read_access.py against a real
@@ -319,8 +324,40 @@ def wait_for(
 # Programs run inside the orchestrator container (stdin carries every secret)
 # ---------------------------------------------------------------------------
 
-_API_PROGRAM = r"""
+# Every program the gate runs inside a pod starts with this and calls
+# cap_memory() once its imports are done. The orchestrator pod has a 1 GiB
+# limit and serves the product meanwhile: a gate program that grows must
+# fail the gate with a MemoryError, never take the pod to the OOM killer.
+# RLIMIT_DATA counts heap, anonymous maps and thread stacks, not the shared
+# libraries mapped in, so the budget is what the program adds after import.
+# (The same helper as scripts/k3d-ssh-agent-connectors-gate.py.)
+POD_MEMORY_BUDGET = 256 << 20
+_POD_MEMORY_CAP = (
+    r"""
+import resource as _srw_resource
+def cap_memory(budget=%d):
+    with open("/proc/self/status") as status:
+        data = next(
+            int(line.split()[1]) * 1024
+            for line in status
+            if line.startswith("VmData:")
+        )
+    limit = data + budget
+    _soft, hard = _srw_resource.getrlimit(_srw_resource.RLIMIT_DATA)
+    if hard != _srw_resource.RLIM_INFINITY:
+        limit = min(limit, hard)  # an inherited cap is only ever tightened
+    _srw_resource.setrlimit(_srw_resource.RLIMIT_DATA, (limit, limit))
+"""
+    % POD_MEMORY_BUDGET
+)
+#: The largest WebSocket frame the live-update reader accepts.
+WS_MAX_FRAME = 8 << 20
+
+_API_PROGRAM = (
+    _POD_MEMORY_CAP
+    + r"""
 import json, sys, urllib.error, urllib.parse, urllib.request
+cap_memory()
 envelope = json.loads(sys.stdin.readline())
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 form = urllib.parse.urlencode({
@@ -343,10 +380,14 @@ except urllib.error.HTTPError as error:
     status, text = error.code, error.read().decode("utf-8", "replace")
 print(json.dumps({"status": status, "body": text}))
 """
+)
 
-_GITEA_PROGRAM = r"""
+_GITEA_PROGRAM = (
+    _POD_MEMORY_CAP
+    + r"""
 import asyncio, json, sys
 from orchestrator.services.gitea import GiteaClient
+cap_memory()
 request = json.loads(sys.stdin.readline())
 async def main():
     client = GiteaClient()
@@ -411,15 +452,23 @@ async def main():
     print(json.dumps(out))
 asyncio.run(main())
 """
+)
 
 # A cockpit-like WebSocket on a pinned session's agent pod sends one live
 # ``config.update`` (the settings pane's frame) and prints the answer with the
 # same request id: ``config.changed`` or ``error``. Names only come back.
-_LIVE_UPDATE_PROGRAM = r"""
-import asyncio, json, sys, urllib.parse, urllib.request
+_LIVE_UPDATE_PROGRAM = (
+    _POD_MEMORY_CAP
+    + r"""
+import asyncio, json, sys, urllib.error, urllib.parse, urllib.request
 import websockets
+cap_memory()
 r = json.loads(sys.stdin.readline())
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# A session still attaching answers /connection with 409 or 425, or closes
+# the socket with 4500 or 4503: the gate retries those, nothing else.
+RETRY_STATUS = (409, 425)
+RETRY_CLOSE = (4500, 4503)
 def session_token():
     form = urllib.parse.urlencode({
         "grant_type": "password", "client_id": "admin-cli", "scope": "openid",
@@ -433,11 +482,20 @@ def session_token():
     )
     with opener.open(request, timeout=60) as response:
         return json.load(response)["token"]
-async def main():
-    token = await asyncio.to_thread(session_token)
+def retry(reason):
+    print(json.dumps({"outcome": "retry", "reason": reason}))
+async def update():
+    try:
+        token = await asyncio.to_thread(session_token)
+    except urllib.error.HTTPError as error:
+        if error.code in RETRY_STATUS:
+            return retry("connection %d" % error.code)
+        raise
     url = "ws://%s:%d/p/%s/ws?t=%s" % (r["ip"], r["port"], r["thread"], token)
     loop = asyncio.get_running_loop()
-    async with websockets.connect(url, max_size=None, open_timeout=30) as ws:
+    async with websockets.connect(
+        url, max_size=r["max_size"], open_timeout=30
+    ) as ws:
         await ws.send(json.dumps({
             "method": "config.update", "config": {},
             "datasource_ids": r["datasource_ids"], "request_id": r["request_id"],
@@ -469,11 +527,32 @@ async def main():
                     "detail": params.get("detail"),
                 }))
                 return
+async def main():
+    try:
+        await update()
+    except websockets.exceptions.ConnectionClosed as error:
+        received = getattr(error, "rcvd", None)
+        code = getattr(received, "code", None) or getattr(error, "code", None)
+        if code in RETRY_CLOSE:
+            return retry("closed %s" % code)
+        raise
+    except websockets.exceptions.InvalidHandshake as error:
+        response = getattr(error, "response", None)
+        status = getattr(error, "status_code", None) or getattr(
+            response, "status_code", None
+        )
+        if status in RETRY_STATUS or status == 503:
+            return retry("handshake %s" % status)
+        raise
 asyncio.run(main())
 """
+)
 
-_DAV_PROGRAM = r"""
+_DAV_PROGRAM = (
+    _POD_MEMORY_CAP
+    + r"""
 import base64, json, sys, urllib.error, urllib.request
+cap_memory()
 r = json.loads(sys.stdin.readline())
 auth = base64.b64encode(f"{r['user']}:{r['password']}".encode()).decode()
 body = r.get("body")
@@ -489,11 +568,14 @@ except urllib.error.HTTPError as error:
     status = error.code
 print(json.dumps({"status": status}))
 """
+)
 
 # The deployed payload builder over a job's or a session's exactly resolved
 # connectors, with the deployment's own gates. It prints types, names and
 # tool lists only: the resolved rows carry decrypted credentials.
-_PAYLOAD_PROGRAM = r"""
+_PAYLOAD_PROGRAM = (
+    _POD_MEMORY_CAP
+    + r"""
 import asyncio, json, sys
 from types import SimpleNamespace
 from orchestrator.application.preparation import datasource_payload_dependencies
@@ -504,6 +586,7 @@ from orchestrator.services.agent_datasource_payload import (
     build_datasource_tool_override, build_datasources_payload,
 )
 from orchestrator.services.connector_drivers.registry import builtin_connector_drivers
+cap_memory()
 request = json.loads(sys.stdin.readline())
 async def main():
     db = PostgresDB(
@@ -540,10 +623,14 @@ async def main():
     }))
 asyncio.run(main())
 """
+)
 
-_HASH_PROGRAM = r"""
+_HASH_PROGRAM = (
+    _POD_MEMORY_CAP
+    + r"""
 import hashlib, json, sys
 from pathlib import Path
+cap_memory()
 root = Path(sys.argv[1])
 request = json.loads(sys.stdin.read())
 expected = request["files"]
@@ -565,6 +652,7 @@ missing = sorted(
 )
 print(json.dumps({"stale": stale, "extra": extra, "missing_text": missing}))
 """
+)
 
 
 def in_orchestrator(
@@ -729,9 +817,9 @@ PLAN = [
     "(--skip-live skips it)",
     "cockpit: Playwright presses Test on a kubeconfig row; result is unsupported",
     "notes: Neo4j not deployed on k3d (covered by the real-container test)",
-    "cleanup: end + delete session, cancel + delete job, delete connectors, "
-    "project, Gitea repos + token, Nextcloud user, database + role; residue "
-    "check",
+    "cleanup: end + delete sessions (also any titled with the gate id), "
+    "cancel + delete job, delete connectors, project, Gitea repos + token, "
+    "Nextcloud user, database + role; residue check",
 ]
 
 # Attached live to the pinned session, then detached: env, managed, SSH.
@@ -1810,9 +1898,32 @@ class ConnectorDriversGate:
             return []
         return [line for line in out.splitlines() if any(n in line for n in needles)]
 
+    def session_ready(self) -> bool:
+        """Whether /connection admits the live session (409/425: attaching)."""
+        status, body = self.api.call(
+            "GET", f"/api/sessions/{self.live_thread}/connection"
+        )
+        if status == 200:
+            return True
+        if status in (409, 425):
+            return False
+        raise GateError(f"/connection answered HTTP {status}: {str(body)[:200]}")
+
     def live_update(self, datasource_ids: list[str], label: str) -> dict:
-        """One live ``config.update``; retried while the session still attaches."""
+        """One live ``config.update``; retried while the session still attaches.
+
+        The agent writes the workspace facts before the thread is marked
+        active, so /connection is polled until it admits the session, and an
+        attempt that still meets 409/425, a 4500/4503 close or "No active
+        session" is retried.
+        """
         request_id = f"{self.gate_id}-{label}"
+        wait_for(
+            "live session admitted by /connection",
+            self.session_ready,
+            timeout=self.args.turn_timeout,
+            interval=5,
+        )
 
         def attempt() -> dict | None:
             result = in_orchestrator(
@@ -1827,9 +1938,13 @@ class ConnectorDriversGate:
                     "datasource_ids": datasource_ids,
                     "request_id": request_id,
                     "timeout": self.args.turn_timeout,
+                    "max_size": WS_MAX_FRAME,
                 },
                 timeout=self.args.turn_timeout + 90,
             )
+            if result.get("outcome") == "retry":
+                print(f"live {label}: retrying ({result.get('reason')})", flush=True)
+                return None
             if result.get("outcome") == "error" and "No active session" in str(
                 result.get("message")
             ):
@@ -1849,24 +1964,37 @@ class ConnectorDriversGate:
         return self.workspace_pod(f"app=srw-workspace,srw/thread-id={self.live_thread}")
 
     def held_fingerprints(self, pod: str) -> set[str]:
-        """Fingerprints every connector ssh-agent socket in the workspace holds."""
+        """Fingerprints every connector ssh-agent socket in the workspace holds.
+
+        The script always exits 0, so a failed exec raises instead of reading
+        as "no key held".
+        """
         _rc, listing = self.ws(
             pod,
             'for socket in ~/.ssh/srw-managed/sockets/*.sock; do test -S "$socket" '
             '|| continue; SSH_AUTH_SOCK="$socket" ssh-add -l 2>/dev/null | '
-            "awk 'NF { print $2 }'; done\n",
-            check=False,
+            "awk 'NF { print $2 }'; done\nexit 0\n",
         )
         return set(listing.split())
 
-    def live_fetches(self, pod: str) -> bool:
-        rc, _out = self.ws(
+    def live_checkout(self, pod: str) -> tuple[bool, bool]:
+        """``(cloned, fetches)`` for the live repository's checkout.
+
+        One script that always exits 0 and prints both answers, so a missing
+        clone or a failed exec never reads as "no longer fetches".
+        """
+        _rc, out = self.ws(
             pod,
-            f"cd ~/workspace/repos/{self.repo} && "
-            "GIT_TERMINAL_PROMPT=0 git fetch -q origin 2>/dev/null\n",
-            check=False,
+            f"repo=~/workspace/repos/{self.repo}; cloned=0; fetched=0\n"
+            'test -d "$repo/.git" && cloned=1\n'
+            'if [ "$cloned" = 1 ]; then (cd "$repo" && GIT_TERMINAL_PROMPT=0 '
+            "git fetch -q origin 2>/dev/null) && fetched=1; fi\n"
+            'echo "checkout cloned=$cloned fetched=$fetched"\nexit 0\n',
         )
-        return rc == 0
+        match = re.search(r"checkout cloned=([01]) fetched=([01])", out)
+        if not match:
+            raise GateError(f"the checkout state is unreadable: {out[-200:]}")
+        return match.group(1) == "1", match.group(2) == "1"
 
     def live_readme(self, pod: str) -> str:
         _rc, text = self.ws(pod, "cat ~/workspace/README.md 2>/dev/null\n", check=False)
@@ -1909,7 +2037,7 @@ class ConnectorDriversGate:
         )
         self.report.check(
             "live attach: the SSH repository is cloned and fetches through its alias",
-            self.live_fetches(pod),
+            self.live_checkout(pod) == (True, True),
         )
         readme = self.live_readme(pod)
         self.report.check(
@@ -1955,7 +2083,7 @@ class ConnectorDriversGate:
         )
         self.report.check(
             "live detach: the clone stays but no longer fetches",
-            not self.live_fetches(pod),
+            self.live_checkout(pod) == (True, False),
         )
         self.report.check(
             "live detach: README.md says no connectors are attached",
@@ -2071,6 +2199,14 @@ class ConnectorDriversGate:
             step("delete session", self.end_session)
         if self.live_thread:
             step("delete live session", lambda: self.delete_thread(self.live_thread))
+        # A create that timed out may still have made its session (and a
+        # pinned pod): every session titled with this gate id goes too.
+        for leftover in self.titled_threads():
+            if leftover not in (self.thread, self.live_thread):
+                step(
+                    f"delete leftover session {leftover}",
+                    lambda leftover=leftover: self.delete_thread(leftover),
+                )
         if self.job:
             step(
                 "cancel job",
@@ -2147,9 +2283,20 @@ class ConnectorDriversGate:
             print(f"cleanup: {problem} failed", flush=True)
         return problems
 
+    def titled_threads(self) -> list[str]:
+        """Sessions whose title carries this gate id (both phases title them)."""
+        rows = sql(
+            "SELECT id FROM threads WHERE "
+            f"position({lit(self.gate_id)} in coalesce(title, '')) > 0"
+        )
+        return [row for row in rows.splitlines() if re.fullmatch(r"[0-9a-f-]{36}", row)]
+
     def residue(self) -> list[str]:
         """What this run created and cleanup did not remove."""
         left: list[str] = []
+        titled = self.titled_threads()
+        if titled:
+            left.append(f"sessions titled with the gate id: {titled}")
         prefix = self.gate_id.replace("_", "\\_") + " %"
         count = sql(f"SELECT count(*) FROM datasources WHERE name LIKE {lit(prefix)}")
         if count != "0":
@@ -2170,6 +2317,14 @@ class ConnectorDriversGate:
             f"srw/thread-id={self.thread}" if self.thread else "",
             f"srw/thread-id={self.live_thread}" if self.live_thread else "",
             f"{PINNED_THREAD_LABEL}={self.live_thread}" if self.live_thread else "",
+            *(
+                selector
+                for thread in titled
+                for selector in (
+                    f"srw/thread-id={thread}",
+                    f"{PINNED_THREAD_LABEL}={thread}",
+                )
+            ),
         ]
         for selector in filter(None, selectors):
             try:
@@ -2224,7 +2379,11 @@ class ConnectorDriversGate:
                 "session: ended and deleted", self.end_session(), "thread row"
             )
             if not self.args.skip_live:
-                self.live()
+                try:
+                    self.live()
+                except GateError as exc:
+                    # The job, its agent checks and the cockpit still run.
+                    self.report.check("live: infrastructure", False, str(exc))
             self.job_settle()
             self.job_agent_checks()
             self.cockpit()

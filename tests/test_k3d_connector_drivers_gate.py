@@ -316,7 +316,10 @@ def test_cleanup_order_and_scope(monkeypatch):
         "drop database",
     ]
     # The SQL fallback deletes only the row this run wrote, by id and name.
-    assert statements == [
+    # The leftover lookup by title asks first and finds nothing here.
+    assert statements[0].startswith("SELECT id FROM threads WHERE position(")
+    assert runner.gate_id in statements[0]
+    assert statements[1:] == [
         f"DELETE FROM datasources WHERE id = 'ds-2' AND name = '{runner.name('mcp-row')}'"
     ]
 
@@ -457,7 +460,7 @@ def _live(monkeypatch, **fault):
         observed["readme_attached"],
         observed["readme_detached"],
     )
-    held, fetches, logs = observed["held"], observed["fetches"], observed["logs"]
+    held, checkout, logs = observed["held"], observed["checkout"], observed["logs"]
     runner.live_thread = "00000000-0000-4000-8000-0000000000cc"
     runner.live_fingerprint = "SHA256:" + "k" * 43
     phase = {"now": "attach"}
@@ -476,7 +479,7 @@ def _live(monkeypatch, **fault):
         lambda pod, needle, path: [f"{gate.HOME}/.srw-credentials/env.sh"],
     )
     monkeypatch.setattr(runner, "held_fingerprints", lambda pod: held[phase["now"]])
-    monkeypatch.setattr(runner, "live_fetches", lambda pod: fetches[phase["now"]])
+    monkeypatch.setattr(runner, "live_checkout", lambda pod: checkout[phase["now"]])
     monkeypatch.setattr(
         runner,
         "live_readme",
@@ -506,7 +509,7 @@ def _good_live(runner_name):
         ),
         "readme_detached": "_No connectors attached._",
         "held": {"attach": {"SHA256:" + "k" * 43}, "detach": set()},
-        "fetches": {"attach": True, "detach": False},
+        "checkout": {"attach": (True, True), "detach": (True, False)},
         "logs": [
             f"INFO Connected to postgresql datasource: {pg} (read-only)",
             "INFO Datasources re-set up live: 3 attached (3 added, 0 removed), "
@@ -531,8 +534,11 @@ def test_live_checks_pass_when_attach_and_detach_both_land(monkeypatch):
     [
         {"held": {"attach": set(), "detach": set()}},
         {"held": {"attach": {"SHA256:" + "k" * 43}, "detach": {"SHA256:" + "k" * 43}}},
-        {"fetches": {"attach": False, "detach": False}},
-        {"fetches": {"attach": True, "detach": True}},
+        {"checkout": {"attach": (False, False), "detach": (True, False)}},
+        {"checkout": {"attach": (True, False), "detach": (True, False)}},
+        {"checkout": {"attach": (True, True), "detach": (True, True)}},
+        # No clone at all must not read as "no longer fetches".
+        {"checkout": {"attach": (True, True), "detach": (False, False)}},
         {"readme_detached": "- **still listed**"},
         {"logs": []},
     ],
@@ -549,7 +555,7 @@ def test_a_live_update_error_fails_the_ack_check(monkeypatch):
     monkeypatch.setattr(runner, "live_workspace", lambda: "ws-pod")
     monkeypatch.setattr(runner, "workspace_grep", lambda *a: [])
     monkeypatch.setattr(runner, "held_fingerprints", lambda pod: set())
-    monkeypatch.setattr(runner, "live_fetches", lambda pod: False)
+    monkeypatch.setattr(runner, "live_checkout", lambda pod: (False, False))
     monkeypatch.setattr(runner, "live_readme", lambda pod: "")
     runner.live_attached({"outcome": "error", "message": "rejected"})
     failed = [name for name, ok, _ in runner.report.results if not ok]
@@ -599,3 +605,177 @@ def test_cleanup_deletes_the_live_session_after_the_first(monkeypatch):
         f"DELETE /api/persistent/threads/{runner.thread}",
         f"DELETE /api/persistent/threads/{runner.live_thread}",
     ]
+
+
+def test_every_pod_program_caps_its_memory():
+    for program in (
+        gate._API_PROGRAM,
+        gate._GITEA_PROGRAM,
+        gate._LIVE_UPDATE_PROGRAM,
+        gate._DAV_PROGRAM,
+        gate._PAYLOAD_PROGRAM,
+        gate._HASH_PROGRAM,
+    ):
+        assert program.startswith(gate._POD_MEMORY_CAP)
+        assert "\ncap_memory()\n" in program
+
+
+def test_the_memory_cap_is_real():
+    """Control: under the cap, an allocation past the budget fails."""
+    completed = subprocess.run(
+        [sys.executable, "-"],
+        input=gate._POD_MEMORY_CAP
+        + f"cap_memory()\nb = bytes({gate.POD_MEMORY_BUDGET + (128 << 20)})\n",
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode != 0
+    assert "MemoryError" in completed.stderr
+
+
+def test_the_live_reader_bounds_its_frames():
+    assert gate.WS_MAX_FRAME == 8 << 20
+    assert 'max_size=r["max_size"]' in gate._LIVE_UPDATE_PROGRAM
+    assert "max_size=None" not in gate._LIVE_UPDATE_PROGRAM
+
+
+def _spin(label, probe, *, timeout, interval=3.0):
+    for _ in range(20):
+        value = probe()
+        if value:
+            return value
+    raise gate.GateError(f"timed out: {label}")
+
+
+@pytest.mark.parametrize(("status", "ready"), [(200, True), (425, False), (409, False)])
+def test_connection_readiness(monkeypatch, status, ready):
+    runner = _runner()
+    runner.live_thread = "00000000-0000-4000-8000-0000000000cc"
+    monkeypatch.setattr(
+        runner.api, "call", lambda method, path, body=None: (status, {})
+    )
+    assert runner.session_ready() is ready
+
+
+def test_connection_readiness_fails_on_anything_else(monkeypatch):
+    runner = _runner()
+    runner.live_thread = "00000000-0000-4000-8000-0000000000cc"
+    monkeypatch.setattr(runner.api, "call", lambda method, path, body=None: (500, {}))
+    with pytest.raises(gate.GateError):
+        runner.session_ready()
+
+
+def test_a_live_update_retries_while_the_session_attaches(monkeypatch):
+    runner = _runner()
+    runner.live_thread = "00000000-0000-4000-8000-0000000000cc"
+    monkeypatch.setattr(gate, "wait_for", _spin)
+    readiness = iter([425, 425, 200])
+    monkeypatch.setattr(
+        runner.api, "call", lambda method, path, body=None: (next(readiness), {})
+    )
+    monkeypatch.setattr(runner, "pinned_pod", lambda: {"status": {"podIP": "10.0.0.9"}})
+    answers = iter(
+        [
+            {"outcome": "retry", "reason": "connection 425"},
+            {"outcome": "retry", "reason": "closed 4503"},
+            {"outcome": "error", "message": "No active session"},
+            {"outcome": "config.changed", "datasources": {"added": ["x"]}},
+        ]
+    )
+    sent: list[dict] = []
+
+    def program(source, payload, **kwargs):
+        sent.append(payload)
+        return next(answers)
+
+    monkeypatch.setattr(gate, "in_orchestrator", program)
+    result = runner.live_update(["ds-1"], "attach")
+    assert result["outcome"] == "config.changed"
+    assert len(sent) == 4
+    assert {payload["max_size"] for payload in sent} == {gate.WS_MAX_FRAME}
+    assert {payload["request_id"] for payload in sent} == {f"{runner.gate_id}-attach"}
+
+
+def test_a_live_failure_never_skips_the_later_checks(monkeypatch):
+    runner = _runner()
+    ran: list[str] = []
+    for phase in (
+        "preflight",
+        "fixture",
+        "lifecycle",
+        "refusals",
+        "attach_setup",
+        "job_run",
+        "session",
+        "session_checks",
+        "notes",
+    ):
+        monkeypatch.setattr(runner, phase, lambda: None)
+    for phase in ("job_settle", "job_agent_checks", "cockpit"):
+        monkeypatch.setattr(runner, phase, lambda phase=phase: ran.append(phase))
+    monkeypatch.setattr(runner, "end_session", lambda: True)
+
+    def live():
+        raise gate.GateError("socket closed 1006")
+
+    monkeypatch.setattr(runner, "live", live)
+    monkeypatch.setattr(runner, "cleanup", lambda: [])
+    monkeypatch.setattr(runner, "residue", lambda: [])
+    assert runner.run() == 1
+    assert ran == ["job_settle", "job_agent_checks", "cockpit"]
+    failed = [name for name, ok, _ in runner.report.results if not ok]
+    assert failed == ["live: infrastructure"]
+
+
+def test_workspace_reads_fail_loudly_when_the_exec_fails(monkeypatch):
+    runner = _runner()
+    monkeypatch.setattr(gate, "run", lambda *a, **k: (1, "", "exec failed"))
+    with pytest.raises(gate.GateError):
+        runner.held_fingerprints("ws-pod")
+    with pytest.raises(gate.GateError):
+        runner.live_checkout("ws-pod")
+
+
+@pytest.mark.parametrize(
+    ("out", "state"),
+    [
+        ("checkout cloned=1 fetched=1", (True, True)),
+        ("checkout cloned=1 fetched=0", (True, False)),
+        ("checkout cloned=0 fetched=0", (False, False)),
+    ],
+)
+def test_the_checkout_state_is_read_from_one_line(monkeypatch, out, state):
+    runner = _runner()
+    monkeypatch.setattr(gate, "run", lambda *a, **k: (0, out, ""))
+    assert runner.live_checkout("ws-pod") == state
+
+
+def test_the_checkout_state_must_be_readable(monkeypatch):
+    runner = _runner()
+    monkeypatch.setattr(gate, "run", lambda *a, **k: (0, "", ""))
+    with pytest.raises(gate.GateError):
+        runner.live_checkout("ws-pod")
+
+
+def test_cleanup_and_residue_find_sessions_by_the_gate_id(monkeypatch):
+    """A create that timed out after it made its session is still cleaned up."""
+    runner = _runner()
+    leftover = "00000000-0000-4000-8000-0000000000ee"
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        gate,
+        "sql",
+        lambda query, **k: leftover if "FROM threads WHERE position(" in query else "0",
+    )
+    monkeypatch.setattr(
+        runner.api,
+        "call",
+        lambda method, path, body=None: deleted.append(path.split("?")[0]) or (404, {}),
+    )
+    assert runner.cleanup() == []
+    assert deleted == [f"/api/persistent/threads/{leftover}"]
+
+    monkeypatch.setattr(gate, "command", lambda *a, **k: '{"items": []}')
+    left = runner.residue()
+    assert any(leftover in item for item in left)
