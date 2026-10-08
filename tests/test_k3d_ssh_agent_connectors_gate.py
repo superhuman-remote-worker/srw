@@ -276,60 +276,57 @@ def _gate_runner(*extra):
     runner.thread = "00000000-0000-4000-8000-000000000001"
     runner.job = "00000000-0000-4000-8000-0000000000aa"
     # Never the cluster: tests of the wait itself restore the real one.
-    runner.wait_for_job_sleep = lambda: None
+    runner.wait_for_job_at_work = lambda: None
     return runner
 
 
-def _sleep_probe(monkeypatch, runner, *answers):
-    """The real wait_for_job_sleep, against a fake workspace."""
-    runner.wait_for_job_sleep = gate.SshAgentConnectorsGate.wait_for_job_sleep.__get__(
-        runner
+def _progress_probe(monkeypatch, runner, *counts):
+    """The real wait_for_job_at_work, against fake checkpoint counts."""
+    runner.wait_for_job_at_work = (
+        gate.SshAgentConnectorsGate.wait_for_job_at_work.__get__(runner)
     )
-    monkeypatch.setattr(runner, "workspace_pod", lambda selector: "pod")
-    remaining = list(answers)
-    scripts = []
+    remaining = list(counts)
+    asked = []
 
-    def ws(pod, script, check=True):
-        scripts.append(script)
-        answer = remaining.pop(0) if len(remaining) > 1 else remaining[0]
-        return (0, "sleeping") if answer else (1, "")
+    def checkpoints():
+        asked.append(1)
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
 
-    monkeypatch.setattr(runner, "ws", ws)
-    return scripts
+    monkeypatch.setattr(runner, "job_checkpoints", checkpoints)
+    return asked
 
 
-def test_the_cancel_waits_until_the_job_agent_runs_its_sleep(monkeypatch, clocked):
+def test_the_cancel_waits_until_the_job_is_at_work(monkeypatch, clocked):
     runner = _gate_runner()
     _statuses(monkeypatch, runner, "processing")
-    scripts = _sleep_probe(monkeypatch, runner, False, False, True)
+    asked = _progress_probe(monkeypatch, runner, 1, 2, gate.JOB_AT_WORK_CHECKPOINTS)
 
-    runner.wait_for_job_sleep()
+    runner.wait_for_job_at_work()
 
-    assert len(scripts) == 3
-    assert "pgrep -u agent-host -x sleep" in scripts[0]
+    assert len(asked) == 3
     assert clocked.now == 10
 
 
-def test_the_sleep_wait_ends_when_the_job_settles(monkeypatch, clocked):
+def test_the_progress_wait_ends_when_the_job_settles(monkeypatch, clocked):
     runner = _gate_runner()
     _statuses(monkeypatch, runner, "completed")
-    scripts = _sleep_probe(monkeypatch, runner, False)
+    asked = _progress_probe(monkeypatch, runner, 0)
 
-    runner.wait_for_job_sleep()
+    runner.wait_for_job_at_work()
 
-    assert scripts == [] and clocked.now == 0
+    assert asked == [] and clocked.now == 0
 
 
-def test_a_sleep_that_never_starts_does_not_block_the_cancel(
+def test_a_job_that_never_progresses_does_not_block_the_cancel(
     monkeypatch, clocked, capsys
 ):
     runner = _gate_runner("--turn-timeout", "60")
     _statuses(monkeypatch, runner, "processing")
-    _sleep_probe(monkeypatch, runner, False)
+    _progress_probe(monkeypatch, runner, 1)
 
-    runner.wait_for_job_sleep()
+    runner.wait_for_job_at_work()
 
-    assert "never started its sleep" in capsys.readouterr().out
+    assert "never got past its first steps" in capsys.readouterr().out
     assert 60 <= clocked.now <= 70
 
 
@@ -529,25 +526,6 @@ def test_a_present_thread_snapshot_is_scanned(monkeypatch, clocked):
         "snapshot (thread): no key in snapshot objects",
         False,
     )
-
-
-def test_the_job_brief_holds_it_in_a_sleep(monkeypatch):
-    runner = _gate_runner()
-    runner.connectors = {label: f"id-{label}" for label in "ABCD"}
-    bodies = []
-
-    class Stop(Exception):
-        pass
-
-    def ok(method, path, body=None):
-        bodies.append(body)
-        raise Stop
-
-    monkeypatch.setattr(runner.api, "ok", ok)
-    with pytest.raises(Stop):
-        runner.job_run()
-
-    assert f"sleep {gate.JOB_SLEEP_SECONDS}" in bodies[0]["description"]
 
 
 def test_run_scans_the_job_snapshot_before_end_and_cleanup(monkeypatch):

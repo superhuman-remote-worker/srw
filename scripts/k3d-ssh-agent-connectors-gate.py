@@ -37,11 +37,13 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
   detach      after B is detached (stateless: applied at the next attach)
               B's agent and config are gone and A still fetches
   job-snap    on k3d a stateless job's S3 snapshot comes from a cancel, not
-              from completion (or an approval). So once the job's workspace
-              checks pass, and while it still runs (its brief holds it in a
-              deliberate sleep), the gate cancels it, waits (bounded) for
-              the cancel to finish and for the jobs/<id>/ objects to settle,
-              and scans them for gate key bodies. A cancel that leaves no
+              from completion (or an approval), and only once the job is at
+              work: a cancel during its first seconds takes none. So once the
+              job's workspace checks pass and its graph has taken a few steps
+              (checkpoint rows), while it still runs, the gate cancels it,
+              waits (bounded) for the cancel to finish and for the jobs/<id>/
+              objects to settle, and scans them member by member for gate key
+              bodies and for any PEM private key. A cancel that leaves no
               object FAILS. A job that settled before the cancel is reported
               SKIP (k3d completion takes no snapshot), after one listing.
   end         after End the workspace holds no ssh-agent process (counted
@@ -778,8 +780,9 @@ def origin_alias(origin: str, *, owner: str, repo: str) -> str | None:
 # A job in these statuses is still running; a cancel ends it (and on k3d is
 # what uploads its jobs/<id>/ snapshot).
 JOB_RUNNING = frozenset({"created", "processing"})
-# Long enough that the job is still running when its workspace checks end.
-JOB_SLEEP_SECONDS = 600
+# The job's graph has taken this many steps (checkpoint rows) once its agent
+# is at work: a cancel before that takes no snapshot.
+JOB_AT_WORK_CHECKPOINTS = 4
 
 
 class SshAgentConnectorsGate:
@@ -1306,41 +1309,38 @@ class SshAgentConnectorsGate:
                 )
         return self._store
 
-    def wait_for_job_sleep(self) -> None:
-        """Wait (bounded) until the job's agent runs the brief's sleep.
+    def job_checkpoints(self) -> int:
+        return int(
+            sql(f"SELECT count(*) FROM checkpoints WHERE thread_id = {lit(self.job)}")
+            or 0
+        )
+
+    def wait_for_job_at_work(self) -> None:
+        """Wait (bounded) until the job's graph has taken a few steps.
 
         A cancel that lands while a stateless job is still starting deletes
         its workspace without the archive snapshot (k3d, 2026-10-08: a job
-        cancelled 16 s after dispatch left no jobs/<id>/ object; one
-        cancelled minutes in, with its agent working, left a 99.9 MB
-        snapshot). The sleep running is the sign the agent has started.
+        cancelled 16 s after dispatch, just past its first checkpoint, left
+        no jobs/<id>/ object; one cancelled minutes in, its agent working,
+        left a 99.9 MB snapshot). The job expert has no shell, so progress
+        is read from its checkpoint rows, not from the workspace.
         """
 
-        try:
-            pod = self.workspace_pod(f"app=srw-workspace,srw/job-id={self.job}")
-        except GateError:
-            return
-
-        def sleeping() -> bool:
+        def at_work() -> bool:
             if self.job_status() not in JOB_RUNNING:
                 return True
-            rc, out = self.ws(
-                pod,
-                "pgrep -u agent-host -x sleep >/dev/null && echo sleeping\n",
-                check=False,
-            )
-            return rc == 0 and out.strip() == "sleeping"
+            return self.job_checkpoints() >= JOB_AT_WORK_CHECKPOINTS
 
         try:
             wait_for(
-                "job agent in its sleep",
-                sleeping,
+                "job agent at work",
+                at_work,
                 timeout=self.args.turn_timeout,
                 interval=5,
             )
         except GateError:
             print(
-                "note: the job's agent never started its sleep; cancelling anyway",
+                "note: the job never got past its first steps; cancelling anyway",
                 flush=True,
             )
 
@@ -1349,15 +1349,15 @@ class SshAgentConnectorsGate:
 
         On k3d a stateless job's ``jobs/<id>/`` snapshot comes from a cancel:
         neither completion nor an approval takes one. So this runs once the
-        job's workspace checks pass, while its brief still holds it in a
-        sleep, and before End and cleanup (whose delete removes the objects).
+        job's workspace checks pass and its agent is at work, while it still
+        runs, and before End and cleanup (whose delete removes the objects).
         A job that settled first is reported SKIP after one listing.
         """
 
         if not self.job or not self.store_configured():
             return
         prefix = f"jobs/{self.job}/"
-        self.wait_for_job_sleep()
+        self.wait_for_job_at_work()
         status = self.job_status()
         if status not in JOB_RUNNING:
             if self.snapshot_objects(prefix).get("objects"):
@@ -1481,15 +1481,12 @@ class SshAgentConnectorsGate:
             "POST",
             "/api/jobs",
             {
-                # The sleep keeps the job running through its workspace
-                # checks, so the gate can cancel it: on k3d only a cancel
-                # uploads the job's snapshot.
+                # The job runs for minutes either way (its strategic phase
+                # alone is several LLM turns), long enough for the workspace
+                # checks and the cancel that takes its snapshot.
                 "description": (
-                    "C1 ssh-agent gate. Step 1: run the shell command "
-                    f"`sleep {JOB_SLEEP_SECONDS}` and wait for it to finish; it "
-                    "is a deliberate delay, so do not skip, shorten or "
-                    "background it. Step 2: write the word ok to "
-                    "output/c1.txt. Step 3: complete the job."
+                    "C1 ssh-agent gate: write the word ok to output/c1.txt, "
+                    "then complete the job."
                 ),
                 "datasource_ids": [self.connectors["A"], self.connectors["C"]],
                 "config_override": {"workspace": {"backend": "sandbox"}},
