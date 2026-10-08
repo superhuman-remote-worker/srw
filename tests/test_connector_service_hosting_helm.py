@@ -236,6 +236,51 @@ def test_egress_settings_reach_the_orchestrator():
     assert env["CONNECTOR_SERVICE_PODS_ENABLED"] == "true"
 
 
+def _orchestrator_env_items(docs: list[dict]) -> dict[str, dict]:
+    deployment = next(
+        doc
+        for doc in docs
+        if doc["kind"] == "Deployment"
+        and doc["metadata"]["name"].endswith("-orchestrator")
+    )
+    container = next(
+        c
+        for c in deployment["spec"]["template"]["spec"]["containers"]
+        if c["name"] == "orchestrator"
+    )
+    return {item["name"]: item for item in container.get("env", [])}
+
+
+def test_refused_ranges_default_to_the_private_tiers_except_lists():
+    """Driver pods of a home-allowed connector reach no more than that tier's
+    workspaces: never the k3s nodes or the MetalLB range."""
+    refused = orchestrator_env(render())["CONNECTOR_SERVICE_REFUSED_CIDRS"]
+    ranges = refused.split(",")
+    assert "10.0.50.0/24" in ranges  # k3s nodes: apiserver, kubelet, etcd
+    assert "10.0.51.0/24" in ranges  # MetalLB
+    assert "169.254.0.0/16" in ranges
+    # home-allowed gives the home LAN back; internet-only's except is unused.
+    assert "192.168.178.0/24" not in ranges
+    assert len(ranges) == len(set(ranges))
+
+    explicit = orchestrator_env(
+        render("connectors.servicePods.refusedCidrs={10.9.0.0/24,192.0.2.0/24}")
+    )
+    assert explicit["CONNECTOR_SERVICE_REFUSED_CIDRS"] == "10.9.0.0/24,192.0.2.0/24"
+
+    widened = orchestrator_env(
+        render(
+            "connectors.servicePods.privateTiers={home-allowed,internet-only}",
+        )
+    )["CONNECTOR_SERVICE_REFUSED_CIDRS"].split(",")
+    assert "192.168.178.0/24" in widened
+
+
+def test_the_orchestrator_knows_its_own_pod_address():
+    item = _orchestrator_env_items(render(EXCHANGE, ON))["CONNECTOR_SERVICE_POD_IP"]
+    assert item["valueFrom"] == {"fieldRef": {"fieldPath": "status.podIP"}}
+
+
 DRIVER_RULE = {
     "to": [
         {

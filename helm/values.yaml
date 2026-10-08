@@ -176,6 +176,9 @@ connectors:
     # once and written into the pod's NetworkPolicy ipBlocks and hostAliases.
     # These are the cluster's REAL pod and service ranges (k3s defaults
     # below), always refused as egress targets.
+    # The orchestrator refuses to host (stops every driver pod, starts none)
+    # unless its own pod address and the lease exchange's Service address lie
+    # inside them, so a cluster with other ranges fails closed.
     clusterCidrs:
       - 10.42.0.0/16
       - 10.43.0.0/16
@@ -184,6 +187,12 @@ connectors:
     # when every project it belongs to is on one of these tiers.
     privateTiers:
       - home-allowed
+    # -- Ranges no driver pod may reach even where private addresses are
+    # allowed: the cluster's nodes (kube-apiserver, kubelet, etcd) and its
+    # load balancers. Empty uses the `except` lists of the workspace tiers
+    # named in privateTiers (workspace.networkPolicy.tiers), so a driver pod
+    # reaches no more than that tier's workspaces do.
+    refusedCidrs: []
     # -- Pin AAAA answers too (dual-stack clusters only).
     ipv6: false
     # -- Set only after the cluster's CNI enforced the 12-probe start-up

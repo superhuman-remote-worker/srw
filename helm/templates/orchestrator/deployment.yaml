@@ -1907,6 +1907,21 @@ spec:
               value: {{ join "," .clusterCidrs | quote }}
             - name: CONNECTOR_SERVICE_PRIVATE_TIERS
               value: {{ join "," .privateTiers | quote }}
+            {{- $refused := .refusedCidrs | default list }}
+            {{- if not $refused }}
+            {{- range $tier := $.Values.workspace.networkPolicy.tiers }}
+            {{- if has $tier.name $.Values.connectors.servicePods.privateTiers }}
+            {{- $refused = concat $refused ($tier.except | default list) }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            - name: CONNECTOR_SERVICE_REFUSED_CIDRS
+              value: {{ $refused | uniq | join "," | quote }}
+            # Hosting is refused unless this address lies in clusterCidrs.
+            - name: CONNECTOR_SERVICE_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: CONNECTOR_SERVICE_IPV6
               value: {{ .ipv6 | quote }}
             - name: CONNECTOR_SERVICE_NAMESPACE

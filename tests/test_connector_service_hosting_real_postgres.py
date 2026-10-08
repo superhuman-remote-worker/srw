@@ -780,6 +780,8 @@ def reconciler(db):
             max_installation=2,
             idle_seconds=60,
             start_timeout_seconds=120,
+            refused_cidrs=("10.0.50.0/24", "10.0.51.0/24"),
+            pod_ip="10.42.0.9",
         ),
         resolver=resolver,
         clock=lambda: datetime.now(timezone.utc) + offset[0],
@@ -948,6 +950,103 @@ async def test_an_egress_the_tier_forbids_refuses_the_launch_and_backs_off(
 
 
 @pytest.mark.asyncio
+async def test_a_home_tier_connector_never_reaches_the_nodes(db, reconciler):
+    """Private addresses allowed, the refused ranges (k3s nodes, MetalLB)
+    still are not: kube-apiserver, kubelet and etcd stay out of reach."""
+    ADDRESSES["k3s-node.home"] = ["10.0.50.11"]
+    try:
+        connector = await _echo_connector(db, host="k3s-node.home")
+        await _link(db, await _project(db, "home-allowed"), connector)
+        await _echo_image(db)
+        await _bind_echo(db, connector, await _thread(db))
+        report = await reconciler.reconcile_once()
+    finally:
+        ADDRESSES.pop("k3s-node.home")
+    assert report.started == []
+    assert "nodes and load balancers" in report.refused[0][1]
+    (pod,) = await _pods(db)
+    assert pod["revoke_reason"] == "launch_refused"
+
+
+@pytest.mark.asyncio
+async def test_a_cluster_with_other_ranges_refuses_to_host(db, reconciler):
+    """The orchestrator's pod and the exchange Service outside clusterCidrs:
+    the ranges every pod policy refuses are not this cluster's. Every live
+    pod stops and none starts."""
+    connector = await _echo_connector(db)
+    await _echo_image(db)
+    await _bind_echo(db, connector, await _thread(db))
+    await reconciler.reconcile_once()
+    (pod,) = await _pods(db)
+    reconciler.fake.ready(str(pod["id"]))
+    reconciler.settings = dataclasses.replace(
+        reconciler.settings, cluster_cidrs=("10.96.0.0/12", "10.244.0.0/16")
+    )
+    report = await reconciler.reconcile_once()
+    assert report.stopped == [(str(pod["id"]), "hosting_refused")]
+    assert report.refused[0][0] == "installation"
+    assert "10.42.0.9" in report.refused[0][1]
+    assert "clusterCidrs" in report.refused[0][1]
+    (pod,) = await _pods(db)
+    assert pod["revoked_at"] is not None and pod["removed_at"] is not None
+    # Bindings remain; still nothing starts.
+    report = await reconciler.reconcile_once()
+    assert report.started == []
+    assert len(await _pods(db)) == 1
+
+
+@pytest.mark.parametrize(
+    ("pod_ip", "addresses", "fragment"),
+    [
+        ("", None, "pod address is unknown"),
+        ("10.42.0.9", ["192.0.2.10"], "Service address 192.0.2.10"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_unknown_pod_or_an_exchange_outside_refuses_to_host(
+    db, reconciler, pod_ip, addresses, fragment
+):
+    reconciler.settings = dataclasses.replace(reconciler.settings, pod_ip=pod_ip)
+    saved = ADDRESSES["srw-orchestrator.srw.svc"]
+    if addresses is not None:
+        ADDRESSES["srw-orchestrator.srw.svc"] = addresses
+    try:
+        connector = await _echo_connector(db)
+        await _echo_image(db)
+        await _bind_echo(db, connector, await _thread(db))
+        report = await reconciler.reconcile_once()
+    finally:
+        ADDRESSES["srw-orchestrator.srw.svc"] = saved
+    assert report.started == []
+    assert fragment in report.refused[0][1]
+    assert await _pods(db) == []
+
+
+@pytest.mark.asyncio
+async def test_an_unresolvable_exchange_starts_nothing_and_stops_nothing(
+    db, reconciler
+):
+    """A resolver blip is not a misconfiguration: live pods keep serving."""
+    connector = await _echo_connector(db)
+    await _echo_image(db)
+    await _bind_echo(db, connector, await _thread(db))
+    await reconciler.reconcile_once()
+    (pod,) = await _pods(db)
+    reconciler.fake.ready(str(pod["id"]))
+    saved = ADDRESSES.pop("srw-orchestrator.srw.svc")
+    try:
+        await _bind_echo(db, await _echo_connector(db), await _thread(db))
+        report = await reconciler.reconcile_once()
+    finally:
+        ADDRESSES["srw-orchestrator.srw.svc"] = saved
+    assert report.started == [] and report.stopped == []
+    live = [row for row in await _pods(db) if row["revoked_at"] is None]
+    assert [str(row["id"]) for row in live] == [str(pod["id"])]
+    # Resolvable again: the waiting binding gets its pod.
+    assert len((await reconciler.reconcile_once()).started) == 1
+
+
+@pytest.mark.asyncio
 async def test_a_digest_launches_from_the_repository_it_was_resolved_from(
     db, reconciler
 ):
@@ -978,7 +1077,7 @@ async def test_an_unexpected_build_error_leaves_no_live_identity_and_backs_off(
     resolve = reconciler.resolver
 
     async def broken(host, ipv6):
-        if host == "srw-orchestrator.srw.svc":
+        if host == "one.one.one.one":
             raise RuntimeError("resolver crashed")
         return await resolve(host, ipv6)
 

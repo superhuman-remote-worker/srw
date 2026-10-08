@@ -1412,6 +1412,10 @@
               "items": {"type": "string", "minLength": 3}
             },
             "privateTiers": {"type": "array", "items": {"type": "string"}},
+            "refusedCidrs": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 3}
+            },
             "ipv6": {"type": "boolean"},
             "networkEnforcementVerified": {"type": "boolean"},
             "driverResources": {

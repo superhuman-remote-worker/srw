@@ -208,6 +208,8 @@ def service_hosting_settings(
         private_tiers=frozenset(settings.connector_service_private_tiers),
         ipv6=settings.connector_service_ipv6,
         resources=dict(settings.connector_service_resources),
+        refused_cidrs=tuple(settings.connector_service_refused_cidrs),
+        pod_ip=settings.connector_service_pod_ip,
     )
 
 

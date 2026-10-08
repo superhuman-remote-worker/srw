@@ -10,6 +10,10 @@ plus its lifecycle (0361).
 
 Each leader-gated pass:
 
+0. refuses to host at all unless this orchestrator's pod address and the
+   lease exchange's Service address lie inside ``clusterCidrs``: on a cluster
+   whose real ranges differ, the cluster ranges every pod policy refuses
+   would be the wrong ones. Every live pod is stopped and none starts;
 1. reads the live bindings of installed service drivers and the live pods;
 2. starts a pod for every (connector, digest) with a binding and no live pod
    for the connector's current credential generation: under an advisory lock
@@ -39,6 +43,7 @@ planes" (service) and "The driver namespace baseline".
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import time
@@ -87,6 +92,7 @@ CAPACITY = "capacity"
 START_TIMEOUT = "start_timeout"
 POD_LOST = "pod_lost"
 NOT_READY = "not_ready"
+HOSTING_REFUSED = "hosting_refused"
 #: Stops that back the key off before the next start.
 _BACKOFF_REASONS = (LAUNCH_REFUSED, LAUNCH_FAILED, START_TIMEOUT, CAPACITY)
 _CAPACITY_LOCK = "srw-connector-service-capacity"
@@ -392,6 +398,46 @@ class ServiceHostingSettings:
     private_tiers: frozenset[str] = frozenset({"home-allowed"})
     ipv6: bool = False
     resources: Mapping[str, Any] = field(default_factory=dict)
+    #: Refused even where private addresses are allowed (nodes, load
+    #: balancers): ``servicePods.refusedCidrs``.
+    refused_cidrs: tuple[str, ...] = ()
+    #: This orchestrator's pod address (the downward API's status.podIP).
+    pod_ip: str = ""
+
+    def cluster_problem(self, exchange_address: str) -> str | None:
+        """Why this cluster's ranges are not the configured ``clusterCidrs``.
+
+        Driver policies refuse ``clusterCidrs`` as egress; on a cluster whose
+        real pod and service ranges differ they would refuse the wrong ones.
+        The orchestrator's own pod address and the exchange's Service address
+        are one known pod and one known Service address: both must lie inside.
+        """
+        cidrs = []
+        for cidr in self.cluster_cidrs:
+            try:
+                cidrs.append(ipaddress.ip_network(cidr, strict=False))
+            except ValueError:
+                continue
+        named = ", ".join(self.cluster_cidrs) or "none"
+        for what, raw in (
+            ("this orchestrator's pod address", self.pod_ip),
+            ("the lease exchange's Service address", exchange_address),
+        ):
+            if not raw:
+                return f"{what} is unknown"
+            try:
+                address = ipaddress.ip_address(raw)
+            except ValueError:
+                return f"{what} {raw!r} is not an address"
+            if not any(
+                cidr.version == address.version and address in cidr for cidr in cidrs
+            ):
+                return (
+                    f"{what} {address} is outside connectors.servicePods."
+                    f"clusterCidrs ({named}); set them to the cluster's real pod "
+                    "and service ranges"
+                )
+        return None
 
     def launch_policy(self, exchange_address: str) -> ServiceLaunchPolicy:
         resources = self.resources or {}
@@ -692,6 +738,7 @@ class ServiceHostingReconciler:
         *,
         generation: str,
         private_allowed: bool,
+        exchange_address: str,
         report: ReconcileReport,
     ) -> None:
         from orchestrator.services.connector_service_images import (
@@ -720,6 +767,7 @@ class ServiceHostingReconciler:
                 self.settings.cluster_cidrs,
                 allow_private=private_allowed,
                 ipv6=self.settings.ipv6,
+                refused_cidrs=self.settings.refused_cidrs,
             )
             pins = await pin_egress(
                 spec.egress,
@@ -745,7 +793,7 @@ class ServiceHostingReconciler:
                 credentials=connector.get("credentials"),
                 identity_token=minted.token,
                 pins=pins,
-                policy=self.settings.launch_policy(await self._exchange_address()),
+                policy=self.settings.launch_policy(exchange_address),
             )
         except (EgressRefused, ServiceLaunchError, ServiceImageUnavailable) as exc:
             # SRW will not build this pod: say why, back the key off.
@@ -885,6 +933,26 @@ class ServiceHostingReconciler:
                 await self._remove(row, report)
         live = [row for row in rows if row["revoked_at"] is None]
 
+        exchange: str | None = None
+        try:
+            exchange = await self._exchange_address()
+        except ServiceLaunchError as exc:
+            # A resolver blip: nothing starts this pass, nothing is stopped.
+            logger.warning("Driver pods not started this pass: %s", exc)
+        else:
+            problem = self.settings.cluster_problem(exchange)
+            if problem is not None:
+                logger.error(
+                    "Service-pod hosting refused: %s. Every driver pod is "
+                    "stopped and none starts.",
+                    problem,
+                )
+                for row in live:
+                    await self._stop(row, HOSTING_REFUSED, report)
+                report.refused.append(("installation", problem))
+                report.swept = await self._sweep()
+                return report
+
         # The connector's current generation for each bound (connector, digest).
         current: dict[tuple[str, str], tuple[str, bool, Mapping[str, Any]]] = {}
         for key, binding in bindings.items():
@@ -925,7 +993,7 @@ class ServiceHostingReconciler:
             for r in survivors
         }
         for key, (generation, private, connector) in current.items():
-            if (key[0], key[1], generation) in held:
+            if exchange is None or (key[0], key[1], generation) in held:
                 continue
             binding = bindings[key]
             async with self.store.acquire() as conn:
@@ -937,6 +1005,7 @@ class ServiceHostingReconciler:
                 connector,
                 generation=generation,
                 private_allowed=private,
+                exchange_address=exchange,
                 report=report,
             )
 
@@ -1109,6 +1178,7 @@ async def connector_egress_view(
 
 __all__ = [
     "CAPACITY",
+    "HOSTING_REFUSED",
     "IDLE",
     "LAUNCH_FAILED",
     "LAUNCH_REFUSED",

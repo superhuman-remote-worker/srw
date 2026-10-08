@@ -107,20 +107,23 @@ def parse_name_list(raw: str | None) -> frozenset[str]:
     return frozenset(item.strip() for item in (raw or "").split(",") if item.strip())
 
 
-def parse_cidr_list(raw: str | None) -> tuple[str, ...]:
-    """The cluster's pod and service ranges from a comma-separated list.
+def parse_cidr_list(
+    raw: str | None, *, default: tuple[str, ...] = DEFAULT_CLUSTER_CIDRS
+) -> tuple[str, ...]:
+    """Networks from a comma-separated list (the cluster's pod and service
+    ranges unless ``default`` says otherwise).
 
-    Unset or empty is k3s's defaults. A malformed entry is dropped with a
-    warning; when none is left the defaults stand, so a typo never opens the
-    cluster's own ranges to driver pods.
+    Unset or empty is ``default`` (k3s's defaults). A malformed entry is
+    dropped with a warning; when none is left the defaults stand, so a typo
+    never opens the cluster's own ranges to driver pods.
     """
     cidrs: list[str] = []
     for item in sorted(parse_name_list(raw)):
         try:
             cidrs.append(str(ipaddress.ip_network(item, strict=False)))
         except ValueError:
-            logger.warning("Cluster CIDR %r is not a network; ignoring it", item)
-    return tuple(cidrs) or DEFAULT_CLUSTER_CIDRS
+            logger.warning("CIDR %r is not a network; ignoring it", item)
+    return tuple(cidrs) or default
 
 
 def parse_session_subagent_fanout_lanes(raw: str | None) -> frozenset[str]:
@@ -233,6 +236,11 @@ class DeploymentSettings:
     connector_service_cluster_cidrs: tuple[str, ...] = DEFAULT_CLUSTER_CIDRS
     connector_service_private_tiers: frozenset[str] = DEFAULT_PRIVATE_TIERS
     connector_service_ipv6: bool = False
+    #: Ranges no driver pod may reach even where private addresses are
+    #: allowed (the cluster's nodes and load balancers), and this pod's own
+    #: address: hosting is refused unless it lies inside the cluster ranges.
+    connector_service_refused_cidrs: tuple[str, ...] = ()
+    connector_service_pod_ip: str = ""
     #: SRW's static driver shim image (``connectors.drivers.shim.image``):
     #: the canary wait, the shim install and every driver's command.
     connector_driver_shim_image: str = ""
@@ -337,6 +345,12 @@ class DeploymentSettings:
                 else DEFAULT_PRIVATE_TIERS
             ),
             connector_service_ipv6=_enabled("CONNECTOR_SERVICE_IPV6"),
+            connector_service_refused_cidrs=parse_cidr_list(
+                os.environ.get("CONNECTOR_SERVICE_REFUSED_CIDRS"), default=()
+            ),
+            connector_service_pod_ip=os.environ.get(
+                "CONNECTOR_SERVICE_POD_IP", ""
+            ).strip(),
             connector_driver_shim_image=os.environ.get(
                 "CONNECTOR_DRIVER_SHIM_IMAGE", ""
             ).strip(),

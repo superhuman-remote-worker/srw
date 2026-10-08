@@ -6,10 +6,12 @@ driver pod's declared egress is pinned when the pod is created:
 1. each declared host (``spec.egress``; ``${config.<key>}`` from the
    connector's config) is resolved once, A records (AAAA too on dual-stack
    clusters);
-2. every address is checked: the cluster's pod and service ranges, loopback,
-   link-local (cloud metadata included), multicast and reserved ranges are
-   always refused; private and home ranges (RFC 1918, CGNAT, IPv6 ULA) only
-   when the connector's projects' network tier allows them;
+2. every address is checked: the cluster's pod and service ranges, the
+   installation's refused ranges (its nodes and load balancers, by default
+   the private tiers' ``except`` lists), loopback, link-local (cloud
+   metadata included), multicast and reserved ranges are always refused;
+   private and home ranges (RFC 1918, CGNAT, IPv6 ULA) only when the
+   connector's projects' network tier allows them;
 3. the same answer goes into the pod's NetworkPolicy ``ipBlock``s and its
    ``hostAliases``, so the pod never resolves the name itself (no rebinding,
    no disagreeing resolver) and TLS still checks the name it dials;
@@ -101,15 +103,24 @@ class EgressPolicy:
     )
     allow_private: bool = False
     ipv6: bool = False
+    #: Ranges refused even where private addresses are allowed: the
+    #: cluster's nodes and load balancers (``servicePods.refusedCidrs``).
+    refused: tuple[IPNetwork, ...] = ()
 
     @classmethod
     def build(
-        cls, cluster_cidrs: Iterable[str], *, allow_private: bool, ipv6: bool = False
+        cls,
+        cluster_cidrs: Iterable[str],
+        *,
+        allow_private: bool,
+        ipv6: bool = False,
+        refused_cidrs: Iterable[str] = (),
     ) -> EgressPolicy:
         return cls(
             cluster_cidrs=tuple(ipaddress.ip_network(c) for c in cluster_cidrs),
             allow_private=allow_private,
             ipv6=ipv6,
+            refused=tuple(ipaddress.ip_network(c, strict=False) for c in refused_cidrs),
         )
 
 
@@ -251,6 +262,11 @@ def refusal(address: IPAddress | IPNetwork, policy: EgressPolicy) -> str | None:
     for cluster in policy.cluster_cidrs:
         if cluster.version == network.version and network.overlaps(cluster):
             return "is inside the cluster's pod or service range"
+    for refused in policy.refused:
+        if refused.version == network.version and network.overlaps(refused):
+            return (
+                "is in a range this installation refuses (its nodes and load balancers)"
+            )
     for refused, reason in _ALWAYS_REFUSED:
         if refused.version == network.version and network.overlaps(refused):
             return reason

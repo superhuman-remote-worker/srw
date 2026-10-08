@@ -117,6 +117,39 @@ def test_the_real_cluster_ranges_are_configurable():
     assert refusal(ipaddress.ip_address("10.42.0.1"), policy) is None
 
 
+def test_nodes_and_load_balancers_stay_refused_where_private_is_allowed():
+    """The home tier gives the LAN back, never the k3s nodes (apiserver
+    6443, kubelet 10250, etcd) or the MetalLB range."""
+    policy = EgressPolicy.build(
+        ["10.42.0.0/16", "10.43.0.0/16"],
+        allow_private=True,
+        refused_cidrs=["10.0.50.0/24", "10.0.51.0/24"],
+    )
+    for address in ("10.0.50.11", "10.0.51.200"):
+        found = refusal(ipaddress.ip_address(address), policy)
+        assert found is not None and "nodes and load balancers" in found
+    assert refusal(ipaddress.ip_network("10.0.0.0/16"), policy) is not None
+    assert refusal(ipaddress.ip_address("10.0.52.1"), policy) is None
+    assert refusal(ipaddress.ip_address("192.168.178.20"), policy) is None
+
+
+@pytest.mark.asyncio
+async def test_a_host_resolving_to_a_node_refuses_the_pod():
+    policy = EgressPolicy.build(
+        ["10.42.0.0/16", "10.43.0.0/16"],
+        allow_private=True,
+        refused_cidrs=["10.0.50.0/24"],
+    )
+    with pytest.raises(EgressRefused, match="10.0.50.3"):
+        await pin_egress(
+            [EgressRule("nas.home.example", (443,))],
+            {},
+            policy=policy,
+            resolver=resolver({"nas.home.example": ["192.168.178.5", "10.0.50.3"]}),
+            now=lambda: NOW,
+        )
+
+
 def test_a_network_overlapping_a_refused_range_is_refused():
     assert refusal(ipaddress.ip_network("0.0.0.0/0"), HOME) is not None
     assert (
@@ -280,6 +313,8 @@ def test_the_settings_never_lose_the_cluster_ranges():
     # A typo is dropped; with nothing left the defaults stand.
     assert parse_cidr_list("10.96.0.0/12,not-a-cidr") == ("10.96.0.0/12",)
     assert parse_cidr_list("nope") == ("10.42.0.0/16", "10.43.0.0/16")
+    # Refused ranges have no defaults of their own (the chart supplies them).
+    assert parse_cidr_list(None, default=()) == ()
 
 
 def test_the_environment_reaches_the_settings(monkeypatch):
@@ -289,7 +324,14 @@ def test_the_environment_reaches_the_settings(monkeypatch):
     monkeypatch.setenv("CONNECTOR_SERVICE_CLUSTER_CIDRS", "10.96.0.0/12")
     monkeypatch.setenv("CONNECTOR_SERVICE_PRIVATE_TIERS", "home-allowed,lab")
     monkeypatch.setenv("CONNECTOR_SERVICE_IPV6", "true")
+    monkeypatch.setenv("CONNECTOR_SERVICE_REFUSED_CIDRS", "10.0.50.0/24,10.0.51.0/24")
+    monkeypatch.setenv("CONNECTOR_SERVICE_POD_IP", "10.42.1.7")
     settings = DeploymentSettings.from_environment()
+    assert settings.connector_service_refused_cidrs == (
+        "10.0.50.0/24",
+        "10.0.51.0/24",
+    )
+    assert settings.connector_service_pod_ip == "10.42.1.7"
     assert settings.connector_service_pods_enabled is True
     assert settings.connector_service_enforcement_verified is False
     assert settings.connector_service_cluster_cidrs == ("10.96.0.0/12",)

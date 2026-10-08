@@ -291,6 +291,8 @@ def _settings(**over: Any) -> DeploymentSettings:
         connector_service_max_installation=3,
         connector_service_idle_seconds=60.0,
         connector_service_resources={"limits": {"memory": "128Mi"}},
+        connector_service_refused_cidrs=("10.0.50.0/24",),
+        connector_service_pod_ip="10.42.0.9",
     )
     values.update(over)
     return DeploymentSettings(**values)
@@ -306,6 +308,11 @@ def test_hosting_settings_come_from_the_deployment():
     assert policy.exchange_address == "10.43.0.20"
     assert policy.memory_limit == "128Mi"
     assert policy.cpu_limit == "500m"
+    assert settings.refused_cidrs == ("10.0.50.0/24",)
+    assert settings.pod_ip == "10.42.0.9"
+    assert settings.cluster_problem("10.43.0.20") is None
+    assert "10.43.0.20" not in (settings.cluster_problem("10.96.0.10") or "")
+    assert "Service address 10.96.0.10" in settings.cluster_problem("10.96.0.10")
 
 
 @pytest.mark.parametrize(
