@@ -146,3 +146,33 @@ class TestExpectations:
         assert any("egress enforced" in p for p in problems)
         assert any("carries a value" in p for p in problems)
         assert gate.matrix_problems(MATRIX, NAMES[1:])
+
+    def test_a_development_driver_must_be_labelled_development(self):
+        from orchestrator.services.connector_drivers import builtin_connector_drivers
+        from orchestrator.services.connector_drivers.matrix import capability_matrix
+        from shared.connectors.builtin import DEVELOPMENT_SPECS
+
+        development = frozenset(spec.name for spec in DEVELOPMENT_SPECS)
+        with_probe = json.loads(
+            json.dumps(capability_matrix(builtin_connector_drivers(lease_probe=True)))
+        )
+        # The k3d profile installs the lease probe: accepted, as development.
+        assert gate.matrix_problems(with_probe, NAMES, development) == []
+        assert [d["name"] for d in with_probe["drivers"] if gate.is_development(d)] == [
+            "srw.lease-probe/v1"
+        ]
+        # Without the development names it is a stranger, as before.
+        assert gate.matrix_problems(with_probe, NAMES)
+        # Labelled built-in and trusted, it is a product bug the gate names.
+        mislabelled = copy.deepcopy(with_probe)
+        mislabelled["drivers"][-1]["trust"] = {"tier": "builtin", "trusted": True}
+        assert gate.matrix_problems(mislabelled, NAMES, development) == [
+            "srw.lease-probe/v1 is not labelled development and untrusted"
+        ]
+        # A built-in labelled development is refused too.
+        demoted = copy.deepcopy(with_probe)
+        demoted["drivers"][0]["trust"]["tier"] = "development"
+        assert any(
+            "srw.env/v1 is not built-in" in p
+            for p in gate.matrix_problems(demoted, NAMES, development)
+        )

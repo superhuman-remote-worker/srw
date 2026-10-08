@@ -17,9 +17,12 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
   api        GET /api/datasources/drivers as the test account answers 200
              with one entry per built-in spec of this checkout, in order;
              every datasource driver has access levels, each with an
-             enforced_by line; built-ins are built-in and trusted; the
-             enforced and installation egress columns say "not applicable";
-             no credential slot schema carries a default or an example
+             enforced_by line; built-ins are built-in and trusted; a
+             development driver the deployment installs (the lease probe,
+             orchestrator.connectorLeases.probeDriver) may follow, labelled
+             development and untrusted (a NOTE names it); the enforced and
+             installation egress columns say "not applicable"; no credential
+             slot schema carries a default or an example
   page       Playwright: Settings -> Connector drivers lists every driver the
              API returns, each access level with its "Enforced by" line, and
              the Connectors page links to it
@@ -244,13 +247,36 @@ def link_expectation(
     return shape, read_write
 
 
-def matrix_problems(matrix: dict[str, Any], spec_names: list[str]) -> list[str]:
-    """Everything the API matrix gets wrong against this checkout's specs."""
+def is_development(driver: dict[str, Any]) -> bool:
+    """Whether the matrix labels a driver development-only (the lease probe)."""
+    return (driver.get("trust") or {}).get("tier") == "development"
+
+
+def matrix_problems(
+    matrix: dict[str, Any],
+    spec_names: list[str],
+    development_names: frozenset[str] = frozenset(),
+) -> list[str]:
+    """Everything the API matrix gets wrong against this checkout's specs.
+
+    The built-in specs are listed in order, each built-in and trusted. A
+    development driver (``DEVELOPMENT_SPECS``) may follow when the deployment
+    installs it, and must then be labelled development and untrusted; any
+    other driver is a problem.
+    """
     problems: list[str] = []
     drivers = matrix.get("drivers") or []
-    names = [driver.get("name") for driver in drivers]
+    names = [d.get("name") for d in drivers if d.get("name") not in development_names]
     if names != spec_names:
         problems.append(f"drivers {names} are not the built-in specs {spec_names}")
+    for driver in drivers:
+        name = driver.get("name")
+        trust = driver.get("trust") or {}
+        if name in development_names:
+            if not is_development(driver) or trust.get("trusted") is not False:
+                problems.append(f"{name} is not labelled development and untrusted")
+        elif trust.get("tier") != "builtin" or trust.get("trusted") is not True:
+            problems.append(f"{name} is not built-in and trusted")
     for driver in drivers:
         name = driver.get("name")
         levels = driver.get("access_levels") or []
@@ -261,8 +287,6 @@ def matrix_problems(matrix: dict[str, Any], spec_names: list[str]) -> list[str]:
             for level in levels
             if not (level.get("enforced_by") or "").strip()
         ]
-        if (driver.get("trust") or {}).get("tier") != "builtin":
-            problems.append(f"{name} is not built-in and trusted")
         egress = driver.get("egress") or {}
         for column in ("enforced", "installation"):
             if (egress.get(column) or {}).get("status") != "not_applicable":
@@ -309,6 +333,8 @@ class MatrixGate:
         self.matrix: dict[str, Any] = {}
         #: Set when the account lacks the publish grant (see reveal_publish).
         self.revealed = False
+        #: This checkout's DEVELOPMENT_SPECS names (set by the api check).
+        self.development: frozenset[str] = frozenset()
 
     def run(self) -> int:
         try:
@@ -370,15 +396,26 @@ class MatrixGate:
             return
         self.matrix = body
         sys.path.insert(0, str(ROOT / "src"))
-        from shared.connectors.builtin import BUILTIN_SPECS
+        from shared.connectors.builtin import BUILTIN_SPECS, DEVELOPMENT_SPECS
 
-        problems = matrix_problems(self.matrix, [spec.name for spec in BUILTIN_SPECS])
+        self.development = frozenset(spec.name for spec in DEVELOPMENT_SPECS)
+        problems = matrix_problems(
+            self.matrix, [spec.name for spec in BUILTIN_SPECS], self.development
+        )
         self.report.check(
-            "api: every built-in driver, levels with enforced_by, built-in trust, "
-            "egress not applicable, no slot values",
+            "api: every built-in driver, levels with enforced_by, built-in trust "
+            "(a development driver labelled development), egress not applicable, "
+            "no slot values",
             not problems,
             "; ".join(problems[:5]),
         )
+        installed = sorted(
+            d["name"] for d in self.matrix.get("drivers") or [] if is_development(d)
+        )
+        if installed:
+            self.report.note(
+                f"development drivers installed by this deployment: {installed}"
+            )
 
     def cockpit(self) -> None:
         try:
@@ -491,13 +528,27 @@ class MatrixGate:
         public = page.locator(".visibility-toggle input[type=checkbox]")
         public.check(timeout=30000)
         hints = json.loads(EN.read_text())["datasources"]["form"]
+        offered_types = set(
+            type_select.locator("option").evaluate_all("els => els.map(e => e.value)")
+        )
         problems: list[str] = []
         seen_literal: dict[str, list[str]] = {}
         for driver in self.matrix["drivers"]:
             kind = driver.get("legacy_type")
             # The form picks a stored type, so only the driver that owns it
-            # (not a variant such as srw.mcp-remote/v1) is the type's.
-            if not kind or kind in UNPUBLISHED_IN_FORM or not owns_type(driver):
+            # (not a variant such as srw.mcp-remote/v1) is the type's; a
+            # development driver (the lease probe) is in no catalogue. Its
+            # label is the api check's business, so either sign skips it.
+            if (
+                not kind
+                or kind in UNPUBLISHED_IN_FORM
+                or not owns_type(driver)
+                or is_development(driver)
+                or driver.get("name") in self.development
+            ):
+                continue
+            if kind not in offered_types:
+                problems.append(f"{kind}: the connector form offers no such type")
                 continue
             type_select.select_option(kind)
             choices, hint_key = picker_expectation(driver)
