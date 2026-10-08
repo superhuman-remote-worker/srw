@@ -421,6 +421,30 @@ def test_a_declared_dns_need_keeps_the_cluster_resolver():
     ]
 
 
+def test_the_vm_peer_matches_the_launcher_labels_the_chart_stamps():
+    """The VM peer selects exactly the labels the VM controller's VMI
+    template puts on every virt-launcher pod."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    configmap = (root / "helm/templates/vm-controller/configmap.yaml").read_text()
+    for line in (
+        "srw.io/component: agent-workspace",
+        'srw.io/owner-kind: "${OWNER_KIND}"',
+        'srw.io/owner-id: "${OWNER_ID}"',
+    ):
+        assert line in configmap
+    owner = "77777777-8888-4999-8aaa-bbbbbbbbbbbb"
+    peer = binding_ingress_policy(
+        _identity(), kind="job", owner_id=owner, policy=POLICY
+    )["spec"]["ingress"][0]["from"][1]
+    assert peer["podSelector"]["matchLabels"] == {
+        "srw.io/component": "agent-workspace",
+        "srw.io/owner-kind": "job",
+        "srw.io/owner-id": owner,
+    }
+
+
 def test_the_binding_ingress_policy_admits_one_workspace():
     owner = "77777777-8888-4999-8aaa-bbbbbbbbbbbb"
     policy = binding_ingress_policy(
@@ -452,7 +476,18 @@ def test_the_binding_ingress_policy_admits_one_workspace():
                                     "srw/thread-id": owner,
                                 }
                             },
-                        }
+                        },
+                        # A same-cluster VM workspace's virt-launcher pod.
+                        {
+                            "namespaceSelector": RELEASE,
+                            "podSelector": {
+                                "matchLabels": {
+                                    "srw.io/component": "agent-workspace",
+                                    "srw.io/owner-kind": "thread",
+                                    "srw.io/owner-id": owner,
+                                }
+                            },
+                        },
                     ],
                     "ports": [{"protocol": "TCP", "port": "srw-driver"}],
                 }
@@ -464,6 +499,11 @@ def test_the_binding_ingress_policy_admits_one_workspace():
     assert job["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"] == {
         "srw.io/component": "agent-workspace",
         "srw/job-id": owner,
+    }
+    assert job["spec"]["ingress"][0]["from"][1]["podSelector"]["matchLabels"] == {
+        "srw.io/component": "agent-workspace",
+        "srw.io/owner-kind": "job",
+        "srw.io/owner-id": owner,
     }
     with pytest.raises(ValueError):
         binding_ingress_policy(_identity(), kind="pod", owner_id=owner, policy=POLICY)

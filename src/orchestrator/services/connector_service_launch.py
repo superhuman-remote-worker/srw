@@ -549,7 +549,14 @@ def binding_ingress_policy(
     policy: ServiceLaunchPolicy,
 ) -> dict[str, Any]:
     """Ingress for one binding of a workspace-facing driver: only the bound
-    workspace (its ``srw/job-id`` or ``srw/thread-id``) on ``srw-driver``.
+    workspace on ``srw-driver``.
+
+    Two peers in the release namespace, both ``srw.io/component:
+    agent-workspace``: a container workspace pod carries ``srw/job-id`` or
+    ``srw/thread-id``; a same-cluster KubeVirt VM workspace's virt-launcher
+    pod carries the VMI template's ``srw.io/owner-kind`` and
+    ``srw.io/owner-id`` instead (``vmController`` VM template). A VM in a
+    remote VM cluster is not in this cluster and cannot reach the pod.
 
     A network rule, not a lease check: it bounds where a leaked lease token
     can be used.
@@ -584,7 +591,17 @@ def binding_ingress_policy(
                                     label: owner,
                                 }
                             },
-                        )
+                        ),
+                        _release_peer(
+                            policy,
+                            {
+                                "matchLabels": {
+                                    "srw.io/component": "agent-workspace",
+                                    "srw.io/owner-kind": kind,
+                                    "srw.io/owner-id": owner,
+                                }
+                            },
+                        ),
                     ],
                     "ports": _driver_port(),
                 }
