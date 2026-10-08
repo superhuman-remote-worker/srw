@@ -27,9 +27,15 @@ in a short-lived pod SRW starts for that purpose.
 What a driver can do in this release:
 
 - **Return data, never commands.** A bind returns environment variables and
-  credential files for the workspace. SRW writes them over its own channel.
-  No driver image gets a shell in a workspace, and nothing it returns may make
-  the workspace run code (see [what a binding may hold](#what-a-binding-may-hold)).
+  credential files for the workspace. SRW writes them over its own channel,
+  and no driver image gets a shell in a workspace. What it returns is still
+  data the workspace's programs read: SRW refuses the variable names on its
+  list of known tool hooks and the file locations whose formats run a
+  command (see [what a binding may hold](#what-a-binding-may-hold)), but that
+  list is a best-effort lint, not a sandbox. **The author of a driver image is
+  the trust boundary**, as the author of a workspace image is: register only
+  images whose authors you trust with the connector's credentials and with
+  what lands in your workspaces.
 - **Run unprivileged.** Its pod runs as the image's own user (root included),
   with every Linux capability dropped, no privilege escalation, seccomp
   `RuntimeDefault`, no ServiceAccount token and no ingress. Its egress is
@@ -96,10 +102,13 @@ An error line names a class:
 
 A bind that fails with any class but `transient` (or gives up retrying) is
 final for that Job or Session until the connector, its registration or its
-access changes: a Job fails with your `message` before it starts; a Session
-goes on without the connector, and its workspace README and the connector say
-why. `message` is what users see. `detail` goes to the operator log only;
-never put a secret in either.
+access changes: a Job fails before it starts; a Session goes on without the
+connector, and its workspace README and the connector say why. `message` is
+what the connector's owner and administrators see, with control characters
+removed and cut at 500 characters; everyone else (another project member's
+Job or Session, and its agent) reads "its driver reported an error" instead,
+so your text never reaches a workspace you were not trusted with. `detail`
+goes to the operator log only; never put a secret in either.
 
 The JSON Schemas of these messages ship with SRW:
 [`request.schema.json`](../src/shared/connectors/request.schema.json),
@@ -156,15 +165,20 @@ The rules SRW applies when you register:
 - **`delivery_forms`** lists what your bind returns: `env_file`,
   `credential_file` or both.
 - **`env_names`** lists every environment variable your bind may set, a
-  file's `env_var` included. A driver that returns `env_file` must declare
-  them, so whoever registers or uses your driver sees them first. None may be
-  a variable a driver may not set (see
+  file's `env_var` included, each at most 128 characters. A driver that
+  returns `env_file` must declare them: they are shown on the driver, on each
+  of its connectors and in the attach picker, before anyone attaches one.
+  None may be a variable a driver may not set (see
   [what a binding may hold](#what-a-binding-may-hold)).
 - **`config_schema`** is a JSON Schema (2020-12) for the connector's config.
   SRW validates every connector against it when it is saved, on its own
-  servers, so a registered schema holds no regular expression (`pattern`,
-  `patternProperties`, `format: regex`) and no `$ref` outside itself, and
-  stays under 32 KiB and 12 levels deep. Check a pattern in your `check`.
+  servers, so a registered schema holds no regular expression anywhere in
+  the document (`pattern`, `patternProperties`, `format: regex`, whatever key
+  holds them), a `$ref` points only at `#/$defs/<name>` or
+  `#/definitions/<name>` of the same document, no `$id`, `$anchor`,
+  `$dynamicAnchor`, `$dynamicRef` or `$recursiveRef` appears, `$schema` is
+  2020-12 or absent, and it stays under 32 KiB and 12 levels deep. Check a
+  pattern in your `check`.
 - **`credential_slots`** name the parts of the connector's credentials. Each
   slot's `schema` lists the keys it owns (the same schema rules apply); mark
   secrets `writeOnly`. A connector may only store keys some slot owns, and
@@ -211,27 +225,44 @@ def bind(request):
 ### What a binding may hold
 
 - `env_file` entries: `{"name": ..., "value": ...}`. The name is one your spec
-  declares in `env_names`. Two connectors may not set the same name. A driver
-  may not set a variable that can run code, redirect traffic or loosen TLS in
-  the workspace: SRW's own (`PATH`, `HOME`, `SRW_*`, `LD_*`, `PYTHON*`…), the
-  `GIT_*` and `SSH_*` families, every `*_PROXY` in any case, the CA and TLS
-  variables (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`…),
-  `KUBECONFIG`, `DOCKER_CONFIG`, `XDG_*`, `TMPDIR`, `HISTFILE`, editors and
-  pagers (`EDITOR`, `*PAGER`, `*EDITOR`, `LESSOPEN`, `BROWSER`), `*ASKPASS`,
-  the package managers' options (`NPM_CONFIG_*`, `PIP_*`, `UV_*`, `CARGO_*`,
-  `GOPROXY`…) and the runtimes' (`NODE_OPTIONS`, `PERL5*`, `RUBY*`,
-  `JAVA_TOOL_OPTIONS`, `DOTNET_*`, `BUN_*`…), `OPENSSL_CONF` and
-  `GLIBC_TUNABLES`. The full list is
-  [`env_names.py`](../src/shared/connectors/env_names.py). A value is a string
-  of at most 64 KiB without NUL bytes.
+  declares in `env_names`. SRW refuses the names on its list of known tool
+  hooks, compared in any case: SRW's own (`PATH`, `HOME`, `SRW_*`, `LD_*`,
+  `PYTHON*`…), the `GIT_*` and `SSH_*` families, every `*_PROXY`, the CA and
+  TLS variables (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`,
+  `NODE_EXTRA_CA_CERTS`…), `KUBECONFIG`, `DOCKER_*`, `XDG_*`, `TMPDIR`,
+  `HISTFILE`, shell prompts, editors and pagers (`PS1`, `EDITOR`, `*PAGER`,
+  `*EDITOR`, `LESSOPEN`, `*BROWSER`), `*ASKPASS`, every name ending in
+  `_OPTS`, `_OPTIONS`, `FLAGS`, `_COMMAND`, `_ARGS`, `RC`, `RCPATH`,
+  `_CONFIG`, `_CONFIG_FILE`, `_CONFIG_PATH`, `_CONFIG_DIR` or `_HOME`, and the
+  settings of the common runtimes, build tools and package managers
+  (`NODE_*`, `NPM_CONFIG_*`, `PIP_*`, `UV_*`, `CARGO_*`, `GRADLE_*`,
+  `MAVEN_*`, `YARN_*`, `COREPACK_*`, `ERL_*`, `ELIXIR_*`, `CMAKE_*`, `TF_*`,
+  `ANSIBLE_*`, `CLOUDSDK_*`, `JULIA_*`, `JUPYTER_*`, `DENO_*`, `BASH_*`,
+  `PERL5*`, `RUBY*`, `DOTNET_*`, `BUN_*`, `JAVA_HOME`, `CC`, `GOPROXY`…). The
+  full list is [`env_names.py`](../src/shared/connectors/env_names.py), the
+  one SRW's managed MCP servers are checked against too. It is a
+  best-effort lint against known hooks, not a sandbox: a tool it does not
+  know may read a name it does not list. Credential-shaped names
+  (`AWS_ACCESS_KEY_ID`, `PGPASSWORD`, `DATABASE_URL`, `GITHUB_TOKEN`,
+  `OPENAI_API_KEY`…) are yours to set. A value is a string of at most 64 KiB
+  without NUL bytes.
 - `credential_file` entries: `{"path": ..., "content": ..., "mode": 384,
-  "env_var": ...}`. The path is `~/.srw-files/…`, `~/.netrc` or `~/.pgpass`.
-  The other places a built-in credential file may land (`~/.kube/`, `~/.aws/`,
+  "env_var": ...}`. The path is `~/.srw-files/…`, `~/.netrc` or `~/.pgpass`,
+  at most 255 characters, and one binding writes each path once. The other
+  places a built-in credential file may land (`~/.kube/`, `~/.aws/`,
   `~/.docker/`, `~/.config/<app>/`) hold formats that run a command (a
   kubeconfig's `exec`, an AWS `credential_process`), which a driver's output
-  may not carry in this release. A file is never executable. `env_var`, when
+  may not carry in this release; for the same reason a `~/.netrc` may not
+  define a macro (`macdef`). A file is never executable. `env_var`, when
   set, names the file in the environment and follows the variable rules.
 - Every entry's `recipient` is `workspace`.
+
+A variable two connectors of one Job or Session would set is never
+delivered twice: when your binding sets a name an environment connector, a
+credential file's `env_var` or another registered driver's connector (the
+one with the lower connector id) already sets, a Session goes on without
+your connector and its README says which name and which connector; a Job is
+refused before it starts with the same reason.
 
 SRW checks the binding before anything reaches the workspace. A binding it
 won't deliver fails the bind with the reason on the connector, and SRW revokes
@@ -320,10 +351,13 @@ digest and records it with the spec it ran with:
   refused with "The image behind … changed its contract (…): pin a digest or
   register a new driver major." when the new image has no label, declares
   another name or plane, changes the protocol major, drops a credential slot,
-  adds a required one or changes one's schema, sets new environment names,
-  returns new forms or reaches new egress, or the connector's stored config no
-  longer validates. Release breaking changes under a new name (`…/v2`). An
-  image without a label stays at the digest it was registered at.
+  an access level or a workspace backend, adds a required slot or changes
+  one's schema, sets new environment names, returns new forms, reaches new
+  egress or newly needs DNS, or the connector's stored config no longer
+  validates. Release breaking changes under a new name (`…/v2`). An image
+  without a label binds only while the tag still points at the registered
+  digest: SRW cannot read a moved image's contract, so it refuses it; pin a
+  digest, or add the label.
 - When the registry can't be reached, a bind reuses the digest it resolved
   last, and the connector's `driver_status.last_bind.stale` says so.
 
@@ -350,9 +384,13 @@ curl -X POST "$SRW/api/connector-drivers" -H "Authorization: Bearer $TOKEN" \
 
 Leave `scope` out for your Account. `GET /api/connector-drivers` lists the
 registrations you can see (an administrator may also read another user's by
-id, for support). `POST /api/connector-drivers/<id>/disable` is the kill
-switch: the driver binds nothing new, SRW revokes every live binding of it,
-and its connectors show "registration disabled"; `/enable` undoes it.
+id, for support); each says whether you may manage it (`can_manage`) and,
+if you may, how many connectors use it and how many of its bindings are live
+(`usage`). `POST /api/connector-drivers/<id>/disable` is the kill switch: the
+driver binds nothing new, SRW revokes every live binding of it, and its
+connectors show "registration disabled"; `/enable` undoes it. The cockpit
+offers Disable and Delete only to those who may use them and asks before a
+Disable, naming the live bindings it revokes.
 `DELETE /api/connector-drivers/<id>` removes a registration once SRW revoked
 all its bindings, if no connector uses it or it is disabled.
 
@@ -395,7 +433,11 @@ linked at their paths. Detach it from a live Session and SRW runs your
 pinned Session stops setting its variables for new commands (a stateless
 Session keeps them set, holding the revoked credential, until it ends).
 Change its config or credentials and every binding of it is revoked; the next
-delivery binds again. **Test connection** runs your `check`.
+delivery binds again. A Job or Session that no longer selects the connector,
+or may no longer use it (its owner left the project, the connector's project
+link was removed), has its binding revoked within a reconciler pass
+(`access_lost`), a paused Job's included. **Test connection** runs your
+`check`.
 `GET /api/datasources/<id>` shows the registration and how the last bind went
 in `driver_status`.
 
@@ -449,6 +491,9 @@ registrations.
 | "the driver image could not be pulled (ErrImagePull)" | The registry refused the pull, or the image is gone. | Check the reference and that the registry serves it without credentials. |
 | "The connector driver did not answer: …" | The pod never posted: the program crashed before writing, or the deadline passed. | Read the pod's events and log in the connector namespace; run the image with the test kit. |
 | `driver_status.notice` is "registration disabled" | Someone disabled the registration. | Ask its owner, or move the connector to another driver. |
+| A Session's README says "Not delivered: it sets X, which connector Y sets too", or a Job failed with it | Two connectors of the execution set the same variable. | Detach one, or change the variable one of them sets. |
+| `last_bind.message` says "its driver reported an error (the connector's owner sees …)" | The driver's own message is shown to the connector's owner and administrators only. | Ask the connector's owner. |
+| A `connector_driver_revoke_abandoned` security event; a binding's `revoke_error` says "gave up after …" | SRW could not revoke what the driver minted (12 transient failures, or a final error). It may still be live upstream. | Revoke it upstream by hand; the event names the binding, connector and registration. |
 
 ## For operators
 
@@ -463,5 +508,8 @@ registrations.
 | `connectors.servicePods.quota.bindTimePods` | `10` | Live bind-time pods; the orchestrator refuses past it with a clear message, and the namespace quota is the backstop. |
 
 Registration is never an admission control: any image may be a driver, as any
-image may be a workspace. The control is privilege, which custom images don't
-get, and what a driver's output may do in a workspace, which SRW checks.
+image may be a workspace. The controls are privilege, which custom images don't
+get, and a best-effort check of what a driver's output may set in a
+workspace; beyond them the image's author is the trust boundary, as a
+workspace image's is. Disable is the kill switch when one turns out not to
+be trustworthy.

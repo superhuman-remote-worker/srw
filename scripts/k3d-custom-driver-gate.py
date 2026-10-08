@@ -145,6 +145,7 @@ import time
 import urllib.request
 import zlib
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -185,6 +186,19 @@ TOKEN_FILE = "~/.srw-files/example/token"
 EXCHANGE_PATH = "/v1/leases/exchange"
 INTROSPECT_PATH = "/v1/leases/introspect"
 RESULT_PATH = "/v1/drivers/result"
+#: A pinned session's agent serves its WebSocket here (the settings pane's).
+AGENT_PORT = 8001
+#: The largest WebSocket frame the live-update reader accepts.
+WS_MAX_FRAME = 8 << 20
+#: What the workspace script prints for a variable that is not set.
+EMPTY_SHA = hashlib.sha256(b"").hexdigest()
+#: The orchestrator's log line when the dispatcher hands a job on, per lane:
+#: after the bind gate let it through.
+DISPATCH_LINES = {
+    "pinned": "Dispatch: assigned job {job}",
+    "stateless": "Dispatcher: admitted stateless worker job {job}",
+}
+_POD_NAME_RE = re.compile(r"[a-z0-9]([-a-z0-9]{0,251}[a-z0-9])?\Z")
 #: The example driver's misbehaviours (its ``misbehave`` config) and the
 #: reason SRW gives for refusing each binding.
 REFUSALS = {
@@ -629,6 +643,127 @@ print(json.dumps({"answers": answers}))
 )
 
 
+# A cockpit-like WebSocket on a pinned session's agent pod sends one live
+# ``config.update`` (the settings pane's frame) and prints the answer with the
+# same request id: ``config.changed`` or ``error``. Names only come back.
+_LIVE_UPDATE_PROGRAM = (
+    _POD_MEMORY_CAP
+    + r"""
+import asyncio, json, sys, urllib.error, urllib.parse, urllib.request
+import websockets
+cap_memory()
+r = json.loads(sys.stdin.readline())
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# A session still attaching answers /connection with 409 or 425, or closes
+# the socket with 4500 or 4503: the gate retries those, nothing else.
+RETRY_STATUS = (409, 425)
+RETRY_CLOSE = (4500, 4503)
+def session_token():
+    form = urllib.parse.urlencode({
+        "grant_type": "password", "client_id": r["client_id"], "scope": "openid",
+        "username": r["username"], "password": r["password"],
+    }).encode()
+    with opener.open(r["token_url"], data=form, timeout=30) as response:
+        bearer = json.load(response)["id_token"]
+    request = urllib.request.Request(
+        "http://localhost:8085/api/sessions/%s/connection" % r["thread"],
+        headers={"Authorization": "Bearer " + bearer},
+    )
+    with opener.open(request, timeout=60) as response:
+        return json.load(response)["token"]
+def retry(reason):
+    print(json.dumps({"outcome": "retry", "reason": reason}))
+async def update():
+    try:
+        token = await asyncio.to_thread(session_token)
+    except urllib.error.HTTPError as error:
+        if error.code in RETRY_STATUS:
+            return retry("connection %d" % error.code)
+        raise
+    url = "ws://%s:%d/p/%s/ws?t=%s" % (r["ip"], r["port"], r["thread"], token)
+    loop = asyncio.get_running_loop()
+    async with websockets.connect(
+        url, max_size=r["max_size"], open_timeout=30
+    ) as ws:
+        await ws.send(json.dumps({
+            "method": "config.update", "config": {},
+            "datasource_ids": r["datasource_ids"], "request_id": r["request_id"],
+        }))
+        deadline = loop.time() + r["timeout"]
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                print(json.dumps({"outcome": "timeout"}))
+                return
+            try:
+                raw = await asyncio.wait_for(ws.recv(), remaining)
+            except asyncio.TimeoutError:
+                continue
+            try:
+                frame = json.loads(raw)
+            except ValueError:
+                continue
+            params = frame.get("params") if isinstance(frame, dict) else None
+            if not isinstance(params, dict):
+                continue
+            if params.get("request_id") != r["request_id"]:
+                continue
+            if frame.get("method") in ("config.changed", "error"):
+                print(json.dumps({
+                    "outcome": frame["method"],
+                    "message": params.get("message"),
+                }))
+                return
+async def main():
+    try:
+        await update()
+    except websockets.exceptions.ConnectionClosed as error:
+        received = getattr(error, "rcvd", None)
+        code = getattr(received, "code", None) or getattr(error, "code", None)
+        if code in RETRY_CLOSE:
+            return retry("closed %s" % code)
+        raise
+    except websockets.exceptions.InvalidHandshake as error:
+        response = getattr(error, "response", None)
+        status = getattr(error, "status_code", None) or getattr(
+            response, "status_code", None
+        )
+        if status in RETRY_STATUS or status == 503:
+            return retry("handshake %s" % status)
+        raise
+asyncio.run(main())
+"""
+)
+
+
+def parse_instant(text: str) -> datetime | None:
+    """An RFC 3339 instant (a row's timestamp, a log line's prefix) as an
+    aware datetime; nanoseconds are cut to what datetime holds."""
+    text = text.strip().replace("Z", "+00:00")
+    match = re.fullmatch(r"(.*T\d\d:\d\d:\d\d)(\.\d+)?([+-]\d\d:\d\d)?", text)
+    if match is None:
+        return None
+    head, fraction, offset = match.groups()
+    fraction = (fraction or "")[:7]
+    try:
+        instant = datetime.fromisoformat(head + fraction + (offset or "+00:00"))
+    except ValueError:
+        return None
+    return instant.astimezone(timezone.utc)
+
+
+def dispatched_at(logs: str, job: str, lane: str) -> datetime | None:
+    """When the orchestrator's log (``kubectl logs --timestamps``) says the
+    dispatcher handed ``job`` on in ``lane``: the earliest such line."""
+    needle = DISPATCH_LINES[lane].format(job=job)
+    found = [
+        instant
+        for line in logs.splitlines()
+        if needle in line and (instant := parse_instant(line.split(" ", 1)[0]))
+    ]
+    return min(found) if found else None
+
+
 def parse_denyprobe(log: str) -> bool:
     """Whether the default deny held in the probe's last rounds."""
     verdicts = [
@@ -1039,11 +1174,15 @@ PLAN = [
     "(binding_refused); a bound connector deleted is still revoked "
     "(connector_deleted) with the inputs of its bind",
     "pinned: a pinned session binds and delivers; a driver that fails for good "
-    "leaves it usable, with the notice in its README and on the connector",
-    "job: a job is held until its bind ends, receives the binding, and its "
-    "binding is revoked when it ends (execution_ended)",
+    "leaves it usable, with the notice in its README and on the connector; a "
+    "live detach over its WebSocket revokes the binding and unsets "
+    "EXAMPLE_TOKEN in its workspace; attaching it live again binds anew",
+    "job: a job is held until its bind ends (the dispatcher's log hands it on "
+    "at or after bound_at), receives the binding, and its binding is revoked "
+    "when it ends (execution_ended)",
     "disable: disabling the registration revokes its live bindings "
-    "(registration_disabled) and refuses new binds; the viewer may not",
+    "(registration_disabled) and refuses new binds; the pinned session's next "
+    "delivery unsets EXAMPLE_TOKEN with a notice; the viewer may not",
     "cleanup: jobs, sessions, connectors, registrations, project, accounts, "
     "OAuth client, probe pod, registry tags and image rows are gone; no "
     "binding of the run's connectors is unrevoked; no driver-namespace object "
@@ -1891,6 +2030,141 @@ class CustomDriverGate:
     def job_status(self, job: str) -> str:
         return sql(f"SELECT status FROM jobs WHERE id = {lit(job)}")
 
+    # -- a pinned session's live selection ---------------------------------------
+    def pinned_assignment(self, thread: str) -> dict[str, str] | None:
+        """The agent a pinned thread is assigned to: ``hostname``, ``pod_ip``
+        (a pooled pinned pod carries no thread label)."""
+        row = sql(
+            "SELECT coalesce(json_build_object('hostname', a.hostname, "
+            "'pod_ip', a.pod_ip)::text, '') FROM threads t JOIN agents a ON "
+            f"a.id = t.agent_id WHERE t.id = {lit(thread)}"
+        )
+        if not row:
+            return None
+        assignment = json.loads(row)
+        hostname = str(assignment.get("hostname") or "")
+        if not _POD_NAME_RE.fullmatch(hostname):
+            return None
+        return {"hostname": hostname, "pod_ip": str(assignment.get("pod_ip") or "")}
+
+    def pinned_ip(self, thread: str) -> str:
+        """The pod IP of the running, ready agent pod ``thread`` is assigned to."""
+
+        def probe() -> str | None:
+            assignment = self.pinned_assignment(thread)
+            if assignment is None:
+                return None
+            rc, out, _err = run(
+                K + ["get", "pod", assignment["hostname"], "-o", "json"], timeout=60
+            )
+            if rc:
+                return None
+            status = json.loads(out).get("status", {})
+            ready = status.get("phase") == "Running" and all(
+                item.get("ready") for item in status.get("containerStatuses") or [{}]
+            )
+            ip = str(status.get("podIP") or "")
+            if not ready or not ip:
+                return None
+            if assignment["pod_ip"] and assignment["pod_ip"] != ip:
+                return None
+            return ip
+
+        return wait_for(f"pinned agent pod of {thread}", probe, timeout=600)
+
+    def live_update(self, thread: str, labels: list[str], label: str) -> dict:
+        """One live ``config.update`` selecting ``labels``' connectors, over
+        the pinned session's own WebSocket (as the settings pane sends it);
+        retried while the session still attaches."""
+
+        def ready() -> bool:
+            status, body = self.owner.call("GET", f"/api/sessions/{thread}/connection")
+            if status == 200:
+                return True
+            if status in (409, 425):
+                return False
+            raise GateError(f"/connection answered HTTP {status}: {str(body)[:200]}")
+
+        wait_for(
+            f"session {thread} admitted by /connection",
+            ready,
+            timeout=self.args.turn_timeout,
+            interval=5,
+        )
+
+        def attempt() -> dict | None:
+            result = in_pod(
+                ORCHESTRATOR,
+                ORCHESTRATOR_CONTAINER,
+                _LIVE_UPDATE_PROGRAM,
+                {
+                    "username": self.owner.username,
+                    "password": self.owner.password,
+                    "client_id": self.owner.client_id,
+                    "token_url": KEYCLOAK_TOKEN_URL,
+                    "thread": thread,
+                    "ip": self.pinned_ip(thread),
+                    "port": AGENT_PORT,
+                    "datasource_ids": [self.connectors[name] for name in labels],
+                    "request_id": f"{self.gate_id}-{label}",
+                    "timeout": self.args.turn_timeout,
+                    "max_size": WS_MAX_FRAME,
+                },
+                timeout=self.args.turn_timeout + 90,
+            )
+            if result.get("outcome") == "retry":
+                return None
+            if result.get("outcome") == "error" and "No active session" in str(
+                result.get("message")
+            ):
+                return None
+            return result
+
+        result = wait_for(
+            f"live {label} answered",
+            attempt,
+            timeout=self.args.turn_timeout,
+            interval=10,
+        )
+        print(f"live {label}: {json.dumps(result)[:300]}", flush=True)
+        return result
+
+    def unset(self, selector: str) -> dict[str, str]:
+        """The workspace's facts once the minted variable is no longer set
+        (its environment files, sourced, leave it empty); ``{}`` when it
+        stays set."""
+        pod = self.workspace_pod(selector)
+
+        def probe() -> dict | None:
+            facts = self.workspace_facts(pod)
+            return facts if facts.get("value_sha") == EMPTY_SHA else None
+
+        try:
+            return wait_for(
+                f"the minted variable gone from {selector}'s workspace",
+                probe,
+                timeout=self.args.turn_timeout,
+                interval=5,
+            )
+        except GateError:
+            return {}
+
+    def dispatch_instant(self, job: str, since: float) -> datetime | None:
+        """When the orchestrator handed ``job`` on (its log, with timestamps)."""
+        rc, logs, _err = run(
+            K
+            + [
+                "logs",
+                ORCHESTRATOR,
+                "-c",
+                ORCHESTRATOR_CONTAINER,
+                "--timestamps",
+                f"--since={max(60, int(time.time() - since) + 60)}s",
+            ],
+            timeout=120,
+        )
+        return dispatched_at(logs, job, self.args.job_lane) if rc == 0 else None
+
     def answered(self, thread: str) -> bool:
         """Whether the session answered a turn (an assistant message)."""
         try:
@@ -2263,6 +2537,37 @@ class CustomDriverGate:
             "pinned: the session stays usable: it answers its turn",
             self.answered(thread),
         )
+        if row["status"] == "bound":
+            detached = self.live_update(thread, ["fail"], "detach")
+            retired = self.revoked(row["id"])
+            facts = self.unset(f"srw/thread-id={thread}")
+            self.report.check(
+                "pinned: a live detach over the session's WebSocket revokes the "
+                "binding (connector_detached) and unsets EXAMPLE_TOKEN in its "
+                "workspace",
+                detached.get("outcome") == "config.changed"
+                and retired is not None
+                and retired.get("revoke_reason") == "connector_detached"
+                and not retired.get("revoke_error")
+                and bool(facts),
+                json.dumps({"update": detached, "revoked": retired})[:400],
+            )
+            attached = self.live_update(thread, ["example", "fail"], "attach")
+            again = self.settled(thread)
+            facts = (
+                self.delivered(f"srw/thread-id={thread}", again["id"])
+                if again["status"] == "bound"
+                else {}
+            )
+            self.report.check(
+                "pinned: attaching it live again binds anew and delivers the "
+                "new binding's variable",
+                attached.get("outcome") == "config.changed"
+                and again["id"] != row["id"]
+                and again["status"] == "bound"
+                and bool(facts),
+                json.dumps({"update": attached, "status": again["status"]})[:300],
+            )
         since = max(60, int(time.time() - started) + 30)
         rc, logs, _err = run(
             K
@@ -2283,6 +2588,7 @@ class CustomDriverGate:
 
     # -- job -------------------------------------------------------------------------
     def job_checks(self) -> None:
+        created = time.time()
         job = self.create_job("job", ["example"])
         row = self.settled(job, kind="job")
         claimed = sql(
@@ -2296,6 +2602,25 @@ class CustomDriverGate:
         )
         if row["status"] != "bound":
             return
+        bound_at = parse_instant(str(row.get("bound_at") or ""))
+        handed_on = wait_for(
+            f"the dispatcher hands job {job} on",
+            lambda: self.dispatch_instant(job, created),
+            timeout=self.args.turn_timeout,
+            interval=5,
+        )
+        self.report.check(
+            f"job: the dispatcher held the {self.args.job_lane} job until its "
+            "bind ended (its log hands it on at or after bound_at)",
+            bound_at is not None and handed_on >= bound_at,
+            json.dumps(
+                {
+                    "bound_at": str(bound_at),
+                    "handed_on": str(handed_on),
+                    "line": DISPATCH_LINES[self.args.job_lane],
+                }
+            ),
+        )
         facts = self.delivered(f"srw/job-id={job}", row["id"])
         self.report.check(
             "job: its workspace received the variable the driver minted for it",
@@ -2373,6 +2698,19 @@ class CustomDriverGate:
             "disable: the connector says its registration is disabled",
             self.driver_status("example").get("notice") == "registration disabled",
         )
+        pinned = self.threads.get("pinned")
+        if live is not None and pinned:
+            redelivered = self.live_update(pinned, ["example", "fail"], "redeliver")
+            facts = self.unset(f"srw/thread-id={pinned}")
+            lines = self.noticed(f"srw/thread-id={pinned}", ["disabled"])
+            self.report.check(
+                "disable: the pinned session's next delivery unsets EXAMPLE_TOKEN "
+                "and its README says the connector's registration is disabled",
+                redelivered.get("outcome") == "config.changed"
+                and bool(facts)
+                and any("disabled" in line for line in lines),
+                json.dumps({"update": redelivered, "notices": lines})[:400],
+            )
         seen_before = set(self.watch.pods if self.watch else ())
         thread = self.create_session("disabled", ["example"])
         row = self.settled(thread)

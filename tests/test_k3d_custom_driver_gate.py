@@ -25,6 +25,7 @@ PROGRAMS = {
     "keycloak": gate._KEYCLOAK_PROGRAM,
     "hash": gate._HASH_PROGRAM,
     "exchange": gate._EXCHANGE_PROGRAM,
+    "live update": gate._LIVE_UPDATE_PROGRAM,
 }
 DIGEST = "sha256:" + "ab" * 32
 CONNECTOR = "66666666-7777-4888-8999-aaaaaaaaaaaa"
@@ -475,3 +476,57 @@ def test_the_default_deny_probe_verdict_is_its_last_rounds():
     assert gate.parse_denyprobe(raced) is True
     unenforced = "\n".join(["canary=closed"] * 2 + ["canary=open"] * 10)
     assert gate.parse_denyprobe(unenforced) is False
+
+
+def test_instants_read_from_rows_and_kubectl_log_prefixes():
+    assert gate.parse_instant("2026-10-08T18:18:30.216885+00:00") == datetime(
+        2026, 10, 8, 18, 18, 30, 216885, tzinfo=timezone.utc
+    )
+    assert gate.parse_instant("2026-10-08T18:18:30.216885123Z") == datetime(
+        2026, 10, 8, 18, 18, 30, 216885, tzinfo=timezone.utc
+    )
+    assert gate.parse_instant("2026-10-08T20:18:30+02:00") == datetime(
+        2026, 10, 8, 18, 18, 30, tzinfo=timezone.utc
+    )
+    assert gate.parse_instant("not a time") is None
+
+
+@pytest.mark.parametrize(
+    ("lane", "line"),
+    [
+        ("pinned", "INFO Dispatch: assigned job {job} (priority=0) to agent a1"),
+        ("stateless", "INFO Dispatcher: admitted stateless worker job {job} (queue=x)"),
+    ],
+)
+def test_the_job_is_handed_on_at_its_dispatcher_line(lane, line):
+    job = CONNECTOR
+    logs = "\n".join(
+        [
+            "2026-10-08T18:18:31.000000001Z " + line.format(job=job),
+            "2026-10-08T18:18:29.500000000Z INFO something else about " + job,
+            "2026-10-08T18:18:40.000000000Z " + line.format(job=job),
+            "2026-10-08T18:18:20.000000000Z " + line.format(job=OPERATION),
+        ]
+    )
+    assert gate.dispatched_at(logs, job, lane) == datetime(
+        2026, 10, 8, 18, 18, 31, tzinfo=timezone.utc
+    )
+    assert gate.dispatched_at("", job, lane) is None
+
+
+def test_the_dispatcher_lines_are_the_orchestrator_s():
+    """The gate's needles are the log lines the dispatcher writes."""
+    control = (ROOT / "src/orchestrator/services/job_control_delivery.py").read_text()
+    dispatcher = (ROOT / "src/orchestrator/services/job_dispatcher.py").read_text()
+    assert '"Dispatch: assigned job %s (priority=%s) to agent %s"' in control
+    assert '"Dispatcher: admitted stateless worker job %s (queue=%s)"' in dispatcher
+    assert set(gate.DISPATCH_LINES) == {"pinned", "stateless"}
+
+
+def test_an_unset_variable_is_the_empty_value_s_hash():
+    """The workspace script prints sha256 of an empty value for an unset
+    variable (``${EXAMPLE_TOKEN:-}``)."""
+    import hashlib
+
+    assert gate.EMPTY_SHA == hashlib.sha256(b"").hexdigest()
+    assert "${EXAMPLE_TOKEN:-}" in gate._WORKSPACE_SCRIPT

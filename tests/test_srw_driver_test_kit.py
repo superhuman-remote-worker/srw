@@ -112,6 +112,37 @@ class TestTheExampleDriver:
         # A bind without the token is the driver's credentials error.
         assert "credentials error" in failures["bind"][0]
 
+    def test_its_revoke_fails_without_the_driver_state_of_its_bind(self, tmp_path):
+        """The k3d gate relies on this: a revoke SRW ran without the
+        driver_state its bind returned is an error, never a quiet success."""
+        import os
+        import subprocess
+
+        request = tmp_path / "request.json"
+        request.write_text(
+            json.dumps(
+                {
+                    "protocol_version": "1.0",
+                    "operation": "revoke",
+                    "binding_id": "6f0d3a52-0d5c-4a4b-9a43-0b8d0a8b2f01",
+                    "connector": {"config": {"file": True}, "access": "ReadWrite"},
+                    "credentials": {"token": "a-test-token"},
+                }
+            )
+        )
+        done = subprocess.run(
+            [sys.executable, str(EXAMPLE / "srw_example_driver.py")],
+            env={**os.environ, "SRW_REQUEST_FILE": str(request)},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert done.returncode == 1
+        (line,) = [json.loads(text) for text in done.stdout.splitlines()]
+        assert line["type"] == "error"
+        assert line["error"]["class"] == "system"
+        assert "driver_state" in line["error"]["message"]
+
     def test_the_image_runs_the_driver_as_a_non_root_user(self):
         dockerfile = (ROOT / "docker/Dockerfile.driver-example").read_text()
         assert (

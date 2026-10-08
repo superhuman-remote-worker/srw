@@ -113,13 +113,16 @@ def revoke(request: dict[str, Any]) -> int:
     if not token:
         return error("credentials", "Revoke needs the token the binding was made with")
     state = request.get("driver_state")
-    if state is not None:
-        try:
-            named = json.loads(state).get("minted")
-        except (ValueError, AttributeError):
-            named = None
-        if named != fingerprint(minted(token, request["binding_id"])):
-            return error("system", "The driver_state does not name this binding")
+    if state is None:
+        # SRW hands back what the bind returned; without it a real driver
+        # could not find what it minted. The gate relies on this failing.
+        return error("system", "Revoke needs the driver_state its bind returned")
+    try:
+        named = json.loads(state).get("minted")
+    except (ValueError, AttributeError):
+        named = None
+    if named != fingerprint(minted(token, request["binding_id"])):
+        return error("system", "The driver_state does not name this binding")
     # Nothing minted here outlives the binding: already gone is success.
     return result({})
 
