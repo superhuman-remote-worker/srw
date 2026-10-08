@@ -1588,6 +1588,13 @@ jobs:
         run: |
           go vet ./...
           go test -count=1 ./...
+      # The in-pod plane's FUSE opener (connector drivers D7, spike
+      # prototype): tested here; its images wait for D7 proper.
+      - name: Vet and test the FUSE opener
+        working-directory: drivers/fuse-opener
+        run: |
+          go vet ./...
+          go test -count=1 -race ./...
       - uses: docker/setup-buildx-action@v3
         with:
           buildkitd-config-inline: |

@@ -620,6 +620,8 @@ jobs:
       driver-shim: ${{ steps.check.outputs.driver-shim }}
       driver-mcp-front: ${{ steps.check.outputs.driver-mcp-front }}
       driver-git-swap: ${{ steps.check.outputs.driver-git-swap }}
+      # The in-pod plane's FUSE opener (D7): tested only, no image yet.
+      in-pod-mount: ${{ steps.check.outputs.in-pod-mount }}
       workspace: ${{ steps.check.outputs.workspace }}
       # Per-component image identity: full sha of the newest commit that
       # touched the component's build inputs. Consumed by the build jobs
@@ -635,6 +637,7 @@ jobs:
       driver-shim-sha: ${{ steps.check.outputs.driver-shim-sha }}
       driver-mcp-front-sha: ${{ steps.check.outputs.driver-mcp-front-sha }}
       driver-git-swap-sha: ${{ steps.check.outputs.driver-git-swap-sha }}
+      in-pod-mount-sha: ${{ steps.check.outputs.in-pod-mount-sha }}
       vm-base-sha: ${{ steps.check.outputs.vm-base-sha }}
       vm-base-stage1-sha: ${{ steps.check.outputs.vm-base-stage1-sha }}
       chart: ${{ steps.check.outputs.chart }}
@@ -929,6 +932,18 @@ jobs:
           DRIVER_GIT_SWAP_SHA=$(last_input_sha "${DRIVER_GIT_SWAP_PATHS[@]}")
           DRIVER_GIT_SWAP=$(image_missing driver-git-swap "$DRIVER_GIT_SWAP_SHA")
 
+          # The in-pod plane's FUSE opener (D7, spike prototype): one static Go
+          # binary, stdlib only. Its images wait for D7 proper, so no image
+          # answers "changed": the push range does (as for the chart below),
+          # and a range that cannot be resolved tests it.
+          IN_POD_MOUNT_PATHS=(drivers/fuse-opener/ .dockerignore docker/Dockerfile.in-pod-mount)
+          IN_POD_MOUNT_SHA=$(last_input_sha "${IN_POD_MOUNT_PATHS[@]}")
+          if [ -z "${RANGE_BASE:-}" ] || [ -n "$(git diff --name-only "$RANGE_BASE" HEAD -- "${IN_POD_MOUNT_PATHS[@]}" .github/workflows/develop.yml)" ]; then
+            IN_POD_MOUNT="true"
+          else
+            IN_POD_MOUNT="false"
+          fi
+
           AGENT_SHA=$(last_input_sha "${AGENT_PATHS[@]}")
           AGENT=$(image_missing agent "$AGENT_SHA")
 
@@ -1032,6 +1047,7 @@ jobs:
           echo "  vm-preparer=$VM_PREPARER  driver-shim=$DRIVER_SHIM (${DRIVER_SHIM_SHA::7})"
           echo "  driver-mcp-front=$DRIVER_MCP_FRONT (${DRIVER_MCP_FRONT_SHA::7})"
           echo "  driver-git-swap=$DRIVER_GIT_SWAP (${DRIVER_GIT_SWAP_SHA::7})"
+          echo "  in-pod-mount=$IN_POD_MOUNT (${IN_POD_MOUNT_SHA::7})"
           echo "  vm input shas: vm-controller=${VM_CONTROLLER_SHA::7} vm-base=${VM_BASE_SHA::7} vm-base-stage1=${VM_BASE_STAGE1_SHA::7}"
           echo "  chart=$CHART"
           echo "  input shas: agent=${AGENT_SHA::7} orchestrator=${ORCHESTRATOR_SHA::7} cockpit=${COCKPIT_SHA::7} mcp=${MCP_SHA::7} workspace=${WORKSPACE_SHA::7}"
@@ -1057,6 +1073,8 @@ jobs:
             echo "driver-mcp-front-sha=$DRIVER_MCP_FRONT_SHA"
             echo "driver-git-swap=$DRIVER_GIT_SWAP"
             echo "driver-git-swap-sha=$DRIVER_GIT_SWAP_SHA"
+            echo "in-pod-mount=$IN_POD_MOUNT"
+            echo "in-pod-mount-sha=$IN_POD_MOUNT_SHA"
             echo "vm-base=$VM_BASE"
             echo "vm-base-sha=$VM_BASE_SHA"
             echo "vm-base-stage1=$VM_BASE_STAGE1"
@@ -2274,6 +2292,30 @@ jobs:
           cache: false
       - name: Vet and test the MCP test server
         working-directory: drivers/mcp-test
+        run: |
+          go vet ./...
+          go test -count=1 -race ./...
+
+  # The in-pod plane's FUSE opener (connector drivers D7, spike prototype):
+  # vetted and tested with the toolchain docker/Dockerfile.in-pod-mount
+  # builds with. Its images and the chart's digests wait for D7 proper.
+  test-in-pod-mount:
+    needs: [changes]
+    if: needs.changes.outputs.in-pod-mount == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - name: Vet and test the FUSE opener
+        working-directory: drivers/fuse-opener
         run: |
           go vet ./...
           go test -count=1 -race ./...
