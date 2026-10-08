@@ -137,7 +137,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from shared.connectors.env_names import CODE_ENV, CODE_ENV_PREFIXES, loads_code
+from .env_names import CODE_ENV, CODE_ENV_PREFIXES, loads_code
 
 #: The path the front serves MCP at, on the ``srw-driver`` port.
 FRONT_PATH = "/mcp"

@@ -679,14 +679,12 @@ async def apply_thread_config_update_locked(
                         reason="connector_detached",
                     )
         # A registered driver's connector selected live binds now; the
-        # agent's refetch of the workspace waits for it. An update that
-        # selects none starts nothing.
+        # agent's refetch of the workspace waits for it. Only the connectors
+        # this update adds, and only the registered ones among them: an
+        # update that adds none starts nothing.
         added_ids = [cid for cid in selected_ds_ids if cid not in previous_ds_ids]
-        if added_ids and any(
-            spec_for_row(row) is IMAGE_DRIVER_SPEC
-            for row in await dependencies.store.get_datasource_policy_rows(added_ids)
-        ):
-            connector_bind_time.start_thread_bindings(thread_id)
+        if added_ids:
+            connector_bind_time.start_thread_bindings(thread_id, added_ids)
 
     # Config-change audit (live_session_settings.md Slice C): key paths only,
     # fired after every persist step succeeded. log_security_event never

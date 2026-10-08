@@ -801,32 +801,28 @@ async def prepare_lease_delivery(
     """
     from orchestrator.services.connector_bind_time import prepare_bind_time_bindings
 
+    async def service_part() -> None:
+        if not any(
+            isinstance(entry, Mapping)
+            and (spec := lease_spec(entry)) is not None
+            and spec.plane == "service"
+            for entry in entries or ()
+        ):
+            return
+        from orchestrator.services.connector_git_swap_delivery import (
+            prepare_git_swap_delivery,
+        )
+        from orchestrator.services.connector_service_images import (
+            prepare_service_images,
+        )
+
+        await prepare_service_images(entries, owner=owner, store=db)
+        await prepare_git_swap_delivery(db, entries)
+
     await asyncio.gather(
         prepare_bind_time_bindings(entries, owner=owner, wait=bind_wait),
-        _prepare_service_delivery(db, entries, owner=owner),
+        service_part(),
     )
-
-
-async def _prepare_service_delivery(
-    db: Any, entries: Sequence[Any] | None, *, owner: LeaseOwner
-) -> None:
-    """:func:`prepare_lease_delivery`'s service-plane part (D5, C3)."""
-    if not any(
-        isinstance(entry, Mapping)
-        and (spec := lease_spec(entry)) is not None
-        and spec.plane == "service"
-        for entry in entries or ()
-    ):
-        return
-    from orchestrator.services.connector_git_swap_delivery import (
-        prepare_git_swap_delivery,
-    )
-    from orchestrator.services.connector_service_images import (
-        prepare_service_images,
-    )
-
-    await prepare_service_images(entries, owner=owner, store=db)
-    await prepare_git_swap_delivery(db, entries)
 
 
 async def prepare_thread_lease_delivery(db: Any, thread_id: str) -> None:

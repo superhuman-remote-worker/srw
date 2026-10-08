@@ -626,11 +626,13 @@ class TestRegisteredDrivers:
     def test_the_route_lists_the_registrations_the_caller_sees(self):
         row, _registration = self._registration()
         wire = _client()
-        wire.store.fetch = AsyncMock(return_value=[row])
+        # The visible registrations, then (the caller owns it) its usage.
+        wire.store.fetch = AsyncMock(side_effect=[[row], []])
         body = wire.client.get("/api/datasources/drivers").json()
         names = [driver["name"] for driver in body["drivers"]]
         assert names[-1] == "acme.env/v1"
-        query, account, projects = wire.store.fetch.await_args.args
+        assert body["drivers"][-1]["registration"]["can_manage"] is True
+        query, account, projects = wire.store.fetch.await_args_list[0].args
         assert "connector_driver_registrations" in query
         assert str(account) == USER["id"]
         assert projects == []

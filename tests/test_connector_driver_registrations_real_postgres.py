@@ -2310,7 +2310,7 @@ class TestCollisions:
 
 
 class TestTheDriversOwnText:
-    def test_an_error_line_the_driver_wrote_is_its_own_text_sanitized(self):
+    async def test_an_error_line_the_driver_wrote_is_its_own_text_sanitized(self):
         outcome = bind_time._outcome_from_post(
             {
                 "exit_code": 1,
@@ -2445,3 +2445,19 @@ class TestWhoManagesARegistration:
         theirs = await view(viewer)
         assert theirs["can_manage"] is False and "usage" not in theirs
         assert (await view(admin))["can_manage"] is True
+
+
+class TestALiveSelectionBindsWhatItAdds:
+    async def test_only_the_added_registered_connectors_bind(self, db, registry):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        operations = FakeOperations({"bind": _bound(ENV)})
+        _runtime(db, operations)
+        thread = await _thread(db, user, connectors=[connector])
+        await bind_time.prepare_thread_bindings(db, thread, only=[str(uuid4())])
+        await _settled()
+        assert operations.calls == []
+        bind_time.start_thread_bindings(thread, [connector.upper()])
+        await _settled()
+        assert len(operations.calls) == 1

@@ -658,23 +658,15 @@ async def test_a_live_detach_revokes_a_registered_driver_s_binding():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("added", "starts"), [("image_driver", True), ("generic", False)]
-)
-async def test_a_live_selection_starts_a_bind_only_for_a_registered_driver(
-    added, starts
-):
-    """D6 re-review: a newly selected registered driver's connector binds at
-    once; a selection that adds none starts nothing."""
+async def test_a_live_selection_starts_binds_for_what_it_adds_only():
+    """D6 re-review: a live update starts binds for the connectors it adds
+    (the registered ones among them, on the store's own connection), and
+    none when it adds none; it consults no policy row for that."""
     from orchestrator.services import connector_bind_time
     from tests.test_b06_lane_b_thread_config_update import THREAD, _pinned_thread
 
-    deps = _detach_dependencies()
-    deps.store.get_datasource_policy_rows = AsyncMock(
-        return_value=[{"id": IMAGE_ID, "type": added}]
-    )
     deps = dataclasses.replace(
-        deps,
+        _detach_dependencies(),
         authorize_thread_datasource_selection=AsyncMock(
             return_value=([KEPT_ID, IMAGE_ID], {})
         ),
@@ -691,8 +683,20 @@ async def test_a_live_selection_starts_a_bind_only_for_a_registered_driver(
             actor=None,
             dependencies=deps,
         )
-    deps.store.get_datasource_policy_rows.assert_awaited_once_with([IMAGE_ID])
-    assert started.called is starts
+        started.assert_called_once_with(THREAD, [IMAGE_ID])
+        deps.store.get_datasource_policy_rows.assert_not_awaited()
+        started.reset_mock()
+        unchanged = _pinned_thread(metadata={"datasource_ids": [KEPT_ID, IMAGE_ID]})
+        await tcu.apply_thread_config_update_locked(
+            THREAD,
+            unchanged,
+            {},
+            [KEPT_ID, IMAGE_ID],
+            request=MagicMock(),
+            actor=None,
+            dependencies=deps,
+        )
+        started.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -733,22 +737,31 @@ async def test_a_session_s_bind_wait_and_git_swap_checks_share_one_budget():
 
 @pytest.mark.asyncio
 async def test_a_delivery_s_bind_wait_and_service_checks_share_one_budget():
-    from orchestrator.services import connector_bind_time
+    from orchestrator.services import (
+        connector_bind_time,
+        connector_git_swap_delivery,
+        connector_service_images,
+    )
 
     service_started = asyncio.Event()
 
     async def bind(_entries, *, owner, wait):
         await asyncio.wait_for(service_started.wait(), timeout=2)
 
-    async def service(_db, _entries, *, owner):
+    async def images(_entries, *, owner, store):
         service_started.set()
 
     with (
         patch.object(connector_bind_time, "prepare_bind_time_bindings", bind),
-        patch.object(leases, "_prepare_service_delivery", service),
+        patch.object(connector_service_images, "prepare_service_images", images),
+        patch.object(
+            connector_git_swap_delivery, "prepare_git_swap_delivery", AsyncMock()
+        ),
     ):
         await leases.prepare_lease_delivery(
-            "db", [], owner=leases.LeaseOwner.thread("thread-1")
+            "db",
+            [{"type": "echo_service", "datasource_id": PROBE_ID}],
+            owner=leases.LeaseOwner.thread("thread-1"),
         )
 
 

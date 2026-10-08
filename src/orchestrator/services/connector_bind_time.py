@@ -1601,18 +1601,29 @@ async def _targets(conn: Any, kind: str, execution_id: str) -> list[Any]:
 
 
 async def prepare_thread_bindings(
-    store: Any, thread_id: str, *, wait: float | None = None
+    store: Any,
+    thread_id: str,
+    *,
+    wait: float | None = None,
+    only: Sequence[str] | None = None,
 ) -> None:
     """Start a session's binds and wait for them at most ``wait`` seconds
     (``wait_seconds`` when ``None``), before its attach reserves an agent or
-    answers the agent's poll (under the agent's 30 s request). Never
-    raises."""
+    answers the agent's poll (under the agent's 30 s request); ``only``
+    narrows them to those connectors. Never raises."""
     runtime = bind_time_runtime()
     if runtime is None or not _uuid(thread_id):
         return
     try:
         async with runtime.store.acquire() as conn:
             targets = await _targets(conn, "thread", str(thread_id))
+        if only is not None:
+            wanted = _canonical_ids(only)
+            targets = [
+                target
+                for target in targets
+                if str(target["connector_id"]).lower() in wanted
+            ]
         if targets:
             await asyncio.gather(
                 *(
@@ -1631,12 +1642,18 @@ async def prepare_thread_bindings(
         logger.warning("Preparing session %s binds failed: %s", thread_id, exc)
 
 
-def start_thread_bindings(thread_id: str) -> None:
+def start_thread_bindings(
+    thread_id: str, connector_ids: Sequence[str] | None = None
+) -> None:
     """Start a session's binds in the background (a live selection), without
-    waiting. No-op without driver pods."""
+    waiting: of ``connector_ids`` only (the ones a live update added) when
+    given; a connector of no registered driver starts nothing. No-op
+    without driver pods."""
     if bind_time_runtime() is None:
         return
-    started = asyncio.create_task(prepare_thread_bindings(None, thread_id, wait=0))
+    started = asyncio.create_task(
+        prepare_thread_bindings(None, thread_id, wait=0, only=connector_ids)
+    )
     _background.add(started)
     started.add_done_callback(_background.discard)
 
