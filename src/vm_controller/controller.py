@@ -3065,6 +3065,77 @@ class VMController:
                         "refusing to delete a superseded rootdisk PVC UID"
                     )
 
+        ready_preflight = (
+            parent_cleanup.get("retention_preflight")
+            if isinstance(parent_cleanup, Mapping)
+            else None
+        )
+        if (
+            isinstance(parent_cleanup, Mapping)
+            and "retention_preflight" in parent_cleanup
+        ):
+            from shared.vm_cancel_retention import valid_retention_preflight
+
+            if not isinstance(ready_preflight, Mapping):
+                raise RuntimeError("retained delete preflight is malformed")
+            if ready_preflight.get("kind") == "vm_cancel_retention_preflight_v1":
+                if not valid_retention_preflight(
+                    ready_preflight, ready_preflight.get("frozen")
+                ):
+                    raise RuntimeError("retained delete preflight is malformed")
+            elif ready_preflight.get("kind") != "vm_job_retained_ready_preflight_v1":
+                raise RuntimeError("retained delete preflight is malformed")
+        ready_proof = (
+            isinstance(ready_preflight, Mapping)
+            and ready_preflight.get("kind") == "vm_job_retained_ready_preflight_v1"
+        )
+        if ready_proof:
+            from shared.vm_cancel_retention import valid_ready_retention_preflight
+
+            frozen = ready_preflight.get("frozen")
+            intent = parent_cleanup.get("intent")
+            expected_intent = {
+                "owner_id": job_id,
+                "owner_kind": "job",
+                "provision_generation": generation,
+                "purge_disk": False,
+                "pvc_uid": expected_rootdisk_pvc_uid,
+                "resource": "vm_workspace",
+                "source": "job_terminal_vm_release",
+                "vm_uid": expected_vm_uid,
+            }
+            if (
+                not valid_ready_retention_preflight(ready_preflight, frozen)
+                or owner_kind != "job"
+                or purge_disk is not False
+                or workspace_storage is not None
+                or generation is None
+                or expected_vm_uid is None
+                or expected_rootdisk_pvc_uid is None
+                or not isinstance(intent, Mapping)
+                or dict(intent) != expected_intent
+                or frozen["job_id"] != job_id
+                or frozen["provision_generation"] != generation
+                or frozen["vm_uid"] != expected_vm_uid
+                or frozen["pvc_uid"] != expected_rootdisk_pvc_uid
+                or frozen["cleanup_request_id"] != parent_cleanup.get("request_id")
+                or frozen["cleanup_intent_digest"]
+                != parent_cleanup.get("intent_digest")
+                or _safe_uid(parent_cleanup.get("admission_id")) is None
+            ):
+                raise RuntimeError("Ready retained delete authority is unproven")
+            if vm_already_absent:
+                final_storage = await self._qualify_cancel_retained_rootdisk(
+                    job_id, expected_rootdisk_pvc_uid
+                )
+                if final_storage.get("dv_uid") != ready_preflight["dv_uid"]:
+                    raise RuntimeError("Ready retained disk identity changed")
+            elif (
+                await self._qualify_ready_retention_preflight(frozen, vm=current_vm)
+                != ready_preflight
+            ):
+                raise RuntimeError("Ready retained runtime or disk changed")
+
         if (
             owner_kind == "job"
             and purge_disk is False
@@ -3072,6 +3143,7 @@ class VMController:
             and isinstance(parent_cleanup, Mapping)
             and isinstance(parent_cleanup.get("intent"), Mapping)
             and parent_cleanup["intent"].get("source") == "job_terminal_vm_release"
+            and not ready_proof
         ):
             await self._qualify_cancel_retained_rootdisk(
                 job_id,
@@ -3223,6 +3295,7 @@ class VMController:
         *,
         exact_absence: bool = False,
         workspace_storage: dict | None = None,
+        retained_ready_stop_candidate: Mapping[str, object] | None = None,
     ) -> dict:
         """Query KubeVirt for a VM's current status."""
         from kubernetes.client.exceptions import ApiException
@@ -3516,6 +3589,17 @@ class VMController:
                     rootdisk=rootdisk,
                     pvc_uid=rootdisk_pvc_uid,
                 )
+        if retained_ready_stop_candidate is not None and workspace_storage is None:
+            proof = await self._qualify_ready_retention_preflight(
+                retained_ready_stop_candidate, vm=vm, vmi=vmi
+            )
+            if (
+                proof is not None
+                and retained_ready_stop_candidate.get("job_id") == job_id
+                and retained_ready_stop_candidate.get("provision_generation")
+                == _provision_generation(provision_generation)
+            ):
+                result["retention_preflight"] = proof
         return result
 
     async def _provisioning_status_evidence(
@@ -4990,6 +5074,120 @@ class VMController:
             "no_consumers": True,
         }
 
+    async def _qualify_ready_retention_preflight(
+        self, candidate: Mapping[str, object], *, vm=None, vmi=None
+    ) -> dict | None:
+        """Read exact Ready runtime and its standalone disk before any stop."""
+        from shared.vm_cancel_retention import (
+            valid_ready_retention_candidate,
+            valid_ready_retention_preflight,
+        )
+
+        if (
+            LIFECYCLE_HMAC_SECRET is None
+            or not valid_ready_retention_candidate(candidate)
+            or candidate["namespace"] != VM_NAMESPACE
+        ):
+            return None
+        collector = getattr(self, "resource_inventory_collector", None)
+        if (
+            collector is None
+            or getattr(collector, "namespace", None) != VM_NAMESPACE
+            or getattr(collector, "cluster_id", None) != candidate["cluster_id"]
+        ):
+            return None
+        job_id = candidate["job_id"]
+        vm_name = f"agent-vm-{job_id}"
+        try:
+            if vm is None:
+                vm = await asyncio.to_thread(
+                    self.k8s_client.get_namespaced_custom_object,
+                    group=KUBEVIRT_GROUP,
+                    version=KUBEVIRT_VERSION,
+                    namespace=VM_NAMESPACE,
+                    plural=KUBEVIRT_PLURAL,
+                    name=vm_name,
+                )
+            if vmi is None:
+                vmi = await asyncio.to_thread(
+                    self.k8s_client.get_namespaced_custom_object,
+                    group=KUBEVIRT_GROUP,
+                    version=KUBEVIRT_VERSION,
+                    namespace=VM_NAMESPACE,
+                    plural=KUBEVIRT_VMI_PLURAL,
+                    name=vm_name,
+                )
+            vm_status = _object_value(vm, "status", {}) or {}
+            vmi_status = _object_value(vmi, "status", {}) or {}
+            vm_labels = _metadata_value(vm, "labels", {}) or {}
+            vm_annotations = _metadata_value(vm, "annotations", {}) or {}
+            if (
+                _admitted_vm_uid(vm, expected_name=vm_name) != candidate["vm_uid"]
+                or _admitted_provision_generation(vm)
+                != candidate["provision_generation"]
+                or _metadata_value(vmi, "name") != vm_name
+                or _metadata_value(vmi, "uid") != candidate["vmi_uid"]
+                or vm_labels.get("srw.io/owner-kind") != "job"
+                or vm_labels.get("srw.io/owner-id") != job_id
+                or vm_annotations.get("srw.io/vm-create-request-id")
+                != candidate["request_id"]
+                or _object_value(vm_status, "created") is not True
+                or not any(
+                    _object_value(c, "type") == "Ready"
+                    and _object_value(c, "status") == "True"
+                    for c in (_object_value(vm_status, "conditions", []) or [])
+                )
+                or _object_value(vmi_status, "phase") != "Running"
+            ):
+                return None
+            pods = await asyncio.to_thread(
+                self.core_api.list_namespaced_pod,
+                namespace=VM_NAMESPACE,
+                label_selector=f"vm.kubevirt.io/name={vm_name}",
+            )
+            items = _object_value(pods, "items")
+            if not isinstance(items, list) or len(items) != 1:
+                return None
+            pod = items[0]
+            pod_name = _metadata_value(pod, "name")
+            pod_spec = _object_value(pod, "spec", {}) or {}
+            node_name = _object_value(pod_spec, "nodeName") or _object_value(
+                pod_spec, "node_name"
+            )
+            if (
+                not isinstance(pod_name, str)
+                or not pod_name
+                or _metadata_value(pod, "uid") != candidate["launcher_uid"]
+                or _object_value(_object_value(pod, "status", {}), "phase") != "Running"
+                or not isinstance(node_name, str)
+                or not node_name
+            ):
+                return None
+            node = await asyncio.to_thread(self.core_api.read_node, name=node_name)
+            if _metadata_value(node, "uid") != candidate["node_uid"]:
+                return None
+            runtime = {
+                "vm_name": vm_name,
+                "vm_uid": candidate["vm_uid"],
+                "vmi_uid": candidate["vmi_uid"],
+                "launcher_name": pod_name,
+                "launcher_uid": candidate["launcher_uid"],
+            }
+            storage = await self._qualify_cancel_retained_rootdisk(
+                job_id, candidate["pvc_uid"], allowed_runtime=runtime
+            )
+            proof = {
+                "version": 1,
+                "kind": "vm_job_retained_ready_preflight_v1",
+                "stop_policy": "retained_ready_continuation_v1",
+                "frozen": dict(candidate),
+                **storage,
+                "consumer_scope": "exact_frozen_runtime_only",
+            }
+            return proof if valid_ready_retention_preflight(proof, candidate) else None
+        except Exception:
+            return None
+
     async def _cleanup_carrier_pvc(self, name: str) -> object | None:
         from kubernetes.client.exceptions import ApiException
 
@@ -6379,6 +6577,15 @@ class VMController:
                 provision_generation=request_generation,
                 exact_absence=data.get("exact_absence") is True,
                 **(
+                    {
+                        "retained_ready_stop_candidate": data[
+                            "retained_ready_stop_candidate"
+                        ]
+                    }
+                    if "retained_ready_stop_candidate" in data
+                    else {}
+                ),
+                **(
                     {"workspace_storage": data["workspace_storage"]}
                     if data.get("workspace_storage") is not None
                     else {}
@@ -6831,6 +7038,15 @@ class VMController:
                     else {}
                 ),
                 **({"exact_absence": True} if exact_absence else {}),
+                **(
+                    {
+                        "retained_ready_stop_candidate": request.query[
+                            "retained_ready_stop_candidate"
+                        ]
+                    }
+                    if "retained_ready_stop_candidate" in request.query
+                    else {}
+                ),
             },
             operation="status",
         )
@@ -6845,6 +7061,15 @@ class VMController:
                 job_id,
                 provision_generation=request_payload.get("provision_generation"),
                 exact_absence=request_payload.get("exact_absence") is True,
+                **(
+                    {
+                        "retained_ready_stop_candidate": json.loads(
+                            request_payload["retained_ready_stop_candidate"]
+                        )
+                    }
+                    if request_payload.get("retained_ready_stop_candidate") is not None
+                    else {}
+                ),
                 **(
                     {
                         "workspace_storage": json.loads(

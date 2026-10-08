@@ -154,6 +154,16 @@ async def acquire_job_retained_disk_purge(store, *, job_id: str, identity):
         except (KeyError, TypeError, ValueError):
             return CleanupPermit(allowed=False, reason="retained_disk_binding_unproven")
         bootstrap = None
+        retained_terminal = None
+        if await conn.fetchval(
+            "SELECT to_regclass('public.vm_job_retained_resumes') IS NOT NULL"
+        ):
+            retained_terminal = await conn.fetchval(
+                "SELECT t.id FROM vm_job_retained_resumes op JOIN jobs j ON j.id=op.job_id "
+                "JOIN vm_job_retained_resume_terminals t ON t.resume_id=op.id "
+                "WHERE j.id=$1 AND j.context->>'_vm_job_retained_resume'=op.id::text",
+                owner,
+            )
         if await conn.fetchval(
             "SELECT to_regclass('public.vm_job_cancel_retention_authorities') IS NOT NULL"
         ):
@@ -165,12 +175,16 @@ async def acquire_job_retained_disk_purge(store, *, job_id: str, identity):
                 "SELECT cleanup_admission_id FROM vm_job_cancel_retention_authorities "
                 "WHERE (job_id=$1 OR pvc_uid=$2) AND NOT "
                 "public.vm_job_cancel_retention_discharged(cleanup_admission_id)",
-                owner, pvc,
+                owner,
+                pvc,
             )
             if protected:
                 bootstrap = JobRetainedPurgeBootstrap(
-                    job_id=owner, pvc_uid=pvc, final_request_id=final["request_id"],
-                    provision_generation=generation, cleanup_request_id=request_id,
+                    job_id=owner,
+                    pvc_uid=pvc,
+                    final_request_id=final["request_id"],
+                    provision_generation=generation,
+                    cleanup_request_id=request_id,
                     intent_digest=digest,
                     retention_admission_ids=frozenset(
                         row["cleanup_admission_id"] for row in protected
@@ -201,12 +215,14 @@ async def acquire_job_retained_disk_purge(store, *, job_id: str, identity):
             ):
                 raise ResourceAdmissionError("retained_disk_receipt_unproven")
             return bound
+        tail_column = ",retained_terminal_id" if retained_terminal is not None else ""
+        tail_value = ",$14" if retained_terminal is not None else ""
         await conn.execute(
             "INSERT INTO vm_job_retained_disk_purge_authorities "
             "(cleanup_admission_id,job_id,final_request_id,provision_generation,"
             "vm_uid,vmi_uid,launcher_uid,pvc_uid,binding_kind,workspace_instance_id,"
-            "workspace_generation,cleanup_request_id,intent_digest) "
-            "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) "
+            f"workspace_generation,cleanup_request_id,intent_digest{tail_column}) "
+            f"VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13{tail_value}) "
             "ON CONFLICT DO NOTHING",
             permit.admission_id,
             owner,
@@ -221,6 +237,7 @@ async def acquire_job_retained_disk_purge(store, *, job_id: str, identity):
             instance_generation,
             request_id,
             digest,
+            *((retained_terminal,) if retained_terminal is not None else ()),
         )
         predecessors = await conn.fetch(
             "SELECT s.request_id,s.cleanup_admission_id,s.reservation_id,"
@@ -305,6 +322,80 @@ async def read_job_retained_disk_purge_candidate(store, permit):
 
     async with store.db.acquire() as conn, conn.transaction():
         return await _candidate(conn, permit)
+
+
+async def read_current_retained_purge(
+    db, *, job_id, generation, vm_uid, pvc_uid, parent_cleanup=None, candidate=None
+):
+    """Prove the committed physical target of a typed logical-tail Delete.
+
+    None is an unrelated owner. A recognized continuation must carry either its
+    exact signed parent or its complete native attestation candidate. The native
+    validator proves current Delete/no successor and every physical predecessor's
+    process-zero receipt without rewriting the logical runtime projection.
+    All locks end before the caller performs external I/O.
+    """
+    try:
+        owner = UUID(str(job_id))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    async with db.acquire() as conn, conn.transaction():
+        if not await conn.fetchval(
+            "SELECT to_regclass('public.vm_job_retained_resumes') IS NOT NULL"
+        ):
+            return None
+        await _lock_owner(conn, owner)
+        locator = await conn.fetchrow(
+            "SELECT pvc_uid FROM vm_job_retained_resumes WHERE job_id=$1 LIMIT 1",
+            owner,
+        )
+        if locator is None:
+            return None
+        await _lock_owner(conn, owner, locator["pvc_uid"])
+        await conn.fetchrow(
+            "SELECT unit_id FROM run_queue WHERE unit_id=$1 FOR UPDATE", owner
+        )
+        await conn.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner)
+        # Re-read identity and authorization after every owner/PVC/queue/Job wait.
+        rows = await conn.fetch(
+            "SELECT d.* FROM vm_job_retained_disk_purge_authorities d "
+            "WHERE d.job_id=$1 AND d.provision_generation::text=$2 "
+            "AND d.vm_uid::text=$3 AND d.pvc_uid::text=$4 "
+            "AND d.pvc_uid=$5 AND d.retained_terminal_id IS NOT NULL "
+            "AND d.admitted_xact_id<>pg_current_xact_id() "
+            "AND NOT EXISTS(SELECT 1 FROM vm_job_retained_disk_purge_predecessors p "
+            "WHERE p.cleanup_admission_id=d.cleanup_admission_id "
+            "AND p.admitted_xact_id=pg_current_xact_id())",
+            owner,
+            str(generation),
+            str(vm_uid),
+            str(pvc_uid),
+            locator["pvc_uid"],
+        )
+        if len(rows) != 1:
+            raise ResourceAdmissionError("retained_purge_committed_authority_unproven")
+        authority = rows[0]
+        intent = {
+            "owner_kind": "job",
+            "owner_id": str(owner),
+            "source": "public_vm_delete",
+            "resource": "vm_workspace",
+            "provision_generation": str(authority["provision_generation"]),
+            "vm_uid": str(authority["vm_uid"]),
+            "pvc_uid": str(authority["pvc_uid"]),
+            "purge_disk": True,
+        }
+        permit = bind_vm_cleanup_permit(
+            CleanupPermit(allowed=True, admission_id=authority["cleanup_admission_id"]),
+            request_id=authority["cleanup_request_id"],
+            intent=intent,
+        )
+        if candidate is None and parent_cleanup != permit.parent_cleanup:
+            raise ResourceAdmissionError("retained_purge_parent_changed")
+        current = await _candidate(conn, permit)
+        if candidate is not None and candidate != current:
+            raise ResourceAdmissionError("retained_purge_candidate_changed")
+        return current
 
 
 async def has_job_retained_disk_purge_authority(store, admission_id):

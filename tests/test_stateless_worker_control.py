@@ -547,6 +547,7 @@ async def test_cancel_finalizer_waits_for_lease_then_prunes_checkpoint():
             return {
                 "status": "cancelled",
                 "execution_lane": "stateless",
+                "retained_resume": None,
                 "cleanup_pending": True,
             }
         raise AssertionError(normalized)
@@ -638,6 +639,7 @@ async def test_cancel_cleanup_finalizers_are_idempotent_after_marker_clear():
             return {
                 "status": "cancelled",
                 "execution_lane": "stateless",
+                "retained_resume": None,
                 "cleanup_pending": cleanup_pending,
             }
         if normalized.startswith("UPDATE jobs"):

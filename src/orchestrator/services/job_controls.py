@@ -1288,6 +1288,11 @@ class JobControlOperations:
                         context_merge,
                         expected_status=expected_status,
                         lift_operator_pause_hold=operator_pause_lift,
+                        **(
+                            {"owner_resume_user_id": user.get("id") if user else None}
+                            if workspace_context_key == "vm"
+                            else {}
+                        ),
                         **self.dependencies.completion_control.resume_guard_kwargs(),
                     )
                 elif job.get("execution_lane") == "stateless":

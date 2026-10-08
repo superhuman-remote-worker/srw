@@ -1651,7 +1651,8 @@ async def _end_thread_flow_owned(
         )
         if terminal_join == "waiting_for_release":
             return {
-                "status": "ending", "retirement_disposition": "ended",
+                "status": "ending",
+                "retirement_disposition": "ended",
                 "retirement_permanent": True,
             }
         if terminal_join in {"wake_won", "held"}:
@@ -1855,8 +1856,13 @@ async def _end_thread_flow_owned(
                 detail={
                     "code": "pinned_retirement_conflict",
                     "reason": retirement.get("reason") or state,
-                    **({"message": "Close active IDE or SSH access, then retry ending this session"}
-                       if retirement.get("reason") == "active_workspace_access" else {}),
+                    **(
+                        {
+                            "message": "Close active IDE or SSH access, then retry ending this session"
+                        }
+                        if retirement.get("reason") == "active_workspace_access"
+                        else {}
+                    ),
                 },
             )
         # Idle admission installs this row atomically with the same pinned
@@ -1868,7 +1874,9 @@ async def _end_thread_flow_owned(
             "AND owner_id=$1::uuid AND release_kind='pinned_thread' "
             "AND thread_runtime_generation=$2::uuid "
             "AND thread_retirement_token=$3::uuid AND closed_at IS NULL",
-            thread_id, retirement["generation"], retirement["token"],
+            thread_id,
+            retirement["generation"],
+            retirement["token"],
         )
         if require_physical_agent_stop and idle_stop is None:
             raise HTTPException(
@@ -2869,6 +2877,22 @@ async def archive_and_cleanup_workspace(
         never_issued_terminal = False
         if (
             job.get("status") == "cancelled"
+            and isinstance(raw_context, dict)
+            and raw_context.get("_vm_job_retained_resume") is not None
+        ):
+            from orchestrator.services.vm_job_retained_resume import (
+                settle_retained_no_compute,
+            )
+
+            absent = await settle_retained_no_compute(postgres_db, entity_id)
+            if absent is False:
+                raise RuntimeError("retained VM Resume terminal remains held")
+            if absent is True:
+                never_issued_terminal = True
+                actions.append("retained vm Resume source absent")
+        if (
+            not never_issued_terminal
+            and job.get("status") == "cancelled"
             and job.get("execution_lane") == "stateless"
             and isinstance(raw_context, dict)
             and raw_context.get("_stateless_cancel_cleanup_pending") is True
@@ -2894,34 +2918,43 @@ async def archive_and_cleanup_workspace(
         pending_terminal_vm_cleanup = False
         if vm_ctx and not never_issued_terminal and not _vm_needs_release(vm_ctx):
             async with postgres_db.acquire() as conn:
-                pending_terminal_vm_cleanup = bool(await conn.fetchval(
-                    "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
-                    "WHERE owner_kind='job' AND owner_id=$1::uuid "
-                    "AND source='job_terminal_vm_release' "
-                    "AND pvc_uid::text IS NOT DISTINCT FROM $2::text "
-                    "AND completed_at IS NULL)",
-                    entity_id, vm_ctx.get("rootdisk_pvc_uid"),
-                ))
+                pending_terminal_vm_cleanup = bool(
+                    await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
+                        "WHERE owner_kind='job' AND owner_id=$1::uuid "
+                        "AND source='job_terminal_vm_release' "
+                        "AND pvc_uid::text IS NOT DISTINCT FROM $2::text "
+                        "AND completed_at IS NULL)",
+                        entity_id,
+                        vm_ctx.get("rootdisk_pvc_uid"),
+                    )
+                )
 
         # VM cleanup (snapshot + delete)
-        if not never_issued_terminal and (_vm_needs_release(vm_ctx) or pending_terminal_vm_cleanup):
+        if not never_issued_terminal and (
+            _vm_needs_release(vm_ctx) or pending_terminal_vm_cleanup
+        ):
             if vm_provisioner.lifecycle_available:
                 teardown_identity = await vm_provisioner.capture_vm_teardown_identity(
                     entity_id
                 )
                 retaining = None
                 if (
-                    job.get("status") == "cancelled"
+                    (
+                        job.get("status") == "cancelled"
+                        or raw_context.get("_vm_job_retained_resume") is not None
+                    )
                     and job.get("execution_lane") == "stateless"
                     and not job.get("parent_job_id")
                     and vm_ctx.get("workspace_storage") is None
                 ):
-                    from orchestrator.services.vm_job_cancel_retention import (
-                        acquire_cancel_retention,
+                    from orchestrator.services.vm_job_retained_resume import (
+                        acquire_retained_terminal_cleanup,
                     )
 
-                    retaining = await acquire_cancel_retention(
+                    retaining = await acquire_retained_terminal_cleanup(
                         recovery_store,
+                        vm_provisioner,
                         job_id=entity_id,
                         identity=teardown_identity,
                     )
@@ -2934,18 +2967,23 @@ async def archive_and_cleanup_workspace(
                     # The context is a hint; only the durable reservation can
                     # authorize keeping this rootdisk after terminal compute.
                     if await vm_provisioner._storage_context(entity_id) is None:
-                        raise RuntimeError("VM retained storage authority is unavailable")
+                        raise RuntimeError(
+                            "VM retained storage authority is unavailable"
+                        )
                     purge_disk = False
                 from orchestrator.services.vm_idle_lifecycle import (
                     retained_terminal_rootdisk,
                 )
 
                 if await retained_terminal_rootdisk(
-                    postgres_db, job_id=entity_id,
+                    postgres_db,
+                    job_id=entity_id,
                     generation=teardown_identity.provision_generation,
                     pvc_uid=teardown_identity.rootdisk_pvc_uid,
                 ):
-                    raise RuntimeError("terminal VM rootdisk belongs to idle review release")
+                    raise RuntimeError(
+                        "terminal VM rootdisk belongs to idle review release"
+                    )
                 cleanup = retaining
                 if cleanup is None:
                     cleanup = await acquire_vm_cleanup_permit(
@@ -2960,13 +2998,17 @@ async def archive_and_cleanup_workspace(
                     raise RuntimeError("job VM cleanup held for workspace recovery")
                 marker = (
                     raw_context.get("_job_terminal_vm_cleanup")
-                    if isinstance(raw_context, dict) else None
+                    if isinstance(raw_context, dict)
+                    else None
                 )
-                if marker is not None and not await postgres_db.bind_terminal_vm_cleanup_admission(
-                    entity_id,
-                    expected_generation=teardown_identity.provision_generation,
-                    admission_id=cleanup.admission_id,
-                    pvc_uid=teardown_identity.rootdisk_pvc_uid,
+                if (
+                    marker is not None
+                    and not await postgres_db.bind_terminal_vm_cleanup_admission(
+                        entity_id,
+                        expected_generation=teardown_identity.provision_generation,
+                        admission_id=cleanup.admission_id,
+                        pvc_uid=teardown_identity.rootdisk_pvc_uid,
+                    )
                 ):
                     raise RuntimeError("terminal Job VM cleanup admission changed")
                 disposition = completed_cleanup_outcome(cleanup)
@@ -2999,8 +3041,7 @@ async def archive_and_cleanup_workspace(
                 )
 
         if (
-            vm_ctx
-            and job.get("execution_lane") == "stateless"
+            job.get("execution_lane") == "stateless"
             and raw_context.get("_stateless_delete_pending") is True
         ):
             from orchestrator.services.vm_job_retained_disk_purge import (
@@ -3008,9 +3049,25 @@ async def archive_and_cleanup_workspace(
                 execute_job_retained_disk_purge,
             )
 
-            identity = await vm_provisioner.capture_vm_teardown_identity(entity_id)
-            purge = await acquire_job_retained_disk_purge(
-                recovery_store, job_id=entity_id, identity=identity
+            from orchestrator.services.vm_job_retained_resume import (
+                complete_retained_cancel,
+                retained_delete_identity,
+            )
+
+            if raw_context.get("_vm_job_retained_resume") is not None:
+                if not await complete_retained_cancel(
+                    postgres_db, entity_id, clear_pending=False
+                ):
+                    raise RuntimeError("retained VM Delete terminal remains held")
+            identity = await retained_delete_identity(postgres_db, entity_id)
+            if identity is None and vm_ctx:
+                identity = await vm_provisioner.capture_vm_teardown_identity(entity_id)
+            purge = (
+                None
+                if identity is None
+                else await acquire_job_retained_disk_purge(
+                    recovery_store, job_id=entity_id, identity=identity
+                )
             )
             if purge is not None:
                 await execute_job_retained_disk_purge(

@@ -362,12 +362,15 @@ class TestResumeJobOnAgentInjection:
             True,
         )
         monkeypatch.setattr(
-            orchestrator.main.app.state.resources.postgres_db, "prepare_pinned_job_delivery",
+            orchestrator.main.app.state.resources.postgres_db,
+            "prepare_pinned_job_delivery",
             AsyncMock(return_value={"id": delivery_id}),
         )
         confirm = AsyncMock(return_value=True)
         monkeypatch.setattr(
-            orchestrator.main.app.state.resources.postgres_db, "confirm_pinned_job_dispatch", confirm,
+            orchestrator.main.app.state.resources.postgres_db,
+            "confirm_pinned_job_dispatch",
+            confirm,
         )
         recipient = pinned_session_identity_module.PinnedJobRecipient(
             expected_agent_id=AGENT_ID,
@@ -376,8 +379,13 @@ class TestResumeJobOnAgentInjection:
             expected_job_id=JOB_ID,
         )
         monkeypatch.setattr(
-            controls_composition, "prepare_pinned_job_mutation_target",
-            AsyncMock(return_value=job_mutation_target_module.PinnedJobMutationTarget(_agent(), recipient)),
+            controls_composition,
+            "prepare_pinned_job_mutation_target",
+            AsyncMock(
+                return_value=job_mutation_target_module.PinnedJobMutationTarget(
+                    _agent(), recipient
+                )
+            ),
         )
         accepted_client = SimpleNamespace()
 
@@ -398,12 +406,16 @@ class TestResumeJobOnAgentInjection:
                 "delegation_results": [{"job_id": "child-1", "status": "completed"}],
                 "delegation_results_delivery_id": "77777777-7777-4777-8777-777777777777",
                 "_workspace_contract": {
-                    "version": 1, "requested_backend": "vm",
-                    "assigned_backend": "vm", "assignment_source": "request",
+                    "version": 1,
+                    "requested_backend": "vm",
+                    "assigned_backend": "vm",
+                    "assignment_source": "request",
                 },
                 "vm": {
-                    "status": "ready", "provisioner": "vm",
-                    "ssh_host": "100.64.0.7", "ssh_port": 22,
+                    "status": "ready",
+                    "provisioner": "vm",
+                    "ssh_host": "100.64.0.7",
+                    "ssh_port": 22,
                     "provision_generation": WORKSPACE_RUNTIME,
                 },
             },
@@ -902,6 +914,10 @@ class TestResumeEndpointDelegation:
     async def test_stateless_resume_reenqueues_without_registered_agent(
         self, endpoint_collaborators, monkeypatch
     ):
+        access_module.require_internal_or_job_access.return_value = (
+            {"id": "00000000-0000-0000-0000-0000000000cc"},
+            endpoint_collaborators.job,
+        )
         endpoint_collaborators.job.update(
             {
                 "execution_lane": "stateless",
@@ -953,6 +969,7 @@ class TestResumeEndpointDelegation:
         endpoint_collaborators.delegate.assert_not_awaited()
         orchestrator.main.app.state.resources.postgres_db.get_agent.assert_not_awaited()
         endpoint_collaborators.queue_for_resume.assert_not_awaited()
+        endpoint_collaborators.prepare_stateless.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_fast_path_delegates_to_shared_resume(self, endpoint_collaborators):
@@ -999,8 +1016,9 @@ class TestResumeEndpointDelegation:
         delegated_job = endpoint_collaborators.delegate.await_args.args[0]
         assert delegated_job["context"]["queued_feedback"] == "try again"
         assert delegated_job["context"]["queued_feedback_reason"]
-        assert delegated_job["context"]["queued_feedback_delivery_id"] == (
-            merged[1]["queued_feedback_delivery_id"]
+        assert (
+            delegated_job["context"]["queued_feedback_delivery_id"]
+            == (merged[1]["queued_feedback_delivery_id"])
         )
 
     @pytest.mark.asyncio
@@ -1248,6 +1266,10 @@ class TestResumeEndpointWorkspacelessJob:
     async def test_stateless_reprovision_resume_stamps_intent_without_enqueue(
         self, workspaceless
     ):
+        access_module.require_internal_or_job_access.return_value = (
+            {"id": "00000000-0000-0000-0000-0000000000cc"},
+            workspaceless.job,
+        )
         workspaceless.job.update(
             {
                 "execution_lane": "stateless",
@@ -1280,6 +1302,34 @@ class TestResumeEndpointWorkspacelessJob:
         workspaceless.shed.assert_not_awaited()
         workspaceless.queue_for_resume.assert_not_awaited()
         workspaceless.queue_stateless.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stateless_vm_owner_resume_passes_actor_only_to_vm_preflight(
+        self, workspaceless
+    ):
+        actor_id = "00000000-0000-0000-0000-0000000000cc"
+        workspaceless.job.update(execution_lane="stateless", status="cancelled")
+        access_module.require_internal_or_job_access.return_value = (
+            {"id": actor_id},
+            workspaceless.job,
+        )
+
+        result = await control_seams.resume_job(
+            MagicMock(), JOB_ID, job_controls_module.JobResumeRequest()
+        )
+
+        assert result["status"] == "queued"
+        workspaceless.prepare_stateless.assert_awaited_once_with(
+            JOB_ID,
+            "vm",
+            None,
+            expected_status="cancelled",
+            lift_operator_pause_hold="",
+            owner_resume_user_id=actor_id,
+        )
+        workspaceless.queue_stateless.assert_not_awaited()
+        workspaceless.queue_for_resume.assert_not_awaited()
+        workspaceless.shed.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_healthy_vm_job_still_resumes_directly(self, workspaceless):

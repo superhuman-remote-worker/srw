@@ -806,6 +806,43 @@ class VMResourceReservationStore:
             raise ResourceAdmissionError("resource_waiter_changed")
         if reservation is None:
             if (
+                retry.get("job_retained_resume_id") is not None
+                and not disposition_complete
+            ):
+                allowed = await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_creation_retries r "
+                    "JOIN vm_job_retained_resumes op ON op.id=r.job_retained_resume_id "
+                    "JOIN jobs j ON j.id=op.job_id JOIN run_queue q ON q.unit_id=j.id "
+                    "WHERE r.request_id=$1 AND r.request_id=op.request_id AND r.owner_kind='job' "
+                    "AND r.job_id=j.id AND r.provision_generation=op.provision_generation "
+                    "AND r.expected_pvc_uid=op.pvc_uid AND r.state='cancel_requested' "
+                    "AND r.observed_vm_uid IS NULL AND r.observed_pvc_uid IS NULL "
+                    "AND r.creation_admission_id IS NULL AND r.creation_carrier_uid IS NULL "
+                    "AND r.cancellation_disposition IS NULL AND j.status='cancelled' "
+                    "AND j.assigned_agent_id IS NULL AND q.state='done' "
+                    "AND q.leased_by IS NULL AND q.leased_until IS NULL "
+                    "AND j.context->>'_vm_job_retained_resume'=op.id::text "
+                    "AND public.vm_job_cancel_retention_settled(op.physical_cleanup_admission_id) "
+                    "AND NOT public.vm_job_cancel_retention_discharged(op.root_retention_admission_id) "
+                    "AND NOT EXISTS(SELECT 1 FROM vm_resource_reservations v WHERE v.request_id=r.request_id) "
+                    "AND NOT EXISTS(SELECT 1 FROM vm_creation_effects e WHERE e.request_id=r.request_id))",
+                    retry["request_id"],
+                )
+                if not allowed or waiter["state"] not in {
+                    "waiting",
+                    "nonfit",
+                    "parked",
+                    "cancelled",
+                    "released",
+                }:
+                    raise ResourceAdmissionError("reservation_release_unproven")
+                if waiter["state"] not in {"cancelled", "released"}:
+                    await conn.execute(
+                        "UPDATE vm_resource_waiters SET state='cancelled',reason='creation_cancelled',"
+                        "revision=revision+1 WHERE request_id=$1",
+                        retry["request_id"],
+                    )
+            if (
                 retry["owner_kind"] == "thread"
                 and not disposition_complete
                 and waiter["state"] not in {"cancelled", "released"}
@@ -1186,10 +1223,11 @@ class VMResourceReservationStore:
 
         retention = {}
         if await retention_for_admission_on_conn(conn, cleanup["id"]) is not None:
-            preflight = await conn.fetchval(
-                "SELECT retention_preflight FROM vm_pre_ssh_stop_intents WHERE cleanup_admission_id=$1",
-                cleanup["id"],
+            from orchestrator.services.vm_job_retained_resume import (
+                retention_preflight_on_conn,
             )
+
+            preflight = await retention_preflight_on_conn(conn, cleanup["id"])
             retention["retention_preflight"] = (
                 _json(preflight) if preflight is not None else None
             )
@@ -1232,10 +1270,11 @@ class VMResourceReservationStore:
         if await retention_for_admission_on_conn(conn, cleanup["id"]) is not None:
             from shared.vm_cancel_retention import retained_rootdisk_from_preflight
 
-            preflight = await conn.fetchval(
-                "SELECT retention_preflight FROM vm_pre_ssh_stop_intents WHERE cleanup_admission_id=$1",
-                cleanup["id"],
+            from orchestrator.services.vm_job_retained_resume import (
+                retention_preflight_on_conn,
             )
+
+            preflight = await retention_preflight_on_conn(conn, cleanup["id"])
             try:
                 expected["retained_rootdisk"] = retained_rootdisk_from_preflight(
                     _json(preflight)

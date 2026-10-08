@@ -62,10 +62,93 @@ def valid_retention_preflight(value, frozen):
     )
 
 
+_READY_UUID_FIELDS = frozenset(
+    {
+        "job_id",
+        "continuation_id",
+        "request_id",
+        "provision_generation",
+        "reservation_id",
+        "vm_uid",
+        "vmi_uid",
+        "launcher_uid",
+        "node_uid",
+        "pvc_uid",
+        "cleanup_request_id",
+    }
+)
+_READY_CANDIDATE_FIELDS = _READY_UUID_FIELDS | {
+    "version",
+    "kind",
+    "owner_kind",
+    "namespace",
+    "cluster_id",
+    "reservation_revision",
+    "cleanup_intent_digest",
+}
+
+
+def valid_ready_retention_candidate(value):
+    """The Ready continuation is a distinct, exact authority from pre-SSH."""
+    return (
+        isinstance(value, Mapping)
+        and set(value) == _READY_CANDIDATE_FIELDS
+        and type(value["version"]) is int
+        and value["version"] == 1
+        and value["kind"] == "vm_job_retained_ready_stop_candidate_v1"
+        and value["owner_kind"] == "job"
+        and all(_uuid(value[field]) for field in _READY_UUID_FIELDS)
+        and _name(value["namespace"], 63)
+        and "." not in value["namespace"]
+        and isinstance(value["cluster_id"], str)
+        and 0 < len(value["cluster_id"]) <= 253
+        and value["cluster_id"] == value["cluster_id"].strip()
+        and not any(character.isspace() for character in value["cluster_id"])
+        and type(value["reservation_revision"]) is int
+        and value["reservation_revision"] > 0
+        and isinstance(value["cleanup_intent_digest"], str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", value["cleanup_intent_digest"])
+        is not None
+    )
+
+
+def valid_ready_retention_preflight(value, frozen):
+    if not isinstance(value, Mapping) or not valid_ready_retention_candidate(frozen):
+        return False
+    if not _uuid(value.get("dv_uid")) or not _name(value.get("pvc_name"), 253):
+        return False
+    if value["pvc_name"] != f"agent-vm-{frozen['job_id']}-rootdisk":
+        return False
+    return _same(
+        value,
+        {
+            "version": 1,
+            "kind": "vm_job_retained_ready_preflight_v1",
+            "stop_policy": "retained_ready_continuation_v1",
+            "frozen": dict(frozen),
+            "namespace": frozen["namespace"],
+            "owner_id": frozen["job_id"],
+            "pvc_name": value["pvc_name"],
+            "pvc_uid": frozen["pvc_uid"],
+            "dv_uid": value["dv_uid"],
+            "ownership": "standalone_dv",
+            "deleting": False,
+            "consumer_scope": "exact_frozen_runtime_only",
+        },
+    )
+
+
 def retained_rootdisk_from_preflight(preflight):
     """Expected final witness; callers must still authenticate fresh observation."""
-    if not isinstance(preflight, Mapping) or not valid_retention_preflight(
-        preflight, preflight.get("frozen")
+    if not isinstance(preflight, Mapping) or not (
+        (
+            preflight.get("kind") == "vm_cancel_retention_preflight_v1"
+            and valid_retention_preflight(preflight, preflight.get("frozen"))
+        )
+        or (
+            preflight.get("kind") == "vm_job_retained_ready_preflight_v1"
+            and valid_ready_retention_preflight(preflight, preflight.get("frozen"))
+        )
     ):
         raise ValueError("retention_preflight_unproven")
     return {

@@ -375,6 +375,23 @@ class VMCreationRetryStore:
         return context, vm, execution
 
     async def _predecessor(self, conn, job, pvc_uid, proposal):
+        from orchestrator.services.vm_job_retained_resume import (
+            retained_resume_predecessor_on_conn,
+        )
+
+        retained = await retained_resume_predecessor_on_conn(conn, job)
+        if retained is not None:
+            if (
+                str(pvc_uid) != retained["expected_pvc_uid"]
+                or proposal.get("predecessor_cleanup_admission_id")
+                != retained["predecessor_cleanup_admission_id"]
+                or proposal.get("predecessor_evidence")
+                != retained["predecessor_evidence"]
+            ):
+                raise VMCreationRetryConflict("retained_resume_predecessor_changed")
+            return retained["predecessor_evidence"], UUID(
+                retained["predecessor_cleanup_admission_id"]
+            )
         evidence = proposal.get("predecessor_evidence") or {}
         old = (_json(job["context"]) or {}).get("last_vm") or {}
         lineage = job.get("_creation_lineage_scope")
@@ -607,8 +624,12 @@ class VMCreationRetryStore:
                         context_merge=resume_context_merge,
                     )
             return existing
+        from orchestrator.services.vm_job_retained_resume import operation_on_conn
+
+        retained_resume = await operation_on_conn(conn, job)
         if (
-            proposal.get("origin") != "initial"
+            proposal.get("origin")
+            != ("resume" if retained_resume is not None else "initial")
             or snapshot.get("initial_request") is not True
         ):
             raise VMCreationRetryConflict("creation_request_unproven")
@@ -628,9 +649,16 @@ class VMCreationRetryStore:
 
             validate_prepared_request(predecessor, payload, configuration)
 
+        retained_columns = (
+            ",job_retained_resume_id" if retained_resume is not None else ""
+        )
+        retained_values = ",$15" if retained_resume is not None else ""
+        origin = "resume" if retained_resume is not None else "initial"
         row = await conn.fetchrow(
-            "INSERT INTO vm_creation_retries(request_id,job_id,provision_generation,origin,request_digest,canonical_request,controller_configuration_digest,execution_id,execution_revision,execution_generation,admission_deadline,expected_pvc_uid,predecessor_evidence,predecessor_cleanup_admission_id,controller_configuration) "
-            "VALUES($1,$2,$3,'initial',$4,$5::jsonb,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14::jsonb) RETURNING *",
+            "INSERT INTO vm_creation_retries(request_id,job_id,provision_generation,origin,request_digest,canonical_request,controller_configuration_digest,execution_id,execution_revision,execution_generation,admission_deadline,expected_pvc_uid,predecessor_evidence,predecessor_cleanup_admission_id,controller_configuration"
+            + retained_columns
+            + ") "
+            + f"VALUES($1,$2,$3,'{origin}',$4,$5::jsonb,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14::jsonb{retained_values}) RETURNING *",
             request_uuid,
             job_uuid,
             generation,
@@ -645,6 +673,7 @@ class VMCreationRetryStore:
             json.dumps(predecessor),
             predecessor_id,
             json.dumps(configuration) if configuration is not None else None,
+            *([retained_resume["id"]] if retained_resume is not None else []),
         )
         retry = _record(row)
         if resource_writer is not None:
@@ -1276,6 +1305,17 @@ class VMCreationRetryStore:
             or permit["intent_digest"] != cleanup_intent_digest(intent)
         ):
             raise VMCreationRetryConflict("creation_reservation_changed")
+        if row.get("job_retained_resume_id") is not None and not await conn.fetchval(
+            "SELECT c.retained_resume_admitted_xact_id<>pg_current_xact_id() "
+            "AND r.job_retained_resume_admitted_xact_id<>pg_current_xact_id() "
+            "AND op.admitted_xact_id<>pg_current_xact_id() "
+            "FROM vm_workspace_cleanup_admissions c JOIN vm_creation_retries r "
+            "ON r.creation_admission_id=c.id JOIN vm_job_retained_resumes op "
+            "ON op.id=r.job_retained_resume_id WHERE c.id=$1 AND r.request_id=$2",
+            permit["id"],
+            row["request_id"],
+        ):
+            raise VMCreationRetryConflict("retained_resume_authority_not_committed")
         return permit
 
     async def begin_effect(

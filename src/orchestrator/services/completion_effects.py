@@ -12,6 +12,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from orchestrator.services.completion_effect_policy import COMPLETION_EFFECT_INDEX
 from orchestrator.services.container_provisioner import WorkspaceTeardownIdentity
 from orchestrator.services.vm_workspace_recovery_store import (
+    CleanupPermit,
     bind_vm_cleanup_permit,
     vm_cleanup_kwargs,
     cleanup_intent_digest,
@@ -212,7 +213,9 @@ async def run_completion_workspace_teardown(
                 intent = (getattr(permit, "parent_cleanup", None) or {}).get("intent")
                 if isinstance(intent, Mapping) and intent.get("resource") == "vm":
                     await complete_vm_cleanup_permit(
-                        recovery_store, permit, outcome=outcome,
+                        recovery_store,
+                        permit,
+                        outcome=outcome,
                         provisioner=vm_provisioner,
                     )
                 else:
@@ -258,6 +261,89 @@ async def run_completion_workspace_teardown(
                 or not 1 <= ssh_port <= 65535
             ):
                 raise RuntimeError("VM teardown intent has invalid SSH port")
+            identity = VMTeardownIdentity(
+                provision_generation=generation,
+                vm_uid=vm_uid,
+                rootdisk_pvc_uid=rootdisk_uid,
+                ssh_host=ssh_host,
+                ssh_port=ssh_port,
+                ssh_host_key_fingerprint=ssh_host_key_fingerprint,
+            )
+            from orchestrator.services.vm_job_retained_resume import (
+                acquire_retained_terminal_cleanup,
+                complete_retained_cancel,
+            )
+
+            retained = await acquire_retained_terminal_cleanup(
+                recovery_store,
+                vm_provisioner,
+                job_id=job_id,
+                identity=identity,
+            )
+            if retained is not None:
+                if not isinstance(retained, CleanupPermit) or not retained.allowed:
+                    raise RuntimeError("retained terminal cleanup held")
+                parent = retained.parent_cleanup
+                if (
+                    not isinstance(parent, Mapping)
+                    or not isinstance(parent.get("intent"), Mapping)
+                    or parent["intent"].get("purge_disk") is not False
+                ):
+                    raise RuntimeError("retained terminal cleanup identity changed")
+                replayed = completed_cleanup_outcome(retained)
+                if replayed is not None:
+                    if replayed != "completed":
+                        raise RuntimeError("retained terminal cleanup held")
+                    await complete_vm_cleanup_permit(
+                        recovery_store,
+                        retained,
+                        outcome="completed",
+                        provisioner=vm_provisioner,
+                    )
+                    if (
+                        await complete_retained_cancel(
+                            postgres_db,
+                            job_id,
+                            clear_pending=False,
+                        )
+                        is not True
+                    ):
+                        raise RuntimeError("retained terminal proof incomplete")
+                    return VMTeardownResult("completed", True)
+                if (
+                    await prepare_vm_cleanup_resource(
+                        recovery_store,
+                        retained,
+                    )
+                    is None
+                ):
+                    raise RuntimeError("retained terminal charge unproven")
+                outcome = await vm_provisioner.release_vm_captured(
+                    job_id,
+                    identity,
+                    ssh_host=ssh_host,
+                    ssh_port=ssh_port,
+                    purge_disk=False,
+                    capture_snapshot=False,
+                    **vm_cleanup_kwargs(retained),
+                )
+                if outcome.disposition == "completed":
+                    await complete_vm_cleanup_permit(
+                        recovery_store,
+                        retained,
+                        outcome="completed",
+                        provisioner=vm_provisioner,
+                    )
+                    if (
+                        await complete_retained_cancel(
+                            postgres_db,
+                            job_id,
+                            clear_pending=False,
+                        )
+                        is not True
+                    ):
+                        raise RuntimeError("retained terminal proof incomplete")
+                return outcome
             if (
                 not isinstance(ssh_host_key_fingerprint, str)
                 or not ssh_host_key_fingerprint.startswith("SHA256:")
@@ -269,7 +355,9 @@ async def run_completion_workspace_teardown(
             )
 
             if await retained_terminal_rootdisk(
-                postgres_db, job_id=job_id, generation=generation,
+                postgres_db,
+                job_id=job_id,
+                generation=generation,
                 pvc_uid=rootdisk_uid,
             ):
                 raise RuntimeError("terminal_retention_unknown: exact rootdisk held")
@@ -290,14 +378,7 @@ async def run_completion_workspace_teardown(
             else:
                 outcome = await vm_provisioner.release_vm_captured(
                     job_id,
-                    VMTeardownIdentity(
-                        provision_generation=generation,
-                        vm_uid=vm_uid,
-                        rootdisk_pvc_uid=rootdisk_uid,
-                        ssh_host=ssh_host,
-                        ssh_port=ssh_port,
-                        ssh_host_key_fingerprint=ssh_host_key_fingerprint,
-                    ),
+                    identity,
                     ssh_host=ssh_host,
                     ssh_port=ssh_port,
                     purge_disk=True,
@@ -448,7 +529,8 @@ async def run_completion_workspace_teardown(
                     )
 
                     if await retained_terminal_rootdisk(
-                        postgres_db, job_id=job_id,
+                        postgres_db,
+                        job_id=job_id,
                         generation=current_vm.get("provision_generation"),
                         pvc_uid=current_vm.get("rootdisk_pvc_uid"),
                     ):

@@ -498,6 +498,7 @@ class NatsBridge:
         *,
         exact_absence: bool = False,
         workspace_storage: dict | None = None,
+        retained_ready_stop_candidate: Mapping[str, Any] | None = None,
     ) -> Optional[dict]:
         """Query live VM status via NATS request/reply.
 
@@ -536,6 +537,19 @@ class NatsBridge:
             from shared.vm_workspace_storage import storage_binding
 
             payload["workspace_storage"] = storage_binding(workspace_storage)
+        if retained_ready_stop_candidate is not None:
+            from shared.vm_cancel_retention import valid_ready_retention_candidate
+
+            if (
+                self._lifecycle_hmac_secret is None
+                or not valid_ready_retention_candidate(retained_ready_stop_candidate)
+                or retained_ready_stop_candidate["job_id"] != job_id
+                or retained_ready_stop_candidate["provision_generation"] != generation
+            ):
+                return None
+            payload["retained_ready_stop_candidate"] = dict(
+                retained_ready_stop_candidate
+            )
         payload = sign_payload(
             payload,
             direction="request",

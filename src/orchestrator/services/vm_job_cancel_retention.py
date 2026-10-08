@@ -168,13 +168,27 @@ async def retention_settlement_is_current_on_conn(
     )
 
 
-async def acquire_cancel_retention(store, *, job_id: str, identity):
+async def acquire_cancel_retention(
+    store, *, job_id: str, identity, retention_preflight=None
+):
     """None is reserved for clearly unrelated work, never a recognized refusal."""
+
+    from orchestrator.services.vm_job_retained_resume import (
+        acquire_retained_resume_cleanup,
+    )
 
     try:
         owner = _uuid(job_id)
     except (TypeError, ValueError, AttributeError):
         return CleanupPermit(allowed=False, reason="cancel_retention_identity_unproven")
+    continuation = await acquire_retained_resume_cleanup(
+        store,
+        job_id=job_id,
+        identity=identity,
+        retention_preflight=retention_preflight,
+    )
+    if continuation is not None:
+        return continuation
     async with store.db.acquire() as conn, conn.transaction():
         await conn.execute(
             "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",

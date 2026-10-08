@@ -286,6 +286,13 @@ class VMCreationPreflightStore:
         return job, current, current_vm, current_prior
 
     async def _predecessor(self, conn, job, old):
+        from orchestrator.services.vm_job_retained_resume import (
+            retained_resume_predecessor_on_conn,
+        )
+
+        retained = await retained_resume_predecessor_on_conn(conn, job)
+        if retained is not None:
+            return retained
         lineage = job.get("_creation_lineage_scope")
         if lineage:
             if old:
@@ -497,6 +504,24 @@ class VMCreationPreflightStore:
         async with self.db.acquire() as conn:
             async with conn.transaction():
                 job, context, old_vm, prior = await self._lock(conn, owner)
+                from orchestrator.services.vm_job_retained_resume import (
+                    operation_on_conn,
+                )
+
+                retained_resume = await operation_on_conn(conn, job)
+                if retained_resume is not None:
+                    source_request = await conn.fetchval(
+                        "SELECT canonical_request FROM vm_creation_retries WHERE request_id=$1",
+                        retained_resume["predecessor_request_id"],
+                    )
+                    request = _object(source_request)
+                    request["provision_generation"] = str(
+                        retained_resume["provision_generation"]
+                    )
+                    fresh_context = {
+                        **fresh_context,
+                        "provision_generation": request["provision_generation"],
+                    }
                 idle_wake = None
                 if idle_wake_id is None and (
                     old_vm.get("status") in {"suspending", "suspended"}
@@ -674,8 +699,11 @@ class VMCreationPreflightStore:
                 value = {
                     "version": 1,
                     "request_id": (
-                        str(idle_wake["wake_request_id"])
-                        if idle_first else str(uuid4())
+                        str(retained_resume["request_id"])
+                        if retained_resume is not None
+                        else str(idle_wake["wake_request_id"])
+                        if idle_first
+                        else str(uuid4())
                     ),
                     "job_id": job_id,
                     "request": deepcopy(request),
@@ -918,10 +946,13 @@ class VMCreationPreflightStore:
                 if snapshot is None:
                     raise VMCreationRetryConflict("creation_request_unproven")
                 proposal = {
-                    "origin": "initial",
+                    "origin": "resume"
+                    if _object(job["context"]).get("_vm_job_retained_resume")
+                    else "initial",
                     "idle_wake_id": (
-                        (_object(_object(job["context"]).get("vm")))
-                        .get("idle_wake_operation_id")
+                        (_object(_object(job["context"]).get("vm"))).get(
+                            "idle_wake_operation_id"
+                        )
                     ),
                     "expected_status": job["status"],
                     "request_digest": snapshot["request_digest"],

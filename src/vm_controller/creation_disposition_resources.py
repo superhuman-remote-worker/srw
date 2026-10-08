@@ -302,8 +302,90 @@ class DispositionResources:
         if root and any(pin.get("pvc_uid") == root["pvc_uid"] for pin in pins):
             raise CreationUnproven("creation_resource_recovery_pinned")
 
+    async def _check_inherited_rootdisk(self, grant):
+        """Prove B's signed disk custody without claiming a C root effect."""
+        root = grant.get("resource")
+        completion = grant.get("completion")
+        expected_pvc = self.row.get("expected_pvc_uid")
+        if (
+            grant.get("operation") != "retain_inherited_rootdisk"
+            or self.row.get("owner_kind") != "job"
+            or self.disposition["disk_policy"] != "retain"
+            or self.disposition["objects"].get("rootdisk") is not None
+            or expected_pvc is None
+            or any(
+                effect["effect_kind"] == "rootdisk" and effect["state"] != "rejected"
+                for effect in self.disposition["effects"]
+            )
+        ):
+            raise CreationUnproven("creation_disposition_grant_changed")
+        expected_root = {
+            "name": f"agent-vm-{self.row['job_id']}-rootdisk",
+            "namespace": self.actuator.namespace,
+            "uid": root.get("uid") if isinstance(root, Mapping) else None,
+            "pvc_uid": str(expected_pvc),
+        }
+        if (
+            not isinstance(root, Mapping)
+            or dict(root) != expected_root
+            or not isinstance(completion, Mapping)
+            or dict(completion)
+            != {
+                "version": 1,
+                "disposition_id": self.disposition["disposition_id"],
+                "kind": "rootdisk_retained",
+                **expected_root,
+            }
+            or type(completion.get("version")) is not int
+        ):
+            raise CreationUnproven("creation_disposition_grant_changed")
+        try:
+            observed = await self.actuator.controller._qualify_cancel_retained_rootdisk(
+                self.row["job_id"], expected_root["pvc_uid"]
+            )
+            pins = await self.actuator.controller._active_recovery_pins()
+        except Exception as exc:
+            raise CreationUnproven("creation_resource_identity_changed") from exc
+        if (
+            not isinstance(observed, Mapping)
+            or dict(observed)
+            != {
+                "version": 1,
+                "kind": "vm_retained_rootdisk_v1",
+                "namespace": expected_root["namespace"],
+                "owner_kind": "job",
+                "owner_id": self.row["job_id"],
+                "pvc_name": expected_root["name"],
+                "pvc_uid": expected_root["pvc_uid"],
+                "dv_uid": expected_root["uid"],
+                "ownership": "standalone_dv",
+                "deleting": False,
+                "no_consumers": True,
+            }
+            or not isinstance(pins, list)
+            or any(
+                not isinstance(pin, Mapping)
+                or pin.get("pvc_uid") == expected_root["pvc_uid"]
+                for pin in pins
+            )
+        ):
+            raise CreationUnproven("creation_resource_identity_changed")
+
     async def run(self):
         await self.check()
+        inherited_grant = None
+        if (
+            self.disposition["disk_policy"] == "retain"
+            and self.disposition["objects"].get("rootdisk") is None
+            and self.row.get("expected_pvc_uid") is not None
+        ):
+            inherited_grant = await self.actuator.authority(
+                "authorize-disposition",
+                request_id=self.row["request_id"],
+                carrier=self.lease,
+                stage="rootdisk",
+            )
+            await self._check_inherited_rootdisk(inherited_grant)
         for stage in ("cloud_init", "rootdisk"):
             grant = await self.actuator.authority(
                 "authorize-disposition",
@@ -324,6 +406,12 @@ class DispositionResources:
                 scan["objects"][stage] = {"name": completion["name"]}
                 await require_no_consumers(self.actuator, scan)
                 await self.record(stage, completion)
+                continue
+            if grant.get("operation") == "retain_inherited_rootdisk":
+                if stage != "rootdisk" or grant != inherited_grant:
+                    raise CreationUnproven("creation_disposition_grant_changed")
+                await self._check_inherited_rootdisk(grant)
+                await self.record(stage, grant["completion"])
                 continue
             if grant.get("resource") != self.disposition["objects"].get(stage):
                 raise CreationUnproven("creation_disposition_grant_changed")

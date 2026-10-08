@@ -1133,6 +1133,29 @@ supersession of an unissued purge request. Disabled admission holds those
 candidates; it never falls back to disk purge. Persisted retention guards, exact
 retries, settlement and separately authorized permanent Delete remain active.
 
+Migration `0339_vm_job_retained_resume.sql` and matching server/controller code
+add explicit owner **Resume** for this retained Cancel lineage. Resume keeps the
+same Job and PVC, preserves the frozen image/configuration, and admits a fresh
+VM generation only after the preceding cleanup has settled and released its
+compute reservation. The gate must be enabled to admit a new continuation;
+already admitted work remains protected and can reconcile after it is disabled.
+The retained data remains on the original PVC. Stopping compute through this
+path does not create an S3 disk snapshot or a separate backup.
+
+Each resumed VM must settle its own terminal cleanup before another Resume.
+A Ready VM requires authenticated process retirement and physical stop proof;
+a never-Ready VM uses the separate pre-SSH stop checks. A failed creation that
+provably issued no VM can settle without inventing a VM stop receipt. An issued
+or uncertain creation stays held until its actual outcome is established,
+including any reservation that still accounts for possible compute.
+
+**Cancel** retains the protected disk. Explicit permanent **Delete** first
+settles the current continuation, then authorizes deletion of that exact disk
+using the complete retained history. This also applies when the latest Resume
+failed before creating a VM: its no-effect result and the preceding physical
+disk custody must both be proved. A timeout or absent API response is not proof
+that cleanup completed; use the existing controls and reported pending state.
+
 Publish with the effective gate false. Enable only after the schema and
 retention-aware Controller/Core versions are installed, preservation and Delete
 acceptance is qualified, and every old controller/transport consumer and cleanup

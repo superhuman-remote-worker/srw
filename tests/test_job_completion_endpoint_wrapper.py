@@ -59,6 +59,8 @@ CURATOR_ID = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
 
 
 class _AllowCleanupStore:
+    _synthetic_legacy_only = True
+
     async def acquire_cleanup_permit(self, **_kwargs):
         return SimpleNamespace(allowed=True)
 
@@ -137,6 +139,25 @@ def _isolate_workspace_cleanup_authority(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(recovery, "prepare_vm_cleanup_resource", no_resource_charge)
     monkeypatch.setattr(
         completion_effects, "prepare_vm_cleanup_resource", no_resource_charge
+    )
+    # This suite's explicit legacy owners use a permit-only fake with no DB.
+    # Keep that fixture unrelated to the typed retained Job continuation;
+    # production still requires the real tri-state SQL reader.
+    from orchestrator.services import vm_job_retained_resume
+
+    original_acquire_retained = vm_job_retained_resume.acquire_retained_terminal_cleanup
+
+    async def synthetic_legacy_retention(store, provisioner, *, job_id, identity):
+        if job_id == JOB_ID and getattr(store, "_synthetic_legacy_only", False) is True:
+            return None
+        return await original_acquire_retained(
+            store, provisioner, job_id=job_id, identity=identity
+        )
+
+    monkeypatch.setattr(
+        vm_job_retained_resume,
+        "acquire_retained_terminal_cleanup",
+        synthetic_legacy_retention,
     )
 
 
@@ -2704,6 +2725,8 @@ async def test_hybrid_vm_and_kubernetes_s36_captures_and_releases_both(
     active_cleanup: UUID | None = None
 
     class SequentialCleanupStore:
+        _synthetic_legacy_only = True
+
         async def acquire_cleanup_permit(self, **kwargs):
             nonlocal active_cleanup
             request_id = kwargs["request_id"]

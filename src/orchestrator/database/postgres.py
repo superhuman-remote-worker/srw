@@ -6049,6 +6049,21 @@ class PostgresDB:
             canonical_owner, ambiguous = _job_workspace_owner(owner_id, row)
             if ambiguous or canonical_owner != owner_id:
                 return False
+            if context.get(
+                "_vm_job_retained_resume"
+            ) is not None and await conn.fetchval(
+                "SELECT to_regclass('public.vm_job_retained_resumes') IS NOT NULL"
+            ):
+                # This only defers prune. Terminal/physical authority is proved
+                # again by archive, including an accepted Resume with no VM.
+                return bool(
+                    await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_job_retained_resumes "
+                        "WHERE id::text=$1 AND job_id=$2)",
+                        context["_vm_job_retained_resume"],
+                        owner_id,
+                    )
+                )
             vm = context.get("vm")
             if not isinstance(vm, dict) or vm.get("workspace_storage") is not None:
                 # Retained storage needs its durable reservation proof, which
@@ -6202,6 +6217,7 @@ class PostgresDB:
                     await cancel_queued_worker_batch(conn, job_id=job_uuid)
                 job = await conn.fetchrow(
                     "SELECT status::text AS status, execution_lane, "
+                    "context->>'_vm_job_retained_resume' AS retained_resume, "
                     "COALESCE(context, '{}'::jsonb) "
                     "? '_stateless_cancel_cleanup_pending' AS cleanup_pending "
                     "FROM jobs WHERE id = $1 FOR UPDATE",
@@ -6218,6 +6234,21 @@ class PostgresDB:
                     # settle owner already proved the checkpoint/workspace
                     # cleanup and cleared the marker.
                     return True
+                if job["retained_resume"] is not None:
+                    from orchestrator.services.vm_job_retained_resume import installed
+
+                    # This exact continuation must settle its own compute or
+                    # no-source terminal before any checkpoint destruction.
+                    # The complete callback performs the deferred strict prune.
+                    return bool(
+                        await installed(conn)
+                        and await conn.fetchval(
+                            "SELECT EXISTS(SELECT 1 FROM vm_job_retained_resumes "
+                            "WHERE id::text=$1 AND job_id=$2)",
+                            job["retained_resume"],
+                            job_uuid,
+                        )
+                    )
 
         # The marker remains set until the orchestrator has also completed the
         # external workspace teardown. A strict failure is retried by the
@@ -6236,6 +6267,19 @@ class PostgresDB:
             job_uuid = UUID(job_id)
         except ValueError:
             return False
+
+        from orchestrator.services.vm_job_retained_resume import (
+            complete_retained_cancel,
+        )
+
+        source_absent = await complete_retained_cancel(
+            self, job_uuid, clear_pending=False
+        )
+        if source_absent is not None:
+            if not source_absent:
+                return False
+            await self.delete_checkpoint_thread(job_id, strict=True)
+            return await complete_retained_cancel(self, job_uuid)
 
         from orchestrator.services.vm_job_cancel_retention import (
             complete_cancel_retention_marker,
@@ -35044,6 +35088,7 @@ class PostgresDB:
         expected_status: str,
         completion_commands_enabled: bool = False,
         lift_operator_pause_hold: str | None = None,
+        owner_resume_user_id: UUID | str | None = None,
     ) -> bool:
         """Prepare an explicit worker resume that needs K8s reprovisioning.
 
@@ -35059,6 +35104,23 @@ class PostgresDB:
             job_uuid = UUID(job_id)
         except ValueError:
             return False
+
+        if workspace_context_key == "vm":
+            from orchestrator.services.vm_job_retained_resume import (
+                prepare_owner_resume,
+            )
+
+            retained = await prepare_owner_resume(
+                self,
+                job_id=job_uuid,
+                context_merge=context_merge,
+                expected_status=expected_status,
+                requested_by=owner_resume_user_id,
+                completion_commands_enabled=completion_commands_enabled,
+                lift_operator_pause_hold=lift_operator_pause_hold,
+            )
+            if retained is not None:
+                return retained
 
         context_merge = _stateless_resume_context(context_merge)
 
@@ -46622,8 +46684,7 @@ class PostgresDB:
                     or marker["resident_cleanup_required"] is not True
                     or marker["shell_retirement_required"] is not True
                     or marker["runtime_incarnation"] != runtime
-                    or marker["host_key_fingerprint"]
-                    != expected_host_key_fingerprint
+                    or marker["host_key_fingerprint"] != expected_host_key_fingerprint
                     or marker["workspace_generation"] != generation
                     or marker["endpoint_generation"] != generation
                     or not isinstance(workspace, dict)
@@ -46635,8 +46696,7 @@ class PostgresDB:
                     or binding.get("ssh_host_key_fingerprint")
                     != expected_host_key_fingerprint
                     or any(
-                        metadata.get(ack_key, {}).get("runtime_incarnation")
-                        != runtime
+                        metadata.get(ack_key, {}).get("runtime_incarnation") != runtime
                         for ack_key in (
                             "_stateless_resident_retirement_ack",
                             "_stateless_shell_retirement_ack",

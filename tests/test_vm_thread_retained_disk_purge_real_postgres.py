@@ -54,6 +54,18 @@ class RetainedDisk(PhysicalStop):
 
 
 async def predecessor_snapshot(db, case):
+    # Forward Job-only extensions must remain NULL on historical thread rows.
+    # Compare the original data separately from these newly added columns.
+    assert not await db.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM vm_creation_retries r WHERE "
+        "to_jsonb(r)->>'job_retained_resume_id' IS NOT NULL OR "
+        "to_jsonb(r)->>'job_retained_resume_admitted_xact_id' IS NOT NULL)"
+    )
+    assert not await db.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions r "
+        "WHERE source='pinned_thread_retirement' AND "
+        "to_jsonb(r)->>'retained_resume_admitted_xact_id' IS NOT NULL)"
+    )
     result = {}
     for table in (
         "vm_creation_retries",
@@ -63,10 +75,13 @@ async def predecessor_snapshot(db, case):
         "vm_resource_thread_cleanup_stops",
     ):
         result[table] = await db.fetch(
-            f"SELECT (to_jsonb(r)-'thread_retained_resume_id')::text AS row FROM {table} r ORDER BY to_jsonb(r)::text"
+            f"SELECT (to_jsonb(r)-'thread_retained_resume_id'"
+            f"-'job_retained_resume_id'-'job_retained_resume_admitted_xact_id')::text AS row "
+            f"FROM {table} r ORDER BY to_jsonb(r)::text"
         )
     result["cleanup"] = await db.fetch(
-        "SELECT to_jsonb(r)::text AS row FROM vm_workspace_cleanup_admissions r "
+        "SELECT (to_jsonb(r)-'retained_resume_admitted_xact_id')::text AS row "
+        "FROM vm_workspace_cleanup_admissions r "
         "WHERE source='pinned_thread_retirement' ORDER BY id"
     )
     return result

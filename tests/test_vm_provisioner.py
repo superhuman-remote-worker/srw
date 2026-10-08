@@ -6,6 +6,7 @@ Tests cover explicit VM mode selection and the external/HTTP lifecycle paths.
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -68,6 +69,24 @@ def mock_db():
     db.record_managed_repository_workspace_process_zero = AsyncMock(return_value=True)
     db.get_job = AsyncMock(return_value={"context": {"vm": _ready_vm_context()}})
     db.get_thread = AsyncMock(return_value={"metadata": {"vm": _ready_vm_context()}})
+
+    # These legacy lifecycle cases have no typed retained-Job Resume lineage.
+    # Model the native lookup instead of bypassing the provisioner's guard.
+    conn = MagicMock()
+    conn.fetchval = AsyncMock(return_value=True)
+    conn.fetchrow = AsyncMock(return_value=None)
+    conn.execute = AsyncMock()
+
+    @asynccontextmanager
+    async def transaction():
+        yield
+
+    @asynccontextmanager
+    async def acquire():
+        yield conn
+
+    conn.transaction = transaction
+    db.acquire = acquire
     return db
 
 

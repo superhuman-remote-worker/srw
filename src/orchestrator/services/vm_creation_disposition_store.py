@@ -538,6 +538,56 @@ class VMCreationDispositionStore:
             raise VMCreationRetryConflict("creation_disposition_stage_unavailable")
         resource = disposition["objects"].get(stage)
         if resource is None:
+            if (
+                stage == "rootdisk"
+                and disposition["disk_policy"] == "retain"
+                and row["owner_kind"] == "job"
+                and row["expected_pvc_uid"] is not None
+                and row["canonical_request"].get("workspace_storage") is None
+                and row["observed_pvc_uid"] in (None, row["expected_pvc_uid"])
+                and not any(
+                    effect["effect_kind"] == "rootdisk"
+                    and effect["state"] != "rejected"
+                    for effect in disposition["effects"]
+                )
+            ):
+                inherited = _json(
+                    await conn.fetchval(
+                        "SELECT public.vm_job_retained_inherited_rootdisk(r) "
+                        "FROM vm_creation_retries r WHERE request_id=$1",
+                        row["request_id"],
+                    )
+                )
+                expected_name = f"agent-vm-{row['job_id']}-rootdisk"
+                try:
+                    exact = (
+                        type(inherited) is dict
+                        and set(inherited) == {"name", "namespace", "uid", "pvc_uid"}
+                        and inherited["name"] == expected_name
+                        and inherited["namespace"] == disposition["namespace"]
+                        and inherited["pvc_uid"] == str(row["expected_pvc_uid"])
+                        and all(
+                            isinstance(inherited[key], str)
+                            and str(UUID(inherited[key])) == inherited[key]
+                            for key in ("uid", "pvc_uid")
+                        )
+                    )
+                except (TypeError, ValueError, AttributeError):
+                    exact = False
+                if not exact:
+                    raise VMCreationRetryConflict(
+                        "creation_disposition_stage_unavailable"
+                    )
+                return {
+                    "operation": "retain_inherited_rootdisk",
+                    "resource": inherited,
+                    "completion": {
+                        "version": 1,
+                        "disposition_id": disposition["disposition_id"],
+                        "kind": "rootdisk_retained",
+                        **inherited,
+                    },
+                }
             if any(
                 e["effect_kind"] == stage and e["state"] != "rejected"
                 for e in disposition["effects"]
