@@ -144,6 +144,25 @@ func TestResolveReportsFailure(t *testing.T) {
 	}
 }
 
+func TestSelfReportsTheProcessFacts(t *testing.T) {
+	s := setup(t, "http://exchange.invalid")
+	code, body, _ := get(t, s.routes(), http.MethodGet, "/self", "")
+	if code != 200 || body["identity_file_readable"] != true {
+		t.Fatalf("%d %v", code, body)
+	}
+	process := body["process"].(map[string]any)
+	if _, ok := process["CapEff"]; !ok {
+		t.Fatalf("no CapEff in %v", process)
+	}
+	facts := processFacts("Name:\techo\nUid:\t65532\t65532\t65532\t65532\nCapEff:\t0000000000000000\nNoNewPrivs:\t1\n")
+	if facts["Uid"] != "65532 65532 65532 65532" || facts["CapEff"] != "0000000000000000" || facts["NoNewPrivs"] != "1" {
+		t.Fatalf("facts %v", facts)
+	}
+	if _, ok := facts["Name"]; ok {
+		t.Fatal("only the security facts are reported")
+	}
+}
+
 func TestTheServerNeedsTheShim(t *testing.T) {
 	if _, err := loadServer(func(string) string { return "" }); err == nil {
 		t.Fatal("must refuse without the request and identity files")

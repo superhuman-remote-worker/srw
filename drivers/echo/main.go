@@ -11,6 +11,8 @@
 //	                 status and fields, and the credential only as a SHA-256
 //	GET  /probe?addr=HOST:PORT   whether a TCP connect from this pod completes
 //	GET  /resolve?name=NAME      whether this pod can resolve a name
+//	GET  /self       its uid, capabilities, no-new-privs and whether a
+//	                 ServiceAccount token is mounted
 //
 // and a second listener on SRW_ECHO_EXTRA_PORT that nothing outside the pod
 // may reach (the gate checks that only the named port is open). Never the
@@ -190,9 +192,44 @@ func (s *server) handleResolve(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"name": name, "resolved": true, "addresses": addresses})
 }
 
+// serviceAccountToken is where Kubernetes mounts a pod's token when it may.
+const serviceAccountToken = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+// processFacts reads what the kernel says about this process: its user, its
+// capabilities and whether it may gain privileges.
+func processFacts(status string) map[string]string {
+	facts := map[string]string{}
+	for _, line := range strings.Split(status, "\n") {
+		name, value, found := strings.Cut(line, ":")
+		if !found {
+			continue
+		}
+		switch name {
+		case "Uid", "Gid", "CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb", "NoNewPrivs", "Seccomp":
+			facts[name] = strings.Join(strings.Fields(value), " ")
+		}
+	}
+	return facts
+}
+
+func (s *server) handleSelf(w http.ResponseWriter, r *http.Request) {
+	status, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	_, tokenErr := os.Stat(serviceAccountToken)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"process":                processFacts(string(status)),
+		"service_account_token":  tokenErr == nil,
+		"identity_file_readable": s.identity != "",
+	})
+}
+
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleRoot)
+	mux.HandleFunc("/self", s.handleSelf)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
