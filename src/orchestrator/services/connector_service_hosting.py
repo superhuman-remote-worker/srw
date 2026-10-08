@@ -87,7 +87,7 @@ CAPACITY = "capacity"
 START_TIMEOUT = "start_timeout"
 POD_LOST = "pod_lost"
 #: Stops that back the key off before the next start.
-_BACKOFF_REASONS = (LAUNCH_REFUSED, START_TIMEOUT, CAPACITY)
+_BACKOFF_REASONS = (LAUNCH_REFUSED, LAUNCH_FAILED, START_TIMEOUT, CAPACITY)
 _CAPACITY_LOCK = "srw-connector-service-capacity"
 
 
@@ -482,7 +482,13 @@ class ServiceHostingReconciler:
         }
 
     async def _exchange_address(self) -> str:
-        answers = await self.resolver(self.settings.exchange_host, False)
+        try:
+            answers = await self.resolver(self.settings.exchange_host, False)
+        except OSError as exc:
+            raise ServiceLaunchError(
+                f"the lease exchange host {self.settings.exchange_host} does not "
+                f"resolve ({exc})"
+            ) from exc
         for answer in answers:
             if ":" not in answer:
                 return answer
@@ -696,6 +702,16 @@ class ServiceHostingReconciler:
             logger.warning(
                 "Driver pod for connector %s refused: %s", binding.connector_id, exc
             )
+            return
+        except Exception as exc:
+            # Nothing was created yet; never leave a live identity without a
+            # pod. The key backs off like a refusal.
+            logger.exception(
+                "Driver pod for connector %s could not be built", binding.connector_id
+            )
+            await self._revoke(row, LAUNCH_FAILED, error=type(exc).__name__)
+            await self._mark_removed(str(row["id"]))
+            report.refused.append((binding.connector_id, type(exc).__name__))
             return
         async with self.store.acquire() as conn:
             await conn.execute(

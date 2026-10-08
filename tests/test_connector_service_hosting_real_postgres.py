@@ -755,6 +755,31 @@ async def test_an_egress_the_tier_forbids_refuses_the_launch_and_backs_off(
 
 
 @pytest.mark.asyncio
+async def test_an_unexpected_build_error_leaves_no_live_identity_and_backs_off(
+    db, reconciler
+):
+    resolve = reconciler.resolver
+
+    async def broken(host, ipv6):
+        if host == "srw-orchestrator.srw.svc":
+            raise RuntimeError("resolver crashed")
+        return await resolve(host, ipv6)
+
+    reconciler.resolver = broken
+    connector = await _echo_connector(db)
+    await _echo_image(db)
+    await _bind_echo(db, connector, await _thread(db))
+    report = await reconciler.reconcile_once()
+    assert report.started == [] and report.refused == [(connector, "RuntimeError")]
+    (pod,) = await _pods(db)
+    assert pod["revoke_reason"] == "launch_failed"
+    assert pod["removed_at"] is not None
+    assert reconciler.fake.plans == {}
+    await reconciler.reconcile_once()
+    assert len(await _pods(db)) == 1
+
+
+@pytest.mark.asyncio
 async def test_a_lost_or_never_ready_pod_is_stopped_and_replaced(db, reconciler):
     connector = await _echo_connector(db)
     await _echo_image(db)
