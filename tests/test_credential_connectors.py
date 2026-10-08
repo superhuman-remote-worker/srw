@@ -225,6 +225,14 @@ def test_the_environment_materializer_installs_every_env_connector():
             [{"type": "generic", "credentials": {"env_vars": {"PATH": "/x"}}}],
             "reserved by the workspace",
         ),
+        (
+            [{"type": "credentials", "credentials": {"env_vars": ["API_KEY"]}}],
+            "must be a name/value object",
+        ),
+        (
+            [{"type": "generic", "credentials": {"env_vars": None}}],
+            "must be a name/value object",
+        ),
     ],
 )
 def test_the_environment_materializer_keeps_the_delivery_errors(entries, message):

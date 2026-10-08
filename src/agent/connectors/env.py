@@ -17,6 +17,7 @@ from agent.connectors.base import (
     RuntimeContext,
     declared_read_only_note,
 )
+from agent.connectors.legacy import env_vars_unreadable
 from shared.credential_connectors import normalize_credential_env
 
 
@@ -37,6 +38,8 @@ def credential_environment(deliveries: Sequence[Delivery]) -> dict[str, str]:
     """
     result: dict[str, str] = {}
     for delivery in deliveries:
+        if env_vars_unreadable(delivery.entry):
+            raise ValueError("Environment variables must be a name/value object")
         values = normalize_credential_env(
             {value["name"]: value["value"] for value in delivery.values("env_file")},
             required=_required(delivery),

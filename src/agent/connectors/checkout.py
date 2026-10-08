@@ -562,6 +562,11 @@ class CheckoutMaterializer:
     def materialize(self, deliveries: Sequence[Delivery], rt: RuntimeContext) -> None:
         if not deliveries:
             return
+        if rt.workspace_manager is None and rt.execution == "session":
+            # A session without a workspace has nothing to clone into (lite
+            # tiers refuse repositories at dispatch); a worker says so loudly.
+            logger.debug("No session workspace; repository checkouts skipped")
+            return
         clone_repository_datasources(
             [delivery.entry for delivery in deliveries],
             rt.workspace_manager,

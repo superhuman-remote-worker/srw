@@ -22,6 +22,7 @@ from collections.abc import Sequence
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.connectors.base import AGENT_HOME, Delivery, FactsLines, RuntimeContext
+from agent.connectors.legacy import deliveries_from_payload, unreadable_file_modes
 
 logger = logging.getLogger(__name__)
 
@@ -196,10 +197,13 @@ def _write_files(
     for delivery in deliveries:
         ds_name = delivery.name
         ds_slug = _ds_slug_hyphen(ds_name)
-        entries = delivery.binding.entries if delivery.binding else ()
-        for entry in entries:
-            if entry.form != "credential_file":
-                continue
+        entries = [
+            entry
+            for entry in (delivery.binding.entries if delivery.binding else ())
+            if entry.form == "credential_file"
+        ]
+        bad_modes = unreadable_file_modes(delivery.entry)
+        for index, entry in enumerate(entries):
             if entry.recipient != "agent_pod":
                 logger.warning(
                     "Skipping a credential file for '%s': delivery to %s is "
@@ -225,6 +229,9 @@ def _write_files(
             contents = value["content"]
             if value.get("transform") == "kubeconfig_prefix":
                 contents = _prefix_kubeconfig_yaml(contents, ds_slug)
+            bad_mode = bad_modes[index] if index < len(bad_modes) else None
+            if bad_mode is not None:
+                logger.warning("Bad mode %r on '%s'; using 0600", bad_mode, ds_name)
             mode = int(value.get("mode", 0o600))
 
             parent = os.path.dirname(absolute)
@@ -297,8 +304,6 @@ def process_credential_files(
     ``home_dir`` overrides the ``/home/srw`` prefix of the stored target
     paths; production leaves the default and tests pass a tmp directory.
     """
-    from agent.connectors.legacy import deliveries_from_payload
-
     deliveries = [
         delivery
         for delivery in deliveries_from_payload(ds_configs)

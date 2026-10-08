@@ -128,13 +128,17 @@ def test_the_descriptor_carries_each_forms_values():
 
     token = _value(binding_from_legacy_entry(entries["repository_token"]), "checkout")
     assert token["auth"] == "token_in_url"
-    assert token["secret"] == "ghp_widgets-secret"
+    # The clone reads the token from the entry; no second copy.
+    assert "secret" not in token
+    assert "ghp_widgets-secret" not in repr(
+        binding_from_legacy_entry(entries["repository_token"]).to_json()
+    )
     assert token["forge"] == "github"
     assert token["datasource_id"] == entries["repository_token"]["datasource_id"]
 
     ssh = _value(binding_from_legacy_entry(entries["repository_ssh"]), "checkout")
     assert ssh["auth"] == "ssh_agent"
-    assert ssh["secret"] is None
+    assert "secret" not in ssh
 
     pg = _value(binding_from_legacy_entry(entries["postgresql"]), "managed_connection")
     assert pg["kind"] == "postgresql"
@@ -507,3 +511,59 @@ def test_facts_list_an_unserved_type_under_other():
 def test_facts_state_the_empty_set():
     lines = connector_registry().facts([], RuntimeContext(execution="session"))
     assert lines == ["_No connectors attached._", ""]
+
+
+def test_a_bad_file_mode_warns_and_falls_back_to_0600(tmp_path, caplog):
+    """The warning the agent always gave for an unreadable mode."""
+    import os
+
+    row = resolved_row("generic_file")
+    row["credentials"]["files"][0]["mode"] = "0999"
+    deliveries = deliveries_from_payload([row])
+    rt = RuntimeContext(execution="worker", home_dir=str(tmp_path))
+    with caplog.at_level(logging.WARNING):
+        CredentialFileMaterializer().materialize(deliveries, rt)
+    assert "Bad mode '0999'" in caplog.text
+    first = Path(rt.files_manifest["files"][0])
+    assert os.stat(first).st_mode & 0o777 == 0o600
+    CredentialFileMaterializer().release(rt)
+
+
+def test_knowledge_bindings_skip_a_connector_that_is_no_knowledge_base():
+    """A caller passing a whole payload never binds another connector."""
+    from agent.services.knowledge.bindings import build_knowledge_bindings
+
+    bindings = build_knowledge_bindings(
+        datasources=[
+            {
+                "type": "postgresql",
+                "name": "PG",
+                "datasource_id": "00000000-0000-0000-0000-0000000000d8",
+            },
+            {
+                "type": "KB",
+                "name": "Docs",
+                "datasource_id": "00000000-0000-0000-0000-0000000000d9",
+            },
+        ]
+    )
+    assert [binding.name for binding in bindings] == ["Docs"]
+
+
+@pytest.mark.parametrize(
+    ("execution", "clones"), [("session", False), ("worker", True)]
+)
+def test_checkouts_without_a_workspace(execution, clones, caplog):
+    """A session skips quietly, as it did; a worker reports it."""
+    from agent.connectors.checkout import CheckoutMaterializer
+
+    deliveries = deliveries_from_payload([resolved_row("repository_token")])
+    with (
+        patch("agent.connectors.checkout.clone_repository_datasources") as clone,
+        caplog.at_level(logging.WARNING),
+    ):
+        CheckoutMaterializer().materialize(
+            deliveries, RuntimeContext(execution=execution)
+        )
+    assert clone.called is clones
+    assert caplog.text == ""

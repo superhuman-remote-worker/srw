@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable, Literal, Optional
 
+from shared.connectors.builtin import spec_for_type
 from shared.native_kb import (
     NATIVE_PROJECT_CONFIG_KEY as NATIVE_PROJECT_CONFIG_KEY,
     native_kb_project_id as native_kb_project_id,
@@ -64,9 +65,10 @@ def build_knowledge_bindings(
 
     The first native project remains the sole write target, matching the
     existing primary-project behavior. External KB datasource payloads are
-    always read-only in Slice 4 v1. ``datasources`` holds KB payload entries
-    only: the connector registry routes the knowledge-index form here
-    (``agent.connectors.knowledge``).
+    always read-only in Slice 4 v1. The connector registry routes the
+    knowledge-index form here (``agent.connectors.knowledge``); an entry whose
+    driver delivers no knowledge index is skipped all the same, so a caller
+    passing a whole payload never binds another connector as a KB.
 
     A project's own KB datasource (auto-attached at project creation) is keyed
     by its *project* id, not its datasource id — its notes are indexed under
@@ -112,6 +114,9 @@ def build_knowledge_bindings(
         tuple[str, uuid.UUID, str, dict[str, Any], dict[str, Any]]
     ] = []
     for datasource in datasources:
+        spec = spec_for_type(str(datasource.get("type") or "").lower())
+        if spec is None or "knowledge_index" not in spec.delivery_forms:
+            continue
         raw_id = datasource.get("datasource_id") or datasource.get("id")
         native_project = native_kb_project_id(datasource)
         try:

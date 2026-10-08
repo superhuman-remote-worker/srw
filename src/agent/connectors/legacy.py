@@ -47,6 +47,18 @@ def _optional_str(value: Any) -> str | None:
     return str(value) if value else None
 
 
+def env_vars_unreadable(entry: Mapping[str, Any]) -> bool:
+    """Whether the entry carries ``env_vars`` that are not a name/value object.
+
+    Such an entry yields no ``env_file`` entries; the environment
+    materializer refuses it with the message it always gave.
+    """
+    credentials = _credentials(entry)
+    return "env_vars" in credentials and not isinstance(
+        credentials["env_vars"], Mapping
+    )
+
+
 def _env_entries(entry: Mapping[str, Any], spec: DriverSpec) -> list[BindingEntry]:
     variables = _credentials(entry).get("env_vars")
     if not isinstance(variables, Mapping):
@@ -68,6 +80,19 @@ def _file_mode(raw: Any) -> int | None:
         return int(str(raw or "0600"), 8)
     except ValueError:
         return None
+
+
+def unreadable_file_modes(entry: Mapping[str, Any]) -> list[Any]:
+    """Per ``credential_file`` entry, in order, the raw mode it could not read.
+
+    ``None`` where the mode was read (or absent). A file entry without a
+    readable mode gets 0600; the materializer warns about these.
+    """
+    return [
+        None if _file_mode(item.get("mode")) is not None else item.get("mode")
+        for item in _credentials(entry).get("files") or []
+        if isinstance(item, Mapping)
+    ]
 
 
 def _file_entries(entry: Mapping[str, Any], spec: DriverSpec) -> list[BindingEntry]:
@@ -123,8 +148,9 @@ def checkout_auth(entry: Mapping[str, Any]) -> str:
 
 
 def _checkout_entries(entry: Mapping[str, Any], spec: DriverSpec) -> list[BindingEntry]:
-    auth = checkout_auth(entry)
-    token = _credentials(entry).get("token") if auth == "token_in_url" else None
+    # No ``secret``: the clone reads the token from the entry, and a second
+    # in-memory copy would have no reader. The rest is what a D5 wire
+    # binding must carry for the clone and the repo tools.
     return [
         BindingEntry(
             recipient="workspace",
@@ -132,8 +158,7 @@ def _checkout_entries(entry: Mapping[str, Any], spec: DriverSpec) -> list[Bindin
             value={
                 "url": str(entry.get("connection_url") or ""),
                 "name_hint": str(entry.get("name") or "repo"),
-                "auth": auth,
-                "secret": str(token) if token else None,
+                "auth": checkout_auth(entry),
                 "default_branch": _optional_str(entry.get("default_branch")),
                 "require_default_branch": entry.get("require_default_branch") is True,
                 "forge": _optional_str(_mapping(entry.get("config")).get("forge")),
