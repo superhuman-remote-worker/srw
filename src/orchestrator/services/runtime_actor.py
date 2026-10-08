@@ -19,6 +19,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from orchestrator.services.thread_mount_rows import durable_project_ids
 from shared.runtime_actor import (
     RUNTIME_ACTOR_BOOTSTRAP_HEADER,
     RUNTIME_ACTOR_HEADER,
@@ -204,23 +205,17 @@ def _exact_live_pinned_runtime(thread: Any) -> bool:
 
 
 async def _thread_project_ids(db: Any, thread: dict[str, Any]) -> list[str]:
-    """Derive the same native-project ordering as the attach boundary."""
+    """The same project scope as the attach boundary (``thread_project_ids``).
 
-    rows = await db.list_thread_mounts(str(thread["id"]))
-    project_ids = [
-        str(row["source_ref"])
-        for row in rows
-        if row.get("mount_kind") in {"project", "project_default"}
-        and row.get("source_ref")
-    ]
-    if project_ids:
-        return list(dict.fromkeys(project_ids))
-    metadata = _metadata(thread)
-    fallback = [
-        *([str(thread["project_id"])] if thread.get("project_id") else []),
-        *(str(value) for value in metadata.get("project_ids") or []),
-    ]
-    return list(dict.fromkeys(fallback))
+    Mount rows are read only for a legacy multi-project Session, whose
+    ``threads.project_id`` is NULL.
+    """
+    legacy_mounts = (
+        None
+        if thread.get("project_id")
+        else await db.list_thread_mounts(str(thread["id"]))
+    )
+    return durable_project_ids(thread, legacy_mounts=legacy_mounts)
 
 
 async def derive_runtime_actor(

@@ -15,14 +15,17 @@ Three properties are load-bearing and moved unchanged:
   returns ``None`` for that project so the caller falls back to the legacy
   session folder. A thread must never end up with zero cloud surfaces because a
   transient failure was treated as an answer.
-* **Connector authorization must not depend on cloud availability.**
-  :func:`thread_project_ids` returns the durable logical scope even when the
-  mount backfill it attempts fails, because the project list gates datasource
-  access.
-* **``project_default`` rows count as project attachments.** They mount the
-  owner's cloud home at the workspace root rather than under ``projects/``, but
-  they are still an attachment for datasource resolution and visibility. The
-  shape excluded from the project scope is ``repo``.
+* **Connector authorization does not depend on mount rows.**
+  :func:`thread_project_ids` answers from ``threads.project_id``, the one
+  project a Session belongs to (single_project_sessions.md), so the project
+  list that gates datasource access is the same with or without the thread's
+  ``thread_mounts`` rows and whether or not the cloud is up. Only a legacy
+  multi-project Session, whose column is NULL, still reads its list from the
+  legacy places (main_cloud_as_connectors.md, slice 1).
+* **``project_default`` rows count as project attachments** of such a legacy
+  Session. They mount the owner's cloud home at the workspace root rather
+  than under ``projects/``. The shape excluded from the project scope is
+  ``repo``.
 
 Collaborators arrive through :class:`ThreadMountDependencies`, rebuilt per
 invocation by the application rather than captured at import: ``store`` and
@@ -122,75 +125,88 @@ def project_ids_from_mounts(mounts: list[dict[str, Any]]) -> list[str]:
     return out
 
 
-async def thread_project_ids(
-    thread_id: str, *, dependencies: ThreadMountDependencies
+def durable_project_ids(
+    thread: dict[str, Any] | None,
+    *,
+    legacy_mounts: list[dict[str, Any]] | None = None,
 ) -> list[str]:
-    """Derive the project-attachment list for a thread from ``thread_mounts``.
+    """The project scope of ``thread``, from durable state only.
 
-    Replaces the legacy ``threads.metadata.project_ids`` JSONB read. Phase 1
-    of cloud_collaboration_model.md §9. Both ``mount_kind='project'`` and
-    ``project_default`` rows contribute — see ``project_ids_from_mounts``,
-    which is what actually filters; ``repo`` rows are the shape excluded here.
-    (This line used to claim ``project_default`` was excluded too. It never
-    was, and reading it that way sends you looking for a bug that isn't there
-    — see knowledge-base/knowledge/issues/session_contacts_never_register_on_default_project.md.)
-
-    **Lazy backfill (transitional):** threads that predate the migration
-    have ``metadata.project_ids`` set but no ``thread_mounts`` rows. Newer
-    single-project threads also retain ``threads.project_id`` as their
-    durable logical scope even when cloud mount construction is unavailable.
-    When no mount rows exist, materialize either source on the spot where
-    possible and return the logical IDs even if the cloud transport cannot be
-    built. Connector authorization must not depend on cloud availability.
+    A Session belongs to one project at most, and that project is
+    ``threads.project_id`` (single_project_sessions.md): every create path
+    writes it, so the column is the whole answer for every Session that has a
+    project. A NULL column means no project, except on a **legacy
+    multi-project Session** created before that rule (the column was NULL for
+    two or more projects). Its list lives only in the legacy places, read in
+    their historical order: ``metadata.project_ids`` (before Phase 1 of the
+    cloud collaboration model), else the ``project`` and ``project_default``
+    rows of ``thread_mounts`` (``legacy_mounts``). Those Sessions keep
+    working as legacy; nothing else reads the mount rows for scope.
     """
-    store = dependencies.store
-    mounts = await store.list_thread_mounts(thread_id)
-    ids = project_ids_from_mounts(mounts)
-    if ids:
-        return ids
-
-    # ---- lazy backfill from metadata.project_ids ----
-    thread = await store.get_thread(thread_id)
     if not thread:
         return []
+    if thread.get("project_id"):
+        return [str(thread["project_id"])]
     metadata = thread.get("metadata") or {}
     if isinstance(metadata, str):
         try:
             metadata = json.loads(metadata)
         except (json.JSONDecodeError, TypeError):
             metadata = {}
-    fallback_ids = list(
-        dict.fromkeys(
-            [
-                *([str(thread["project_id"])] if thread.get("project_id") else []),
-                *(str(value) for value in (metadata.get("project_ids") or [])),
-            ]
+    legacy = [
+        str(value)
+        for value in (
+            metadata.get("project_ids") if isinstance(metadata, dict) else None
         )
-    )
-    if not fallback_ids:
+        or []
+        if value
+    ]
+    if not legacy:
+        legacy = project_ids_from_mounts(legacy_mounts or [])
+    return list(dict.fromkeys(legacy))
+
+
+async def thread_project_ids(
+    thread_id: str, *, dependencies: ThreadMountDependencies
+) -> list[str]:
+    """The project-attachment list of a thread: :func:`durable_project_ids`.
+
+    Connector authorization reads this, so its answer never depends on the
+    thread's ``thread_mounts`` rows (main_cloud_as_connectors.md, slice 1):
+    a Session's connector eligibility is the same with those rows emptied.
+
+    **Mount backfill (delivery only, transitional):** a thread whose scope
+    has no mount row (created while the cloud was down, or before Phase 1)
+    gets its rows built here, best effort, because workspace delivery reads
+    them right after this call. The result is never read back for the scope,
+    and a failure is logged and retried on the next access. It goes with
+    ``thread_mounts`` when cloud folders become connectors.
+    """
+    store = dependencies.store
+    thread = await store.get_thread(thread_id)
+    if not thread:
         return []
-    try:
-        rows = await build_thread_mount_rows(fallback_ids, dependencies=dependencies)
-        if rows:
-            await store.replace_thread_mounts(thread_id, rows)
-            logger.info(
-                "Thread %s: backfilled %d thread_mounts row(s) from "
-                "durable project scope",
+    mounts = await store.list_thread_mounts(thread_id)
+    scope = durable_project_ids(thread, legacy_mounts=mounts)
+    if scope and not project_ids_from_mounts(mounts):
+        try:
+            rows = await build_thread_mount_rows(scope, dependencies=dependencies)
+            if rows:
+                await store.replace_thread_mounts(thread_id, rows)
+                logger.info(
+                    "Thread %s: backfilled %d thread_mounts row(s) from "
+                    "durable project scope",
+                    thread_id,
+                    len(rows),
+                )
+        except Exception as e:
+            logger.warning(
+                "Thread %s: thread_mounts backfill failed (%s); "
+                "the project scope is unaffected",
                 thread_id,
-                len(rows),
+                e,
             )
-            return project_ids_from_mounts(await store.list_thread_mounts(thread_id))
-    except Exception as e:
-        # Don't let a backfill failure prevent the caller from getting the
-        # project_ids — fall back to the durable logical scope. The next
-        # access retries the backfill.
-        logger.warning(
-            "Thread %s: thread_mounts backfill failed (%s); "
-            "returning durable project scope",
-            thread_id,
-            e,
-        )
-    return fallback_ids
+    return scope
 
 
 async def build_default_project_mount_row(
@@ -534,6 +550,7 @@ __all__ = [
     "build_default_project_mount_row",
     "build_project_mount_row",
     "build_thread_mount_rows",
+    "durable_project_ids",
     "project_ids_from_mounts",
     "resolve_thread_datasource_delivery",
     "resolve_thread_datasources",
