@@ -225,6 +225,10 @@ def build_datasources_payload(
             continue
         entry = driver.bind(ds, creds, ctx=ctx)
         if entry is not None:
+            if lease_spec(entry) is not None:
+                # A lease driver's entry never carries its upstream secret,
+                # whatever its bind returned; the lease step fills it.
+                entry["credentials"] = {}
             payload.append(entry)
 
     return payload or None

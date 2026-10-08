@@ -339,6 +339,20 @@ class WorkspaceBackend(ABC):
         """
         raise ValueError("Credential files require a sandbox or VM workspace")
 
+    def install_connector_lease(self, connector_id: str, token: str) -> str:
+        """Write a connector's credential lease token to its 0600 file.
+
+        Fails closed: only a backend with a private secret-stdin channel to
+        a shell workspace may hold a lease token (connector drivers C2).
+        """
+        del connector_id, token
+        raise ValueError("Connector leases require a sandbox or VM workspace")
+
+    def remove_connector_lease(self, connector_id: str) -> None:
+        """Remove a connector's credential lease token file."""
+        del connector_id
+        raise ValueError("Connector leases require a sandbox or VM workspace")
+
     def execute_with_secret_stdin(
         self, command: str, secret: str | bytes, *, timeout: int = 30
     ) -> bool:

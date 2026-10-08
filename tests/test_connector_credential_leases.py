@@ -978,3 +978,11 @@ class TestWindowSettings:
         settings = DeploymentSettings.from_environment()
         assert settings.connector_lease_ttl_seconds == 900
         assert settings.connector_lease_sweep_seconds == 15.0
+
+    def test_the_base_backend_fails_closed(self):
+        from shared.runtime.core.workspace_backend import WorkspaceBackend
+
+        with pytest.raises(ValueError, match="sandbox or VM"):
+            WorkspaceBackend.install_connector_lease(object(), CONNECTOR, "scl_x")
+        with pytest.raises(ValueError, match="sandbox or VM"):
+            WorkspaceBackend.remove_connector_lease(object(), CONNECTOR)

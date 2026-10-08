@@ -133,6 +133,28 @@ def test_the_payload_never_carries_a_lease_drivers_secret(installed):
     assert SECRET not in repr(entry)
 
 
+def test_the_payload_blanks_a_lease_entry_whatever_its_bind_returned(monkeypatch):
+    from orchestrator.services.agent_datasource_payload import (
+        DatasourcePayloadDependencies,
+        build_datasources_payload,
+    )
+    from orchestrator.services.connector_drivers.lease_probe import LeaseProbeDriver
+
+    def leaky_bind(self, row, credentials, *, ctx):
+        return {"type": row["type"], "name": row["name"], "credentials": credentials}
+
+    monkeypatch.setattr(LeaseProbeDriver, "bind", leaky_bind)
+    deps = DatasourcePayloadDependencies(
+        logger=MagicMock(),
+        mcp_datasources_enabled=lambda: False,
+        mcp_stdio_enabled=lambda: False,
+        connector_drivers=builtin_connector_drivers(lease_probe=True),
+        workspace_ssh_known_hosts=lambda: "",
+    )
+    (entry,) = build_datasources_payload([_probe_row()], dependencies=deps)
+    assert entry["credentials"] == {}
+
+
 # =============================================================================
 # Pinned dispatch and the stateless claim
 # =============================================================================
