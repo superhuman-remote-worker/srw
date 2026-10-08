@@ -9,11 +9,14 @@ from contextlib import asynccontextmanager
 from functools import partial
 import json
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
+import asyncpg
 import pytest
+import pytest_asyncio
 
 from orchestrator.services import thread_retirement
 from orchestrator.services.job_mutation_controls import JobControlOperations
@@ -31,7 +34,6 @@ from tests.test_vm_job_cancel_retention_real_postgres import acquire, cancelled,
 from tests.test_vm_job_retained_resume_real_postgres import (
     _base_db,  # noqa: F401
     _db_fixture,  # noqa: F401
-    _schema_applied,  # noqa: F401
     _pre_ssh_db,  # noqa: F401
     _retention_db,  # noqa: F401
     db as _resume_db,
@@ -45,6 +47,28 @@ from tests.test_vm_job_retained_resume_real_postgres import (
 )
 
 db = _resume_db
+
+
+@pytest_asyncio.fixture(scope="module")
+async def _schema_applied(pg_dsn, tmp_path_factory):  # noqa: F811
+    """Seed genuinely historical True parents before the 0340 commit guard."""
+    from orchestrator.database.migrate import run_migrations
+
+    migrations = (
+        Path(__file__).resolve().parents[1] / "src/orchestrator/database/migrations/app"
+    )
+    stage = tmp_path_factory.mktemp("ready-purge-pre0340")
+    for path in migrations.glob("*.sql"):
+        if path.name.split("_", 1)[0] <= "0339":
+            (stage / path.name).write_bytes(path.read_bytes())
+    pool = await asyncpg.create_pool(pg_dsn, min_size=1, max_size=3)
+    try:
+        await run_migrations(pool, stage)
+        assert not await pool.fetchval(
+            "SELECT to_regprocedure('public.vm_job_initial_ready_retention_candidate(uuid,uuid,uuid,uuid,uuid,uuid,boolean)') IS NOT NULL"
+        )
+    finally:
+        await pool.close()
 
 
 async def ready_source(db):
@@ -61,7 +85,11 @@ async def ready_source(db):
             {"status": "ready", "active_pod_uid": state["frozen"]["launcher_uid"]}
         ),
     )
-    assert await acquire(state) is None
+    # This fixture deliberately admits the historical True parent using the
+    # pre-0340 schema. Fresh Ready Cancel selection now holds until the new
+    # retained authority is available, even while that schema is absent.
+    selected = await acquire(state)
+    assert selected is not None and not selected.allowed
     return state
 
 

@@ -97,6 +97,10 @@ class VMPreSSHStopStore:
             "id"
         ] or not valid_retention_preflight(preflight, frozen):
             raise VMPreSSHStopConflict("retention_preflight_unproven")
+        if authority.get("policy_version") == 3 and preflight != _json_object(
+            authority["ready_retention_preflight"]
+        ):
+            raise VMPreSSHStopConflict("initial_ready_preflight_changed")
         if not await conn.fetchval(
             "SELECT public.validate_vm_job_cancel_retention($1,false)", cleanup["id"]
         ):
@@ -142,6 +146,23 @@ class VMPreSSHStopStore:
             or not cleanup_digest.startswith("sha256:")
         ):
             raise VMPreSSHStopConflict("cleanup_intent_changed")
+        from orchestrator.services.vm_job_cancel_retention import (
+            retention_for_admission_on_conn,
+        )
+
+        authority = await retention_for_admission_on_conn(conn, cleanup_id)
+        ready_stop = authority is not None and authority.get("policy_version") == 3
+        if ready_stop:
+            for key in (
+                f"workspace-recovery:job:{job_id}",
+                f"workspace-recovery-pvc:{authority['pvc_uid']}",
+            ):
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1,0))", key
+                )
+            await conn.fetchrow(
+                "SELECT unit_id FROM run_queue WHERE unit_id=$1 FOR UPDATE", job_id
+            )
         job = await conn.fetchrow(
             "SELECT id,status,execution_lane,assigned_agent_id,context "
             "FROM jobs WHERE id=$1 FOR UPDATE",
@@ -175,7 +196,11 @@ class VMPreSSHStopStore:
             or cleanup["intent_digest"] != cleanup_digest
             or cleanup["completed_at"] is not None
             or retry["state"] != "succeeded"
-            or retry["ready_at"] is not None
+            or (
+                retry["ready_at"] is None
+                if ready_stop
+                else retry["ready_at"] is not None
+            )
             or retry["request_id"] is None
             or retry["observed_vm_uid"] is None
             or retry["observed_pvc_uid"] is None
@@ -186,6 +211,19 @@ class VMPreSSHStopStore:
             or cleanup_intent.get("pvc_uid") != str(retry["observed_pvc_uid"])
         ):
             raise VMPreSSHStopConflict("retirement_authority_changed")
+        if ready_stop and (
+            authority["cleanup_admission_id"] != cleanup_id
+            or parent_cleanup.get("retention_preflight")
+            != _json_object(authority["ready_retention_preflight"])
+            or not await conn.fetchval(
+                "SELECT admitted_xact_id<>pg_current_xact_id() FROM vm_job_cancel_retention_authorities WHERE cleanup_admission_id=$1",
+                cleanup_id,
+            )
+            or not await conn.fetchval(
+                "SELECT public.validate_vm_job_cancel_retention($1,false)", cleanup_id
+            )
+        ):
+            raise VMPreSSHStopConflict("initial_ready_authority_changed")
         charge = await conn.fetchrow(
             "SELECT * FROM vm_resource_reservations WHERE request_id=$1 "
             "AND state<>'released' FOR UPDATE",
@@ -218,6 +256,19 @@ class VMPreSSHStopStore:
             raise VMPreSSHStopConflict("resource_policy_changed")
         if frozen is not None and (
             not valid_frozen_stop_candidate(frozen)
+            or (frozen.get("kind") == "vm_initial_ready_positive_stop_candidate_v1")
+            != ready_stop
+            or (
+                ready_stop
+                and (
+                    frozen.get("cleanup_admission_id") != str(cleanup_id)
+                    or frozen.get("cleanup_request_id") != str(cleanup_request)
+                    or frozen.get("cleanup_intent_digest") != cleanup_digest
+                    or not valid_retention_preflight(
+                        parent_cleanup.get("retention_preflight"), frozen
+                    )
+                )
+            )
             or frozen["job_id"] != str(job_id)
             or frozen["provision_generation"] != str(generation)
             or frozen["vm_uid"] != str(charge["vm_uid"])
@@ -258,6 +309,14 @@ class VMPreSSHStopStore:
                     return None
                 _require_intent_current(row, cleanup, retry, charge)
                 frozen = _json_object(row["frozen"])
+                if (
+                    frozen["kind"] == "vm_initial_ready_positive_stop_candidate_v1"
+                    and not await conn.fetchval(
+                        "SELECT initial_ready_xact_id<>pg_current_xact_id() FROM vm_pre_ssh_stop_intents WHERE cleanup_admission_id=$1",
+                        cleanup["id"],
+                    )
+                ):
+                    raise VMPreSSHStopConflict("initial_ready_intent_uncommitted")
                 await self._locked_current(
                     conn,
                     job_id=owner,
@@ -473,6 +532,15 @@ class VMPreSSHStopStore:
                 )
                 if row is None:
                     return None
+                if (
+                    _json_object(row["frozen"])["kind"]
+                    == "vm_initial_ready_positive_stop_candidate_v1"
+                    and not await conn.fetchval(
+                        "SELECT initial_ready_xact_id<>pg_current_xact_id() FROM vm_pre_ssh_stop_proofs WHERE cleanup_admission_id=$1",
+                        cleanup["id"],
+                    )
+                ):
+                    raise VMPreSSHStopConflict("initial_ready_proof_uncommitted")
                 _require_intent_current(row, cleanup, retry, charge)
                 frozen = _json_object(row["frozen"])
                 proof = _json_object(row["terminal_evidence"])
@@ -493,4 +561,14 @@ class VMPreSSHStopStore:
                     "terminal_evidence": proof,
                     "evidence_digest": row["evidence_digest"],
                     "process_zero_receipt_id": str(row["zero_id"]),
+                    **(
+                        {
+                            "retention_preflight": _json_object(
+                                row["retention_preflight"]
+                            )
+                        }
+                        if frozen["kind"]
+                        == "vm_initial_ready_positive_stop_candidate_v1"
+                        else {}
+                    ),
                 }

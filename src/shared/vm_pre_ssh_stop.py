@@ -30,6 +30,11 @@ _CANDIDATE_KEYS = {
     "launcher_resource_version",
     "containers",
 }
+_INITIAL_READY_CANDIDATE_KEYS = _CANDIDATE_KEYS | {
+    "cleanup_admission_id",
+    "cleanup_request_id",
+    "cleanup_intent_digest",
+}
 _PROOF_KEYS = {
     "kind",
     "frozen_digest",
@@ -102,9 +107,22 @@ def _container_vector(value: object) -> dict[tuple[str, str], str] | None:
 def valid_frozen_stop_candidate(value: object) -> bool:
     """Accept one complete, current launcher metadata vector, never a hint."""
 
-    if not isinstance(value, Mapping) or set(value) != _CANDIDATE_KEYS:
+    if not isinstance(value, Mapping):
         return False
-    if value.get("kind") != "vm_pre_ssh_stop_candidate_v1":
+    kind = value.get("kind")
+    if kind == "vm_pre_ssh_stop_candidate_v1":
+        if set(value) != _CANDIDATE_KEYS:
+            return False
+    elif kind == "vm_initial_ready_positive_stop_candidate_v1":
+        if (
+            set(value) != _INITIAL_READY_CANDIDATE_KEYS
+            or not _canonical_uuid(value.get("cleanup_admission_id"))
+            or not _canonical_uuid(value.get("cleanup_request_id"))
+            or not isinstance(value.get("cleanup_intent_digest"), str)
+            or not _DIGEST.fullmatch(value["cleanup_intent_digest"])
+        ):
+            return False
+    else:
         return False
     if any(
         not _canonical_uuid(value.get(key))
@@ -149,7 +167,12 @@ def valid_positive_stop_proof(
         or set(observed) != _PROOF_KEYS
         or not isinstance(frozen_digest, str)
         or not _DIGEST.fullmatch(frozen_digest)
-        or observed.get("kind") != "vm_pre_ssh_positive_stop_v1"
+        or observed.get("kind")
+        != (
+            "vm_initial_ready_positive_stop_v1"
+            if frozen["kind"] == "vm_initial_ready_positive_stop_candidate_v1"
+            else "vm_pre_ssh_positive_stop_v1"
+        )
         or observed.get("frozen_digest") != frozen_digest
         or observed.get("pod_intent_digest") != frozen_digest
         or observed.get("pod_finalizer") != PRE_SSH_STOP_FINALIZER

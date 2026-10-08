@@ -656,18 +656,32 @@ async def test_actual_cancel_settle_keeps_disk_and_survives_settlement_response_
 
 
 @pytest.mark.asyncio
-async def test_exact_durably_ready_source_stays_outside_never_ready_policy(db):
+async def test_durably_ready_source_requires_distinct_ready_authority(db):
     state = await cancelled(db, old=False, retiring=False)
     await db.execute(
-        "UPDATE jobs SET context=jsonb_set(context,'{vm,status}','\"ready\"') WHERE id=$1",
+        "UPDATE jobs SET context=jsonb_set(context,'{vm}',context->'vm'||$2::jsonb) WHERE id=$1",
         UUID(state["job_id"]),
+        json.dumps(
+            {"status": "ready", "active_pod_uid": state["frozen"]["launcher_uid"]}
+        ),
     )
     await db.execute(
         "UPDATE vm_creation_retries SET ready_at=clock_timestamp() WHERE job_id=$1",
         UUID(state["job_id"]),
     )
     before = await authority_rows(db, state)
-    assert await acquire(state) is None
+    # Explicit additions stop at 0338; schema_current may already include0340.
+    # Either way, no Ready proof means no fallback to ordinary True cleanup.
+    permit = await acquire(state)
+    assert permit.allowed is False
+    installed = await db.fetchval(
+        "SELECT to_regprocedure('public.vm_job_initial_ready_retention_candidate(uuid,uuid,uuid,uuid,uuid,uuid,boolean)') IS NOT NULL"
+    )
+    assert permit.reason == (
+        "initial_ready_retention_unproven"
+        if installed
+        else "cancel_retention_schema_unavailable"
+    )
     assert await authority_rows(db, state) == before
 
 

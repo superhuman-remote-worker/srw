@@ -2938,6 +2938,36 @@ async def test_terminal_report_failure_preserves_shell_and_error_releases(
 
 
 @pytest.mark.asyncio
+async def test_vm_typed_report_loss_selects_restriction_without_generic_release(
+    worker_runtime, monkeypatch
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "false")
+    claim = _claim(input_seq=9, prior="processing")
+    final = {
+        "should_stop": True,
+        "goal_achieved": False,
+        "error": {"type": "workspace_unavailable"},
+    }
+    executor, agent, client, _, _, _, release = _install(
+        monkeypatch, claim, final, report_result=False
+    )
+    executor._completion_commands_enabled = True
+    executor._worker_workspace_backend = "vm"
+    executor._worker_workspace_provisioner = None
+    hold = AsyncMock(return_value="held")
+    monkeypatch.setattr(turn_executor, "hold_failed_container_worker_report", hold)
+
+    result = await executor._report_worker_terminal(claim, final, client=client)
+
+    hold.assert_awaited_once_with(
+        executor._db, unit_id=claim.unit_id, lease_token=claim.lease_token
+    )
+    assert result == "held:worker_execution_outcome_unknown"
+    release.assert_not_awaited()
+    assert agent.hold_calls >= 1
+
+
+@pytest.mark.asyncio
 async def test_cancel_winning_during_terminal_report_closes_without_error_release(
     worker_runtime,
     monkeypatch,

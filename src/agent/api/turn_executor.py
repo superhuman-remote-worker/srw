@@ -177,6 +177,31 @@ _COMPLETION_REPORT_PAYLOAD_FIELDS = (
     "freeze_data",
 )
 
+
+def _uncertain_worker_workspace_report(
+    *,
+    completion_commands_enabled: bool,
+    workspace_backend: str | None,
+    workspace_provisioner: str | None,
+    goal_achieved: bool,
+    error: Any,
+) -> bool:
+    """Select only typed uncertain workspace failures for the restriction hold."""
+    if not completion_commands_enabled or goal_achieved is not False:
+        return False
+    if not isinstance(error, dict) or not (
+        error.get("type") == "workspace_unavailable"
+        or worker_workspace_exhaustion_cause(error) is not None
+    ):
+        return False
+    return bool(
+        workspace_backend == "sandbox"
+        and workspace_provisioner == "k8s"
+        or workspace_backend == "vm"
+        and not workspace_recovery_enabled()
+    )
+
+
 # --- Tunables (env-overridable where deployment cares) -----------------------
 
 IDLE_POLL_SECONDS = 0.5
@@ -2609,18 +2634,12 @@ class StatelessTurnExecutor:
         # below instead follows ordinary bounded retry/parking semantics.
         self._worker_terminal_report_generation = (job_id, int(token))
         error = wire_payload.get("error")
-        self._worker_container_report_uncertain = bool(
-            self._completion_commands_enabled
-            and self._worker_workspace_backend == "sandbox"
-            and self._worker_workspace_provisioner == "k8s"
-            and wire_payload.get("goal_achieved", False) is False
-            and isinstance(error, dict)
-            and (
-                error.get("type") == "workspace_unavailable"
-                # Native budget exhaustion preserves the typed workspace cause;
-                # losing that report leaves the same command outcome unknown.
-                or worker_workspace_exhaustion_cause(error) is not None
-            )
+        self._worker_container_report_uncertain = _uncertain_worker_workspace_report(
+            completion_commands_enabled=self._completion_commands_enabled,
+            workspace_backend=self._worker_workspace_backend,
+            workspace_provisioner=self._worker_workspace_provisioner,
+            goal_achieved=wire_payload.get("goal_achieved", False),
+            error=error,
         )
         started_at = time.perf_counter()
         try:

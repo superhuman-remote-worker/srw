@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from shared.vm_resource_admission import ResourceAdmissionError
@@ -44,6 +44,180 @@ async def _installed(conn):
     return await conn.fetchval(
         "SELECT to_regclass('public.vm_job_cancel_retention_authorities') IS NOT NULL"
     )
+
+
+async def _initial_ready_installed(conn):
+    return await conn.fetchval(
+        "SELECT to_regprocedure('public.vm_job_initial_ready_retention_candidate(uuid,uuid,uuid,uuid,uuid,uuid,boolean)') IS NOT NULL"
+    )
+
+
+def _initial_ready_wire(owner, identity, candidate, request_id, digest):
+    return {
+        "version": 1,
+        "kind": "vm_job_initial_ready_stop_candidate_v1",
+        "owner_kind": "job",
+        "job_id": str(owner),
+        "namespace": candidate["namespace"],
+        "cluster_id": candidate["cluster_id"],
+        "request_id": candidate["creation_request_id"],
+        "provision_generation": identity.provision_generation,
+        "reservation_id": candidate["reservation_id"],
+        "reservation_revision": candidate["reservation_revision"],
+        "vm_uid": identity.vm_uid,
+        "vmi_uid": candidate["vmi_uid"],
+        "launcher_uid": candidate["launcher_uid"],
+        "node_uid": candidate["node_uid"],
+        "pvc_uid": identity.rootdisk_pvc_uid,
+        "cleanup_request_id": str(request_id),
+        "cleanup_intent_digest": digest,
+    }
+
+
+async def initial_ready_retention_candidate(db, *, job_id, identity):
+    """Read the exact root candidate; release all locks before signed status I/O."""
+    owner, pvc = _uuid(job_id), _uuid(identity.rootdisk_pvc_uid)
+    async with db.acquire() as conn, conn.transaction():
+        if not await _initial_ready_installed(conn):
+            return None
+        for key in (f"workspace-recovery:job:{owner}", f"workspace-recovery-pvc:{pvc}"):
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1,0))", key
+            )
+        _, _, request_id, digest, _ = vm_cleanup_request_identity(
+            owner_kind="job",
+            owner_id=owner,
+            identity=identity,
+            source="job_terminal_vm_release",
+            purge_disk=False,
+        )
+        old = await conn.fetchrow(
+            "SELECT id FROM vm_workspace_cleanup_admissions WHERE owner_kind='job' "
+            "AND owner_id=$1 AND request_id=$2 FOR UPDATE",
+            owner,
+            request_id,
+        )
+        candidate = _json(
+            await conn.fetchval(
+                "SELECT public.vm_job_initial_ready_retention_candidate($1,$2,$3,$4,$5)",
+                owner,
+                _uuid(identity.provision_generation),
+                _uuid(identity.vm_uid),
+                pvc,
+                old["id"] if old else None,
+            )
+        )
+        if not isinstance(candidate, dict):
+            return None
+        if old is not None:
+            request_id = uuid5(
+                NAMESPACE_URL, f"vm-job-cancel-retain-v1:{old['id']}:{digest}"
+            )
+        return _initial_ready_wire(owner, identity, candidate, request_id, digest)
+
+
+async def read_current_initial_ready_preflight(
+    db, parent_cleanup, *, job_id, generation
+):
+    """Recognize immutable policy3 before any proof/SSH fallback; end locks here."""
+    from shared.vm_cancel_retention import valid_ready_retention_preflight
+
+    owner = _uuid(job_id)
+    async with db.acquire() as conn, conn.transaction():
+        if not await _initial_ready_installed(conn):
+            return False, None
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            f"workspace-recovery:job:{owner}",
+        )
+        locator = await conn.fetchrow(
+            "SELECT a.pvc_uid FROM vm_job_cancel_retention_authorities a JOIN jobs j ON j.id=a.job_id "
+            "WHERE a.job_id=$1 AND a.policy_version=3 AND NOT j.context ? '_vm_job_retained_resume'",
+            owner,
+        )
+        if locator is None:
+            return False, None
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            f"workspace-recovery-pvc:{locator['pvc_uid']}",
+        )
+        await conn.fetchrow(
+            "SELECT unit_id FROM run_queue WHERE unit_id=$1 FOR UPDATE", owner
+        )
+        await conn.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner)
+        authority = await conn.fetchrow(
+            "SELECT a.*,c.completed_at,a.admitted_xact_id<>pg_current_xact_id() AS committed "
+            "FROM vm_job_cancel_retention_authorities a JOIN vm_workspace_cleanup_admissions c "
+            "ON c.id=a.cleanup_admission_id JOIN jobs j ON j.id=a.job_id "
+            "WHERE a.job_id=$1 AND a.policy_version=3 AND NOT j.context ? '_vm_job_retained_resume' "
+            "AND j.context->'vm'->>'provision_generation'=a.provision_generation::text "
+            "AND j.context->'vm'->>'vm_uid'=a.vm_uid::text "
+            "AND j.context->'vm'->>'rootdisk_pvc_uid'=a.pvc_uid::text",
+            owner,
+        )
+        if (
+            authority is None
+            or not authority["committed"]
+            or str(authority["provision_generation"]) != str(generation)
+        ):
+            raise ResourceAdmissionError("initial_ready_retention_changed")
+        if (
+            isinstance(parent_cleanup, dict)
+            and isinstance(parent_cleanup.get("intent"), dict)
+            and parent_cleanup["intent"].get("purge_disk") is True
+        ):
+            purge = await conn.fetchrow(
+                "SELECT * FROM vm_job_retained_disk_purge_authorities WHERE job_id=$1 "
+                "AND cleanup_admission_id::text=$2 AND provision_generation=$3 AND vm_uid=$4 AND pvc_uid=$5 "
+                "AND admitted_xact_id<>pg_current_xact_id()",
+                owner,
+                parent_cleanup.get("admission_id"),
+                authority["provision_generation"],
+                authority["vm_uid"],
+                authority["pvc_uid"],
+            )
+            if purge is None:
+                raise ResourceAdmissionError("initial_ready_purge_unproven")
+            intent = {
+                **_json(authority["retaining_intent"]),
+                "purge_disk": True,
+                "source": "public_vm_delete",
+            }
+            expected = bind_vm_cleanup_permit(
+                CleanupPermit(allowed=True, admission_id=purge["cleanup_admission_id"]),
+                request_id=purge["cleanup_request_id"],
+                intent=intent,
+            ).parent_cleanup
+            if parent_cleanup != expected or not await conn.fetchval(
+                "SELECT public.validate_vm_job_retained_disk_purge($1,false)",
+                purge["cleanup_admission_id"],
+            ):
+                raise ResourceAdmissionError("initial_ready_purge_changed")
+            return True, None
+        if authority["completed_at"] is not None:
+            raise ResourceAdmissionError("initial_ready_retention_completed")
+        proof = _json(authority["ready_retention_preflight"])
+        candidate = _json(
+            await conn.fetchval(
+                "SELECT public.vm_job_retained_ready_candidate(a) FROM vm_job_cancel_retention_authorities a WHERE cleanup_admission_id=$1",
+                authority["cleanup_admission_id"],
+            )
+        )
+        expected = bind_vm_cleanup_permit(
+            CleanupPermit(allowed=True, admission_id=authority["cleanup_admission_id"]),
+            request_id=authority["cleanup_request_id"],
+            intent=_json(authority["retaining_intent"]),
+        ).parent_cleanup
+        if (
+            not valid_ready_retention_preflight(proof, candidate)
+            or parent_cleanup != {**expected, "retention_preflight": proof}
+            or not await conn.fetchval(
+                "SELECT public.validate_vm_job_cancel_retention($1,false)",
+                authority["cleanup_admission_id"],
+            )
+        ):
+            raise ResourceAdmissionError("initial_ready_retention_changed")
+        return True, proof
 
 
 async def retention_for_admission_on_conn(conn, admission_id: UUID):
@@ -144,6 +318,9 @@ async def retention_settlement_is_current_on_conn(
 ) -> bool:
     if not await _installed(conn):
         return False
+    ready_scope = "r.ready_at IS NULL"
+    if await _initial_ready_installed(conn):
+        ready_scope = "((a.policy_version=1 AND r.ready_at IS NULL) OR (a.policy_version=3 AND r.ready_at IS NOT NULL AND r.job_retained_resume_id IS NULL))"
     return bool(
         await conn.fetchval(
             "SELECT EXISTS(SELECT 1 FROM vm_job_cancel_retention_authorities a "
@@ -157,7 +334,7 @@ async def retention_settlement_is_current_on_conn(
             "AND j.context->'vm'->>'rootdisk_pvc_uid'=a.pvc_uid::text "
             "AND q.unit_kind='worker_batch' AND q.state='done' "
             "AND q.leased_by IS NULL AND q.leased_until IS NULL "
-            "AND r.state='succeeded' AND r.ready_at IS NULL "
+            f"AND r.state='succeeded' AND {ready_scope} "
             "AND NOT EXISTS(SELECT 1 FROM vm_creation_retries later WHERE later.owner_kind='job' "
             "AND later.job_id=a.job_id AND (later.created_at,later.request_id)>(r.created_at,r.request_id))) "
             "AND public.vm_job_cancel_retention_settled($1)",
@@ -314,10 +491,8 @@ async def acquire_cancel_retention(
             "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
             f"workspace-recovery-pvc:{pvc}",
         )
-        if (
-            prior is None
-            and vm.get("status") == "ready"
-            and await conn.fetchval(
+        ready_root = bool(
+            await conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM vm_creation_retries WHERE owner_kind='job' "
                 "AND job_id=$1 AND provision_generation=$2 AND observed_vm_uid=$3 "
                 "AND observed_pvc_uid=$4 AND ready_at IS NOT NULL)",
@@ -326,11 +501,7 @@ async def acquire_cancel_retention(
                 vm_uid,
                 pvc,
             )
-        ):
-            # An exact currently and durably Ready source is outside this policy.
-            # Ready history appearing on an already-retiring candidate is drift;
-            # missing/uncertain sources remain recognized refusals below.
-            return None
+        )
         if (
             prior is None
             and await _installed(conn)
@@ -374,7 +545,7 @@ async def acquire_cancel_retention(
                 return CleanupPermit(
                     allowed=False, reason="cancel_retention_authority_changed"
                 )
-            return bind_vm_cleanup_permit(
+            permit = bind_vm_cleanup_permit(
                 CleanupPermit(
                     allowed=True,
                     admission_id=prior["cleanup_admission_id"],
@@ -383,9 +554,24 @@ async def acquire_cancel_retention(
                 request_id=prior["cleanup_request_id"],
                 intent=_json(prior["retaining_intent"]),
             )
+            if prior["policy_version"] == 3:
+                permit = replace(
+                    permit,
+                    parent_cleanup={
+                        **permit.parent_cleanup,
+                        "retention_preflight": _json(
+                            prior["ready_retention_preflight"]
+                        ),
+                    },
+                )
+            return permit
         if not cancel_retention_admission_enabled():
             return CleanupPermit(allowed=False, reason="cancel_retention_not_activated")
         if not await _installed(conn):
+            return CleanupPermit(
+                allowed=False, reason="cancel_retention_schema_unavailable"
+            )
+        if ready_root and not await _initial_ready_installed(conn):
             return CleanupPermit(
                 allowed=False, reason="cancel_retention_schema_unavailable"
             )
@@ -434,8 +620,13 @@ async def acquire_cancel_retention(
             )
         except VMCreationRetryConflict as exc:
             return CleanupPermit(allowed=False, reason=str(exc))
+        candidate_function = (
+            "vm_job_initial_ready_retention_candidate"
+            if ready_root
+            else "vm_job_cancel_retention_candidate"
+        )
         candidate = await conn.fetchval(
-            "SELECT public.vm_job_cancel_retention_candidate($1,$2,$3,$4,$5)",
+            f"SELECT public.{candidate_function}($1,$2,$3,$4,$5)",
             owner,
             generation,
             vm_uid,
@@ -447,6 +638,18 @@ async def acquire_cancel_retention(
             return CleanupPermit(
                 allowed=False, reason="cancel_retention_scope_unproven"
             )
+        if old is not None:
+            request_id = uuid5(
+                NAMESPACE_URL, f"vm-job-cancel-retain-v1:{old['id']}:{digest}"
+            )
+        if ready_root:
+            from shared.vm_cancel_retention import valid_ready_retention_preflight
+
+            frozen = _initial_ready_wire(owner, identity, candidate, request_id, digest)
+            if not valid_ready_retention_preflight(retention_preflight, frozen):
+                return CleanupPermit(
+                    allowed=False, reason="initial_ready_retention_unproven"
+                )
         if old is not None:
             request_id = uuid5(
                 NAMESPACE_URL,
@@ -475,8 +678,8 @@ async def acquire_cancel_retention(
             "(cleanup_admission_id,superseded_admission_id,job_id,creation_request_id,"
             "provision_generation,reservation_id,reservation_revision,vm_uid,vmi_uid,"
             "launcher_uid,pvc_uid,node_uid,namespace,cluster_id,cleanup_request_id,"
-            "intent_digest,retaining_intent,superseded_request_id,superseded_intent_digest) "
-            "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18,$19)",
+            "intent_digest,retaining_intent,superseded_request_id,superseded_intent_digest,policy_version,ready_retention_preflight) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18,$19,$20,$21::jsonb)",
             permit.admission_id,
             old["id"] if old else None,
             owner,
@@ -496,6 +699,8 @@ async def acquire_cancel_retention(
             json.dumps(intent),
             old["request_id"] if old else None,
             old["intent_digest"] if old else None,
+            3 if ready_root else 1,
+            json.dumps(retention_preflight) if ready_root else None,
         )
         if old is not None:
             await conn.execute(
@@ -505,6 +710,14 @@ async def acquire_cancel_retention(
                 owner,
                 str(old["id"]),
                 str(permit.admission_id),
+            )
+        if ready_root:
+            permit = replace(
+                permit,
+                parent_cleanup={
+                    **permit.parent_cleanup,
+                    "retention_preflight": retention_preflight,
+                },
             )
         await prepare_vm_cleanup_resource(store, permit, _conn=conn)
         return permit

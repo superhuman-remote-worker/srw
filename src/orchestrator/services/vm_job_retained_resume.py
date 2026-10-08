@@ -243,6 +243,8 @@ async def prepare_owner_resume(
             ):
                 return False
             context = _json(job["context"]) or {}
+            if "_worker_execution_hold" in context:
+                return False
             previous_id = context.get("_vm_job_retained_resume")
             terminal = None
             retained_vm = context.get("vm")
@@ -335,6 +337,15 @@ async def read_current_ready_preflight(db, parent_cleanup, *, job_id, generation
     not fall through to the older release path.
     """
     from shared.vm_resource_admission import ResourceAdmissionError
+    from orchestrator.services.vm_job_cancel_retention import (
+        read_current_initial_ready_preflight,
+    )
+
+    recognized, initial_proof = await read_current_initial_ready_preflight(
+        db, parent_cleanup, job_id=job_id, generation=generation
+    )
+    if recognized:
+        return initial_proof
 
     owner = UUID(str(job_id))
     async with db.acquire() as conn, conn.transaction():
@@ -714,12 +725,22 @@ async def acquire_retained_terminal_cleanup(store, provisioner, *, job_id, ident
     if (
         permit is None
         or permit.allowed
-        or permit.reason != "retained_ready_retention_unproven"
+        or permit.reason
+        not in {"retained_ready_retention_unproven", "initial_ready_retention_unproven"}
     ):
         return permit
-    candidate = await retained_ready_candidate(
-        store.db, job_id=job_id, identity=identity
-    )
+    if permit.reason == "initial_ready_retention_unproven":
+        from orchestrator.services.vm_job_cancel_retention import (
+            initial_ready_retention_candidate,
+        )
+
+        candidate = await initial_ready_retention_candidate(
+            store.db, job_id=job_id, identity=identity
+        )
+    else:
+        candidate = await retained_ready_candidate(
+            store.db, job_id=job_id, identity=identity
+        )
     if candidate is None:
         return permit
     proof = await provisioner.qualify_retained_ready_stop(candidate)
@@ -732,7 +753,7 @@ async def retention_preflight_on_conn(conn, admission_id):
     if await installed(conn):
         proof = await conn.fetchval(
             "SELECT ready_retention_preflight FROM vm_job_cancel_retention_authorities "
-            "WHERE cleanup_admission_id=$1 AND policy_version=2",
+            "WHERE cleanup_admission_id=$1 AND policy_version IN (2,3)",
             admission_id,
         )
         if proof is not None:

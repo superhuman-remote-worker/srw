@@ -1562,7 +1562,11 @@ class VMProvisioner:
             or observed.get("_identity_authenticated") is not True
             or observed.get("job_id") != job_id
             or observed.get("provision_generation") != generation
-            or observed.get("ready") is not True
+            or (
+                type(observed.get("ready")) is not bool
+                if candidate["kind"] == "vm_job_initial_ready_stop_candidate_v1"
+                else observed.get("ready") is not True
+            )
             or observed.get("vm_uid") != candidate["vm_uid"]
             or observed.get("vmi_uid") != candidate["vmi_uid"]
             or observed.get("active_pod_uid") != candidate["launcher_uid"]
@@ -1627,7 +1631,10 @@ class VMProvisioner:
                     )
                     or (
                         retention_preflight.get("kind")
-                        == "vm_job_retained_ready_preflight_v1"
+                        in {
+                            "vm_job_retained_ready_preflight_v1",
+                            "vm_job_initial_ready_preflight_v1",
+                        }
                         and valid_ready_retention_preflight(
                             retention_preflight, retention_preflight.get("frozen")
                         )
@@ -1835,7 +1842,21 @@ class VMProvisioner:
         ):
             return False
         store = VMPreSSHStopStore(self._db)
+        preflight = parent_cleanup.get("retention_preflight")
+        initial_ready = (
+            isinstance(preflight, Mapping)
+            and preflight.get("kind") == "vm_job_initial_ready_preflight_v1"
+        )
         try:
+            if initial_ready and not await self._ready_parent_is_current(
+                parent_cleanup,
+                job_id=job_id,
+                generation=identity.provision_generation,
+                expected_vm_uid=identity.vm_uid,
+                expected_pvc_uid=identity.rootdisk_pvc_uid,
+                entity_type="job",
+            ):
+                return False
             retention_required = await store.requires_retention_preflight(
                 parent_cleanup
             )
@@ -1845,7 +1866,14 @@ class VMProvisioner:
             if intent is None:
                 inspected = await self._request_pre_ssh_stop(
                     {
-                        "action": "inspect",
+                        "action": "inspect_initial_ready"
+                        if initial_ready
+                        else "inspect",
+                        **(
+                            {"parent_cleanup": dict(parent_cleanup)}
+                            if initial_ready
+                            else {}
+                        ),
                         "job_id": job_id,
                         "provision_generation": identity.provision_generation,
                         "expected_vm_uid": identity.vm_uid,
@@ -1876,6 +1904,16 @@ class VMProvisioner:
                         {"retention_preflight": preflight} if retention_required else {}
                     ),
                 )
+                if initial_ready:
+                    # A caller's outer transaction can turn admission into a
+                    # savepoint. Require the persisted intent's commit fence
+                    # before sending the physical stop, not only before proof.
+                    committed = await store.current_intent(
+                        job_id, identity.provision_generation, parent_cleanup
+                    )
+                    if committed != intent:
+                        return False
+                    intent = committed
             if retention_required:
                 from shared.vm_cancel_retention import valid_retention_preflight
 
@@ -1883,6 +1921,15 @@ class VMProvisioner:
                     intent.get("retention_preflight"), intent.get("frozen")
                 ):
                     return False
+            if initial_ready and not await self._ready_parent_is_current(
+                parent_cleanup,
+                job_id=job_id,
+                generation=identity.provision_generation,
+                expected_vm_uid=identity.vm_uid,
+                expected_pvc_uid=identity.rootdisk_pvc_uid,
+                entity_type="job",
+            ):
+                return False
             stopped = await self._request_pre_ssh_stop(
                 {
                     "action": "stop",
@@ -1939,6 +1986,11 @@ class VMProvisioner:
                     "terminal_evidence": committed["terminal_evidence"],
                     "process_zero_receipt_id": committed["process_zero_receipt_id"],
                     "evidence_digest": committed["evidence_digest"],
+                    **(
+                        {"retention_preflight": committed["retention_preflight"]}
+                        if "retention_preflight" in committed
+                        else {}
+                    ),
                 }
             )
             return bool(
@@ -2309,12 +2361,15 @@ class VMProvisioner:
             if preflight.get("kind") == "vm_cancel_retention_preflight_v1":
                 if not valid_retention_preflight(preflight, preflight.get("frozen")):
                     return False
-            elif preflight.get("kind") != "vm_job_retained_ready_preflight_v1":
+            elif preflight.get("kind") not in {
+                "vm_job_retained_ready_preflight_v1",
+                "vm_job_initial_ready_preflight_v1",
+            }:
                 return False
-        supplied_ready = (
-            isinstance(preflight, Mapping)
-            and preflight.get("kind") == "vm_job_retained_ready_preflight_v1"
-        )
+        supplied_ready = isinstance(preflight, Mapping) and preflight.get("kind") in {
+            "vm_job_retained_ready_preflight_v1",
+            "vm_job_initial_ready_preflight_v1",
+        }
         # Existing legacy callers can carry non-UUID test/administrative IDs.
         # A protected continuation is a UUID-backed Job by construction, so
         # such an ID cannot name the new Ready authority.
@@ -2558,6 +2613,17 @@ class VMProvisioner:
             and current_identity.credential_runtime_started is False
         )
         discovered_endpoint = False
+        initial_ready_stop = bool(
+            entity_type == "job"
+            and self.mode == "same-cluster"
+            and not purge_disk
+            and current_identity is not None
+            and current_identity.credential_runtime_started is True
+            and isinstance(parent_cleanup, Mapping)
+            and isinstance(parent_cleanup.get("retention_preflight"), Mapping)
+            and parent_cleanup["retention_preflight"].get("kind")
+            == "vm_job_initial_ready_preflight_v1"
+        )
         if not never_started:
             if (
                 not effective_ssh_host
@@ -2580,8 +2646,10 @@ class VMProvisioner:
                     and self.mode == "same-cluster"
                     and current_identity is not None
                     and current_identity.credential_runtime_started is True
-                    and not effective_ssh_host
-                    and not effective_ssh_port
+                    and (
+                        initial_ready_stop
+                        or (not effective_ssh_host and not effective_ssh_port)
+                    )
                     and not purge_disk
                     and isinstance(parent_cleanup, Mapping)
                     and not (
@@ -2613,6 +2681,19 @@ class VMProvisioner:
                 operation="VM managed repository process retirement",
             )
             if not retired:
+                if initial_ready_stop and await self._attempt_pre_ssh_positive_stop(
+                    job_id, identity, parent_cleanup
+                ):
+                    if await self._release_pre_ssh_stop_finalizer(
+                        job_id, generation, parent_cleanup
+                    ):
+                        return await self.delete_vm_captured(
+                            job_id,
+                            identity,
+                            purge_disk=False,
+                            entity_type="job",
+                            parent_cleanup=parent_cleanup,
+                        )
                 return VMTeardownResult("process_zero_unproven", False)
         reprobe = await self._probe_vm_teardown_identity(job_id, generation)
         if (

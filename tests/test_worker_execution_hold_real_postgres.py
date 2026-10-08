@@ -311,7 +311,11 @@ async def test_renewed_attempt_is_not_expired_and_cancel_supersedes_late_hold(db
 
 
 @pytest.mark.asyncio
-async def test_issued_container_digest_drift_is_held_without_runtime_rewrite(db):
+@pytest.mark.parametrize("vm_flag", ["false", "true"])
+async def test_issued_container_digest_drift_is_held_without_runtime_rewrite(
+    db, monkeypatch, vm_flag
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", vm_flag)
     claim = await stream.exact_claim(db)
     # Native authority correctly forbids direct mutation of Ready runtime
     # coordinates. Contract drift is representable and must not turn an
@@ -414,7 +418,7 @@ async def test_held_parent_blocks_descendant_claim_even_without_display_hold(db)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("vm_flag", ["false", "true"])
 @pytest.mark.parametrize("kind", ["container_prebundle", "historical_vm_no_attempt"])
-async def test_positive_ordinary_reaper_cases_keep_existing_retry(
+async def test_reaper_retries_prebundle_and_preserves_unknown_vm_attempt(
     db, monkeypatch, vm_flag, kind
 ):
     monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", vm_flag)
@@ -424,8 +428,8 @@ async def test_positive_ordinary_reaper_cases_keep_existing_retry(
             "SELECT lease_token FROM run_queue WHERE unit_id=$1", job_id
         )
     else:
-        # Historical queue/Job rows carry no claim-attempt ledger. No Ready
-        # runtime or stop evidence is fabricated by this compatibility fixture.
+        # A historical leased queue/Job without a native attempt cannot prove
+        # the bundle was never issued. It must not silently requeue under OFF.
         from tests.test_vm_workspace_recovery_real_postgres import insert_leased_job
 
         job_id, token = await insert_leased_job(db._pool, include_attempt=False)
@@ -458,6 +462,14 @@ async def test_positive_ordinary_reaper_cases_keep_existing_retry(
                 "SELECT count(*) FROM vm_workspace_recoveries WHERE owner_id=$1", job_id
             )
             == 1
+        )
+    elif kind == "historical_vm_no_attempt":
+        assert queue["state"] == "leased" and queue["lease_token"] == token
+        assert (
+            await db.fetchval(
+                "SELECT count(*) FROM vm_workspace_recoveries WHERE owner_id=$1", job_id
+            )
+            == 0
         )
     else:
         assert queue["state"] == "queued" and queue["lease_token"] == token + 1

@@ -1128,10 +1128,22 @@ marker/checkpoint/PVC survival. The cluster is deleted on success and failure;
 
 `orchestrator.vmJobCancelRetention.enabled` defaults to false and renders
 `VM_JOB_CANCEL_RETENTION_ENABLED`. It admits new compute-only retention authority
-for exactly scoped cancelled, never-Ready stateless VM Jobs, including immutable
-supersession of an unissued purge request. Disabled admission holds those
-candidates; it never falls back to disk purge. Persisted retention guards, exact
+for exactly scoped cancelled stateless VM Jobs, including never-Ready Jobs and,
+with migration `0340_vm_job_ready_cancel_retention.sql`, initial Jobs with durable
+Ready history. Admission requires the exact current creation, compute reservation
+and disk custody; an unissued purge request can be superseded only with proof
+that it had no physical effects. Disabled admission or missing schema holds new
+candidates rather than selecting disk purge. Persisted retention guards, exact
 retries, settlement and separately authorized permanent Delete remain active.
+Historical, already admitted ordinary purge requests retain their exact replay
+contract; upgrading cannot recover data already purged.
+
+With VM workspace recovery disabled, an exactly bound VM Worker attempt is held
+when its executor is lost after bundle authorization. The interrupted command
+is not requeued. Cancel remains available and preserves the disk through the
+retention checks above. The hold survives Cancel: stopping compute does not
+establish the interrupted command's outcome, and Resume remains blocked. This
+change adds no automatic replay or command-disposition repair.
 
 Migration `0339_vm_job_retained_resume.sql` and matching server/controller code
 add explicit owner **Resume** for this retained Cancel lineage. Resume keeps the
@@ -1149,6 +1161,13 @@ provably issued no VM can settle without inventing a VM stop receipt. An issued
 or uncertain creation stays held until its actual outcome is established,
 including any reservation that still accounts for possible compute.
 
+For an initial Ready Cancel, missing or failed SSH retirement can use a distinct
+positive-stop proof bound to the committed retention authority. It halts the
+exact VM and requires complete terminated-container evidence before releasing
+the finalizer, then verifies the original signed stop and retained disk before
+releasing the compute reservation. A missing or partial proof leaves cleanup
+pending and compute accounted for.
+
 **Cancel** retains the protected disk. Explicit permanent **Delete** first
 settles the current continuation, then authorizes deletion of that exact disk
 using the complete retained history. This also applies when the latest Resume
@@ -1157,9 +1176,9 @@ disk custody must both be proved. A timeout or absent API response is not proof
 that cleanup completed; use the existing controls and reported pending state.
 
 Publish with the effective gate false. Enable only after the schema and
-retention-aware Controller/Core versions are installed, preservation and Delete
-acceptance is qualified, and every old controller/transport consumer and cleanup
-Core/worker actor has physically stopped. A single new controller response or
+retention-aware Controller/Core/Agent versions are installed, preservation and
+Delete acceptance is qualified, and every old controller/transport consumer and
+cleanup Core/worker actor has physically stopped. A single new controller response or
 Ready Deployment does not prove that boundary. Both enabling and disabling roll
 Core and stateless worker Pods through template checksums. Disabling stops new
 admissions only after old enabled actors exit; it does not undo admitted work or
