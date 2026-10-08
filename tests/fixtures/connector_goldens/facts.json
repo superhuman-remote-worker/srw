@@ -649,7 +649,6 @@
       "",
       "### Available Tools",
       "- `cypher_query` — execute read-only Cypher queries",
-      "- `cypher_execute` — execute write Cypher statements (CREATE, MERGE, DELETE, SET)",
       "- `get_database_schema` — inspect labels, relationships, properties",
       "",
       "No CLI access or write operations available."
@@ -659,8 +658,7 @@
       "neo4j access",
       "How do I connect to Supply Graph?",
       "What databases are available?"
-    ],
-    "pinned_defect": "the read-only neo4j note lists cypher_execute, a write tool the read-only tool set does not bind"
+    ]
   },
   "kb_note/mongodb/read_only": {
     "note_id": "ds-d500000a",

@@ -195,13 +195,7 @@ for _kind in KINDS:
     )
 for _kind in ("postgresql", "neo4j", "mongodb", "webdav"):
     NOTE_CASES[f"{_kind}/read_only"] = NoteCase(
-        resolved_row(_kind, project_read_only=True),
-        pinned_defect=(
-            "the read-only neo4j note lists cypher_execute, a write tool the "
-            "read-only tool set does not bind"
-            if _kind == "neo4j"
-            else None
-        ),
+        resolved_row(_kind, project_read_only=True)
     )
 NOTE_CASES.update(
     {

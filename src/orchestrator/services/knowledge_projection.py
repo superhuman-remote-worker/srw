@@ -207,7 +207,6 @@ def build_managed_readonly_note(name: str, desc: str, ds_type: str) -> str:
         ],
         "neo4j": [
             "- `cypher_query` — execute read-only Cypher queries",
-            "- `cypher_execute` — execute write Cypher statements (CREATE, MERGE, DELETE, SET)",
             "- `get_database_schema` — inspect labels, relationships, properties",
         ],
         "mongodb": [
