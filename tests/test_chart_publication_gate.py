@@ -304,12 +304,14 @@ def test_the_mcp_front_is_vetted_tested_built_and_pinned_by_digest(name, publica
     assert test["working-directory"] == "drivers/mcp-front"
     assert "go vet ./..." in test["run"] and "go test" in test["run"]
     assert "-race" in test["run"]
-    # The development MCP server it is tested against: vetted and tested.
+    # The development MCP server it is tested against: vetted and tested,
+    # on develop in its own job (a change to it alone republishes nothing).
+    server_steps = jobs["test-mcp-test-server"]["steps"] if name == "develop" else steps
     server = next(
-        s for s in steps if s.get("name") == "Vet and test the MCP test server"
+        s for s in server_steps if s.get("name") == "Vet and test the MCP test server"
     )
     assert server["working-directory"] == "drivers/mcp-test"
-    assert "go vet ./..." in server["run"] and "go test" in server["run"]
+    assert "go vet ./..." in server["run"] and "-race" in server["run"]
     go = next(s for s in steps if s.get("uses", "").startswith("actions/setup-go@"))
     dockerfile = (SCRIPT.parents[1] / "docker/Dockerfile.driver-mcp-front").read_text()
     base = re.search(
@@ -334,10 +336,23 @@ def test_the_mcp_front_is_vetted_tested_built_and_pinned_by_digest(name, publica
 
 def test_develop_rebuilds_the_mcp_front_when_its_inputs_change():
     text, jobs = workflow("develop")
-    assert "DRIVER_MCP_FRONT_PATHS=(drivers/mcp-front/ drivers/mcp-test/" in text
+    assert (
+        "DRIVER_MCP_FRONT_PATHS=(drivers/mcp-front/ .dockerignore "
+        "docker/Dockerfile.driver-mcp-front)" in text
+    )
     assert 'image_missing driver-mcp-front "$DRIVER_MCP_FRONT_SHA"' in text
     outputs = jobs["changes"]["outputs"]
     assert "driver-mcp-front" in outputs and "driver-mcp-front-sha" in outputs
+    # The test server has its own change detection and job, so it never
+    # moves the front's image.
+    assert "mcp-test-changed" in outputs
+    assert "git diff --name-only \"$BASE\" HEAD -- 'drivers/mcp-test/'" in text
+    server = jobs["test-mcp-test-server"]
+    assert "mcp-test-changed == 'true'" in server["if"]
+    assert server["needs"] == ["changes"]
+    assert not any(
+        "docker/build-push" in step.get("uses", "") for step in server["steps"]
+    )
     # The development MCP test server is tested, never built or published.
     for name in ("develop", "main"):
         text = workflow(name)[0]

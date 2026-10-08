@@ -638,6 +638,7 @@ jobs:
       chart: ${{ steps.check.outputs.chart }}
       python-changed: ${{ steps.test-paths.outputs.python }}
       cockpit-changed: ${{ steps.test-paths.outputs.cockpit }}
+      mcp-test-changed: ${{ steps.test-paths.outputs.mcp-test }}
       # Space-separated test files for pytest, or `tests/` for the whole suite.
       pytest-target: ${{ steps.select.outputs.pytest-target }}
     steps:
@@ -723,6 +724,7 @@ jobs:
             echo "RANGE_BASE=" >> "$GITHUB_ENV"
             echo "python=true" >> "$GITHUB_OUTPUT"
             echo "cockpit=true" >> "$GITHUB_OUTPUT"
+            echo "mcp-test=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -751,7 +753,16 @@ jobs:
             echo "cockpit=false" >> "$GITHUB_OUTPUT"
           fi
 
-          echo "Test path detection: $(grep -E '^(python|cockpit)=' "$GITHUB_OUTPUT" | tr '\n' ' ')"
+          # The development MCP test server (D5a) is tested on its own: it
+          # is never built or published, so it never moves the front's image.
+          if git diff --name-only "$BASE" HEAD -- 'drivers/mcp-test/' \
+            '.github/workflows/develop.yml' | grep -q .; then
+            echo "mcp-test=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mcp-test=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Test path detection: $(grep -E '^(python|cockpit|mcp-test)=' "$GITHUB_OUTPUT" | tr '\n' ' ')"
 
       - name: Select affected test files
         id: select
@@ -906,9 +917,7 @@ jobs:
           DRIVER_SHIM=$(image_missing driver-shim "$DRIVER_SHIM_SHA")
 
           # The managed MCP front (D5a): one static Go binary, stdlib only.
-          # Its job also tests the development MCP server (drivers/mcp-test),
-          # so a change there runs it too.
-          DRIVER_MCP_FRONT_PATHS=(drivers/mcp-front/ drivers/mcp-test/ .dockerignore docker/Dockerfile.driver-mcp-front)
+          DRIVER_MCP_FRONT_PATHS=(drivers/mcp-front/ .dockerignore docker/Dockerfile.driver-mcp-front)
           DRIVER_MCP_FRONT_SHA=$(last_input_sha "${DRIVER_MCP_FRONT_PATHS[@]}")
           DRIVER_MCP_FRONT=$(image_missing driver-mcp-front "$DRIVER_MCP_FRONT_SHA")
 
@@ -2234,6 +2243,30 @@ jobs:
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-driver-shim:buildcache-develop
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-driver-shim:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
+  # The development MCP server (D5a) the front's integration tests and the
+  # k3d gate run behind it: vetted and tested when it changes, never built or
+  # published, so a change to it alone republishes nothing.
+  test-mcp-test-server:
+    needs: [changes]
+    if: needs.changes.outputs.mcp-test-changed == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - name: Vet and test the MCP test server
+        working-directory: drivers/mcp-test
+        run: |
+          go vet ./...
+          go test -count=1 -race ./...
+
   # The managed MCP front (D5a): the only exposed port of every managed MCP
   # driver pod. Vetted and tested with the toolchain the image builds with,
   # then published; the chart is stamped with its digest (a managed MCP
@@ -2263,13 +2296,6 @@ jobs:
           cache: false
       - name: Vet and test the front
         working-directory: drivers/mcp-front
-        run: |
-          go vet ./...
-          go test -count=1 -race ./...
-      # The development MCP server the front's integration tests and the
-      # k3d gate run behind it: tested here, never built or published.
-      - name: Vet and test the MCP test server
-        working-directory: drivers/mcp-test
         run: |
           go vet ./...
           go test -count=1 -race ./...
