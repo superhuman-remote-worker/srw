@@ -312,6 +312,12 @@ def test_the_mcp_front_is_vetted_tested_built_and_pinned_by_digest(name, publica
     )
     assert server["working-directory"] == "drivers/mcp-test"
     assert "go vet ./..." in server["run"] and "-race" in server["run"]
+    # The stdio bridge the same image carries (D5b): its modules verified
+    # against go.sum, vetted and raced, in the front's job.
+    bridge = next(s for s in steps if s.get("name") == "Vet and test the stdio bridge")
+    assert bridge["working-directory"] == "drivers/mcp-bridge"
+    assert "go mod verify" in bridge["run"] and "go vet ./..." in bridge["run"]
+    assert "-race" in bridge["run"]
     go = next(s for s in steps if s.get("uses", "").startswith("actions/setup-go@"))
     dockerfile = (SCRIPT.parents[1] / "docker/Dockerfile.driver-mcp-front").read_text()
     base = re.search(
@@ -320,6 +326,9 @@ def test_the_mcp_front_is_vetted_tested_built_and_pinned_by_digest(name, publica
         dockerfile,
     )
     assert base is not None and base.group(1) == go["with"]["go-version"]
+    # One image, both binaries: the front and the bridge pin together.
+    assert "COPY --from=build /out/srw-mcp-bridge /srw-mcp-bridge" in dockerfile
+    assert "go mod verify" in dockerfile
     build = next(
         s["with"] for s in steps if s.get("uses", "").startswith("docker/build-push")
     )
@@ -336,9 +345,10 @@ def test_the_mcp_front_is_vetted_tested_built_and_pinned_by_digest(name, publica
 
 def test_develop_rebuilds_the_mcp_front_when_its_inputs_change():
     text, jobs = workflow("develop")
+    # A change of the stdio bridge rebuilds the image that carries it (D5b).
     assert (
-        "DRIVER_MCP_FRONT_PATHS=(drivers/mcp-front/ .dockerignore "
-        "docker/Dockerfile.driver-mcp-front)" in text
+        "DRIVER_MCP_FRONT_PATHS=(drivers/mcp-front/ drivers/mcp-bridge/ "
+        ".dockerignore docker/Dockerfile.driver-mcp-front)" in text
     )
     assert 'image_missing driver-mcp-front "$DRIVER_MCP_FRONT_SHA"' in text
     outputs = jobs["changes"]["outputs"]

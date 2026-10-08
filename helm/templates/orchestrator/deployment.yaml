@@ -2000,8 +2000,9 @@ spec:
               value: {{ printf "%s:%s%s" .image.repository (.image.tag | default "latest") (ternary (printf "@%s" .image.digest) "" (ne (.image.digest | default "") "")) | quote }}
             {{- end }}
             {{- end }}
-            # Managed MCP servers (connector drivers D5a): driver name ->
-            # image reference (tag, or tag@digest), and the front they run behind.
+            # Managed MCP servers (connector drivers D5a, D5b): driver name ->
+            # image reference (tag, or tag@digest), and the front they run
+            # behind (whose image also carries the stdio bridge).
             {{- $managedMcp := dict }}
             {{- range $key, $name := dict "gitea" "srw.gitea-mcp/v1" }}
             {{- $entry := index $.Values.connectors.drivers.managedMcp $key }}
@@ -2012,9 +2013,12 @@ spec:
             {{- if .Values.connectors.drivers.mcpTest.enabled }}
             {{- $_ := set $managedMcp "srw.mcp-test/v1" .Values.connectors.drivers.mcpTest.image }}
             {{- end }}
+            {{- if .Values.connectors.drivers.mcpStdioTest.enabled }}
+            {{- $_ := set $managedMcp "srw.mcp-stdio-test/v1" .Values.connectors.drivers.mcpStdioTest.image }}
+            {{- end }}
             {{- if $managedMcp }}
             {{- if not .Values.connectors.servicePods.enabled }}
-            {{- fail "a managed MCP server (connectors.drivers.managedMcp, mcpTest) needs connectors.servicePods.enabled: it runs as a service-plane driver" }}
+            {{- fail "a managed MCP server (connectors.drivers.managedMcp, mcpTest, mcpStdioTest) needs connectors.servicePods.enabled: it runs as a service-plane driver" }}
             {{- end }}
             {{- if not .Values.connectors.drivers.mcpFront.image.digest }}
             {{- fail "a managed MCP server needs connectors.drivers.mcpFront.image.digest: every managed MCP pod runs the front, so it is pinned by digest (CI stamps it; Tilt sets it in k3d)" }}

@@ -683,6 +683,8 @@ def test_tilt_builds_the_front_and_the_test_server_and_pins_both():
     }
     for image, directory in (
         ("srw-driver-mcp-front", "drivers/mcp-front/"),
+        # The front's image carries the stdio bridge (D5b).
+        ("srw-driver-mcp-front", "drivers/mcp-bridge/"),
         ("srw-driver-mcp-test", "drivers/mcp-test/"),
     ):
         keywords = builds[image]
@@ -708,9 +710,46 @@ def test_the_k3d_profile_installs_the_test_server_and_gitea_behind_the_front():
     drivers = yaml.safe_load(example.read_text())["connectors"]["drivers"]
     assert drivers["mcpTest"]["enabled"] is True
     assert drivers["managedMcp"]["gitea"]["enabled"] is True
+    assert drivers["mcpStdioTest"]["enabled"] is True
     env = orchestrator_env(render(values=(example,)))
     images = json.loads(env["CONNECTOR_MANAGED_MCP_IMAGES"])
-    assert set(images) == {"srw.gitea-mcp/v1", "srw.mcp-test/v1"}
+    assert set(images) == {
+        "srw.gitea-mcp/v1",
+        "srw.mcp-test/v1",
+        "srw.mcp-stdio-test/v1",
+    }
     assert env["CONNECTOR_MCP_FRONT_IMAGE"].startswith(
         "srw-registry:5000/srw-driver-mcp-front@sha256:"
     )
+
+
+# =============================================================================
+# Managed MCP for stdio images (D5b): the stock memory server
+# =============================================================================
+
+MCP_STDIO_TEST = "connectors.drivers.mcpStdioTest.enabled=true"
+
+
+def test_the_stdio_test_server_runs_the_pinned_stock_image():
+    import json
+
+    env = orchestrator_env(render(EXCHANGE, ON, FRONT, MCP_STDIO_TEST))
+    assert json.loads(env["CONNECTOR_MANAGED_MCP_IMAGES"]) == {
+        "srw.mcp-stdio-test/v1": "docker.io/mcp/memory:latest@sha256:"
+        "db0c2db07a44b6797eba7a832b1bda142ffc899588aae82c92780cbb2252407f"
+    }
+    # It runs behind the front, whose image carries the bridge.
+    assert env["CONNECTOR_MCP_FRONT_IMAGE"].endswith(f"@{FRONT_DIGEST}")
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        (FRONT, MCP_STDIO_TEST),  # without service hosting
+        (EXCHANGE, ON, MCP_STDIO_TEST),  # no pinned front (nor bridge)
+        (EXCHANGE, ON, FRONT, MCP_STDIO_TEST, "connectors.drivers.mcpStdioTest.x=1"),
+    ],
+)
+def test_an_incomplete_stdio_setup_fails_to_render(settings):
+    with pytest.raises(subprocess.CalledProcessError):
+        render(*settings)

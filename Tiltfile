@@ -440,12 +440,13 @@ docker_build(
 
 # Managed MCP front (connector drivers D5a): SRW's static Go front every
 # managed MCP driver pod runs beside its server, the pod's only exposed port.
-# The chart pins it by digest, as it does the shim.
+# The same image carries the stdio bridge (D5b), which a stdio server's pod
+# installs from it. The chart pins it by digest, as it does the shim.
 docker_build(
     'srw-driver-mcp-front',
     context='.',
     dockerfile='docker/Dockerfile.driver-mcp-front',
-    only=['drivers/mcp-front/', 'docker/Dockerfile.driver-mcp-front'],
+    only=['drivers/mcp-front/', 'drivers/mcp-bridge/', 'docker/Dockerfile.driver-mcp-front'],
 )
 
 # Development MCP test server (D5a): the image behind srw.mcp-test/v1, which

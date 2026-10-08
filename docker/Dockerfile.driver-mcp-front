@@ -1,5 +1,6 @@
 # =============================================================================
-# srw-driver-mcp-front — SRW's front for managed MCP servers
+# srw-driver-mcp-front — SRW's front for managed MCP servers, and the stdio
+# bridge it fronts for stdio images
 # =============================================================================
 # Connector drivers D5a: the only exposed port of a managed MCP driver pod.
 # It authenticates each request with the caller's lease token (the lease
@@ -7,8 +8,17 @@
 # credential, hides and refuses the tools the binding's access level does not
 # allow, scrubs the credential from every answer, and serves /readyz from a
 # real MCP probe of the server beside it. One static Go binary (standard
-# library only) on scratch, run as an unprivileged user; the pod drops every
-# capability and mounts its root filesystem read-only.
+# library only).
+#
+# D5b: the image also carries /srw-mcp-bridge, SRW's static stdio bridge
+# (built on the official MCP Go SDK). A stdio server's pod copies it into
+# the server container with an init container from this image (`install`),
+# so the front and the bridge it speaks to are always the same build, pinned
+# by one digest. The bridge runs one process of a stock stdio image per
+# binding.
+#
+# Scratch, run as an unprivileged user; the pod drops every capability and
+# mounts its root filesystem read-only.
 #
 #   docker build -f docker/Dockerfile.driver-mcp-front -t srw-driver-mcp-front .
 #
@@ -22,17 +32,29 @@ ARG SRW_SOURCE_REVISION="dev"
 ARG TARGETOS
 ARG TARGETARCH
 
-WORKDIR /src
+# The bridge's modules first (go.sum pins every one), so a source change
+# reuses the download layer.
+WORKDIR /src/mcp-bridge
+COPY drivers/mcp-bridge/go.mod drivers/mcp-bridge/go.sum ./
+RUN go mod download && go mod verify
+
+WORKDIR /src/mcp-front
 COPY drivers/mcp-front/ ./
+WORKDIR /src/mcp-bridge
+COPY drivers/mcp-bridge/ ./
 RUN set -eu; \
     goarch="${TARGETARCH:-$(go env GOARCH)}"; \
-    CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="$goarch" go build -trimpath \
-        -ldflags "-s -w -X main.version=${SRW_SOURCE_REVISION}" \
-        -o /out/srw-mcp-front .; \
-    if [ "$goarch" = "$(go env GOHOSTARCH)" ]; then /out/srw-mcp-front version; fi
+    for program in mcp-front mcp-bridge; do \
+        cd "/src/$program"; \
+        CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="$goarch" go build -trimpath \
+            -ldflags "-s -w -X main.version=${SRW_SOURCE_REVISION}" \
+            -o "/out/srw-$program" .; \
+        if [ "$goarch" = "$(go env GOHOSTARCH)" ]; then "/out/srw-$program" version; fi; \
+    done
 
 FROM scratch
 COPY --from=build /out/srw-mcp-front /srw-mcp-front
+COPY --from=build /out/srw-mcp-bridge /srw-mcp-bridge
 USER 65532:65532
 ENTRYPOINT ["/srw-mcp-front"]
 CMD ["serve"]

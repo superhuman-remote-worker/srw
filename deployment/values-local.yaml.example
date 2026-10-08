@@ -372,6 +372,12 @@ connectors:
         repository: srw-registry:5000/srw-driver-git-swap
         tag: dev
       fallback: token-in-url
+    # The development stdio server (srw.mcp-stdio-test/v1, D5b): Docker's
+    # stock mcp/memory image behind the front and the stdio bridge the front's
+    # image carries, pulled from Docker Hub at the chart's pinned digest. The
+    # managed MCP stdio gate drives it.
+    mcpStdioTest:
+      enabled: true
 
 databases:
   # Non-HA local default. All five PostgreSQL engines continue to inherit

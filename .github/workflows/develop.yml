@@ -918,8 +918,9 @@ jobs:
           DRIVER_SHIM_SHA=$(last_input_sha "${DRIVER_SHIM_PATHS[@]}")
           DRIVER_SHIM=$(image_missing driver-shim "$DRIVER_SHIM_SHA")
 
-          # The managed MCP front (D5a): one static Go binary, stdlib only.
-          DRIVER_MCP_FRONT_PATHS=(drivers/mcp-front/ .dockerignore docker/Dockerfile.driver-mcp-front)
+          # The managed MCP front (D5a): one static Go binary, stdlib only,
+          # and the stdio bridge its image carries (D5b, drivers/mcp-bridge).
+          DRIVER_MCP_FRONT_PATHS=(drivers/mcp-front/ drivers/mcp-bridge/ .dockerignore docker/Dockerfile.driver-mcp-front)
           DRIVER_MCP_FRONT_SHA=$(last_input_sha "${DRIVER_MCP_FRONT_PATHS[@]}")
           DRIVER_MCP_FRONT=$(image_missing driver-mcp-front "$DRIVER_MCP_FRONT_SHA")
 
@@ -2307,6 +2308,14 @@ jobs:
       - name: Vet and test the front
         working-directory: drivers/mcp-front
         run: |
+          go vet ./...
+          go test -count=1 -race ./...
+      # The stdio bridge the same image carries (D5b): its modules are
+      # checked against go.sum, then it is vetted and tested.
+      - name: Vet and test the stdio bridge
+        working-directory: drivers/mcp-bridge
+        run: |
+          go mod verify
           go vet ./...
           go test -count=1 -race ./...
       - uses: docker/setup-buildx-action@v3

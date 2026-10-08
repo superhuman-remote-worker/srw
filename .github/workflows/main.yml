@@ -1660,6 +1660,14 @@ jobs:
         run: |
           go vet ./...
           go test -count=1 -race ./...
+      # The stdio bridge the same image carries (D5b): its modules are
+      # checked against go.sum, then it is vetted and tested.
+      - name: Vet and test the stdio bridge
+        working-directory: drivers/mcp-bridge
+        run: |
+          go mod verify
+          go vet ./...
+          go test -count=1 -race ./...
       # The development MCP server the front's integration tests and the
       # k3d gate run behind it: tested here, never built or published.
       - name: Vet and test the MCP test server

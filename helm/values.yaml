@@ -307,7 +307,9 @@ connectors:
     # the only exposed port of every managed MCP driver pod. It checks each
     # request's lease token with the lease exchange, injects the connector's
     # upstream credential, hides and refuses the tools a ReadOnly binding may
-    # not call, and scrubs the credential from every answer. A managed MCP
+    # not call, and scrubs the credential from every answer. The image also
+    # carries SRW's stdio bridge, which a stdio server's pod installs from it
+    # to run one process of the server per binding (D5b). A managed MCP
     # driver needs a digest (the chart fails to render without one); CI
     # stamps tag and digest.
     mcpFront:
@@ -368,6 +370,17 @@ connectors:
     ca:
       secretName: ""
       validityDays: 3650
+    # -- Development only: srw.mcp-stdio-test/v1 (D5b), Docker's stock
+    # mcp/memory image, unchanged, behind the front and SRW's stdio bridge,
+    # one process per binding. It needs no external account;
+    # scripts/k3d-managed-mcp-stdio-gate.py drives it. Pulled from Docker
+    # Hub at the pinned digest. Never in production.
+    mcpStdioTest:
+      enabled: false
+      image:
+        repository: docker.io/mcp/memory
+        tag: latest
+        digest: "sha256:db0c2db07a44b6797eba7a832b1bda142ffc899588aae82c92780cbb2252407f"
 
 orchestrator:
   # -- 1 replica by default. NOT a statement about what HA needs: leader
