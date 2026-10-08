@@ -102,10 +102,11 @@ class RepositoryDriver(WorkspaceSshDriver):
         self, row: Mapping[str, Any], credentials: Any, *, ctx: BindContext
     ) -> dict[str, Any] | None:
         # An SSH key never rides ``datasources``: that list becomes job
-        # metadata and graph state. The entry keeps the non-secret alias the
-        # key is reached through instead.
+        # metadata and graph state. An SSH-key repository's entry keeps the
+        # non-secret alias the key is reached through instead, and a token
+        # repository's clone never reads a key, so a stray one is dropped too.
         ssh_identity = self.ssh_identity_descriptor(row)
-        if ssh_identity is not None:
+        if isinstance(credentials, Mapping):
             credentials = {
                 key: value for key, value in credentials.items() if key != "ssh_key"
             }

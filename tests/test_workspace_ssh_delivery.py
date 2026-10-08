@@ -136,6 +136,26 @@ class TestDatasourcesPayload:
         assert token["credentials"] == {"auth_method": "token", "token": "ghp_token"}
         assert "ssh_identity" not in token
 
+    def test_a_token_repository_drops_a_stray_key_and_delivers_no_identity(self):
+        """Token auth with an SSH URL and a leftover ``ssh_key``: the API
+        accepts the row, but its clone never reads a key, so the key neither
+        rides ``datasources`` nor reaches the workspace's ssh-agent."""
+        row = {
+            **_token_repository(),
+            "connection_url": "ssh://git@git.example.test:2222/acme/docs.git",
+            "config": {"forge": "gitea"},
+            "credentials": {
+                "auth_method": "token",
+                "token": "ghp_token",
+                "ssh_key": generate_ed25519_keypair().private_key,
+            },
+        }
+        assert build_workspace_ssh_identities([row]) is None
+        (entry,) = build_datasources_payload([row], dependencies=_deps())
+        assert entry["credentials"] == {"auth_method": "token", "token": "ghp_token"}
+        assert "ssh_identity" not in entry
+        assert "PRIVATE KEY" not in json.dumps(entry)
+
     def test_a_pre_c1_row_degrades_to_an_unavailable_connector(self):
         legacy = _repository(
             credentials={"auth_method": "ssh", "ssh_key": "not a parseable key"}
