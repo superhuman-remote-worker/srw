@@ -251,6 +251,28 @@ class TestBuiltinMatrix:
         assert json.loads(json.dumps(matrix)) == matrix
 
 
+class TestDevelopmentDrivers:
+    def test_the_lease_probe_is_labelled_development_never_trusted(self):
+        # Installed only where orchestrator.connectorLeases.probeDriver is on.
+        matrix = capability_matrix(builtin_connector_drivers(lease_probe=True))
+        *builtins, probe = matrix["drivers"]
+        assert probe["name"] == "srw.lease-probe/v1"
+        assert probe["trust"] == {
+            "tier": "development",
+            "trusted": False,
+            "image": None,
+            # SRW wrote it: its claims are SRW's, not a third party's.
+            "claims_declared_by_author": False,
+        }
+        assert [d["name"] for d in builtins] == [
+            spec.name for spec in builtin_connector_drivers().specs()
+        ]
+        assert all(d["trust"]["tier"] == "builtin" for d in builtins)
+
+    def test_without_the_switch_it_is_not_installed(self, matrix):
+        assert "srw.lease-probe/v1" not in {d["name"] for d in matrix["drivers"]}
+
+
 class TestDriversOutsideTheTrustedList:
     def test_every_claim_is_marked_as_the_authors(self):
         registry = ConnectorDriverRegistry([_ImageDriver(_image_spec())])

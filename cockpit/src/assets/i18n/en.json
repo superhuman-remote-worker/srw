@@ -3044,7 +3044,8 @@
     "trust": {
       "builtin": "Built-in, trusted",
       "trusted": "Trusted image",
-      "custom": "Custom, not verified"
+      "custom": "Custom, not verified",
+      "development": "Development only, not for real connectors"
     },
     "shipsWithSrw": "Ships with SRW",
     "credentials": "Credential slots",

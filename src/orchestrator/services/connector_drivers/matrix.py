@@ -18,7 +18,9 @@ what it is.  A driver's author could still write a value into a schema, so
   becomes ``{}``.
 
 Trust: the built-in drivers are SRW's own code, so their claims are SRW's.
-A driver outside the trusted list (registration arrives in D6) is marked
+A development driver (the lease probe, on only where a deployment switch
+installs it) is SRW's too but tier ``development``, never trusted. A driver
+outside the trusted list (registration arrives in D6) is marked
 ``claims_declared_by_author``: SRW does not verify foreign images, the same
 as for workspace images.
 
@@ -43,7 +45,7 @@ from orchestrator.services.connector_drivers.registry import (
     ConnectorDriver,
     ConnectorDriverRegistry,
 )
-from shared.connectors.builtin import BUILTIN_SPECS
+from shared.connectors.builtin import BUILTIN_SPECS, DEVELOPMENT_SPECS
 from shared.connectors.contract import (
     PROTOCOL_VERSION,
     AccessLevel,
@@ -54,6 +56,9 @@ from shared.connectors.contract import (
 )
 
 _BUILTIN_NAMES = frozenset(spec.name for spec in BUILTIN_SPECS)
+#: Drivers SRW ships for development only, installed when a deployment
+#: switch turns them on (the lease probe).
+_DEVELOPMENT_NAMES = frozenset(spec.name for spec in DEVELOPMENT_SPECS)
 #: Keywords carrying an example or a fallback value: dropped on a schema that
 #: is or holds a secret.
 _VALUE_KEYWORDS = frozenset({"default", "examples"})
@@ -290,6 +295,16 @@ def _trust(spec: DriverSpec, *, in_process: bool) -> dict[str, Any]:
         return {
             "tier": "builtin",
             "trusted": True,
+            "image": None,
+            "claims_declared_by_author": False,
+        }
+    if in_process and spec.name in _DEVELOPMENT_NAMES:
+        # SRW's own code, so its claims are SRW's, but installed for
+        # development and gates only (the lease probe): never a trusted
+        # driver for real connectors.
+        return {
+            "tier": "development",
+            "trusted": False,
             "image": None,
             "claims_declared_by_author": False,
         }

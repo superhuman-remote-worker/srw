@@ -3044,7 +3044,8 @@
     "trust": {
       "builtin": "Eingebaut, vertrauenswürdig",
       "trusted": "Vertrauenswürdiges Image",
-      "custom": "Eigenes, nicht geprüft"
+      "custom": "Eigenes, nicht geprüft",
+      "development": "Nur für die Entwicklung, nicht für echte Konnektoren"
     },
     "shipsWithSrw": "Wird mit SRW ausgeliefert",
     "credentials": "Zugangsdaten-Slots",

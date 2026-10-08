@@ -528,6 +528,7 @@ export class ConnectorDriversPageComponent implements OnInit {
 
   protected trustTone(driver: ConnectorDriver): BadgeTone {
     if (driver.trust.tier === 'builtin') return 'success';
+    if (driver.trust.tier === 'development') return 'alert';
     return driver.trust.trusted ? 'info' : 'warning';
   }
 

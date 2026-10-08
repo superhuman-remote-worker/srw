@@ -114,6 +114,20 @@ describe('ConnectorDriversPageComponent', () => {
     expect(text(card(host, 'srw.mcp/v1').querySelector('.tools'))).toBe(page.toolsDiscovered);
   });
 
+  it('labels a development driver as such, not built-in and not an author\'s', () => {
+    const probe: ConnectorDriver = {
+      ...CUSTOM,
+      name: 'srw.lease-probe/v1',
+      title: 'Lease probe (development)',
+      trust: {tier: 'development', trusted: false, image: null, claims_declared_by_author: false},
+    };
+    const {host} = mount([probe]);
+    const card = host.querySelector<HTMLElement>('[data-driver="srw.lease-probe/v1"]')!;
+    expect(text(card.querySelector('.driver-badges'))).toContain(page.trust.development);
+    expect(text(card.querySelector('.driver-badges'))).not.toContain(page.trust.builtin);
+    expect(card.querySelector('[data-claims="author"]')).toBeNull();
+  });
+
   it("marks every claim of a driver outside the trusted list as its author's", () => {
     const {host} = mount([CUSTOM]);
     const custom = card(host, CUSTOM.name);

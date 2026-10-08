@@ -91,8 +91,10 @@ export interface ConnectorEgressStatus {
 }
 
 export interface ConnectorDriverTrust {
-  /** `builtin` ships with SRW; `trusted` and `custom` are registered images (D6). */
-  tier: 'builtin' | 'trusted' | 'custom';
+  /** `builtin` ships with SRW; `development` too, but only where a
+   *  deployment switch installs it (the lease probe), never trusted;
+   *  `trusted` and `custom` are registered images (D6). */
+  tier: 'builtin' | 'development' | 'trusted' | 'custom';
   trusted: boolean;
   /** The registered image reference; null for drivers inside SRW. */
   image: string | null;
