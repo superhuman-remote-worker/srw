@@ -159,6 +159,65 @@ def validate_retained_retry(
     _uuid(after.get("observed_vm_uid"))
 
 
+def validate_retirement_retry_snapshot(
+    snapshot: Mapping[str, Any], *, job_id: str, owner_id: str,
+    generation: str, vm_uid: str, pvc_uid: str, cleanup_id: str,
+    request_id: str, hold_id: str, run_id: str, now: float,
+) -> float:
+    """Fence one acceptance-only retry to its paused owner and old runtime."""
+    from orchestrator.operator_cli.vm_retained_resume_pause import (
+        OwnerPauseHoldError, owned_pause_hold_id,
+    )
+
+    context = _object(snapshot.get("context"))
+    current = _object(context.get("vm"))
+    try:
+        owned_pause_hold_id(context, owner_id=owner_id, expected_hold_id=hold_id)
+    except OwnerPauseHoldError as exc:
+        raise AcceptanceFailure("predecessor owner Pause hold changed") from exc
+    retry_after = current.get("retirement_retry_after")
+    if (
+        str(snapshot.get("id")) != job_id
+        or str(snapshot.get("user_id")) != owner_id
+        or snapshot.get("status") != "paused"
+        or snapshot.get("execution_lane") != "stateless"
+        or snapshot.get("assigned_agent_id") is not None
+        or context.get("vm_retained_resume_acceptance_gate") != run_id
+        or context.get("_vm_creation_pending") is not None
+        or any(context.get(key) is not None for key in (
+            "_workspace_dispatch_authority", "_completion_control_claim",
+            "_stateless_control_claim", "last_operator_pause_hold",
+        ))
+        or current.get("provision_generation") != generation
+        or current.get("vm_uid") != vm_uid
+        or current.get("rootdisk_pvc_uid") != pvc_uid
+        or current.get("status") not in {
+            "ready", "retiring_process_zero", "deleting", "delete_failed", "deleted",
+        }
+        or current.get("retirement_cleanup_pending") is not True
+        or current.get("retirement_last_result") != "retry_pending"
+        or type(current.get("retirement_attempts")) is not int
+        or current["retirement_attempts"] < 1
+        or type(retry_after) not in (int, float)
+        or not now - 900 <= retry_after <= now + 300
+        or snapshot.get("queue_state") != "done"
+        or snapshot.get("queue_leased_by") is not None
+        or snapshot.get("queue_leased_until") is not None
+        or snapshot.get("queue_lease_token") != 0
+        or str(snapshot.get("cleanup_id")) != cleanup_id
+        or str(snapshot.get("cleanup_request_id")) != request_id
+        or str(snapshot.get("cleanup_pvc_uid")) != pvc_uid
+        or snapshot.get("cleanup_source") != "dispatcher_vm_recycle"
+        or snapshot.get("cleanup_completed_at") is not None
+        or snapshot.get("cleanup_outcome") is not None
+        or any(snapshot.get(key) is not False for key in (
+            "active_access", "active_remote", "active_recovery", "active_creation",
+        ))
+    ):
+        raise AcceptanceFailure("predecessor retirement retry authority changed")
+    return float(retry_after)
+
+
 def validate_worker_evidence(
     queue: Mapping[str, Any], attempt: Mapping[str, Any], pod: Mapping[str, Any],
     *, job_id: str, run_id: str,
@@ -516,11 +575,42 @@ class LiveScenario:
         ):
             raise AcceptanceFailure("owner Resume did not lift the exact fixture Pause")
 
+    async def retirement_retry_snapshot(self, cleanup_id: str) -> dict[str, Any]:
+        """Read the exact owner, queue and open cleanup in one DB statement."""
+        return await self.row(
+            "SELECT j.id,j.user_id,j.status::text AS status,j.execution_lane,"
+            "j.assigned_agent_id,j.context,q.state AS queue_state,"
+            "q.leased_by AS queue_leased_by,q.leased_until AS queue_leased_until,"
+            "q.lease_token AS queue_lease_token,c.id AS cleanup_id,"
+            "c.request_id AS cleanup_request_id,c.pvc_uid AS cleanup_pvc_uid,"
+            "c.source AS cleanup_source,c.completed_at AS cleanup_completed_at,"
+            "c.outcome AS cleanup_outcome,"
+            "EXISTS(SELECT 1 FROM vm_idle_access_leases a WHERE a.owner_kind='job' "
+            "AND a.owner_id=j.id AND a.closed_at IS NULL "
+            "AND a.expires_at>clock_timestamp()) AS active_access,"
+            "EXISTS(SELECT 1 FROM vm_remote_operation_leases r "
+            "WHERE r.owner_kind='job' AND r.owner_id=j.id "
+            "AND r.settled_at IS NULL AND r.lease_expires_at>clock_timestamp()) "
+            "AS active_remote,"
+            "EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs w "
+            "WHERE w.job_id=j.id AND w.resolved_at IS NULL) AS active_recovery,"
+            "EXISTS(SELECT 1 FROM vm_creation_retries r WHERE r.job_id=j.id "
+            "AND r.state IN ('queued','reconciling','attention','cancel_requested')) "
+            "AS active_creation "
+            "FROM jobs j LEFT JOIN run_queue q ON q.unit_id=j.id "
+            "AND q.unit_kind='worker_batch' "
+            "LEFT JOIN vm_workspace_cleanup_admissions c ON c.id=$2 "
+            "AND c.owner_kind='job' AND c.owner_id=j.id "
+            "WHERE j.id=$1",
+            UUID(self.args.job_id), UUID(cleanup_id),
+        )
+
     async def retire_predecessor(self, vm: dict[str, Any]) -> dict[str, Any]:
         """Pause only the gate call before the production physical-stop transport."""
         from orchestrator.services.vm_provisioning_cleanup import recycle_provisioning_vm
         from orchestrator.services.vm_workspace_recovery_store import VMWorkspaceRecoveryStore
 
+        deadline = time.monotonic() + 900
         entered, release = asyncio.Event(), asyncio.Event()
         delegate = self.provisioner
 
@@ -547,7 +637,7 @@ class LiveScenario:
         try:
             await asyncio.wait_for(entered.wait(), timeout=30)
             open_cleanup = await self.row(
-                "SELECT id,pvc_uid,completed_at FROM vm_workspace_cleanup_admissions "
+                "SELECT id,request_id,pvc_uid,completed_at FROM vm_workspace_cleanup_admissions "
                 "WHERE owner_kind='job' AND owner_id=$1 "
                 "AND source='dispatcher_vm_recycle' AND completed_at IS NULL "
                 "ORDER BY admitted_at DESC LIMIT 1",
@@ -564,7 +654,76 @@ class LiveScenario:
             # Do not leave a supported cleanup task running against a closing
             # DB/provisioner if the HTTP negative assertion fails. Preserve
             # the exception while still allowing its physical stop to settle.
-            result = await asyncio.wait_for(task, timeout=300)
+            try:
+                result = await asyncio.wait_for(
+                    task, timeout=min(300, max(0, deadline - time.monotonic())),
+                )
+            finally:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+        if result == "retry_pending":
+            if not open_cleanup.get("request_id"):
+                raise AcceptanceFailure("predecessor cleanup request identity is unavailable")
+            previous_attempts = vm.get("retirement_attempts", 0)
+            if type(previous_attempts) is not int or previous_attempts < 0:
+                raise AcceptanceFailure("predecessor retirement attempt is malformed")
+            for _ in range(6):
+                snapshot = await self.retirement_retry_snapshot(str(open_cleanup["id"]))
+                retry_at = validate_retirement_retry_snapshot(
+                    snapshot, job_id=self.args.job_id,
+                    owner_id=self.args.expected_owner_id,
+                    generation=str(vm["provision_generation"]),
+                    vm_uid=str(vm["vm_uid"]),
+                    pvc_uid=self.args.expected_pvc_uid,
+                    cleanup_id=str(open_cleanup["id"]),
+                    request_id=str(open_cleanup["request_id"]),
+                    hold_id=self.args.expected_pause_hold_id,
+                    run_id=self.args.run_id, now=time.time(),
+                )
+                fresh_vm = _object(_object(snapshot["context"]).get("vm"))
+                attempts = fresh_vm["retirement_attempts"]
+                if attempts != previous_attempts + 1:
+                    raise AcceptanceFailure("predecessor retirement attempt changed")
+                delay = max(0.0, retry_at - time.time())
+                if time.monotonic() + delay >= deadline:
+                    raise AcceptanceFailure("predecessor retirement retry deadline elapsed")
+                if delay:
+                    await asyncio.sleep(delay)
+                # A worker, owner action or another cleanup actor could have
+                # changed authority during the durable wait. Never send using
+                # the old Ready snapshot or a stale read.
+                current = await self.retirement_retry_snapshot(str(open_cleanup["id"]))
+                current_retry_at = validate_retirement_retry_snapshot(
+                    current, job_id=self.args.job_id,
+                    owner_id=self.args.expected_owner_id,
+                    generation=str(vm["provision_generation"]),
+                    vm_uid=str(vm["vm_uid"]),
+                    pvc_uid=self.args.expected_pvc_uid,
+                    cleanup_id=str(open_cleanup["id"]),
+                    request_id=str(open_cleanup["request_id"]),
+                    hold_id=self.args.expected_pause_hold_id,
+                    run_id=self.args.run_id, now=time.time(),
+                )
+                current_vm = _object(_object(current["context"]).get("vm"))
+                if (current_retry_at != retry_at
+                        or current_vm["retirement_attempts"] != attempts
+                        or time.time() < current_retry_at):
+                    raise AcceptanceFailure("predecessor retirement clock changed")
+                remaining = min(300, deadline - time.monotonic())
+                if remaining <= 0:
+                    raise AcceptanceFailure("predecessor retirement retry deadline elapsed")
+                result = await asyncio.wait_for(
+                    recycle_provisioning_vm(
+                        self.args.job_id, current_vm, db=self.db,
+                        provisioner=self.provisioner,
+                        recovery_store=VMWorkspaceRecoveryStore(self.db),
+                        now=time.time(), phase_timeout=False,
+                    ), timeout=remaining,
+                )
+                if result != "retry_pending":
+                    break
+                previous_attempts = attempts
         if result != "completed":
             raise AcceptanceFailure("supported predecessor retirement did not settle")
         settled = await self.row(
