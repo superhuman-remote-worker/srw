@@ -2080,15 +2080,19 @@ spec:
             {{- end }}
             # The in-pod plane's mount sidecars (connector drivers D7, spike
             # prototype): the workspace provisioner adds them only with both.
+            # Both are pinned by digest: the opener runs privileged in every
+            # Pod that mounts, and rclone holds the credential.
             {{- with .Values.connectors.inPodPlane }}
             {{- if .enabled }}
-            {{- if or (not .opener.image.repository) (not .rclone.image.repository) }}
-            {{- fail "connectors.inPodPlane.enabled needs connectors.inPodPlane.opener.image.repository and connectors.inPodPlane.rclone.image.repository" }}
+            {{- range $name, $sidecar := dict "opener" .opener "rclone" .rclone }}
+            {{- if or (not $sidecar.image.repository) (not $sidecar.image.digest) }}
+            {{- fail (printf "connectors.inPodPlane.enabled needs connectors.inPodPlane.%s.image.repository and .digest: the in-pod plane's images are pinned by digest" $name) }}
+            {{- end }}
             {{- end }}
             - name: CONNECTOR_IN_POD_OPENER_IMAGE
-              value: {{ printf "%s:%s%s" .opener.image.repository (.opener.image.tag | default "latest") (ternary (printf "@%s" .opener.image.digest) "" (ne (.opener.image.digest | default "") "")) | quote }}
+              value: {{ include "srw.imageRef" (dict "image" .opener.image) | quote }}
             - name: CONNECTOR_IN_POD_RCLONE_IMAGE
-              value: {{ printf "%s:%s%s" .rclone.image.repository (.rclone.image.tag | default "latest") (ternary (printf "@%s" .rclone.image.digest) "" (ne (.rclone.image.digest | default "") "")) | quote }}
+              value: {{ include "srw.imageRef" (dict "image" .rclone.image) | quote }}
             {{- end }}
             {{- end }}
             - name: KB_EXTERNAL_REINDEX_CONCURRENCY

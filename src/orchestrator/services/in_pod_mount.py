@@ -1,15 +1,16 @@
 """The in-pod plane's cloud mount sidecars (connector drivers D7, spike prototype).
 
-Two native sidecars give a workspace Pod a FUSE mount while the workspace
-container has no FUSE device, no capability for it and no credential:
+Two native sidecars give a workspace Pod a FUSE mount whose daemon and
+credential live outside the workspace container:
 
 - ``srw-fuse-opener`` is privileged and the only privileged code. It opens
   /dev/fuse, mounts it at its one target inside a memory emptyDir it shares
   with Bidirectional propagation, and passes the descriptor over a unix socket
-  in a second emptyDir only the rclone sidecar mounts. It opens no network
-  listener and never reads what the filesystem serves. It forces nosuid,
-  nodev and, for a read-only mount, ro; on SIGTERM it detaches the mount so
-  the kubelet can tear the emptyDir down.
+  in a second emptyDir, which the rclone sidecar mounts read-only and the
+  workspace not at all. It opens no network listener and never reads what
+  the filesystem serves. It forces nosuid, nodev, default_permissions and,
+  for a read-only mount, ro; on SIGTERM it detaches the mount so the kubelet
+  can tear the emptyDir down.
 - ``srw-cloud-mount`` runs rclone mount2 unprivileged (uid 65534, every
   capability dropped, read-only root filesystem, no /dev/fuse). It alone
   mounts the credential Secret and asks the opener through the fusermount3
@@ -17,9 +18,16 @@ container has no FUSE device, no capability for it and no credential:
   of a Pod share localhost.
 
 The workspace container mounts the shared emptyDir read-only with
-HostToContainer propagation, so it sees the mount at ``/cloud/<name>`` and can
-neither plant a symlink at the target nor remount it. The opener starts first
-and stops last, so a mount whose rclone died is still detached at shutdown.
+HostToContainer propagation and sees the mount at ``/cloud/<name>``. The
+opener starts first and stops last, so a mount whose rclone died is still
+detached at shutdown.
+
+What the workspace cannot do holds only for a workspace container without
+privilege or CAP_SYS_ADMIN: root in today's FUSE profile (privileged, with
+/dev/fuse; the chart default) could remount the mount read-write, unmount it
+and reach the node. The spike measured exactly that, so the builder refuses
+such a workspace until D7 proper decides the workspace profile; with chart
+defaults only a workspace under ``workspace.fuse.enabled: false`` qualifies.
 
 Off unless the chart's ``connectors.inPodPlane`` is on, and nothing asks for a
 mount yet: D7 proper wires connectors and the main cloud. Design and the
@@ -86,7 +94,8 @@ class CloudMountSidecar:
     secret_name: str
     #: An rclone remote of that config, e.g. ``cloud:`` or ``cloud:Projects/x``.
     remote: str
-    #: Enforced by the opener's mount flags, not only by rclone's flag.
+    #: The opener's mount flag and rclone's flag, on top of what the
+    #: credential allows; neither holds against CAP_SYS_ADMIN in the workspace.
     read_only: bool = True
 
     def __post_init__(self) -> None:
@@ -192,7 +201,9 @@ def _rclone(mount: CloudMountSidecar, image: str) -> dict[str, Any]:
                 "readOnly": True,
                 "mountPropagation": "HostToContainer",
             },
-            {"name": SOCKET_VOLUME, "mountPath": SOCKET_DIR},
+            # connect(2) needs no write access to the directory; read-only
+            # leaves only the opener able to place anything there.
+            {"name": SOCKET_VOLUME, "mountPath": SOCKET_DIR, "readOnly": True},
             {"name": CREDENTIAL_VOLUME, "mountPath": CREDENTIAL_DIR, "readOnly": True},
             {"name": RCLONE_TMP_VOLUME, "mountPath": "/tmp"},
         ],
@@ -203,6 +214,16 @@ def _rclone(mount: CloudMountSidecar, image: str) -> dict[str, Any]:
             "failureThreshold": 60,
         },
     }
+
+
+def _workspace_can_mount(container: dict[str, Any]) -> bool:
+    """Whether the workspace container could remount or unmount the cloud mount."""
+    context = container.get("securityContext") or {}
+    added = (context.get("capabilities") or {}).get("add") or []
+    return bool(context.get("privileged")) or any(
+        str(capability).upper().removeprefix("CAP_") == "SYS_ADMIN"
+        for capability in added
+    )
 
 
 def add_cloud_mount_sidecars(
@@ -226,6 +247,11 @@ def add_cloud_mount_sidecars(
         for container in spec["containers"]
         if container["name"] == "workspace"
     )
+    if _workspace_can_mount(workspace):
+        raise ValueError(
+            "the cloud mount sidecars need a workspace without privilege or "
+            "SYS_ADMIN (workspace.fuse.enabled: false) until D7 decides its profile"
+        )
     names = {volume["name"] for volume in spec.get("volumes", [])} | {
         container["name"] for container in spec.get("initContainers", [])
     }

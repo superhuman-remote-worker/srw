@@ -3,7 +3,9 @@
 The pod shape the k3d spike (scripts/k3d-in-pod-plane-spike.py) measured:
 only the opener is privileged and only it propagates mounts; rclone and the
 credential stay out of the workspace container; the workspace's view is
-read-only and receives mounts; nothing opens a listener.
+read-only and receives mounts; nothing opens a listener. Those hold only for
+a workspace without privilege or SYS_ADMIN, so the default FUSE profile is
+refused.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from orchestrator.services.in_pod_mount import (
     CREDENTIAL_VOLUME,
     OPENER_CONTAINER,
     RCLONE_CONTAINER,
+    SOCKET_VOLUME,
     CloudMountSidecar,
     InPodPlaneImages,
     add_cloud_mount_sidecars,
@@ -63,7 +66,33 @@ def mounts_of(container: dict) -> dict[str, dict]:
 def plane_on(monkeypatch):
     monkeypatch.setenv("CONNECTOR_IN_POD_OPENER_IMAGE", f" {IMAGES.opener} ")
     monkeypatch.setenv("CONNECTOR_IN_POD_RCLONE_IMAGE", IMAGES.rclone)
+    # The only workspace profile the sidecars accept until D7 decides one.
+    monkeypatch.setenv("WORKSPACE_FUSE_ENABLED", "false")
     return ContainerProvisioner()
+
+
+@pytest.mark.parametrize(
+    ("fuse_privileged", "why"), [("true", "privileged"), ("false", "SYS_ADMIN")]
+)
+def test_the_default_fuse_profile_is_refused(monkeypatch, fuse_privileged, why):
+    monkeypatch.setenv("CONNECTOR_IN_POD_OPENER_IMAGE", IMAGES.opener)
+    monkeypatch.setenv("CONNECTOR_IN_POD_RCLONE_IMAGE", IMAGES.rclone)
+    monkeypatch.delenv("WORKSPACE_FUSE_ENABLED", raising=False)
+    monkeypatch.setenv("WORKSPACE_FUSE_PRIVILEGED", fuse_privileged)
+    provisioner = ContainerProvisioner()
+    context = build(provisioner)["spec"]["containers"][0]["securityContext"]
+    assert context.get("privileged", False) == (why == "privileged")
+    assert "SYS_ADMIN" in context["capabilities"]["add"]
+    with pytest.raises(ValueError, match="without privilege or SYS_ADMIN"):
+        build(provisioner, MOUNT)
+
+
+def test_a_workspace_adding_sys_admin_by_its_cap_name_is_refused(plane_on):
+    manifest = build(plane_on)
+    context = manifest["spec"]["containers"][0]["securityContext"]
+    context["capabilities"]["add"] = [*context["capabilities"]["add"], "CAP_SYS_ADMIN"]
+    with pytest.raises(ValueError, match="SYS_ADMIN"):
+        add_cloud_mount_sidecars(manifest, MOUNT, IMAGES)
 
 
 def test_the_plane_is_off_without_both_images(monkeypatch):
@@ -75,11 +104,16 @@ def test_the_plane_is_off_without_both_images(monkeypatch):
         build(provisioner, MOUNT)
 
 
-def test_without_a_cloud_mount_the_pod_is_todays(monkeypatch, plane_on):
+@pytest.mark.parametrize("fuse", ["true", "false"])
+def test_without_a_cloud_mount_the_pod_is_todays(monkeypatch, fuse):
+    monkeypatch.setenv("WORKSPACE_FUSE_ENABLED", fuse)
+    monkeypatch.setenv("CONNECTOR_IN_POD_OPENER_IMAGE", IMAGES.opener)
+    monkeypatch.setenv("CONNECTOR_IN_POD_RCLONE_IMAGE", IMAGES.rclone)
+    on = ContainerProvisioner()
     monkeypatch.delenv("CONNECTOR_IN_POD_OPENER_IMAGE")
     monkeypatch.delenv("CONNECTOR_IN_POD_RCLONE_IMAGE")
-    assert build(plane_on) == build(ContainerProvisioner())
-    assert "initContainers" not in build(plane_on)["spec"]
+    assert build(on) == build(ContainerProvisioner())
+    assert "initContainers" not in build(on)["spec"]
 
 
 def test_the_opener_starts_first_and_alone_is_privileged(plane_on):
@@ -132,6 +166,12 @@ def test_rclone_runs_unprivileged_and_alone_holds_the_credential(plane_on):
     assert rclone["args"][:3] == ["mount2", "cloud:Projects/x", "/srw/cloud/project"]
     assert "--read-only" in rclone["args"]
     assert mounts_of(rclone)[CLOUD_VOLUME]["mountPropagation"] == "HostToContainer"
+    # rclone reaches the opener's socket but can place nothing beside it.
+    assert mounts_of(rclone)[SOCKET_VOLUME]["readOnly"] is True
+    assert "readOnly" not in mounts_of(init(manifest, OPENER_CONTAINER))[SOCKET_VOLUME]
+    assert all(
+        SOCKET_VOLUME not in mounts_of(c) for c in manifest["spec"]["containers"]
+    )
     holders = [
         c["name"]
         for c in [*manifest["spec"]["initContainers"], *manifest["spec"]["containers"]]
