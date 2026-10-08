@@ -288,33 +288,36 @@ def _statuses(monkeypatch, runner, *sequence):
 
 
 def _store(monkeypatch, *, configured=True, job=([],), thread=(), hits=()):
-    """Fake the in-orchestrator snapshot program; ``job`` is a listing sequence."""
+    """Fake the in-orchestrator listing and the local object scan.
+
+    ``job`` is a sequence of listings; ``hits`` are keys whose scan finds a
+    needle.
+    """
 
     job_listings = list(job)
     log = []
 
     def program(source, request, timeout=180):
         assert source is gate._SNAPSHOT_PROGRAM
+        assert request["mode"] == "list"
         (prefix,) = request["prefixes"]
         kind = "job" if prefix.startswith("jobs/") else "thread"
-        log.append((kind, "list" if request.get("list_only") else "scan"))
+        log.append((kind, "list"))
         if not configured:
             return {"configured": False}
         if kind == "job":
             objects = job_listings.pop(0) if len(job_listings) > 1 else job_listings[0]
         else:
             objects = list(thread)
-        if request.get("list_only"):
-            return {"configured": True, "objects": list(objects)}
-        assert "PRIVATE KEY" in request["needles"]
-        return {
-            "configured": True,
-            "decoder": True,
-            "objects": list(objects),
-            "hits": [key for key in objects if key in hits],
-        }
+        return {"configured": True, "objects": list(objects)}
+
+    def scan_object(key, needles, timeout=900):
+        assert b"PRIVATE KEY" in needles
+        log.append(("job" if key.startswith("jobs/") else "thread", "scan"))
+        return gate.ObjectScan(complete=True, hit=key in hits, size=1)
 
     monkeypatch.setattr(gate, "in_orchestrator", program)
+    monkeypatch.setattr(gate, "scan_snapshot_object", scan_object)
     return log
 
 
@@ -517,3 +520,258 @@ def test_the_verdict_counts_skips_without_failing(monkeypatch, capsys):
     last = capsys.readouterr().out.strip().splitlines()[-1]
     assert last.startswith(f"PASS {runner.gate_id}: 1 checks, 0 failed")
     assert "1 skipped" in last
+
+
+# -- bounded memory -------------------------------------------------------------
+# The k3d run of 2026-10-08 OOM-killed the orchestrator: the snapshot scan read
+# a ~100 MB object whole and decompressed it whole inside the pod. Now the pod
+# only passes bytes through and the gate scans the stream itself; both run
+# here under the RLIMIT_DATA budget the pod programs set, on objects larger
+# than that budget.
+
+_BIG = gate.POD_MEMORY_BUDGET + (128 << 20)
+_NEEDLE = b"c1-gate-needle-" + b"q" * 24
+
+
+def _needs_zstd() -> None:
+    import shutil
+
+    if shutil.which("zstd") is None:
+        pytest.skip("zstd not installed")
+
+
+def _fake_store(root: Path) -> Path:
+    """A fake ``orchestrator.services.snapshot_service`` for the pod program.
+
+    FAKE_OBJECT (JSON) lists the object's segments, produced lazily:
+    ``["skip", n]`` a zstd skippable frame of n bytes, ``["zeros", n]``,
+    ``["file", path]`` and ``["hex", text]``. ``read()`` without a size
+    returns it whole, the way a careless program would read it.
+    """
+    package = root / "fake" / "orchestrator" / "services"
+    package.mkdir(parents=True)
+    (root / "fake" / "orchestrator" / "__init__.py").write_text("")
+    (package / "__init__.py").write_text("")
+    (package / "snapshot_service.py").write_text(
+        """
+import json, os, struct
+
+def _segments():
+    for kind, value in json.loads(os.environ["FAKE_OBJECT"]):
+        if kind == "skip":
+            yield struct.pack("<II", 0x184D2A50, value)
+            yield from _zeros(value)
+        elif kind == "zeros":
+            yield from _zeros(value)
+        elif kind == "file":
+            with open(value, "rb") as handle:
+                while chunk := handle.read(1 << 20):
+                    yield chunk
+        else:
+            yield bytes.fromhex(value)
+
+def _zeros(count):
+    while count:
+        take = min(count, 1 << 20)
+        count -= take
+        yield bytes(take)
+
+class _Body:
+    def __init__(self):
+        self._parts, self._pending = _segments(), b""
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            return self._pending + b"".join(self._parts)
+        while not self._pending:
+            self._pending = next(self._parts, b"")
+            if not self._pending:
+                return b""
+        part, self._pending = self._pending[:size], self._pending[size:]
+        return part
+
+class _S3:
+    def get_object(self, Bucket, Key):
+        return {"Body": _Body()}
+
+    def list_objects_v2(self, **kwargs):
+        return {"Contents": [{"Key": "jobs/x/env.tar.zst"}]}
+
+class SnapshotService:
+    def __init__(self):
+        self._s3, self._bucket = None, "srw-snapshots"
+
+    async def connect(self, db):
+        self._s3 = _S3()
+"""
+    )
+    return root / "fake"
+
+
+def _compressed(tmp_path: Path, size: int, tail: bytes) -> Path:
+    """``size`` zeros then ``tail``, zstd-compressed (small on disk)."""
+    out = tmp_path / "payload.zst"
+    zeros = subprocess.Popen(
+        ["head", "-c", str(size), "/dev/zero"], stdout=subprocess.PIPE
+    )
+    with out.open("wb") as handle:
+        compressor = subprocess.Popen(
+            ["zstd", "-q", "-c"], stdin=subprocess.PIPE, stdout=handle
+        )
+        assert zeros.stdout is not None and compressor.stdin is not None
+        while chunk := zeros.stdout.read(1 << 20):
+            compressor.stdin.write(chunk)
+        compressor.stdin.write(tail)
+        compressor.stdin.close()
+        assert compressor.wait() == 0 and zeros.wait() == 0
+    return out
+
+
+def _run_capped(script: str, env: dict) -> str:
+    """Run ``script`` in a fresh python under the pod programs' memory cap."""
+    import os
+    import textwrap
+
+    runner = (
+        textwrap.dedent(
+            f"""
+            import importlib.util, json, sys
+            spec = importlib.util.spec_from_file_location("gate", {str(_SCRIPT)!r})
+            gate = importlib.util.module_from_spec(spec)
+            sys.modules["gate"] = gate
+            spec.loader.exec_module(gate)
+            exec(gate._POD_MEMORY_CAP)
+            cap_memory()
+            """
+        )
+        + script
+    )
+    completed = subprocess.run(
+        [sys.executable, "-"],
+        input=runner,
+        capture_output=True,
+        text=True,
+        env=dict(os.environ, **env),
+        timeout=300,
+    )
+    assert completed.returncode == 0, completed.stderr[-2000:]
+    return completed.stdout.strip().splitlines()[-1]
+
+
+def test_scan_stream_finds_a_needle_split_across_reads():
+    data = b"a" * 10 + _NEEDLE + b"b" * 10
+    for chunk_size in (1, 7, 16, len(data)):
+        stream = __import__("io").BytesIO(data)
+        found, size, head = gate.scan_stream(
+            stream.read, [b"absent", _NEEDLE], chunk_size=chunk_size
+        )
+        assert found == {1} and size == len(data) and head == b"aaaa"
+
+
+def test_the_memory_cap_is_real():
+    """Control: under the cap, a whole read this large fails."""
+    completed = subprocess.run(
+        [sys.executable, "-"],
+        input=gate._POD_MEMORY_CAP + f"cap_memory()\nb = bytes({_BIG})\n",
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode != 0
+    assert "MemoryError" in completed.stderr
+
+
+def test_every_pod_program_caps_its_memory():
+    for program in (
+        gate._API_PROGRAM,
+        gate._GITEA_PROGRAM,
+        gate._SNAPSHOT_PROGRAM,
+        gate._HASH_PROGRAM,
+    ):
+        assert program.startswith(gate._POD_MEMORY_CAP)
+        assert "\ncap_memory()\n" in program
+
+
+def test_the_pod_program_passes_an_object_larger_than_the_cap_through(tmp_path):
+    """The pod side alone: it caps itself, so a whole read would fail."""
+    import json
+    import os
+
+    fake = _fake_store(tmp_path)
+    env = dict(
+        os.environ,
+        PYTHONPATH=str(fake),
+        FAKE_OBJECT=json.dumps([["zeros", _BIG], ["hex", _NEEDLE.hex()]]),
+    )
+    producer = subprocess.Popen(
+        [sys.executable, "-c", gate._SNAPSHOT_PROGRAM],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    assert producer.stdin is not None and producer.stdout is not None
+    producer.stdin.write(b'{"mode": "stream", "key": "jobs/x/raw"}\n')
+    producer.stdin.close()
+    found, size, _head = gate.scan_stream(producer.stdout.read, [_NEEDLE])
+    stderr = producer.stderr.read() if producer.stderr else b""
+
+    assert producer.wait() == 0, stderr[-2000:]
+    assert size == _BIG + len(_NEEDLE)
+    assert found == {0}
+
+
+def _local_scan(tmp_path, segments, key="jobs/x/env.tar.zst") -> dict:
+    """scan_snapshot_object, capped, with the pod program run locally."""
+    import json
+
+    fake = _fake_store(tmp_path)
+    script = (
+        "gate.snapshot_stream_command = lambda: "
+        "[sys.executable, '-c', gate._SNAPSHOT_PROGRAM]\n"
+        f"scan = gate.scan_snapshot_object({key!r}, [{_NEEDLE!r}])\n"
+        "print(json.dumps(scan.__dict__))\n"
+    )
+    return json.loads(
+        _run_capped(
+            script,
+            {"PYTHONPATH": str(fake), "FAKE_OBJECT": json.dumps(segments)},
+        )
+    )
+
+
+def test_the_local_scan_streams_an_object_larger_than_the_cap(tmp_path):
+    """Both ends capped. The object is larger than the cap compressed (a
+    skippable frame in front) and decompressed, so a whole read on either
+    side fails with a MemoryError."""
+    _needs_zstd()
+    payload = _compressed(tmp_path, _BIG, _NEEDLE)
+
+    scan = _local_scan(tmp_path, [["skip", _BIG], ["file", str(payload)]])
+
+    assert scan == {
+        "complete": True,
+        "hit": True,
+        "size": _BIG + len(_NEEDLE),
+        "detail": "",
+    }
+
+
+def test_a_truncated_object_is_never_read_as_clean(tmp_path):
+    _needs_zstd()
+    payload = _compressed(tmp_path, 1 << 20, _NEEDLE)
+    cut = tmp_path / "cut.zst"
+    cut.write_bytes(payload.read_bytes()[:-8])
+
+    scan = _local_scan(tmp_path, [["file", str(cut)]])
+
+    assert scan["complete"] is False
+
+
+def test_a_compressed_object_without_a_zst_name_is_not_complete(tmp_path):
+    _needs_zstd()
+    payload = _compressed(tmp_path, 1 << 20, _NEEDLE)
+
+    scan = _local_scan(tmp_path, [["file", str(payload)]], key="jobs/x/odd-name")
+
+    assert scan["complete"] is False

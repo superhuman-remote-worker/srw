@@ -77,6 +77,8 @@ import re
 import secrets
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -183,8 +185,37 @@ def wait_for(
 # Programs run inside the orchestrator container (stdin carries every secret)
 # ---------------------------------------------------------------------------
 
-_API_PROGRAM = r"""
+# Every program the gate runs inside a pod starts with this and calls
+# cap_memory() once its imports are done. The orchestrator pod has a 1 GiB
+# limit and serves the product meanwhile: a gate program that grows must
+# fail the gate with a MemoryError, never take the pod to the OOM killer.
+# RLIMIT_DATA counts heap, anonymous maps and thread stacks, not the shared
+# libraries mapped in, so the budget is what the program adds after import.
+POD_MEMORY_BUDGET = 256 << 20
+_POD_MEMORY_CAP = (
+    r"""
+import resource as _srw_resource
+def cap_memory(budget=%d):
+    with open("/proc/self/status") as status:
+        data = next(
+            int(line.split()[1]) * 1024
+            for line in status
+            if line.startswith("VmData:")
+        )
+    limit = data + budget
+    _soft, hard = _srw_resource.getrlimit(_srw_resource.RLIMIT_DATA)
+    if hard != _srw_resource.RLIM_INFINITY:
+        limit = min(limit, hard)  # an inherited cap is only ever tightened
+    _srw_resource.setrlimit(_srw_resource.RLIMIT_DATA, (limit, limit))
+"""
+    % POD_MEMORY_BUDGET
+)
+
+_API_PROGRAM = (
+    _POD_MEMORY_CAP
+    + r"""
 import json, sys, urllib.error, urllib.parse, urllib.request
+cap_memory()
 envelope = json.loads(sys.stdin.readline())
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 form = urllib.parse.urlencode({
@@ -207,10 +238,14 @@ except urllib.error.HTTPError as error:
     status, text = error.code, error.read().decode("utf-8", "replace")
 print(json.dumps({"status": status, "body": text}))
 """
+)
 
-_GITEA_PROGRAM = r"""
+_GITEA_PROGRAM = (
+    _POD_MEMORY_CAP
+    + r"""
 import asyncio, json, sys
 from orchestrator.services.gitea import GiteaClient
+cap_memory()
 request = json.loads(sys.stdin.readline())
 async def main():
     client = GiteaClient()
@@ -245,20 +280,30 @@ async def main():
     print(json.dumps(out))
 asyncio.run(main())
 """
+)
 
-_SNAPSHOT_PROGRAM = r"""
-import asyncio, json, shutil, subprocess, sys
+# Lists snapshot objects, or passes ONE object's bytes through to stdout,
+# 1 MiB at a time. Nothing is read whole, decompressed or scanned in the
+# pod: the gate does that in its own process (scan_snapshot_object).
+# ``stream`` exits 3 when no object store is configured.
+_SNAPSHOT_PROGRAM = (
+    _POD_MEMORY_CAP
+    + r"""
+import asyncio, json, sys
 from orchestrator.services.snapshot_service import SnapshotService
 request = json.loads(sys.stdin.readline())
-needles = [value.encode() for value in request["needles"]]
-async def main():
+async def connect():
     service = SnapshotService()
     await service.connect(None)
-    s3 = getattr(service, "_s3", None)
+    return service
+service = asyncio.run(connect())
+s3 = getattr(service, "_s3", None)
+cap_memory()
+if request["mode"] == "list":
     if s3 is None:
         print(json.dumps({"configured": False}))
-        return
-    keys, hits = [], []
+        raise SystemExit(0)
+    keys = []
     for prefix in request["prefixes"]:
         token = None
         while True:
@@ -270,32 +315,29 @@ async def main():
             if not page.get("IsTruncated"):
                 break
             token = page.get("NextContinuationToken")
-    if request.get("list_only"):
-        print(json.dumps({"configured": True, "objects": keys}))
-        return
-    for key in keys:
-        raw = s3.get_object(Bucket=service._bucket, Key=key)["Body"].read()
-        data = raw
-        if key.endswith(".zst"):
-            try:
-                import zstandard
-                data = zstandard.ZstdDecompressor().stream_reader(raw).read()
-            except ImportError:
-                if shutil.which("zstd") is None:
-                    print(json.dumps({"configured": True, "decoder": False}))
-                    return
-                data = subprocess.run(
-                    ["zstd", "-dc"], input=raw, capture_output=True, check=True
-                ).stdout
-        if any(needle in data for needle in needles):
-            hits.append(key)
-    print(json.dumps({"configured": True, "decoder": True, "objects": keys, "hits": hits}))
-asyncio.run(main())
+    print(json.dumps({"configured": True, "objects": keys}))
+elif request["mode"] == "stream":
+    if s3 is None:
+        raise SystemExit(3)
+    body = s3.get_object(Bucket=service._bucket, Key=request["key"])["Body"]
+    out = sys.stdout.buffer
+    while True:
+        chunk = body.read(1 << 20)
+        if not chunk:
+            break
+        out.write(chunk)
+    out.flush()
+else:
+    raise SystemExit("unknown mode")
 """
+)
 
-_HASH_PROGRAM = r"""
+_HASH_PROGRAM = (
+    _POD_MEMORY_CAP
+    + r"""
 import hashlib, json, sys
 from pathlib import Path
+cap_memory()
 root = sys.argv[1]
 expected = json.loads(sys.stdin.read())
 print(json.dumps(sorted(
@@ -304,6 +346,119 @@ print(json.dumps(sorted(
     or hashlib.sha256(Path(root, path).read_bytes()).hexdigest() != digest
 )))
 """
+)
+
+
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+STREAM_CHUNK = 1 << 20
+
+
+def scan_stream(
+    read: Callable[[int], bytes],
+    needles: list[bytes],
+    *,
+    chunk_size: int = STREAM_CHUNK,
+) -> tuple[set[int], int, bytes]:
+    """Scan a byte stream chunk by chunk: ``(needle indexes found, size, head)``.
+
+    Consecutive windows overlap by the longest needle less one byte, so a
+    needle split across two reads is still found; nothing larger than one
+    chunk plus that overlap is ever held.
+    """
+
+    overlap = max((len(needle) for needle in needles), default=1) - 1
+    found: set[int] = set()
+    size, head, tail = 0, b"", b""
+    while True:
+        chunk = read(chunk_size)
+        if not chunk:
+            return found, size, head
+        if len(head) < 4:
+            head = (head + chunk)[:4]
+        size += len(chunk)
+        window = tail + chunk
+        found.update(index for index, needle in enumerate(needles) if needle in window)
+        tail = window[-overlap:] if overlap > 0 else b""
+
+
+@dataclass
+class ObjectScan:
+    complete: bool
+    hit: bool
+    size: int
+    detail: str = ""
+
+
+def snapshot_stream_command() -> list[str]:
+    """The producer: the pod passes the object's bytes through to stdout."""
+    return (
+        K
+        + ["exec", "-i", ORCHESTRATOR, "-c", ORCHESTRATOR_CONTAINER, "--"]
+        + ["python", "-c", _SNAPSHOT_PROGRAM]
+    )
+
+
+def scan_snapshot_object(
+    key: str, needles: list[bytes], *, timeout: int = 900
+) -> ObjectScan:
+    """Stream one snapshot object out of the pod and scan it here.
+
+    A ``.zst`` object is decompressed by a local ``zstd -dc`` reading the
+    producer's stdout directly; both exit codes must be 0, so a truncated
+    transfer or archive is never read as clean. A raw object that turns out
+    to be zstd-compressed is not complete either: its bytes were never
+    looked at decompressed. Raises FileNotFoundError when zstd is missing.
+    """
+
+    compressed = ".zst" in key.rsplit("/", 1)[-1]
+    request = (json.dumps({"mode": "stream", "key": key}) + "\n").encode()
+    with tempfile.TemporaryFile() as errors:
+        producer = subprocess.Popen(
+            snapshot_stream_command(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=errors,
+        )
+        processes = [producer]
+        try:
+            assert producer.stdin is not None and producer.stdout is not None
+            producer.stdin.write(request)
+            producer.stdin.close()
+            source = producer.stdout
+            if compressed:
+                decoder = subprocess.Popen(
+                    ["zstd", "-dcq"],
+                    stdin=producer.stdout,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                processes.append(decoder)
+                producer.stdout.close()
+                assert decoder.stdout is not None
+                source = decoder.stdout
+            watchdog = threading.Timer(
+                timeout, lambda: [process.kill() for process in processes]
+            )
+            watchdog.start()
+            try:
+                found, size, head = scan_stream(source.read, needles)
+            finally:
+                watchdog.cancel()
+            codes = [process.wait(timeout=60) for process in processes]
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+        errors.seek(0)
+        stderr = _scrub(errors.read()[-300:].decode("utf-8", "replace").strip())
+    complete = (
+        all(code == 0 for code in codes)
+        and size > 0
+        and (compressed or not head.startswith(ZSTD_MAGIC))
+    )
+    detail = "" if complete else f"exit {codes}, {size} bytes; {stderr}".rstrip("; ")
+    return ObjectScan(complete=complete, hit=bool(found), size=size, detail=detail)
 
 
 def in_orchestrator(
@@ -1010,7 +1165,7 @@ class SshAgentConnectorsGate:
         """Whether an object store is configured; reported once if not."""
 
         if self._store is None:
-            listed = self.snapshot_objects(f"threads/{self.thread}/", scan=False)
+            listed = self.snapshot_objects(f"threads/{self.thread}/")
             self._store = bool(listed.get("configured"))
             if not self._store:
                 self.report.check(
@@ -1036,7 +1191,7 @@ class SshAgentConnectorsGate:
         prefix = f"jobs/{self.job}/"
         status = self.job_status()
         if status not in JOB_RUNNING:
-            if self.snapshot_objects(prefix, scan=False).get("objects"):
+            if self.snapshot_objects(prefix).get("objects"):
                 self.scan_snapshot("snapshot (job)", prefix)
             else:
                 self.report.skip(
@@ -1084,30 +1239,39 @@ class SshAgentConnectorsGate:
             return
         self.scan_snapshot("snapshot (job)", prefix)
 
-    def snapshot_objects(self, prefix: str, *, scan: bool) -> dict:
-        request: dict[str, Any] = {"prefixes": [prefix], "needles": []}
-        if scan:
-            request["needles"] = self.needles() + ["PRIVATE KEY"]
-        else:
-            request["list_only"] = True
-        return in_orchestrator(_SNAPSHOT_PROGRAM, request, timeout=600)
+    def snapshot_objects(self, prefix: str) -> dict:
+        return in_orchestrator(
+            _SNAPSHOT_PROGRAM, {"mode": "list", "prefixes": [prefix]}, timeout=120
+        )
 
     def scan_snapshot(self, name: str, prefix: str) -> None:
-        result = self.snapshot_objects(prefix, scan=True)
-        if not result.get("decoder"):
-            self.report.check(f"{name}: zstd decoder available", False)
-            return
-        objects = result.get("objects") or []
+        """Stream every object under ``prefix`` out of the pod and scan it here."""
+
+        objects = self.snapshot_objects(prefix).get("objects") or []
+        needles = [needle.encode() for needle in self.needles() + ["PRIVATE KEY"]]
+        hits: list[str] = []
+        incomplete: list[str] = []
+        for key in objects:
+            try:
+                scanned = scan_snapshot_object(key, needles)
+            except FileNotFoundError:
+                self.report.check(f"{name}: zstd decoder available", False)
+                return
+            if scanned.hit:
+                hits.append(key)
+            if not scanned.complete:
+                incomplete.append(f"{key} ({scanned.detail})")
         self.report.check(
             f"{name}: no key in snapshot objects",
-            bool(objects) and not result.get("hits"),
-            f"{len(objects)} objects; hits {result.get('hits')}",
+            bool(objects) and not hits and not incomplete,
+            f"{len(objects)} objects; hits {hits}"
+            + (f"; incomplete {incomplete}" if incomplete else ""),
         )
 
     def snapshot_settled(self, prefix: str) -> bool:
         """True once objects exist and the listing held still for one poll."""
 
-        listed = self.snapshot_objects(prefix, scan=False).get("objects") or []
+        listed = self.snapshot_objects(prefix).get("objects") or []
         previous, self._snapshot_listing = self._snapshot_listing, sorted(listed)
         return bool(listed) and self._snapshot_listing == previous
 
@@ -1123,7 +1287,7 @@ class SshAgentConnectorsGate:
         thread_prefix = f"threads/{self.thread}/"
         if not self.store_configured():
             return
-        if self.snapshot_objects(thread_prefix, scan=False).get("objects"):
+        if self.snapshot_objects(thread_prefix).get("objects"):
             self.scan_snapshot("snapshot (thread)", thread_prefix)
         else:
             self.report.check(
