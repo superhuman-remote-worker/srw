@@ -405,6 +405,17 @@ export interface DatasourceConfig {
   /** Token repository: PEM certificates SRW's git swap driver alone trusts
    *  the forge with (a forge behind a private CA). Not a secret. */
   upstream_ca?: string;
+  /** GitHub App repository (C5): the App and its installation, and a GitHub
+   *  Enterprise Server's API base. Set through the API; the form keeps it. */
+  github_app?: {app_id: string; installation_id: string; api_base?: string};
+  /** Kubeconfig (C5): TokenRequest minting for one ServiceAccount. Set
+   *  through the API; the form never sends a kubeconfig's config. */
+  token_request?: {
+    namespace: string;
+    service_account: string;
+    expiration_seconds?: number;
+    audiences?: string[];
+  };
 }
 
 export type DatasourceIndexState =

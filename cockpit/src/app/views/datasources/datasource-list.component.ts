@@ -4478,6 +4478,31 @@ export class DatasourceListComponent implements OnInit {
     this.formData.mcpEnv.splice(index, 1);
   }
 
+  /** The repository config keys this form renders (and so decides). */
+  private static readonly REPOSITORY_FORM_CONFIG_KEYS: ReadonlySet<string> = new Set([
+    'forge',
+    'known_hosts',
+    'upstream_ca',
+  ]);
+
+  /** The edited repository connector's stored config without the keys the
+   *  form renders: kept as they are on save. A GitHub App's `github_app`
+   *  goes with its credentials, so a new token or key drops it. */
+  private unrenderedRepositoryConfig(): DatasourceConfig {
+    const stored: DatasourceConfig =
+      this.editingId() !== null ? this.editingOriginal?.config ?? {} : {};
+    const kept: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(stored)) {
+      if (!DatasourceListComponent.REPOSITORY_FORM_CONFIG_KEYS.has(key)) {
+        kept[key] = value;
+      }
+    }
+    const replacing =
+      this.gitAuthMethod === 'ssh' ? !!this.gitSshKey : !!this.formCredentials.password;
+    if (replacing) delete kept['github_app'];
+    return kept as DatasourceConfig;
+  }
+
   /** Non-secret, type-specific config for the create/update/test payloads.
    *  `undefined` for types without config so the column stays untouched. */
   private buildTypeConfig(): DatasourceConfig | undefined {
@@ -4490,7 +4515,12 @@ export class DatasourceListComponent implements OnInit {
     if (this.formData.type === 'repository') {
       // canSave() already requires forge to be non-blank before this can be
       // reached from the UI; the `{}` fallback only guards a defensive call.
-      const config: DatasourceConfig = this.formData.forge ? {forge: this.formData.forge} : {};
+      // The config is replaced as a whole on update: keys this form does not
+      // render (a GitHub App's `github_app`, set through the API) are kept.
+      const config: DatasourceConfig = {
+        ...this.unrenderedRepositoryConfig(),
+        ...(this.formData.forge ? {forge: this.formData.forge} : {}),
+      };
       if (this.gitAuthMethod === 'ssh' && this.sshKnownHosts.trim()) {
         config.known_hosts = this.sshKnownHosts.trim();
       }

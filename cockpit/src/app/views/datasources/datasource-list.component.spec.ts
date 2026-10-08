@@ -706,6 +706,47 @@ describe('DatasourceListComponent repository forge selection', () => {
       expect.objectContaining({config: {forge: 'github'}}),
     );
   });
+
+  // A GitHub App connector (C5) is set up through the API; editing it in the
+  // form must keep the config keys the form does not render.
+  const githubApp = {app_id: '4242', installation_id: '9090'};
+
+  it('keeps a GitHub App config the form does not render on an edit', () => {
+    const {api, component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      type: 'repository',
+      connection_url: 'https://github.com/acme/widget.git',
+      config: {forge: 'github', github_app: githubApp},
+    });
+    component.formData.name = 'renamed';
+
+    component.saveForm();
+
+    expect(api.updateDatasource).toHaveBeenCalledWith(
+      ds.id,
+      expect.objectContaining({config: {forge: 'github', github_app: githubApp}}),
+    );
+  });
+
+  it('drops the GitHub App config when a token replaces the App', () => {
+    const {api, component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      type: 'repository',
+      connection_url: 'https://github.com/acme/widget.git',
+      config: {forge: 'github', github_app: githubApp, later_option: 'kept'},
+    });
+    component.gitAuthMethod = 'token';
+    component.formCredentials.password = 'ghp_replacement';
+
+    component.saveForm();
+
+    expect(api.updateDatasource).toHaveBeenCalledWith(
+      ds.id,
+      expect.objectContaining({config: {forge: 'github', later_option: 'kept'}}),
+    );
+  });
 });
 
 describe('DatasourceListComponent SSH connector host keys', () => {
