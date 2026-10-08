@@ -82,21 +82,29 @@ class GitSwapDriver(DatasourceDriver):
         }
 
     def service_connector(self, row: Mapping[str, Any]) -> Mapping[str, Any]:
-        from orchestrator.services.connector_git_swap_delivery import upstream_ca_of
+        return swap_service_connector(row)
 
-        try:
-            upstream = swap_upstream(row.get("connection_url"))
-        except UnservedUpstream:
-            # No host to pin: the pod is refused at launch (and a running one
-            # stops: its declared egress no longer holds).
-            return {**row, "config": {}}
-        config = {"upstream": upstream.url, "host": upstream.host}
-        ca = upstream_ca_of(row.get("config"))
-        if ca is not None:
-            # The only roots the pod trusts its upstream with (a private CA);
-            # a change starts a new pod (the credential generation).
-            config["upstream_ca"] = ca
-        return {**row, "config": config}
+
+def swap_service_connector(row: Mapping[str, Any]) -> Mapping[str, Any]:
+    """What a git swap pod is built from for a repository row: its clean
+    upstream, the host to pin and the connector's upstream CA. The
+    reconciler's credential generation and a delivery's "is the current
+    pod serving" read the same (``connector_git_swap_delivery``)."""
+    from orchestrator.services.connector_git_swap_delivery import upstream_ca_of
+
+    try:
+        upstream = swap_upstream(row.get("connection_url"))
+    except UnservedUpstream:
+        # No host to pin: the pod is refused at launch (and a running one
+        # stops: its declared egress no longer holds).
+        return {**row, "config": {}}
+    config = {"upstream": upstream.url, "host": upstream.host}
+    ca = upstream_ca_of(row.get("config"))
+    if ca is not None:
+        # The only roots the pod trusts its upstream with (a private CA);
+        # a change starts a new pod (the credential generation).
+        config["upstream_ca"] = ca
+    return {**row, "config": config}
 
 
 def route_token_repository(
@@ -136,4 +144,9 @@ def route_token_repository(
     entry["git_swap"] = {}
 
 
-__all__ = ["GitSwapDriver", "route_token_repository", "token_auth"]
+__all__ = [
+    "GitSwapDriver",
+    "route_token_repository",
+    "swap_service_connector",
+    "token_auth",
+]

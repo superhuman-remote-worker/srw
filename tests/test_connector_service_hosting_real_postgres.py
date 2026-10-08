@@ -33,6 +33,7 @@ from orchestrator.services.connector_lease_exchange import (
 )
 from orchestrator.services.connector_service_hosting import (
     IDLE_EVICTED,
+    ReconcileReport,
     ServiceRuntimeError,
     PodState,
     ServiceHostingReconciler,
@@ -2232,3 +2233,141 @@ async def test_the_connector_egress_view_shows_what_its_pods_enforce(db, reconci
     assert pod["live"] is True and pod["ready"] is False
     assert pod["enforced"]["hosts"][0]["addresses"] == ["1.1.1.1"]
     assert pod["resolved_at"] is not None
+
+
+# =============================================================================
+# C3 re-review 2: a superseded pod's drain and place at the cap, eviction
+# =============================================================================
+
+
+async def _idle_pod(db, reconciler) -> dict:
+    """A pod whose binding ended a pass ago: idle, no binding uses it."""
+    connector = await _echo_connector(db)
+    thread = await _thread(db)
+    await _bind_echo(db, connector, thread)
+    before = {str(pod["id"]) for pod in await _pods(db)}
+    await reconciler.reconcile_once()
+    (pod,) = [pod for pod in await _pods(db) if str(pod["id"]) not in before]
+    reconciler.fake.ready(str(pod["id"]))
+    await _end(db, thread)
+    await reconciler.reconcile_once()
+    return dict(pod)
+
+
+@pytest.mark.asyncio
+async def test_a_superseded_pod_drains_from_its_successors_readiness(db, reconciler):
+    connector = await _echo_connector(db)
+    await _echo_image(db)
+    await _bind_echo(db, connector, await _thread(db))
+    await reconciler.reconcile_once()
+    (old,) = await _pods(db)
+    reconciler.fake.ready(str(old["id"]))
+    await reconciler.reconcile_once()
+    await _set_config(
+        db, connector, {"host": "one.one.one.one", "port": 443, "message": "v2"}
+    )
+    report = await reconciler.reconcile_once()
+    (new,) = report.started
+    # Its successor still starting: the old pod serves past the drain time
+    # (only the idle time stops it then).
+    reconciler.offset[0] = timedelta(seconds=31)
+    assert (await reconciler.reconcile_once()).stopped == []
+    reconciler.offset[0] = timedelta()
+    reconciler.fake.ready(new)
+    await reconciler.reconcile_once()
+    name = endpoint_service_name(connector, D1)
+    assert reconciler.fake.endpoints[name] == new
+    # Idle for an hour by its row, yet the drain runs from the successor's
+    # readiness (a moment ago).
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE connector_driver_identities "
+            "SET idle_since = now() - interval '1 hour' WHERE id = $1",
+            old["id"],
+        )
+    assert (await reconciler.reconcile_once()).stopped == []
+    reconciler.offset[0] = timedelta(seconds=31)
+    report = await reconciler.reconcile_once()
+    assert report.stopped == [(str(old["id"]), "superseded")]
+
+
+@pytest.mark.asyncio
+async def test_at_the_cap_a_superseded_pod_gives_way_to_its_successor(db, reconciler):
+    """Re-review 2: at the cap, a connector's new generation must not wait
+    out its own old pod (which no idle pod rule would stop for an hour)."""
+    await _echo_image(db)
+    connector = await _echo_connector(db)
+    await _bind_echo(db, connector, await _thread(db))
+    other = await _echo_connector(db)
+    await _bind_echo(db, other, await _thread(db))
+    await reconciler.reconcile_once()
+    old, bystander = await _pods(db)
+    if str(old["connector_id"]) != connector:
+        old, bystander = bystander, old
+    for pod in (old, bystander):
+        reconciler.fake.ready(str(pod["id"]))
+    await reconciler.reconcile_once()
+    await _set_config(
+        db, connector, {"host": "one.one.one.one", "port": 443, "message": "v2"}
+    )
+    report = await reconciler.reconcile_once()
+    assert report.stopped == [(str(old["id"]), "superseded")]
+    assert len(report.started) == 1 and report.capacity == 0
+    pods = {str(pod["id"]): pod for pod in await _pods(db)}
+    assert pods[str(bystander["id"])]["revoked_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_an_eviction_rechecks_the_binding_under_the_capacity_lock(db, reconciler):
+    await _echo_image(db)
+    pod = await _idle_pod(db, reconciler)
+    # A delivery binds its key after the pass read it unbound.
+    thread = await _thread(db)
+    await _bind_echo(db, str(pod["connector_id"]), thread)
+    report = ReconcileReport()
+    assert not await reconciler._evict(pod, "idle_evicted", report, bound_ok=False)
+    (row,) = [p for p in await _pods(db) if p["id"] == pod["id"]]
+    assert row["revoked_at"] is None and report.stopped == []
+    await _end(db, thread)
+    assert await reconciler._evict(pod, "idle_evicted", report, bound_ok=False)
+    (row,) = [p for p in await _pods(db) if p["id"] == pod["id"]]
+    assert row["revoke_reason"] == "idle_evicted"
+
+
+@pytest.mark.asyncio
+async def test_a_terminating_victim_is_waited_for_not_doubled(db, reconciler):
+    """Re-review 2's over-eviction: the victim's row counts until its
+    objects are gone; the next pass waits for that slot instead of stopping
+    another idle pod."""
+    await _echo_image(db)
+    first = await _idle_pod(db, reconciler)
+    second = await _idle_pod(db, reconciler)
+    terminating: dict[str, bool] = {}
+    remove = reconciler.fake.remove
+
+    async def slow_remove(identity):
+        if terminating.get(identity.identity_id, True):
+            return False  # still terminating
+        return await remove(identity)
+
+    reconciler.fake.remove = slow_remove
+    waiting = await _echo_connector(db)
+    await _bind_echo(db, waiting, await _thread(db))
+
+    async def revoked() -> list[str]:
+        return [
+            str(pod["id"]) for pod in await _pods(db) if pod["revoked_at"] is not None
+        ]
+
+    report = await reconciler.reconcile_once()
+    assert report.capacity == 1 and report.started == []
+    (victim,) = await revoked()
+    assert victim == str(first["id"])  # the longest idle
+    report = await reconciler.reconcile_once()
+    assert report.capacity == 1 and report.started == []
+    assert await revoked() == [victim]  # the second idle pod still lives
+    terminating[victim] = False
+    report = await reconciler.reconcile_once()
+    assert len(report.started) == 1
+    assert await revoked() == [victim]
+    assert str(second["id"]) not in {identity for identity, _ in report.stopped}

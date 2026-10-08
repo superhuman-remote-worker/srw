@@ -397,17 +397,57 @@ def _candidates(entries: Any) -> list[tuple[dict[str, Any], str]]:
     return found
 
 
-async def _serving(conn: Any, connector_id: str) -> bool:
+async def current_generation(conn: Any, connector_id: str) -> str | None:
+    """The credential generation the reconciler builds the connector's pod
+    with now (its clean upstream, its upstream CA, its projects' tier), read
+    from the stored row as the reconciler reads it; ``None`` when the row is
+    gone."""
+    from orchestrator.services.connector_drivers.git_swap import (
+        swap_service_connector,
+    )
+    from orchestrator.services.connector_service_hosting import (
+        credential_generation,
+    )
+
+    row = await conn.fetchrow(
+        "SELECT connection_url, config FROM datasources WHERE id = $1",
+        UUID(connector_id),
+    )
+    if row is None:
+        return None
+    private = await private_addresses_allowed(
+        conn, connector_id, private_tiers=git_swap_delivery_settings().private_tiers
+    )
+    return credential_generation(
+        GIT_SWAP_SPEC,
+        swap_service_connector(
+            {"connection_url": row["connection_url"], "config": row["config"]}
+        ),
+        private_allowed=private,
+    )
+
+
+async def _serving(conn: Any, connector_id: str, generation: str | None = None) -> bool:
+    """Whether a ready pod of the connector's current generation serves it.
+    A pod of an earlier generation (an upstream CA or a tier that changed
+    since) or one still starting proves nothing about the pod a delivery
+    binds to now: that one's start may fail (C3 re-review 2)."""
+    if generation is None:
+        generation = await current_generation(conn, connector_id)
+        if generation is None:
+            return False
     return bool(
         await conn.fetchval(
             """
             SELECT 1 FROM connector_driver_identities
              WHERE connector_id = $1 AND driver = $2
-               AND credential_generation IS NOT NULL AND revoked_at IS NULL
+               AND credential_generation = $3
+               AND revoked_at IS NULL AND ready_at IS NOT NULL
              LIMIT 1
             """,
             UUID(connector_id),
             GIT_SWAP_SPEC.name,
+            generation,
         )
     )
 
@@ -525,13 +565,39 @@ def _stop_problem(reason: str, error: Any) -> Problem:
     return Problem("driver_not_started", f"{reason}: {detail}" if detail else reason)
 
 
-async def launch_problem(conn: Any, connector_id: str) -> Problem | None:
+#: The pods that hold a slot a new pod of the connector ($1, whose current
+#: generation is $2) cannot take: live, and neither idle without a binding
+#: (the reconciler stops the longest-idle such pod at the cap) nor the
+#: connector's own pod of an earlier generation (it gives way to its
+#: successor). A stopped pod still terminating holds no slot here: the
+#: reconciler waits for it rather than stopping another. The reconciler's
+#: eviction (``connector_service_hosting``) decides the same way.
+_BUSY_PODS = """
+SELECT count(*) FROM connector_driver_identities AS pod
+ WHERE pod.credential_generation IS NOT NULL
+   AND pod.removed_at IS NULL AND pod.revoked_at IS NULL
+   AND NOT (
+        (pod.idle_since IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM connector_credential_leases AS lease
+             WHERE lease.connector_id = pod.connector_id
+               AND lease.image_digest = pod.image_digest
+               AND lease.revoked_at IS NULL AND lease.expires_at > now()))
+        OR (pod.connector_id = $1 AND pod.credential_generation IS DISTINCT FROM $2)
+   )
+"""
+
+
+async def launch_problem(
+    conn: Any, connector_id: str, *, generation: str | None = None
+) -> Problem | None:
     """Why the connector's driver pod cannot be counted on now: its last pod
     stopped without serving (within the back-off, and since the connector
-    last changed), or the installation has no room for one. A serving pod
-    is no problem."""
+    last changed), or the installation has no room for one. A ready pod of
+    the connector's current generation is no problem."""
     settings = git_swap_delivery_settings()
-    if await _serving(conn, connector_id):
+    if generation is None:
+        generation = await current_generation(conn, connector_id)
+    if generation is not None and await _serving(conn, connector_id, generation):
         return None
     stopped = await conn.fetchrow(
         """
@@ -553,13 +619,7 @@ async def launch_problem(conn: Any, connector_id: str) -> Problem | None:
     )
     if stopped is not None:
         return _stop_problem(str(stopped["revoke_reason"]), stopped["launch_error"])
-    # Busy pods count against the cap; an idle one makes room (the
-    # reconciler stops the longest-idle unbound pod for a new one).
-    busy = await conn.fetchval(
-        "SELECT count(*) FROM connector_driver_identities "
-        "WHERE credential_generation IS NOT NULL AND removed_at IS NULL "
-        "AND idle_since IS NULL"
-    )
+    busy = await conn.fetchval(_BUSY_PODS, UUID(connector_id), generation)
     if int(busy or 0) >= settings.max_installation:
         return Problem("no_room", f"cap {settings.max_installation}")
     return None
@@ -617,10 +677,12 @@ async def git_swap_problem(
     problem = await owner_workspace_problem(conn, owner)
     if problem is not None:
         return problem
-    if await _serving(conn, connector_id):
-        # A pod serves this connector: it proved its upstream at start.
+    generation = await current_generation(conn, connector_id)
+    if generation is not None and await _serving(conn, connector_id, generation):
+        # The current generation's pod serves: it proved its upstream (and
+        # its upstream CA) at start.
         return None
-    problem = await launch_problem(conn, connector_id)
+    problem = await launch_problem(conn, connector_id, generation=generation)
     if problem is not None:
         return problem
     return await _upstream_problem(conn, entry, connector_id)
@@ -824,6 +886,7 @@ __all__ = [
     "check_upstream",
     "clean_detail",
     "configure_git_swap_delivery",
+    "current_generation",
     "delivery_report",
     "describe",
     "git_swap_delivery_settings",

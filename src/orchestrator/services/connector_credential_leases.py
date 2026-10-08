@@ -48,7 +48,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
@@ -99,6 +99,8 @@ RevokeReason = Literal[
 ]
 EXPIRED = "expired"
 _OWNER_COLUMNS = {"job": "job_id", "thread": "thread_id"}
+#: A uuid's text form (a stored selection's ids are checked before the cast).
+_UUID_TEXT = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 _TERMINAL_JOB_STATUSES = ("completed", "failed", "cancelled")
 #: The thread statuses whose leases the sweep renews (the live set the
 #: thread file and upload routes use); ``suspended`` and ``ended`` lapse.
@@ -136,6 +138,10 @@ class LeaseOwner:
 
     kind: Literal["job", "thread"]
     id: str
+    #: The execution delivering on this owner's workspace when it is not
+    #: the owner itself (a child Job on its parent's workspace): the lease
+    #: is the owner's, which that execution may not revoke.
+    borrowed_by: str | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if self.kind not in _OWNER_COLUMNS:
@@ -166,7 +172,13 @@ def job_lease_owner(job: Mapping[str, Any]) -> LeaseOwner:
         stateless_worker_workspace_owner,
     )
 
-    return LeaseOwner.job(stateless_worker_workspace_owner(dict(job)).id)
+    owner = str(stateless_worker_workspace_owner(dict(job)).id)
+    execution = str(job.get("id") or "")
+    return LeaseOwner(
+        "job",
+        owner,
+        borrowed_by=execution if execution and execution != owner else None,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -631,10 +643,16 @@ async def _fall_back(
     """A git swap candidate on the installation's fallback: its entry says
     why, and the lease its owner held for the connector (an earlier attach
     served it through the driver) is revoked, so a workspace wired then
-    stops reaching the driver with it."""
+    stops reaching the driver with it.
+
+    Not when the delivering execution borrows the owner's workspace (a
+    child Job on its parent's): the lease is the parent's, and the parent's
+    checkout, which the child keeps as it is, still uses it."""
     from orchestrator.services import connector_git_swap_delivery as swaps
 
     swaps.apply_fallback(entry, problem)
+    if owner.borrowed_by is not None:
+        return
     await revoke_connector_leases(
         conn,
         owner=owner,
@@ -652,8 +670,16 @@ async def _ask_for_reconcile(conn: Any) -> None:
     execute = getattr(conn, "execute", None)
     if not callable(execute):
         return
+    transaction = getattr(conn, "transaction", None)
     try:
-        await execute("SELECT pg_notify($1, '')", RECONCILE_CHANNEL)
+        if callable(transaction):
+            # A savepoint inside the delivery's transaction (as
+            # record_lease_event's): a failed NOTIFY must not abort the
+            # delivery; the interval pass starts the pod anyway.
+            async with transaction():
+                await execute("SELECT pg_notify($1, '')", RECONCILE_CHANNEL)
+        else:
+            await execute("SELECT pg_notify($1, '')", RECONCILE_CHANNEL)
     except Exception:
         logger.debug("Asking the reconciler for a pass failed", exc_info=True)
 
@@ -775,21 +801,26 @@ async def prepare_thread_lease_delivery(db: Any, thread_id: str) -> None:
         if not git_swap_delivery_settings().installed:
             return
         async with db.acquire() as conn:
+            # The selected ids as uuids, so the lookup uses the primary key
+            # (a malformed id selects nothing rather than failing the cast).
             rows = await conn.fetch(
                 """
                 SELECT d.id, d.type, d.connection_url, d.config
-                  FROM threads AS t
-                  JOIN datasources AS d
-                    ON d.id::text IN (
-                        SELECT jsonb_array_elements_text(
-                            CASE WHEN jsonb_typeof(t.metadata->'datasource_ids')
-                                      = 'array'
-                                 THEN t.metadata->'datasource_ids'
-                                 ELSE '[]'::jsonb END)
-                    )
-                 WHERE t.id = $1::uuid
+                  FROM datasources AS d
+                 WHERE d.id IN (
+                       SELECT selected.value::uuid
+                         FROM threads AS t,
+                              jsonb_array_elements_text(
+                                  CASE WHEN jsonb_typeof(t.metadata->'datasource_ids')
+                                            = 'array'
+                                       THEN t.metadata->'datasource_ids'
+                                       ELSE '[]'::jsonb END
+                              ) AS selected(value)
+                        WHERE t.id = $1::uuid
+                          AND selected.value ~* $2)
                 """,
                 UUID(str(thread_id)),
+                _UUID_TEXT,
             )
         entries = [
             entry for row in rows if (entry := candidate_entry(dict(row))) is not None

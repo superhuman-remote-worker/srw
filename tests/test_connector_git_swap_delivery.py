@@ -140,6 +140,28 @@ class FakeConn:
         return "OK"
 
 
+class TxConn(FakeConn):
+    """A FakeConn with transactions (savepoints when nested): records each
+    one's outcome."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.transactions: list[str] = []
+
+    def transaction(self):
+        conn = self
+
+        class Transaction:
+            async def __aenter__(self_inner):
+                return self_inner
+
+            async def __aexit__(self_inner, kind, exc, tb):
+                conn.transactions.append("rolled back" if kind else "committed")
+                return False
+
+        return Transaction()
+
+
 def _reason(problem: Any) -> str:
     assert isinstance(problem, swaps.Problem), problem
     return problem.reason
@@ -220,10 +242,74 @@ class TestWorkspaceReach:
 # =============================================================================
 
 
+_SCOPE = {"is_global": False, "projects": 0, "allowed": 0}
+
+
 class TestLaunch:
     @pytest.mark.asyncio
     async def test_a_serving_pod_is_no_problem(self):
-        assert await swaps.launch_problem(FakeConn(values=[1]), CONNECTOR) is None
+        conn = FakeConn(values=[1])
+        assert await swaps.launch_problem(conn, CONNECTOR, generation="g2") is None
+        # Only a ready pod of the connector's current generation serves.
+        assert "credential_generation = $3" in conn.queries[0]
+        assert "ready_at IS NOT NULL" in conn.queries[0]
+
+    @pytest.mark.asyncio
+    async def test_the_current_generation_is_the_reconcilers(self):
+        """C3 re-review 2: the delivery reads the generation the reconciler
+        builds the pod with now (the URL, the upstream CA, the tier)."""
+        certificate, _ = _self_signed()
+        row = {
+            "connection_url": "https://git.corp/o/r.git",
+            "config": json.dumps({"forge": "gitea", "upstream_ca": certificate}),
+        }
+        # "WITH scope" first: its query reads datasources too.
+        conn = FakeConn({"WITH scope": _SCOPE, "FROM datasources WHERE id": row})
+        expected = credential_generation(
+            GIT_SWAP_SPEC,
+            GitSwapDriver(IMAGE).service_connector(
+                {**row, "config": {"forge": "gitea", "upstream_ca": certificate}}
+            ),
+            private_allowed=False,
+        )
+        assert await swaps.current_generation(conn, CONNECTOR) == expected
+        # A new CA is a new generation; a gone row has none.
+        other, _ = _self_signed("other.example")
+        changed = FakeConn(
+            {
+                "WITH scope": _SCOPE,
+                "FROM datasources WHERE id": {
+                    **row,
+                    "config": {"upstream_ca": other},
+                },
+            }
+        )
+        assert await swaps.current_generation(changed, CONNECTOR) != expected
+        assert await swaps.current_generation(FakeConn(), CONNECTOR) is None
+
+    @pytest.mark.asyncio
+    async def test_a_superseded_pod_does_not_hide_its_failing_successor(
+        self, monkeypatch
+    ):
+        """The probe of C3 re-review 2: an old-CA pod lives its hour; its
+        successor (the new CA) exits 78. The delivery must see that."""
+
+        async def generation(conn, connector_id):
+            return "g2"
+
+        monkeypatch.setattr(swaps, "current_generation", generation)
+        conn = FakeConn(
+            {
+                "revoke_reason = ANY": {
+                    "revoke_reason": "upstream_unreachable",
+                    "launch_error": "untrusted certificate: unknown authority",
+                }
+            },
+            # The g1 pod is no pod of g2: the serving query finds nothing.
+            values=[None],
+        )
+        problem = await swaps.launch_problem(conn, CONNECTOR)
+        assert _reason(problem) == "untrusted_certificate"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -261,10 +347,22 @@ class TestLaunch:
             swaps.GitSwapDeliverySettings(max_installation=3)
         )
         conn = FakeConn(values=[None, 3])
-        assert _reason(await swaps.launch_problem(conn, CONNECTOR)) == "no_room"
-        # Idle pods make room (the reconciler evicts the longest-idle one).
-        assert "idle_since IS NULL" in conn.queries[-1]
-        assert await swaps.launch_problem(FakeConn(values=[None, 2]), CONNECTOR) is None
+        assert (
+            _reason(await swaps.launch_problem(conn, CONNECTOR, generation="g2"))
+            == "no_room"
+        )
+        # The pods the reconciler would not stop for this one: an idle pod
+        # without a binding makes room, and so does the connector's own pod
+        # of an earlier generation (it gives way to its successor).
+        assert conn.queries[-1] == swaps._BUSY_PODS
+        assert "NOT EXISTS" in swaps._BUSY_PODS
+        assert "IS DISTINCT FROM $2" in swaps._BUSY_PODS
+        assert (
+            await swaps.launch_problem(
+                FakeConn(values=[None, 2]), CONNECTOR, generation="g2"
+            )
+            is None
+        )
 
     def test_every_stop_that_backs_off_makes_a_connector_unservable(self):
         assert set(swaps.UNSERVABLE_STOPS) == set(hosting._BACKOFF_REASONS)
@@ -558,6 +656,7 @@ class TestDecision:
             return run
 
         monkeypatch.setattr(swaps, "owner_workspace_problem", check("workspace", None))
+        monkeypatch.setattr(swaps, "current_generation", check("generation", "g2"))
         monkeypatch.setattr(swaps, "_serving", check("serving", False))
         monkeypatch.setattr(swaps, "launch_problem", check("launch", None))
         monkeypatch.setattr(swaps, "_upstream_problem", check("upstream", None))
@@ -568,7 +667,7 @@ class TestDecision:
             )
             is None
         )
-        assert asked == ["workspace", "serving", "launch", "upstream"]
+        assert asked == ["workspace", "generation", "serving", "launch", "upstream"]
         asked.clear()
         room = swaps.Problem("no_room")
         monkeypatch.setattr(swaps, "launch_problem", check("launch", room))
@@ -578,8 +677,9 @@ class TestDecision:
             )
             is room
         )
-        assert asked == ["workspace", "serving", "launch"]
-        # A serving pod proved its upstream: no upstream check at all (B2).
+        assert asked == ["workspace", "generation", "serving", "launch"]
+        # The current generation's pod proved its upstream: no upstream
+        # check at all (B2).
         asked.clear()
         monkeypatch.setattr(swaps, "_serving", check("serving", True))
         assert (
@@ -588,7 +688,7 @@ class TestDecision:
             )
             is None
         )
-        assert asked == ["workspace", "serving"]
+        assert asked == ["workspace", "generation", "serving"]
         # A URL the driver cannot serve, though a candidate.
         problem = await swaps.git_swap_problem(
             FakeConn(),
@@ -717,6 +817,53 @@ class TestDeliver:
         assert delivery.revoked == [(owner, [OTHER], "served_by_fallback")]
         # A new binding asks the reconciler for a pass, at commit (S1): a
         # NOTIFY sent with the transaction.
+        assert conn.executed == [
+            ("SELECT pg_notify($1, '')", hosting.RECONCILE_CHANNEL)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_child_on_its_parents_workspace_never_revokes_its_lease(
+        self, delivery
+    ):
+        """C3 re-review 2: a lease belongs to the workspace's owner. A child
+        Job on its parent's workspace delivers under the parent's lease
+        owner; its fallback must not revoke the lease the parent's checkout,
+        which the child keeps as it is, still uses."""
+        child = "00000000-0000-4000-8000-0000000000c1"
+        owner = leases.job_lease_owner(
+            {
+                "id": child,
+                "parent_job_id": JOB,
+                "context": {"inherits_parent_workspace": True},
+            }
+        )
+        assert owner == leases.LeaseOwner.job(JOB) and owner.borrowed_by == child
+        delivery.problems[CONNECTOR] = swaps.Problem("workspace_remote_vm")
+        entry = _candidate()
+        await leases.deliver_connector_leases(FakeConn(), [entry], owner=owner)
+        assert "fallback" in entry["git_swap"]
+        assert delivery.revoked == []
+        # The parent's own delivery (the owner itself) revokes it.
+        own = leases.job_lease_owner({"id": JOB, "context": {}})
+        assert own.borrowed_by is None
+        await leases.deliver_connector_leases(FakeConn(), [_candidate()], owner=own)
+        assert delivery.revoked == [(own, [CONNECTOR], "served_by_fallback")]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_notify_never_aborts_the_delivery(self):
+        """The NOTIFY runs in a savepoint of the delivery's transaction: its
+        failure rolls back to it, never the delivery."""
+
+        class Failing(TxConn):
+            async def execute(self, query, *args):
+                raise RuntimeError("notify failed")
+
+        conn = Failing()
+        await leases._ask_for_reconcile(conn)
+        assert conn.transactions == ["rolled back"]
+        conn = TxConn()
+        await leases._ask_for_reconcile(conn)
+        assert conn.transactions == ["committed"]
         assert conn.executed == [
             ("SELECT pg_notify($1, '')", hosting.RECONCILE_CHANNEL)
         ]
@@ -1032,11 +1179,6 @@ class TestCheck:
 # The upstream CA
 # =============================================================================
 
-_CASES = (
-    "/tmp/claude-1000/-home-ghost-Repositories-Superhuman-Remote-Worker/"
-    "c79113c0-f9fe-4a88-ab5b-c9b13ff59caa/scratchpad/c3-rereview/ca_cases.txt"
-)
-
 
 class TestUpstreamCa:
     def test_only_pem_certificates_re_serialised(self):
@@ -1082,13 +1224,48 @@ class TestUpstreamCa:
             with pytest.raises(ValueError, match=why):
                 swaps.validate_upstream_ca(bad)
 
-    def test_the_reviewers_cases_are_refused(self):
-        try:
-            text = Path(_CASES).read_text()
-        except OSError:
-            pytest.skip("the re-review's probe file is not here")
-        with pytest.raises(ValueError):
-            swaps.validate_upstream_ca(text)
+    def test_the_reviewers_cases(self):
+        """The first re-review's cases, inline: indented blocks are only
+        whitespace between blocks; a block of another kind (here a private
+        key's bytes under another name), text between the blocks and text
+        after them are refused, as the driver refuses them."""
+        certificate, _ = _self_signed()
+        key = ec.generate_private_key(ec.SECP256R1())
+        der = key.private_bytes(
+            serialization.Encoding.DER,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+        import base64
+
+        secret = (
+            "-----BEGIN SECRET-----\n"
+            + base64.encodebytes(der).decode()
+            + "-----END SECRET-----\n"
+        )
+        indented = f" {certificate} {certificate}"
+        assert swaps.validate_upstream_ca(indented) == certificate + certificate
+        for bad in (
+            certificate + secret,
+            certificate + " hello world\n" + certificate,
+            certificate + "trailing junk here\n",
+        ):
+            with pytest.raises(ValueError):
+                swaps.validate_upstream_ca(bad)
+
+    def test_pem_headers_never_reach_the_driver(self):
+        """C3 re-review 2's mutation (the stored text not re-serialised): a
+        CERTIFICATE block with RFC 1421 headers parses here, but the driver
+        refuses PEM headers (exit 78). What is stored is the certificate
+        alone."""
+        certificate, _ = _self_signed()
+        first, rest = certificate.strip().split("\n", 1)
+        with_headers = (
+            f"{first}\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n\n{rest}\n"
+        )
+        stored = swaps.validate_upstream_ca(with_headers)
+        assert stored == certificate
+        assert "Proc-Type" not in stored and "DEK-Info" not in stored
 
     def test_a_repository_connector_keeps_it(self):
         certificate, _ = _self_signed()
@@ -1238,24 +1415,105 @@ class TestReconciler:
         assert reconciler._idle_seconds(_pod_row(driver="srw.unknown/v1")) == 600
 
     @pytest.mark.asyncio
-    async def test_a_superseded_pod_drains_for_the_repin_drain_only(self):
+    async def test_a_superseded_pod_drains_from_its_successors_readiness(self):
         # C3 re-review S7: after an upstream CA change the old pod must not
-        # hold a slot (and serve) for the hour-long idle time.
+        # hold a slot (and serve) for the hour-long idle time. Re-review 2:
+        # its drain starts when the successor turned ready (not when the
+        # old pod turned idle), and it stops only once the endpoint Service
+        # names another pod, as a re-pin's old pod does.
         reconciler = _reconciler(
             PodState("Running"), idle_seconds=600, repin_drain_seconds=30
         )
         reconciler.store = _store(FakeConn())
-        since = reconciler.clock() - dt.timedelta(seconds=60)
-        row = _pod_row(idle_since=since)
-        report = hosting.ReconcileReport()
-        assert not await reconciler._settle_idle(
-            row, bound=False, report=report, superseded=True
+        targets = {"name": None}
+
+        async def endpoint_target(row):
+            return targets["name"]
+
+        reconciler._endpoint_target = endpoint_target
+        now = reconciler.clock()
+        row = _pod_row(idle_since=now - dt.timedelta(hours=2))
+        successor = _pod_row(
+            id="44444444-4444-4444-8444-444444444444",
+            credential_generation="g2",
+            ready_at=now - dt.timedelta(seconds=10),
         )
-        assert reconciler.stops == [(hosting.IDLE, None)]
-        reconciler.stops.clear()
-        # An idle pod of the same driver waits its hour.
-        assert await reconciler._settle_idle(row, bound=False, report=report)
+        report = hosting.ReconcileReport()
+        # Ready 10 s ago: the drain has 20 s left, however long it idled.
+        assert await reconciler._settle_idle(
+            row, bound=False, report=report, successor=successor
+        )
+        successor["ready_at"] = now - dt.timedelta(seconds=31)
+        # The drain is over, but the endpoint does not name another pod yet.
+        assert await reconciler._settle_idle(
+            row, bound=False, report=report, successor=successor
+        )
+        targets["name"] = str(row["id"])
+        assert await reconciler._settle_idle(
+            row, bound=False, report=report, successor=successor
+        )
         assert reconciler.stops == []
+        targets["name"] = str(successor["id"])
+        assert not await reconciler._settle_idle(
+            row, bound=False, report=report, successor=successor
+        )
+        assert reconciler.stops == [(hosting.SUPERSEDED, None)]
+        reconciler.stops.clear()
+        # Without a successor, an idle pod of the same driver waits its hour.
+        assert await reconciler._settle_idle(
+            _pod_row(idle_since=now - dt.timedelta(minutes=50)),
+            bound=False,
+            report=report,
+        )
+        assert reconciler.stops == []
+
+    def test_only_a_ready_successor_starts_the_drain(self):
+        """``ready_successors`` and ``drain_successor`` (re-review 2): a
+        superseded pod whose successor is still starting, or failing, is no
+        superseded pod yet; it keeps serving whatever the drain time."""
+        key = (CONNECTOR, DIGEST)
+        now = dt.datetime.now(dt.timezone.utc)
+        old = _pod_row(credential_generation="g1", ready_at=now)
+        starting = _pod_row(
+            id="44444444-4444-4444-8444-444444444444", credential_generation="g2"
+        )
+        generations = {key: "g2"}
+        successors = hosting.ready_successors([old, starting], generations)
+        assert successors == {}
+        assert hosting.drain_successor(old, generations, successors) is None
+        ready = {**starting, "ready_at": now}
+        successors = hosting.ready_successors([old, ready], generations)
+        assert successors == {key: ready}
+        assert hosting.drain_successor(old, generations, successors) is ready
+        # The current generation's own pod, and a key no binding uses, have
+        # no successor.
+        assert hosting.drain_successor(ready, generations, successors) is None
+        assert hosting.drain_successor(old, {}, successors) is None
+
+    def test_a_bound_key_is_never_evicted_for_another_connector(self):
+        """``evictable_pods`` (re-review 2): an idle pod whose connector and
+        digest have a live binding (a superseded pod draining) never makes
+        room for another connector; it gives way only to its own
+        successor (``superseded_pods``)."""
+        now = dt.datetime.now(dt.timezone.utc)
+        superseded = _pod_row(credential_generation="g1", idle_since=now)
+        unbound = _pod_row(
+            id="55555555-5555-4555-8555-555555555555",
+            connector_id=OTHER,
+            idle_since=now - dt.timedelta(minutes=1),
+        )
+        busy = _pod_row(id="66666666-6666-4666-8666-666666666666")
+        bindings = {(CONNECTOR, DIGEST): object()}
+        survivors = [superseded, unbound, busy]
+        assert hosting.evictable_pods(survivors, {busy["id"]}, bindings) == [unbound]
+        generations = {(CONNECTOR, DIGEST): "g2"}
+        assert hosting.superseded_pods(survivors, generations) == {
+            (CONNECTOR, DIGEST): [superseded, busy]
+        }
+        # Longest idle first.
+        older = {**unbound, "id": "77777777-7777-4777-8777-777777777777"}
+        older["idle_since"] = now - dt.timedelta(hours=1)
+        assert hosting.evictable_pods([unbound, older], set(), {}) == [older, unbound]
 
     @pytest.mark.asyncio
     async def test_a_superseded_pod_admits_no_binding_issued_after(self):
@@ -1306,9 +1564,8 @@ class TestReconciler:
         self, monkeypatch
     ):
         reconciler = _reconciler(PodState("Running"), max_installation=1)
-        # Each candidate's key is read again before it is stopped: unbound.
-        reconciler.store = _store(FakeConn())
         claims: list[str] = []
+        evicted: list[tuple[str, str, bool]] = []
 
         async def claim(spec, binding, generation, reference, *, replaces=None):
             claims.append(generation)
@@ -1316,39 +1573,79 @@ class TestReconciler:
                 raise hosting.ServiceCapacityError("cap")
             return None  # a live pod holds the key now: nothing to build
 
+        async def evict(row, reason, report, *, bound_ok):
+            evicted.append((row["pod_name"], reason, bound_ok))
+            # A delivery bound the first victim's key since the pass read it.
+            return row["pod_name"] != "bound-since"
+
         monkeypatch.setattr(reconciler, "_claim", claim)
+        monkeypatch.setattr(reconciler, "_evict", evict)
         monkeypatch.setattr(
             images, "image_reference_for", lambda driver: "ghcr.io/x/y:1"
         )
-        oldest = _pod_row(id="22222222-2222-4222-8222-222222222222", pod_name="old")
-        newer = _pod_row(id="33333333-3333-4333-8333-333333333333", pod_name="new")
-        reconciler._evictable = [oldest, newer]
-        report = hosting.ReconcileReport()
-        await reconciler._start(
-            GIT_SWAP_SPEC,
-            hosting._Binding(OTHER, GIT_SWAP_SPEC.name, DIGEST),
-            {},
-            generation="g1",
-            private_allowed=False,
-            exchange_address="10.43.0.5",
-            report=report,
+
+        async def start(connector=OTHER):
+            await reconciler._start(
+                GIT_SWAP_SPEC,
+                hosting._Binding(connector, GIT_SWAP_SPEC.name, DIGEST),
+                {},
+                generation="g2",
+                private_allowed=False,
+                exchange_address="10.43.0.5",
+                report=report,
+            )
+
+        bound = _pod_row(
+            id="22222222-2222-4222-8222-222222222222", pod_name="bound-since"
         )
-        assert reconciler.stops == [(hosting.IDLE_EVICTED, None)]
-        assert claims == ["g1", "g1"] and report.capacity == 0
+        oldest = _pod_row(id="33333333-3333-4333-8333-333333333333", pod_name="old")
+        newer = _pod_row(id="44444444-4444-4444-8444-444444444444", pod_name="new")
+        reconciler._evictable = [bound, oldest, newer]
+        report = hosting.ReconcileReport()
+        await start()
+        assert evicted == [
+            ("bound-since", hosting.IDLE_EVICTED, False),
+            ("old", hosting.IDLE_EVICTED, False),
+        ]
+        assert claims == ["g2", "g2"] and report.capacity == 0
         assert reconciler._evictable == [newer]
+        # A stopped pod still terminating: this start waits for its slot
+        # and stops no other (re-review 2's over-eviction).
+        evicted.clear()
+        claims.clear()
+        reconciler._freeing = 1
+        await start()
+        assert evicted == [] and report.capacity == 1 and reconciler._freeing == 0
+        # The key's own superseded pod gives way to its successor first,
+        # whatever its bindings.
+        claims.clear()
+        superseded = _pod_row(pod_name="superseded", credential_generation="g1")
+        reconciler._superseded = {(CONNECTOR, DIGEST): [superseded]}
+        await start(CONNECTOR)
+        assert evicted == [("superseded", hosting.SUPERSEDED, True)]
         # Nothing evictable: a capacity refusal, as before.
         reconciler._evictable = []
+        evicted.clear()
         claims.clear()
-        await reconciler._start(
-            GIT_SWAP_SPEC,
-            hosting._Binding(OTHER, GIT_SWAP_SPEC.name, DIGEST),
-            {},
-            generation="g1",
-            private_allowed=False,
-            exchange_address="10.43.0.5",
-            report=report,
+        await start()
+        assert evicted == [] and report.capacity == 2
+
+    @pytest.mark.asyncio
+    async def test_an_eviction_rechecks_the_binding_under_the_capacity_lock(self):
+        """The pass read the victim unbound; a delivery may have bound its
+        key since. The revoke is conditional, under the capacity lock."""
+        reconciler = _reconciler(PodState("Running"))
+        conn = TxConn(values=[1])
+        reconciler.store = _store(conn)
+        report = hosting.ReconcileReport()
+        victim = _pod_row(pod_name="victim")
+        assert not await reconciler._evict(
+            victim, hosting.IDLE_EVICTED, report, bound_ok=False
         )
-        assert report.capacity == 1
+        assert "pg_advisory_xact_lock" in conn.executed[0][0]
+        assert conn.executed[0][1] == hosting._CAPACITY_LOCK
+        assert "connector_credential_leases" in conn.queries[-1]
+        assert report.stopped == []
 
     @pytest.mark.asyncio
     async def test_eviction_spares_a_pod_bound_since_the_pass_read_the_bindings(
@@ -1356,19 +1653,25 @@ class TestReconciler:
     ):
         # D5b: a managed MCP server's stdio bridge runs a process per
         # binding, so a binding issued after the pass read the bindings
-        # spares its pod; the next candidate makes room instead.
+        # spares its pod; the next candidate makes room instead. The
+        # candidate's key is read again under the capacity lock.
         reconciler = _reconciler(PodState("Running"), max_installation=1)
-        conn = FakeConn(values=[True, False])
+        conn = TxConn(values=[True, False])
         reconciler.store = _store(conn)
-        stopped: list[str] = []
+        revoked: list[str] = []
 
-        async def stop(row, reason, report, *, error=None):
-            stopped.append(row["pod_name"])
+        async def revoke(conn_, *, identity_id, reason):
+            revoked.append(identity_id)
+            return [identity_id]
+
+        async def remove(row, report):
+            return None
 
         async def claim(spec, binding, generation, reference, *, replaces=None):
             raise hosting.ServiceCapacityError("cap")
 
-        monkeypatch.setattr(reconciler, "_stop", stop)
+        monkeypatch.setattr(hosting, "revoke_driver_identity", revoke)
+        monkeypatch.setattr(reconciler, "_remove", remove)
         monkeypatch.setattr(reconciler, "_claim", claim)
         monkeypatch.setattr(
             images, "image_reference_for", lambda driver: "ghcr.io/x/y:1"
@@ -1390,7 +1693,7 @@ class TestReconciler:
             exchange_address="10.43.0.5",
             report=report,
         )
-        assert stopped == ["idle"]
+        assert revoked == [unbound["id"]]
         assert [q for q in conn.queries if "connector_credential_leases" in q] == [
             hosting._KEY_BOUND,
             hosting._KEY_BOUND,
@@ -1399,7 +1702,7 @@ class TestReconciler:
         # Only bound candidates left: nothing is stopped, the start waits.
         conn.values = [True]
         reconciler._evictable = [bound_now]
-        stopped.clear()
+        revoked.clear()
         report = hosting.ReconcileReport()
         await reconciler._start(
             GIT_SWAP_SPEC,
@@ -1410,7 +1713,7 @@ class TestReconciler:
             exchange_address="10.43.0.5",
             report=report,
         )
-        assert stopped == [] and report.capacity == 1
+        assert revoked == [] and report.capacity == 1
 
     @pytest.mark.asyncio
     async def test_a_committed_delivery_wakes_the_leaders_loop(self, monkeypatch):
