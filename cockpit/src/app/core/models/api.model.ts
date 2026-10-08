@@ -2443,6 +2443,11 @@ export interface ExpertExportBundle {
   prompts: Record<string, unknown>;
 }
 
+/** A Connector resource by name in a scope (omitted: the execution's own), or by uid. */
+export type ConnectorRef =
+  | {name: string; scope?: {kind: 'Account' | 'Project' | 'Catalog'; name: string}}
+  | {uid: string};
+
 export interface JobCreateRequest {
   workspace?: Record<string, unknown> | null;
   description: string;
@@ -2471,6 +2476,9 @@ export interface JobCreateRequest {
   datasource_ids?: string[];
   /** Mutually exclusive with datasource_ids, including an explicit empty array. */
   use_datasource_defaults?: boolean;
+  /** Connectors by manifest ref (`{alias: {ref: {name, scope?} | {uid}}}`), authorized like
+   *  datasource_ids. Combining it with datasource_ids or use_datasource_defaults is a 400. */
+  execution?: {connectors: Record<string, {ref: ConnectorRef}>};
   /** Ignored compatibility input; the server derives ownership from the authenticated caller. */
   user_id?: string;
   project_id?: string;

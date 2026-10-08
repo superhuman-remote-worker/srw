@@ -10,6 +10,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, WithJsonSchema, field_validator, model_validator
 
+from orchestrator.schemas.execution_selection import ExecutionSelection
 from orchestrator.schemas.inline_expert import (
     EXPERT_BASED_ON_DESCRIPTION,
     InlineExpertSelection,
@@ -156,6 +157,15 @@ class JobCreate(BaseModel):
             "defaults. Mutually exclusive with datasource_ids."
         ),
     )
+    execution: ExecutionSelection | None = Field(
+        None,
+        description=(
+            "Execution selections by manifest ref. execution.connectors "
+            "attaches Connectors by name in a scope or by uid, and is "
+            "authorized exactly like datasource_ids; combining it with "
+            "datasource_ids or use_datasource_defaults is refused with 400."
+        ),
+    )
     user_id: str | None = Field(None, description="User UUID who created this job")
     project_id: str | None = Field(
         None, description="Project UUID to associate this job with"
@@ -242,6 +252,7 @@ PUBLIC_JOB_CREATE_FIELDS = (
     "required_deliverables",
     "datasource_ids",
     "use_datasource_defaults",
+    "execution",
     "user_id",
     "project_id",
     "priority",

@@ -481,6 +481,7 @@ def job_admission_datasources_dependencies(
     """Bind current connector authorities without evaluating selection defaults."""
     from functools import partial
 
+    from orchestrator.services.connector_refs import resolve_execution_connectors
     from orchestrator.services.datasource_policy import default_datasource_selection
 
     return JobAdmissionDatasourcesDependencies(
@@ -503,6 +504,9 @@ def job_admission_datasources_dependencies(
         default_selection=partial(default_datasource_selection, resources.postgres_db),
         defaults_on_omission=deployment_gates.datasource_defaults_on_omission,
         selection_provenance=job_datasource_selection.datasource_selection_provenance,
+        resolve_connector_refs=partial(
+            resolve_execution_connectors, resources.postgres_db
+        ),
     )
 
 

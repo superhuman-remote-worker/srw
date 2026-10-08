@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable
 from fastapi import HTTPException
 
 from orchestrator.schemas.job_create import JobCreate
+from orchestrator.services.connector_refs import refuse_connector_selector_conflict
 from orchestrator.services.datasource_policy_errors import (
     DatasourceMaterializationAuthorizationError,
     DatasourcePolicyConflictError,
@@ -84,6 +85,7 @@ async def admit_job(
     command.config_override = dependencies.validate_tool_overrides(
         command.config_override
     )
+    refuse_connector_selector_conflict(command)
     await dependencies.enforce_readiness()
     try:
         scope = await prepare_job_admission_scope(

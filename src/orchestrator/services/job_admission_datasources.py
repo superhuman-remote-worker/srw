@@ -36,6 +36,16 @@ class AuthorizeDatasourceSelection(Protocol):
     ) -> tuple[list[str], dict[str, int]]: ...
 
 
+class ResolveConnectorRefs(Protocol):
+    async def __call__(
+        self,
+        execution: Any,
+        *,
+        owner_id: str | None,
+        project_id: str | None,
+    ) -> list[str]: ...
+
+
 class DatasourceSelectionProvenance(Protocol):
     async def __call__(
         self,
@@ -61,6 +71,8 @@ class JobAdmissionDatasourcesDependencies:
     ]
     defaults_on_omission: Callable[[], bool]
     selection_provenance: DatasourceSelectionProvenance
+    # ``execution.connectors`` refs to connector ids (services.connector_refs).
+    resolve_connector_refs: ResolveConnectorRefs | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +102,18 @@ async def prepare_job_admission_datasources(
     target_project_ids = [project_id] if project_id else []
     lite_backend = dependencies.backend_from_override(config_override)
     selection_was_supplied = "datasource_ids" in job.model_fields_set
+    requested_datasource_ids = job.datasource_ids or []
+    if job.execution is not None:
+        # Connector refs are an explicit selection of the ids they name: the
+        # same branch, the same authorization, the same snapshot.
+        if dependencies.resolve_connector_refs is None:
+            raise HTTPException(503, "Connector references are unavailable.")
+        requested_datasource_ids = await dependencies.resolve_connector_refs(
+            job.execution,
+            owner_id=str(effective_user_id) if effective_user_id else None,
+            project_id=project_id,
+        )
+        selection_was_supplied = True
     trusted_system_origin = bool(
         internal_call and internal_origin_bound and selection_actor is None
     )
@@ -119,7 +143,6 @@ async def prepare_job_admission_datasources(
 
     if selection_was_supplied:
         selection_origin = "explicit"
-        requested_datasource_ids = job.datasource_ids or []
         trusted_explicit_reuse = False
         if trusted_system_origin and effective_user_id is None:
             # An ownerless internal caller has no ambient connector

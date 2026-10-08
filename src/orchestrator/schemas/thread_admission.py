@@ -35,6 +35,7 @@ from pydantic import (
     model_validator,
 )
 
+from orchestrator.schemas.execution_selection import ExecutionSelection
 from orchestrator.schemas.inline_expert import (
     EXPERT_BASED_ON_DESCRIPTION,
     InlineExpertSelection,
@@ -100,6 +101,15 @@ class ThreadCreateRequest(BaseModel):
         description=(
             "Resolve the owner's currently available automatic connector "
             "defaults. Mutually exclusive with datasource_ids."
+        ),
+    )
+    execution: ExecutionSelection | None = Field(
+        None,
+        description=(
+            "Execution selections by manifest ref. execution.connectors "
+            "attaches Connectors by name in a scope or by uid, and is "
+            "authorized exactly like datasource_ids; combining it with "
+            "datasource_ids or use_datasource_defaults is refused with 400."
         ),
     )
     permission_mode: str | None = Field(

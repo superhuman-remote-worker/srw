@@ -74,6 +74,10 @@ from orchestrator.schemas.inline_expert import InlineExpertSelection
 from orchestrator.schemas.thread_admission import ThreadCreateRequest
 from orchestrator.security.access import redact_config_override
 from orchestrator.services.config_overrides import validated_config_name
+from orchestrator.services.connector_refs import (
+    refuse_connector_selector_conflict,
+    resolve_execution_connectors,
+)
 from orchestrator.services.config_resolver import resolve_config
 from orchestrator.services.default_experts import (
     DefaultExpertUnavailable,
@@ -419,14 +423,29 @@ async def select_thread_datasources(
     gated for older API clients that encoded an opt-out by leaving the field
     out. Returns ``(ids, policy_revisions, provenance)``.
     """
-    if "datasource_ids" in request_body.model_fields_set:
+    requested_ids = request_body.datasource_ids or []
+    if request_body.execution is not None:
+        # Connector refs are an explicit selection of the ids they name: the
+        # same branch, the same authorization, the same snapshot.
+        requested_ids = await resolve_execution_connectors(
+            dependencies.store,
+            request_body.execution,
+            owner_id=str(user["id"]),
+            project_id=(
+                effective_project_ids[0] if len(effective_project_ids) == 1 else None
+            ),
+        )
+    if (
+        "datasource_ids" in request_body.model_fields_set
+        or request_body.execution is not None
+    ):
         thread_selection_origin = "explicit"
         (
             selected_thread_datasource_ids,
             selected_thread_datasource_revisions,
         ) = await dependencies.authorize_thread_datasource_selection(
             user,
-            request_body.datasource_ids or [],
+            requested_ids,
             workspace_backend=thread_backend,
             target_project_ids=effective_project_ids,
             effective_work_owner_id=str(user["id"]),
@@ -494,6 +513,7 @@ async def resolve_thread_creation_plan(
     # resolution, so authorize it before choosing the expert. A new Session
     # has one project or none: thread_creation_project_ids refuses a second
     # one with 422 before any lookup.
+    refuse_connector_selector_conflict(request_body)
     requested_project_ids = thread_creation_project_ids(request_body, user)
     effective_project_ids = await dependencies.authorize_thread_project_ids(
         user, requested_project_ids
@@ -1610,11 +1630,15 @@ async def list_threads(
                 t, mounts_by_thread.get(str(t["id"]), [])
             )
         if getattr(dependencies.store, "supports_vm_creation_retry", False):
-            from orchestrator.services.vm_creation_owner_view import thread_creation_views
+            from orchestrator.services.vm_creation_owner_view import (
+                thread_creation_views,
+            )
 
             progress = await thread_creation_views(
-                dependencies.store, [str(t["id"]) for t in threads],
-                viewer_user_id=str(user["id"]), admin=user.get("is_admin") is True,
+                dependencies.store,
+                [str(t["id"]) for t in threads],
+                viewer_user_id=str(user["id"]),
+                admin=user.get("is_admin") is True,
             )
             for t in threads:
                 t["vm_creation"] = progress.get(str(t["id"]))
