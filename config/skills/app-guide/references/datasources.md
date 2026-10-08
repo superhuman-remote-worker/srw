@@ -24,7 +24,12 @@ agents never see connectors you didn't attach.
   needs to reach some other system, delivered to a sandbox or VM workspace.
   A kubeconfig or generic file lands at its path under the workspace home
   (kubeconfigs are merged into `~/.kube/config`, so `kubectl` works as is);
-  an SSH key is held by an ssh-agent and never written to disk.
+  an SSH key is held by an ssh-agent and never written to disk. A file's
+  path must be in a credential location (`~/.kube/`, `~/.aws/`, `~/.azure/`,
+  `~/.docker/`, `~/.srw-files/`, a few `~/.config/<app>/` directories,
+  `~/.netrc`, `~/.pgpass`), and the files go when the session ends or the job
+  finishes. A job that ends while paused or waiting for review keeps them in
+  its workspace until the job is deleted.
 - **Credentials** — named environment variables for API keys or website
   logins, delivered to a sandbox or VM workspace. Scripts read them from the
   environment; browser forms use `browser_type(ref=..., env_var="NAME")`.

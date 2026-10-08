@@ -16,10 +16,22 @@ already holds a file of the user's is left alone (the contents still reach
 the store).
 
 Every delivery on a shell workspace syncs the whole current set, empty or
-not: a detach, live or between attaches, removes the file and empties the
+not: a detach, live or between attaches, removes the file and unsets the
 variable that named it, and a backend swap writes the set again on the new
 host before the old one retires. The terminal shell retirement removes them
-with the work item (``RemoteBackend.shell_cleanup``).
+with the work item (``RemoteBackend.shell_cleanup``): a session's End, a
+job's completed, failed or cancelled status while its agent runs, the
+retired side of a tier swap.
+
+Known gap (slice D1d): a job that ends without a live agent never runs that
+retirement. Paused or pending_review, then cancelled (or approved) from the
+cockpit, the job's store and links stay in its workspace volume until the
+workspace is torn down, at the latest when the job is deleted. No snapshot
+ever holds them (``.srw-credentials`` is excluded), and no later work item
+reads them (each has its own store and sources only its own environment
+file). There is no claim-fenced path to the workspace at that moment: the
+orchestrator's cancel does not reach it, and the teardown deletes the
+volume itself.
 
 An entry's ``transform`` and ``merge_group`` carry what used to be a
 kubeconfig type check: kubeconfig names are prefixed with the connector's
