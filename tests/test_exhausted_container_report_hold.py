@@ -163,16 +163,16 @@ async def test_untyped_nested_and_other_top_level_errors_do_not_gain_hold(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "backend,provisioner,commands",
+    "backend,provisioner,commands,vm_recovery",
     [
-        ("vm", "k8s", True),
-        ("sandbox", "docker", True),
-        ("sandbox", None, True),
-        ("sandbox", "k8s", False),
+        ("vm", "k8s", True, True),
+        ("sandbox", "docker", True, False),
+        ("sandbox", None, True, False),
+        ("sandbox", "k8s", False, False),
     ],
 )
 async def test_exhaustion_hold_preserves_existing_authority_gates(
-    worker_runtime, monkeypatch, backend, provisioner, commands
+    worker_runtime, monkeypatch, backend, provisioner, commands, vm_recovery
 ):
     claim = worker._claim(prior="processing", attempts=6, max_attempts=5)
     executor, _, client, _, _, _, release, hold = install(
@@ -181,10 +181,39 @@ async def test_exhaustion_hold_preserves_existing_authority_gates(
     client.backend = backend
     configure_bundle(client, provisioner=provisioner)
     executor._completion_commands_enabled = commands
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", str(vm_recovery).lower())
     await executor._serve_worker_claim(claim)
     client.report_completion.assert_awaited_once()
     hold.assert_not_awaited()
     release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_vm_recovery_off_typed_exhaustion_report_loss_holds_worker_claim(
+    worker_runtime, monkeypatch
+):
+    claim = worker._claim(prior="processing", attempts=6, max_attempts=5)
+    executor, agent, client, _, rotate, complete, release, hold = install(
+        monkeypatch, claim, exhausted()
+    )
+    client.backend = "vm"
+    configure_bundle(client, provisioner=None)
+    client.report_completion.side_effect = TimeoutError("completion response lost")
+
+    await executor._serve_worker_claim(claim)
+
+    client.report_completion.assert_awaited_once()
+    reported = client.report_completion.await_args.args[1]
+    assert reported["error"]["type"] == "worker_retry_exhausted"
+    assert reported["error"]["cause"]["type"] == "workspace_unavailable"
+    assert executor._worker_workspace_backend == "vm"
+    hold.assert_awaited_once_with(
+        executor._db, unit_id=claim.unit_id, lease_token=claim.lease_token
+    )
+    assert agent.cleanup_calls and all(agent.cleanup_calls)
+    release.assert_not_awaited()
+    rotate.assert_not_awaited()
+    complete.assert_not_awaited()
 
 
 @pytest.mark.asyncio
