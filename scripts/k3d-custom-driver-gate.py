@@ -1333,9 +1333,12 @@ class CustomDriverGate:
             return {}
         return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
 
-    def delivered(self, selector: str, binding_id: str) -> dict[str, str]:
+    def delivered(
+        self, selector: str, binding_id: str, *, with_file: bool = False
+    ) -> dict[str, str]:
         """The workspace's facts once it holds the variable the driver minted
-        for ``binding_id``; ``{}`` when it never does."""
+        for ``binding_id`` (and, ``with_file``, its credential file, which a
+        separate sync step places); ``{}`` when it never does."""
         pod = self.workspace_pod(selector)
         expected = hashlib.sha256(
             secret(minted(self.token, binding_id)).encode()
@@ -1343,7 +1346,11 @@ class CustomDriverGate:
 
         def probe() -> dict | None:
             facts = self.workspace_facts(pod)
-            return facts if facts.get("value_sha") == expected else None
+            if facts.get("value_sha") != expected:
+                return None
+            if with_file and not (facts.get("file_sha") and facts.get("var_real")):
+                return None
+            return facts
 
         try:
             return wait_for(
@@ -2303,7 +2310,7 @@ class CustomDriverGate:
             "; ".join(problems),
         )
         self.bind_identity = self.watch.identities.get(name, "")
-        facts = self.delivered(f"srw/thread-id={thread}", row["id"])
+        facts = self.delivered(f"srw/thread-id={thread}", row["id"], with_file=True)
         self.report.check(
             "bind: the workspace has the variable the driver minted for this "
             "binding and its credential file (0600), named by "
