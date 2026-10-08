@@ -36,6 +36,7 @@ from orchestrator.services.cloud import (
     CloudMountSubject,
     ProjectFolderHandle,
     SessionFolderHandle,
+    SupportsProtectedLower,
     SupportsRcloneMount,
     provider_adapter,
     provider_offers,
@@ -470,13 +471,15 @@ def _build_protected_cloud_mount(
     per-mount READER credential — never agent-service — and its transport is
     the provider adapter's. Returns None unless the row is an active grant of
     a provider that offers the protected level."""
+    adapter = provider_adapter(row.get("backend")) if row else None
     if (
         not row
         or row.get("status") != "active"
         or not provider_offers(row.get("backend"), PROTECTED_PROJECT_FOLDER)
+        or not isinstance(adapter, SupportsProtectedLower)
     ):
         return None
-    lower_transport = provider_adapter(row["backend"]).protected_lower_transport(row)
+    lower_transport = adapter.protected_lower_transport(row)
     return {
         "version": 1,
         "driver": "rclone",

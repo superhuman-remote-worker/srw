@@ -2903,13 +2903,15 @@ cloud:
   # Pair with Secret key NEXTCLOUD_RCLONE_USER_HOME_PASSWORD.
   nextcloudRcloneUserHomeUsername: ""
   # -- The main cloud is configured here only; the admin Main cloud page is
-  # read-only. At startup the orchestrator adopts these values when they
-  # describe the active installation differently (a new URL, user or secret
-  # reference). Values describing a *different* installation (another
-  # provider or server) are adopted only when this names the active
-  # installation id shown on the Main cloud page: new work then goes to the
-  # described cloud and everything stamped with the old one stays on it.
-  # Leave empty otherwise; a stale id is ignored.
+  # read-only. At startup the orchestrator adopts a change to these values
+  # on its own only where its attestation proves it: the same installation
+  # reached at a new internal URL, admin account or protected-effect lane.
+  # Any other change (the public URL, the agent account or its secret
+  # reference), a *different* installation (another provider or server), or
+  # a cloud reinstalled at the same address is adopted only when this names
+  # the active installation id shown on the Main cloud page: new work then
+  # goes to the described cloud, and everything stamped with the old
+  # installation stays on it. Leave empty otherwise; a stale id is ignored.
   replaceInstallation: ""
 
 # =============================================================================

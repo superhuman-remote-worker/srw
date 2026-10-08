@@ -182,6 +182,20 @@ class OpenCloudBackend:
 
     backend_id = BACKEND_ID
     capabilities = OPENCLOUD_CAPABILITIES
+    #: What ``ensure_initialized`` proves: it mints a service-account token
+    #: from the issuer with the client credentials and reaches the internal
+    #: URL with it. The public URL and the role, quota and TLS settings are
+    #: never exercised.
+    attested_fields: frozenset[str] = frozenset(
+        {
+            "version",
+            "backend_id",
+            "base_url",
+            "keycloak_issuer",
+            "keycloak_client_id",
+            "keycloak_client_secret",
+        }
+    )
 
     def __init__(self, settings: OpenCloudSettings) -> None:
         self._settings = settings

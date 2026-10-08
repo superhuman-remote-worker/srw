@@ -20,6 +20,7 @@ from orchestrator.services.cloud.base import (
     HealthStatus,
     MainCloudBackend,
     RcloneMountSpec,
+    SupportsProtectedLower,
     SupportsRcloneMount,
     UserHome,
 )
@@ -588,6 +589,7 @@ __all__ = [
     "RcloneMountSpec",
     "SessionFolderHandle",
     "ShareHandle",
+    "SupportsProtectedLower",
     "SupportsRcloneMount",
     "UserHome",
     "UserId",

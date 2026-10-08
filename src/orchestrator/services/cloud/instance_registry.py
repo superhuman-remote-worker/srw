@@ -11,14 +11,20 @@ At startup :func:`initialize_main_cloud_instance_authority` compares what Helm
 describes with the active instance and reconciles them:
 
 * the same routing and secret references: the active instance is loaded;
-* the same installation (equal installation proof), described differently:
-  Helm's description is attested and activated, as the form's save did;
-* a different installation: activated only when ``replace_installation``
-  (``cloud.replaceInstallation`` → ``MAIN_CLOUD_REPLACE_INSTALLATION``) names
-  the active instance id. Moving new work to another cloud fences everything
-  stamped with the old installation to it, so it never follows from values
-  that merely drifted, such as an instance an admin activated through the
-  removed form while Helm still describes the bundled cloud;
+* the same installation (equal installation proof), described differently in
+  fields its attestation proves (the adapter's ``attested_fields``: for
+  Nextcloud the internal URL, the admin account and the protected-effect
+  lane): Helm's description is activated, as the form's save did;
+* any other change -- a field the attestation does not prove (the public URL,
+  the agent account or its secret reference), or a different installation --
+  is activated only when ``replace_installation`` (``cloud.replaceInstallation``
+  → ``MAIN_CLOUD_REPLACE_INSTALLATION``) names the active instance id. Moving
+  new work to another cloud fences everything stamped with the old
+  installation to it, so it never follows from values that merely drifted,
+  such as an instance an admin activated through the removed form while Helm
+  still describes the bundled cloud. The confirmation also attests a
+  description that matches, so a cloud reinstalled at the same address (a new
+  proof) can be adopted;
 * a description that fails to attest leaves the active instance serving.
 """
 
@@ -34,6 +40,7 @@ from orchestrator.services.cloud import (
     MainCloudBackend,
     MainCloudRouter,
     build_backend_from_config,
+    provider_adapter,
 )
 from orchestrator.services.cloud.backend_instance_authority import (
     MainCloudBackendInstanceAuthority,
@@ -426,6 +433,52 @@ async def _close_candidate(candidate: Candidate | None) -> None:
         pass
 
 
+def confirms_replacement(
+    replace_installation: str | None,
+    authority: MainCloudBackendInstanceAuthority,
+) -> bool:
+    """Whether the operator's ``cloud.replaceInstallation`` names this
+    active instance (a UUID, compared case-insensitively)."""
+    return bool(replace_installation) and (
+        replace_installation.strip().lower() == authority.backend_instance_id.lower()
+    )
+
+
+def changed_fields(
+    active: MainCloudBackendInstanceAuthority,
+    proposed: MainCloudBackendInstanceAuthority,
+) -> frozenset[str]:
+    """The routing keys and secret-reference fields that differ (names only)."""
+    routing_a, routing_b = active.routing, proposed.routing
+    refs_a, refs_b = active.secret_refs, proposed.secret_refs
+    return frozenset(
+        {
+            k
+            for k in routing_a.keys() | routing_b.keys()
+            if routing_a.get(k) != routing_b.get(k)
+        }
+        | {k for k in refs_a.keys() | refs_b.keys() if refs_a.get(k) != refs_b.get(k)}
+    )
+
+
+def unattested_changes(
+    active: MainCloudBackendInstanceAuthority,
+    proposed: MainCloudBackendInstanceAuthority,
+) -> frozenset[str]:
+    """Changes the provider's attestation does not prove.
+
+    ``ensure_initialized`` proves only what it exercises (the adapter's
+    ``attested_fields``: for Nextcloud the internal URL, the admin account
+    and the protected-effect lane, never the agent account or the public
+    URL). A change to anything else could point delivery at another server or
+    credential while the installation proof still matches, so it is adopted
+    only on the operator's confirmation.
+    """
+    adapter = provider_adapter(proposed.backend_id)
+    attested = getattr(adapter, "attested_fields", frozenset())
+    return changed_fields(active, proposed) - attested
+
+
 async def _reconcile_with_helm(
     db: Any,
     router: MainCloudRouter,
@@ -437,13 +490,17 @@ async def _reconcile_with_helm(
 
     Returns the new active record, or ``None`` when ``active`` keeps serving
     (Helm matches it, describes nothing adoptable, fails to attest, describes
-    another installation without the confirmation, or a racing replica moved
-    the pointer first). Every outcome is logged without a secret value.
+    another installation or an unattested change without the confirmation, or
+    a racing replica moved the pointer first). A confirmation naming the
+    active instance attests Helm's description even when it matches, so a
+    cloud reinstalled at the same address (a new installation proof) can be
+    adopted. Every outcome is logged without a secret value.
     """
 
     authority = active["authority"]
+    confirmed = confirms_replacement(replace_installation, authority)
     status = helm_configuration_status(authority)
-    if status.state == "matches":
+    if status.state == "matches" and not confirmed:
         return None
     if status.state == "invalid":
         logger.error(
@@ -468,9 +525,23 @@ async def _reconcile_with_helm(
         proposed.backend_id == authority.backend_id
         and proposed.installation_proof_sha256 == authority.installation_proof_sha256
     )
-    if not same_installation and replace_installation != (
-        authority.backend_instance_id
-    ):
+    if same_installation:
+        if not changed_fields(authority, proposed):
+            await _close_candidate(candidate)  # nothing to change
+            return None
+        unattested = unattested_changes(authority, proposed)
+        if unattested and not confirmed:
+            await _close_candidate(candidate)
+            logger.warning(
+                "Main cloud: Helm changes %s of installation %s, which its "
+                "attestation does not prove; it keeps serving as before. To "
+                "adopt the change, set cloud.replaceInstallation to %s.",
+                sorted(unattested),
+                authority.backend_instance_id,
+                authority.backend_instance_id,
+            )
+            return None
+    elif not confirmed:
         await _close_candidate(candidate)
         logger.warning(
             "Main cloud: Helm describes a different installation (%s) than the "
@@ -489,21 +560,32 @@ async def _reconcile_with_helm(
         activated_by=HELM_ACTOR,
         candidate=candidate,
     )
-    if activated is not None:
+    if activated is None:
         logger.warning(
-            "Main cloud: adopted the configuration Helm describes (%s, %s); "
-            "instance %s replaces %s for new work",
-            status.detail,
-            "same installation" if same_installation else "new installation",
-            activated["authority"].backend_instance_id,
+            "Main cloud: Helm's configuration was attested but not activated "
+            "(the active pointer moved, or an instance with the same routing "
+            "and proof is registered with other secret references); "
+            "installation %s keeps serving",
             authority.backend_instance_id,
         )
+        return None
+    logger.warning(
+        "Main cloud: adopted the configuration Helm describes (%s, %s); "
+        "instance %s replaces %s for new work",
+        status.detail or "confirmed",
+        "same installation" if same_installation else "new installation",
+        activated["authority"].backend_instance_id,
+        authority.backend_instance_id,
+    )
     return activated
 
 
 __all__ = [
     "HELM_ACTOR",
     "HelmConfigurationStatus",
+    "changed_fields",
+    "confirms_replacement",
+    "unattested_changes",
     "activate_main_cloud_config",
     "build_attested_main_cloud_candidate",
     "helm_configuration_status",

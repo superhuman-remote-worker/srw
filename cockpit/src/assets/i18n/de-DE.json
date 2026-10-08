@@ -1574,7 +1574,7 @@
         "invalid": "unvollständig"
       },
       "helmNote": {
-        "differs": "Die cloud-Werte in Helm beschreiben etwas anderes als die aktive Installation. Der Orchestrator übernimmt sie beim nächsten Start, wenn sie dieselbe Installation beschreiben; für eine andere Installation bestätigen Sie den Wechsel mit cloud.replaceInstallation = {{instance}}.",
+        "differs": "Die cloud-Werte in Helm beschreiben etwas anderes als die aktive Installation. Beim nächsten Start übernimmt der Orchestrator nur, was die Attestierung der Installation belegt (interne URL oder Admin-Account); für alles andere oder eine andere Installation bestätigen Sie mit cloud.replaceInstallation = {{instance}}.",
         "invalid": "Die cloud-Werte in Helm sind unvollständig (ein erforderliches Secret fehlt), daher bleibt die aktive Installation in Betrieb."
       },
       "matrixTitle": "Provider-Unterstützung",

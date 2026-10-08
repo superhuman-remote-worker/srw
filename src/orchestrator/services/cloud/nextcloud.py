@@ -198,6 +198,23 @@ class NextcloudBackend:
 
     backend_id = BACKEND_ID
     capabilities = NEXTCLOUD_CAPABILITIES
+    #: Routing keys and secret-reference fields ``ensure_initialized`` proves:
+    #: it connects to the internal URL as the admin account and, when the
+    #: protected-effect lane is configured, verifies its signed attestation
+    #: (URL, config digest, HMAC key). It never uses the agent account or
+    #: the public URL, so a change to those is not proven by the proof.
+    attested_fields: frozenset[str] = frozenset(
+        {
+            "version",
+            "backend_id",
+            "base_url",
+            "admin_user",
+            "admin_password",
+            "protected_effect_url",
+            "protected_effect_config_sha256",
+            "protected_effect_hmac_key",
+        }
+    )
 
     def __init__(self, settings: NextcloudSettings) -> None:
         # Phase 1.5 parity with OpenCloudBackend (Issue 12): consume a

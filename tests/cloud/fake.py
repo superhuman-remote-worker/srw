@@ -53,6 +53,7 @@ class FakeMainCloudBackend:
 
     backend_id = BACKEND_ID
     capabilities = FAKE_CAPABILITIES
+    attested_fields: frozenset[str] = frozenset()
 
     def __init__(
         self,

@@ -125,6 +125,10 @@ class MainCloudBackend(Protocol):
     #: The provider support matrix this adapter declares (``capabilities.py``):
     #: what code outside the adapters asks instead of naming a provider.
     capabilities: ProviderCapabilities
+    #: The routing keys and secret-reference fields ``ensure_initialized``
+    #: proves; a change to any other field is adopted from Helm only on the
+    #: operator's confirmation (``instance_registry``).
+    attested_fields: frozenset[str]
 
     @property
     def backend_instance_id(self) -> Optional[str]:
@@ -434,6 +438,20 @@ class CanaryFixture:
     path: str
     version_ref: Optional[str] = None
     trash_ref: Optional[str] = None
+
+
+@runtime_checkable
+class SupportsProtectedLower(Protocol):
+    """Optional capability of a provider that offers the ``protected`` level:
+    the transport of a protected mount's read-only lower layer, built from an
+    active ``cloud_ro_mounts`` reader grant (never the agent-service
+    credential). Checked on the adapter class; a provider whose declaration
+    offers ``protected`` without it gets no protected mount (fail closed)."""
+
+    @staticmethod
+    def protected_lower_transport(row: dict[str, Any]) -> dict[str, Any]:
+        """``{"backend", "source", "auth"}`` of the lower rclone mount."""
+        ...
 
 
 @runtime_checkable

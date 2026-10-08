@@ -1574,7 +1574,7 @@
         "invalid": "incomplete"
       },
       "helmNote": {
-        "differs": "Helm's cloud values describe something other than the active installation. The orchestrator adopts them at its next start when they describe the same installation; for a different installation, set cloud.replaceInstallation to {{instance}} to confirm the move.",
+        "differs": "Helm's cloud values describe something other than the active installation. At its next start the orchestrator adopts only what attesting the installation proves (its internal URL or admin account); for anything else, or a different installation, set cloud.replaceInstallation to {{instance}} to confirm.",
         "invalid": "Helm's cloud values are incomplete (a required secret is unset), so the active installation keeps serving."
       },
       "matrixTitle": "Provider support",
