@@ -16,13 +16,11 @@ from tests.test_vm_resource_thread_cleanup_real_postgres import (
     _schema_applied,  # noqa: F401
     pg_dsn as _pg_dsn,
 )
+from tests._connector_lease_migrations import LEASE_TABLE_MIGRATIONS
 
 
 db = _db
 pg_dsn = _pg_dsn
-#: Migrations an old-head stage still needs: the code these upgrade tests
-#: run is today's, and its retirement Begin revokes credential leases (C2).
-LEASE_TABLE_MIGRATIONS = ("0346_", "0347_")
 
 
 class RetainedDisk(PhysicalStop):

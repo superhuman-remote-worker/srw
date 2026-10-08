@@ -39,8 +39,8 @@ from tests.test_vm_end_actuator_handoff_real_postgres import (
     db as _db,
     pg_dsn as _pg_dsn,
 )
+from tests._connector_lease_migrations import LEASE_TABLE_MIGRATIONS
 from tests.test_vm_thread_retained_disk_purge_real_postgres import (
-    LEASE_TABLE_MIGRATIONS,
     RetainedDisk,
     predecessor_snapshot,
 )

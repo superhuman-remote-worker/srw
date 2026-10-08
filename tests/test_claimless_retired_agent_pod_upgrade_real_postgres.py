@@ -74,6 +74,7 @@ from shared.persistent_input_delivery import (
     PINNED_ADMISSION_COUNT_INCREMENT,
 )
 from tests import test_pinned_permanent_warm_release_real_postgres as upstream_warm
+from tests._connector_lease_migrations import is_lease_table_migration
 from tests import test_self_ended_pinned_retirement_real_postgres as self_end
 
 MIGRATIONS = self_end.authority_fixtures.SCHEMA_FILE.parent / "migrations" / "app"
@@ -294,9 +295,19 @@ def _stage(tmp_path, name, *, through, exclude=()):
     staged = tmp_path / name
     staged.mkdir()
     for path in migrate.discover(MIGRATIONS):
-        if path.name.split("_", 1)[0] <= through and path.name not in exclude:
+        # Today's code these fixtures run revokes credential leases (C2):
+        # every stage carries the lease tables.
+        if (
+            path.name.split("_", 1)[0] <= through or is_lease_table_migration(path.name)
+        ) and path.name not in exclude:
             shutil.copy2(path, staged / path.name)
     return staged
+
+
+def _historical(ledger):
+    """The ledger rows of the history itself, without the lease tables every
+    stage carries for today's code (C2)."""
+    return [row for row in ledger if not is_lease_table_migration(row["filename"])]
 
 
 def _variant_capture_sql():
@@ -316,7 +327,14 @@ def _stage_upstream(tmp_path):
         through=UPSTREAM_HEAD.split("_", 1)[0],
         exclude=RECONCILED_MIGRATIONS,
     )
-    assert max(path.name for path in staged.iterdir()) == UPSTREAM_HEAD
+    assert (
+        max(
+            path.name
+            for path in staged.iterdir()
+            if not is_lease_table_migration(path.name)
+        )
+        == UPSTREAM_HEAD
+    )
     return staged
 
 
@@ -899,7 +917,7 @@ async def test_upgrade_from_upstream_0305_adds_only_the_reconciled_files(
         published_later = {
             path.name
             for path in migrate.discover(MIGRATIONS)
-            if path.name > CAPTURE_MIGRATION
+            if path.name > CAPTURE_MIGRATION and not is_lease_table_migration(path.name)
         }
         assert {row["filename"] for row in upgraded} - {
             row["filename"] for row in before
@@ -1087,7 +1105,7 @@ async def test_upgrade_from_the_original_local_0286_0287_history(
 
         await _run_as_owner(history, _stage_original_local(tmp_path))
         deployed = await _ledger(history)
-        assert len(deployed) == DEPLOYED_LEDGER_ROWS
+        assert len(_historical(deployed)) == DEPLOYED_LEDGER_ROWS
         assert {
             row["filename"]: row["checksum"]
             for row in deployed
@@ -1132,8 +1150,8 @@ async def _build_repaired_k3d_history(history, tmp_path, store, stack, monkeypat
         ),
     )
     repaired = await _ledger(history)
-    assert len(repaired) == REPAIRED_LEDGER_ROWS
-    assert max(row["filename"] for row in repaired) == VALIDATOR_0302
+    assert len(_historical(repaired)) == REPAIRED_LEDGER_ROWS
+    assert max(row["filename"] for row in _historical(repaired)) == VALIDATOR_0302
     assert {
         row["filename"]: row["checksum"]
         for row in repaired

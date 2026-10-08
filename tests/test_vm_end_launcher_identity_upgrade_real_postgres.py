@@ -13,6 +13,7 @@ from orchestrator.application import controls
 from orchestrator.database.migrate import run_migrations
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.services import stale_agent_detector as detector
+from tests._connector_lease_migrations import is_lease_table_migration
 from tests.test_pinned_vm_initial_binding_real_postgres import _bind_protected_agent
 from tests.test_vm_end_actuator_handoff_real_postgres import pg_dsn as _pg_dsn, scenario
 
@@ -31,7 +32,9 @@ async def test_populated_0298_to_0299_preserves_exact_legacy_continuation(
     stage = tmp_path / "migrations"
     stage.mkdir()
     for path in migrations.glob("*.sql"):
-        if path.name.split("_", 1)[0] <= "0298":
+        # Today's Begin revokes credential leases (C2), so the old head
+        # carries the lease tables the code it runs needs.
+        if path.name.split("_", 1)[0] <= "0298" or is_lease_table_migration(path.name):
             (stage / path.name).write_bytes(path.read_bytes())
     database = "launcher_upgrade_" + uuid4().hex
     admin = await asyncpg.connect(pg_dsn)

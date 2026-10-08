@@ -11,9 +11,7 @@ from tests.test_vm_end_actuator_handoff_real_postgres import pg_dsn as _pg_dsn, 
 from tests import test_persistent_recycler_real_postgres as fixtures
 from tests.test_b10_session_queries_real_postgres import _thread
 from tests.test_pinned_vm_initial_binding_real_postgres import _bind_protected_agent
-from tests.test_vm_thread_retained_disk_purge_real_postgres import (
-    LEASE_TABLE_MIGRATIONS,
-)
+from tests._connector_lease_migrations import LEASE_TABLE_MIGRATIONS
 
 
 pg_dsn = _pg_dsn

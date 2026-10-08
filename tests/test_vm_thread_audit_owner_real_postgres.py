@@ -9,6 +9,7 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
+from tests._connector_lease_migrations import is_lease_table_migration
 from tests.test_pinned_vm_failed_initial_end_real_postgres import (
     _authorize,
     _base_db,  # noqa: F401
@@ -399,7 +400,11 @@ async def test_migration_backfills_live_identity_without_inventing_old_settlemen
     previous.mkdir()
     try:
         for path in discover(migrations):
-            if path.name <= "0288_vm_initial_creation_cleanup_lineage.sql":
+            # Today's Begin revokes credential leases (C2), so the old
+            # head carries the lease tables the code it runs needs.
+            if path.name <= "0288_vm_initial_creation_cleanup_lineage.sql" or (
+                is_lease_table_migration(path.name)
+            ):
                 (previous / path.name).write_bytes(path.read_bytes())
         await run_migrations(pool, previous)
         store = PostgresDB(connection_string=dsn, min_connections=1, max_connections=4)
