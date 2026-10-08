@@ -110,6 +110,30 @@ def _assert_lease_only(entry: dict[str, Any]) -> None:
 
 
 # =============================================================================
+# The payload builder
+# =============================================================================
+
+
+@pytest.mark.parametrize("installed", [True, False])
+def test_the_payload_never_carries_a_lease_drivers_secret(installed):
+    from orchestrator.services.agent_datasource_payload import (
+        DatasourcePayloadDependencies,
+        build_datasources_payload,
+    )
+
+    deps = DatasourcePayloadDependencies(
+        logger=MagicMock(),
+        mcp_datasources_enabled=lambda: False,
+        mcp_stdio_enabled=lambda: False,
+        connector_drivers=builtin_connector_drivers(lease_probe=installed),
+        workspace_ssh_known_hosts=lambda: "",
+    )
+    (entry,) = build_datasources_payload([_probe_row()], dependencies=deps)
+    assert entry["credentials"] == {}
+    assert SECRET not in repr(entry)
+
+
+# =============================================================================
 # Pinned dispatch and the stateless claim
 # =============================================================================
 

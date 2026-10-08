@@ -32,6 +32,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from orchestrator.services.connector_credential_leases import lease_spec
 from orchestrator.services.connector_drivers import ConnectorDriverRegistry
 from orchestrator.services.connector_drivers.base import (
     BindContext,
@@ -209,7 +210,11 @@ def build_datasources_payload(
 
         driver = dependencies.connector_drivers.for_type(ds["type"])
         if driver is None:
-            # A stored type no driver serves is forwarded as stored.
+            # A stored type no driver serves is forwarded as stored, except
+            # the upstream secret of a lease driver (connector drivers C2),
+            # which never reaches an agent, installed or not.
+            if lease_spec(ds) is not None:
+                creds = {}
             payload.append(
                 payload_entry(
                     ds,
