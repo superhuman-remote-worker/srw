@@ -511,6 +511,55 @@ def test_the_review_template_probes_are_refused(args, program, command, config):
     assert _launch_problem(args, program, command=command, config=config)
 
 
+#: The long forms of the short code options, and each runner family's own
+#: code options (the D5b re-review's npx --call=, swept): fused with "=" and
+#: as the next argument, at launch (the image's program) and with mcp command.
+_LONG_AND_RUNNER_CODE_OPTIONS = [
+    ("--call", ("npx", "-y", "pkg")),
+    ("--call", ("npm", "exec")),
+    ("--eval", ("node", "idx.js")),
+    ("--print", ("node", "idx.js")),
+    ("--require", ("node", "idx.js")),
+    ("--import", ("node", "idx.js")),
+    ("--loader", ("node", "idx.js")),
+    ("--experimental-loader", ("nodejs", "idx.js")),
+    ("--node-options", ("npx", "-y", "pkg")),
+    ("--script-shell", ("npm", "exec", "pkg")),
+    ("--userconfig", ("npx", "pkg")),
+    ("--preload", ("bun", "run", "idx.ts")),
+    ("--config", ("bun", "idx.ts")),
+    ("--config", ("deno", "run", "idx.ts")),
+    ("--import-map", ("deno", "run", "idx.ts")),
+    ("--location", ("deno", "run", "idx.ts")),
+    ("-E", ("perl", "srv.pl")),
+    ("-M", ("perl", "srv.pl")),
+    ("-I", ("perl", "srv.pl")),
+    ("-I", ("ruby3.3", "srv.rb")),
+    ("-d", ("php", "srv.php")),
+    ("-B", ("php8.3", "srv.php")),
+    ("-cp", ("java", "-jar", "srv.jar")),
+    ("-jar", ("java",)),
+    ("--class-path", ("java", "Main")),
+    ("--index", ("uvx", "pkg")),
+    ("--find-links", ("uvx", "pkg")),
+    ("--with-requirements", ("uv", "tool", "run", "pkg")),
+    ("--spec", ("pipx", "run", "pkg")),
+    ("-f", ("uvx", "pkg")),
+]
+
+
+@pytest.mark.parametrize(("option", "program"), _LONG_AND_RUNNER_CODE_OPTIONS)
+def test_a_long_or_runner_code_option_never_takes_a_template(option, program):
+    for args in ([f"{option}=${{config.x}}"], [option, "${config.x}"]):
+        # The image's program, at launch.
+        assert _launch_problem(args, program), (option, program, args)
+        # The spec's own program: refused at registration already.
+        problems = mcp_problems(
+            _stdio(args=args, env={}, command=list(program)), access_levels=LEVELS
+        )
+        assert any("never code" in p for p in problems), (option, program, problems)
+
+
 @pytest.mark.parametrize(
     ("args", "program", "command"),
     [
@@ -522,6 +571,11 @@ def test_the_review_template_probes_are_refused(args, program, command, config):
         (["--a=${config.root}"], ("/usr/local/bin/python3.12", "app.py"), None),
         # The spec names the program: its author vouches for its argv.
         (["--root=${config.root}"], (), ("/server/github-mcp-server", "stdio")),
+        # A runner's own option is ordinary for another program.
+        (["--config=${config.root}"], (), ("/server/mcp-server",)),
+        (["--index", "${config.root}"], (), ("/server/search-mcp",)),
+        (["--spec=${config.root}"], ("node", "openapi.js"), None),
+        (["-I", "${config.root}"], ("node", "idx.js"), None),
     ],
 )
 def test_ordinary_templated_arguments_still_run(args, program, command):

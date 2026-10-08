@@ -286,31 +286,80 @@ CODE_OPTIONS: frozenset[str] = frozenset(
         "-p",
         "-r",
         "-W",
+        # The long forms of the short ones above, and the other options of
+        # the runners SRW reads whose value is code, where packages or
+        # code come from, or a debugger (node, bun, deno, npm and npx, uv
+        # and uvx, pipx).
+        "--call",
         "--command",
+        "--default-index",
         "--env-file",
         "--env-file-if-exists",
         "--eval",
         "--exec",
         "--experimental-loader",
         "--extra-index-url",
+        "--find-links",
         "--from",
+        "--globalconfig",
         "--import",
+        "--import-map",
         "--index-url",
         "--inspect",
         "--inspect-brk",
         "--inspect-port",
         "--inspect-wait",
         "--loader",
+        "--node-options",
         "--package",
+        "--pip-args",
+        "--preload",
         "--print",
         "--python",
         "--registry",
         "--require",
+        "--script-shell",
+        "--userconfig",
         "--with",
+        "--with-editable",
+        "--with-requirements",
         "/c",
         "/k",
     }
 )
+#: Options whose value is code (or where it comes from) for one family of
+#: runners only: the same name is ordinary elsewhere (``--config`` of a
+#: server, ``-I`` of a compiler), so these are checked when the program is
+#: known to be such a runner (at launch, or with mcp command).
+RUNNER_CODE_OPTIONS: Mapping[str, frozenset[str]] = {
+    # A config file or an import map names the modules to load.
+    "bun": frozenset({"--config"}),
+    "deno": frozenset({"--config", "--location"}),
+    # The class path, the module path and the jar run are code.
+    "java": frozenset({"-classpath", "-cp", "-jar", "--class-path", "--module-path"}),
+    # -E runs code, -M loads a module, -I adds a module search path.
+    "perl": frozenset({"-E", "-I", "-M"}),
+    # Code to run per line or before or after them, an ini setting
+    # (auto_prepend_file), the php.ini and the script.
+    "php": frozenset({"-B", "-E", "-F", "-R", "-c", "-d", "-f"}),
+    "ruby": frozenset({"-I"}),
+    # Where packages come from: an index, a find-links page, a
+    # requirement, a constraint or a spec.
+    "uv": frozenset({"-f", "--constraints", "--index", "--overrides", "--spec"}),
+}
+_RUNNER_FAMILIES: Mapping[str, str] = {
+    "bunx": "bun",
+    "nodejs": "node",
+    "npx": "npm",
+    "pipx": "uv",
+    "pnpm": "npm",
+    "pnpx": "npm",
+    "pypy": "python",
+    "pypy3": "python",
+    "python3": "python",
+    "uvx": "uv",
+    "yarn": "npm",
+}
 #: Programs that run the command their arguments name, after the
 #: positional arguments they take first (a user, a duration, a
 #: directory): the program behind them is the one that runs.
@@ -468,6 +517,13 @@ def _shell(item: str) -> bool:
 
 def _runner(name: str) -> bool:
     return name in SCRIPT_RUNNERS or _VERSIONED_RUNNER.fullmatch(name) is not None
+
+
+def _runner_family(name: str) -> str:
+    """A runner's family (``python3.12`` and ``pypy3`` are ``python``)."""
+    versioned = _VERSIONED_RUNNER.fullmatch(name)
+    base = versioned.group(1) if versioned else name
+    return _RUNNER_FAMILIES.get(base, base)
 
 
 def _real_program(argv: Sequence[str]) -> tuple[str, int] | None:
@@ -729,6 +785,13 @@ def _argv_problems(
             "mcp args are templated, but the program is a shell or runs one: "
             "a template is never code"
         )
+    # A runner's own code options count once the program is known.
+    found = _real_program(argv) if program else None
+    code_options = CODE_OPTIONS
+    if found is not None and _runner(found[0]):
+        code_options = code_options | RUNNER_CODE_OPTIONS.get(
+            _runner_family(found[0]), frozenset()
+        )
     for index in templated:
         item = argv[index]
         if not _ARG_TEMPLATE.fullmatch(item):
@@ -738,14 +801,13 @@ def _argv_problems(
             )
         before = argv[index - 1] if index else ""
         option = item.split("=", 1)[0] if "=" in item else ""
-        if option in CODE_OPTIONS or before in CODE_OPTIONS:
-            which = option if option in CODE_OPTIONS else before
+        if option in code_options or before in code_options:
+            which = option if option in code_options else before
             problems.append(
                 f"mcp args {item!r} is the value of {which!r}: a template is never code"
             )
     if not templated or not program or problems:
         return problems
-    found = _real_program(argv)
     if found is None:
         problems.append(
             "mcp args put a template where a wrapper's command is: a "
@@ -954,6 +1016,7 @@ __all__ = [
     "CODE_ENV",
     "CODE_ENV_PREFIXES",
     "CODE_OPTIONS",
+    "RUNNER_CODE_OPTIONS",
     "FRONT_PATH",
     "FRONT_USER",
     "PROTOCOLS",
