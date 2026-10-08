@@ -29,6 +29,7 @@ COMPONENTS = (
     "vm-preparer",
     "driver-shim",
     "driver-mcp-front",
+    "driver-git-swap",
 )
 # Images that another component's job builds from the same inputs. They share
 # that component's identity and rebuild decision and have no job of their own.

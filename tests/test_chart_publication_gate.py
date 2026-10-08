@@ -358,3 +358,49 @@ def test_develop_rebuilds_the_mcp_front_when_its_inputs_change():
         text = workflow(name)[0]
         assert "Dockerfile.driver-mcp-test" not in text
         assert "driver-mcp-test" not in text
+
+
+@pytest.mark.parametrize(
+    ("name", "publication"),
+    [("develop", "deploy-experimental"), ("main", "release-chart")],
+)
+def test_the_swap_driver_is_vetted_raced_built_and_pinned_by_digest(name, publication):
+    """The git swap driver (C3) is a product image: CI vets and tests it under
+    the race detector with the toolchain its pinned base carries, publishes
+    it, and the chart pins its digest; publication waits for it."""
+    import re
+
+    _, jobs = workflow(name)
+    steps = jobs["build-driver-git-swap"]["steps"]
+    test = next(s for s in steps if s.get("name") == "Vet and test the git swap driver")
+    assert test["working-directory"] == "drivers/git-swap"
+    assert "go vet ./..." in test["run"] and "go test" in test["run"]
+    assert "-race" in test["run"]
+    go = next(s for s in steps if s.get("uses", "").startswith("actions/setup-go@"))
+    dockerfile = (SCRIPT.parents[1] / "docker/Dockerfile.driver-git-swap").read_text()
+    base = re.search(
+        r"FROM --platform=\$BUILDPLATFORM golang:([0-9.]+)-alpine[0-9.]*"
+        r"@sha256:[0-9a-f]{64} AS build",
+        dockerfile,
+    )
+    assert base is not None and base.group(1) == go["with"]["go-version"]
+    build = next(
+        s["with"] for s in steps if s.get("uses", "").startswith("docker/build-push")
+    )
+    assert build["file"] == "./docker/Dockerfile.driver-git-swap"
+    assert "driver-git-swap" in build["cache-to"]
+    scripts = "\n".join(step.get("run", "") for step in jobs[publication]["steps"])
+    assert (
+        ".connectors.drivers.gitSwap.image.digest = strenv(DRIVER_GIT_SWAP_DIGEST)"
+        in scripts
+    )
+    assert "build-driver-git-swap" in jobs[publication]["needs"]
+    assert "driver-git-swap" in gate.COMPONENTS
+
+
+def test_develop_rebuilds_the_swap_driver_when_its_inputs_change():
+    text, jobs = workflow("develop")
+    assert "DRIVER_GIT_SWAP_PATHS=(drivers/git-swap/" in text
+    assert 'image_missing driver-git-swap "$DRIVER_GIT_SWAP_SHA"' in text
+    outputs = jobs["changes"]["outputs"]
+    assert "driver-git-swap" in outputs and "driver-git-swap-sha" in outputs

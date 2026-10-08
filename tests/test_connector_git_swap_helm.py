@@ -69,9 +69,12 @@ def test_off_by_default_the_fallback_still_reaches_the_orchestrator():
     assert "CONNECTOR_GIT_SWAP_IMAGE" not in env
     assert "CONNECTOR_DRIVER_CA_DIR" not in env
     assert _ca_secrets(docs) == [] and _ca_volume(docs) is None
-    assert orchestrator_env(render("connectors.drivers.gitSwap.fallback=refuse"))[
-        "CONNECTOR_GIT_SWAP_FALLBACK"
-    ] == "refuse"
+    assert (
+        orchestrator_env(render("connectors.drivers.gitSwap.fallback=refuse"))[
+            "CONNECTOR_GIT_SWAP_FALLBACK"
+        ]
+        == "refuse"
+    )
 
 
 def test_on_it_runs_its_image_and_the_orchestrator_mounts_the_authority():
@@ -124,7 +127,9 @@ def test_helms_generated_authority_signs_a_driver_certificate():
 
 
 def test_an_operators_own_authority_is_mounted_and_none_is_generated():
-    docs = render(EXCHANGE, ON, SWAP, "connectors.drivers.ca.secretName=vault-driver-ca")
+    docs = render(
+        EXCHANGE, ON, SWAP, "connectors.drivers.ca.secretName=vault-driver-ca"
+    )
     assert _ca_secrets(docs) == []
     assert _ca_volume(docs)["secret"]["secretName"] == "vault-driver-ca"
 
@@ -166,7 +171,9 @@ def test_tilt_builds_the_driver_and_pins_it_by_digest():
         and isinstance(node.args[0], ast.Constant)
     }
     keywords = builds["srw-driver-git-swap"]
-    assert ast.literal_eval(keywords["dockerfile"]) == "docker/Dockerfile.driver-git-swap"
+    assert (
+        ast.literal_eval(keywords["dockerfile"]) == "docker/Dockerfile.driver-git-swap"
+    )
     assert "drivers/git-swap/" in ast.literal_eval(keywords["only"])
     assert (
         "('srw-driver-git-swap', 'connectors.drivers.gitSwap.image.repository', "

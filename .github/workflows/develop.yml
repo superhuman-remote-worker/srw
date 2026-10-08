@@ -619,6 +619,7 @@ jobs:
       vm-preparer: ${{ steps.check.outputs.vm-preparer }}
       driver-shim: ${{ steps.check.outputs.driver-shim }}
       driver-mcp-front: ${{ steps.check.outputs.driver-mcp-front }}
+      driver-git-swap: ${{ steps.check.outputs.driver-git-swap }}
       workspace: ${{ steps.check.outputs.workspace }}
       # Per-component image identity: full sha of the newest commit that
       # touched the component's build inputs. Consumed by the build jobs
@@ -633,6 +634,7 @@ jobs:
       vm-preparer-sha: ${{ steps.check.outputs.vm-preparer-sha }}
       driver-shim-sha: ${{ steps.check.outputs.driver-shim-sha }}
       driver-mcp-front-sha: ${{ steps.check.outputs.driver-mcp-front-sha }}
+      driver-git-swap-sha: ${{ steps.check.outputs.driver-git-swap-sha }}
       vm-base-sha: ${{ steps.check.outputs.vm-base-sha }}
       vm-base-stage1-sha: ${{ steps.check.outputs.vm-base-stage1-sha }}
       chart: ${{ steps.check.outputs.chart }}
@@ -921,6 +923,11 @@ jobs:
           DRIVER_MCP_FRONT_SHA=$(last_input_sha "${DRIVER_MCP_FRONT_PATHS[@]}")
           DRIVER_MCP_FRONT=$(image_missing driver-mcp-front "$DRIVER_MCP_FRONT_SHA")
 
+          # The git swap driver (C3): one static Go binary, stdlib only.
+          DRIVER_GIT_SWAP_PATHS=(drivers/git-swap/ .dockerignore docker/Dockerfile.driver-git-swap)
+          DRIVER_GIT_SWAP_SHA=$(last_input_sha "${DRIVER_GIT_SWAP_PATHS[@]}")
+          DRIVER_GIT_SWAP=$(image_missing driver-git-swap "$DRIVER_GIT_SWAP_SHA")
+
           AGENT_SHA=$(last_input_sha "${AGENT_PATHS[@]}")
           AGENT=$(image_missing agent "$AGENT_SHA")
 
@@ -1023,6 +1030,7 @@ jobs:
           echo "  vm-controller=$VM_CONTROLLER  vm-base=$VM_BASE  vm-base-stage1=$VM_BASE_STAGE1"
           echo "  vm-preparer=$VM_PREPARER  driver-shim=$DRIVER_SHIM (${DRIVER_SHIM_SHA::7})"
           echo "  driver-mcp-front=$DRIVER_MCP_FRONT (${DRIVER_MCP_FRONT_SHA::7})"
+          echo "  driver-git-swap=$DRIVER_GIT_SWAP (${DRIVER_GIT_SWAP_SHA::7})"
           echo "  vm input shas: vm-controller=${VM_CONTROLLER_SHA::7} vm-base=${VM_BASE_SHA::7} vm-base-stage1=${VM_BASE_STAGE1_SHA::7}"
           echo "  chart=$CHART"
           echo "  input shas: agent=${AGENT_SHA::7} orchestrator=${ORCHESTRATOR_SHA::7} cockpit=${COCKPIT_SHA::7} mcp=${MCP_SHA::7} workspace=${WORKSPACE_SHA::7}"
@@ -1046,6 +1054,8 @@ jobs:
             echo "driver-shim-sha=$DRIVER_SHIM_SHA"
             echo "driver-mcp-front=$DRIVER_MCP_FRONT"
             echo "driver-mcp-front-sha=$DRIVER_MCP_FRONT_SHA"
+            echo "driver-git-swap=$DRIVER_GIT_SWAP"
+            echo "driver-git-swap-sha=$DRIVER_GIT_SWAP_SHA"
             echo "vm-base=$VM_BASE"
             echo "vm-base-sha=$VM_BASE_SHA"
             echo "vm-base-stage1=$VM_BASE_STAGE1"
@@ -2350,6 +2360,89 @@ jobs:
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-driver-mcp-front:buildcache-develop
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-driver-mcp-front:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
+  # The git swap driver (C3): the smart-HTTP reverse proxy token repositories
+  # are cloned through. Vetted and tested (race detector; its tests also run
+  # a real git client against git http-backend) with the toolchain the image
+  # builds with, then published; the chart is stamped with its digest.
+  build-driver-git-swap:
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
+    if: >-
+      needs.architecture.result == 'success' &&
+      always() && !cancelled() &&
+      (needs.changes.outputs.driver-git-swap == 'true' || github.event_name == 'workflow_dispatch') &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result != 'failure' && needs.test-python.result != 'cancelled' &&
+      needs.test-cockpit.result != 'failure' && needs.test-cockpit.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      # The same release as docker/Dockerfile.driver-git-swap's pinned base.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - name: Vet and test the git swap driver
+        working-directory: drivers/git-swap
+        run: |
+          go vet ./...
+          go test -count=1 -race ./...
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Image identity = newest input commit, not push HEAD (see build-agent).
+      - name: Resolve component identity
+        id: ident
+        run: |
+          FULL="${{ needs.changes.outputs.driver-git-swap-sha }}"
+          : "${FULL:?component identity is required}"
+          {
+            echo "full=$FULL"
+            echo "short=${FULL::7}"
+            echo "version=0.0.0-dev.sha-${FULL}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-driver-git-swap
+          tags: |
+            type=raw,value=sha-${{ steps.ident.outputs.short }}
+            type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.driver-git-swap
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ steps.ident.outputs.full }}
+            org.opencontainers.image.version=${{ steps.ident.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=driver-git-swap
+          provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ steps.ident.outputs.full }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-driver-git-swap:buildcache-develop
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-driver-git-swap:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
+
 
   # ---------------------------------------------------------------------------
   # Publish the dev Helm chart. The chart version (monotonic 0.0.<run_number>)
@@ -2373,6 +2466,7 @@ jobs:
       - build-vm-preparer
       - build-driver-shim
       - build-driver-mcp-front
+      - build-driver-git-swap
       - chart-test
       - chart-schema-negative
     if: >-
@@ -2458,7 +2552,8 @@ jobs:
           needs.build-vm-controller.result == 'success' ||
           needs.build-vm-preparer.result == 'success' ||
           needs.build-driver-shim.result == 'success' ||
-          needs.build-driver-mcp-front.result == 'success'
+          needs.build-driver-mcp-front.result == 'success' ||
+          needs.build-driver-git-swap.result == 'success'
         env:
           SHA_ORCHESTRATOR: ${{ needs.changes.outputs.orchestrator-sha }}
           SHA_AGENT: ${{ needs.changes.outputs.agent-sha }}
@@ -2469,6 +2564,7 @@ jobs:
           SHA_VMPREPARER: ${{ needs.changes.outputs.vm-preparer-sha }}
           SHA_DRIVERSHIM: ${{ needs.changes.outputs.driver-shim-sha }}
           SHA_DRIVERMCPFRONT: ${{ needs.changes.outputs.driver-mcp-front-sha }}
+          SHA_DRIVERGITSWAP: ${{ needs.changes.outputs.driver-git-swap-sha }}
         run: |
           helm repo add collabora https://collaboraonline.github.io/online --force-update
           helm dependency build helm/
@@ -2506,6 +2602,8 @@ jobs:
           export TAG_DRIVERSHIM="sha-${SHA_DRIVERSHIM::7}"
           : "${SHA_DRIVERMCPFRONT:?verified component identity is required}"
           export TAG_DRIVERMCPFRONT="sha-${SHA_DRIVERMCPFRONT::7}"
+          : "${SHA_DRIVERGITSWAP:?verified component identity is required}"
+          export TAG_DRIVERGITSWAP="sha-${SHA_DRIVERGITSWAP::7}"
           export REV_ORCHESTRATOR="$SHA_ORCHESTRATOR"
           export REV_AGENT="$SHA_AGENT"
           export REV_COCKPIT="$SHA_COCKPIT"
@@ -2518,6 +2616,7 @@ jobs:
           : "${MCP_DIGEST:?verified MCP image digest is required}"
           : "${DRIVER_SHIM_DIGEST:?verified driver shim image digest is required}"
           : "${DRIVER_MCP_FRONT_DIGEST:?verified managed MCP front image digest is required}"
+          : "${DRIVER_GIT_SWAP_DIGEST:?verified git swap driver image digest is required}"
 
           yq -i '
             .image.orchestrator.tag = strenv(TAG_ORCHESTRATOR) |
@@ -2534,6 +2633,8 @@ jobs:
             .connectors.drivers.shim.image.digest = strenv(DRIVER_SHIM_DIGEST) |
             .connectors.drivers.mcpFront.image.tag = strenv(TAG_DRIVERMCPFRONT) |
             .connectors.drivers.mcpFront.image.digest = strenv(DRIVER_MCP_FRONT_DIGEST) |
+            .connectors.drivers.gitSwap.image.tag = strenv(TAG_DRIVERGITSWAP) |
+            .connectors.drivers.gitSwap.image.digest = strenv(DRIVER_GIT_SWAP_DIGEST) |
             .provenance.releaseVersion = strenv(CHART_VERSION) |
             .provenance.components.orchestrator.sourceRevision = strenv(REV_ORCHESTRATOR) |
             .provenance.components.agent.sourceRevision        = strenv(REV_AGENT) |
