@@ -409,11 +409,11 @@ def _kubeconfig_line(
     elif MERGED_KUBECONFIG_LINK in skipped:
         where = "merged into `$KUBECONFIG`, ahead of your own `~/.kube/config`"
     else:
-        where = "merged into `~/.kube/config`"
+        where = "merged into `~/.kube/config` (`$KUBECONFIG`)"
     slug = _ds_slug_hyphen(name)
     return (
         f"- **{name}** (kubeconfig) — {where}; contexts prefixed `{slug}-*`. "
-        "Try `kubectl config get-contexts`."
+        "Where kubectl is installed, try `kubectl config get-contexts`."
     )
 
 

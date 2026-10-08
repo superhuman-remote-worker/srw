@@ -479,7 +479,7 @@ class TestFacts:
     @pytest.mark.parametrize(
         ("report", "where"),
         [
-            ({}, "merged into `~/.kube/config`"),
+            ({}, "merged into `~/.kube/config` (`$KUBECONFIG`)"),
             (
                 {"skipped": {".kube/config": "a file of the user is there"}},
                 "merged into `$KUBECONFIG`, ahead of your own `~/.kube/config`",
@@ -495,7 +495,7 @@ class TestFacts:
         backend.credential_files_report = report
         assert self._facts([_kube_row("Kube", "a", "t")], backend) == [
             f"- **Kube** (kubeconfig) — {where}; contexts prefixed `kube-*`. "
-            "Try `kubectl config get-contexts`."
+            "Where kubectl is installed, try `kubectl config get-contexts`."
         ]
 
     def test_a_kubeconfig_saved_off_the_allowlist_is_not_delivered(self):
