@@ -318,7 +318,9 @@ async def refresh_project(db, project_id) -> tuple[str, dict | None]:
             db, resource["id"], keep
         ):
             return "unchanged", None
-        return "rebuilt", await persist_project_resource(db, project_id)
+        saved = await persist_project_resource(db, project_id)
+        # None: the project row is gone (a delete racing this refresh).
+        return ("rebuilt", saved) if saved else ("none", None)
     saved = await _refresh_authored(db, store, resource, desired)
     return ("updated", saved) if saved else ("unchanged", None)
 

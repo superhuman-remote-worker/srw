@@ -33,7 +33,10 @@ import pytest
 from orchestrator.schemas.job_create import JobCreate
 from orchestrator.schemas.thread_admission import ThreadCreateRequest
 from orchestrator.services import project_connectors
-from orchestrator.services.connector_refs import resolve_execution_connectors
+from orchestrator.services.connector_refs import (
+    resolve_connector_refs,
+    resolve_execution_connectors,
+)
 from orchestrator.services.datasource_policy import (
     GENERIC_UNAVAILABLE_DETAIL,
     default_datasource_selection,
@@ -49,6 +52,10 @@ from orchestrator.services.connector_drivers import builtin_connector_drivers
 from orchestrator.services.manifest_authority import ManifestAuthority
 from orchestrator.services.manifest_execution import ManifestExecutionService
 from orchestrator.services.manifest_projects import persist_project_resource
+from orchestrator.services.manifest_resolution import (
+    REFERENCE_MISSING,
+    LiveManifestResolver,
+)
 from orchestrator.services.manifest_resources import ManifestResourceService
 from orchestrator.services.manifest_store import ManifestStore
 from orchestrator.services.project_connector_defaults import (
@@ -62,6 +69,8 @@ from orchestrator.services.thread_datasource_authorization import (
     ThreadDatasourceAuthorizationDependencies,
     authorize_thread_datasource_selection,
 )
+from shared.manifests import preview_documents
+from shared.manifests.resolution import content_revision
 from tests import test_manifest_native_full_schema as full_schema
 
 database = full_schema.database
@@ -351,17 +360,27 @@ async def test_native_project_apply_links_and_unlinks_what_it_names(database):
     resource = await _project_resource(db, other)
     taken = _project_document(f"project-{other}", stranger, {"db": {"ref": first_ref}})
     taken["metadata"] = resource["document"]["metadata"]
+    expected = {
+        f"Project/Account/{stranger['id']}/project-{other}": resource[
+            "resource_version"
+        ]
+    }
+    # Unseen, it answers as a connector that does not exist...
     with pytest.raises(HTTPException) as refused:
-        await _apply(
-            db,
-            taken,
-            stranger,
-            expected={
-                f"Project/Account/{stranger['id']}/project-{other}": resource[
-                    "resource_version"
-                ]
-            },
-        )
+        await _apply(db, taken, stranger, expected=expected)
+    assert (refused.value.status_code, refused.value.detail) == (
+        422,
+        REFERENCE_MISSING,
+    )
+    # ...and seen through a project the stranger joined, it still needs the
+    # link API's authority: the connector's owner (or a public connector).
+    await db.execute(
+        "INSERT INTO project_members(project_id,user_id,role) VALUES($1,$2,'viewer')",
+        UUID(project),
+        UUID(stranger["id"]),
+    )
+    with pytest.raises(HTTPException) as refused:
+        await _apply(db, taken, stranger, expected=expected)
     assert refused.value.status_code == 403
     assert first not in await _links(db, other)
 
@@ -446,6 +465,132 @@ async def test_a_member_reads_and_reapplies_refs_to_connectors_shared_with_them(
         == (resource["document"]["spec"]["resources"]["connectors"])
     )
     assert await _links(db, project) == {linked}
+
+
+async def _catalog_connector(db, name: str) -> dict:
+    """A Connector in the shared Catalog: no datasource row behind it."""
+    document = {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "Connector",
+        "metadata": {"name": name, "scope": {"kind": "Catalog", "name": "shared"}},
+        "spec": {"driver": "srw.env/v1", "config": {"names": ["REGION"]}},
+    }
+    resolved = preview_documents([document])["resolved"][0]
+    async with db.transaction_scope():
+        store = ManifestStore(db)
+        await store.lock_catalog()
+        await store.lock_identity(document)
+        row, _ = await store.save(
+            document, resolved, content_revision(resolved["spec"]), [], owner_id=None
+        )
+    return row
+
+
+@pytest.mark.asyncio
+async def test_a_connector_ref_is_authorized_by_the_connector_policy_and_leaks_nothing(
+    database,
+):
+    """``ManifestAuthority.resource`` and manifest ref resolution follow the
+    connector policy for a datasource's Connector: its owner, everyone when
+    public, members of a project it is linked to; a Catalog Connector is never
+    one. A ref the caller may not use answers exactly as a ref to nothing."""
+    db = database
+    owner = await _user(db, "Owner")
+    member = await _user(db, "Member")
+    stranger = await _user(db, "Stranger")
+    publisher = await _user(db, "Publisher")
+    project = await _project(db, "Team", owner, **{member["id"]: "editor"})
+    kb = await _knowledge_base(db, project, owner)
+    private = await _connector(db, "Private", owner)
+    linked = await _connector(
+        db, "Linked", owner, scope_mode="projects", project_ids=[project]
+    )
+    public = await _connector(
+        db, "Public", publisher, is_global=True, read_only=True, scope_mode="all"
+    )
+    catalog = await _catalog_connector(db, "shared-env")
+
+    visible = {
+        "owner": {private, linked, public, kb},
+        "member": {linked, public, kb},
+        "stranger": {public},
+    }
+    users = {"owner": owner, "member": member, "stranger": stranger}
+    for label, user in users.items():
+        for datasource_id in (private, linked, public, kb):
+            row = await ManifestStore(db).by_id(datasource_id)
+            if datasource_id in visible[label]:
+                await ManifestAuthority(db, user).resource(row)
+            else:
+                with pytest.raises(HTTPException) as denied:
+                    await ManifestAuthority(db, user).resource(row)
+                assert denied.value.status_code == 403, (label, datasource_id)
+        # A datasource's Connector is never a Catalog resource.
+        claimed = {
+            **await ManifestStore(db).by_id(public),
+            "scope_kind": "Catalog",
+            "scope_name": "shared",
+        }
+        with pytest.raises(HTTPException):
+            await ManifestAuthority(db, user).resource(claimed)
+
+    async def resolve(user, ref):
+        resolver = LiveManifestResolver(ManifestStore(db), ManifestAuthority(db, user))
+        return await resolver.selection(
+            "Connector", {"ref": ref}, {"kind": "Project", "name": project}, []
+        )
+
+    refs = {
+        private: await _ref_of(db, private),
+        linked: await _ref_of(db, linked),
+        public: await _ref_of(db, public),
+        kb: await _ref_of(db, kb),
+    }
+    missing = [
+        {**refs[private], "name": "absent-0123456789ab"},
+        {"name": refs[kb]["name"], "scope": {"kind": "Project", "name": str(uuid4())}},
+    ]
+    for label, user in users.items():
+        for datasource_id, ref in refs.items():
+            if datasource_id in visible[label]:
+                assert await resolve(user, ref) == (
+                    project_connectors.datasource_binding(datasource_id)
+                )
+                continue
+            with pytest.raises(HTTPException) as hidden:
+                await resolve(user, ref)
+            assert (hidden.value.status_code, hidden.value.detail) == (
+                422,
+                REFERENCE_MISSING,
+            )
+        for ref in missing:
+            with pytest.raises(HTTPException) as absent:
+                await resolve(user, ref)
+            assert (absent.value.status_code, absent.value.detail) == (
+                422,
+                REFERENCE_MISSING,
+            )
+        # A Catalog Connector stays a plain Catalog definition: readable, never
+        # a datasource binding...
+        resolved = await resolve(user, {"name": "shared-env", "scope": catalog_scope()})
+        assert resolved["inline"]["driver"] == "srw.env/v1"
+        # ...and never a job's or session's connector.
+        with pytest.raises(HTTPException) as refused:
+            await resolve_connector_refs(
+                db,
+                {"env": {"name": "shared-env", "scope": catalog_scope()}},
+                owner_id=user["id"],
+                project_id=project,
+            )
+        assert (refused.value.status_code, refused.value.detail) == (
+            403,
+            GENERIC_UNAVAILABLE_DETAIL,
+        )
+    assert catalog["linked_id"] is None
+
+
+def catalog_scope() -> dict:
+    return {"kind": "Catalog", "name": "shared"}
 
 
 @pytest.mark.asyncio

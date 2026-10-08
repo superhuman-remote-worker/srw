@@ -15,6 +15,9 @@ from shared.manifests import API_VERSION, preview_documents, validate_documents
 from shared.manifests.resolution import content_revision
 from shared.manifests.validation import MAX_NODES, check_json_value
 
+REFERENCE_MISSING = (
+    "Referenced resource or requested immutable revision does not exist."
+)
 RESOURCE_MAPS = {
     "experts": "Expert",
     "workspaces": "WorkspaceTemplate",
@@ -154,7 +157,8 @@ class LiveManifestResolver:
         # authored identity remains in its owner's Account scope. Resolve the
         # identity first, then consult that domain grant in resource(). A
         # datasource's Connector is shared the same way (public, or linked to
-        # a project), by the connector policy.
+        # a project), by the connector policy, in an Account or a Project.
+        connector = kind == "Connector" and target_scope["kind"] != "Catalog"
         if (
             kind in ("Expert", "Connector")
             and target_scope["kind"] == "Account"
@@ -166,6 +170,11 @@ class LiveManifestResolver:
                 raise HTTPException(
                     422, "Live Account resource references require a UUID."
                 ) from None
+            ref["scope"] = target_scope
+        elif connector and target_scope["kind"] == "Project":
+            target_scope["name"] = self.project_aliases.get(
+                target_scope["name"], target_scope["name"]
+            )
             ref["scope"] = target_scope
         else:
             ref["scope"] = await self.scope(target_scope)
@@ -182,11 +191,15 @@ class LiveManifestResolver:
             kind, ref["scope"], ref["name"], revision=ref.get("revision")
         )
         if not row:
-            raise HTTPException(
-                422,
-                "Referenced resource or requested immutable revision does not exist.",
-            )
-        await self.authority.resource(row)
+            raise HTTPException(422, REFERENCE_MISSING)
+        try:
+            await self.authority.resource(row)
+        except HTTPException as exc:
+            # A Connector the caller may not see answers as one that does not
+            # exist: a ref is never a probe for someone else's connectors.
+            if not connector or exc.status_code != 403:
+                raise
+            raise HTTPException(422, REFERENCE_MISSING) from None
         self.observe(row)
         if kind == "Connector" and row.get("linked_id"):
             # A datasource's Connector binds as its datasource, the form the

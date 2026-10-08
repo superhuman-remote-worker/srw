@@ -124,11 +124,17 @@ class ManifestAuthority:
                     )
             return
         if row["kind"] == "Connector" and row.get("linked_id") and not write:
-            # A datasource's Connector is visible as its datasource is to the
-            # link API: public, or to an administrator, its creator or a member
-            # of a project it is linked to. Writes stay with its scope (and the
+            # A datasource's Connector is visible by the connector policy, as
+            # its datasource is to the link API: to its owner, an
+            # administrator, everyone when public, and the members of a project
+            # it is linked to; never as a Catalog resource (a datasource's
+            # Connector is never one). Writes stay with its scope (and the
             # store refuses them: the datasource API writes it).
-            datasource = await self.db.get_datasource(str(row["linked_id"]))
+            datasource = (
+                None
+                if row.get("scope_kind") == "Catalog"
+                else await self.db.get_datasource(str(row["linked_id"]))
+            )
             if not datasource or not (
                 datasource.get("is_global")
                 or await user_can_access_datasource(self.user, self.db, datasource)
