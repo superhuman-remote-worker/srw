@@ -44,7 +44,9 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
              scope (creator's Account, a native KB's project, an ownerless
              row's one project), driver, access, the platform marker, a config
              valid against the driver's schema with only ``scheme://host``
-             of a URL -- and no resource carries credentials. Other people's
+             of a URL -- and a resource's credentials are only references
+             to its own ``connector-<hex>`` secret (since D3b; the secret
+             itself is scripts/k3d-connector-secrets-gate.py's). Other people's
              rows are held to the same mapping, but a problem there (a row
              the backfill deferred, say) is a NOTE, not a failure. The rerun
              changed no ``policy_revision``, no project link and none of the
@@ -716,8 +718,15 @@ def row_problems(row: dict[str, Any], *, exact_name: bool = False) -> list[str]:
     access = "ReadOnly" if row.get("read_only") is True else None
     if live.get("access") != access:
         problems.append(f"{label}: access {live.get('access')}, expected {access}")
-    if live.get("has_credentials"):
-        problems.append(f"{label}: the Connector carries credentials")
+    credentials = live.get("credentials") or {}
+    own = "connector-" + hex_id
+    if not isinstance(credentials, dict) or any(
+        ref != {"secretRef": {"name": own, "key": key}}
+        for key, ref in credentials.items()
+    ):
+        problems.append(
+            f"{label}: the Connector's credentials are not references to its own secret"
+        )
     problems += [
         f"{label}: {problem}"
         for problem in config_problems(str(live.get("driver")), live.get("config"))
@@ -767,7 +776,7 @@ SELECT coalesce(json_agg(json_build_object(
       'access', r.document->'spec'->>'access',
       'transport', r.document->'spec'->'config'->>'transport',
       'config', r.document->'spec'->'config',
-      'has_credentials', (r.document->'spec') ? 'credentials',
+      'credentials', r.document->'spec'->'credentials',
       'platform_managed', r.platform_managed,
       'version', r.resource_version,
       'display_name', r.document->'metadata'->'annotations'->>'srw.io/display-name',
@@ -1257,7 +1266,7 @@ class ConnectorResourcesGate:
         problems = row_problems(row, exact_name=True) if row else ["no row"]
         self.report.check(
             "write: create writes the row's Connector (Account scope, "
-            "srw.postgresql/v1, no credentials)",
+            "srw.postgresql/v1, credentials only by reference)",
             not problems and resource.get("version") == 1,
             "; ".join(problems[:5]) or f"version {resource.get('version')}",
         )

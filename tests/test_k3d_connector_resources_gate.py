@@ -212,7 +212,7 @@ def _row(**over):
             "driver": "srw.postgresql/v1",
             "access": None,
             "transport": None,
-            "has_credentials": False,
+            "credentials": {},
             "config": {"endpoint": "postgresql://db.internal:5432"},
             "platform_managed": None,
             "version": 1,
@@ -231,6 +231,14 @@ def test_a_row_that_matches_the_mapping_has_no_problem():
     assert gate.row_problems(_row(), exact_name=True) == []
 
 
+def test_references_to_its_own_secret_are_the_mapping_since_d3b():
+    own = "connector-" + ROW_ID.replace("-", "")
+    refs = {key: {"secretRef": {"name": own, "key": key}} for key in ("url", "shape")}
+    assert gate.row_problems(_row(resource={"credentials": refs})) == []
+    # A resource written before D3b has no references at all.
+    assert gate.row_problems(_row(resource={"credentials": None})) == []
+
+
 @pytest.mark.parametrize(
     ("over", "problem"),
     [
@@ -239,7 +247,19 @@ def test_a_row_that_matches_the_mapping_has_no_problem():
         ({"resource": {"scope_name": PROJECT}}, "scope"),
         ({"resource": {"driver": "srw.neo4j/v1"}}, "driver"),
         ({"read_only": True}, "access"),
-        ({"resource": {"has_credentials": True}}, "credentials"),
+        ({"resource": {"credentials": {"password": "s3cret"}}}, "credentials"),
+        (
+            {
+                "resource": {
+                    "credentials": {
+                        "url": {
+                            "secretRef": {"name": "connector-" + "0" * 32, "key": "url"}
+                        }
+                    }
+                }
+            },
+            "credentials",
+        ),
         ({"resource": {"name": "orders"}}, "name"),
         ({"resource": {"linked_id": None}}, "linked"),
         ({"manifest_resource_id": None}, "manifest_resource_id"),
