@@ -44,7 +44,12 @@ from orchestrator.services.job_admission_datasources import (
     prepare_job_admission_datasources,
 )
 from orchestrator.services.job_admission_scope import JobAdmissionActor
-from orchestrator.services.project_connectors import legacy_alias, link_entries
+from orchestrator.services.project_connectors import (
+    drop_connector_aliases,
+    legacy_alias,
+    link_entries,
+)
+from shared.manifests import validate_documents
 from orchestrator.services.thread_admission import (
     resolve_thread_creation_plan,
     select_thread_datasources,
@@ -644,3 +649,36 @@ def test_two_links_with_one_resource_name_get_distinct_aliases():
         "prod-0123456789ab",
         "connector-" + SECOND.replace("-", ""),
     ]
+
+
+def test_a_dropped_alias_leaves_every_binding_that_named_it():
+    spec = {
+        "resources": {
+            "experts": {"lead": {"ref": {"name": "developer"}}},
+            "connectors": {
+                "db": {"ref": {"name": "prod-db-aaaaaaaaaaaa"}},
+                "kb": {"ref": {"name": "knowledge-cccccccccccc"}},
+            },
+        },
+        "defaults": {"connectors": ["db", "kb"]},
+        "team": {
+            "state": "Held",
+            "officer": {"expert": "lead", "connectors": ["kb", "db"]},
+            "slots": {"build": {"count": 1, "expert": "lead", "connectors": ["db"]}},
+        },
+    }
+    drop_connector_aliases(spec, ["db"])
+    assert list(spec["resources"]["connectors"]) == ["kb"]
+    assert spec["defaults"]["connectors"] == ["kb"]
+    assert spec["team"]["officer"]["connectors"] == ["kb"]
+    assert spec["team"]["slots"]["build"]["connectors"] == []
+    validate_documents(
+        [
+            {
+                "apiVersion": "srw/v1alpha1",
+                "kind": "Project",
+                "metadata": {"name": "team"},
+                "spec": spec,
+            }
+        ]
+    )

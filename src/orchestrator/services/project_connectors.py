@@ -130,6 +130,26 @@ def link_entries(rows: Iterable[Mapping[str, Any]]) -> dict[str, tuple[str, dict
     return entries
 
 
+def drop_connector_aliases(spec: dict, aliases: Iterable[str]) -> None:
+    """Remove connector aliases from a Project spec: the entries, and every
+    binding that names them (``defaults``, ``team.officer``, each
+    ``team.slots`` entry; the bindings validation checks)."""
+    gone = set(aliases)
+    connectors = spec.setdefault("resources", {}).setdefault("connectors", {})
+    for alias in gone:
+        connectors.pop(alias, None)
+    team = spec.get("team") or {}
+    for binding in (
+        spec.get("defaults") or {},
+        team.get("officer") or {},
+        *(team.get("slots") or {}).values(),
+    ):
+        if "connectors" in binding:
+            binding["connectors"] = [
+                alias for alias in binding["connectors"] if alias not in gone
+            ]
+
+
 async def project_link_rows(db, project_id: Any) -> list:
     """The Project's links with their Connector resources, for ``link_entries``."""
     return await db.fetch(_LINKS, UUID(str(project_id)))
@@ -349,16 +369,7 @@ async def _refresh_authored(db, store, resource, desired):
             )
     children = []
     for item in (document, resolved):
-        connectors = (
-            item["spec"].setdefault("resources", {}).setdefault("connectors", {})
-        )
-        for alias in removed:
-            connectors.pop(alias, None)
-        defaults = item["spec"].get("defaults") or {}
-        if "connectors" in defaults:
-            defaults["connectors"] = [
-                alias for alias in defaults["connectors"] if alias not in removed
-            ]
+        drop_connector_aliases(item["spec"], removed)
     connectors = document["spec"]["resources"]["connectors"]
     resolved_connectors = resolved["spec"]["resources"]["connectors"]
     for alias, datasource_id in added:
@@ -540,6 +551,7 @@ async def heal_project_connectors(db) -> dict[str, int]:
 __all__ = [
     "DATASOURCE_DRIVER",
     "datasource_binding",
+    "drop_connector_aliases",
     "entry_datasource_id",
     "entry_datasource_ids",
     "heal_project_connectors",
