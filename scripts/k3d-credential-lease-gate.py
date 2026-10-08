@@ -11,7 +11,8 @@ in-pod program capping its own memory, and a cleanup in ``finally`` that
 touches only what this run created and then checks for residue by gate id.
 
 It needs the k3d profile of deployment/values-local.yaml.example:
-``orchestrator.connectorLeases.probeDriver: true`` (the development driver
+``orchestrator.connectorLeases.exchangePort: 8088`` (the chart serves no
+exchange by default), ``probeDriver: true`` (the development driver
 ``srw.lease-probe/v1``, which keeps a fake upstream secret behind a lease)
 and a short ``ttlSeconds`` (120), so lapse and renewal show in minutes.
 
@@ -892,8 +893,9 @@ class CredentialLeaseGate:
         )
         if not configured:
             raise GateError(
-                "set orchestrator.connectorLeases (probeDriver: true, a ttlSeconds "
-                f"of at most {self.args.max_ttl}) as the k3d profile does"
+                "set orchestrator.connectorLeases (exchangePort: 8088, probeDriver: "
+                f"true, a ttlSeconds of at most {self.args.max_ttl}) as the k3d "
+                "profile does"
             )
         self.port, self.ttl = int(port), int(ttl)
         self.sweep = min(int(sweep) if sweep.isdigit() else 60, self.ttl // 4)
