@@ -62,11 +62,11 @@ type bridge struct {
 	logf func(string, ...any)
 	now  func() time.Time
 
-	mu       sync.Mutex
-	closed   bool
-	sessions map[string]*session // by Mcp-Session-Id
-	bindings map[string]*session // by binding; "" is the front's probe
-	// Process groups not yet reaped (live sessions and stopping ones): the
+	mu        sync.Mutex
+	closed    bool
+	processes map[string]*process // by binding; "" is the front's probe
+	sessions  map[string]*session // by Mcp-Session-Id
+	// Process groups not yet reaped (live processes and stopping ones): the
 	// orphan reaper never waits for one of them.
 	groups   map[int]bool
 	stopping sync.WaitGroup
@@ -74,36 +74,49 @@ type bridge struct {
 
 func newBridge(opts options, env []string, logf func(string, ...any), now func() time.Time) *bridge {
 	return &bridge{
-		opts:     opts,
-		env:      env,
-		logf:     logf,
-		now:      now,
-		sessions: map[string]*session{},
-		bindings: map[string]*session{},
-		groups:   map[int]bool{},
+		opts:      opts,
+		env:       env,
+		logf:      logf,
+		now:       now,
+		processes: map[string]*process{},
+		sessions:  map[string]*session{},
+		groups:    map[int]bool{},
 	}
 }
 
-// session is one binding's MCP session and the process serving it: the
-// SDK's streamable server transport faces the front, its command transport
-// the process, and two pumps copy messages between them.
-type session struct {
+// process is one binding's stdio process. It starts with the binding's
+// first session and lives as long as the binding: until the front ends the
+// binding, it is idle, or it exits. It serves the binding's sessions one at
+// a time (SRW's agent opens one each time it attaches the connector): a new
+// session takes over from the previous one. A stdio server serves one
+// client, so the process is initialized once: a later session's initialize
+// is answered with the process's own first answer, and that session's
+// initialized notification is not forwarded. A process with a call still
+// unanswered when a new session comes (a cancelled one included: a server
+// may still answer it) is restarted instead, so a late answer can never
+// reach another session's call of the same id.
+type process struct {
 	bridge     *bridge
-	id         string
 	binding    string
-	transport  *mcp.StreamableServerTransport
-	server     mcp.Connection
-	child      mcp.Connection
 	cmd        *exec.Cmd
+	child      mcp.Connection
 	stderr     *lineLogger
 	credential bool
 	started    time.Time
 
-	mu       sync.Mutex
+	mu sync.Mutex
+	// The session the process serves now; nil between sessions.
+	current *session
+	// The first initialize's id until its answer, then that answer.
+	initID     jsonrpc.ID
+	initDone   bool
+	initResult json.RawMessage
+	// The calls the process has not answered yet, by the session that made
+	// each.
+	pending  map[jsonrpc.ID]*session
 	lastUsed time.Time
-	active   int
-	// The front's calls the process has not answered yet.
-	pending map[jsonrpc.ID]bool
+	// Requests and streams of its session open now: never idle while any.
+	active int
 
 	done     chan struct{}
 	stopOnce sync.Once
@@ -111,87 +124,78 @@ type session struct {
 	stopped chan struct{}
 }
 
-func (s *session) label() string {
-	if s.binding == "" {
+// session is one MCP session of a binding: the SDK's streamable server
+// transport facing the front, and a pump copying its messages to the
+// binding's process.
+type session struct {
+	id        string
+	process   *process
+	transport *mcp.StreamableServerTransport
+	server    mcp.Connection
+	// The process was initialized before this session took it over.
+	reused    bool
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func labelOf(binding string) string {
+	if binding == "" {
 		return "probe"
 	}
-	return "binding=" + s.binding
+	return "binding=" + binding
 }
 
-func (s *session) pid() int {
-	if s.cmd.Process == nil {
+func (p *process) label() string { return labelOf(p.binding) }
+
+func (p *process) pid() int {
+	if p.cmd.Process == nil {
 		return 0
 	}
-	return s.cmd.Process.Pid
+	return p.cmd.Process.Pid
 }
 
-// enter and leave count the requests and streams open on the session; a
-// session with one open is never idle.
-func (s *session) enter() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.active++
-	s.lastUsed = s.bridge.now()
+// enter and leave count the requests and streams open on the process's
+// session; a process with one open is never idle.
+func (p *process) enter() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.active++
+	p.lastUsed = p.bridge.now()
 }
 
-func (s *session) leave() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.active--
-	s.lastUsed = s.bridge.now()
+func (p *process) leave() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.active--
+	p.lastUsed = p.bridge.now()
 }
 
-func (s *session) touch() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.lastUsed = s.bridge.now()
+func (p *process) touch() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lastUsed = p.bridge.now()
 }
 
-// expect records a call of the front's the process must answer; answered
-// forgets it once the process did.
-func (s *session) expect(message jsonrpc.Message) {
-	if request, ok := message.(*jsonrpc.Request); ok && request.IsCall() {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		s.pending[request.ID] = true
-	}
-}
-
-func (s *session) answered(message jsonrpc.Message) {
-	if response, ok := message.(*jsonrpc.Response); ok {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		delete(s.pending, response.ID)
-	}
-}
-
-// failPending answers each call the process will no longer answer with a
-// closed-connection error, so its caller learns at once that the session
-// ended (SRW's client reconnects within its budget) instead of waiting for
-// its call timeout.
-func (s *session) failPending(reason string) {
-	s.mu.Lock()
-	ids := make([]jsonrpc.ID, 0, len(s.pending))
-	for id := range s.pending {
-		ids = append(ids, id)
-	}
-	s.pending = map[jsonrpc.ID]bool{}
-	s.mu.Unlock()
-	for _, id := range ids {
-		s.server.Write(context.Background(), &jsonrpc.Response{
-			ID:    id,
-			Error: &jsonrpc.Error{Code: connectionClosed, Message: "the server's process stopped: " + reason},
-		})
-	}
-}
-
-func (s *session) idleFor(now time.Time) time.Duration {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.active > 0 {
+func (p *process) idleFor(now time.Time) time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.active > 0 {
 		return 0
 	}
-	return now.Sub(s.lastUsed)
+	return now.Sub(p.lastUsed)
+}
+
+// reusable: a new session may take the process over (it is initialized,
+// and no earlier session's call is still unanswered).
+func (p *process) reusable() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	select {
+	case <-p.done:
+		return false
+	default:
+	}
+	return p.initDone && len(p.pending) == 0
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -274,8 +278,8 @@ func (b *bridge) serveMCP(w http.ResponseWriter, r *http.Request) {
 		// accepted is the one it decodes.
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.ContentLength = int64(len(body))
-		s.enter()
-		defer s.leave()
+		s.process.enter()
+		defer s.process.leave()
 		s.transport.ServeHTTP(w, r)
 	case http.MethodGet:
 		s := b.lookup(sessionID, binding)
@@ -283,8 +287,8 @@ func (b *bridge) serveMCP(w http.ResponseWriter, r *http.Request) {
 			refuse(w, http.StatusNotFound, "session not found")
 			return
 		}
-		s.enter()
-		defer s.leave()
+		s.process.enter()
+		defer s.process.leave()
 		s.transport.ServeHTTP(w, r)
 	case http.MethodDelete:
 		s := b.lookup(sessionID, binding)
@@ -292,7 +296,11 @@ func (b *bridge) serveMCP(w http.ResponseWriter, r *http.Request) {
 			refuse(w, http.StatusNotFound, "session not found")
 			return
 		}
-		s.stop("its client ended the session")
+		s.close()
+		if binding == "" {
+			// The probe's process serves one probe.
+			s.process.stop("the probe ended")
+		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		w.Header().Set("Allow", "GET, POST, DELETE")
@@ -300,30 +308,29 @@ func (b *bridge) serveMCP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func labelOf(binding string) string {
-	if binding == "" {
-		return "probe"
-	}
-	return "binding=" + binding
-}
-
-// lookup finds a session of this binding: a session id another binding
-// opened is no session of this one's.
+// lookup finds the session a binding's process serves now: a session id
+// another binding opened, or one a later session took over from, is no
+// session of this one's.
 func (b *bridge) lookup(sessionID, binding string) *session {
 	if sessionID == "" {
 		return nil
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	s := b.sessions[sessionID]
-	if s == nil || s.binding != binding {
+	b.mu.Unlock()
+	if s == nil || s.process.binding != binding {
+		return nil
+	}
+	s.process.mu.Lock()
+	defer s.process.mu.Unlock()
+	if s.process.current != s {
 		return nil
 	}
 	return s
 }
 
-// open starts a session and its process for a binding, replacing the
-// binding's previous one: one process per binding.
+// open starts a session of a binding on the binding's process: the one it
+// has, or a new one.
 func (b *bridge) open(binding, credential string) (*session, int, error) {
 	if b.opts.credentialEnv != "" && binding != "" && credential == "" {
 		return nil, http.StatusBadRequest, errors.New("the front named no credential for this binding")
@@ -338,45 +345,84 @@ func (b *bridge) open(binding, credential string) (*session, int, error) {
 		b.mu.Unlock()
 		return nil, http.StatusServiceUnavailable, errors.New("the bridge is stopping")
 	}
-	previous := b.bindings[binding]
-	if binding != "" && previous == nil && b.bindingCount() >= b.opts.maxProcesses {
-		b.mu.Unlock()
-		b.logf("refused %s: %d binding processes run, the most this pod runs", labelOf(binding), b.opts.maxProcesses)
-		return nil, http.StatusServiceUnavailable, fmt.Errorf("this server's pod runs at most %d binding processes", b.opts.maxProcesses)
+	p := b.processes[binding]
+	var replaced *process
+	if p != nil && !p.reusable() {
+		replaced, p = p, nil
 	}
-	s, err := b.start(binding, credential)
-	if err != nil {
-		b.mu.Unlock()
-		b.logf("%s: the server's program did not start: %v", labelOf(binding), err)
-		return nil, http.StatusBadGateway, errors.New("the server's program did not start")
+	if p == nil {
+		if binding != "" && b.bindingCount(replaced) >= b.opts.maxProcesses {
+			b.mu.Unlock()
+			b.logf("refused %s: %d binding processes run, the most this pod runs", labelOf(binding), b.opts.maxProcesses)
+			return nil, http.StatusServiceUnavailable, fmt.Errorf("this server's pod runs at most %d binding processes", b.opts.maxProcesses)
+		}
+		started, err := b.start(binding, credential)
+		if err != nil {
+			b.mu.Unlock()
+			b.logf("%s: the server's program did not start: %v", labelOf(binding), err)
+			return nil, http.StatusBadGateway, errors.New("the server's program did not start")
+		}
+		b.processes[binding] = started
+		b.groups[started.pid()] = true
+		p = started
 	}
-	if previous != nil {
-		delete(b.sessions, previous.id)
-	}
-	b.sessions[s.id] = s
-	b.bindings[binding] = s
-	b.groups[s.pid()] = true
+	s, previous, err := b.attach(p)
 	b.mu.Unlock()
+	if replaced != nil {
+		replaced.stop("a new session of its binding came while it had a call unanswered")
+	}
 	if previous != nil {
-		previous.stop("a new session of its binding replaced it")
+		previous.close()
+	}
+	if err != nil {
+		return nil, http.StatusBadGateway, errors.New("the session did not start")
 	}
 	return s, 0, nil
 }
 
-// bindingCount is the binding processes running (the probe's excluded);
-// the caller holds b.mu.
-func (b *bridge) bindingCount() int {
+// bindingCount is the binding processes running (the probe's and one
+// being replaced excluded); the caller holds b.mu.
+func (b *bridge) bindingCount(except *process) int {
 	count := 0
-	for binding := range b.bindings {
-		if binding != "" {
+	for binding, p := range b.processes {
+		if binding != "" && p != except {
 			count++
 		}
 	}
 	return count
 }
 
-// start runs the program for one binding and connects the two halves.
-func (b *bridge) start(binding, credential string) (*session, error) {
+// attach opens a session on a process; it returns the session the process
+// served until now, for the caller to close. The caller holds b.mu.
+func (b *bridge) attach(p *process) (*session, *session, error) {
+	transport := &mcp.StreamableServerTransport{SessionID: rand.Text()}
+	server, err := transport.Connect(context.Background())
+	if err != nil {
+		return nil, nil, err
+	}
+	s := &session{
+		id:        transport.SessionID,
+		process:   p,
+		transport: transport,
+		server:    server,
+		closed:    make(chan struct{}),
+	}
+	p.mu.Lock()
+	previous := p.current
+	p.current = s
+	s.reused = p.initDone
+	p.lastUsed = b.now()
+	p.mu.Unlock()
+	b.sessions[s.id] = s
+	go s.toProcess()
+	if s.reused {
+		b.logf("%s: a new session took over process %d", p.label(), p.pid())
+	}
+	return s, previous, nil
+}
+
+// start runs the program for one binding and connects to it.
+func (b *bridge) start(binding, credential string) (*process, error) {
 	cmd := exec.Command(b.opts.program[0], b.opts.program[1:]...)
 	cmd.Env = childEnv(b.env, b.opts.credentialEnv, credential)
 	stderr := &lineLogger{logf: b.logf, label: labelOf(binding), scrub: newScrubber(credential)}
@@ -388,98 +434,180 @@ func (b *bridge) start(binding, credential string) (*session, error) {
 	if err != nil {
 		return nil, err
 	}
-	transport := &mcp.StreamableServerTransport{SessionID: rand.Text()}
-	server, err := transport.Connect(context.Background())
-	if err != nil {
-		child.Close()
-		return nil, err
-	}
 	now := b.now()
-	s := &session{
+	p := &process{
 		bridge:     b,
-		id:         transport.SessionID,
 		binding:    binding,
-		transport:  transport,
-		server:     server,
-		child:      child,
 		cmd:        cmd,
+		child:      child,
 		stderr:     stderr,
 		credential: credential != "",
 		started:    now,
 		lastUsed:   now,
-		pending:    map[jsonrpc.ID]bool{},
+		pending:    map[jsonrpc.ID]*session{},
 		done:       make(chan struct{}),
 		stopped:    make(chan struct{}),
 	}
-	go s.toProcess()
-	go s.toFront()
-	b.logf("%s: started process %d", s.label(), s.pid())
-	return s, nil
+	go p.toFront()
+	b.logf("%s: started process %d", p.label(), p.pid())
+	return p, nil
 }
 
-// toProcess copies the front's messages to the process's stdin. Each was
+// toProcess copies the session's messages to its process's stdin. Each was
 // checked to encode to the bytes the front sent, so the process reads
-// exactly those.
+// exactly those. A session that took an initialized process over gets the
+// process's own initialize answer, and its initialized notification stays
+// here.
 func (s *session) toProcess() {
 	ctx := context.Background()
+	p := s.process
 	for {
 		message, err := s.server.Read(ctx)
 		if err != nil {
-			s.stop("its session closed")
+			s.close()
 			return
 		}
-		s.expect(message)
-		if err := s.child.Write(ctx, message); err != nil {
-			s.stop("its process stopped reading")
-			return
-		}
-	}
-}
-
-// toFront copies the process's messages to the session: an answer to the
-// request that asked, anything else to the session's open stream. A
-// message nothing can take (no stream open, an answer nobody waits for) is
-// dropped.
-func (s *session) toFront() {
-	ctx := context.Background()
-	for {
-		message, err := s.child.Read(ctx)
-		if err != nil {
-			s.stop("its process ended")
-			return
-		}
-		s.touch()
-		s.answered(message)
-		if err := s.server.Write(ctx, message); err != nil {
-			select {
-			case <-s.done:
-				return
-			default:
+		if s.reused {
+			if request, ok := message.(*jsonrpc.Request); ok {
+				switch {
+				case request.IsCall() && request.Method == "initialize":
+					p.mu.Lock()
+					result := p.initResult
+					p.mu.Unlock()
+					s.server.Write(ctx, &jsonrpc.Response{ID: request.ID, Result: result})
+					continue
+				case !request.IsCall() && request.Method == "notifications/initialized":
+					continue
+				}
 			}
 		}
+		if request, ok := message.(*jsonrpc.Request); ok && request.IsCall() {
+			p.mu.Lock()
+			if request.Method == "initialize" && !p.initDone && !p.initID.IsValid() {
+				p.initID = request.ID
+			}
+			p.pending[request.ID] = s
+			p.mu.Unlock()
+		}
+		if err := p.child.Write(ctx, message); err != nil {
+			p.stop("its process stopped reading")
+			return
+		}
 	}
 }
 
-// stop ends the session at once (each call in flight is answered with a
-// closed-connection error, its requests and streams end, its id is unknown
-// from now on) and its process within the grace: stdin closed, then
-// SIGTERM, then SIGKILL, and its process group killed after it.
-func (s *session) stop(reason string) {
-	s.stopOnce.Do(func() {
-		s.failPending(reason)
-		close(s.done)
+// toFront copies the process's messages to its sessions: an answer to the
+// session whose call it answers, if that session is still the process's;
+// a request or notification of the server's to its session's open stream.
+// A message nothing can take is dropped.
+func (p *process) toFront() {
+	ctx := context.Background()
+	for {
+		message, err := p.child.Read(ctx)
+		if err != nil {
+			p.stop("its process ended")
+			return
+		}
+		p.touch()
+		var target *session
+		p.mu.Lock()
+		switch m := message.(type) {
+		case *jsonrpc.Response:
+			owner := p.pending[m.ID]
+			delete(p.pending, m.ID)
+			if p.initID.IsValid() && m.ID == p.initID {
+				p.initID = jsonrpc.ID{}
+				if m.Error == nil {
+					p.initDone, p.initResult = true, m.Result
+				}
+			}
+			if owner != nil && owner == p.current {
+				target = owner
+			}
+		default:
+			target = p.current
+		}
+		p.mu.Unlock()
+		if target != nil {
+			// Undeliverable (no stream open for it): dropped.
+			target.server.Write(ctx, message)
+		}
+	}
+}
+
+// close ends a session: its requests and streams end and its id is
+// unknown from now on. Its process stays with its binding.
+func (s *session) close() {
+	s.closeOnce.Do(func() {
+		close(s.closed)
 		s.server.Close()
-		b := s.bridge
-		b.forget(s)
+		p := s.process
+		b := p.bridge
+		b.mu.Lock()
+		if b.sessions[s.id] == s {
+			delete(b.sessions, s.id)
+		}
+		b.mu.Unlock()
+		p.mu.Lock()
+		if p.current == s {
+			p.current = nil
+		}
+		p.mu.Unlock()
+	})
+}
+
+// failPending answers each call of the process's session the process will
+// no longer answer with a closed-connection error, so its caller learns at
+// once that the session ended (SRW's client reconnects within its budget)
+// instead of waiting for its call timeout.
+func (p *process) failPending(reason string) {
+	p.mu.Lock()
+	current := p.current
+	var ids []jsonrpc.ID
+	for id, owner := range p.pending {
+		if owner == current {
+			ids = append(ids, id)
+		}
+	}
+	p.pending = map[jsonrpc.ID]*session{}
+	p.mu.Unlock()
+	for _, id := range ids {
+		current.server.Write(context.Background(), &jsonrpc.Response{
+			ID:    id,
+			Error: &jsonrpc.Error{Code: connectionClosed, Message: "the server's process stopped: " + reason},
+		})
+	}
+}
+
+// stop ends the process's session at once (each call in flight is answered
+// with a closed-connection error) and the process within the grace: stdin
+// closed, then SIGTERM, then SIGKILL, and its process group killed after
+// it.
+func (p *process) stop(reason string) {
+	p.stopOnce.Do(func() {
+		p.failPending(reason)
+		close(p.done)
+		p.mu.Lock()
+		current := p.current
+		p.mu.Unlock()
+		if current != nil {
+			current.close()
+		}
+		b := p.bridge
+		b.mu.Lock()
+		if b.processes[p.binding] == p {
+			delete(b.processes, p.binding)
+		}
+		b.mu.Unlock()
 		b.stopping.Add(1)
 		go func() {
 			defer b.stopping.Done()
-			defer close(s.stopped)
-			pid := s.pid()
-			err := s.child.Close()
+			defer close(p.stopped)
+			pid := p.pid()
+			err := p.child.Close()
 			killGroup(pid)
 			reapGroup(pid, reapWithin)
-			s.stderr.flush()
+			p.stderr.flush()
 			b.mu.Lock()
 			delete(b.groups, pid)
 			b.mu.Unlock()
@@ -487,32 +615,20 @@ func (s *session) stop(reason string) {
 			if err != nil {
 				outcome = err.Error()
 			}
-			b.logf("%s: process %d stopped (%s): %s", s.label(), pid, reason, outcome)
+			b.logf("%s: process %d stopped (%s): %s", p.label(), pid, reason, outcome)
 		}()
 	})
-}
-
-// forget removes the session from the registry, if it is still there.
-func (b *bridge) forget(s *session) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.sessions[s.id] == s {
-		delete(b.sessions, s.id)
-	}
-	if b.bindings[s.binding] == s {
-		delete(b.bindings, s.binding)
-	}
 }
 
 // endBinding stops a binding's process: the front saw its lease end.
 func (b *bridge) endBinding(binding, reason string) bool {
 	b.mu.Lock()
-	s := b.bindings[binding]
+	p := b.processes[binding]
 	b.mu.Unlock()
-	if s == nil {
+	if p == nil {
 		return false
 	}
-	s.stop(reason)
+	p.stop(reason)
 	return true
 }
 
@@ -538,24 +654,24 @@ func (b *bridge) housekeep(ctx context.Context) {
 	}
 }
 
-// stopIdle stops each process whose session has had no request or open
-// stream for the idle time (the probe's for probeIdle at most).
+// stopIdle stops each process that has had no request or open stream for
+// the idle time (the probe's for probeIdle at most).
 func (b *bridge) stopIdle() {
 	now := b.now()
 	b.mu.Lock()
-	var idle []*session
-	for _, s := range b.sessions {
+	var idle []*process
+	for binding, p := range b.processes {
 		limit := b.opts.idle
-		if s.binding == "" && probeIdle < limit {
+		if binding == "" && probeIdle < limit {
 			limit = probeIdle
 		}
-		if s.idleFor(now) >= limit {
-			idle = append(idle, s)
+		if p.idleFor(now) >= limit {
+			idle = append(idle, p)
 		}
 	}
 	b.mu.Unlock()
-	for _, s := range idle {
-		s.stop("idle")
+	for _, p := range idle {
+		p.stop("idle")
 	}
 }
 
@@ -573,13 +689,13 @@ func (b *bridge) reapOrphans() {
 func (b *bridge) close(reason string) {
 	b.mu.Lock()
 	b.closed = true
-	var all []*session
-	for _, s := range b.sessions {
-		all = append(all, s)
+	var all []*process
+	for _, p := range b.processes {
+		all = append(all, p)
 	}
 	b.mu.Unlock()
-	for _, s := range all {
-		s.stop(reason)
+	for _, p := range all {
+		p.stop(reason)
 	}
 	b.stopping.Wait()
 }
@@ -591,6 +707,7 @@ type processStatus struct {
 	Started    time.Time `json:"started"`
 	LastUsed   time.Time `json:"last_used"`
 	Active     int       `json:"active"`
+	Session    bool      `json:"session"`
 	Credential bool      `json:"credential"`
 }
 
@@ -601,13 +718,14 @@ type bridgeStatus struct {
 	IdleSeconds   int             `json:"idle_seconds"`
 }
 
-// status lists the processes: their binding, process id and whether each
-// got a credential; never a credential or a session id.
+// status lists the processes: their binding, process id, whether a session
+// holds each now and whether each got a credential; never a credential or
+// a session id.
 func (b *bridge) status() bridgeStatus {
 	b.mu.Lock()
-	sessions := make([]*session, 0, len(b.bindings))
-	for _, s := range b.bindings {
-		sessions = append(sessions, s)
+	processes := make([]*process, 0, len(b.processes))
+	for _, p := range b.processes {
+		processes = append(processes, p)
 	}
 	b.mu.Unlock()
 	out := bridgeStatus{
@@ -616,18 +734,19 @@ func (b *bridge) status() bridgeStatus {
 		CredentialEnv: b.opts.credentialEnv,
 		IdleSeconds:   int(b.opts.idle / time.Second),
 	}
-	for _, s := range sessions {
-		s.mu.Lock()
+	for _, p := range processes {
+		p.mu.Lock()
 		out.Processes = append(out.Processes, processStatus{
-			Binding:    s.binding,
-			Probe:      s.binding == "",
-			PID:        s.pid(),
-			Started:    s.started.UTC(),
-			LastUsed:   s.lastUsed.UTC(),
-			Active:     s.active,
-			Credential: s.credential,
+			Binding:    p.binding,
+			Probe:      p.binding == "",
+			PID:        p.pid(),
+			Started:    p.started.UTC(),
+			LastUsed:   p.lastUsed.UTC(),
+			Active:     p.active,
+			Session:    p.current != nil,
+			Credential: p.credential,
 		})
-		s.mu.Unlock()
+		p.mu.Unlock()
 	}
 	sort.Slice(out.Processes, func(i, j int) bool { return out.Processes[i].Binding < out.Processes[j].Binding })
 	return out

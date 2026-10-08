@@ -10,8 +10,9 @@ k3d gate proves in the cluster: two sessions get two processes in one pod,
 each process gets its binding's credential in its environment and nothing
 of SRW's, the agent holds only the lease token, ReadOnly hides and refuses
 write tools before any process sees them, an execution without the
-connector gets 401, a process ends with its binding and with its session,
-the pod runs at most its cap of processes, and the D5a review's
+connector gets 401, a process ends with its binding and serves its
+binding's next session with its state (initialized once), the pod runs at
+most its cap of processes, and the D5a review's
 parsing-differential corpus never reaches a process as a write call: every
 line a process reads is in one form every reader agrees on.
 
@@ -341,12 +342,25 @@ async def test_a_process_ends_with_its_binding(pod):
 
 
 @pytest.mark.asyncio
-async def test_a_process_ends_with_its_session(pod):
-    manager = await _connected(_entry(pod, pod.exchange.issue("ReadWrite")))
-    pid = json.loads(await _text(_tool(manager, "whoami")))["pid"]
-    await manager.aclose()
-    assert await _until(lambda: not _alive(pid)), "the process outlived its session"
-    assert pod.processes_by_binding() == {}
+async def test_a_process_serves_its_bindings_next_session_with_its_state(pod):
+    """The agent opens a session each time it attaches the connector (a
+    stateless session's turns may run on different agent pods): the
+    binding's process, and the state it keeps, serve the next one."""
+    token = pod.exchange.issue("ReadWrite")
+    first = await _connected(_entry(pod, token))
+    before = json.loads(await _text(_tool(first, "whoami")))
+    await first.aclose()
+    assert _alive(before["pid"])
+    second = await _connected(_entry(pod, token))
+    try:
+        after = json.loads(await _text(_tool(second, "whoami")))
+        assert after["pid"] == before["pid"] and after["calls"] == before["calls"] + 1
+        assert pod.processes_by_binding() == {_lease_id(pod, token): before["pid"]}
+        # The server was initialized once.
+        log = next(pod.lines.glob(f"{before['pid']}.log")).read_bytes()
+        assert log.count(b'"method":"initialize"') == 1
+    finally:
+        await second.aclose()
 
 
 @pytest.mark.asyncio

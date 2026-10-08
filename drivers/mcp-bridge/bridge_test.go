@@ -349,21 +349,76 @@ func TestASessionReachesOnlyItsOwnBindingsProcess(t *testing.T) {
 	}
 }
 
-func TestANewInitializeReplacesItsBindingsProcess(t *testing.T) {
+func TestANewSessionOfABindingTakesItsProcessOver(t *testing.T) {
 	h := newHarness(t, nil)
 	first := h.open("lease-a", "credential-a")
 	before := h.whoami("lease-a", "credential-a", first)
+	// The agent opens a session each time it attaches the connector: the
+	// binding's process, and its state, serve the next one.
 	second := h.open("lease-a", "credential-a")
 	after := h.whoami("lease-a", "credential-a", second)
-	if after.PID == before.PID {
-		t.Fatal("the new session reached the old process")
+	if after.PID != before.PID || after.Calls != 2 {
+		t.Fatalf("the new session did not keep the binding's process: %+v then %+v", before, after)
 	}
-	waitGone(t, before.PID)
 	if response, _ := h.do(http.MethodPost, "lease-a", "credential-a", first, callBody(5, "whoami")); response.StatusCode != http.StatusNotFound {
-		t.Fatalf("the replaced session answered %d", response.StatusCode)
+		t.Fatalf("the session taken over answered %d", response.StatusCode)
 	}
-	if listed := h.status(); len(listed.Processes) != 1 || listed.Processes[0].PID != after.PID {
+	// The process was initialized once: the second session's initialize
+	// was answered with its first answer, its initialized stayed with the
+	// bridge (a Go SDK server refuses either twice).
+	lines := received(t, h.logDir, before.PID)
+	initializes := 0
+	for _, line := range lines {
+		if strings.Contains(line, `"method":"initialize"`) || strings.Contains(line, `"method":"notifications/initialized"`) {
+			initializes++
+		}
+	}
+	if initializes != 2 {
+		t.Fatalf("the process read %d initialize messages: %v", initializes, lines)
+	}
+	if listed := h.status(); len(listed.Processes) != 1 || listed.Processes[0].PID != before.PID || !listed.Processes[0].Session {
 		t.Fatalf("status: %+v", listed)
+	}
+}
+
+func TestAProcessWithACallUnansweredIsRestartedForANewSession(t *testing.T) {
+	h := newHarness(t, nil)
+	first := h.open("lease-a", "credential-a")
+	before := h.whoami("lease-a", "credential-a", first).PID
+	answers := make(chan string, 1)
+	go func() {
+		_, body := h.do(http.MethodPost, "lease-a", "credential-a", first, callBody(11, "slow"))
+		answers <- body
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		h.bridge.mu.Lock()
+		p := h.bridge.processes["lease-a"]
+		h.bridge.mu.Unlock()
+		p.mu.Lock()
+		waiting := len(p.pending)
+		p.mu.Unlock()
+		if waiting == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the slow call never reached the process")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// Its late answer must never reach the new session's call 11.
+	second := h.open("lease-a", "credential-a")
+	if after := h.whoami("lease-a", "credential-a", second); after.PID == before || after.Calls != 1 {
+		t.Fatalf("a process with a call unanswered was taken over: %+v", after)
+	}
+	waitGone(t, before)
+	select {
+	case body := <-answers:
+		if failure, failed := answer(t, body)["error"]; !failed || !strings.Contains(string(failure), `"code":-32000`) {
+			t.Fatalf("the call in flight got %s", body)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the call in flight was never answered")
 	}
 }
 
@@ -423,14 +478,30 @@ func TestACallInFlightWhenItsBindingEndsIsAnsweredAtOnce(t *testing.T) {
 	}
 }
 
-func TestTheClientEndingItsSessionStopsTheProcess(t *testing.T) {
+func TestTheClientEndingItsSessionLeavesTheProcessToItsBinding(t *testing.T) {
 	h := newHarness(t, nil)
 	session := h.open("lease-a", "credential-a")
 	pid := h.whoami("lease-a", "credential-a", session).PID
 	if response, _ := h.do(http.MethodDelete, "lease-a", "", session, ""); response.StatusCode != http.StatusNoContent {
 		t.Fatalf("DELETE: %d", response.StatusCode)
 	}
+	if response, _ := h.do(http.MethodPost, "lease-a", "credential-a", session, callBody(5, "whoami")); response.StatusCode != http.StatusNotFound {
+		t.Fatalf("the ended session answered %d", response.StatusCode)
+	}
+	if gone(pid) || h.status().Processes[0].Session {
+		t.Fatal("the process did not outlive its session")
+	}
+	again := h.open("lease-a", "credential-a")
+	if h.whoami("lease-a", "credential-a", again).PID != pid {
+		t.Fatal("the binding's next session did not get its process")
+	}
+	h.bridge.endBinding("lease-a", "its binding ended")
 	waitGone(t, pid)
+	// The probe's process serves one probe.
+	probe := h.open("", "")
+	probePID := h.whoami("", "", probe).PID
+	h.do(http.MethodDelete, "", "", probe, "")
+	waitGone(t, probePID)
 }
 
 func TestAProcessThatExitsEndsItsSession(t *testing.T) {

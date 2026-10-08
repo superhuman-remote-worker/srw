@@ -20,18 +20,23 @@
 //     Srw-Bridge-Binding and hands over the binding's credential in
 //     Srw-Bridge-Credential (base64); a request without a binding is the
 //     front's readiness probe, which gets a process of its own;
-//   - an initialize starts the binding's process (the image's program, with
-//     the container's environment and, in --credential-env, the binding's
-//     credential; never the pod's Secret, which holds none); a new
-//     initialize of the binding replaces its process, and one session's
-//     requests reach only its own process;
+//   - the binding's first initialize starts its process (the image's
+//     program, with the container's environment and, in --credential-env,
+//     the binding's credential; never the pod's Secret, which holds none),
+//     and a session's requests reach only its binding's process;
+//   - the process lives with its binding and serves the binding's later
+//     sessions too (SRW's agent opens one per attach), one at a time: a new
+//     session takes over, its initialize is answered with the process's own
+//     first answer, so the server is initialized once; a process with a
+//     call still unanswered is restarted instead;
 //   - it accepts a message only in the exact form the front forwards (the
 //     MCP Go SDK decodes it and must encode it back to the same bytes), so
 //     the process reads exactly the bytes the front checked;
 //   - it stops a binding's process when the front says the binding ended
-//     (DELETE /srw/bindings/{binding}), when its session ends, and when it
-//     has had no request or open stream for --idle; it runs at most
-//     --max-processes binding processes at once (503 past it);
+//     (DELETE /srw/bindings/{binding}), when the process exits, and when it
+//     has had no request or open stream for --idle, answering its calls in
+//     flight at once; it runs at most --max-processes binding processes at
+//     once (503 past it);
 //   - each process runs in its own process group, which is killed with it;
 //     its stderr goes to the container log with the credential scrubbed.
 //
