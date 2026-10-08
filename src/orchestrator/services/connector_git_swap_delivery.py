@@ -81,6 +81,9 @@ UNSERVABLE_STOPS = (
 INLINE_CHECK_SECONDS = 4.0
 #: The upstream CA a repository connector may carry: PEM certificates only.
 MAX_UPSTREAM_CA_BYTES = 64 * 1024
+#: The shortest forge token the driver uses (drivers/git-swap
+#: minCredentialLength).
+MIN_TOKEN_LENGTH = 16
 
 
 @dataclass(frozen=True)
@@ -469,6 +472,13 @@ async def git_swap_problem(
         swap_upstream(entry.get("connection_url"))
     except UnservedUpstream as exc:
         return f"the git swap driver cannot serve it: {exc}"
+    token = (entry.get("credentials") or {}).get("token")
+    if not isinstance(token, str) or len(token) < MIN_TOKEN_LENGTH:
+        # The driver refuses it (it masks the token in every answer).
+        return (
+            f"its token is shorter than {MIN_TOKEN_LENGTH} characters, which the "
+            "git swap driver does not use"
+        )
     for check in (
         lambda: owner_workspace_problem(conn, owner),
         lambda: launch_problem(conn, connector_id),
@@ -526,12 +536,15 @@ def apply_fallback(
 # =============================================================================
 
 
-async def delivery_report(row: Mapping[str, Any]) -> dict[str, Any] | None:
+async def delivery_report(
+    row: Mapping[str, Any], *, token: str | None = None
+) -> dict[str, Any] | None:
     """How a token repository is delivered on this installation, for its
     Test: through the driver, or the fallback and why. Probes the upstream's
     TLS afresh (no credential) and remembers the verdict. ``None`` when the
     driver is not installed. The workspace's own reach is decided per
-    delivery: container and same-cluster VM workspaces only."""
+    delivery: container and same-cluster VM workspaces only. ``token`` is
+    only measured, never sent."""
     settings = git_swap_delivery_settings()
     if not settings.installed:
         return None
@@ -564,6 +577,11 @@ async def delivery_report(row: Mapping[str, Any]) -> dict[str, Any] | None:
             else "verified against public roots"
         )
         problem = (tls if _definite(tls) else None) or launch
+    if problem is None and token is not None and len(token) < MIN_TOKEN_LENGTH:
+        problem = (
+            f"its token is shorter than {MIN_TOKEN_LENGTH} characters, which the "
+            "git swap driver does not use"
+        )
     if problem is None:
         report.update(mode="git-swap", reason="")
     elif settings.fallback == FALLBACK_REFUSE:

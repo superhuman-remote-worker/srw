@@ -128,7 +128,7 @@ class RepositoryDriver(WorkspaceSshDriver):
         # probes the upstream's TLS without a credential (C3).
         from orchestrator.services import connector_git_swap_delivery as swaps
 
-        report = await swaps.delivery_report(row)
+        report = await swaps.delivery_report(row, token=credentials.get("token"))
         if report is None:
             return result
         result = dict(result)

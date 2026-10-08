@@ -418,6 +418,14 @@ class TestDecision:
             connector_id=CONNECTOR,
             owner=owner,
         )
+        # A token the driver would refuse (it masks it in every answer).
+        short = {**_candidate(), "credentials": {"token": "short-token"}}
+        assert "shorter than 16 characters" in await swaps.git_swap_problem(
+            FakeConn(), short, connector_id=CONNECTOR, owner=owner
+        )
+        proxy = (ROOT / "drivers/git-swap/proxy.go").read_text()
+        found = re.search(r"minCredentialLength = (\d+)", proxy)
+        assert found and int(found.group(1)) == swaps.MIN_TOKEN_LENGTH
 
 
 @pytest.fixture
@@ -613,7 +621,8 @@ class TestCheck:
         async def probe(ds, url, creds):
             return {"status": "ok", "message": "Authenticated as octo"}
 
-        async def report(row):
+        async def report(row, *, token=None):
+            assert token == TOKEN
             return {
                 "driver": GIT_SWAP_SPEC.name,
                 "mode": "token-in-url",
