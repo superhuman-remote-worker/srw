@@ -254,6 +254,31 @@ class DriverSpec:
         )
 
 
+def effective_access(entry: Mapping[str, Any], spec: DriverSpec) -> str | None:
+    """The access level a delivered entry binds at, from the driver's levels.
+
+    The one rule for the agent (a binding's ``access``) and SRW (the level a
+    credential lease is issued at). A read-only project link clamps to the
+    lowest level. Otherwise the level the connector's config names (a driver
+    whose config has an ``access`` property, such as email), else the
+    driver's default, else its highest; a name the driver does not offer
+    fails closed to the lowest.
+    """
+    levels = spec.ranked_access_ids()
+    if not levels:
+        return None
+    if entry.get("project_read_only", False):
+        return levels[0]
+    requested = None
+    properties = spec.config_schema.get("properties")
+    config = entry.get("config")
+    if isinstance(properties, Mapping) and "access" in properties:
+        requested = config.get("access") if isinstance(config, Mapping) else None
+    if requested is None:
+        requested = spec.default_access or levels[-1]
+    return requested if requested in levels else levels[0]
+
+
 def protocol_major(version: str) -> int | None:
     """The major of a ``MAJOR.MINOR`` protocol version, or ``None`` if malformed."""
     match = _PROTOCOL.fullmatch(version or "")

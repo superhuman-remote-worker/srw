@@ -51,13 +51,12 @@ from shared.connectors.builtin import (
     LEGACY_TYPE_IDS,
     spec_for_type,
 )
-from shared.connectors.contract import validate_spec
+from shared.connectors.contract import effective_access, validate_spec
 from shared.connectors.leases import (
     MAX_CACHE_SECONDS,
     TOKEN_LENGTH,
     TOKEN_PATTERN,
     last_four,
-    lease_access,
     lease_file_name,
     mint_token,
     operation_allowed,
@@ -181,9 +180,34 @@ class TestSpec:
             assert any("lease_token" in p for p in validate_spec(spec))
         assert any("credential_delivery" in p for p in validate_spec(unknown))
 
-    def test_lease_access_clamps_a_read_only_link(self):
-        assert lease_access({}, LEASE_PROBE_SPEC) == "ReadWrite"
-        assert lease_access({"project_read_only": True}, LEASE_PROBE_SPEC) == (
+    def test_a_lease_is_issued_at_the_level_the_agent_binds(self):
+        """One rule on both sides: the agent's binding ``access`` and the
+        level a lease is issued at are the same function, for every spec and
+        every config shape (an unknown level fails closed to the lowest)."""
+        from agent.connectors.legacy import binding_from_legacy_entry
+        from agent.connectors.legacy import effective_access as agent_rule
+        from shared.connectors.builtin import BUILTIN_SPECS, DEVELOPMENT_SPECS
+
+        assert agent_rule is effective_access
+        shapes = [
+            {},
+            {"project_read_only": True},
+            {"project_read_only": False, "config": {"access": "send"}},
+            {"config": {"access": "ReadOnly"}},
+            {"config": {"access": "no-such-level"}},
+            {"config": "not a mapping"},
+        ]
+        for spec in BUILTIN_SPECS + DEVELOPMENT_SPECS:
+            for shape in shapes:
+                entry = {"type": spec.legacy_type, "name": "x", **shape}
+                expected = effective_access(entry, spec)
+                levels = spec.ranked_access_ids()
+                assert expected is None if not levels else expected in levels
+                if spec.legacy_type:
+                    binding = binding_from_legacy_entry(entry)
+                    assert binding is not None and binding.access == expected
+        assert effective_access({}, LEASE_PROBE_SPEC) == "ReadWrite"
+        assert effective_access({"project_read_only": True}, LEASE_PROBE_SPEC) == (
             "ReadOnly"
         )
 
