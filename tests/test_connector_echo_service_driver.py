@@ -182,8 +182,13 @@ def test_the_matrix_shows_its_image_and_service():
     ]
     assert entry["name"] == "srw.echo-service/v1"
     assert entry["plane"] == "service"
-    assert entry["trust"]["image"] == IMAGE
-    assert entry["trust"]["claims_declared_by_author"] is True
+    # SRW's own development driver: its claims are SRW's, never trusted.
+    assert entry["trust"] == {
+        "tier": "development",
+        "trusted": False,
+        "image": IMAGE,
+        "claims_declared_by_author": False,
+    }
     assert entry["service"]["port"] == 8080
     assert entry["service"]["callers"] == ["harness", "workspace"]
     assert entry["egress"]["enforced"]["reason"] == "pinned_per_pod"

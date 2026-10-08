@@ -19,10 +19,12 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
              every datasource driver has access levels, each with an
              enforced_by line; built-ins are built-in and trusted; a
              development driver the deployment installs (the lease probe,
-             orchestrator.connectorLeases.probeDriver) may follow, labelled
-             development and untrusted (a NOTE names it); the enforced and
-             installation egress columns say "not applicable"; no credential
-             slot schema carries a default or an example
+             orchestrator.connectorLeases.probeDriver; the echo service,
+             connectors.drivers.echo) may follow, labelled development and
+             untrusted (a NOTE names it); the enforced and installation
+             egress columns say "not applicable", or for a service-plane
+             driver a hosting status (D5); no credential slot schema carries
+             a default or an example
   page       Playwright: Settings -> Connector drivers lists every driver the
              API returns, each access level with its "Enforced by" line, and
              the Connectors page links to it
@@ -288,9 +290,20 @@ def matrix_problems(
             if not (level.get("enforced_by") or "").strip()
         ]
         egress = driver.get("egress") or {}
-        for column in ("enforced", "installation"):
-            if (egress.get(column) or {}).get("status") != "not_applicable":
-                problems.append(f"{name} egress {column} is not 'not applicable'")
+        if driver.get("plane") == "service":
+            # A service-plane driver runs its own pods (D5): its columns say
+            # how they are pinned, or that this deployment hosts none.
+            expected = {
+                "enforced": {"enforced", "not_enforced"},
+                "installation": {"verified", "unverified", "not_enforced"},
+            }
+            for column, statuses in expected.items():
+                if (egress.get(column) or {}).get("status") not in statuses:
+                    problems.append(f"{name} egress {column} is not a hosting status")
+        else:
+            for column in ("enforced", "installation"):
+                if (egress.get(column) or {}).get("status") != "not_applicable":
+                    problems.append(f"{name} egress {column} is not 'not applicable'")
         for slot in driver.get("credential_slots") or []:
             text = json.dumps(slot.get("schema"))
             if '"default"' in text or '"examples"' in text:

@@ -18,8 +18,9 @@ what it is.  A driver's author could still write a value into a schema, so
   becomes ``{}``.
 
 Trust: the built-in drivers are SRW's own code, so their claims are SRW's.
-A development driver (the lease probe, on only where a deployment switch
-installs it) is SRW's too but tier ``development``, never trusted. A driver
+A development driver (the lease probe or the echo service, on only where a
+deployment switch installs it) is SRW's too but tier ``development``, never
+trusted; a service-plane one shows the image its pods run. A driver
 outside the trusted list (registration arrives in D6) is marked
 ``claims_declared_by_author``: SRW does not verify foreign images, the same
 as for workspace images.
@@ -372,12 +373,12 @@ def _trust(
         }
     if in_process and spec.name in _DEVELOPMENT_NAMES:
         # SRW's own code, so its claims are SRW's, but installed for
-        # development and gates only (the lease probe): never a trusted
-        # driver for real connectors.
+        # development and gates only (the lease probe, the echo service):
+        # never a trusted driver for real connectors.
         return {
             "tier": "development",
             "trusted": False,
-            "image": None,
+            "image": image,
             "claims_declared_by_author": False,
         }
     # D6 registers image drivers with their image reference and checks it

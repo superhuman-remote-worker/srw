@@ -169,6 +169,26 @@ class TestExpectations:
         assert gate.matrix_problems(mislabelled, NAMES, development) == [
             "srw.lease-probe/v1 is not labelled development and untrusted"
         ]
+        # The k3d profile also installs the echo service (D5): a service-plane
+        # driver whose egress columns are hosting statuses, not "not applicable".
+        from orchestrator.services.connector_drivers.matrix import HostingStatus
+
+        for hosting in (HostingStatus(enabled=True), None):
+            with_echo = json.loads(
+                json.dumps(
+                    capability_matrix(
+                        builtin_connector_drivers(
+                            lease_probe=True, echo_service_image="r/echo:1"
+                        ),
+                        hosting=hosting,
+                    )
+                )
+            )
+            assert gate.matrix_problems(with_echo, NAMES, development) == []
+        with_echo["drivers"][-1]["egress"]["enforced"]["status"] = "not_applicable"
+        assert gate.matrix_problems(with_echo, NAMES, development) == [
+            "srw.echo-service/v1 egress enforced is not a hosting status"
+        ]
         # A built-in labelled development is refused too.
         demoted = copy.deepcopy(with_probe)
         demoted["drivers"][0]["trust"]["tier"] = "development"
