@@ -100,6 +100,24 @@ export interface ConnectorDriverTrust {
   image: string | null;
   /** Outside the trusted list every claim is the author's, unverified. */
   claims_declared_by_author: boolean;
+  /** Registered images only: whether the image may have privilege. */
+  privileged?: boolean;
+}
+
+/** Where a registered image driver lives (D6); absent on SRW's own. */
+export interface ConnectorDriverRegistration {
+  id: string;
+  scope: {kind: 'Account' | 'Project' | 'Catalog'; name: string};
+  image_reference: string;
+  image_digest: string;
+  spec_source: 'label' | 'spec_operation' | 'server_json';
+}
+
+/** `POST /api/connector-drivers`: the spec comes from the image itself. */
+export interface RegisterConnectorDriverRequest {
+  image: string;
+  scope?: {kind: 'Account' | 'Project' | 'Catalog'; name: string};
+  name?: string;
 }
 
 export interface ConnectorDriver {
@@ -140,6 +158,8 @@ export interface ConnectorDriver {
   deployment_gate: string | null;
   service: Record<string, unknown> | null;
   trust: ConnectorDriverTrust;
+  /** A registered image driver's registration (D6). */
+  registration?: ConnectorDriverRegistration;
 }
 
 export interface ConnectorDriverMatrix {

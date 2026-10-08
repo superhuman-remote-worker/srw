@@ -3058,6 +3058,22 @@
       "development": "Development only, not for real connectors"
     },
     "shipsWithSrw": "Ships with SRW",
+    "register": {
+      "title": "Register a driver image",
+      "desc": "Any image may be a driver: SRW reads its specification from the image (the io.srw.driver.spec label) and runs it unprivileged in its own pod. A driver receives its connectors' credentials, so register only images whose authors you trust.",
+      "image": "Image reference",
+      "imagePlaceholder": "registry.example/team/driver:1.0 or …@sha256:…",
+      "scope": "Register in",
+      "scopeAccount": "Mine",
+      "scopeCatalog": "Shared (everyone)",
+      "submit": "Register",
+      "delete": "Delete registration",
+      "scopeKind": {
+        "Account": "Registered in an account",
+        "Project": "Registered in a project",
+        "Catalog": "Registered in the shared catalog"
+      }
+    },
     "credentials": "Credential slots",
     "noSlots": "None",
     "slotRequired": "required",

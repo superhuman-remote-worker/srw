@@ -3058,6 +3058,22 @@
       "development": "Nur für die Entwicklung, nicht für echte Konnektoren"
     },
     "shipsWithSrw": "Wird mit SRW ausgeliefert",
+    "register": {
+      "title": "Treiber-Image registrieren",
+      "desc": "Jedes Image kann ein Treiber sein: SRW liest seine Spezifikation aus dem Image (Label io.srw.driver.spec) und führt es ohne Privilegien in einem eigenen Pod aus. Ein Treiber erhält die Zugangsdaten seiner Konnektoren; registriere nur Images, deren Autoren du vertraust.",
+      "image": "Image-Referenz",
+      "imagePlaceholder": "registry.example/team/driver:1.0 oder …@sha256:…",
+      "scope": "Registrieren in",
+      "scopeAccount": "Meine",
+      "scopeCatalog": "Geteilt (alle)",
+      "submit": "Registrieren",
+      "delete": "Registrierung löschen",
+      "scopeKind": {
+        "Account": "In einem Konto registriert",
+        "Project": "In einem Projekt registriert",
+        "Catalog": "Im geteilten Katalog registriert"
+      }
+    },
     "credentials": "Zugangsdaten-Slots",
     "noSlots": "Keine",
     "slotRequired": "erforderlich",

@@ -1,12 +1,15 @@
 import {Component, computed, inject, OnInit, signal} from '@angular/core';
 import {RouterLink} from '@angular/router';
 import {TranslocoPipe} from '@jsverse/transloco';
+import {ApiService} from '../../core/services/api.service';
 import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
+import {UserService} from '../../core/services/user.service';
 import {ConnectorDriver, ConnectorEgressStatus} from '../../core/models/connector-driver.model';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {AppBadgeComponent, type BadgeTone} from '../../ui/badge';
 import {AppButtonComponent} from '../../ui/button';
 import {AppInputComponent} from '../../ui/input';
+import {AppSelectComponent} from '../../ui/select';
 import {AppSpinnerComponent} from '../../ui/spinner';
 
 /** Egress reasons the matrix reports; anything newer shows its raw status. */
@@ -24,6 +27,14 @@ const PLANES = new Set(['harness', 'bind_time', 'service', 'in_pod']);
 /** A stable element id for a driver, so a link can open the page at it. */
 export function driverAnchor(name: string): string {
   return 'driver-' + name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+}
+
+/** The server's reason for a refused registration or delete. */
+export function errorDetail(error: unknown): string {
+  const detail = (error as {error?: {detail?: unknown}} | null)?.error?.detail;
+  if (typeof detail === 'string' && detail) return detail;
+  const status = (error as {status?: unknown} | null)?.status;
+  return typeof status === 'number' ? `HTTP ${status}` : 'Request failed';
 }
 
 /**
@@ -49,6 +60,7 @@ export function driverAnchor(name: string): string {
     AppBadgeComponent,
     AppButtonComponent,
     AppInputComponent,
+    AppSelectComponent,
     AppSpinnerComponent,
   ],
   template: `
@@ -62,6 +74,42 @@ export function driverAnchor(name: string): string {
           {{ 'connectorDrivers.desc' | transloco }}
           <a routerLink="/datasources" class="page-link">{{ 'connectorDrivers.toConnectors' | transloco }}</a>
         </p>
+
+        <section class="register-card" data-section="register">
+          <h2>{{ 'connectorDrivers.register.title' | transloco }}</h2>
+          <p class="muted">{{ 'connectorDrivers.register.desc' | transloco }}</p>
+          <div class="register-row">
+            <app-input
+              size="sm"
+              [value]="image()"
+              (valueChange)="image.set($event)"
+              [placeholder]="'connectorDrivers.register.imagePlaceholder' | transloco"
+              [ariaLabel]="'connectorDrivers.register.image' | transloco"
+            />
+            <app-select
+              size="sm"
+              [fullWidth]="false"
+              [value]="scope()"
+              (changed)="scope.set($event === 'Catalog' ? 'Catalog' : 'Account')"
+              [ariaLabel]="'connectorDrivers.register.scope' | transloco"
+            >
+              <option value="Account">{{ 'connectorDrivers.register.scopeAccount' | transloco }}</option>
+              @if (isAdmin()) {
+                <option value="Catalog">{{ 'connectorDrivers.register.scopeCatalog' | transloco }}</option>
+              }
+            </app-select>
+            <app-button
+              size="sm"
+              [disabled]="!image().trim() || registering()"
+              (clicked)="register()"
+            >
+              {{ 'connectorDrivers.register.submit' | transloco }}
+            </app-button>
+          </div>
+          @if (registerError(); as error) {
+            <p class="register-error" role="alert">{{ error }}</p>
+          }
+        </section>
 
         <div class="toolbar">
           <app-input
@@ -110,6 +158,23 @@ export function driverAnchor(name: string): string {
 
             @if (driver.trust.claims_declared_by_author) {
               <p class="author-note" data-claims="author">{{ 'connectorDrivers.authorNote' | transloco }}</p>
+            }
+
+            @if (driver.registration; as registration) {
+              <div class="registration" data-section="registration">
+                <span>
+                  {{ 'connectorDrivers.register.scopeKind.' + registration.scope.kind | transloco }}
+                  · <code>{{ registration.image_digest }}</code>
+                </span>
+                <app-button
+                  variant="secondary"
+                  size="sm"
+                  [disabled]="deleting() === registration.id"
+                  (clicked)="remove(registration.id)"
+                >
+                  {{ 'connectorDrivers.register.delete' | transloco }}
+                </app-button>
+              </div>
             }
 
             <div class="driver-body">
@@ -295,6 +360,52 @@ export function driverAnchor(name: string): string {
     .page-link {
       margin-left: 4px;
       color: var(--accent-color);
+    }
+
+    .register-card {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 16px 20px;
+      background: var(--panel-bg);
+      border: 1px solid var(--border-hairline);
+      border-radius: var(--radius-surface);
+    }
+
+    .register-card h2 {
+      margin: 0;
+      font-size: 1rem;
+    }
+
+    .register-card p {
+      margin: 0;
+    }
+
+    .register-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .register-row app-input {
+      flex: 1;
+      min-width: 220px;
+    }
+
+    .register-error {
+      color: var(--danger);
+      font-size: 0.85rem;
+    }
+
+    .registration {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 0.85rem;
+      color: var(--text-secondary);
     }
 
     .toolbar {
@@ -514,9 +625,20 @@ export function driverAnchor(name: string): string {
 })
 export class ConnectorDriversPageComponent implements OnInit {
   protected readonly service = inject(ConnectorDriversService);
+  private readonly api = inject(ApiService);
+  private readonly users = inject(UserService);
 
   readonly query = signal('');
   readonly drivers = this.service.drivers;
+
+  /** Registering a driver image (D6): its reference and where it lives.
+   *  A Project registration is made over the API or MCP (left out here). */
+  readonly image = signal('');
+  readonly scope = signal<'Account' | 'Catalog'>('Account');
+  readonly registering = signal(false);
+  readonly registerError = signal<string | null>(null);
+  readonly deleting = signal<string | null>(null);
+  readonly isAdmin = computed(() => this.users.currentUser()?.is_admin === true);
 
   readonly visible = computed(() => {
     const drivers = this.drivers() ?? [];
@@ -532,6 +654,43 @@ export class ConnectorDriversPageComponent implements OnInit {
 
   ngOnInit(): void {
     this.service.load(true);
+  }
+
+  /** Register the image; the server reads its spec from the image itself
+   *  and says why it refuses one. */
+  register(): void {
+    const image = this.image().trim();
+    if (!image || this.registering()) return;
+    this.registering.set(true);
+    this.registerError.set(null);
+    const scope =
+      this.scope() === 'Catalog' ? {kind: 'Catalog' as const, name: 'shared'} : undefined;
+    this.api.registerConnectorDriver({image, ...(scope ? {scope} : {})}).subscribe({
+      next: () => {
+        this.registering.set(false);
+        this.image.set('');
+        this.service.load(true);
+      },
+      error: (error) => {
+        this.registering.set(false);
+        this.registerError.set(errorDetail(error));
+      },
+    });
+  }
+
+  remove(id: string): void {
+    this.deleting.set(id);
+    this.registerError.set(null);
+    this.api.deleteConnectorDriver(id).subscribe({
+      next: () => {
+        this.deleting.set(null);
+        this.service.load(true);
+      },
+      error: (error) => {
+        this.deleting.set(null);
+        this.registerError.set(errorDetail(error));
+      },
+    });
   }
 
   protected trustTone(driver: ConnectorDriver): BadgeTone {

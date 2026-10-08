@@ -143,7 +143,10 @@ import {
   ManifestApplyResult, WorkspaceBinding, WorkspaceTemplateDocument, WorkspaceTemplateItem,
   WorkspaceTemplateItems, WorkspaceTemplateSpec,
 } from '../models/workspace-template.model';
-import {ConnectorDriverMatrix} from '../models/connector-driver.model';
+import {
+  ConnectorDriverMatrix,
+  RegisterConnectorDriverRequest,
+} from '../models/connector-driver.model';
 import {environment} from '../environment';
 
 /**
@@ -1028,6 +1031,17 @@ export class ApiService {
    * the caller, which keeps its pre-matrix behaviour. */
   getConnectorDrivers(): Observable<ConnectorDriverMatrix> {
     return this.http.get<ConnectorDriverMatrix>(`${this.baseUrl}/datasources/drivers`);
+  }
+
+  /** Register a driver image (D6). Errors reach the caller: the server's
+   * detail says why an image or a scope was refused. */
+  registerConnectorDriver(body: RegisterConnectorDriverRequest): Observable<{id: string}> {
+    return this.http.post<{id: string}>(`${this.baseUrl}/connector-drivers`, body);
+  }
+
+  /** Delete a driver registration no connector uses (409 while one does). */
+  deleteConnectorDriver(id: string): Observable<{status: string}> {
+    return this.http.delete<{status: string}>(`${this.baseUrl}/connector-drivers/${id}`);
   }
 
   /** Projects the caller may use in a connector's availability policy. Current

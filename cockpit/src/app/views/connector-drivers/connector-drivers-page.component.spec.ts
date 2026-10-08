@@ -2,8 +2,15 @@ import {beforeAll, describe, expect, it, vi} from 'vitest';
 import {CUSTOM_ELEMENTS_SCHEMA, signal, ɵresolveComponentResources} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
 import {TranslocoPipe, TranslocoTestingModule} from '@jsverse/transloco';
-import {ConnectorDriversPageComponent, driverAnchor} from './connector-drivers-page.component';
+import {of, throwError} from 'rxjs';
+import {
+  ConnectorDriversPageComponent,
+  driverAnchor,
+  errorDetail,
+} from './connector-drivers-page.component';
+import {ApiService} from '../../core/services/api.service';
 import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
+import {UserService} from '../../core/services/user.service';
 import {ConnectorDriver, ConnectorDriverMatrix} from '../../core/models/connector-driver.model';
 // The API's own response for the built-in drivers
 // (tests/test_connector_capability_matrix.py pins it).
@@ -28,12 +35,17 @@ const CUSTOM: ConnectorDriver = {
   trust: {tier: 'custom', trusted: false, image: 'ghcr.io/acme/ticketing:1', claims_declared_by_author: true},
 };
 
-function mount(drivers: ConnectorDriver[] | null, loadFailed = false) {
+function mount(drivers: ConnectorDriver[] | null, loadFailed = false, admin = false) {
   const service = {
     drivers: signal(drivers),
     loadFailed: signal(loadFailed),
     load: vi.fn(),
   };
+  const api = {
+    registerConnectorDriver: vi.fn(() => of({id: 'r1'})),
+    deleteConnectorDriver: vi.fn(() => of({status: 'deleted'})),
+  };
+  const users = {currentUser: signal({id: 'u1', is_admin: admin})};
   TestBed.configureTestingModule({
     imports: [
       ConnectorDriversPageComponent,
@@ -43,7 +55,11 @@ function mount(drivers: ConnectorDriver[] | null, loadFailed = false) {
         preloadLangs: true,
       }),
     ],
-    providers: [{provide: ConnectorDriversService, useValue: service}],
+    providers: [
+      {provide: ConnectorDriversService, useValue: service},
+      {provide: ApiService, useValue: api},
+      {provide: UserService, useValue: users},
+    ],
   });
   // The primitives stay inert (their signal inputs are not wired in this
   // harness, see helm-managed-badge.component.spec.ts); their text renders.
@@ -52,7 +68,7 @@ function mount(drivers: ConnectorDriver[] | null, loadFailed = false) {
   });
   const fixture = TestBed.createComponent(ConnectorDriversPageComponent);
   fixture.detectChanges();
-  return {fixture, host: fixture.nativeElement as HTMLElement, service};
+  return {fixture, host: fixture.nativeElement as HTMLElement, service, api};
 }
 
 const card = (host: HTMLElement, name: string) =>
@@ -180,5 +196,73 @@ describe('ConnectorDriversPageComponent', () => {
     expect(text(host.querySelector('[role="alert"]'))).toContain(page.loadFailed);
     host.querySelector('[role="alert"] app-button')!.dispatchEvent(new Event('clicked'));
     expect(service.load).toHaveBeenLastCalledWith(true);
+  });
+
+  describe('registering a driver image (D6)', () => {
+    it('offers the shared catalog to administrators only', () => {
+      const user = mount([]).host.querySelector('[data-section="register"]')!;
+      expect(text(user)).toContain(page.register.title);
+      expect(text(user)).toContain(page.register.scopeAccount);
+      expect(text(user)).not.toContain(page.register.scopeCatalog);
+      TestBed.resetTestingModule();
+      const admin = mount([], false, true).host.querySelector('[data-section="register"]')!;
+      expect(text(admin)).toContain(page.register.scopeCatalog);
+    });
+
+    it('registers the image in the chosen scope and reloads the matrix', () => {
+      const {fixture, service, api} = mount([], false, true);
+      const component = fixture.componentInstance;
+      component.image.set('  ghcr.io/acme/env:1  ');
+      component.register();
+      expect(api.registerConnectorDriver).toHaveBeenLastCalledWith({image: 'ghcr.io/acme/env:1'});
+      expect(service.load).toHaveBeenLastCalledWith(true);
+      expect(component.image()).toBe('');
+      component.image.set('ghcr.io/acme/env:1');
+      component.scope.set('Catalog');
+      component.register();
+      expect(api.registerConnectorDriver).toHaveBeenLastCalledWith({
+        image: 'ghcr.io/acme/env:1',
+        scope: {kind: 'Catalog', name: 'shared'},
+      });
+    });
+
+    it("shows the server's reason for a refused image", () => {
+      const {fixture, host, api} = mount([]);
+      api.registerConnectorDriver.mockReturnValueOnce(
+        throwError(() => ({status: 422, error: {detail: "driver names under srw. are SRW's own"}})),
+      );
+      fixture.componentInstance.image.set('ghcr.io/acme/srw:1');
+      fixture.componentInstance.register();
+      fixture.detectChanges();
+      expect(text(host.querySelector('.register-error'))).toBe(
+        "driver names under srw. are SRW's own",
+      );
+    });
+
+    it('shows where a registered driver lives and deletes its registration', () => {
+      const registered: ConnectorDriver = {
+        ...CUSTOM,
+        registration: {
+          id: 'r1',
+          scope: {kind: 'Account', name: 'u1'},
+          image_reference: 'ghcr.io/acme/ticketing:1',
+          image_digest: 'sha256:' + '1'.repeat(64),
+          spec_source: 'label',
+        },
+      };
+      const {fixture, host, api, service} = mount([registered]);
+      const section = card(host, CUSTOM.name).querySelector('[data-section="registration"]')!;
+      expect(text(section)).toContain(page.register.scopeKind.Account);
+      expect(text(section)).toContain('sha256:' + '1'.repeat(64));
+      fixture.componentInstance.remove('r1');
+      expect(api.deleteConnectorDriver).toHaveBeenCalledWith('r1');
+      expect(service.load).toHaveBeenLastCalledWith(true);
+    });
+
+    it('reads an error detail, else the status', () => {
+      expect(errorDetail({status: 409, error: {detail: 'in use'}})).toBe('in use');
+      expect(errorDetail({status: 500, error: {}})).toBe('HTTP 500');
+      expect(errorDetail(null)).toBe('Request failed');
+    });
   });
 });
