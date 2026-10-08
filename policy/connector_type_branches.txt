@@ -19,9 +19,8 @@
 #
 # <file>  <qualname>  <kind>  <type ids>  <fingerprint>  #<ordinal>  <classification>  [<reason>]
 
-src/agent/api/persistent_session.py  PersistentSession._protected_cloud_config_valid  compare  webdav  dfe8cd429615  #1  not-a-connector-type  a cloud mount's rclone source.type, not a connector
-src/agent/api/session_workspace.py  validate_protected_cloud_mount  compare  webdav  5490bf991804  #1  not-a-connector-type  a cloud mount's rclone source.type, not a connector
 src/agent/database/postgres_db.py  JobsNamespace.record_pull_request  sql-literal  repository  c6e491f05375  #1  sql  PR record insert checks the attachment is a repository connector in SQL; type stays a mirror column (D3)
+src/agent/services/cloud_sync/protected_lower.py  is_protected_reader_transport  compare  webdav  dfe8cd429615  #1  not-a-connector-type  a cloud mount's rclone source.type, not a connector
 src/mcp_server/server.py  _get_mcp_caller_ctx  type-keyword  mcp  0665ab3128f9  #1  not-a-connector-type  the MCP server's caller kind (an MCP token principal), not a connector
 src/mcp_server/server.py  _get_mcp_caller_ctx  type-keyword  mcp  0665ab3128f9  #2  not-a-connector-type  the MCP server's caller kind (an MCP token principal), not a connector
 src/mcp_server/server.py  _get_mcp_caller_ctx  type-keyword  mcp  0665ab3128f9  #3  not-a-connector-type  the MCP server's caller kind (an MCP token principal), not a connector
