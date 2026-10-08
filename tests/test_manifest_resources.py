@@ -143,8 +143,11 @@ async def database(pg_url, monkeypatch):
     await db.execute(
         migration.with_name("0347_connector_credential_leases.sql").read_text()
     )
+    # 0350's srw_resources columns; that migration also alters datasources,
+    # which this fixture does not create.
     await db.execute(
-        migration.with_name("0352_resource_platform_managed.sql").read_text()
+        "ALTER TABLE srw_resources ADD COLUMN platform_managed TEXT, "
+        "ADD COLUMN linked_updated_at TIMESTAMPTZ"
     )
     yield db
     await db.disconnect()

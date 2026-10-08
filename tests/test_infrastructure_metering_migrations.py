@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0347_connector_credential_leases.sql"
+    / "src/orchestrator/database/migrations/app/0352_datasources_managed_key_idx.notx.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

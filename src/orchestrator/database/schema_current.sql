@@ -30438,6 +30438,7 @@ CREATE TABLE public.srw_resources (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     installation_managed boolean DEFAULT false NOT NULL,
     platform_managed text,
+    linked_updated_at timestamp with time zone,
     CONSTRAINT srw_resources_document_check CHECK ((jsonb_typeof(document) = 'object'::text)),
     CONSTRAINT srw_resources_kind_check CHECK ((kind = ANY (ARRAY['Expert'::text, 'WorkspaceTemplate'::text, 'Connector'::text, 'Project'::text, 'Job'::text]))),
     CONSTRAINT srw_resources_resolved_check CHECK ((jsonb_typeof(resolved) = 'object'::text)),
@@ -30465,6 +30466,13 @@ COMMENT ON COLUMN public.srw_resources.installation_managed IS 'TRUE for resourc
 --
 
 COMMENT ON COLUMN public.srw_resources.platform_managed IS 'Managed key of the platform-owned domain row this resource mirrors (project-kb:<project>, ...). Only the platform write-through writes it; the API refuses edits and deletes.';
+
+
+--
+-- Name: COLUMN srw_resources.linked_updated_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.srw_resources.linked_updated_at IS 'The linked domain row''s updated_at this resource was last written from. A row whose updated_at differs needs its resource rewritten.';
 
 
 --

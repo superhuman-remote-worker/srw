@@ -24,7 +24,7 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
 
   preflight  Tilt reports the srw resource ``ok``; every orchestrator pod
              serves this checkout's D3a modules byte for byte; the migration
-             ledger holds 0350-0354 as applied; both accounts are approved
+             ledger holds 0350-0352 as applied; both accounts are approved
   backfill   the deployed ``migrate_stored_connectors``, rerun in the
              orchestrator pod, writes the legacy row's Connector; every
              datasource of this run then has the Connector the mapping names
@@ -105,10 +105,8 @@ _NAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 
 MIGRATIONS = (
     "0350_datasource_manifest_identity.sql",
-    "0351_datasource_manifest_resource_fk.sql",
-    "0352_resource_platform_managed.sql",
-    "0353_validate_datasource_manifest_identity.sql",
-    "0354_datasources_managed_key_idx.notx.sql",
+    "0351_validate_datasource_manifest_identity.sql",
+    "0352_datasources_managed_key_idx.notx.sql",
 )
 #: What the orchestrator must serve byte for byte for D3a.
 SERVED = (
@@ -649,7 +647,7 @@ class Report:
 
 PLAN = [
     "preflight: Tilt srw ok; every orchestrator pod serves this checkout's D3a "
-    "modules and migrations; the ledger holds 0350-0354; both accounts approved",
+    "modules and migrations; the ledger holds 0350-0352; both accounts approved",
     "fixture: Postgres database + SELECT-only role, a project (with its native "
     "KB) owned by --user with --other-user as editor, and one legacy row "
     "written straight to the table and linked to the project",
