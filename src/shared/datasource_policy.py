@@ -4,7 +4,12 @@ import logging
 import re
 from typing import Any, Dict, List, Tuple
 
-from shared.connectors.builtin import EMAIL_SPEC, tool_map, tool_map_entry
+from shared.connectors.builtin import (
+    EMAIL_SPEC,
+    spec_for_type,
+    tool_map,
+    tool_map_entry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +98,20 @@ def datasource_tool_categories(
             categories[category] = list(tool_info["read"])
         else:
             categories[category] = list(tool_info["write"])
+    # Drivers outside the tool map whose tools are discovered at runtime
+    # (managed MCP servers, D5a) attach their category's sentinel too. Their
+    # access level is enforced at the server's front, which lists only the
+    # tools the binding may call.
+    for ds_type in by_type:
+        if ds_type in DATASOURCE_TOOL_MAP:
+            continue
+        spec = spec_for_type(ds_type)
+        if (
+            spec is not None
+            and spec.tool_category
+            and any(level.tools == "*" for level in spec.access_levels)
+        ):
+            categories[spec.tool_category] = ["*"]
     return categories
 
 

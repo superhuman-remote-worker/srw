@@ -1,6 +1,8 @@
 """Specs of the drivers SRW ships: the 13 datasource types, the two
-generic-hosting delivery drivers and one development driver (the lease
-probe, off unless an installation turns it on).
+generic-hosting delivery drivers, the managed MCP servers of its catalogue
+(off until an installation names their images) and the development drivers
+(the lease probe, the echo service and the MCP test server, off unless an
+installation turns them on).
 
 The datasource drivers are named ``srw.<type>/v1`` and keep the stored
 ``datasources.type`` as ``legacy_type``.  Their order here is the connector
@@ -853,6 +855,218 @@ ECHO_SERVICE_SPEC = DriverSpec(
     ),
 )
 
+# ---------------------------------------------------------------------------
+# Managed MCP servers (connector drivers D5a)
+#
+# An MCP server image SRW hosts as a service driver: a shared pod per
+# connector with SRW's front in front of the server. The agent process is the
+# client and holds only a lease token; the front checks it with the lease
+# exchange, injects the upstream credential the exchange returns, and hides
+# and refuses the tools the binding's access level does not allow (the
+# ``mcp`` block's tool classes). An installation turns each one on with its
+# image in the chart (``connectors.drivers.managedMcp``); no catalogue lists
+# one that is off.
+# ---------------------------------------------------------------------------
+
+
+def _managed_mcp_access(read_only: str, read_write: str) -> tuple[AccessLevel, ...]:
+    return (
+        AccessLevel("ReadOnly", 0, read_only, tools="*"),
+        AccessLevel("ReadWrite", 1, read_write, tools="*"),
+    )
+
+
+_MANAGED_MCP_TOOL_ACCESS: Mapping[str, Any] = {
+    "ReadOnly": ["read"],
+    "ReadWrite": ["read", "write"],
+}
+_FRONT_HIDES_WRITE_TOOLS = (
+    "SRW's front hides and refuses every tool the driver's spec does not "
+    "class as read; a tool the server adds later stays hidden until it does."
+)
+
+#: The read tools of the official Gitea MCP server (gitea-mcp 1.8). Exact
+#: names, never patterns: a tool the server adds is a write tool until it is
+#: classed here.
+GITEA_MCP_READ_TOOLS: tuple[str, ...] = (
+    "get_gitea_mcp_server_version",
+    "get_me",
+    "get_user_orgs",
+    "search_users",
+    "search_org_teams",
+    "search_repos",
+    "search_issues",
+    "notification_read",
+    "label_read",
+    "milestone_read",
+    "wiki_read",
+    "timetracking_read",
+    "package_read",
+    "project_read",
+    "list_issues",
+    "attachment_read",
+    "issue_read",
+    "list_pull_requests",
+    "pull_request_read",
+    "actions_config_read",
+    "actions_run_read",
+    "list_my_repos",
+    "list_org_repos",
+    "get_repository_tree",
+    "get_file_contents",
+    "get_dir_contents",
+    "list_branches",
+    "get_tag",
+    "list_tags",
+    "list_commits",
+    "get_commit",
+    "get_release",
+    "get_latest_release",
+    "list_releases",
+)
+_ACCESS_CHOICE: Mapping[str, Any] = {
+    "enum": ["ReadOnly", "ReadWrite"],
+    "title": "Access",
+}
+
+#: The official Gitea MCP server (docker.gitea.com/gitea-mcp-server), a
+#: stock image that speaks streamable HTTP and takes the Gitea token on each
+#: request, so the front injects it from the lease exchange and the pod's
+#: Secret holds none. Its connector names the Gitea instance; the host and
+#: port it pins are derived from that URL.
+GITEA_MCP_SPEC = DriverSpec(
+    name="srw.gitea-mcp/v1",
+    legacy_type="gitea_mcp",
+    title="Gitea (managed MCP server)",
+    guide_topic="datasources",
+    plane="service",
+    delivery_forms=("mcp_client",),
+    config_schema={
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["url"],
+        "properties": {
+            "url": {
+                "type": "string",
+                "title": "Gitea URL",
+                "maxLength": 512,
+                "pattern": "^https?://[^/?#@\\s]+/?$",
+            },
+            "host": _MIRROR,
+            "port": {"type": "integer", "readOnly": True},
+            "access": _ACCESS_CHOICE,
+        },
+    },
+    credential_slots=(
+        CredentialSlot(
+            "token",
+            "secret_string",
+            {"type": "object", "properties": {"token": _SECRET}},
+            required=True,
+            update="replace",
+        ),
+    ),
+    tool_category="mcp",
+    access_levels=_managed_mcp_access(
+        _FRONT_HIDES_WRITE_TOOLS,
+        "The Gitea token decides what the server may do.",
+    ),
+    default_access="ReadWrite",
+    supported_backends=ALL_BACKENDS,
+    workspace_requirements=(
+        "None: the agent process is the MCP client; the server runs in its "
+        "own pod and the token never reaches the agent or the workspace."
+    ),
+    egress=(EgressRule("${config.host}", ("${config.port}",)),),
+    holds_upstream_credentials=True,
+    credential_delivery="lease",
+    service=ServiceSpec(
+        port=8080,
+        callers=("harness",),
+        resources={"limits": {"cpu": "500m", "memory": "128Mi"}},
+        start_seconds=20,
+        mcp={
+            "transport": "http",
+            "port": 8091,
+            "path": "/mcp",
+            "protocol": "legacy",
+            "tools": {"read": list(GITEA_MCP_READ_TOOLS)},
+            "access": _MANAGED_MCP_TOOL_ACCESS,
+            "credential": {"header": "Authorization", "scheme": "Bearer"},
+            "env": {"MCP_MODE": "http", "GITEA_HOST": "${config.url}"},
+            "args": ["-b", "127.0.0.1", "-p", "8091"],
+            "max_in_flight_per_binding": 4,
+            "tool_pinning": "warn",
+        },
+    ),
+)
+
+#: A development managed MCP server (D5a): SRW's srw-mcp-test image, built
+#: by Tilt only. Its read tools report what the front injected (a digest of
+#: the bearer it received) and try to leak it back, so a k3d gate can prove
+#: injection, scrubbing and the tool filter; its write tools change an
+#: in-memory note. Installed only when ``connectors.drivers.mcpTest`` names
+#: its image; no catalogue lists it.
+MCP_TEST_SPEC = DriverSpec(
+    name="srw.mcp-test/v1",
+    legacy_type="mcp_test",
+    title="MCP test server (development)",
+    plane="service",
+    delivery_forms=("mcp_client",),
+    config_schema={
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "message": {"type": "string", "maxLength": 256},
+            "access": _ACCESS_CHOICE,
+        },
+    },
+    credential_slots=(
+        CredentialSlot(
+            "token",
+            "secret_string",
+            {"type": "object", "properties": {"token": _SECRET}},
+            required=True,
+            update="replace",
+        ),
+    ),
+    tool_category="mcp",
+    access_levels=_managed_mcp_access(
+        _FRONT_HIDES_WRITE_TOOLS,
+        "The test server allows every tool.",
+    ),
+    default_access="ReadWrite",
+    supported_backends=ALL_BACKENDS,
+    workspace_requirements="None: the agent process is the MCP client.",
+    publishable=False,
+    holds_upstream_credentials=True,
+    credential_delivery="lease",
+    service=ServiceSpec(
+        port=8080,
+        callers=("harness",),
+        resources={"limits": {"cpu": "100m", "memory": "64Mi"}},
+        start_seconds=10,
+        mcp={
+            "transport": "http",
+            "port": 8091,
+            "path": "/mcp",
+            "protocol": "legacy",
+            "tools": {
+                "read": ["whoami", "notes_list", "notes_read", "leak_credential"]
+            },
+            "access": _MANAGED_MCP_TOOL_ACCESS,
+            "credential": {"header": "Authorization", "scheme": "Bearer"},
+            "args": ["-listen", "127.0.0.1:8091"],
+            "max_in_flight_per_binding": 4,
+            "tool_pinning": "warn",
+        },
+    ),
+)
+
+#: Managed MCP servers SRW ships in its catalogue (each needs its image in
+#: the chart before it is installed).
+MANAGED_MCP_SPECS: tuple[DriverSpec, ...] = (GITEA_MCP_SPEC,)
+
 #: Datasource drivers in catalogue order.
 DATASOURCE_SPECS: tuple[DriverSpec, ...] = (
     GENERIC_SPEC,
@@ -883,11 +1097,15 @@ BUILTIN_SPECS: tuple[DriverSpec, ...] = MANIFEST_SPECS + tuple(
 )
 #: Drivers an installation turns on for development only. Their stored types
 #: resolve (an agent must read what it is sent) but no catalogue lists them.
-DEVELOPMENT_SPECS: tuple[DriverSpec, ...] = (LEASE_PROBE_SPEC, ECHO_SERVICE_SPEC)
+DEVELOPMENT_SPECS: tuple[DriverSpec, ...] = (
+    LEASE_PROBE_SPEC,
+    ECHO_SERVICE_SPEC,
+    MCP_TEST_SPEC,
+)
 
 _BY_TYPE: dict[str, DriverSpec] = {
     spec.legacy_type: spec
-    for spec in DATASOURCE_SPECS + DEVELOPMENT_SPECS
+    for spec in DATASOURCE_SPECS + MANAGED_MCP_SPECS + DEVELOPMENT_SPECS
     if spec.legacy_type
 }
 LEGACY_TYPE_IDS: tuple[str, ...] = tuple(

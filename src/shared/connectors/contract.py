@@ -353,11 +353,12 @@ def validate_spec(spec: DriverSpec) -> list[str]:
             f"{CREDENTIAL_DELIVERY_MODES}"
         )
     elif (spec.credential_delivery == "lease") != (
-        "lease_token" in spec.delivery_forms
+        "lease_token" in spec.delivery_forms or managed_mcp_driver(spec)
     ):
         problems.append(
             "a driver delivers in the lease_token form exactly when its "
-            "credential_delivery is 'lease'"
+            "credential_delivery is 'lease' (a managed MCP driver's lease is "
+            "its client's bearer token instead)"
         )
     problems += _access_problems(spec)
     problems += _slot_problems(spec)
@@ -378,11 +379,46 @@ def validate_spec(spec: DriverSpec) -> list[str]:
                 f"service callers {service.callers!r} must be a non-empty subset "
                 f"of {SERVICE_CALLERS}"
             )
+        if service.mcp is not None:
+            problems += _managed_mcp_problems(spec)
     for rule in spec.egress:
         if not rule.host or not rule.ports:
             problems.append("an egress rule needs a host and at least one port")
         if rule.protocol not in _EGRESS_PROTOCOLS:
             problems.append(f"egress protocol {rule.protocol!r} is invalid")
+    return problems
+
+
+def managed_mcp_driver(spec: DriverSpec) -> bool:
+    """Whether ``spec`` is a managed MCP driver: a service driver with an
+    ``mcp`` block whose client is the agent process (D5a)."""
+    return bool(
+        spec.service is not None
+        and spec.service.mcp is not None
+        and "mcp_client" in spec.delivery_forms
+    )
+
+
+def _managed_mcp_problems(spec: DriverSpec) -> list[str]:
+    """A managed MCP driver: the agent process is the client, through the
+    front, with a lease token as its bearer; never the workspace."""
+    from .mcp import mcp_problems
+
+    service = spec.service
+    problems = mcp_problems(
+        service.mcp,
+        access_levels=[level.id for level in spec.access_levels],
+        front_port=service.port,
+    )
+    if tuple(service.callers) != ("harness",):
+        problems.append("a managed MCP server is called by the agent process only")
+    if spec.delivery_forms != ("mcp_client",):
+        problems.append("a managed MCP driver delivers in the mcp_client form only")
+    if spec.credential_delivery != "lease":
+        problems.append(
+            "a managed MCP driver delivers by lease: the front authenticates "
+            "each call with the caller's lease token"
+        )
     return problems
 
 
