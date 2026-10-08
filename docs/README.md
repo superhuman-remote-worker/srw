@@ -13,6 +13,7 @@ notes are intentionally not prerequisites for using the public repository.
 | Prepare K3s on a shared server with separate volume storage | [K3s host preparation](k3s-host-preparation.md) |
 | Install on an existing cluster | [Helm chart guide](../helm/README.md) |
 | Run Jobs and Sessions on your own tools | [Build your own workspace image](workspace-images.md) |
+| Give agents a credential SRW has no connector for | [Build your own connector driver](connector-drivers.md) |
 | Understand the runtime and data flow | [Architecture](architecture.md) |
 | Evaluate the isolation boundary | [Security model](security-model.md) |
 | Understand continuous project work | [Project loops](project-loops.md) |
@@ -29,6 +30,8 @@ notes are intentionally not prerequisites for using the public repository.
   workspace.
 - [Build your own workspace image](workspace-images.md) — add your tools to a
   workspace image and run Jobs and Sessions on it.
+- [Build your own connector driver](connector-drivers.md) — write, test,
+  register and use a bind-time driver image.
 - [VM capacity diagnostics](vm-capacity.md) — interpret resource inventory,
   retained reservations and unavailable capacity.
 - [Expert configuration](../config/README.md) — configure agent roles, overlays,
