@@ -184,26 +184,29 @@ class TestHasMethods:
         ctx = ToolContext()
         assert ctx.has_postgres() is False
 
-    def test_has_datasource_true(self):
+    # A tool asks for its connection by its own tool category; the slot the
+    # connection sits in comes from the driver specs (agent.connectors.slots).
+    def test_has_connection_for_true(self):
         ctx = ToolContext(datasources={"neo4j": MagicMock()})
-        assert ctx.has_datasource("neo4j") is True
+        assert ctx.has_connection_for("graph") is True
 
-    def test_has_datasource_false_missing_key(self):
+    def test_has_connection_for_false_missing_key(self):
         ctx = ToolContext()
-        assert ctx.has_datasource("neo4j") is False
+        assert ctx.has_connection_for("graph") is False
 
-    def test_has_datasource_false_none_value(self):
+    def test_has_connection_for_false_none_value(self):
         ctx = ToolContext(datasources={"neo4j": None})
-        assert ctx.has_datasource("neo4j") is False
+        assert ctx.has_connection_for("graph") is False
 
-    def test_get_datasource_returns_connection(self):
+    def test_connection_for_returns_connection(self):
         conn = MagicMock()
         ctx = ToolContext(datasources={"neo4j": conn})
-        assert ctx.get_datasource("neo4j") is conn
+        assert ctx.connection_for("graph") is conn
 
-    def test_get_datasource_returns_none(self):
+    def test_connection_for_returns_none(self):
         ctx = ToolContext()
-        assert ctx.get_datasource("neo4j") is None
+        assert ctx.connection_for("graph") is None
+        assert ctx.connection_for("no-such-category") is None
 
     def test_has_git_true(self):
         gm = MagicMock()
