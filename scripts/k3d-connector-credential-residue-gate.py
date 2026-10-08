@@ -46,6 +46,7 @@ import secrets
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -233,23 +234,56 @@ def connector_bodies(gate_id: str, values: GateSecrets) -> list[dict[str, Any]]:
 # no needle is ever an argument. They print labels and paths only.
 # ---------------------------------------------------------------------------
 
+# Every program the gate runs inside a pod calls cap_memory() once its
+# imports are done. The orchestrator pod has a 1 GiB limit and serves the
+# product meanwhile: a gate program that grows must fail the gate with a
+# MemoryError, never take the pod to the OOM killer. RLIMIT_DATA counts heap,
+# anonymous maps and thread stacks (inherited by its children), not the
+# shared libraries mapped in, so the budget is what the program adds.
+POD_MEMORY_BUDGET = 256 << 20
+_POD_MEMORY_CAP = (
+    """
+import resource as _srw_resource
+def cap_memory(budget=%d):
+    with open("/proc/self/status") as status:
+        data = next(
+            int(line.split()[1]) * 1024
+            for line in status
+            if line.startswith("VmData:")
+        )
+    limit = data + budget
+    _soft, hard = _srw_resource.getrlimit(_srw_resource.RLIMIT_DATA)
+    if hard != _srw_resource.RLIM_INFINITY:
+        limit = min(limit, hard)  # an inherited cap is only ever tightened
+    _srw_resource.setrlimit(_srw_resource.RLIMIT_DATA, (limit, limit))
+"""
+    % POD_MEMORY_BUDGET
+)
+
 _SCAN_HELPERS = r"""
 import json, os, sys
 MARKERS = {markers}
 NEEDLES = {{label: value.encode() for label, value in MARKERS.items()}}
 OVERLAP = max(len(n) for n in NEEDLES.values())
 
-def scan_stream(read, found, where):
-    tail = b""
+def scan_stream(read, found, where, extra=None):
+    # 1 MiB at a time, windows overlapping by the longest needle: nothing
+    # larger than that is ever held. ``extra`` ({{name: bytes}}) are looked
+    # for too; the names seen are returned.
+    seen, tail = set(), b""
+    longest = max([OVERLAP] + [len(value) for value in (extra or {{}}).values()])
     while True:
         chunk = read(1 << 20)
         if not chunk:
-            return
+            return seen
         window = tail + chunk
         for label, needle in NEEDLES.items():
             if needle in window:
                 found.setdefault(label, set()).add(where)
-        tail = window[-OVERLAP:]
+        for name, value in (extra or {{}}).items():
+            if value in window:
+                seen.add(name)
+        tail = window[-longest:]
 
 def report(found, **extra):
     extra["hits"] = {{label: sorted(paths) for label, paths in sorted(found.items())}}
@@ -269,8 +303,10 @@ def _markers_literal(markers: dict[str, str]) -> str:
 def file_scan_script(markers: dict[str, str], roots: Sequence[str]) -> str:
     """Scan every regular file under ``roots`` (pinned SQLite checkpoints)."""
     return (
-        _SCAN_HELPERS.format(markers=_markers_literal(markers))
+        _POD_MEMORY_CAP
+        + _SCAN_HELPERS.format(markers=_markers_literal(markers))
         + f"""
+cap_memory()
 found, files = {{}}, 0
 for root in {list(roots)!r}:
     for directory, _dirs, names in os.walk(root):
@@ -286,9 +322,12 @@ report(found, files=files)
     )
 
 
+# The tar-aware scan. It runs in the orchestrator pod for the live
+# captures (scan_archive, from a capture file) and in the gate's own process
+# for the product's S3 snapshot (scan_archive_stream, from a local zstd fed
+# by the pod's pass-through): the same text either way.
 _ARCHIVE_SCANNER = r"""
 import asyncio, base64, hashlib, re, shutil, subprocess, tarfile, tempfile
-from orchestrator.services.snapshot_service import SnapshotService
 
 JOB = {job_id!r}
 EXCLUDED = re.compile({excluded!r})
@@ -297,12 +336,12 @@ def _reader(data):
     chunks = [data]
     return lambda _size: chunks.pop() if chunks else b""
 
-def scan_archive(path):
-    # Stream the archive once: member names, pax headers and file bodies.
+def scan_archive_stream(stream):
+    # Stream the tar once: member names, pax headers and file bodies, each
+    # body 1 MiB at a time; no member is ever held whole.
     found, members, excluded = {{}}, 0, set()
     ssh_config = history = False
-    unzstd = subprocess.Popen(["zstd", "-dc", "--", path], stdout=subprocess.PIPE)
-    with tarfile.open(fileobj=unzstd.stdout, mode="r|") as archive:
+    with tarfile.open(fileobj=stream, mode="r|") as archive:
         for member in archive:
             members += 1
             name = member.name
@@ -316,16 +355,25 @@ def scan_archive(path):
             history = history or name.endswith("agent-host/.bash_history")
             data = archive.extractfile(member)
             if name.endswith("agent-host/.ssh/config"):
-                body = data.read()
-                ssh_config = b"c0-gate.invalid" in body
-                scan_stream(_reader(body), found, name)
+                seen = scan_stream(
+                    data.read, found, name, extra={{"kept": b"c0-gate.invalid"}}
+                )
+                ssh_config = "kept" in seen
             else:
                 scan_stream(data.read, found, name)
-    if unzstd.wait() != 0:
-        raise RuntimeError("zstd failed")
     return dict(members=members, excluded_paths=sorted(excluded),
                 ssh_config_kept=ssh_config, bash_history_present=history,
                 hits={{k: sorted(v) for k, v in sorted(found.items())}})
+
+def scan_archive(path):
+    unzstd = subprocess.Popen(["zstd", "-dc", "--", path], stdout=subprocess.PIPE)
+    try:
+        result = scan_archive_stream(unzstd.stdout)
+    finally:
+        unzstd.stdout.close()
+    if unzstd.wait() != 0:
+        raise RuntimeError("zstd failed")
+    return result
 """
 
 
@@ -348,8 +396,11 @@ def snapshot_capture_script(
     if not _HOST_RE.fullmatch(ssh_host) or not 0 < int(ssh_port) < 65536:
         raise GateFailure("workspace endpoint is malformed")
     return (
-        _archive_scanner(markers, job_id)
+        _POD_MEMORY_CAP
+        + _archive_scanner(markers, job_id)
         + f"""
+from orchestrator.services.snapshot_service import SnapshotService
+cap_memory()
 HOST, PORT = {ssh_host!r}, {int(ssh_port)}
 
 def fingerprint():
@@ -398,25 +449,130 @@ asyncio.run(main())
     )
 
 
-def s3_snapshot_script(markers: dict[str, str], *, job_id: str) -> str:
-    """Download the job's real S3 snapshot, if one exists yet, and scan it."""
+#: ``s3_snapshot_stream_script`` exit codes: no object store, no snapshot yet.
+S3_NO_STORE, S3_NO_SNAPSHOT = 3, 4
+
+
+def s3_snapshot_stream_script(*, job_id: str) -> str:
+    """Pass the job's real S3 snapshot through to stdout, 1 MiB at a time.
+
+    No marker is in it and nothing is read whole, decompressed or scanned in
+    the pod: the gate scans the stream in its own process
+    (:func:`scan_s3_snapshot_stream`). Exits 3 without an object store and 4
+    while the job has no snapshot.
+    """
+    key = f"jobs/{UUID(job_id)}/env.tar.zst"
     return (
-        _archive_scanner(markers, job_id)
-        + """
-async def main():
+        _POD_MEMORY_CAP
+        + f"""
+import asyncio, sys
+from orchestrator.services.snapshot_service import SnapshotService
+KEY = {key!r}
+async def connect():
     service = SnapshotService()
     await service.connect(None)
-    result = dict(available=False)
-    if service.is_available:
-        with tempfile.TemporaryDirectory(prefix="srw-c0-gate-") as workdir:
-            out = os.path.join(workdir, "product.tar.zst")
-            if await service.download_snapshot(JOB, out):
-                result = dict(available=True, **scan_archive(out))
-    print(json.dumps(result, sort_keys=True))
-
-asyncio.run(main())
+    return service
+service = asyncio.run(connect())
+cap_memory()
+s3 = getattr(service, "_s3", None)
+if not service.is_available or s3 is None:
+    raise SystemExit({S3_NO_STORE})
+try:
+    body = s3.get_object(Bucket=service._bucket, Key=KEY)["Body"]
+except Exception as error:
+    code = getattr(error, "response", {{}}).get("Error", {{}}).get("Code", "")
+    if code in ("404", "NoSuchKey"):
+        raise SystemExit({S3_NO_SNAPSHOT})
+    raise
+out = sys.stdout.buffer
+while True:
+    chunk = body.read(1 << 20)
+    if not chunk:
+        break
+    out.write(chunk)
+out.flush()
 """
     )
+
+
+def s3_snapshot_producer() -> list[str]:
+    """The pod side of the S3 scan: its python reads the script on stdin."""
+    return [
+        "kubectl",
+        f"--context={LOCAL_CONTEXT}",
+        "-n",
+        LOCAL_NAMESPACE,
+        "exec",
+        "-i",
+        ORCHESTRATOR,
+        "-c",
+        "orchestrator",
+        "--",
+        "python",
+        "-",
+    ]
+
+
+def scan_s3_snapshot_stream(
+    markers: dict[str, str], *, job_id: str, timeout: int = 900
+) -> dict[str, Any] | None:
+    """Scan the job's S3 snapshot here, streamed out of the pod.
+
+    The pod passes the object's bytes through; a local ``zstd -dc`` reads
+    them straight from the producer and the tar-aware scanner (the same text
+    the pod runs for captures) reads zstd's output, 1 MiB at a time. Returns
+    None while there is no snapshot; raises GateFailure when the transfer or
+    the archive is incomplete.
+    """
+    namespace: dict[str, Any] = {}
+    exec(_archive_scanner(markers, job_id), namespace)  # the gate's own text
+    with tempfile.TemporaryFile() as errors:
+        producer = subprocess.Popen(
+            s3_snapshot_producer(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=errors,
+        )
+        processes = [producer]
+        try:
+            assert producer.stdin is not None and producer.stdout is not None
+            producer.stdin.write(s3_snapshot_stream_script(job_id=job_id).encode())
+            producer.stdin.close()
+            try:
+                decoder = subprocess.Popen(
+                    ["zstd", "-dcq"],
+                    stdin=producer.stdout,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+            except FileNotFoundError:
+                raise GateFailure("zstd is not installed where the gate runs") from None
+            processes.append(decoder)
+            producer.stdout.close()
+            watchdog = threading.Timer(
+                timeout, lambda: [process.kill() for process in processes]
+            )
+            watchdog.start()
+            try:
+                result = namespace["scan_archive_stream"](decoder.stdout)
+                failure = None
+            except Exception as error:  # a short or broken stream
+                result, failure = None, type(error).__name__
+            finally:
+                watchdog.cancel()
+            codes = [process.wait(timeout=60) for process in processes]
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+    if codes[0] in (S3_NO_STORE, S3_NO_SNAPSHOT):
+        return None
+    if failure or any(codes):
+        raise GateFailure(
+            f"S3 snapshot stream incomplete (exit {codes}, {failure or 'no error'})"
+        )
+    return result
 
 
 def checkpoint_scan_sql(markers: dict[str, str], *, job_id: str) -> str:
@@ -658,8 +814,9 @@ class Gate:
             f"/app/{path}": hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
             for path in paths
         }
-        probe = (
+        probe = _POD_MEMORY_CAP + (
             "import hashlib, json\n"
+            "cap_memory()\n"
             f"expected = {expected!r}\n"
             "stale = [p for p, h in expected.items() if hashlib.sha256("
             "open(p, 'rb').read()).hexdigest() != h]\n"
@@ -936,13 +1093,14 @@ class Gate:
 
     def scan_s3_snapshot(self, markers: dict[str, str]) -> None:
         """Wait (bounded) for the job's real S3 snapshot, then scan it."""
-        script = s3_snapshot_script(markers, job_id=self.job_id)
+        broken: list[str] = []
 
         def available():
-            result = self.kube.python(
-                ORCHESTRATOR, "orchestrator", script, operation="s3 snapshot"
-            )
-            return result if result.get("available") else None
+            try:
+                return scan_s3_snapshot_stream(markers, job_id=self.job_id)
+            except GateFailure as error:  # appeared, but did not read whole
+                broken.append(str(error))
+                return {"broken": True}
 
         try:
             result = wait_for(
@@ -956,6 +1114,9 @@ class Gate:
                 "snapshot_s3_product", "skipped", reason="never appeared"
             )
             return
+        if broken:
+            self.report.record("snapshot_s3_product", "fail", reason=broken[-1])
+            raise GateFailure("the job's S3 snapshot could not be read whole")
         if self._archive_verdict("snapshot_s3_product", result):
             raise GateFailure("credential residue in the job's S3 snapshot")
 

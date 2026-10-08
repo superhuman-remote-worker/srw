@@ -334,7 +334,7 @@ def _fake_snapshot_package(root: Path, home_root: Path) -> Path:
     (package / "snapshot_service.py").write_text(
         textwrap.dedent(
             f"""
-            import os, subprocess, tempfile
+            import os, struct, subprocess, tempfile
 
             def _archive(path):
                 with open(path, "wb") as out:
@@ -343,15 +343,52 @@ def _fake_snapshot_package(root: Path, home_root: Path) -> Path:
                         shell=True, stdout=out, check=True,
                     )
 
+            class _Missing(Exception):
+                response = {{"Error": {{"Code": "NoSuchKey"}}}}
+
+            class _Body:
+                # FAKE_SKIPPABLE_BYTES puts a zstd skippable frame of that
+                # many bytes in front: a compressed object that large, made
+                # lazily, which every zstd decoder steps over.
+                def __init__(self, path):
+                    self._skip = int(os.environ.get("FAKE_SKIPPABLE_BYTES", "0"))
+                    self._header = (
+                        struct.pack("<II", 0x184D2A50, self._skip)
+                        if self._skip else b""
+                    )
+                    self._file = open(path, "rb")
+
+                def read(self, size=-1):
+                    if size is None or size < 0:
+                        whole = self._header + bytes(self._skip) + self._file.read()
+                        self._header, self._skip = b"", 0
+                        return whole
+                    if self._header:
+                        part, self._header = self._header[:size], self._header[size:]
+                        return part
+                    if self._skip:
+                        take = min(size, self._skip)
+                        self._skip -= take
+                        return bytes(take)
+                    return self._file.read(size)
+
+            class _S3:
+                def get_object(self, Bucket, Key):
+                    if os.environ.get("FAKE_SNAPSHOT_MISSING"):
+                        raise _Missing()
+                    fd, path = tempfile.mkstemp(suffix=".tar.zst")
+                    os.close(fd)
+                    _archive(path)
+                    return {{"Body": _Body(path)}}
+
             class SnapshotService:
                 is_available = False
+                _s3 = None
+                _bucket = "srw-snapshots"
 
                 async def connect(self, db):
                     self.is_available = True
-
-                async def download_snapshot(self, job_id, dest):
-                    _archive(dest)
-                    return True
+                    self._s3 = _S3()
 
                 async def capture_vm_snapshot(self, **kwargs):
                     fd, path = tempfile.mkstemp(suffix=".tar.zst")
@@ -421,13 +458,150 @@ def test_capture_scanner_reports_paths_not_secrets(tmp_path, leak) -> None:
         _assert_archive(result[mode], leak)
 
 
+def _local_producer(monkeypatch, fake: Path) -> None:
+    """Run the pod side of the S3 scan as a local python on the fake package."""
+    monkeypatch.setattr(gate, "s3_snapshot_producer", lambda: [sys.executable, "-"])
+    monkeypatch.setenv("PYTHONPATH", str(fake))
+
+
 @pytest.mark.parametrize("leak", [True, False])
-def test_s3_scanner_reads_the_real_snapshot(tmp_path, leak) -> None:
+def test_s3_scanner_reads_the_real_snapshot(tmp_path, monkeypatch, leak) -> None:
     _needs("tar", "zstd")
     fake = _fake_snapshot_package(tmp_path, _fixture_home(tmp_path, leak))
+    _local_producer(monkeypatch, fake)
+
+    result = gate.scan_s3_snapshot_stream(MARKERS, job_id=str(uuid4()))
+
+    assert result is not None
+    _assert_archive(result, leak)
+
+
+def test_s3_scanner_reports_no_snapshot_yet(tmp_path, monkeypatch) -> None:
+    _needs("tar", "zstd")
+    fake = _fake_snapshot_package(tmp_path, _fixture_home(tmp_path, False))
+    _local_producer(monkeypatch, fake)
+    monkeypatch.setenv("FAKE_SNAPSHOT_MISSING", "1")
+
+    assert gate.scan_s3_snapshot_stream(MARKERS, job_id=str(uuid4())) is None
+
+
+def test_the_s3_stream_program_carries_no_marker() -> None:
+    script = gate.s3_snapshot_stream_script(job_id=str(uuid4()))
+    assert all(needle not in script for needle in MARKERS.values())
+    compile(script, "<s3 stream>", "exec")
+
+
+def test_a_truncated_s3_snapshot_is_never_read_as_clean(tmp_path, monkeypatch) -> None:
+    _needs("tar", "zstd")
+    archive = tmp_path / "cut.tar.zst"
+    subprocess.run(
+        f"tar -C {_fixture_home(tmp_path, True)} -cf - home | zstd -q",
+        shell=True,
+        stdout=archive.open("wb"),
+        check=True,
+    )
+    data = archive.read_bytes()
+    archive.write_bytes(data[: len(data) // 2])
+    monkeypatch.setattr(gate, "s3_snapshot_producer", lambda: ["cat", str(archive)])
+
+    with pytest.raises(gate.GateFailure, match="incomplete"):
+        gate.scan_s3_snapshot_stream(MARKERS, job_id=str(uuid4()))
+
+
+def test_a_failed_producer_is_never_read_as_clean(tmp_path, monkeypatch) -> None:
+    """The whole archive arrived, but the pod side did not exit cleanly."""
+    _needs("tar", "zstd")
+    archive = tmp_path / "whole.tar.zst"
+    subprocess.run(
+        f"tar -C {_fixture_home(tmp_path, False)} -cf - home | zstd -q",
+        shell=True,
+        stdout=archive.open("wb"),
+        check=True,
+    )
+    monkeypatch.setattr(
+        gate,
+        "s3_snapshot_producer",
+        lambda: ["sh", "-c", f"cat {archive}; exit 7"],
+    )
+
+    with pytest.raises(gate.GateFailure, match="incomplete"):
+        gate.scan_s3_snapshot_stream(MARKERS, job_id=str(uuid4()))
+
+
+# -- bounded memory -----------------------------------------------------------
+# The k3d run of 2026-10-08 OOM-killed the orchestrator: the S3 scan read a
+# ~100 MB snapshot whole and decompressed it whole inside the pod. Each scan
+# below runs under the same RLIMIT_DATA budget the pod programs set, on an
+# archive whose one member alone is larger than that budget.
+
+_BIG_MEMBER = gate.POD_MEMORY_BUDGET + (128 << 20)
+
+
+def _big_fixture_home(tmp_path: Path) -> Path:
+    home_root = _fixture_home(tmp_path, True)
+    big = home_root / "home" / "agent-host" / "workspace" / "big.bin"
+    with big.open("wb") as handle:
+        handle.truncate(_BIG_MEMBER)  # sparse; tar reads zeros
+    with (home_root / "home" / "agent-host" / ".bash_history").open("a") as handle:
+        handle.write("tail\n")
+    return home_root
+
+
+def test_the_memory_cap_is_real() -> None:
+    """Control: the cap does stop a whole read this large."""
+    completed = subprocess.run(
+        [sys.executable, "-"],
+        input=gate._POD_MEMORY_CAP + f"cap_memory()\nb = bytes({_BIG_MEMBER})\n",
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode != 0
+    assert "MemoryError" in completed.stderr
+
+
+def test_the_capture_scan_streams_a_member_larger_than_the_cap(tmp_path) -> None:
+    _needs("tar", "zstd")
+    fake = _fake_snapshot_package(tmp_path, _big_fixture_home(tmp_path))
     env = dict(os.environ, PYTHONPATH=str(fake))
 
-    result = _run_script(gate.s3_snapshot_script(MARKERS, job_id=str(uuid4())), env=env)
+    result = _run_script(
+        gate.snapshot_capture_script(
+            MARKERS, job_id=str(uuid4()), ssh_host="127.0.0.1", ssh_port=1
+        ),
+        env=env,
+    )
 
-    assert result["available"] is True
-    _assert_archive(result, leak)
+    for mode in ("non_strict", "strict"):
+        assert result[mode]["captured"] is True
+        _assert_archive(result[mode], True)
+
+
+def test_the_s3_scan_streams_a_member_larger_than_the_cap(tmp_path) -> None:
+    """Both ends capped: the pod program by itself, the local scan here.
+
+    The object is larger than the cap compressed (a skippable frame in front)
+    and its tar has a member larger than the cap, so a whole read on either
+    side fails with a MemoryError.
+    """
+    _needs("tar", "zstd")
+    fake = _fake_snapshot_package(tmp_path, _big_fixture_home(tmp_path))
+    runner = textwrap.dedent(
+        f"""
+        import importlib.util, json, sys
+        spec = importlib.util.spec_from_file_location("gate", {str(_SCRIPT)!r})
+        gate = importlib.util.module_from_spec(spec)
+        sys.modules["gate"] = gate
+        spec.loader.exec_module(gate)
+        exec(gate._POD_MEMORY_CAP)
+        cap_memory()
+        gate.s3_snapshot_producer = lambda: [sys.executable, "-"]
+        result = gate.scan_s3_snapshot_stream({MARKERS!r}, job_id={str(uuid4())!r})
+        print(json.dumps(result))
+        """
+    )
+    env = dict(os.environ, PYTHONPATH=str(fake), FAKE_SKIPPABLE_BYTES=str(_BIG_MEMBER))
+    result = _run_script(runner, env=env)
+
+    _assert_archive(result, True)
+    assert result["members"] >= 8
