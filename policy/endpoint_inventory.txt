@@ -190,6 +190,7 @@ POST   /api/datasources/ssh-keys/generate                                       
 DELETE /api/datasources/{datasource_id}                                                 pat=admin           gated:require_datasource_owner
 GET    /api/datasources/{datasource_id}                                                 pat=jobs:read       gated:require_datasource_access
 PUT    /api/datasources/{datasource_id}                                                 pat=admin           gated:require_datasource_owner
+GET    /api/datasources/{datasource_id}/egress                                          pat=jobs:read       gated:require_datasource_access
 GET    /api/datasources/{datasource_id}/index-status                                    pat=jobs:read       gated:require_datasource_access
 POST   /api/datasources/{datasource_id}/reindex                                         pat=admin           gated:require_datasource_owner
 POST   /api/datasources/{datasource_id}/test                                            pat=admin           gated:require_datasource_owner
