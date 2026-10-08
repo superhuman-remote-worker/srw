@@ -51,17 +51,15 @@ Send = Callable[[Message], Awaitable[None]]
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 
 
-class _BodyTooLarge(Exception):
-    pass
-
-
 class BodyLimit:
     """ASGI wrapper refusing a request body over ``limit`` bytes with 413.
 
     A declared ``Content-Length`` over the limit is refused before anything
-    is read; a body that streams past the limit (chunked, or lying about its
-    length) is refused at the first chunk that crosses it, so the
-    application never buffers more than ``limit`` bytes.
+    is read. A body that streams past the limit (chunked, or lying about its
+    length) is cut at the first chunk that crosses it: the application sees
+    the client disconnect, so it never holds more than ``limit`` bytes, and
+    whatever it answers to that is dropped. The 413 (no-store) is this
+    wrapper's own, not the framework's 400 for an unreadable body.
     """
 
     def __init__(self, app: ASGIApp, *, limit: int = MAX_BODY_BYTES) -> None:
@@ -97,28 +95,36 @@ class BodyLimit:
                     await self._refuse(send)
                     return
         received = 0
+        overflow = False
         started = False
 
         async def limited_receive() -> Message:
-            nonlocal received
+            nonlocal received, overflow
+            if overflow:
+                return {"type": "http.disconnect"}
             message = await receive()
             if message.get("type") == "http.request":
                 received += len(message.get("body") or b"")
                 if received > self.limit:
-                    raise _BodyTooLarge
+                    overflow = True
+                    return {"type": "http.disconnect"}
             return message
 
-        async def tracked_send(message: Message) -> None:
+        async def guarded_send(message: Message) -> None:
             nonlocal started
+            if overflow and not started:
+                # The application's answer to a body it never fully got.
+                return
             if message.get("type") == "http.response.start":
                 started = True
             await send(message)
 
         try:
-            await self.app(scope, limited_receive, tracked_send)
-        except _BodyTooLarge:
-            if started:
+            await self.app(scope, limited_receive, guarded_send)
+        except Exception:
+            if not overflow or started:
                 raise
+        if overflow and not started:
             await self._refuse(send)
 
 
@@ -169,11 +175,16 @@ class _EmbeddedServer(uvicorn.Server):
 
 
 def exchange_server_config(app: Any) -> uvicorn.Config:
-    """The exchange port's server: bounded, quiet, no websockets."""
+    """The exchange port's server: bounded, quiet, no websockets.
+
+    ``proxy_headers`` is off: no proxy fronts this port, so the client
+    address is always the socket peer, never an ``X-Forwarded-For`` value.
+    """
     return uvicorn.Config(
         BodyLimit(app),
         ws="none",
         lifespan="off",
+        proxy_headers=False,
         log_config=None,
         access_log=False,
         server_header=False,

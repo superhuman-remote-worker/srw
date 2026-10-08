@@ -921,9 +921,17 @@ async def _asgi_call(app, *, body_chunks, headers=()):
 
     scope = {
         "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
         "method": "POST",
+        "scheme": "http",
         "path": EXCHANGE_PATH,
+        "raw_path": EXCHANGE_PATH.encode(),
+        "root_path": "",
+        "query_string": b"",
         "headers": [(k.encode(), v.encode()) for k, v in headers],
+        "client": ("10.42.0.9", 40000),
+        "server": ("127.0.0.1", 8088),
     }
     await app(scope, receive, send)
     return sent
@@ -974,6 +982,47 @@ class TestBoundedPort:
         )
         assert sent[0]["status"] == 200 and sent[1]["body"] == b"16"
 
+    @pytest.mark.asyncio
+    async def test_a_chunked_oversized_body_through_the_app_is_413_no_store(
+        self, exchange_client
+    ):
+        """FastAPI turns an unreadable body into its own 400; the wrapper
+        answers 413 (no-store) itself and drops what the app sent."""
+        client, fake = exchange_client
+        sent = await _asgi_call(
+            connectors_composition.BodyLimit(client.app),
+            body_chunks=[
+                b'{"lease_token": "' + b"x" * 3000,
+                b"x" * 3000 + b'", "operation": "read"}',
+            ],
+            headers=[
+                ("content-type", "application/json"),
+                ("transfer-encoding", "chunked"),
+            ],
+        )
+        starts = [m for m in sent if m["type"] == "http.response.start"]
+        assert [m["status"] for m in starts] == [413]
+        assert (b"cache-control", b"no-store") in starts[0]["headers"]
+        assert fake.calls == []
+
+    def test_a_chunked_post_is_413_no_store(self, exchange_client):
+        client, fake = exchange_client
+        bounded = TestClient(connectors_composition.BodyLimit(client.app))
+
+        def chunks():
+            yield b'{"lease_token": "' + b"x" * 3000
+            yield b"x" * 3000 + b'", "operation": "read"}'
+
+        response = bounded.post(
+            EXCHANGE_PATH,
+            content=chunks(),
+            headers={"content-type": "application/json"},
+        )
+        assert response.status_code == 413
+        assert response.headers["cache-control"] == "no-store"
+        assert response.json() == {"error": "request_too_large"}
+        assert fake.calls == []
+
     def test_the_real_port_refuses_a_large_post(self, exchange_client):
         client, fake = exchange_client
         bounded = TestClient(connectors_composition.BodyLimit(client.app))
@@ -994,6 +1043,7 @@ class TestBoundedPort:
         )
         assert config.timeout_graceful_shutdown == 5
         assert config.ws == "none" and config.lifespan == "off"
+        assert config.proxy_headers is False
 
 
 class TestWindowSettings:
