@@ -1710,6 +1710,7 @@
       "accessKbReadOnlyHint": "External OKF Knowledge Bases are read-only to agents in this release.",
       "accessEnforcedBy": "Enforced by:",
       "accessAdvisory": "Advisory only:",
+      "githubAppReadOnly": "the GitHub App token SRW mints for each execution has contents: read, so no push succeeds (the workspace shell included).",
       "unlink": "Unlink"
     },
     "repos": {
@@ -2838,6 +2839,7 @@
       "accessReadOnly": "Read-only",
       "accessReadWrite": "Read-write",
       "visibilityCredentialHint": "Read-only is declared, not enforced — use read-only credentials (deploy token / restricted DB account).",
+      "visibilityGithubAppHint": "Read-only is enforced for a GitHub App connector: each execution's token is minted with contents: read, so no push succeeds.",
       "visibilityKbHint": "Knowledge-base connectors are always read-only; credentials never reach agents.",
       "availabilityTitle": "Availability",
       "scopeEverywhere": "Everywhere in my work",

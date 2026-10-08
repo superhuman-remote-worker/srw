@@ -1403,7 +1403,9 @@ type KeyValueRow = {key: string; value: string};
                          levels and forced_read_only). A public connector's
                          read-only is declared, never enforced, so no
                          "enforced by" line here: a project link's read-only
-                         is what the drivers enforce (project-detail). -->
+                         is what the drivers enforce (project-detail). A
+                         GitHub App connector is the exception: its token is
+                         minted with contents: read, and its hint says so. -->
                     @if (formData.is_global) {
                       <div class="access-radio">
                         @if (offersReadOnly()) {
@@ -2741,9 +2743,18 @@ export class DatasourceListComponent implements OnInit {
    *  (the KB) are read-only for everyone; for the rest the flag is only
    *  declared, so the credentials must be scoped. */
   publicHintKey(): string {
+    if (this.isGithubAppForm()) return 'datasources.form.visibilityGithubAppHint';
     return this.offersReadWrite()
       ? 'datasources.form.visibilityCredentialHint'
       : 'datasources.form.visibilityKbHint';
+  }
+
+  /** Whether the form edits a GitHub App repository connector that keeps
+   *  its App (C5, set up through the API): its read-only is enforced, by
+   *  the contents: read token SRW mints for each execution. */
+  isGithubAppForm(): boolean {
+    if (this.formData.type !== 'repository' || this.editingId() === null) return false;
+    return 'github_app' in this.unrenderedRepositoryConfig();
   }
 
   /** Whether a listed public connector reads as read-write. */

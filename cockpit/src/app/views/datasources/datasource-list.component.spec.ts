@@ -729,6 +729,22 @@ describe('DatasourceListComponent repository forge selection', () => {
     );
   });
 
+  it('says a GitHub App connector\'s read-only is enforced, until a token replaces it', () => {
+    const {component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      type: 'repository',
+      connection_url: 'https://github.com/acme/widget.git',
+      config: {forge: 'github', github_app: githubApp},
+    });
+    expect(component.isGithubAppForm()).toBe(true);
+    expect(component.publicHintKey()).toBe('datasources.form.visibilityGithubAppHint');
+    component.gitAuthMethod = 'token';
+    component.formCredentials.password = 'ghp_replacement';
+    expect(component.isGithubAppForm()).toBe(false);
+    expect(component.publicHintKey()).toBe('datasources.form.visibilityCredentialHint');
+  });
+
   it('drops the GitHub App config when a token replaces the App', () => {
     const {api, component, ds} = createComponent();
     component.openEditForm({

@@ -1710,6 +1710,7 @@
       "accessKbReadOnlyHint": "Externe OKF Knowledge Bases sind in dieser Version für Agenten schreibgeschützt.",
       "accessEnforcedBy": "Durchgesetzt durch:",
       "accessAdvisory": "Nur ein Hinweis:",
+      "githubAppReadOnly": "das GitHub-App-Token, das SRW für jede Ausführung erzeugt, hat contents: read, kein Push gelingt (auch nicht aus der Workspace-Shell).",
       "unlink": "Trennen"
     },
     "repos": {
@@ -2838,6 +2839,7 @@
       "accessReadOnly": "Nur Lesen",
       "accessReadWrite": "Lesen & Schreiben",
       "visibilityCredentialHint": "Nur-Lesen ist deklariert, nicht erzwungen — verwenden Sie Nur-Lese-Zugangsdaten (Deploy-Token / eingeschränktes DB-Konto).",
+      "visibilityGithubAppHint": "Bei einem GitHub-App-Konnektor wird Nur-Lesen durchgesetzt: das Token jeder Ausführung wird mit contents: read erzeugt, kein Push gelingt.",
       "visibilityKbHint": "Wissensdatenbank-Konnektoren sind immer schreibgeschützt; Zugangsdaten erreichen die Agenten nie.",
       "availabilityTitle": "Verfügbarkeit",
       "scopeEverywhere": "Überall in meiner Arbeit",

@@ -805,6 +805,27 @@ describe('ProjectDetailPageComponent link access from the capability matrix', ()
     expect(level('email', null)?.id).toBe('draft');
   });
 
+  it('says a GitHub App connector\'s read-only is enforced, at its own rule too', () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const app = {forge: 'github', github_app: {app_id: '1', installation_id: '2'}};
+    const level = (over: object) =>
+      component.linkAccessLevel({type: 'repository', config: app, ...over});
+    // A read-only link: enforced (the token's contents: read), not advisory.
+    expect(level({project_read_only: true})).toMatchObject({id: 'ReadOnly', advisory: false});
+    // The connector's own read-only, or public with the flag never set.
+    expect(level({read_only: true})?.id).toBe('ReadOnly');
+    expect(level({is_global: true, read_only: null})?.id).toBe('ReadOnly');
+    // Published read-write by its owner, on a read-write link.
+    expect(level({is_global: true, read_only: false})?.id).toBe('ReadWrite');
+    expect(component.githubAppReadOnly({type: 'repository', config: app, read_only: true})).toBe(true);
+    // A token repository keeps the declared-only line.
+    expect(
+      component.linkAccessLevel({type: 'repository', config: {forge: 'github'}, project_read_only: true})
+        ?.advisory,
+    ).toBe(true);
+    expect(component.githubAppReadOnly({type: 'repository', config: {forge: 'github'}, read_only: true})).toBe(false);
+  });
+
   it('keeps the KB rule until the matrix loads', () => {
     const {component} = createComponent({drivers: null});
     expect(component.linkAccess({type: 'kb'})).toBe('read_only');

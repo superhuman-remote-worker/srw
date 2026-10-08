@@ -689,7 +689,11 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                           @if (linkAccessLevel(ds); as level) {
                             <div class="link-enforced" [class.link-advisory]="level.advisory" [attr.data-level]="level.id">
                               <strong>{{ (level.advisory ? 'projectDetail.datasources.accessAdvisory' : 'projectDetail.datasources.accessEnforcedBy') | transloco }}</strong>
-                              {{ level.enforced_by }}
+                              @if (githubAppReadOnly(ds)) {
+                                {{ 'projectDetail.datasources.githubAppReadOnly' | transloco }}
+                              } @else {
+                                {{ level.enforced_by }}
+                              }
                             </div>
                           }
                         </td>
@@ -2553,11 +2557,16 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
    *  read/read-write driver, or, for a tiered one (email), the tier its
    *  config stores, else the driver's default. */
   linkAccessLevel(
-    ds: Pick<Datasource, 'type' | 'config'> & {project_read_only?: boolean | null},
+    ds: Pick<Datasource, 'type' | 'config'> &
+      Partial<Pick<Datasource, 'read_only' | 'is_global'>> & {project_read_only?: boolean | null},
   ): ConnectorAccessLevel | null {
     const driver = this.connectorDrivers.forType(ds.type);
     const access = offeredAccess(driver);
     if (!driver || !access) return null;
+    if (this.githubAppReadOnly(ds) && access.readOnly) {
+      // Enforced, not advisory: the token SRW mints has contents: read.
+      return {...access.readOnly, advisory: false};
+    }
     if (access.readOnly && (!access.readWrite || ds.project_read_only === true)) {
       return access.readOnly;
     }
@@ -2566,6 +2575,20 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
       return driver.access_levels.find((level) => level.id === own) ?? access.readWrite;
     }
     return access.readWrite;
+  }
+
+  /** Whether a GitHub App repository connector (C5) binds read-only here:
+   *  its link is read-only, or the connector itself is (its own flag, or
+   *  public with none set). Its read-only is enforced by the token SRW
+   *  mints with contents: read, so no push succeeds. */
+  githubAppReadOnly(
+    ds: Pick<Datasource, 'type' | 'config'> &
+      Partial<Pick<Datasource, 'read_only' | 'is_global'>> & {project_read_only?: boolean | null},
+  ): boolean {
+    const config = ds.config as {github_app?: unknown} | undefined;
+    if (ds.type !== 'repository' || !config?.github_app) return false;
+    const own = ds.read_only === true || (ds.read_only == null && ds.is_global === true);
+    return ds.project_read_only === true || own;
   }
 
   updateDatasourceReadOnly(datasourceId: string, value: string): void {
