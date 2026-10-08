@@ -377,7 +377,7 @@ RUN /usr/local/bin/assert-workspace-contract
 | Image | Contains |
 | --- | --- |
 | `srw-workspace-minimal` | The contract above, the browser stack (Chromium, Playwright, browser-use) and a small CLI set: curl, wget, jq, less, vim-tiny, nano, ripgrep, zip. About 3.1 GB unpacked. |
-| `srw-workspace` | Everything in minimal, plus Node.js 22 with TypeScript and Prettier, compilers and `-dev` libraries, `psql`, `mongosh` and `cypher-shell`, pandoc, poppler and ffmpeg. About 5.7 GB unpacked. |
+| `srw-workspace` | Everything in minimal, plus Node.js 22 with TypeScript and Prettier, compilers and `-dev` libraries, `psql`, `mongosh` and `cypher-shell`, `kubectl` (for kubeconfig connectors), pandoc, poppler and ffmpeg. About 5.7 GB unpacked. |
 
 An Expert whose instructions assume Node, a compiler or a database client fails
 on `srw-workspace-minimal` with "command not found". Use `srw-workspace`, or add

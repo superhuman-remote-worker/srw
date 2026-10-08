@@ -140,6 +140,22 @@ def test_both_targets_run_both_gates():
     assert browser > last_install(full)
 
 
+def test_full_carries_the_pinned_kubectl_kubeconfig_connectors_need():
+    """Kubeconfig connectors land in the workspace home (D1d); the shell
+    needs kubectl. The pin matches the VM base image's."""
+    minimal, full = stages()["minimal"], stages()["full"]
+    pin = dict(re.findall(r"(?m)^ARG (SRW_KUBECTL_\w+)=(\S+)$", full))
+    vm = (REPO / "docker/agent-vm-base/scripts/provision-stage1.sh").read_text()
+    assert pin == dict(re.findall(r"(?m)^(SRW_KUBECTL_\w+)=(\S+)$", vm))
+    assert set(pin) == {"SRW_KUBECTL_VERSION", "SRW_KUBECTL_SHA256"}
+    assert '"${SRW_KUBECTL_SHA256}  /tmp/kubectl" | sha256sum -c -' in full
+    assert "install -m 0755 /tmp/kubectl /usr/local/bin/kubectl" in full
+    assert full.index("/usr/local/bin/kubectl") < full.rfind(
+        "RUN /usr/local/bin/assert-workspace-contract"
+    )
+    assert "kubectl" not in minimal
+
+
 def test_full_installs_node_packages_system_wide():
     # minimal sets npm_config_prefix to the home directory, which the workspace
     # volume hides. A global install in full must not land there.

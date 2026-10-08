@@ -421,6 +421,21 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         cypher-shell
 
 # ---------------------------------------------------------------------------
+# F2b. kubectl, for kubeconfig connectors: their files are merged into
+#      ~/.kube/config in the workspace home. Pinned upstream binary and its
+#      published checksum (dl.k8s.io), the same pin as
+#      agent-vm-base/scripts/provision-stage1.sh.
+# ---------------------------------------------------------------------------
+ARG SRW_KUBECTL_VERSION=v1.33.13
+ARG SRW_KUBECTL_SHA256=316d712726d857c20744c57cb36aa47cfc79bc0af7e82cebf3780244b654c073
+RUN curl -fsSL "https://dl.k8s.io/release/${SRW_KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+        -o /tmp/kubectl \
+    && echo "${SRW_KUBECTL_SHA256}  /tmp/kubectl" | sha256sum -c - \
+    && install -m 0755 /tmp/kubectl /usr/local/bin/kubectl \
+    && rm /tmp/kubectl \
+    && kubectl version --client
+
+# ---------------------------------------------------------------------------
 # F3. Node.js 22 + global packages
 # ---------------------------------------------------------------------------
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
