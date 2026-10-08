@@ -326,7 +326,9 @@ def test_the_environment_reaches_the_settings(monkeypatch):
     monkeypatch.setenv("CONNECTOR_SERVICE_IPV6", "true")
     monkeypatch.setenv("CONNECTOR_SERVICE_REFUSED_CIDRS", "10.0.50.0/24,10.0.51.0/24")
     monkeypatch.setenv("CONNECTOR_SERVICE_POD_IP", "10.42.1.7")
+    monkeypatch.setenv("CONNECTOR_DRIVER_REGISTRY_PRIVATE_HOSTS", "srw-registry:5000")
     settings = DeploymentSettings.from_environment()
+    assert settings.connector_driver_registry_private_hosts == {"srw-registry:5000"}
     assert settings.connector_service_refused_cidrs == (
         "10.0.50.0/24",
         "10.0.51.0/24",

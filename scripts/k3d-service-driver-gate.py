@@ -410,6 +410,7 @@ async def main():
         references={ECHO_SERVICE_SPEC.name: request["reference"]},
         resolver=RegistryResolver(
             hosts=None, insecure_hosts=set(request["insecure_hosts"]),
+            private_hosts=set(request["insecure_hosts"]),
             token_hosts=DEFAULT_TOKEN_HOSTS, same_host_tokens=True, timeout=20,
         ),
         cache_seconds=30, timeout_seconds=30, store=db,

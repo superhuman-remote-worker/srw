@@ -209,6 +209,7 @@ def orchestrator_env(docs: list[dict]) -> dict[str, str]:
 def test_driver_image_resolution_settings_reach_the_orchestrator():
     env = orchestrator_env(render())
     assert env["CONNECTOR_DRIVER_REGISTRY_INSECURE_HOSTS"] == ""
+    assert env["CONNECTOR_DRIVER_REGISTRY_PRIVATE_HOSTS"] == ""
     assert env["CONNECTOR_DRIVER_REGISTRY_TOKEN_HOSTS"] == ""
     assert env["CONNECTOR_DRIVER_RESOLVE_CACHE_SECONDS"] == "60"
     assert env["CONNECTOR_DRIVER_RESOLVE_TIMEOUT_SECONDS"] == "10"
@@ -217,8 +218,10 @@ def test_driver_image_resolution_settings_reach_the_orchestrator():
             "connectors.drivers.registry.insecureHosts[0]=srw-registry:5000",
             "connectors.drivers.registry.insecureHosts[1]=other:5000",
             "connectors.drivers.registry.tokenHosts[0]=tokens.example",
+            "connectors.drivers.registry.privateHosts[0]=srw-registry:5000",
         )
     )
+    assert env["CONNECTOR_DRIVER_REGISTRY_PRIVATE_HOSTS"] == "srw-registry:5000"
     assert env["CONNECTOR_DRIVER_REGISTRY_INSECURE_HOSTS"] == (
         "srw-registry:5000,other:5000"
     )
@@ -502,4 +505,7 @@ def test_the_k3d_profile_resolves_from_the_k3d_registry_over_http():
     example = ROOT / "deployment/values-local.yaml.example"
     registry = yaml.safe_load(example.read_text())["connectors"]["drivers"]["registry"]
     assert registry["insecureHosts"] == ["srw-registry:5000"]
+    # It sits on the k3d network: a private address, which only a listed
+    # registry may resolve to.
+    assert registry["privateHosts"] == ["srw-registry:5000"]
     assert registry["resolveCacheSeconds"] <= 10

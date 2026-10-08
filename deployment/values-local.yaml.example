@@ -310,8 +310,10 @@ connectors:
   drivers:
     registry:
       # The k3d registry Tilt pushes driver images to; the orchestrator pod
-      # resolves `srw-registry` on the k3d network and reaches it over HTTP.
+      # resolves `srw-registry` on the k3d network (a private address) and
+      # reaches it over HTTP.
       insecureHosts: ["srw-registry:5000"]
+      privateHosts: ["srw-registry:5000"]
       # A re-pushed tag is seen within seconds (the gate's moved-tag check).
       resolveCacheSeconds: 5
     # The development echo service driver (srw.echo-service/v1). Tilt builds

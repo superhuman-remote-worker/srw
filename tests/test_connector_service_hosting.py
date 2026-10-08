@@ -398,6 +398,26 @@ def test_hosting_is_off_when_disabled_or_incomplete(over):
     assert connectors_composition.service_hosting_settings(resources) is None
 
 
+def test_driver_images_resolve_at_public_addresses_unless_listed():
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
+
+    resources = SimpleNamespace(
+        settings=_settings(
+            connector_driver_registry_insecure_hosts=frozenset({"srw-registry:5000"}),
+            connector_driver_registry_private_hosts=frozenset({"srw-registry:5000"}),
+            connector_service_cluster_cidrs=("10.96.0.0/12",),
+        ),
+        connector_drivers=builtin_connector_drivers(
+            echo_service_image="srw-registry:5000/srw-driver-echo:dev"
+        ),
+        postgres_db=None,
+    )
+    resolver = connectors_composition.service_image_settings(resources).resolver
+    assert resolver.checks_addresses is True
+    assert resolver.private_hosts == {"srw-registry:5000"}
+    assert [str(n) for n in resolver.refused_networks] == ["10.96.0.0/12"]
+
+
 def test_the_reconciler_is_registered_leader_gated_and_shut_down_in_order():
     order = background_tasks.BACKGROUND_TASK_SHUTDOWN_ORDER
     assert "connector_service_reconciler" in order

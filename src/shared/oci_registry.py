@@ -12,14 +12,27 @@ reference or the manifest names, so a registry (or anything between it and
 SRW) cannot substitute content. The token challenge may only send SRW to an
 allowed token host; a blob redirect is followed once, over HTTPS, without the
 registry token.
+
+Without a registry allow-list (driver images) every request is checked by
+address: the host is resolved once, every answer must be a public address
+(loopback, private, cluster and other non-global ranges only for the hosts
+named in ``private_hosts``; link-local and cloud metadata never), and the
+request dials the checked address with the name kept for the Host header and
+TLS, so a second lookup cannot send it elsewhere. Token realms and blob
+redirect targets go through the same check. Errors are generic: a caller
+never learns an internal status or address (they are logged).
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
+import logging
 import re
+import socket
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
@@ -27,6 +40,8 @@ from urllib.parse import urlsplit
 import httpx
 
 from shared.workspace_preparation import ARCHITECTURE, image_reference
+
+logger = logging.getLogger(__name__)
 
 ACCEPT = ", ".join(
     (
@@ -41,9 +56,77 @@ MAX_RESPONSE_BYTES = 1024 * 1024
 #: Docker Hub answers its registry's challenge from another host.
 DEFAULT_TOKEN_HOSTS = frozenset({"auth.docker.io"})
 
+_Address = ipaddress.IPv4Address | ipaddress.IPv6Address
+_Network = ipaddress.IPv4Network | ipaddress.IPv6Network
+#: Never dialled, whatever a host is listed as.
+_NEVER: tuple[_Network, ...] = tuple(
+    ipaddress.ip_network(cidr)
+    for cidr in (
+        "0.0.0.0/8",
+        "169.254.0.0/16",  # link-local, cloud metadata
+        "168.63.129.16/32",  # Azure wireserver
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+        "::/128",
+        "fe80::/10",
+        "fd00:ec2::254/128",  # AWS metadata over IPv6
+        "ff00::/8",
+    )
+)
+#: Public by the registry of special addresses, yet able to carry a private
+#: IPv4 address: only for listed hosts.
+_TRANSLATED: tuple[_Network, ...] = tuple(
+    ipaddress.ip_network(cidr)
+    for cidr in ("64:ff9b::/96", "64:ff9b:1::/48", "2002::/16")
+)
+
 
 class RegistryResolutionError(ValueError):
     pass
+
+
+def address_refusal(
+    address: _Address,
+    *,
+    private_allowed: bool = False,
+    refused: Iterable[_Network] = (),
+) -> str | None:
+    """Why a registry request may not dial ``address``, or ``None``.
+
+    Link-local, metadata, multicast and unspecified addresses never.
+    Loopback, private, shared (CGNAT), translated and every other non-global
+    address, and the ``refused`` networks (the cluster's ranges), only when
+    the host is listed as private.
+    """
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    for network in _NEVER:
+        if network.version == address.version and address in network:
+            return "is link-local, metadata, multicast or unspecified"
+    if private_allowed:
+        return None
+    for network in refused:
+        if network.version == address.version and address in network:
+            return "is inside the cluster's ranges"
+    for network in _TRANSLATED:
+        if network.version == address.version and address in network:
+            return "is a translated address"
+    if not address.is_global:
+        return "is not a public address"
+    return None
+
+
+HostResolver = Callable[[str], Awaitable[Sequence[str]]]
+
+
+async def system_host_resolver(host: str) -> Sequence[str]:
+    """Every A and AAAA answer of the system resolver."""
+    loop = asyncio.get_running_loop()
+    infos = await loop.getaddrinfo(
+        host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
+    )
+    return [str(info[4][0]) for info in infos]
 
 
 @dataclass(frozen=True)
@@ -106,10 +189,13 @@ class RegistryResolver:
     """Resolves references against registries over HTTPS.
 
     ``hosts`` is an allow-list of registry hosts; ``None`` allows any host
-    (driver images: there is no registry allow-list). ``insecure_hosts`` are
-    reached over plain HTTP and must be named explicitly. A bearer-token
-    challenge may point at ``token_hosts``; with ``same_host_tokens`` it may
-    also point at the registry's own host.
+    (driver images: there is no registry allow-list) and checks every
+    request's address instead: public addresses only, except for the
+    ``private_hosts`` (``host[:port]``), which may also be private, loopback
+    or inside the ``refused_networks`` (the cluster's ranges).
+    ``insecure_hosts`` are reached over plain HTTP and must be named
+    explicitly. A bearer-token challenge may point at ``token_hosts``; with
+    ``same_host_tokens`` it may also point at the registry's own host.
     """
 
     def __init__(
@@ -122,6 +208,9 @@ class RegistryResolver:
         same_host_tokens: bool = False,
         refusal: str = "Image registry is not enabled.",
         timeout: float = 20,
+        private_hosts=(),
+        refused_networks=(),
+        host_resolver: HostResolver | None = None,
     ):
         self.hosts = None if hosts is None else frozenset(hosts)
         self.insecure_hosts = frozenset(insecure_hosts)
@@ -130,8 +219,65 @@ class RegistryResolver:
         self.same_host_tokens = same_host_tokens
         self.refusal = refusal
         self.timeout = float(timeout)
+        self.private_hosts = frozenset(private_hosts)
+        self.refused_networks = tuple(
+            ipaddress.ip_network(cidr, strict=False) for cidr in refused_networks
+        )
+        self.host_resolver = host_resolver or system_host_resolver
+        #: An allow-list is the operator's word for every host on it.
+        self.checks_addresses = self.hosts is None
         if self.hosts is not None and not self.insecure_hosts <= self.hosts:
             raise ValueError("Insecure registry hosts must be explicitly allowed.")
+
+    async def _dial(self, url: str) -> tuple[str, dict[str, str], dict[str, Any]]:
+        """The URL to request, extra headers and extensions.
+
+        With address checks, the host is resolved once and every answer must
+        be allowed; the request dials the first, keeping the name for the
+        Host header and for TLS (SNI and certificate check).
+        """
+        if not self.checks_addresses:
+            return url, {}, {}
+        parsed = httpx.URL(url)
+        host = parsed.host
+        netloc = parsed.netloc.decode("ascii")
+        listed = netloc in self.private_hosts or host in self.private_hosts
+        try:
+            answers = [ipaddress.ip_address(host)]
+            literal = True
+        except ValueError:
+            literal = False
+            try:
+                answers = [
+                    ipaddress.ip_address(answer.split("%")[0])
+                    for answer in await self.host_resolver(host)
+                ]
+            except (OSError, UnicodeError, ValueError) as exc:
+                logger.info("Registry host %s does not resolve: %s", netloc, exc)
+                raise RegistryResolutionError(
+                    "Registry host does not resolve."
+                ) from None
+        if not answers:
+            raise RegistryResolutionError("Registry host does not resolve.")
+        for address in answers:
+            reason = address_refusal(
+                address, private_allowed=listed, refused=self.refused_networks
+            )
+            if reason is not None:
+                logger.warning(
+                    "Registry request to %s refused: %s %s", netloc, address, reason
+                )
+                raise RegistryResolutionError("Registry address is not allowed.")
+        if literal:
+            return url, {}, {}
+        extensions: dict[str, Any] = {}
+        if parsed.scheme == "https":
+            extensions["sni_hostname"] = host
+        return (
+            str(parsed.copy_with(host=str(answers[0]))),
+            {"Host": netloc},
+            extensions,
+        )
 
     def permitted(self, image):
         host, _, _ = image_reference(image)
@@ -141,8 +287,13 @@ class RegistryResolver:
     async def _response(self, client, url, *, headers=None, params=None):
         try:
             async with asyncio.timeout(self.timeout):
+                dial, pinned, extensions = await self._dial(url)
                 async with client.stream(
-                    "GET", url, headers=headers, params=params
+                    "GET",
+                    dial,
+                    headers={**(headers or {}), **pinned},
+                    params=params,
+                    extensions=extensions,
                 ) as response:
                     content = bytearray()
                     async for block in response.aiter_bytes():
@@ -195,6 +346,7 @@ class RegistryResolver:
             },
         )
         if code != 200:
+            logger.info("Registry token request failed: HTTP %s", code)
             raise RegistryResolutionError("Registry token request failed.")
         try:
             token_data = json.loads(token_body)
@@ -317,17 +469,15 @@ class RegistryResolver:
                 raise RegistryResolutionError("Registry blob redirect is not allowed.")
             code, _, content = await self._response(client, location)
         if code != 200:
-            raise RegistryResolutionError(
-                f"Image config retrieval failed (HTTP {code})."
-            )
+            logger.info("Image config retrieval failed: HTTP %s", code)
+            raise RegistryResolutionError("Image config retrieval failed.")
         return content
 
     @staticmethod
     def _manifest(code, headers, content, reference):
         if code != 200:
-            raise RegistryResolutionError(
-                f"Image manifest resolution failed (HTTP {code})."
-            )
+            logger.info("Image manifest resolution failed: HTTP %s", code)
+            raise RegistryResolutionError("Image manifest resolution failed.")
         digest = "sha256:" + hashlib.sha256(content).hexdigest()
         if headers.get("Docker-Content-Digest", digest) != digest or (
             reference.startswith("sha256:") and reference != digest
@@ -350,8 +500,11 @@ __all__ = [
     "ACCEPT",
     "DEFAULT_TOKEN_HOSTS",
     "MAX_RESPONSE_BYTES",
+    "HostResolver",
     "RegistryResolutionError",
     "RegistryResolver",
     "ResolvedImage",
+    "address_refusal",
     "image_config",
+    "system_host_resolver",
 ]

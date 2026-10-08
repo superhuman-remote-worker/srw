@@ -219,9 +219,11 @@ class DeploymentSettings:
     #: never waits longer than a quarter of the TTL.
     connector_lease_sweep_seconds: float = 60.0
     #: Driver image resolution (``connectors.drivers.registry``, D5):
-    #: registries reached over plain HTTP, extra bearer-token hosts, how long
-    #: a resolution is reused, and the deadline of one lookup.
+    #: registries reached over plain HTTP, registries that may resolve to
+    #: private or cluster addresses, extra bearer-token hosts, how long a
+    #: resolution is reused, and the deadline of one lookup.
     connector_driver_registry_insecure_hosts: frozenset[str] = frozenset()
+    connector_driver_registry_private_hosts: frozenset[str] = frozenset()
     connector_driver_registry_token_hosts: frozenset[str] = frozenset()
     connector_driver_resolve_cache_seconds: float = 60.0
     connector_driver_resolve_timeout_seconds: float = 10.0
@@ -316,6 +318,9 @@ class DeploymentSettings:
             ),
             connector_driver_registry_insecure_hosts=parse_name_list(
                 os.environ.get("CONNECTOR_DRIVER_REGISTRY_INSECURE_HOSTS")
+            ),
+            connector_driver_registry_private_hosts=parse_name_list(
+                os.environ.get("CONNECTOR_DRIVER_REGISTRY_PRIVATE_HOSTS")
             ),
             connector_driver_registry_token_hosts=parse_name_list(
                 os.environ.get("CONNECTOR_DRIVER_REGISTRY_TOKEN_HOSTS")

@@ -1890,6 +1890,8 @@ spec:
             {{- with .Values.connectors.drivers.registry }}
             - name: CONNECTOR_DRIVER_REGISTRY_INSECURE_HOSTS
               value: {{ join "," .insecureHosts | quote }}
+            - name: CONNECTOR_DRIVER_REGISTRY_PRIVATE_HOSTS
+              value: {{ join "," .privateHosts | quote }}
             - name: CONNECTOR_DRIVER_REGISTRY_TOKEN_HOSTS
               value: {{ join "," .tokenHosts | quote }}
             - name: CONNECTOR_DRIVER_RESOLVE_CACHE_SECONDS

@@ -140,9 +140,10 @@ def service_image_settings(resources: ApplicationResources) -> ServiceImageSetti
     """How this application resolves service driver images (D5).
 
     Each installed service-plane driver names its image reference. Any
-    registry may serve a driver image (there is no allow-list); plain HTTP
-    only for the hosts the chart names, and a bearer-token challenge only to
-    the registry's own host, Docker Hub's or a host the chart names.
+    registry may serve a driver image (there is no allow-list), at a public
+    address unless the chart names it private; plain HTTP only for the hosts
+    the chart names, and a bearer-token challenge only to the registry's own
+    host, Docker Hub's or a host the chart names.
     """
     settings = resources.settings
     references = {
@@ -155,6 +156,8 @@ def service_image_settings(resources: ApplicationResources) -> ServiceImageSetti
         resolver=RegistryResolver(
             hosts=None,
             insecure_hosts=settings.connector_driver_registry_insecure_hosts,
+            private_hosts=settings.connector_driver_registry_private_hosts,
+            refused_networks=settings.connector_service_cluster_cidrs,
             token_hosts=DEFAULT_TOKEN_HOSTS
             | settings.connector_driver_registry_token_hosts,
             same_host_tokens=True,

@@ -241,6 +241,11 @@ connectors:
       # -- Registries reached over plain HTTP (host[:port]), e.g. the k3d
       # registry. Everything else is HTTPS.
       insecureHosts: []
+      # -- Registries (host[:port]) that may resolve to a private, loopback
+      # or cluster address, e.g. an in-cluster or LAN registry. Every other
+      # registry, token host and blob redirect target must be a public
+      # address; link-local and cloud metadata addresses never are reached.
+      privateHosts: []
       # -- Extra bearer-token hosts a registry may send SRW to. The
       # registry's own host and auth.docker.io are always allowed.
       tokenHosts: []
