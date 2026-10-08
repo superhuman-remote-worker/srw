@@ -2301,6 +2301,7 @@ class CustomDriverGate:
             "job: its workspace received the variable the driver minted for it",
             bool(facts),
         )
+
         def ended(statuses: frozenset[str]) -> str:
             try:
                 return wait_for(
