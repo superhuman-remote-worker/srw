@@ -297,6 +297,12 @@ async def send_session_attach(
     dependencies: SessionAttachBindingDependencies,
 ) -> bool:
     """Serialize connector selection with the complete attach delivery."""
+    # The network part of a lease delivery (a driver image, a git swap
+    # upstream's DNS and TLS) runs before the lock, the pool connection and
+    # the attach reservation; the delivery under them finds it remembered.
+    await connector_credential_leases.prepare_thread_lease_delivery(
+        dependencies.store, thread_id
+    )
     async with dependencies.store.thread_datasource_lock(thread_id):
         return await dependencies.send_session_attach_locked(
             agent,

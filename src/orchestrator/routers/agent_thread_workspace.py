@@ -48,7 +48,11 @@ async def agent_get_thread_workspace(
     # This response is a credential-delivery boundary for cold/dedicated
     # sessions.  Use the same lock as live selection replacement and do every
     # authoritative read + response build beneath it.  Once an A -> B/[] save
-    # commits, no later cold response can deliver the old A payload.
+    # commits, no later cold response can deliver the old A payload. The
+    # lease delivery's network part runs first, outside the lock.
+    await thread_workspace_delivery.prepare_agent_thread_workspace(
+        thread_id, dependencies=dependencies
+    )
     async with dependencies.store.thread_datasource_lock(thread_id):
         return await thread_workspace_delivery.agent_get_thread_workspace_locked(
             thread_id,

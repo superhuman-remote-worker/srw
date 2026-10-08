@@ -493,6 +493,8 @@ async def start_background_tasks(
                     resources, service_hosting
                 ),
                 interval_seconds=resources.settings.connector_service_reconcile_seconds,
+                # Deliveries NOTIFY on commit; the leader's loop LISTENs.
+                store=resources.postgres_db,
             ),
         )
     else:

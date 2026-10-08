@@ -113,7 +113,10 @@ def route_token_repository(
     the ``token-in-url`` entry is the one SRW sent before C3 plus the block
     that says why.
     """
-    from orchestrator.services.connector_git_swap_delivery import apply_fallback
+    from orchestrator.services.connector_git_swap_delivery import (
+        Problem,
+        apply_fallback,
+    )
 
     credentials = entry.get("credentials")
     if not isinstance(credentials, Mapping) or not token_auth(entry, credentials):
@@ -122,18 +125,12 @@ def route_token_repository(
         # An installation without the driver: the entry SRW always sent,
         # untouched (or refused, where the installation says so).
         if fallback == FALLBACK_REFUSE:
-            apply_fallback(
-                entry,
-                "the git swap driver is not installed (connectors.drivers.gitSwap)",
-                fallback=fallback,
-            )
+            apply_fallback(entry, Problem("not_installed"), fallback=fallback)
         return
     try:
         swap_upstream(entry.get("connection_url"))
     except UnservedUpstream as exc:
-        apply_fallback(
-            entry, f"the git swap driver cannot serve it: {exc}", fallback=fallback
-        )
+        apply_fallback(entry, Problem("url_not_served", str(exc)), fallback=fallback)
         return
     # A candidate: the lease step decides per delivery.
     entry["git_swap"] = {}

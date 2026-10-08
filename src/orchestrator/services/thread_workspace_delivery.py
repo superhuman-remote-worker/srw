@@ -476,6 +476,17 @@ async def require_pinned_workspace_credential_owner(
     return parsed_agent_id
 
 
+async def prepare_agent_thread_workspace(
+    thread_id: str, *, dependencies: ThreadWorkspaceDeliveryDependencies
+) -> None:
+    """The network part of the lease delivery the locked response makes (a
+    driver image, a git swap upstream's DNS and TLS), before the route takes
+    the thread's datasource lock. Never raises."""
+    await connector_credential_leases.prepare_thread_lease_delivery(
+        dependencies.store, thread_id
+    )
+
+
 async def agent_get_thread_workspace_locked(
     thread_id: str,
     *,
@@ -1460,5 +1471,6 @@ __all__ = [
     "agent_get_thread_workspace_locked",
     "attest_pinned_thread_k8s_workspace",
     "attest_pinned_thread_vm_workspace",
+    "prepare_agent_thread_workspace",
     "require_pinned_workspace_credential_owner",
 ]

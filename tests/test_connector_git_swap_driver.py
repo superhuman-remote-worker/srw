@@ -244,17 +244,19 @@ class TestRouting:
             route_token_repository(
                 entry, git_swap=GitSwapDriver(IMAGE), fallback="token-in-url"
             )
-        # Visible: the entry says why (the README states it), logged once.
-        assert why in entry["git_swap"]["fallback"]
+        # Visible: the entry says why (the README states it: one of the fixed
+        # reasons), logged once with the detail.
+        assert entry["git_swap"]["fallback"] == swaps.REASONS["url_not_served"]
         assert entry["credentials"]["token"] == TOKEN
         assert leases.lease_spec(entry) is None
         assert caplog.text.count("delivers its token in the clone URL") == 1
+        assert why in caplog.text
 
     def test_refuse_delivers_no_token_and_says_why(self):
         entry = _entry("http://gitea.srw.svc:3000/o/r.git")
         route_token_repository(entry, git_swap=GitSwapDriver(IMAGE), fallback="refuse")
         assert entry["credentials"] == {}
-        assert "not HTTPS" in entry["git_swap"]["unavailable"]
+        assert swaps.REASONS["url_not_served"] in entry["git_swap"]["unavailable"]
         assert "refuses token-in-URL" in entry["git_swap"]["unavailable"]
         # Still a repository entry: no lease is issued for it.
         assert leases.lease_spec(entry) is None

@@ -95,6 +95,7 @@ RevokeReason = Literal[
     "execution_ended",
     "execution_terminal",
     "unreadable",
+    "served_by_fallback",
 ]
 EXPIRED = "expired"
 _OWNER_COLUMNS = {"job": "job_id", "thread": "thread_id"}
@@ -521,13 +522,13 @@ async def deliver_connector_leases(
             try:
                 UUID(connector_id)
             except ValueError:
-                swaps.apply_fallback(entry, "the entry names no connector id")
+                swaps.apply_fallback(entry, swaps.Problem("no_connector_id"))
                 continue
             problem = await swaps.git_swap_problem(
                 conn, entry, connector_id=connector_id, owner=owner
             )
             if problem is not None:
-                swaps.apply_fallback(entry, problem)
+                await _fall_back(conn, entry, problem, owner=owner)
                 continue
         kept = harness_credentials(entry, spec)
         access = effective_access(entry, spec)
@@ -564,7 +565,12 @@ async def deliver_connector_leases(
                     raise
                 from orchestrator.services import connector_git_swap_delivery as swaps
 
-                swaps.apply_fallback(entry, f"its driver's image is not usable ({exc})")
+                await _fall_back(
+                    conn,
+                    entry,
+                    swaps.Problem("image_unavailable", str(exc)),
+                    owner=owner,
+                )
                 continue
         if swap:
             from orchestrator.services import connector_git_swap_delivery as swaps
@@ -600,22 +606,56 @@ async def deliver_connector_leases(
                 )
             except LeaseDeliveryError as exc:
                 # Checked before the lease; a late failure still falls back
-                # (the lease goes unused and ends with its execution).
+                # (and revokes the lease just delivered).
                 from orchestrator.services import connector_git_swap_delivery as swaps
 
                 entry["credentials"] = dict(kept)
-                swaps.apply_fallback(entry, str(exc))
+                await _fall_back(
+                    conn,
+                    entry,
+                    swaps.Problem("endpoint_unavailable", str(exc)),
+                    owner=owner,
+                )
                 continue
         if getattr(lease, "issued", False) and spec.plane == "service":
             # A new binding: its pod starts on the reconciler's next pass;
-            # ask for that pass now rather than at the interval (S1).
-            from orchestrator.services.connector_service_hosting import (
-                request_reconcile,
-            )
-
-            request_reconcile()
+            # ask for that pass when this transaction commits (S1).
+            await _ask_for_reconcile(conn)
         delivered += 1
     return delivered
+
+
+async def _fall_back(
+    conn: Any, entry: dict[str, Any], problem: Any, *, owner: LeaseOwner
+) -> None:
+    """A git swap candidate on the installation's fallback: its entry says
+    why, and the lease its owner held for the connector (an earlier attach
+    served it through the driver) is revoked, so a workspace wired then
+    stops reaching the driver with it."""
+    from orchestrator.services import connector_git_swap_delivery as swaps
+
+    swaps.apply_fallback(entry, problem)
+    await revoke_connector_leases(
+        conn,
+        owner=owner,
+        connector_ids=[str(entry.get("datasource_id"))],
+        reason="served_by_fallback",
+    )
+
+
+async def _ask_for_reconcile(conn: Any) -> None:
+    """Wake the service reconciler once the delivery commits: a NOTIFY in a
+    transaction is sent at its commit and never on a rollback, to whichever
+    replica leads (``connector_service_hosting.RECONCILE_CHANNEL``)."""
+    from orchestrator.services.connector_service_hosting import RECONCILE_CHANNEL
+
+    execute = getattr(conn, "execute", None)
+    if not callable(execute):
+        return
+    try:
+        await execute("SELECT pg_notify($1, '')", RECONCILE_CHANNEL)
+    except Exception:
+        logger.debug("Asking the reconciler for a pass failed", exc_info=True)
 
 
 def _git_swap_block(
@@ -715,6 +755,53 @@ async def prepare_lease_delivery(
 
     await prepare_service_images(entries, owner=owner, store=db)
     await prepare_git_swap_delivery(db, entries)
+
+
+async def prepare_thread_lease_delivery(db: Any, thread_id: str) -> None:
+    """:func:`prepare_lease_delivery` for a session's stored selection, for
+    the delivery paths that build their payload under the thread's
+    datasource lock (the pinned attach and the pinned workspace poll): the
+    network part (a driver image, a git swap upstream's DNS and TLS) runs
+    here, before that lock, a pool connection and an attach reservation are
+    taken; the delivery under them then finds the answers remembered. Reads
+    only the selected repository rows' URL and config (no credential).
+    Never raises."""
+    try:
+        from orchestrator.services.connector_git_swap_delivery import (
+            candidate_entry,
+            git_swap_delivery_settings,
+        )
+
+        if not git_swap_delivery_settings().installed:
+            return
+        async with db.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT d.id, d.type, d.connection_url, d.config
+                  FROM threads AS t
+                  JOIN datasources AS d
+                    ON d.id::text IN (
+                        SELECT jsonb_array_elements_text(
+                            CASE WHEN jsonb_typeof(t.metadata->'datasource_ids')
+                                      = 'array'
+                                 THEN t.metadata->'datasource_ids'
+                                 ELSE '[]'::jsonb END)
+                    )
+                 WHERE t.id = $1::uuid
+                """,
+                UUID(str(thread_id)),
+            )
+        entries = [
+            entry for row in rows if (entry := candidate_entry(dict(row))) is not None
+        ]
+        if entries:
+            await prepare_lease_delivery(
+                db, entries, owner=LeaseOwner.thread(str(thread_id))
+            )
+    except Exception:
+        logger.warning(
+            "Preparing the lease delivery of thread %s failed", thread_id, exc_info=True
+        )
 
 
 async def deliver_connector_leases_with(

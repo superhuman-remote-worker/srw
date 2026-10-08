@@ -138,12 +138,19 @@ _BACKOFF_REASONS = (
     CAPACITY,
     UPSTREAM_UNREACHABLE,
 )
+#: A pod stopped to make room for a new one at the installation's cap: the
+#: longest-idle pod no binding uses (C3 re-review S7).
+IDLE_EVICTED = "idle_evicted"
 #: The running reconciler loop's wake-up (one per process): a delivery that
 #: issues a new service binding asks for a pass now (C3 review S1).
 _WAKE: dict[str, asyncio.Event] = {}
-#: How long a woken pass waits first: the delivery's transaction commits the
-#: binding the pass must see.
-WAKE_SETTLE_SECONDS = 1.0
+#: The channel a delivery NOTIFYs when it issues a new service binding: sent
+#: when its transaction commits, never on a rollback, and heard by the
+#: replica whose loop LISTENs (the leader).
+RECONCILE_CHANNEL = "srw_connector_service_reconcile"
+#: How long a woken pass waits first (a few notifications in a burst make
+#: one pass).
+WAKE_SETTLE_SECONDS = 0.5
 
 
 def request_reconcile() -> None:
@@ -251,6 +258,8 @@ def _upstream_failure(driver_status: Any, limit: int = 300) -> str | None:
     """The driver container's own report that it cannot use its upstream:
     it exited with :data:`UPSTREAM_EXIT_CODE` (now or last time), and its
     termination message says why. Any other exit is the start timeout's."""
+    from orchestrator.services.connector_git_swap_delivery import clean_detail
+
     for key in ("state", "lastState"):
         terminated = _field(_field(driver_status, key), "terminated")
         if terminated is None or _field(terminated, "exitCode") != UPSTREAM_EXIT_CODE:
@@ -260,8 +269,11 @@ def _upstream_failure(driver_status: Any, limit: int = 300) -> str | None:
             for line in str(_field(terminated, "message") or "").splitlines()
             if line.strip()
         ]
-        text = lines[-1] if lines else "the driver cannot use its upstream"
-        return text if len(text) <= limit else text[: limit - 3] + "..."
+        # The driver's own words, but the upstream may shape parts of them:
+        # no control characters, capped (it is stored and logged, never
+        # delivered: deliveries show a fixed reason).
+        text = clean_detail(lines[-1] if lines else "", limit)
+        return text or "the driver cannot use its upstream"
     return None
 
 
@@ -852,6 +864,14 @@ def egress_withdrawn(
     return None
 
 
+def _row_value(row: Any, name: str) -> Any:
+    """A column a row may lack (a fake row in a test, an older query)."""
+    try:
+        return row[name]
+    except (KeyError, IndexError):
+        return None
+
+
 def _pod_key(row: Mapping[str, Any]) -> tuple[str, str, str]:
     return (
         str(row["connector_id"]),
@@ -922,7 +942,7 @@ def _identity(row: Mapping[str, Any]) -> ServicePodIdentity:
 
 
 _LIVE_BINDINGS = """
-SELECT connector_id, driver, image_digest, job_id, thread_id
+SELECT connector_id, driver, image_digest, job_id, thread_id, issued_at
   FROM connector_credential_leases
  WHERE revoked_at IS NULL AND expires_at > now()
    AND image_digest IS NOT NULL AND driver = ANY($1::text[])
@@ -943,6 +963,15 @@ class _Binding:
     driver: str
     digest: str
     owners: set[tuple[str, str]] = field(default_factory=set)
+    #: When each owner's lease was issued (the earliest of its leases).
+    issued: dict[tuple[str, str], datetime] = field(default_factory=dict)
+
+    def bound_by(self, kind: str, owner: str, issued_at: Any) -> None:
+        self.owners.add((kind, owner))
+        if isinstance(issued_at, datetime):
+            known = self.issued.get((kind, owner))
+            if known is None or issued_at < known:
+                self.issued[(kind, owner)] = issued_at
 
 
 class ServiceHostingReconciler:
@@ -971,6 +1000,9 @@ class ServiceHostingReconciler:
         #: a pod's last re-resolution saw. A new leader starts afresh, which
         #: only delays a re-pin by an interval.
         self.strikes = strikes if strikes is not None else {}
+        #: This pass's pods no binding uses, longest idle first: what a new
+        #: pod may take the place of at the installation's cap.
+        self._evictable: list[Mapping[str, Any]] = []
 
     def _service_specs(self) -> dict[str, DriverSpec]:
         return {
@@ -1001,10 +1033,11 @@ class ServiceHostingReconciler:
             binding = grouped.setdefault(
                 key, _Binding(key[0], str(row["driver"]), key[1])
             )
+            issued_at = _row_value(row, "issued_at")
             if row["job_id"] is not None:
-                binding.owners.add(("job", str(row["job_id"])))
+                binding.bound_by("job", str(row["job_id"]), issued_at)
             if row["thread_id"] is not None:
-                binding.owners.add(("thread", str(row["thread_id"])))
+                binding.bound_by("thread", str(row["thread_id"]), issued_at)
         return grouped
 
     async def _revoke(
@@ -1183,11 +1216,33 @@ class ServiceHostingReconciler:
                 spec, binding, generation, reference, replaces=replaces
             )
         except ServiceCapacityError as exc:
-            report.capacity += 1
-            logger.warning(
-                "Driver pod for connector %s not started: %s", binding.connector_id, exc
-            )
-            return
+            if replaces is None and self._evictable:
+                # Make room: stop the longest-idle pod no binding uses. Its
+                # row counts until its objects are gone, so the claim may
+                # succeed only on a later pass.
+                victim = self._evictable.pop(0)
+                logger.warning(
+                    "At the installation's cap: stopping idle driver pod %s for "
+                    "connector %s",
+                    victim["pod_name"],
+                    binding.connector_id,
+                )
+                await self._stop(victim, IDLE_EVICTED, report)
+                try:
+                    claimed = await self._claim(
+                        spec, binding, generation, reference, replaces=replaces
+                    )
+                except ServiceCapacityError:
+                    report.capacity += 1
+                    return
+            else:
+                report.capacity += 1
+                logger.warning(
+                    "Driver pod for connector %s not started: %s",
+                    binding.connector_id,
+                    exc,
+                )
+                return
         if claimed is None:
             return
         row, minted = claimed
@@ -1349,9 +1404,17 @@ class ServiceHostingReconciler:
         return True
 
     async def _settle_idle(
-        self, row: Mapping[str, Any], *, bound: bool, report: ReconcileReport
+        self,
+        row: Mapping[str, Any],
+        *,
+        bound: bool,
+        report: ReconcileReport,
+        superseded: bool = False,
     ) -> bool:
-        """Track a pod's idleness; stop it after the idle timeout."""
+        """Track a pod's idleness; stop it after the idle timeout. A pod
+        ``superseded`` by a newer generation of its connector whose own pod
+        is ready (a config change: an upstream CA, a tier) drains its
+        bindings for ``repinDrainSeconds`` only, whatever the idle time."""
         identity_id = UUID(str(row["id"]))
         async with self.store.acquire() as conn:
             if bound:
@@ -1369,7 +1432,10 @@ class ServiceHostingReconciler:
                     identity_id,
                 )
                 return True
-        if (self.clock() - idle_since).total_seconds() >= self._idle_seconds(row):
+        limit = (
+            self.settings.repin_drain_seconds if superseded else self._idle_seconds(row)
+        )
+        if (self.clock() - idle_since).total_seconds() >= limit:
             await self._stop(row, IDLE, report)
             return False
         return True
@@ -1466,6 +1532,17 @@ class ServiceHostingReconciler:
                 connector,
             )
 
+        # Keys whose current generation has a ready pod: a superseded pod of
+        # such a key drains for repinDrainSeconds, not the idle time.
+        ready_current = {
+            (str(row["connector_id"]), str(row["image_digest"]))
+            for row in live
+            if row["ready_at"] is not None
+            and current.get(
+                (str(row["connector_id"]), str(row["image_digest"])), ("",)
+            )[0]
+            == row["credential_generation"]
+        }
         survivors: list[Mapping[str, Any]] = []
         active_ids: set[str] = set()
         for row in live:
@@ -1493,10 +1570,26 @@ class ServiceHostingReconciler:
                 continue
             key = (str(row["connector_id"]), str(row["image_digest"]))
             active = key in current and current[key][0] == row["credential_generation"]
-            if await self._settle_idle(row, bound=active, report=report):
+            superseded = key in current and not active and key in ready_current
+            if await self._settle_idle(
+                row, bound=active, report=report, superseded=superseded
+            ):
                 survivors.append(row)
                 if active:
                     active_ids.add(str(row["id"]))
+        # At the installation's cap, a new pod takes the place of the
+        # longest-idle pod no binding uses (S7): one user's idle pods may
+        # not keep everyone else's repositories on the fallback.
+        self._evictable = sorted(
+            (
+                row
+                for row in survivors
+                if str(row["id"]) not in active_ids
+                and row["idle_since"] is not None
+                and (str(row["connector_id"]), str(row["image_digest"])) not in bindings
+            ),
+            key=lambda row: row["idle_since"],
+        )
 
         # A pod being replaced holds no key: if its replacement failed, the
         # next start (after its back-off) replaces it again.
@@ -1535,10 +1628,9 @@ class ServiceHostingReconciler:
                 exchange_address=exchange,
                 report=report,
             )
-        await self._sync_binding_policies(bindings, specs)
-        await self._sync_endpoints(
-            specs, {key: generation for key, (generation, _, _) in current.items()}
-        )
+        generations = {key: generation for key, (generation, _, _) in current.items()}
+        await self._sync_binding_policies(bindings, specs, generations)
+        await self._sync_endpoints(specs, generations)
         report.swept = await self._sweep()
         return report
 
@@ -1766,11 +1858,14 @@ class ServiceHostingReconciler:
         self,
         bindings: Mapping[tuple[str, str], _Binding],
         specs: Mapping[str, DriverSpec],
+        generations: Mapping[tuple[str, str], str] | None = None,
     ) -> None:
         """One ingress policy per binding of a workspace-facing driver's pod.
 
-        A superseded pod keeps admitting its connector's bindings while it
-        drains: SRW does not know which pod a binding's workspace still uses.
+        A superseded pod (its connector has a newer generation: ``generations``)
+        keeps admitting the bindings it served before it was superseded while
+        it drains (SRW does not know which pod such a workspace still uses),
+        and admits no binding issued after.
         """
         async with self.store.acquire() as conn:
             rows = await conn.fetch(_POD_ROWS + " AND revoked_at IS NULL")
@@ -1780,9 +1875,26 @@ class ServiceHostingReconciler:
             if spec is None or "workspace" not in spec.service.callers:
                 continue
             identity = _identity(row)
-            binding = bindings.get((identity.connector_id, identity.digest))
+            key = (identity.connector_id, identity.digest)
+            binding = bindings.get(key)
+            owners = sorted(binding.owners if binding else ())
+            current = (generations or {}).get(key)
+            since = _row_value(row, "idle_since")
+            if (
+                binding is not None
+                and current is not None
+                and current != identity.generation
+                and isinstance(since, datetime)
+            ):
+                # Superseded: only what it served before the change.
+                owners = [
+                    owner
+                    for owner in owners
+                    if (issued := binding.issued.get(owner)) is not None
+                    and issued <= since
+                ]
             desired: dict[str, dict] = {}
-            for kind, owner in sorted(binding.owners if binding else ()):
+            for kind, owner in owners:
                 body = binding_ingress_policy(
                     identity, kind=kind, owner_id=owner, policy=policy
                 )
@@ -1830,9 +1942,12 @@ async def connector_service_reconciler(
     *,
     build: Callable[[], ServiceHostingReconciler | None],
     interval_seconds: float,
+    store: Any = None,
 ) -> None:
     """Leader-gated loop: reconcile service pods every ``interval_seconds``,
-    and soon after :func:`request_reconcile` (a new binding's delivery on
+    and soon after a delivery that issued a new binding commits: it NOTIFYs
+    :data:`RECONCILE_CHANNEL`, which this loop LISTENs on with one of
+    ``store``'s connections (and :func:`request_reconcile` wakes it within
     this process).
 
     ``build`` returns ``None`` while Kubernetes is unavailable. A failed pass
@@ -1843,12 +1958,57 @@ async def connector_service_reconciler(
     logger.info("Connector service reconciler started (every %.0fs)", interval_seconds)
     wake = asyncio.Event()
     _WAKE["event"] = wake
+    listener = (
+        asyncio.create_task(_listen(store, wake, shutdown_event))
+        if store is not None
+        else None
+    )
     try:
         await _reconcile_loop(shutdown_event, build, interval_seconds, wake)
     finally:
+        if listener is not None:
+            listener.cancel()
+            try:
+                await listener
+            except (asyncio.CancelledError, Exception):
+                pass
         if _WAKE.get("event") is wake:
             _WAKE.pop("event", None)
     logger.info("Connector service reconciler stopped")
+
+
+async def _listen(
+    store: Any, wake: asyncio.Event, shutdown_event: asyncio.Event
+) -> None:
+    """Hold one LISTEN connection for the loop's life; a lost one is opened
+    again (the interval covers what it missed)."""
+
+    def heard(_connection: Any, _pid: int, _channel: str, _payload: str) -> None:
+        wake.set()
+
+    while not shutdown_event.is_set():
+        try:
+            async with store.acquire() as conn:
+                await conn.add_listener(RECONCILE_CHANNEL, heard)
+                try:
+                    await shutdown_event.wait()
+                finally:
+                    try:
+                        await conn.remove_listener(RECONCILE_CHANNEL, heard)
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Connector service reconciler: LISTEN connection failed; passes "
+                "run on the interval",
+                exc_info=True,
+            )
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
 
 
 async def _reconcile_loop(
@@ -1891,7 +2051,7 @@ async def _reconcile_loop(
         if stop in done or shutdown_event.is_set():
             break
         if woken in done:
-            # A delivery asked: let its transaction commit the binding.
+            # A delivery asked (after its commit): one pass for a burst.
             try:
                 await asyncio.wait_for(
                     shutdown_event.wait(), timeout=WAKE_SETTLE_SECONDS

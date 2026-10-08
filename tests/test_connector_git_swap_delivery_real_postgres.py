@@ -118,13 +118,17 @@ async def test_the_last_pod_decides_within_the_back_off(db):
     async with db.acquire() as conn:
         assert await swaps.launch_problem(conn, connector) is None
     await _pod(
-        db, connector, stop="upstream_unreachable", error="x509: unknown authority"
+        db,
+        connector,
+        stop="upstream_unreachable",
+        error="untrusted certificate: unknown authority",
     )
     async with db.acquire() as conn:
         problem = await swaps.launch_problem(conn, connector)
-    assert problem == (
-        "its driver pod did not start (upstream_unreachable: x509: unknown authority)"
-    )
+    # A fixed reason; the driver's words stay in the detail (the log).
+    assert problem.reason == "untrusted_certificate"
+    assert problem.text == swaps.REASONS["untrusted_certificate"]
+    assert "unknown authority" in problem.detail
     # An idle stop is no failure.
     other = await _connector(db)
     await _pod(db, other, stop="idle")
@@ -162,7 +166,15 @@ async def test_a_live_pod_serves_and_a_full_installation_refuses(db):
     async with db.acquire() as conn:
         assert await swaps.launch_problem(conn, serving) is None
         waiting = await _connector(db)
-        assert "cap of 2 driver pods" in await swaps.launch_problem(conn, waiting)
+        problem = await swaps.launch_problem(conn, waiting)
+        assert problem.reason == "no_room"
+        # Idle pods make room: the reconciler evicts the longest-idle one.
+        await conn.execute(
+            "UPDATE connector_driver_identities SET idle_since = now() "
+            "WHERE connector_id = $1",
+            UUID(serving),
+        )
+        assert await swaps.launch_problem(conn, waiting) is None
 
 
 @pytest.mark.asyncio
@@ -186,9 +198,10 @@ async def test_the_owners_workspace_is_read_from_its_row(db):
                 }
             ),
         )
-        assert "static-pool" in await swaps.owner_workspace_problem(
+        problem = await swaps.owner_workspace_problem(
             conn, leases.LeaseOwner.job(str(job_id))
         )
+        assert problem.reason == "workspace_static_pool"
         assert (
             await swaps.owner_workspace_problem(
                 conn, leases.LeaseOwner.thread(str(thread_id))
