@@ -41,7 +41,11 @@ from orchestrator.database import (
     PostgresDB,
 )
 from orchestrator.security.auth import set_provisioning_backends
-from orchestrator.services import connector_credential_leases, connector_service_images
+from orchestrator.services import (
+    connector_credential_leases,
+    connector_driver_ca,
+    connector_service_images,
+)
 from orchestrator.services import ssh_access as ssh_access_operations
 from orchestrator.services.catalogue_resources import CatalogueResources
 from orchestrator.services.cloud import MainCloudRouter, build_backend
@@ -136,6 +140,12 @@ def build_application_resources(
     # crash) until connect() runs on a real DSN in the lifespan.
     audit_store = AuditStore(audit_url)
 
+    # SRW's connector driver certificate authority (C3): it signs every TLS
+    # driver pod's certificate, and the git swap driver is installed only
+    # with it; process-wide like the lease window below.
+    driver_ca = connector_driver_ca.load_driver_ca(settings.connector_driver_ca_dir)
+    connector_driver_ca.configure_driver_ca(driver_ca)
+
     # Session router — see knowledge-base/knowledge/features/direct_session_websockets.md
     session_router = SessionRouterService(
         namespace=os.environ.get("SESSION_INGRESS_NAMESPACE", "default"),
@@ -198,6 +208,7 @@ def build_application_resources(
             lease_probe=settings.connector_lease_probe_enabled,
             echo_service_image=settings.connector_echo_driver_image or None,
             managed_mcp_images=settings.connector_managed_mcp_images,
+            git_swap_image=connectors_composition.git_swap_image(settings, driver_ca),
         ),
     )
     # Credential leases (connector drivers C2): the window new leases are

@@ -32,7 +32,10 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from orchestrator.services.connector_credential_leases import lease_spec
+from orchestrator.services.connector_credential_leases import (
+    harness_credentials,
+    lease_spec,
+)
 from orchestrator.services.connector_drivers import ConnectorDriverRegistry
 from orchestrator.services.connector_drivers.base import (
     BindContext,
@@ -43,6 +46,8 @@ from orchestrator.services.connector_drivers.base import (
 from orchestrator.services.connector_drivers.workspace_ssh import (
     WorkspaceSshConnectorError,
 )
+from shared.connectors.builtin import GIT_SWAP_SPEC
+from shared.connectors.git_swap import FALLBACK_TOKEN_IN_URL
 from shared.datasource_policy import datasource_tool_categories
 
 
@@ -65,6 +70,10 @@ class DatasourcePayloadDependencies:
     #: ``ssh_identity`` descriptor and the delivered identity read it
     #: here, so they always agree.
     workspace_ssh_known_hosts: Callable[[], str]
+    #: What a token repository gets when the git swap driver cannot serve it
+    #: (``connectors.drivers.gitSwap.fallback``, C3): ``token-in-url`` (the
+    #: delivery before C3) or ``refuse``. Read per call, as the gates are.
+    git_swap_fallback: Callable[[], str] = lambda: FALLBACK_TOKEN_IN_URL
 
     def deployment_gates(self) -> DeploymentGates:
         return DeploymentGates(
@@ -196,6 +205,8 @@ def build_datasources_payload(
         gates=gates,
         logger=dependencies.logger,
         default_known_hosts=dependencies.workspace_ssh_known_hosts(),
+        git_swap=dependencies.connector_drivers.get(GIT_SWAP_SPEC.name),
+        git_swap_fallback=dependencies.git_swap_fallback(),
     )
     payload = []
     for ds in forwarded_datasources(
@@ -225,10 +236,13 @@ def build_datasources_payload(
             continue
         entry = driver.bind(ds, creds, ctx=ctx)
         if entry is not None:
-            if lease_spec(entry) is not None:
+            spec = lease_spec(entry)
+            if spec is not None:
                 # A lease driver's entry never carries its upstream secret,
-                # whatever its bind returned; the lease step fills it.
-                entry["credentials"] = {}
+                # whatever its bind returned, but what its driver keeps for
+                # the agent process (the git swap's forge token); the lease
+                # step fills in the lease.
+                entry["credentials"] = harness_credentials(entry, spec)
             payload.append(entry)
 
     return payload or None

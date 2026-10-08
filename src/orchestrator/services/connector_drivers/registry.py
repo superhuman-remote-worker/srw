@@ -79,9 +79,14 @@ def builtin_connector_drivers(
     lease_probe: bool = False,
     echo_service_image: str | None = None,
     managed_mcp_images: Mapping[str, str] | None = None,
+    git_swap_image: str | None = None,
 ) -> ConnectorDriverRegistry:
     """The drivers SRW ships, in catalogue order.
 
+    ``git_swap_image`` adds the git swap driver (C3) running that image right
+    after the repository driver whose token rows it serves
+    (``connectors.drivers.gitSwap``; the caller installs it only with
+    service-pod hosting and SRW's driver certificate authority).
     ``lease_probe`` adds the development lease probe driver after them
     (``orchestrator.connectorLeases.probeDriver``, slice C2);
     ``echo_service_image`` adds the development echo service driver running
@@ -93,6 +98,16 @@ def builtin_connector_drivers(
     from orchestrator.services.connector_drivers import builtin
 
     drivers: tuple[ConnectorDriver, ...] = builtin.drivers()
+    if git_swap_image:
+        from orchestrator.services.connector_drivers.git_swap import GitSwapDriver
+        from shared.connectors.builtin import REPOSITORY_SPEC
+
+        at = next(
+            index + 1
+            for index, driver in enumerate(drivers)
+            if driver.spec is REPOSITORY_SPEC
+        )
+        drivers = drivers[:at] + (GitSwapDriver(git_swap_image),) + drivers[at:]
     if lease_probe:
         from orchestrator.services.connector_drivers.lease_probe import (
             LeaseProbeDriver,

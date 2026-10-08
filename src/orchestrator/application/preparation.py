@@ -511,6 +511,7 @@ def datasource_payload_dependencies(
         workspace_ssh_known_hosts=lambda: (
             resources.settings.workspace_ssh_known_hosts
         ),
+        git_swap_fallback=lambda: resources.settings.connector_git_swap_fallback,
     )
 
 

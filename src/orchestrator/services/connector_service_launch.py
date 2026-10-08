@@ -27,6 +27,11 @@ it must reach answers), and the **shim install**, which copies the shim into
 an ``emptyDir``. The shim becomes the driver container's command, with the
 image's own entrypoint and command as its arguments.
 
+A **TLS** driver (C3, ``service.tls``: the git swap driver) also gets a
+certificate SRW's driver certificate authority signs for its Service names
+(``connector_driver_ca``), with its key, in the same Secret, mounted at
+``/run/srw/tls.crt`` and ``/run/srw/tls.key``; the request file names them.
+
 A **managed MCP** driver's pod (D5a, a spec with an ``mcp`` block) differs:
 the server image runs as itself, with the block's arguments and environment
 and nothing of SRW's (no identity, no request file, no credential), and
@@ -63,6 +68,8 @@ from shared.connectors.mcp import ManagedMcp, TemplateError, managed_mcp
 MANAGER = "connector-service-hosting"
 REQUEST_PATH = "/run/srw/request.json"
 IDENTITY_PATH = "/run/srw/identity"
+TLS_CERT_PATH = "/run/srw/tls.crt"
+TLS_KEY_PATH = "/run/srw/tls.key"
 SHIM_DIR = "/srw/bin"
 SHIM_PATH = f"{SHIM_DIR}/srw-driver-shim"
 #: The canary a driver pod must never reach: a listener of the exchange's
@@ -164,6 +171,9 @@ class ServiceLaunchPolicy:
     #: exposed port in front of an MCP server image.
     front_image: str = ""
     front_pull_policy: str = "IfNotPresent"
+    #: SRW's connector driver certificate authority (C3): signs a TLS
+    #: driver's certificate (``connector_driver_ca``); ``None`` refuses one.
+    driver_ca: Any = None
 
     def __post_init__(self) -> None:
         for name in (self.namespace, self.release_namespace):
@@ -279,7 +289,27 @@ def service_request(
         # The front's own block: what it forwards to, the tool classes per
         # access level and how it hands the server the credential.
         request["mcp"] = mcp.front_config()
+    if spec.service.tls:
+        request["tls"] = {"cert_file": TLS_CERT_PATH, "key_file": TLS_KEY_PATH}
     return request
+
+
+def service_dns_names(identity: ServicePodIdentity, namespace: str) -> list[str]:
+    """The names a TLS driver pod's certificate is for: its connector's
+    endpoint Service (what bindings dial) and its own Service, each in every
+    form a cluster resolver answers."""
+    names: list[str] = []
+    for service in (
+        endpoint_service_name(identity.connector_id, identity.digest),
+        identity.pod_name,
+    ):
+        names += [
+            f"{service}.{namespace}.svc.cluster.local",
+            f"{service}.{namespace}.svc",
+            f"{service}.{namespace}",
+            service,
+        ]
+    return names
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -395,6 +425,22 @@ def build_service_launch(
         "request.json": _json_bytes(request),
         "identity": identity_token.encode("ascii"),
     }
+    if spec.service.tls:
+        if mcp is not None:
+            raise ServiceLaunchError("a managed MCP pod's front serves no TLS")
+        if policy.driver_ca is None:
+            raise ServiceLaunchError(
+                "no connector driver certificate authority is configured "
+                "(connectors.drivers.ca); a TLS driver cannot start"
+            )
+        try:
+            certificate, key = policy.driver_ca.issue(
+                service_dns_names(identity, namespace)
+            )
+        except ValueError as exc:
+            raise ServiceLaunchError(str(exc)) from None
+        delivery["tls.crt"] = certificate.encode("ascii")
+        delivery["tls.key"] = key.encode("ascii")
     if sum(len(value) for value in delivery.values()) > _MAX_DELIVERY_BYTES:
         raise ServiceLaunchError("the service pod's request exceeds 512 KiB")
     secret = {
@@ -538,6 +584,16 @@ def build_service_launch(
             },
         ],
     }
+    if spec.service.tls:
+        driver["volumeMounts"] += [
+            {
+                "name": "delivery",
+                "mountPath": path,
+                "subPath": key,
+                "readOnly": True,
+            }
+            for path, key in ((TLS_CERT_PATH, "tls.crt"), (TLS_KEY_PATH, "tls.key"))
+        ]
     init_containers = [canary, install]
     containers = [driver]
     volumes: list[dict[str, Any]] = [
@@ -708,13 +764,22 @@ def endpoint_service_name(connector_id: str, digest: str) -> str:
 
 
 def endpoint_url(
-    *, namespace: str, connector_id: str, digest: str, port: int, path: str = ""
+    *,
+    namespace: str,
+    connector_id: str,
+    digest: str,
+    port: int,
+    path: str = "",
+    scheme: str = "http",
 ) -> str:
-    """Where a binding's caller reaches its connector's pods, by name."""
+    """Where a binding's caller reaches its connector's pods, by name
+    (``https`` for a TLS driver, whose certificate names it)."""
     if not _NAMESPACE.fullmatch(namespace or ""):
         raise ValueError(f"invalid namespace {namespace!r}")
+    if scheme not in ("http", "https"):
+        raise ValueError(f"invalid scheme {scheme!r}")
     name = endpoint_service_name(connector_id, digest)
-    return f"http://{name}.{namespace}.svc.cluster.local:{int(port)}{path}"
+    return f"{scheme}://{name}.{namespace}.svc.cluster.local:{int(port)}{path}"
 
 
 def endpoint_service(
@@ -844,6 +909,8 @@ __all__ = [
     "MANAGER",
     "REQUEST_PATH",
     "SHIM_PATH",
+    "TLS_CERT_PATH",
+    "TLS_KEY_PATH",
     "ServiceLaunchError",
     "ServiceLaunchPlan",
     "ServiceLaunchPolicy",
@@ -856,6 +923,7 @@ __all__ = [
     "endpoint_url",
     "label_value",
     "pod_config",
+    "service_dns_names",
     "service_request",
     "service_resources",
 ]

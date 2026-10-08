@@ -101,6 +101,9 @@ class ServiceImageSettings:
     prepared before its transaction. ``service_namespace`` is where service
     pods and their endpoint Services run: a managed MCP binding carries its
     endpoint's URL there (empty while hosting is off).
+    ``service_start_seconds`` is how long a new binding's pod may take to
+    serve (the reconciler's interval plus its start timeout): a git swap
+    binding's first clone waits that long for its driver.
     """
 
     references: Mapping[str, str] = field(default_factory=dict)
@@ -110,6 +113,7 @@ class ServiceImageSettings:
     bind_timeout_seconds: float = DEFAULT_BIND_TIMEOUT_SECONDS
     store: Any = None
     service_namespace: str = ""
+    service_start_seconds: float = 210.0
 
 
 @dataclass(frozen=True)

@@ -53,7 +53,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from shared.connectors.builtin import spec_for_row
+from shared.connectors.builtin import driver_spec_for_row, git_swap_entry
 from shared.connectors.contract import (
     DriverSpec,
     effective_access,
@@ -234,9 +234,27 @@ def _detail(**fields: Any) -> str:
 
 
 def lease_spec(entry: Mapping[str, Any]) -> DriverSpec | None:
-    """The driver spec of a payload entry that is delivered by lease."""
-    spec = spec_for_row(entry)
+    """The driver spec of a payload entry that is delivered by lease (the
+    entry's own driver: a token repository bound through the git swap
+    driver is the swap's)."""
+    spec = driver_spec_for_row(entry)
     return spec if spec is not None and spec.credential_delivery == "lease" else None
+
+
+def harness_credentials(entry: Mapping[str, Any], spec: DriverSpec) -> dict[str, Any]:
+    """What a lease entry still carries for the agent process: the slots its
+    driver names in ``harness_credentials`` (each under its own key), never
+    anything else of the upstream secret. Empty for every lease driver but
+    the git swap, whose forge token the pull-request tools call the forge
+    API with."""
+    credentials = entry.get("credentials")
+    if not isinstance(credentials, Mapping):
+        return {}
+    return {
+        name: credentials[name]
+        for name in spec.harness_credentials
+        if isinstance(credentials.get(name), str) and credentials[name]
+    }
 
 
 def needs_leases(entries: Sequence[Any] | None) -> bool:
@@ -465,11 +483,14 @@ async def deliver_connector_leases(
 
     ``entries`` is a datasources payload built by the drivers' ``bind``. A
     lease entry's ``credentials`` become ``{"lease": {id, connector_id,
-    token}}`` and nothing else, so no upstream secret can ride along; an
-    entry SRW cannot lease delivers no token. The access level is the one the
-    agent binds the entry at (``effective_access``). Returns how many entries
-    carry a lease. The caller holds the connection (and the transaction the
-    delivery belongs to).
+    token}}`` and nothing else but the driver's ``harness_credentials``
+    (the git swap's forge token, for the agent process), so no other
+    upstream secret can ride along; an entry SRW cannot lease delivers no
+    token. A git swap entry's ``git_swap`` block gets the driver's URL and
+    SRW's certificate authority. The access level is the one the agent binds
+    the entry at (``effective_access``). Returns how many entries carry a
+    lease. The caller holds the connection (and the transaction the delivery
+    belongs to).
 
     Entries are issued in connector-id order (the payload keeps its own
     order), so every transaction that takes several connectors' rows takes
@@ -487,7 +508,8 @@ async def deliver_connector_leases(
         spec = lease_spec(entry)
         if spec is None:
             continue
-        entry["credentials"] = {}
+        kept = harness_credentials(entry, spec)
+        entry["credentials"] = dict(kept)
         connector_id = str(entry.get("datasource_id") or "")
         access = effective_access(entry, spec)
         try:
@@ -524,18 +546,70 @@ async def deliver_connector_leases(
             ttl_seconds=ttl_seconds,
         )
         entry["credentials"] = {
+            **kept,
             "lease": {
                 "id": lease.id,
                 "connector_id": lease.connector_id,
                 "token": lease.token,
-            }
+            },
         }
         if managed_mcp_driver(spec):
             # The agent process connects to the connector's endpoint at this
             # digest with the lease token as its bearer (D5a).
             entry["connection_url"] = _managed_mcp_url(spec, connector_id, image_digest)
+        elif git_swap_entry(entry):
+            # The workspace's git reaches the driver at this digest (C3).
+            entry["git_swap"] = _git_swap_block(
+                spec, connector_id, image_digest, entry.get("connection_url")
+            )
         delivered += 1
     return delivered
+
+
+def _git_swap_block(
+    spec: DriverSpec, connector_id: str, digest: str | None, upstream_url: Any
+) -> dict[str, Any]:
+    """What a git swap binding's workspace needs: the driver's URL for the
+    connector's repository (what ``insteadOf`` rewrites the clean upstream
+    URL to), the certificate authority it trusts for that URL only, and how
+    long a first clone waits for the connector's pod."""
+    from orchestrator.services.connector_driver_ca import driver_ca
+    from orchestrator.services.connector_service_images import (
+        service_image_settings,
+    )
+    from orchestrator.services.connector_service_launch import endpoint_url
+    from shared.connectors.git_swap import (
+        UnservedUpstream,
+        driver_repository_url,
+        swap_upstream,
+    )
+
+    settings = service_image_settings()
+    ca = driver_ca()
+    if not settings.service_namespace or not digest or spec.service is None:
+        raise LeaseDeliveryError(
+            f"Service-pod hosting is off; {spec.name} cannot be served"
+        )
+    if ca is None:
+        raise LeaseDeliveryError(
+            f"No connector driver certificate authority; {spec.name} cannot be served"
+        )
+    try:
+        upstream = swap_upstream(upstream_url)
+    except UnservedUpstream as exc:
+        raise LeaseDeliveryError(f"{spec.name} cannot serve this repository: {exc}")
+    endpoint = endpoint_url(
+        namespace=settings.service_namespace,
+        connector_id=connector_id,
+        digest=digest,
+        port=spec.service.port,
+        scheme="https",
+    )
+    return {
+        "url": driver_repository_url(endpoint, connector_id, upstream),
+        "ca": ca.certificate_pem,
+        "wait_seconds": int(settings.service_start_seconds),
+    }
 
 
 def _managed_mcp_url(spec: DriverSpec, connector_id: str, digest: str | None) -> str:
@@ -980,6 +1054,7 @@ __all__ = [
     "connector_lease_sweeper",
     "deliver_connector_leases",
     "deliver_connector_leases_with",
+    "harness_credentials",
     "issue_or_redeliver",
     "lease_spec",
     "lease_sweep_seconds",

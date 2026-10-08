@@ -1,7 +1,10 @@
 """``srw.repository/v1``: a Git repository the agent checks out.
 
-A token repository's token goes into the clone URL (the git swap driver, C3,
-will replace that). An SSH-key repository's key goes into the workspace's
+A token repository on HTTPS is bound through the git swap driver
+(``srw.git-swap/v1``, C3) where it is installed: the workspace holds a lease
+token, never the forge token. Otherwise the installation's fallback applies
+(``connectors.drivers.gitSwap.fallback``): the token in the clone URL, as
+before, or no delivery. An SSH-key repository's key goes into the workspace's
 ssh-agent and the clone runs through its ``srw-repo-<32hex>`` alias (C1): the
 payload entry keeps only the non-secret ``ssh_identity``. ``config`` carries
 the forge (inferred for github.com and gitlab.com, declared otherwise) and,
@@ -20,6 +23,7 @@ from typing import Any
 from fastapi import HTTPException
 
 from orchestrator.services.connector_drivers import knowledge_note
+from orchestrator.services.connector_drivers.git_swap import route_token_repository
 from orchestrator.services.connector_drivers.base import (
     BindContext,
     CheckContext,
@@ -154,6 +158,11 @@ class RepositoryDriver(WorkspaceSshDriver):
             entry["require_default_branch"] = True
         if ssh_identity is not None:
             entry["ssh_identity"] = ssh_identity
+        # A token repository goes through the git swap driver where it is
+        # installed and serves the URL; otherwise the installation's fallback.
+        route_token_repository(
+            entry, git_swap=ctx.git_swap, fallback=ctx.git_swap_fallback
+        )
         return entry
 
 

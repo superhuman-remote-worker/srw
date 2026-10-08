@@ -51,7 +51,11 @@ from orchestrator.services.connector_drivers.registry import (
     ConnectorDriver,
     ConnectorDriverRegistry,
 )
-from shared.connectors.builtin import BUILTIN_SPECS, DEVELOPMENT_SPECS
+from shared.connectors.builtin import (
+    BUILTIN_SPECS,
+    DEVELOPMENT_SPECS,
+    OFFICIAL_SERVICE_SPECS,
+)
 from shared.connectors.contract import (
     PROTOCOL_VERSION,
     AccessLevel,
@@ -62,6 +66,9 @@ from shared.connectors.contract import (
 )
 
 _BUILTIN_NAMES = frozenset(spec.name for spec in BUILTIN_SPECS)
+#: Service drivers SRW ships as its own images (the git swap driver),
+#: installed when the chart names their image.
+_OFFICIAL_NAMES = frozenset(spec.name for spec in OFFICIAL_SERVICE_SPECS)
 #: Drivers SRW ships for development only, installed when a deployment
 #: switch turns them on (the lease probe).
 _DEVELOPMENT_NAMES = frozenset(spec.name for spec in DEVELOPMENT_SPECS)
@@ -354,6 +361,7 @@ def _service(service: ServiceSpec | None) -> dict[str, Any] | None:
         "mcp": _json(service.mcp) if service.mcp is not None else None,
         "port": service.port,
         "callers": list(service.callers),
+        "tls": service.tls,
     }
 
 
@@ -369,6 +377,15 @@ def _trust(
             "tier": "builtin",
             "trusted": True,
             "image": None,
+            "claims_declared_by_author": False,
+        }
+    if in_process and spec.name in _OFFICIAL_NAMES:
+        # SRW's own service driver image (the git swap driver): its pods run
+        # the image the chart names, which SRW publishes.
+        return {
+            "tier": "trusted",
+            "trusted": True,
+            "image": image,
             "claims_declared_by_author": False,
         }
     if in_process and spec.name in _DEVELOPMENT_NAMES:

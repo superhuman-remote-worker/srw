@@ -76,6 +76,7 @@ from orchestrator.services.connector_driver_identities import (
     mint_driver_identity,
     revoke_driver_identity,
 )
+from orchestrator.services.connector_drivers.base import SupportsServiceConnector
 from orchestrator.services.connector_egress import (
     EgressPins,
     EgressPolicy,
@@ -581,6 +582,9 @@ class ServiceHostingSettings:
     #: SRW's managed MCP front image, pinned by digest (D5a); a managed MCP
     #: driver's pod is refused without it.
     front_image: str = ""
+    #: SRW's connector driver certificate authority (C3); a TLS driver's pod
+    #: is refused without it.
+    driver_ca: Any = None
 
     def cluster_problem(self, exchange_address: str) -> str | None:
         """Why this cluster's ranges are not the configured ``clusterCidrs``.
@@ -684,6 +688,7 @@ class ServiceHostingSettings:
             orchestrator_labels=dict(self.orchestrator_labels),
             canary_port=self.canary_port,
             front_image=self.front_image,
+            driver_ca=self.driver_ca,
             **overrides,
         )
 
@@ -1355,25 +1360,35 @@ class ServiceHostingReconciler:
                 return report
 
         # Each connector's config and tier, read once per pass.
-        connectors: dict[str, tuple[Mapping[str, Any] | None, bool]] = {}
+        connectors: dict[tuple[str, str], tuple[Mapping[str, Any] | None, bool]] = {}
 
         async def connector_state(
-            connector_id: str,
+            connector_id: str, driver: str
         ) -> tuple[Mapping[str, Any] | None, bool]:
-            if connector_id not in connectors:
+            key = (connector_id, driver)
+            if key not in connectors:
                 connector = await self.store.get_datasource(connector_id)
+                serving = self.drivers.get(driver)
+                if connector is not None and isinstance(
+                    serving, SupportsServiceConnector
+                ):
+                    # A variant serving some rows of a stored type (the git
+                    # swap) builds its pods from what it derives from the row.
+                    connector = serving.service_connector(connector)
                 async with self.store.acquire() as conn:
                     private = await private_addresses_allowed(
                         conn, connector_id, private_tiers=self.settings.private_tiers
                     )
-                connectors[connector_id] = (connector, private)
-            return connectors[connector_id]
+                connectors[key] = (connector, private)
+            return connectors[key]
 
         # The connector's current generation for each bound (connector, digest).
         current: dict[tuple[str, str], tuple[str, bool, Mapping[str, Any]]] = {}
         for key, binding in bindings.items():
             spec = specs.get(binding.driver)
-            connector, private = await connector_state(binding.connector_id)
+            connector, private = await connector_state(
+                binding.connector_id, binding.driver
+            )
             if spec is None or connector is None:
                 continue
             current[key] = (
@@ -1389,7 +1404,9 @@ class ServiceHostingReconciler:
             if spec is None:
                 await self._stop(row, IDLE, report)  # the driver was uninstalled
                 continue
-            connector, private = await connector_state(str(row["connector_id"]))
+            connector, private = await connector_state(
+                str(row["connector_id"]), str(row["driver"])
+            )
             withdrawn = egress_withdrawn(
                 spec,
                 connector,
@@ -1479,7 +1496,7 @@ class ServiceHostingReconciler:
         active_ids: set[str],
         specs: Mapping[str, DriverSpec],
         *,
-        connector_state: Callable[[str], Any],
+        connector_state: Callable[[str, str], Any],
         exchange_address: str,
         report: ReconcileReport,
     ) -> None:
@@ -1539,7 +1556,9 @@ class ServiceHostingReconciler:
             ):
                 continue
             spec = specs[str(row["driver"])]
-            connector, private = await connector_state(str(row["connector_id"]))
+            connector, private = await connector_state(
+                str(row["connector_id"]), str(row["driver"])
+            )
             if connector is None:
                 continue
             pins = await self._re_resolve(row, spec, connector, private=private)

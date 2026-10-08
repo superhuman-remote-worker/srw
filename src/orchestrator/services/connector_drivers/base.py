@@ -158,6 +158,13 @@ class BindContext:
     logger: logging.Logger
     #: The deployment's default SSH host-key pins (known_hosts text).
     default_known_hosts: str
+    #: The installed git swap driver (C3), or ``None``: a token repository
+    #: is bound through it when it can serve the repository's URL.
+    git_swap: Any = None
+    #: What a token repository gets when the swap cannot serve it
+    #: (``connectors.drivers.gitSwap.fallback``): ``token-in-url`` or
+    #: ``refuse`` (``shared.connectors.git_swap.FALLBACKS``).
+    git_swap_fallback: str = "token-in-url"
 
 
 def key_name(name: Any) -> bool:
@@ -549,6 +556,17 @@ class SupportsCredentialLease(Protocol):
     def lease_upstream(self, row: Mapping[str, Any]) -> dict[str, Any]:
         """``{"credential": str, "allowed_upstream": [str, ...]}`` for a
         decrypted connector row; ``ValueError`` when it holds none."""
+        ...
+
+
+@runtime_checkable
+class SupportsServiceConnector(Protocol):
+    """A service driver whose pods are built from what it derives from a
+    stored row, not the row's own config (the git swap driver serves rows of
+    the repository type: its pods need the clean upstream URL and host)."""
+
+    def service_connector(self, row: Mapping[str, Any]) -> Mapping[str, Any]:
+        """The decrypted row as the reconciler sees it."""
         ...
 
 

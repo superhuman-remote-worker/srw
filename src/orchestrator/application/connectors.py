@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse
 
 from orchestrator.application.resources import ApplicationResources
 from orchestrator.routers import connector_lease_exchange as exchange_routes
+from orchestrator.services.connector_driver_ca import driver_ca
 from orchestrator.services.connector_lease_exchange import (
     NO_STORE,
     ConnectorLeaseExchange,
@@ -136,6 +137,43 @@ class BodyLimit:
             await self._refuse(send)
 
 
+def git_swap_image(settings: Any, ca: Any) -> str | None:
+    """The git swap driver's image when this installation can run it (C3).
+
+    It needs service-pod hosting (its pods are service pods) and SRW's driver
+    certificate authority ``ca`` (workspaces reach it over TLS). Without
+    either it is not installed, which the operator is told: token
+    repositories then take ``connectors.drivers.gitSwap.fallback``.
+    """
+    image = getattr(settings, "connector_git_swap_image", "")
+    if not image:
+        return None
+    missing = [
+        what
+        for what, ok in (
+            (
+                "service-pod hosting (connectors.servicePods)",
+                settings.connector_service_pods_enabled,
+            ),
+            (
+                "the driver certificate authority (connectors.drivers.ca)",
+                ca is not None,
+            ),
+        )
+        if not ok
+    ]
+    if missing:
+        logger.error(
+            "The git swap driver is configured but not installed: it needs %s; "
+            "token repositories take connectors.drivers.gitSwap.fallback=%s",
+            " and ".join(missing),
+            settings.connector_git_swap_fallback,
+        )
+        return None
+    logger.info("The git swap driver is installed with image %s", image)
+    return image
+
+
 def service_image_settings(resources: ApplicationResources) -> ServiceImageSettings:
     """How this application resolves service driver images (D5).
 
@@ -173,6 +211,11 @@ def service_image_settings(resources: ApplicationResources) -> ServiceImageSetti
             settings.connector_service_namespace
             if settings.connector_service_pods_enabled
             else ""
+        ),
+        # A git swap binding's first clone waits for a new pod at most this.
+        service_start_seconds=(
+            settings.connector_service_reconcile_seconds
+            + settings.connector_service_start_timeout_seconds
         ),
     )
 
@@ -225,6 +268,7 @@ def service_hosting_settings(
         reresolve_seconds=settings.connector_service_reresolve_seconds,
         repin_drain_seconds=settings.connector_service_repin_drain_seconds,
         front_image=settings.connector_mcp_front_image,
+        driver_ca=driver_ca(),
     )
 
 
@@ -436,6 +480,7 @@ __all__ = [
     "connector_lease_exchange",
     "connector_lease_exchange_app",
     "connector_service_reconciler_builder",
+    "git_swap_image",
     "service_hosting_settings",
     "exchange_server_config",
     "serve_connector_lease_exchange",

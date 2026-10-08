@@ -25,6 +25,11 @@ from orchestrator.services.connector_egress import (
     DEFAULT_CLUSTER_CIDRS,
     DEFAULT_PRIVATE_TIERS,
 )
+from shared.connectors.git_swap import (
+    FALLBACK_REFUSE,
+    FALLBACK_TOKEN_IN_URL,
+    FALLBACKS,
+)
 from shared.run_queue import LANE_PINNED, LANE_STATELESS
 
 logger = logging.getLogger(__name__)
@@ -168,6 +173,25 @@ def parse_session_subagent_fanout_lanes(raw: str | None) -> frozenset[str]:
     return frozenset(lanes)
 
 
+def parse_git_swap_fallback(raw: str | None) -> str:
+    """``CONNECTOR_GIT_SWAP_FALLBACK``: what a token repository gets when the
+    git swap driver cannot serve it. Unset or empty is ``token-in-url`` (the
+    delivery before C3); a value that is neither is ``refuse`` with a
+    warning, so a typo never puts a token in a workspace."""
+    value = (raw or "").strip().lower()
+    if not value:
+        return FALLBACK_TOKEN_IN_URL
+    if value in FALLBACKS:
+        return value
+    logger.warning(
+        "CONNECTOR_GIT_SWAP_FALLBACK=%r is not one of %s; refusing token "
+        "repositories the git swap driver cannot serve",
+        raw,
+        ", ".join(FALLBACKS),
+    )
+    return FALLBACK_REFUSE
+
+
 @dataclass
 class DeploymentSettings:
     #: Auto-assignment toggle (default on).
@@ -278,6 +302,14 @@ class DeploymentSettings:
     #: (``connectors.drivers.mcpFront.image``, pinned by digest).
     connector_managed_mcp_images: dict[str, str] = field(default_factory=dict)
     connector_mcp_front_image: str = ""
+    #: The git swap driver (C3): its image reference
+    #: (``connectors.drivers.gitSwap.image``; empty installs nothing), what a
+    #: token repository it cannot serve gets (``...gitSwap.fallback``), and
+    #: where SRW's connector driver certificate authority is mounted
+    #: (``connectors.drivers.ca``), which signs its pods' certificates.
+    connector_git_swap_image: str = ""
+    connector_git_swap_fallback: str = FALLBACK_TOKEN_IN_URL
+    connector_driver_ca_dir: str = ""
     #: Where service pods run and how the leader reconciles them
     #: (``connectors.servicePods``): the driver and release namespaces, the
     #: installation cap, the idle and start timeouts, the pass interval, the
@@ -422,6 +454,15 @@ class DeploymentSettings:
             },
             connector_mcp_front_image=os.environ.get(
                 "CONNECTOR_MCP_FRONT_IMAGE", ""
+            ).strip(),
+            connector_git_swap_image=os.environ.get(
+                "CONNECTOR_GIT_SWAP_IMAGE", ""
+            ).strip(),
+            connector_git_swap_fallback=parse_git_swap_fallback(
+                os.environ.get("CONNECTOR_GIT_SWAP_FALLBACK")
+            ),
+            connector_driver_ca_dir=os.environ.get(
+                "CONNECTOR_DRIVER_CA_DIR", ""
             ).strip(),
             connector_service_namespace=os.environ.get(
                 "CONNECTOR_SERVICE_NAMESPACE", ""
