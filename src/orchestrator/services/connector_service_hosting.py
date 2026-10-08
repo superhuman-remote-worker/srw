@@ -39,10 +39,9 @@ Each leader-gated pass:
    so an access change starts no pod;
 6. re-resolves a serving pod's pinned hosts every ``reresolveSeconds``
    (D5a): a shared pod with live bindings never idles, so it would never
-   pick up an upstream that moved. When a host's answer shares no address
-   with what was pinned, or the same changed answer comes twice in a row
-   (a rotating answer that still includes a pinned address does not), a
-   replacement starts for the same key with the new policy and
+   pick up an upstream that moved. When the same changed answer comes
+   twice in a row (a pool answering a rotating subset, overlapping the
+   pinned addresses or not, does not), a replacement starts for the same key with the new policy and
    hostAliases (the old pod is marked ``replaced_at`` and keeps serving),
    and the old pod stops ``repinDrainSeconds`` after the replacement is
    ready and its endpoint Service names it. A replacement that does not
@@ -785,6 +784,11 @@ def egress_withdrawn(
                     network = ipaddress.ip_network(str(address), strict=False)
                 except ValueError:
                     return f"its pinned address {address!r} is not an address"
+                if network.version == 6 and not policy.ipv6:
+                    return (
+                        f"its pinned address {address} for {item.get('host')} is "
+                        "IPv6, and this cluster pins IPv4 only now"
+                    )
                 reason = refusal(network, policy)
                 if reason:
                     return (
@@ -818,19 +822,6 @@ def _address_sets(recorded: Any) -> dict[tuple, tuple[bool, frozenset[str]]]:
         for item in recorded.get("hosts") or ()
         if isinstance(item, Mapping)
     }
-
-
-def _moved(
-    pinned: Mapping[tuple, tuple[bool, frozenset[str]]],
-    fresh: Mapping[tuple, tuple[bool, frozenset[str]]],
-) -> bool:
-    """Whether a host's new answer shares no address with what was pinned
-    (or a host is not pinned at all): the pod cannot reach it any more."""
-    if set(pinned) != set(fresh):
-        return True
-    return any(
-        not (pinned[key][1] & fresh[key][1]) for key in pinned if not pinned[key][0]
-    )
 
 
 def _serving(
@@ -1498,11 +1489,11 @@ class ServiceHostingReconciler:
         A shared pod with live bindings never goes idle, so it never rolls
         on its own: an upstream that moved would stay unreachable. Every
         ``reresolveSeconds`` its hosts are resolved again. A replacement
-        starts for the same key with the new policy and hostAliases when a
-        host's answer shares no address with what was pinned (the pod
-        cannot reach it), or when the same changed answer comes twice in a
-        row; a rotating answer that still holds a pinned address replaces
-        nothing, so DNS round-robin does not roll the pod every interval.
+        starts for the same key with the new policy and hostAliases when the
+        same changed answer comes twice in a row: a pool answering a
+        rotating subset (sharing a pinned address or not) replaces nothing,
+        so DNS round-robin does not roll the pod every interval, and an
+        upstream that really moved is followed one interval later.
         The endpoint Service moves to the replacement once it is ready, and
         the old pod stops ``repinDrainSeconds`` later, once the Service is
         seen to name another pod (if moving it failed, the old pod keeps
@@ -1586,9 +1577,8 @@ class ServiceHostingReconciler:
         """The pod's pins resolved again when its upstream moved; otherwise
         ``None``.
 
-        Moved: a host's answer shares no address with what was pinned, or
-        the answer differs from what was pinned and equals the one the last
-        re-resolution saw. The resolution time is recorded either way, so a
+        Moved: the answer differs from what was pinned and equals the one
+        the last re-resolution saw. The resolution time is recorded either way, so a
         replacement that does not start is tried again an interval later,
         not every pass.
         """
@@ -1615,17 +1605,19 @@ class ServiceHostingReconciler:
             fresh = _address_sets(pins.record())
             if fresh == pinned:
                 self.strikes.pop(sighting, None)
-            elif _moved(pinned, fresh) or self.strikes.get(sighting) == fresh:
-                self.strikes.pop(sighting, None)
+            elif self.strikes.get(sighting) == fresh:
+                # Kept until the pod is replaced (then pruned): a start that
+                # fails is tried again an interval later.
                 moved = pins
             else:
-                # It still answers a pinned address: wait for a second
-                # look before rolling a pod that serves.
+                # A pool may answer a rotating subset, even one sharing no
+                # pinned address, while the pinned ones still serve: wait
+                # for the same answer twice before rolling a pod that
+                # serves.
                 self.strikes[sighting] = fresh
                 logger.info(
-                    "Driver pod %s: a pinned host answers other addresses that "
-                    "still include a pinned one; replacing it if the next "
-                    "resolution agrees",
+                    "Driver pod %s: a pinned host answers other addresses; "
+                    "replacing the pod if the next resolution agrees",
                     row["pod_name"],
                 )
         async with self.store.acquire() as conn:

@@ -184,10 +184,15 @@ connectors:
     # -- Seconds between re-resolutions of a serving pod's pinned egress
     # hosts. A shared pod with live bindings never idles, so without this an
     # upstream that changed its addresses would stay unreachable from it.
-    # When an address set changed, a replacement pod starts with the new
-    # NetworkPolicy and hostAliases, the connector's endpoint Service moves
-    # to it once it is ready, and the old pod stops repinDrainSeconds later.
-    # 0 never re-resolves (a pod then keeps its addresses until it idles).
+    # When two re-resolutions in a row give the same changed answer (a pool
+    # answering a rotating subset replaces nothing), a replacement pod
+    # starts with the new NetworkPolicy and hostAliases, the connector's
+    # endpoint Service moves to it once it is ready, and the old pod stops
+    # repinDrainSeconds after that, once the Service is seen to name the
+    # replacement. A host that no longer resolves, or resolves into a range
+    # SRW refuses, keeps what was pinned. A real move is followed within two
+    # intervals. 0 never re-resolves (a pod keeps its addresses until it
+    # idles).
     reresolveSeconds: 300
     # -- Seconds a pod replaced after a re-pin keeps running once its
     # replacement serves, so requests in flight on it can finish.

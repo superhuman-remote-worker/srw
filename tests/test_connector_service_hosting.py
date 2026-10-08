@@ -622,25 +622,25 @@ class TestEgressWithdrawn:
         found = check("10.0.50.0/24", "1.1.1.0/24")
         assert found is not None and "1.1.1.1" in found and "refuses" in found
 
+    def test_an_ipv6_address_pinned_on_a_cluster_now_ipv4_only_is_withdrawn(self):
+        from orchestrator.services.connector_egress import EgressPolicy
+        from orchestrator.services.connector_service_hosting import egress_withdrawn
 
-def test_a_re_resolution_moves_only_when_no_pinned_address_answers():
-    from orchestrator.services.connector_service_hosting import _moved
+        recorded = self._recorded()
+        recorded["hosts"][0]["addresses"] = ["1.1.1.1", "2606:4700:4700::1111"]
+        config = {"config": {"host": "one.one.one.one", "port": 443}}
 
-    key = ("one.one.one.one", (443,), "tcp")
-    literal = ("192.0.2.0/24", (443,), "tcp")
-    pinned = {
-        key: (False, frozenset({"1.1.1.1", "1.0.0.1"})),
-        literal: (True, frozenset({"192.0.2.0/24"})),
-    }
+        def check(ipv6: bool):
+            policy = EgressPolicy.build(
+                ("10.42.0.0/16", "10.43.0.0/16"), allow_private=False, ipv6=ipv6
+            )
+            return egress_withdrawn(
+                self._spec(), config, recorded, private_allowed=False, policy=policy
+            )
 
-    def fresh(*addresses):
-        return {**pinned, key: (False, frozenset(addresses))}
-
-    assert not _moved(pinned, fresh("1.1.1.1", "9.9.9.9"))
-    assert not _moved(pinned, fresh("1.0.0.1"))
-    assert _moved(pinned, fresh("9.9.9.9", "8.8.8.8"))
-    # A host the pod never pinned (or lost) is a move.
-    assert _moved(pinned, {key: pinned[key]})
+        assert check(True) is None
+        found = check(False)
+        assert found is not None and "IPv6" in found
 
 
 def test_the_endpoint_ranks_the_current_generation_first():

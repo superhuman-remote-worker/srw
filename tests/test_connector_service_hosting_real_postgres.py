@@ -1546,19 +1546,29 @@ async def test_a_new_generation_takes_the_endpoint_once_it_is_ready(db, reconcil
     assert reconciler.fake.endpoints[name] == str(new["id"])
 
 
+async def _sighted_twice(reconciler, answer: list[str]):
+    """The pinned host answers ``answer`` at two re-resolutions in a row:
+    the first only remembers it, the second replaces the pod."""
+    reconciler.addresses["one.one.one.one"] = answer
+    reconciler.offset[0] = timedelta(seconds=301)
+    first = await reconciler.reconcile_once()
+    assert first.started == [] and first.capacity == 0
+    reconciler.offset[0] = timedelta(seconds=602)
+    return await reconciler.reconcile_once()
+
+
 @pytest.mark.asyncio
 async def test_a_moved_upstream_starts_a_replacement_that_takes_over(db, reconciler):
     """A serving pod never idles: its hosts are resolved again on the
-    interval, and a changed address set starts a replacement with the new
-    policy and hostAliases; the old pod serves until the replacement does,
-    then stops after the drain."""
+    interval, and an address set changed at two re-resolutions in a row
+    starts a replacement with the new policy and hostAliases; the old pod
+    serves until the replacement does, then stops after the drain."""
     connector, old = await _serving_pod(db, reconciler)
     name = endpoint_service_name(connector, D1)
     reconciler.addresses["one.one.one.one"] = ["1.0.0.1"]
     # Not due yet.
     assert (await reconciler.reconcile_once()).started == []
-    reconciler.offset[0] = timedelta(seconds=301)
-    report = await reconciler.reconcile_once()
+    report = await _sighted_twice(reconciler, ["1.0.0.1"])
     assert len(report.started) == 1
     old, new = await _pods(db)
     assert old["replaced_at"] is not None and old["revoked_at"] is None
@@ -1639,9 +1649,7 @@ async def test_a_replacement_that_never_serves_leaves_the_old_pod_serving(
 ):
     connector, old = await _serving_pod(db, reconciler)
     name = endpoint_service_name(connector, D1)
-    reconciler.addresses["one.one.one.one"] = ["1.0.0.1"]
-    reconciler.offset[0] = timedelta(seconds=301)
-    await reconciler.reconcile_once()
+    await _sighted_twice(reconciler, ["1.0.0.1"])
     _old, new = await _pods(db)
     # Its start timeout passes: it is stopped, the key backs off, and the
     # old pod keeps serving with what it pinned.
@@ -1676,9 +1684,7 @@ async def test_a_re_pin_at_the_installation_cap_leaves_the_pod_unmarked(db, reco
     (other,) = report.started
     reconciler.fake.ready(other)
     await reconciler.reconcile_once()
-    reconciler.addresses["one.one.one.one"] = ["1.0.0.1"]
-    reconciler.offset[0] = timedelta(seconds=301)
-    report = await reconciler.reconcile_once()
+    report = await _sighted_twice(reconciler, ["1.0.0.1"])
     assert report.capacity == 1
     async with db.acquire() as conn:
         replaced = await conn.fetchval(
@@ -1688,8 +1694,9 @@ async def test_a_re_pin_at_the_installation_cap_leaves_the_pod_unmarked(db, reco
     assert replaced is None
     # The failed re-pin backs off: the next pass does not try again ...
     assert (await reconciler.reconcile_once()).capacity == 0
-    # ... until another interval has passed.
-    reconciler.offset[0] = timedelta(seconds=602)
+    # ... until another interval has passed (the answer is still the one
+    # seen twice: no third sighting is needed).
+    reconciler.offset[0] = timedelta(seconds=903)
     assert (await reconciler.reconcile_once()).capacity == 1
 
 
@@ -1735,12 +1742,19 @@ async def test_a_rotating_answer_that_keeps_a_pinned_address_rolls_nothing(
 
 
 @pytest.mark.asyncio
-async def test_an_answer_sharing_no_pinned_address_replaces_at_once(db, reconciler):
+async def test_a_rotating_disjoint_subset_rolls_nothing(db, reconciler):
+    """A pool answering a different subset each time, sharing no address
+    with what was pinned: the pinned addresses may still serve, so only the
+    same answer twice in a row replaces the pod."""
     _connector, _pod = await _two_address_pod(db, reconciler)
-    reconciler.addresses["one.one.one.one"] = ["9.9.9.9"]
-    reconciler.offset[0] = timedelta(seconds=301)
-    report = await reconciler.reconcile_once()
-    assert len(report.started) == 1
+    for step, answer in enumerate(
+        (["9.9.9.9"], ["8.8.8.8"], ["9.9.9.9", "8.8.4.4"]), start=1
+    ):
+        reconciler.addresses["one.one.one.one"] = answer
+        reconciler.offset[0] = timedelta(seconds=301 * step)
+        assert (await reconciler.reconcile_once()).started == [], answer
+    reconciler.offset[0] = timedelta(seconds=301 * 4)
+    assert len((await reconciler.reconcile_once()).started) == 1
 
 
 @pytest.mark.asyncio
@@ -1830,9 +1844,7 @@ async def test_the_old_pod_serves_until_its_endpoint_names_the_replacement(
     the old pod would leave the endpoint naming a pod that is gone."""
     connector, old = await _serving_pod(db, reconciler)
     name = endpoint_service_name(connector, D1)
-    reconciler.addresses["one.one.one.one"] = ["1.0.0.1"]
-    reconciler.offset[0] = timedelta(seconds=301)
-    await reconciler.reconcile_once()
+    await _sighted_twice(reconciler, ["1.0.0.1"])
     _old, new = await _pods(db)
     # ready_at is database time: the drain counts from now.
     reconciler.offset[0] = timedelta()
