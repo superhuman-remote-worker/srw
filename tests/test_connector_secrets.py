@@ -43,6 +43,7 @@ from orchestrator.services.connector_secrets import (
     CATALOG_SECRET_DETAIL,
     CONNECTOR_SECRET_DETAIL,
     FOREIGN_CONNECTOR_SECRET_DETAIL,
+    ROW_KEY,
     SHAPE_KEY,
     URL_KEY,
     connector_secret_name,
@@ -350,7 +351,8 @@ class TestTheSlotKeys:
     )
     def test_each_driver_flattens_its_slots(self, label, row, keys, secrets):
         values = secret_values(_driver(row), row)
-        assert set(values) == keys
+        # Plus the digest of the row it was written from, when there is one.
+        assert set(values) == (keys | {ROW_KEY} if keys else set())
         assert all(isinstance(value, str) for value in values.values())
         if URL_KEY in keys:
             # The full URL, userinfo, path and query included.
@@ -412,7 +414,12 @@ class TestOddShapes:
         "credentials",
         [
             # A credential field named like a reserved key stays in the shape.
-            {"url": "s3cret-a", "shape": "s3cret-b", "env_vars": {"A": "1"}},
+            {
+                "url": "s3cret-a",
+                "shape": "s3cret-b",
+                "row": "s3cret-c",
+                "env_vars": {"A": "1"},
+            },
             # Non-string values a slot names stay where they are.
             {"env_vars": {"A": 1, "B": None, "C": "c"}},
             {"env_vars": {}},
@@ -429,6 +436,31 @@ class TestOddShapes:
         rebuilt, url = stored_credentials(values)
         assert json.dumps(rebuilt) == json.dumps(credentials)
         assert url is None
+
+    def test_a_key_two_leaves_share_keeps_the_first_and_shapes_the_second(self):
+        """No built-in driver names one key twice (prefixed keys have a dot,
+        field names cannot), but a driver that did loses nothing."""
+
+        class Colliding:
+            def secret_leaves(self, credentials):
+                return [(("a",), "k"), (("b",), "k")]
+
+        row = _row("generic", credentials={"a": "first", "b": "second"})
+        values = secret_values(Colliding(), row)
+        assert values["k"] == "first"
+        assert json.loads(values[SHAPE_KEY])["credentials"] == {
+            "a": None,
+            "b": "second",
+        }
+        assert stored_credentials(values)[0] == {"a": "first", "b": "second"}
+
+    def test_the_shape_holds_a_null_where_each_secret_goes_back(self):
+        row = _row("neo4j", credentials={"username": "u", "password": "p", "n": 1})
+        shape = json.loads(secret_values(_driver(row), row)[SHAPE_KEY])
+        assert shape == {
+            "credentials": {"username": None, "password": None, "n": 1},
+            "secrets": [[["username"], "username"], [["password"], "password"]],
+        }
 
     def test_an_empty_url_is_kept_as_stored(self):
         row = _row("generic", connection_url="")
@@ -474,7 +506,7 @@ class TestOddShapes:
     def test_only_environment_names_become_key_names(self, ds_type, credentials, keys):
         row = _row(ds_type, credentials=copy.deepcopy(credentials))
         values = secret_values(_driver(row), row)
-        assert set(values) == keys
+        assert set(values) == keys | {ROW_KEY}
         assert "s3cret" not in " ".join(values)
         rebuilt, _url = stored_credentials(json.loads(json.dumps(values)))
         assert json.dumps(rebuilt) == json.dumps(credentials)
@@ -627,8 +659,18 @@ def _stored_row(**over):
     return row
 
 
+def _marked(row) -> dict[str, str]:
+    """The row's secret with a different password and URL, as the write-through
+    would not write it but with the row's digest kept: what a delivery reads
+    proves it read the secret."""
+    values = secret_values(_driver(row), row)
+    values["password"] = "secret-pass"
+    values[URL_KEY] = "bolt://other.example.test:7687"
+    return values
+
+
 def _record(row, *, values=None, refs=None, stamp=STAMP, scope="Account"):
-    values = secret_values(_driver(row), row) if values is None else values
+    values = _marked(row) if values is None else values
     name = connector_secret_name(row["id"])
     return {
         "id": row["id"],
@@ -651,11 +693,7 @@ class TestTheReader:
     @pytest.mark.asyncio
     async def test_an_authorized_row_reads_its_connector_secret(self):
         row = _stored_row()
-        secret_row = _stored_row(
-            connection_url="bolt://other.example.test:7687",
-            credentials={"username": "graph", "password": "secret-pass"},
-        )
-        dependencies = _store(_record(secret_row))
+        dependencies = _store(_record(row))
         rows = [row]
         await read_connector_credentials(
             rows, authorized=[str(row["id"])], dependencies=dependencies
@@ -664,11 +702,13 @@ class TestTheReader:
         assert row["connection_url"] == "bolt://other.example.test:7687"
         query, ids = dependencies.store.fetch.await_args.args
         assert ids == [row["id"]]
+        # The secret joins its resource in the resource's own scope only.
+        assert "s.scope_kind = r.scope_kind AND s.scope_name = r.scope_name" in query
 
     @pytest.mark.asyncio
     async def test_an_unauthorized_row_is_never_read(self):
         row = _stored_row()
-        dependencies = _store(_record(_stored_row(credentials={"password": "x"})))
+        dependencies = _store(_record(row))
         await read_connector_credentials(
             [row],
             authorized=["00000000-0000-4000-8000-00000000ffff"],
@@ -707,12 +747,60 @@ class TestTheReader:
     )
     async def test_the_row_is_the_fallback(self, change):
         row = _stored_row()
-        record = _record(_stored_row(credentials={"password": "secret-pass"}))
+        record = _record(row)
         record.update(change)
         await read_connector_credentials(
             [row], authorized=[str(row["id"])], dependencies=_store(record)
         )
         assert row["credentials"]["password"] == "row-pass"
+        assert row["connection_url"] == "bolt://graph.example.test:7687"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "values",
+        [
+            # Written by hand: no digest of the row it stands for.
+            lambda row: {
+                key: value for key, value in _marked(row).items() if key != ROW_KEY
+            },
+            # Written from another row (a digest that is not this row's).
+            lambda row: {**_marked(row), ROW_KEY: "0" * 64},
+            # A key its resource names is missing.
+            lambda row: {
+                key: value for key, value in _marked(row).items() if key != "password"
+            },
+        ],
+        ids=["by_hand", "another_row", "missing_key"],
+    )
+    async def test_a_secret_not_written_from_this_row_is_not_delivered(self, values):
+        row = _stored_row()
+        name = connector_secret_name(row["id"])
+        record = _record(
+            row,
+            values=values(row),
+            refs=credential_refs(name, secret_values(_driver(row), row)),
+        )
+        await read_connector_credentials(
+            [row], authorized=[str(row["id"])], dependencies=_store(record)
+        )
+        assert row["credentials"]["password"] == "row-pass"
+
+    @pytest.mark.asyncio
+    async def test_a_secret_that_does_not_rebuild_falls_back_to_the_row(self, caplog):
+        row = _stored_row()
+        values = _marked(row)
+        shape = json.loads(values[SHAPE_KEY])
+        # The shape puts back a key the secret does not hold.
+        shape["secrets"].append([["extra"], "token"])
+        values[SHAPE_KEY] = json.dumps(shape)
+        with caplog.at_level(logging.WARNING):
+            await read_connector_credentials(
+                [row],
+                authorized=[str(row["id"])],
+                dependencies=_store(_record(row, values=values)),
+            )
+        assert row["credentials"]["password"] == "row-pass"
+        assert "does not rebuild" in caplog.text and "row-pass" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_a_missing_secret_falls_back_and_says_so_without_a_value(
@@ -732,13 +820,22 @@ class TestTheReader:
     @pytest.mark.asyncio
     async def test_a_connector_with_nothing_secret_reads_as_empty(self):
         # Its resource says so (``credentials: {}``) and it has no secret row.
-        row = _stored_row()
+        row = _stored_row(credentials={}, connection_url=None)
         record = _record(row, values={})
         assert record["ciphertext"] is None and json.loads(record["refs"]) == {}
         await read_connector_credentials(
             [row], authorized=[str(row["id"])], dependencies=_store(record)
         )
         assert row["credentials"] == {} and row["connection_url"] is None
+
+    @pytest.mark.asyncio
+    async def test_nothing_secret_is_believed_only_of_a_row_with_nothing(self):
+        row = _stored_row()
+        record = _record(row, values={})
+        await read_connector_credentials(
+            [row], authorized=[str(row["id"])], dependencies=_store(record)
+        )
+        assert row["credentials"]["password"] == "row-pass"
 
     def test_the_payload_of_every_golden_row_is_byte_identical(self):
         """Every kind the payload goldens pin, through its secret."""

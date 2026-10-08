@@ -40,7 +40,7 @@ from fastapi import HTTPException
 
 from orchestrator.services import datasource_config
 from orchestrator.services.connector_drivers import knowledge_note
-from orchestrator.services.connector_secrets import RESERVED_KEYS
+from orchestrator.services.connector_secrets import RESERVED_FIELDS
 from shared.connectors.binding import BindingDescriptor
 from shared.connectors.contract import DriverSpec
 from shared.connectors.envelope import unsupported_check
@@ -450,7 +450,7 @@ class DatasourceDriver:
         its own keys under those names (``connector_secrets``).
         """
         if isinstance(draft.credentials, Mapping) and (
-            RESERVED_KEYS & set(draft.credentials)
+            RESERVED_FIELDS & set(draft.credentials)
         ):
             raise HTTPException(status_code=400, detail=RESERVED_FIELDS_DETAIL)
         credentials = datasource_config.normalize_datasource_credentials(

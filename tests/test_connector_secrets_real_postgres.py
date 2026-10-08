@@ -43,10 +43,12 @@ from orchestrator.services.connector_secrets import (
     CATALOG_SECRET_DETAIL,
     CONNECTOR_SECRET_DETAIL,
     FOREIGN_CONNECTOR_SECRET_DETAIL,
+    ROW_KEY,
     SHAPE_KEY,
     URL_KEY,
     connector_secret_name,
     read_connector_credentials,
+    row_digest,
     stored_credentials,
     write_connector_secret,
 )
@@ -202,8 +204,8 @@ def _scope_of(resource) -> tuple[str, str]:
 
 
 async def _assert_in_step(db, datasource_id: str, keys: set[str]) -> dict:
-    """The resource names exactly the secret's keys, and the secret rebuilds
-    the row."""
+    """The resource names exactly the secret's keys (all but the row digest),
+    and the secret rebuilds the row it holds the digest of."""
     resource = await _resource(db, datasource_id)
     secret = await _secret(db, datasource_id, _scope_of(resource))
     refs = resource["document"]["spec"]["credentials"]
@@ -215,11 +217,12 @@ async def _assert_in_step(db, datasource_id: str, keys: set[str]) -> dict:
     if not keys:
         assert secret is None
         return {}
-    assert set(secret["values"]) == keys == set(secret["keys"])
+    assert set(secret["values"]) == keys | {ROW_KEY} == set(secret["keys"])
     assert stored_credentials(secret["values"]) == (
         row["credentials"],
         row["connection_url"],
     )
+    assert secret["values"][ROW_KEY] == row_digest(row)
     return secret
 
 
@@ -945,6 +948,41 @@ async def test_a_non_owners_session_gets_the_shared_connectors_secrets(database)
         target_project_ids=[world.project],
         dependencies=_thread_dependencies(db, [world.project]),
     )
+    assert not rows[0]["connection_url"].endswith("?from=secret")
+
+
+@pytest.mark.asyncio
+async def test_a_same_named_secret_in_another_scope_is_never_read(database):
+    """The reader joins the secret in its Connector's own scope: a
+    ``connector-<hex>`` secret elsewhere (another project's, say), even one
+    that would pass every other check, falls back to the row."""
+    db = database
+    world = await _shared_connectors(db)
+    public = world.ids["public"]
+    secret = await _secret(db, public)
+    values = dict(secret["values"])
+    values[URL_KEY] = values[URL_KEY] + "?from=secret"
+    async with db.transaction_scope():
+        await write_connector_secret(
+            db,
+            public,
+            {"kind": "Project", "name": world.project},
+            owner_id=None,
+            values=values,
+        )
+    await db.execute(
+        "DELETE FROM srw_resource_secrets WHERE scope_kind='Account' AND name=$1",
+        connector_secret_name(public),
+    )
+    thread = {"id": str(uuid4()), "user_id": str(world.member["id"]), "metadata": {}}
+    rows = await resolve_authorized_thread_datasources(
+        thread,
+        [public],
+        target_project_ids=[world.project],
+        dependencies=_thread_dependencies(db, [world.project]),
+    )
+    row = await db.get_datasource(public)
+    assert rows[0]["connection_url"] == row["connection_url"]
     assert not rows[0]["connection_url"].endswith("?from=secret")
 
 

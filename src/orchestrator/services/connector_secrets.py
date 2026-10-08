@@ -23,7 +23,12 @@ The keys, flattened per driver credential slot (each driver's
   above taken out, and where each one goes back.  It keeps the non-secret
   structure (an auth method, a transport, file targets, mailbox servers) and
   any value no driver names a key for, so the stored object is rebuilt
-  exactly, key order included, whatever its shape (``stored_credentials``).
+  exactly, key order included, whatever its shape (``stored_credentials``);
+* ``row``: a digest of the row's credentials and URL the secret was written
+  from.  No reference names it.  A delivery reads the secret only when it
+  matches the row it delivers, so a ``connector-`` secret written any other
+  way (by hand, or through an orchestrator without D3b during a rollback)
+  is never delivered.
 
 **``shape`` is secret material.**  It holds every value no driver names a
 key for: an extra field a repository row stored (a password, a passphrase),
@@ -78,6 +83,7 @@ questions" -> Credentials) and decision 11.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -93,11 +99,17 @@ logger = logging.getLogger(__name__)
 #: A Connector's resource secret is named after its uid.
 SECRET_PREFIX = "connector-"
 URL_KEY = "url"
+#: A digest of the row the secret was written from: a delivery reads the
+#: secret only for that row, so a secret written any other way (by hand,
+#: during a rollback to an orchestrator without D3b) is never delivered.
+ROW_KEY = "row"
 #: Secret material (see the module docstring): never forwarded to a process.
 SHAPE_KEY = "shape"
-#: Keys no driver slot may use, and no stored credentials object as a
-#: top-level field.
-RESERVED_KEYS = frozenset({URL_KEY, SHAPE_KEY})
+#: Keys no driver slot may use: a stored field with such a name stays in the
+#: shape.
+RESERVED_KEYS = frozenset({URL_KEY, SHAPE_KEY, ROW_KEY})
+#: Top-level fields new credentials may not have (the API refuses them).
+RESERVED_FIELDS = frozenset({URL_KEY, SHAPE_KEY})
 CATALOG_SECRET_DETAIL = (
     "Shared catalog definitions cannot distribute catalog credentials."
 )
@@ -129,12 +141,14 @@ WHERE r.id = ANY($1::uuid[]) AND r.kind = 'Connector'
 """
 #: Secrets of Connectors that were retired or moved to another scope by a
 #: write that did not drop them (an older orchestrator during a rollout).
-#: Only a name that is a linked Connector's uid is looked at.
+#: Only a name that is a linked Connector's uid is looked at; the CASE keeps
+#: the cast from ever seeing another secret's name, whatever the plan.
 STALE_SECRETS = """
 DELETE FROM srw_resource_secrets s
 USING srw_resources r
 WHERE s.name ~ '^connector-[0-9a-f]{32}$'
-  AND r.id = substr(s.name, 11)::uuid
+  AND r.id = CASE WHEN s.name ~ '^connector-[0-9a-f]{32}$'
+                  THEN substr(s.name, 11)::uuid END
   AND r.kind = 'Connector' AND r.linked_id IS NOT NULL
   AND (r.deleted_at IS NOT NULL
        OR s.scope_kind <> r.scope_kind OR s.scope_name <> r.scope_name)
@@ -161,10 +175,21 @@ def _parent(value: Any, path: list[Any] | tuple[Any, ...]) -> Any:
     return value
 
 
+def row_digest(row: Mapping[str, Any]) -> str:
+    """The digest of a row's credentials and connection URL (``ROW_KEY``)."""
+    canonical = json.dumps(
+        [row.get("credentials"), row.get("connection_url")],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 def secret_values(driver: Any, row: Mapping[str, Any]) -> dict[str, str]:
     """The secret of a row's Connector: its keys and their string values.
 
-    Empty when the row holds no credentials and no URL.
+    Empty when the row holds no credentials and no URL; otherwise it also
+    holds the row's digest (``ROW_KEY``), which no reference names.
     """
     credentials = row.get("credentials")
     values: dict[str, str] = {}
@@ -186,6 +211,8 @@ def secret_values(driver: Any, row: Mapping[str, Any]) -> dict[str, str]:
     url = row.get("connection_url")
     if isinstance(url, str):
         values[URL_KEY] = url
+    if values:
+        values[ROW_KEY] = row_digest(row)
     return values
 
 
@@ -205,8 +232,13 @@ def credential_refs(name: str, values: Mapping[str, str]) -> dict[str, Any]:
     """``spec.credentials`` of a Connector: each key of its secret, by name.
 
     No scope: a reference without one resolves in the Connector's scope.
+    The row digest is not a credential and has no reference.
     """
-    return {key: {"secretRef": {"name": name, "key": key}} for key in sorted(values)}
+    return {
+        key: {"secretRef": {"name": name, "key": key}}
+        for key in sorted(values)
+        if key != ROW_KEY
+    }
 
 
 def is_own_connector_secret(ref: Mapping[str, Any], resource: Mapping[str, Any]):
@@ -317,7 +349,12 @@ def _resource_values(record: Mapping[str, Any], row: Mapping[str, Any]):
         # Written before D3b, or by an orchestrator without it.
         return None
     if not refs:
-        return {}
+        # Nothing secret: true only of a row with no credentials and no URL,
+        # as secret_values has it.
+        nothing = row.get("credentials") in (None, {}) and not isinstance(
+            row.get("connection_url"), str
+        )
+        return {} if nothing else None
     name = connector_secret_name(record["id"])
     if any(
         not isinstance(ref, dict)
@@ -332,6 +369,13 @@ def _resource_values(record: Mapping[str, Any], row: Mapping[str, Any]):
     if values is None or not set(refs) <= set(values):
         logger.warning(
             "Connector %s: its resource secret is missing or unreadable; "
+            "delivering the row's credentials",
+            record["id"],
+        )
+        return None
+    if values.get(ROW_KEY) != row_digest(row):
+        logger.warning(
+            "Connector %s: its resource secret was not written from this row; "
             "delivering the row's credentials",
             record["id"],
         )
@@ -370,7 +414,16 @@ async def read_connector_credentials(
         values = _resource_values(record, row)
         if values is None:
             continue
-        row["credentials"], row["connection_url"] = stored_credentials(values)
+        try:
+            credentials, url = stored_credentials(values)
+        except (KeyError, IndexError, TypeError, ValueError):
+            logger.warning(
+                "Connector %s: its resource secret does not rebuild; delivering "
+                "the row's credentials",
+                record["id"],
+            )
+            continue
+        row["credentials"], row["connection_url"] = credentials, url
 
 
 # =============================================================================
@@ -412,6 +465,7 @@ __all__ = [
     "CATALOG_SECRET_DETAIL",
     "CONNECTOR_SECRET_DETAIL",
     "FOREIGN_CONNECTOR_SECRET_DETAIL",
+    "ROW_KEY",
     "SHAPE_KEY",
     "STALE_SECRETS",
     "URL_KEY",
@@ -422,6 +476,7 @@ __all__ = [
     "is_connector_secret_name",
     "is_own_connector_secret",
     "read_connector_credentials",
+    "row_digest",
     "secret_values",
     "stored_credentials",
     "write_connector_secret",
