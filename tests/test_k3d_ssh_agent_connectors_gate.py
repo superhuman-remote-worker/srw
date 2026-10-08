@@ -56,10 +56,19 @@ def test_preflight_compares_the_modules_c1_runs_in():
     root = Path(__file__).resolve().parents[1]
     for path in gate.AGENT_FILES + gate.ORCHESTRATOR_FILES:
         assert (root / path).is_file(), path
-    assert {
-        "src/agent/connectors/checkout.py",
-        "src/agent/connectors/ssh_identity.py",
-    } <= set(gate.AGENT_FILES)
+    package = {
+        str(path.relative_to(root))
+        for path in (root / "src/agent/connectors").rglob("*.py")
+        if "__pycache__" not in path.parts
+    }
+    assert (
+        {
+            "src/agent/connectors/checkout.py",
+            "src/agent/connectors/ssh_identity.py",
+        }
+        <= package
+        <= set(gate.AGENT_FILES)
+    )
 
 
 def test_embedded_programs_compile():
