@@ -7,8 +7,15 @@ matrix" and slice D2.
 
 It is assembled from the registry alone, never from a connector, so it holds
 no credential value: a credential slot says what a secret looks like, never
-what it is.  ``default`` and ``examples`` are dropped from every ``writeOnly``
-schema all the same, in case a driver's author put a value there.
+what it is.  A driver's author could still write a value into a schema, so
+:func:`public_schema` drops, as keywords and never as property names:
+
+* ``default`` and ``examples`` on any schema that is or contains a
+  ``writeOnly`` one (a parent's default can hold its secret child's value);
+* ``const`` and ``enum`` inside a ``writeOnly`` schema;
+* every ``$ref``: a local one is inlined, so a secret pointing at a shared
+  definition loses that definition's default too; a remote or circular one
+  becomes ``{}``.
 
 Trust: the built-in drivers are SRW's own code, so their claims are SRW's.
 A driver outside the trusted list (registration arrives in D6) is marked
@@ -47,8 +54,30 @@ from shared.connectors.contract import (
 )
 
 _BUILTIN_NAMES = frozenset(spec.name for spec in BUILTIN_SPECS)
-#: Keys that carry an example or a fallback value, never shown for a secret.
-_VALUE_KEYS = ("default", "examples")
+#: Keywords carrying an example or a fallback value: dropped on a schema that
+#: is or holds a secret.
+_VALUE_KEYWORDS = frozenset({"default", "examples"})
+#: Keywords spelling out the allowed values: dropped inside a secret.
+_SECRET_VALUE_KEYWORDS = frozenset({"const", "enum"})
+#: Where JSON Schema 2020-12 nests subschemas, by shape.
+_SCHEMA_MAPS = frozenset({"properties", "patternProperties", "dependentSchemas"})
+_SCHEMA_LISTS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
+_SCHEMA_VALUES = frozenset(
+    {
+        "items",
+        "additionalProperties",
+        "propertyNames",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    }
+)
+#: Inlined at each ``$ref``, so not repeated.
+_DEFINITIONS = frozenset({"$defs", "definitions"})
 #: Why a column has no value for a driver that runs in SRW's own process.
 IN_PROCESS = {"status": "not_applicable", "reason": "runs_in_srw_process"}
 
@@ -106,18 +135,102 @@ def driver_entry(driver: ConnectorDriver) -> dict[str, Any]:
     }
 
 
-def public_schema(schema: Any, *, secret: bool = False) -> Any:
-    """``schema`` as JSON, without a value under any ``writeOnly`` node."""
-    if isinstance(schema, Mapping):
-        secret = secret or schema.get("writeOnly") is True
-        return {
-            key: public_schema(value, secret=secret)
-            for key, value in schema.items()
-            if not (secret and key in _VALUE_KEYS)
-        }
-    if isinstance(schema, (list, tuple)):
-        return [public_schema(item, secret=secret) for item in schema]
-    return schema
+def public_schema(schema: Any) -> Any:
+    """``schema`` as JSON with no value a secret could hide in (module doc)."""
+    return _public_node(schema, schema, secret=False, refs=())
+
+
+def _public_node(node: Any, root: Any, *, secret: bool, refs: tuple[str, ...]) -> Any:
+    if not isinstance(node, Mapping):
+        return _json(node)  # a boolean schema
+    node, refs = _inline_ref(node, root, refs)
+    secret = secret or node.get("writeOnly") is True
+    holds_secret = secret or _holds_write_only(node, root, refs)
+    out: dict[str, Any] = {}
+    for key, value in node.items():
+        if key in _DEFINITIONS:
+            continue
+        if key in _VALUE_KEYWORDS and holds_secret:
+            continue
+        if key in _SECRET_VALUE_KEYWORDS and secret:
+            continue
+        if key in _SCHEMA_MAPS and isinstance(value, Mapping):
+            out[key] = {
+                name: _public_node(sub, root, secret=secret, refs=refs)
+                for name, sub in value.items()
+            }
+        elif key in _SCHEMA_LISTS and isinstance(value, (list, tuple)):
+            out[key] = [
+                _public_node(sub, root, secret=secret, refs=refs) for sub in value
+            ]
+        elif key in _SCHEMA_VALUES:
+            out[key] = (
+                [_public_node(sub, root, secret=secret, refs=refs) for sub in value]
+                if isinstance(value, (list, tuple))
+                else _public_node(value, root, secret=secret, refs=refs)
+            )
+        else:
+            out[key] = _json(value)
+    return out
+
+
+def _inline_ref(
+    node: Mapping[str, Any], root: Any, refs: tuple[str, ...]
+) -> tuple[Mapping[str, Any], tuple[str, ...]]:
+    """``node`` with its ``$ref`` replaced by the target, its siblings winning.
+
+    Only a local reference resolves; a remote, missing or circular one leaves
+    ``{}`` (any value), which shows nothing an author put behind it.
+    """
+    while isinstance(node.get("$ref"), str):
+        ref = node["$ref"]
+        target = _resolve_pointer(root, ref) if ref not in refs else None
+        if not isinstance(target, Mapping):
+            return {}, refs
+        refs = (*refs, ref)
+        siblings = {key: value for key, value in node.items() if key != "$ref"}
+        node = {**target, **siblings}
+    return node, refs
+
+
+def _resolve_pointer(root: Any, ref: str) -> Any:
+    if not ref.startswith("#"):
+        return None
+    current = root
+    for part in ref[1:].split("/")[1:]:
+        part = part.replace("~1", "/").replace("~0", "~")
+        if not isinstance(current, Mapping) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _holds_write_only(node: Any, root: Any, refs: tuple[str, ...]) -> bool:
+    """Whether ``node`` or any subschema under it is ``writeOnly``."""
+    if not isinstance(node, Mapping):
+        return False
+    node, refs = _inline_ref(node, root, refs)
+    if node.get("writeOnly") is True:
+        return True
+    for key, value in node.items():
+        if key in _SCHEMA_MAPS and isinstance(value, Mapping):
+            subs = list(value.values())
+        elif key in _SCHEMA_LISTS or key in _SCHEMA_VALUES:
+            subs = list(value) if isinstance(value, (list, tuple)) else [value]
+        else:
+            continue
+        if any(_holds_write_only(sub, root, refs) for sub in subs):
+            return True
+    return False
+
+
+def _json(value: Any) -> Any:
+    """Plain data as JSON: mappings to dicts, tuples to lists."""
+    if isinstance(value, Mapping):
+        return {key: _json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json(item) for item in value]
+    return value
 
 
 def _access_level(level: AccessLevel) -> dict[str, Any]:
@@ -157,9 +270,9 @@ def _service(service: ServiceSpec | None) -> dict[str, Any] | None:
         return None
     return {
         "instancing": service.instancing,
-        "resources": public_schema(service.resources),
+        "resources": _json(service.resources),
         "start_seconds": service.start_seconds,
-        "mcp": public_schema(service.mcp) if service.mcp is not None else None,
+        "mcp": _json(service.mcp) if service.mcp is not None else None,
     }
 
 

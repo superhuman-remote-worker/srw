@@ -210,6 +210,10 @@ async def list_connector_drivers(
 
     It describes installed software and reads no connector, so any approved
     user may read it, as the catalog without a project filter.
+
+    TODO(D6): once drivers can be registered at Account and Project scope,
+    with image references, the matrix must list only the drivers the caller
+    can see (the shared Catalog, their Account, their Projects).
     """
     await dependencies.require_approved_user(request, dependencies.store)
     return capability_matrix(dependencies.operations.connector_drivers)

@@ -276,7 +276,6 @@ class TestNoCredentialValue:
     def test_write_only_schemas_lose_their_values(self):
         schema = {
             "type": "object",
-            "default": {"keep": "non-secret object default"},
             "properties": {
                 "host": {"type": "string", "default": "db.example.com"},
                 "secret": {
@@ -288,10 +287,92 @@ class TestNoCredentialValue:
             },
         }
         cleaned = public_schema(schema)
-        assert cleaned["default"] == {"keep": "non-secret object default"}
         assert cleaned["properties"]["host"]["default"] == "db.example.com"
         assert "default" not in cleaned["properties"]["secret"]
         assert "examples" not in cleaned["properties"]["secret"]["properties"]["nested"]
+
+    def test_a_parent_default_holding_a_secret_childs_value_is_dropped(self):
+        schema = {
+            "type": "object",
+            "default": {"user": "svc", "password": AUTHOR_SECRET},
+            "examples": [{"password": AUTHOR_SECRET}],
+            "properties": {
+                "user": {"type": "string", "default": "svc"},
+                "password": {"type": "string", "writeOnly": True},
+            },
+        }
+        cleaned = public_schema(schema)
+        assert "default" not in cleaned and "examples" not in cleaned
+        assert AUTHOR_SECRET not in json.dumps(cleaned)
+        # A sibling that holds no secret keeps its documentation.
+        assert cleaned["properties"]["user"]["default"] == "svc"
+
+    def test_const_and_enum_inside_a_secret_are_dropped(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "pin": {"type": "string", "writeOnly": True, "const": AUTHOR_SECRET},
+                "auth": {
+                    "type": "object",
+                    "writeOnly": True,
+                    "properties": {"key": {"enum": [AUTHOR_SECRET, "other"]}},
+                },
+                "mode": {"enum": ["a", "b"]},
+                "backend": {"const": "imap_smtp"},
+            },
+        }
+        cleaned = public_schema(schema)
+        assert AUTHOR_SECRET not in json.dumps(cleaned)
+        assert cleaned["properties"]["pin"] == {"type": "string", "writeOnly": True}
+        assert cleaned["properties"]["auth"]["properties"]["key"] == {}
+        assert cleaned["properties"]["mode"] == {"enum": ["a", "b"]}
+        assert cleaned["properties"]["backend"] == {"const": "imap_smtp"}
+
+    def test_a_secret_pointing_at_a_shared_definition_loses_its_default(self):
+        schema = {
+            "type": "object",
+            "$defs": {"token": {"type": "string", "default": AUTHOR_SECRET}},
+            "properties": {
+                "token": {"$ref": "#/$defs/token", "writeOnly": True},
+                "label": {"$ref": "#/$defs/token"},
+            },
+        }
+        cleaned = public_schema(schema)
+        assert "$defs" not in cleaned
+        assert cleaned["properties"]["token"] == {"type": "string", "writeOnly": True}
+        # The non-secret use of the same definition is inlined with its default.
+        assert cleaned["properties"]["label"] == {
+            "type": "string",
+            "default": AUTHOR_SECRET,
+        }
+        assert "$ref" not in json.dumps(cleaned)
+
+    @pytest.mark.parametrize(
+        "ref",
+        ["https://example.com/schema.json", "#/$defs/missing", "#/$defs/loop"],
+    )
+    def test_a_remote_missing_or_circular_ref_shows_nothing(self, ref):
+        schema = {
+            "type": "object",
+            "$defs": {"loop": {"$ref": "#/$defs/loop", "default": AUTHOR_SECRET}},
+            "properties": {"key": {"$ref": ref, "writeOnly": True}},
+        }
+        cleaned = public_schema(schema)
+        assert cleaned["properties"]["key"] == {}
+        assert AUTHOR_SECRET not in json.dumps(cleaned)
+
+    def test_properties_named_like_keywords_survive_inside_a_secret(self):
+        schema = {
+            "type": "object",
+            "writeOnly": True,
+            "properties": {
+                "default": {"type": "string"},
+                "examples": {"type": "string"},
+                "enum": {"type": "string"},
+            },
+        }
+        cleaned = public_schema(schema)
+        assert set(cleaned["properties"]) == {"default", "examples", "enum"}
 
     def test_an_authors_secret_default_never_reaches_the_response(self):
         wire = _client(registry=ConnectorDriverRegistry([_ImageDriver(_image_spec())]))
