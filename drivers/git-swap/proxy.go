@@ -22,9 +22,12 @@ import (
 )
 
 const (
-	// The username SRW's clone URL always used with a forge token
-	// (https://oauth2:<token>@host/...): GitHub, GitLab and Gitea accept it.
-	upstreamUsername = "oauth2"
+	// The username the credential is presented with upstream when the
+	// exchange names none (an orchestrator before C5): the one SRW's clone
+	// URL always used with a forge token (https://oauth2:<token>@host/...).
+	// The exchange names it per credential: x-access-token for a GitHub App
+	// installation token, oauth2 for a static forge token.
+	defaultUpstreamUsername = "oauth2"
 	// A transfer may sit this long with no byte moving either way (GitLab's
 	// git ingress waits an hour; a large repository counts objects for
 	// minutes before its first progress line).
@@ -305,7 +308,7 @@ func (d *driver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cancel()
 		<-watching
 	}()
-	status, size := d.forward(ctx, w, r, rt, body, issued.credential, found.id, watch)
+	status, size := d.forward(ctx, w, r, rt, body, issued.username, issued.credential, found.id, watch)
 	d.logf("lease=%s %s %s status=%d bytes=%d duration=%s", found.id, r.Method, rt.label(), status, size, d.now().Sub(started).Round(time.Millisecond))
 }
 
@@ -435,7 +438,10 @@ func firstReason(reasons []string) string {
 // a host or path from the request) with the credential, and streams the
 // answer back filtered and scrubbed. It returns the status and the bytes
 // relayed.
-func (d *driver) forward(ctx context.Context, w http.ResponseWriter, r *http.Request, rt route, body io.Reader, credential, leaseID string, watch *idleWatch) (int, int64) {
+func (d *driver) forward(ctx context.Context, w http.ResponseWriter, r *http.Request, rt route, body io.Reader, username, credential, leaseID string, watch *idleWatch) (int, int64) {
+	if username == "" {
+		username = defaultUpstreamUsername
+	}
 	target := d.cfg.upstream.url
 	method := http.MethodPost
 	accept := "application/x-" + rt.service + "-result"
@@ -461,7 +467,7 @@ func (d *driver) forward(ctx context.Context, w http.ResponseWriter, r *http.Req
 	}
 	out.Header.Set("Accept", accept)
 	out.Header.Set("Pragma", "no-cache")
-	out.Header.Set("Authorization", "Basic "+basicValue(credential))
+	out.Header.Set("Authorization", "Basic "+basicValueFor(username, credential))
 	if protocol := r.Header.Get("Git-Protocol"); gitProtocolShape.MatchString(protocol) {
 		out.Header.Set("Git-Protocol", protocol)
 	}
@@ -512,7 +518,7 @@ func (d *driver) forward(ctx context.Context, w http.ResponseWriter, r *http.Req
 	}
 	w.WriteHeader(http.StatusOK)
 	sink := &flushWriter{w: w, controller: http.NewResponseController(w), watch: watch}
-	scrub := newScrubber(sink, credential)
+	scrub := newScrubberFor(sink, username, credential)
 	source := &touchReader{r: response.Body, watch: watch}
 	if rt.endpoint == endpointRefs && rt.service == uploadPack {
 		err = filterAdvertisement(scrub, bufio.NewReaderSize(source, copyBuffer))

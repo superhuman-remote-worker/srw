@@ -25,10 +25,16 @@ type scrubber struct {
 
 // newScrubber scrubs the credential itself, its URL escape, its base64 and
 // hex (either case), and the Basic authorization value the driver sends
-// upstream (base64 of "oauth2:<credential>"), as the upstream could echo
+// upstream (base64 of "<username>:<credential>"), as the upstream could echo
 // any of them. Git's answers are pkt-lines and packs, not JSON, so the
 // managed MCP front's JSON-escaped forms do not arise here.
 func newScrubber(dst io.Writer, credential string) *scrubber {
+	return newScrubberFor(dst, defaultUpstreamUsername, credential)
+}
+
+// newScrubberFor is newScrubber for the username the credential is
+// presented with.
+func newScrubberFor(dst io.Writer, username, credential string) *scrubber {
 	s := &scrubber{dst: dst}
 	if credential == "" {
 		return s
@@ -38,6 +44,7 @@ func newScrubber(dst io.Writer, credential string) *scrubber {
 	for _, needle := range []string{
 		credential,
 		url.QueryEscape(credential),
+		basicValueFor(username, credential),
 		basicValue(credential),
 		base64.StdEncoding.EncodeToString([]byte(credential)),
 		encoded,
@@ -53,10 +60,15 @@ func newScrubber(dst io.Writer, credential string) *scrubber {
 	return s
 }
 
-// basicValue is the Basic credential the driver presents upstream; the
-// username is the one SRW's clone URL always used (oauth2).
+// basicValue is the Basic credential under the default username (oauth2).
 func basicValue(credential string) string {
-	return base64.StdEncoding.EncodeToString([]byte(upstreamUsername + ":" + credential))
+	return basicValueFor(defaultUpstreamUsername, credential)
+}
+
+// basicValueFor is the Basic credential the driver presents upstream: the
+// username the exchange named for this credential, and the credential.
+func basicValueFor(username, credential string) string {
+	return base64.StdEncoding.EncodeToString([]byte(username + ":" + credential))
 }
 
 func (s *scrubber) Write(p []byte) (int, error) {

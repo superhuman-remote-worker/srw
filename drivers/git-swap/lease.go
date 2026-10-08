@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"sync"
 	"time"
 )
@@ -47,10 +48,31 @@ type lease struct {
 // grant is an exchanged credential, or why the exchange refused it.
 type grant struct {
 	credential string
-	allowed    []string
-	status     int    // 200, or the HTTP status to answer the client with
-	reason     string // the exchange's refusal, for the log
-	cache      time.Duration
+	// The username the credential is presented upstream with, as the
+	// exchange names it (defaultUpstreamUsername when it names none).
+	username string
+	allowed  []string
+	status   int    // 200, or the HTTP status to answer the client with
+	reason   string // the exchange's refusal, for the log
+	cache    time.Duration
+}
+
+// usernameShape is what a username the exchange names may be: it goes into
+// a Basic credential, so never a colon, a space or a control character.
+var usernameShape = regexp.MustCompile(`\A[A-Za-z0-9._-]{1,64}\z`)
+
+// upstreamUsername is the username of an exchange answer: the one it
+// names, the default when it names none; false for one that may not be used.
+func upstreamUsername(answer map[string]any) (string, bool) {
+	named, present := answer["username"]
+	if !present || named == nil {
+		return defaultUpstreamUsername, true
+	}
+	text, ok := named.(string)
+	if !ok || !usernameShape.MatchString(text) {
+		return "", false
+	}
+	return text, true
 }
 
 // authority is the lease exchange as the driver calls it.
@@ -140,7 +162,13 @@ func (a *httpAuthority) exchange(ctx context.Context, token, operation string) (
 	case http.StatusOK:
 		credential, _ := answer["credential"].(string)
 		seconds, _ := answer["max_cache_seconds"].(float64)
-		found := grant{credential: credential, status: http.StatusOK, cache: time.Duration(seconds) * time.Second}
+		username, ok := upstreamUsername(answer)
+		if !ok {
+			// Not a name a Basic credential may carry: an orchestrator bug,
+			// never forwarded.
+			return grant{}, errUnavailable
+		}
+		found := grant{credential: credential, username: username, status: http.StatusOK, cache: time.Duration(seconds) * time.Second}
 		if items, ok := answer["allowed_upstream"].([]any); ok {
 			for _, item := range items {
 				if text, ok := item.(string); ok {

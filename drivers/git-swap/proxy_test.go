@@ -44,6 +44,7 @@ type fakeAuthority struct {
 	stopping     bool // introspection: this pod's identity is revoked
 	introspected int
 	credential   string        // the forge token (testCredential when empty)
+	username     string        // the username the exchange names (none when empty)
 	cache        time.Duration // the exchange's max_cache_seconds (30 s when 0)
 	expires      time.Time     // the ReadWrite lease's expiry (none when zero)
 }
@@ -93,7 +94,7 @@ func (f *fakeAuthority) exchange(_ context.Context, token, operation string) (gr
 	if cache == 0 {
 		cache = 30 * time.Second
 	}
-	return grant{credential: credential, allowed: allowed, status: http.StatusOK, cache: cache}, nil
+	return grant{credential: credential, username: f.username, allowed: allowed, status: http.StatusOK, cache: cache}, nil
 }
 
 func (f *fakeAuthority) asked() []string {
