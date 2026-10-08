@@ -209,6 +209,7 @@ def test_the_pod_manifest():
                     ],
                     "resources": SHIM_RESOURCES,
                     "securityContext": SHIM_SECURITY,
+                    "terminationMessagePolicy": "FallbackToLogsOnError",
                 },
                 {
                     "name": "install-shim",
@@ -218,6 +219,7 @@ def test_the_pod_manifest():
                     "args": ["install", "/srw/bin"],
                     "resources": SHIM_RESOURCES,
                     "securityContext": SHIM_SECURITY,
+                    "terminationMessagePolicy": "FallbackToLogsOnError",
                     "volumeMounts": [{"name": "srw-bin", "mountPath": "/srw/bin"}],
                 },
             ],

@@ -236,6 +236,51 @@ async def test_observe_reads_a_terminal_phase_and_when_the_pod_turned_unready(
 
 
 @pytest.mark.asyncio
+async def test_observe_reads_why_an_init_container_last_failed(api, runtime):
+    """The canary wait's verdict (its last log line, the termination
+    message with FallbackToLogsOnError) is what the pod is stopped with."""
+    verdict = (
+        "srw-driver-shim: canary-wait: no 3 rounds in a row with the allowed "
+        "targets answering and the canaries refused in 2m0s: the default deny "
+        "is not enforced"
+    )
+    api.objects[("pod", POD)] = {
+        "metadata": {"name": POD, "uid": "u", "labels": dict(IDENTITY.labels)},
+        "status": {
+            "phase": "Pending",
+            "initContainerStatuses": [
+                {
+                    "name": "canary-wait",
+                    "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                    "lastState": {
+                        "terminated": {
+                            "exitCode": 1,
+                            "message": "srw-driver-shim: canary 10.43.0.20:8085 is "
+                            "still reachable\n" + verdict + "\n",
+                        }
+                    },
+                },
+                {"name": "install-shim", "state": {"waiting": {}}},
+            ],
+            "containerStatuses": [{"name": "driver", "ready": False, "state": {}}],
+        },
+    }
+    state = await runtime.observe(IDENTITY)
+    assert state.reason == "CrashLoopBackOff"
+    assert state.message == "canary-wait: " + verdict
+    # A clean exit, or none yet, is no failure.
+    api.objects[("pod", POD)]["status"]["initContainerStatuses"] = [
+        {"name": "canary-wait", "state": {"terminated": {"exitCode": 0}}}
+    ]
+    assert (await runtime.observe(IDENTITY)).message is None
+    # No message (an OOM kill): the exit code says something.
+    api.objects[("pod", POD)]["status"]["initContainerStatuses"] = [
+        {"name": "install-shim", "state": {"terminated": {"exitCode": 137}}}
+    ]
+    assert (await runtime.observe(IDENTITY)).message == "install-shim: exit 137"
+
+
+@pytest.mark.asyncio
 async def test_remove_deletes_every_object_and_the_binding_policies(api, runtime):
     await runtime.launch(_plan())
     binding = {

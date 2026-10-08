@@ -1256,6 +1256,28 @@ async def test_a_lost_or_never_ready_pod_is_stopped_and_replaced(db, reconciler)
 
 
 @pytest.mark.asyncio
+async def test_a_pod_stopped_at_its_start_timeout_records_why(db, reconciler):
+    """The canary wait refusing to start the driver (no enforced default
+    deny) is what an operator reads in launch_error and the egress view."""
+    connector = await _echo_connector(db)
+    await _echo_image(db)
+    await _bind_echo(db, connector, await _thread(db))
+    await reconciler.reconcile_once()
+    (pod,) = await _pods(db)
+    verdict = (
+        "canary-wait: canary-wait: no 3 rounds ...: the default deny is not enforced"
+    )
+    reconciler.fake.states[str(pod["id"])] = PodState(
+        "Pending", uid="u", reason="CrashLoopBackOff", message=verdict
+    )
+    reconciler.offset[0] = timedelta(seconds=121)
+    report = await reconciler.reconcile_once()
+    assert (str(pod["id"]), "start_timeout") in report.stopped
+    (pod,) = await _pods(db)
+    assert pod["launch_error"] == verdict
+
+
+@pytest.mark.asyncio
 async def test_an_evicted_pod_with_bindings_is_replaced(db, reconciler):
     connector = await _echo_connector(db)
     await _echo_image(db)

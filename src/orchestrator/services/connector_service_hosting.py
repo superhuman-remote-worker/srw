@@ -127,7 +127,9 @@ class PodState:
     """A driver pod as the API reports it.
 
     ``unready_since`` is when its Ready condition last turned false (None
-    while ready, or when the API reports no condition).
+    while ready, or when the API reports no condition). ``message`` is why
+    an init container last failed: the last line of its termination message
+    (the canary wait's verdict), recorded with the pod when it is stopped.
     """
 
     phase: str
@@ -135,6 +137,7 @@ class PodState:
     ready: bool = False
     reason: str | None = None
     unready_since: datetime | None = None
+    message: str | None = None
 
     @property
     def absent(self) -> bool:
@@ -160,6 +163,24 @@ def _timestamp(value: Any) -> datetime | None:
 
 def _status(exc: BaseException) -> int | None:
     return getattr(exc, "status", None)
+
+
+def _init_failure(status: Any, limit: int = 300) -> str | None:
+    """The last line an init container printed before it last failed."""
+    for item in _field(status, "initContainerStatuses") or []:
+        for key in ("state", "lastState"):
+            terminated = _field(_field(item, key), "terminated")
+            if terminated is None or _field(terminated, "exitCode") in (0, None):
+                continue
+            lines = [
+                line.strip()
+                for line in str(_field(terminated, "message") or "").splitlines()
+                if line.strip()
+            ]
+            text = lines[-1] if lines else f"exit {_field(terminated, 'exitCode')}"
+            text = f"{_field(item, 'name')}: {text}"
+            return text if len(text) <= limit else text[: limit - 3] + "..."
+    return None
 
 
 def _quota_refusal(exc: BaseException) -> bool:
@@ -316,6 +337,7 @@ class ServicePodRuntime:
                 if ready or _field(condition, "status") == "True"
                 else _timestamp(_field(condition, "lastTransitionTime"))
             ),
+            message=_init_failure(status),
         )
 
     async def _delete(self, delete: Callable[..., Any], name: str) -> None:
@@ -698,10 +720,15 @@ class ServiceHostingReconciler:
             )
 
     async def _stop(
-        self, row: Mapping[str, Any], reason: str, report: ReconcileReport
+        self,
+        row: Mapping[str, Any],
+        reason: str,
+        report: ReconcileReport,
+        *,
+        error: str | None = None,
     ) -> None:
         """Revoke first (the exchange refuses the pod at once), then delete."""
-        await self._revoke(row, reason)
+        await self._revoke(row, reason, error=error)
         report.stopped.append((str(row["id"]), reason))
         await self._remove(row, report)
 
@@ -943,9 +970,9 @@ class ServiceHostingReconciler:
                     "Driver pod %s not ready after %.0fs (%s); stopping it",
                     identity.pod_name,
                     timeout,
-                    state.reason or state.phase,
+                    state.message or state.reason or state.phase,
                 )
-                await self._stop(row, START_TIMEOUT, report)
+                await self._stop(row, START_TIMEOUT, report, error=state.message)
                 return False
             return True
         # It was ready and is not any more (a node restart, Init:CrashLoop):
@@ -956,9 +983,9 @@ class ServiceHostingReconciler:
                 "Driver pod %s unready for %.0fs (%s); replacing it",
                 identity.pod_name,
                 timeout,
-                state.reason or state.phase,
+                state.message or state.reason or state.phase,
             )
-            await self._stop(row, NOT_READY, report)
+            await self._stop(row, NOT_READY, report, error=state.message)
             return False
         return True
 

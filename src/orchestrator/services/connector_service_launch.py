@@ -430,6 +430,9 @@ def build_service_launch(
         "args": _canary_args(pins, policy),
         "resources": deepcopy(_SHIM_RESOURCES),
         "securityContext": _shim_security(),
+        # Its last log line (why the wait gave up) becomes the termination
+        # message the reconciler records with the pod.
+        "terminationMessagePolicy": "FallbackToLogsOnError",
     }
     install = {
         "name": "install-shim",
@@ -439,6 +442,7 @@ def build_service_launch(
         "args": ["install", SHIM_DIR],
         "resources": deepcopy(_SHIM_RESOURCES),
         "securityContext": _shim_security(),
+        "terminationMessagePolicy": "FallbackToLogsOnError",
         "volumeMounts": [{"name": "srw-bin", "mountPath": SHIM_DIR}],
     }
     driver = {
