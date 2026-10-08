@@ -1,17 +1,20 @@
 """Managed MCP servers: service drivers whose pod runs an MCP server image (D5a).
 
 The control-plane half of every managed MCP driver (``srw.gitea-mcp/v1``,
-the development ``srw.mcp-test/v1``): the connector's config and its one
-secret, the ``token`` the server needs upstream. The token never leaves SRW
-except to the server, per request: a binding receives a lease token (the
-agent process's bearer) and the endpoint of the connector's pods, and the
-pod's front exchanges the lease for the token on each call
-(:meth:`lease_upstream`). The pod's Secret holds no credential either:
-``credential_delivery`` is ``lease``.
+the development ``srw.mcp-test/v1`` and, for stdio images (D5b),
+``srw.mcp-stdio-test/v1``): the connector's config and its one secret, the
+``token`` the server needs upstream. The token never leaves SRW except to
+the server: a binding receives a lease token (the agent process's bearer)
+and the endpoint of the connector's pods, and the pod's front exchanges the
+lease for the token on each call (:meth:`lease_upstream`), handing it to an
+HTTP server per request or, through the stdio bridge, to the binding's own
+stdio process in its environment. The pod's Secret holds no credential
+either: ``credential_delivery`` is ``lease``.
 
 Installed only when the chart names the driver's image
-(``connectors.drivers.managedMcp``; ``connectors.drivers.mcpTest`` for the
-development server), and only with service-pod hosting on.
+(``connectors.drivers.managedMcp``; ``connectors.drivers.mcpTest`` and
+``mcpStdioTest`` for the development servers), and only with service-pod
+hosting on.
 """
 
 from __future__ import annotations

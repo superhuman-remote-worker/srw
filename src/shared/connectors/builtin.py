@@ -1,7 +1,7 @@
 """Specs of the drivers SRW ships: the 13 datasource types, the two
 generic-hosting delivery drivers, the managed MCP servers of its catalogue
 (off until an installation names their images) and the development drivers
-(the lease probe, the echo service and the MCP test server, off unless an
+(the lease probe, the echo service and the MCP test servers, off unless an
 installation turns them on).
 
 The datasource drivers are named ``srw.<type>/v1`` and keep the stored
@@ -1073,6 +1073,76 @@ MCP_TEST_SPEC = DriverSpec(
     ),
 )
 
+#: The read tools of the official MCP memory server (Docker's stock
+#: mcp/memory image): they read the knowledge graph, every other tool
+#: changes it. Exact names: a tool the image adds is a write tool.
+MEMORY_MCP_READ_TOOLS: tuple[str, ...] = ("read_graph", "search_nodes", "open_nodes")
+
+#: A development managed MCP server for stdio images (D5b): Docker's stock
+#: mcp/memory image, unchanged, behind SRW's stdio bridge and front, one
+#: process per binding. Its graph is a file in the pod's /tmp, so every
+#: binding of one connector shares it while the pod lives. The server takes
+#: no credential; the connector's token is delivered to each binding's
+#: process anyway (MCP_STDIO_TEST_TOKEN), so the k3d gate can prove where a
+#: stdio server's credential goes. Installed only when
+#: ``connectors.drivers.mcpStdioTest`` is on; no catalogue lists it.
+MCP_STDIO_TEST_SPEC = DriverSpec(
+    name="srw.mcp-stdio-test/v1",
+    legacy_type="mcp_stdio_test",
+    title="MCP stdio test server (development)",
+    plane="service",
+    delivery_forms=("mcp_client",),
+    config_schema={
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"access": _ACCESS_CHOICE},
+    },
+    credential_slots=(
+        CredentialSlot(
+            "token",
+            "secret_string",
+            {"type": "object", "properties": {"token": _SECRET}},
+            required=True,
+            update="replace",
+        ),
+    ),
+    tool_category="mcp",
+    access_levels=_managed_mcp_access(
+        _FRONT_HIDES_WRITE_TOOLS,
+        "The memory server allows every tool.",
+    ),
+    default_access="ReadWrite",
+    supported_backends=ALL_BACKENDS,
+    workspace_requirements="None: the agent process is the MCP client.",
+    publishable=False,
+    holds_upstream_credentials=True,
+    credential_delivery="lease",
+    service=ServiceSpec(
+        port=8080,
+        callers=("harness",),
+        # The bridge and up to four Node processes of the server.
+        resources={"limits": {"cpu": "500m", "memory": "384Mi"}},
+        start_seconds=20,
+        mcp={
+            "transport": "stdio",
+            "port": 8091,
+            "path": "/mcp",
+            "protocol": "legacy",
+            "tools": {"read": list(MEMORY_MCP_READ_TOOLS)},
+            "access": _MANAGED_MCP_TOOL_ACCESS,
+            "credential": {"env": "MCP_STDIO_TEST_TOKEN"},
+            # The image's root filesystem is read-only: the graph lives in
+            # the pod's /tmp.
+            "env": {"MEMORY_FILE_PATH": "/tmp/memory.json"},
+            "stdio_mode": "process-per-binding",
+            "max_bindings_per_pod": 4,
+            "idle_seconds": 600,
+            "max_in_flight_per_binding": 4,
+            "tool_pinning": "warn",
+        },
+    ),
+)
+
 #: Managed MCP servers SRW ships in its catalogue (each needs its image in
 #: the chart before it is installed).
 MANAGED_MCP_SPECS: tuple[DriverSpec, ...] = (GITEA_MCP_SPEC,)
@@ -1214,6 +1284,7 @@ DEVELOPMENT_SPECS: tuple[DriverSpec, ...] = (
     LEASE_PROBE_SPEC,
     ECHO_SERVICE_SPEC,
     MCP_TEST_SPEC,
+    MCP_STDIO_TEST_SPEC,
 )
 
 _BY_TYPE: dict[str, DriverSpec] = {

@@ -296,9 +296,10 @@ class DeploymentSettings:
     #: Development only: install ``srw.echo-service/v1`` running this image
     #: reference (``connectors.drivers.echo``); empty installs nothing.
     connector_echo_driver_image: str = ""
-    #: Managed MCP servers to install (D5a), driver name -> image reference
-    #: (``connectors.drivers.managedMcp`` and ``connectors.drivers.mcpTest``),
-    #: and SRW's front image every such pod runs beside the server
+    #: Managed MCP servers to install (D5a, D5b), driver name -> image
+    #: reference (``connectors.drivers.managedMcp``, ``mcpTest`` and
+    #: ``mcpStdioTest``), and SRW's front image every such pod runs beside
+    #: the server, which also carries the stdio bridge
     #: (``connectors.drivers.mcpFront.image``, pinned by digest).
     connector_managed_mcp_images: dict[str, str] = field(default_factory=dict)
     connector_mcp_front_image: str = ""

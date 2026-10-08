@@ -43,7 +43,11 @@ from orchestrator.services.connector_service_launch import (
     build_service_launch,
     endpoint_service_name,
 )
-from shared.connectors.builtin import GITEA_MCP_SPEC, MCP_TEST_SPEC
+from shared.connectors.builtin import (
+    GITEA_MCP_SPEC,
+    MCP_STDIO_TEST_SPEC,
+    MCP_TEST_SPEC,
+)
 
 CONNECTOR = "66666666-7777-4888-8999-aaaaaaaaaaaa"
 DIGEST = "sha256:" + "ab" * 32
@@ -470,6 +474,9 @@ def test_the_test_server_runs_its_own_program_with_its_arguments():
     assert server["args"] == ["-listen", "127.0.0.1:8091"]
     # The connector's message, which whoami reports: configuration only.
     assert server["env"] == [{"name": "MCP_TEST_MESSAGE", "value": "d5a-0123456789"}]
+    # An HTTP server's pod has no stdio bridge.
+    assert [c["name"] for c in plan.pod["spec"]["initContainers"]] == ["canary-wait"]
+    assert "srw-bin" not in {v["name"] for v in plan.pod["spec"]["volumes"]}
     assert plan.network_policy["spec"]["egress"] == [
         {
             "to": [
@@ -485,3 +492,136 @@ def test_the_test_server_runs_its_own_program_with_its_arguments():
             "ports": [{"protocol": "TCP", "port": 8088}],
         }
     ]
+
+
+# =============================================================================
+# A stdio server's pod: the stock image behind SRW's stdio bridge (D5b)
+# =============================================================================
+
+MEMORY_IMAGE = f"docker.io/mcp/memory@{DIGEST}"
+NO_EGRESS = EgressPins(hosts=(), resolved_at=PINS.resolved_at)
+
+
+def _stdio_plan(spec=MCP_STDIO_TEST_SPEC, **over):
+    values = dict(
+        image=MEMORY_IMAGE,
+        # Docker's mcp/memory: ENTRYPOINT ["node", "dist/index.js"], no CMD.
+        entrypoint=["node", "dist/index.js"],
+        cmd=[],
+        config={},
+        pins=NO_EGRESS,
+    )
+    values.update(over)
+    return _plan(spec, **values)
+
+
+def _stdio_spec(**mcp_over):
+    import dataclasses
+
+    service = MCP_STDIO_TEST_SPEC.service
+    return dataclasses.replace(
+        MCP_STDIO_TEST_SPEC,
+        service=dataclasses.replace(service, mcp={**service.mcp, **mcp_over}),
+    )
+
+
+def test_the_bridge_is_installed_from_the_front_image_after_the_canary():
+    spec = _stdio_plan().pod["spec"]
+    canary, install = spec["initContainers"]
+    assert canary["name"] == "canary-wait"
+    assert install["name"] == "install-bridge"
+    # The bridge ships in the front's image: the two are pinned together.
+    assert install["image"] == FRONT
+    assert install["command"] == ["/srw-mcp-bridge"]
+    assert install["args"] == ["install", "/srw/bin"]
+    assert install["volumeMounts"] == [{"name": "srw-bin", "mountPath": "/srw/bin"}]
+    assert install["securityContext"]["runAsNonRoot"] is True
+    assert install["securityContext"]["capabilities"] == {"drop": ["ALL"]}
+    assert {"name": "srw-bin", "emptyDir": {"sizeLimit": "32Mi"}} in spec["volumes"]
+
+
+def test_the_stock_image_runs_its_own_program_behind_the_bridge():
+    server, front = _stdio_plan().pod["spec"]["containers"]
+    assert server["image"] == MEMORY_IMAGE
+    assert server["command"] == [
+        "/srw/bin/srw-mcp-bridge",
+        "serve",
+        "--listen",
+        "127.0.0.1:8091",
+        "--path",
+        "/mcp",
+        "--max-processes",
+        "4",
+        "--idle",
+        "600s",
+        "--credential-env",
+        "MCP_STDIO_TEST_TOKEN",
+        "--",
+        "node",
+        "dist/index.js",
+    ]
+    assert server["args"] == []
+    assert server["env"] == [{"name": "MEMORY_FILE_PATH", "value": "/tmp/memory.json"}]
+    assert server["volumeMounts"] == [
+        {"name": "tmp", "mountPath": "/tmp"},
+        {"name": "srw-bin", "mountPath": "/srw/bin", "readOnly": True},
+    ]
+    assert "ports" not in server
+    assert server["securityContext"]["readOnlyRootFilesystem"] is True
+    # The front is the pod's only named port, as for an HTTP server.
+    assert front["ports"] == [
+        {"name": "srw-driver", "containerPort": 8080, "protocol": "TCP"}
+    ]
+
+
+def test_a_stdio_pod_holds_no_credential_anywhere():
+    plan = _stdio_plan()
+    request = json.loads(base64.b64decode(plan.secret["data"]["request.json"]))
+    assert request["credentials"] == {}
+    assert TOKEN not in json.dumps(
+        [plan.pod, plan.secret, plan.service, plan.network_policy]
+    )
+    # The front's block: the bridge upstream and where a binding's process
+    # gets its credential (from the front, per binding).
+    assert request["mcp"]["transport"] == "stdio"
+    assert request["mcp"]["upstream"] == "http://127.0.0.1:8091/mcp"
+    assert request["mcp"]["credential"] == {"env": "MCP_STDIO_TEST_TOKEN"}
+    server = plan.pod["spec"]["containers"][0]
+    assert not any(e["name"] == "MCP_STDIO_TEST_TOKEN" for e in server["env"])
+    assert not any(m["name"] == "delivery" for m in server["volumeMounts"])
+
+
+def test_a_spec_command_replaces_the_image_program_behind_the_bridge():
+    server = _stdio_plan(_stdio_spec(command=["/app/server", "--stdio"])).pod["spec"][
+        "containers"
+    ][0]
+    assert server["command"][-3:] == ["--", "/app/server", "--stdio"]
+
+
+def test_a_config_value_never_injects_an_option_or_a_shell_at_launch():
+    templated = _stdio_spec(args=["${config.root}"])
+    plan = _stdio_plan(templated, config={"root": "/data"})
+    assert plan.pod["spec"]["containers"][0]["args"] == ["/data"]
+    with pytest.raises(ServiceLaunchError, match="as an option"):
+        _stdio_plan(templated, config={"root": "--allow-write"})
+    with pytest.raises(ServiceLaunchError, match="line break"):
+        _stdio_plan(templated, config={"root": "/data\n--allow-write"})
+    # The image's own program is a shell: no templated argument.
+    with pytest.raises(ServiceLaunchError, match="is a shell"):
+        _stdio_plan(
+            templated, entrypoint=["/bin/sh", "-c"], cmd=[], config={"root": "x"}
+        )
+    # Kubernetes never expands a $(VAR) in a value.
+    plan = _stdio_plan(templated, config={"root": "/data/$(SECRET)"})
+    assert plan.pod["spec"]["containers"][0]["args"] == ["/data/$$(SECRET)"]
+
+
+def test_the_stdio_test_server_is_installed_only_with_its_image():
+    assert builtin_connector_drivers().for_type("mcp_stdio_test") is None
+    registry = builtin_connector_drivers(
+        managed_mcp_images={"srw.mcp-stdio-test/v1": "mcp/memory:latest"}
+    )
+    driver = registry.for_type("mcp_stdio_test")
+    assert isinstance(driver, ManagedMcpDriver)
+    assert driver.image_reference == "mcp/memory:latest"
+    assert driver.mcp.stdio

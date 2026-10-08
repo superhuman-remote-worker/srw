@@ -92,8 +92,8 @@ def builtin_connector_drivers(
     ``echo_service_image`` adds the development echo service driver running
     that image (``connectors.drivers.echo``, D5); ``managed_mcp_images``
     adds each managed MCP server it names, by driver name, running that image
-    (``connectors.drivers.managedMcp`` and ``mcpTest``, D5a). A name that is
-    no managed MCP driver SRW ships is refused.
+    (``connectors.drivers.managedMcp``, ``mcpTest`` and ``mcpStdioTest``,
+    D5a and D5b). A name that is no managed MCP driver SRW ships is refused.
     """
     from orchestrator.services.connector_drivers import builtin
 

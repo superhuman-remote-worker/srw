@@ -37,7 +37,13 @@ the server image runs as itself, with the block's arguments and environment
 and nothing of SRW's (no identity, no request file, no credential), and
 SRW's **front** beside it holds the identity and the request file, serves
 the ``srw-driver`` port and is ready only when a real MCP probe of the
-server answers. Only the canary wait runs before them.
+server answers. Only the canary wait runs before them. A **stdio** server's
+pod (D5b) also runs the **bridge install** after the canary wait, from the
+front's image: it copies SRW's static stdio bridge into an ``emptyDir``, and
+the bridge becomes the server container's command, with the image's own
+program after it. The bridge runs one process of the server per binding,
+each with its binding's credential in its environment (from the front, per
+binding: still none in the pod).
 
 Labels deliberately omit SRW's agent and chart labels, which grant access to
 internal services under existing NetworkPolicies.
@@ -63,7 +69,12 @@ from shared.connectors.contract import (
     SERVICE_PORT_NAME,
     DriverSpec,
 )
-from shared.connectors.mcp import ManagedMcp, TemplateError, managed_mcp
+from shared.connectors.mcp import (
+    BRIDGE_DIR,
+    ManagedMcp,
+    TemplateError,
+    managed_mcp,
+)
 
 MANAGER = "connector-service-hosting"
 REQUEST_PATH = "/run/srw/request.json"
@@ -607,6 +618,9 @@ def build_service_launch(
         # A managed MCP server: the image runs as itself (no shim, no
         # identity, no request file, no credential) beside SRW's front,
         # which holds the identity and is the pod's only named port.
+        problem = mcp.program_problem(program)
+        if problem:
+            raise ServiceLaunchError(problem)
         try:
             server = _mcp_server_container(
                 image=image,
@@ -618,6 +632,9 @@ def build_service_launch(
         except TemplateError as exc:
             raise ServiceLaunchError(str(exc)) from None
         init_containers = [canary]
+        if mcp.stdio:
+            # The stdio bridge, from the front's image, before the server.
+            init_containers.append(_bridge_install_container(policy))
         containers = [
             server,
             _mcp_front_container(
@@ -630,6 +647,7 @@ def build_service_launch(
         volumes = [
             volumes[1],
             {"name": "tmp", "emptyDir": {"sizeLimit": "256Mi"}},
+            *([volumes[0]] if mcp.stdio else []),
         ]
     host_aliases = pins.host_aliases()
     host_aliases.append(
@@ -695,7 +713,14 @@ def _mcp_server_container(
     resources: dict[str, Any],
 ) -> dict[str, Any]:
     """The MCP server image as it is: its own program, the block's arguments
-    and environment from the connector's config, nothing of SRW's."""
+    and environment from the connector's config, nothing of SRW's. A stdio
+    server's program runs behind the bridge: the bridge is the command, the
+    program follows it, and the bridge starts one process of it per
+    binding."""
+    mounts = [{"name": "tmp", "mountPath": "/tmp"}]
+    if mcp.stdio:
+        program = mcp.bridge_command(program)
+        mounts.append({"name": "srw-bin", "mountPath": BRIDGE_DIR, "readOnly": True})
     return {
         "name": "driver",
         "image": image,
@@ -716,7 +741,23 @@ def _mcp_server_container(
             "readOnlyRootFilesystem": True,
             "capabilities": {"drop": ["ALL"]},
         },
-        "volumeMounts": [{"name": "tmp", "mountPath": "/tmp"}],
+        "volumeMounts": mounts,
+    }
+
+
+def _bridge_install_container(policy: ServiceLaunchPolicy) -> dict[str, Any]:
+    """Copies SRW's stdio bridge from the front's image (the two ship and
+    are pinned together) into the ``emptyDir`` the server mounts."""
+    return {
+        "name": "install-bridge",
+        "image": policy.front_image,
+        "imagePullPolicy": policy.front_pull_policy,
+        "command": ["/srw-mcp-bridge"],
+        "args": ["install", BRIDGE_DIR],
+        "resources": deepcopy(_SHIM_RESOURCES),
+        "securityContext": _shim_security(),
+        "terminationMessagePolicy": "FallbackToLogsOnError",
+        "volumeMounts": [{"name": "srw-bin", "mountPath": BRIDGE_DIR}],
     }
 
 
