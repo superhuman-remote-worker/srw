@@ -27,6 +27,7 @@ from typing import (
 )
 from urllib.parse import urlparse
 
+from shared.connectors.builtin import DATASOURCE_SPECS
 from shared.runtime.core.datasource_catalog import DATASOURCE_TYPES
 from shared.runtime.core.product_capabilities import (
     ComponentProvenance,
@@ -67,6 +68,11 @@ class SessionRuntimeFacts:
     backend_supports_canvas_live_apps: bool
     backend_supports_shared_browser: bool
     attached_datasource_types: tuple[str, ...] = ()
+    #: What the attached connectors' drivers deliver (their specs): the tool
+    #: categories they bind and whether one is a knowledge index. The
+    #: capabilities ask these, never a connector type.
+    attached_tool_categories: tuple[str, ...] = ()
+    knowledge_index_attached: bool = False
     email_access_tier: EmailAccessTier | None = None
     email_connection_failed: bool = False
     email_direct_send_enabled: bool = False
@@ -104,6 +110,10 @@ class SessionRuntimeFacts:
         if any(item not in DATASOURCE_TYPES for item in datasource_types):
             raise ValueError("SessionRuntimeFacts contains an unknown datasource type")
         object.__setattr__(self, "attached_datasource_types", datasource_types)
+        tool_categories = tuple(sorted(set(self.attached_tool_categories)))
+        if any(item not in TOOL_CATEGORIES for item in tool_categories):
+            raise ValueError("SessionRuntimeFacts contains an unknown tool category")
+        object.__setattr__(self, "attached_tool_categories", tool_categories)
 
         tool_names = tuple(sorted(set(self.loaded_tool_names)))
         if any(
@@ -144,7 +154,7 @@ class SessionRuntimeFacts:
             tuple(sorted(component_provenance.items(), key=lambda item: item[0].value)),
         )
 
-        email_attached = "email" in datasource_types
+        email_attached = EMAIL_TOOL_CATEGORY in tool_categories
         if email_attached and self.email_access_tier is None:
             raise ValueError("attached email requires an effective access tier")
         if self.email_access_tier is not None and not email_attached:
@@ -159,6 +169,14 @@ class SessionRuntimeFacts:
             )
         if self.protected_cloud_active and not self.cloud_mount_active:
             raise ValueError("protected cloud requires an active cloud mount")
+
+
+#: The tool categories a connector driver binds (from the built-in specs).
+TOOL_CATEGORIES: frozenset[str] = frozenset(
+    spec.tool_category for spec in DATASOURCE_SPECS if spec.tool_category
+)
+#: The mailbox capability's tool category.
+EMAIL_TOOL_CATEGORY = "email"
 
 
 @dataclass

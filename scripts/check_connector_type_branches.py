@@ -16,14 +16,21 @@ the gate without an edit here.
 
 * a comparison of a *type expression* with a type id or a literal collection
   holding one. A type expression is ``x["type"]``, ``x.get("type")``,
-  ``x.type``, ``x.type_id``, ``x.kind``, ``x["driver"]`` or a name such as
+  ``x.type``, ``x.type_id``, ``x.legacy_type``, ``x.kind``, ``x["driver"]``
+  or a name such as
   ``ds_type``, ``datasource_type`` or ``kind``, also through ``str()``,
   ``.lower()``, ``.strip()`` and ``x or ""``;
 * a ``match`` on a type expression with a type-id case;
 * a set, list or tuple literal naming two or more type ids;
 * a dict literal with three or more type-id keys;
-* ``has_datasource("<id>")`` / ``get_datasource("<id>")`` calls and
-  ``ds_type="<id>"`` keywords;
+* a harness slot read by a type id: ``x.datasources.get("<id>")``,
+  ``connections["<id>"]`` and the like, on a receiver named like a slot
+  registry (``datasources``, ``connections``, ``datasources_dict``...);
+  ``has_datasource("<id>")`` / ``get_datasource("<id>")`` calls;
+* ``spec_for_type("<id>")`` with a literal id;
+* a type id tested ``in`` a name ending in ``datasource_types``
+  (``"email" in facts.attached_datasource_types``);
+* ``ds_type="<id>"`` keywords;
 * a Python string holding SQL that tests a ``type`` column against a type id
   (``d.type = 'kb'``, ``type IN ('a', 'b')``).
 
@@ -47,7 +54,9 @@ driver capability, or it is one of these, with a reason):
   the personal cloud storage, the native KB row and marker), which D3's
   ``managed_key`` marker identifies;
 * ``pending-d3-d4``: a branch D1 cannot convert, because the marker it needs
-  arrives with D3 (``managed_key``) or D4 (the ``cloud_folder`` driver);
+  arrives with D3 (``managed_key``) or D4 (the ``cloud_folder`` driver).
+  Frozen at the reviewed sites (:data:`PENDING_D3_D4_SITES`): no new site
+  may take it;
 * ``driver-internal``: a helper module only drivers call, with their own type
   (import-linter keeps everything else out of it).
 
@@ -82,6 +91,29 @@ ALLOWLIST: tuple[str, ...] = (
 
 #: Retired with slice D1: no site may be left "to convert" again.
 LEGACY_PENDING = "legacy-pending"
+#: The reviewed ``pending-d3-d4`` sites, frozen as the legacy-pending
+#: baseline was: the class cannot take a new one.
+PENDING_D3_D4 = "pending-d3-d4"
+PENDING_D3_D4_SITES: frozenset[tuple[str, str, str, str, str, int]] = frozenset(
+    {
+        (
+            "src/orchestrator/services/agent_datasource_payload.py",
+            "apply_cloud_storage_override",
+            "compare",
+            "webdav",
+            "31c49729257b",
+            1,
+        ),
+        (
+            "src/orchestrator/services/projects.py",
+            "update_project",
+            "compare",
+            "webdav",
+            "31c49729257b",
+            1,
+        ),
+    }
+)
 UNCLASSIFIED = "unclassified"
 ALLOWED_CLASSIFICATIONS = frozenset(
     {
@@ -100,14 +132,24 @@ ALLOWED_CLASSIFICATIONS = frozenset(
 TYPE_NAMES = frozenset(
     {"ds_type", "datasource_type", "connector_type", "type_id", "driver_name", "kind"}
 )
-#: Attributes that hold one (``row.type``, ``driver.type_id``).
+#: Attributes that hold one (``row.type``, ``driver.type_id``,
+#: ``spec.legacy_type``).
 TYPE_ATTRIBUTES = frozenset(
-    {"type", "type_id", "ds_type", "datasource_type", "driver", "kind"}
+    {"type", "type_id", "legacy_type", "ds_type", "datasource_type", "driver", "kind"}
 )
 #: Mapping keys that hold one (``row["type"]``, ``row.get("type")``).
 TYPE_KEYS = frozenset({"type", "ds_type", "datasource_type", "driver", "kind"})
 _UNWRAP_METHODS = frozenset({"lower", "strip", "casefold"})
 _SLOT_CALLS = frozenset({"has_datasource", "get_datasource"})
+#: Receivers that hold the harness slots (``ToolContext.datasources``, a
+#: materializer's ``connections``...): reading one by a type id is a branch.
+_SLOT_RECEIVERS = re.compile(
+    r"(?:^|_)(?:datasources|connections|datasources_dict|clients)$"
+)
+#: Calls that look a driver up by its type.
+_SPEC_LOOKUPS = frozenset({"spec_for_type"})
+#: Collections of attached connector types (``attached_datasource_types``).
+_TYPE_COLLECTION_SUFFIX = "datasource_types"
 _COLLECTION_CALLS = frozenset({"frozenset", "set", "tuple", "list"})
 
 _SQL_EQUALS = re.compile(
@@ -247,6 +289,15 @@ def is_type_expression(node: ast.AST) -> bool:
     return False
 
 
+def _terminal_name(node: ast.AST) -> str:
+    """The last identifier of a name or attribute chain (``a.b.c`` -> ``c``)."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return ""
+
+
 def _string_literals(node: ast.AST) -> list[ast.Constant]:
     """The string constants of a literal or a literal collection."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -367,7 +418,16 @@ class _Visitor(ast.NodeVisitor):
         ids: set[str] = set()
         for operand in operands:
             ids |= self._ids(_string_literals(operand))
-        if ids and any(is_type_expression(operand) for operand in operands):
+        if (
+            ids
+            and any(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops)
+            and any(
+                _terminal_name(operand).endswith(_TYPE_COLLECTION_SUFFIX)
+                for operand in node.comparators
+            )
+        ):
+            self._record("type-membership", ids, _skeleton(node))
+        elif ids and any(is_type_expression(operand) for operand in operands):
             self._record("compare", ids, _skeleton(node))
             for operand in operands:
                 collection = _collection_node(operand)
@@ -406,6 +466,15 @@ class _Visitor(ast.NodeVisitor):
     visit_Tuple = _collection
     visit_List = _collection
 
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        if _SLOT_RECEIVERS.search(_terminal_name(node.value)) and isinstance(
+            node.slice, ast.Constant
+        ):
+            ids = self._ids(_string_literals(node.slice))
+            if ids:
+                self._record("registry-slot", ids, _skeleton(node))
+        self.generic_visit(node)
+
     def visit_Dict(self, node: ast.Dict) -> None:
         keys = [
             k
@@ -427,6 +496,19 @@ class _Visitor(ast.NodeVisitor):
             ids = self._ids(_string_literals(node.args[0]))
             if ids:
                 self._record("registry-slot", ids, _skeleton(node))
+        if (
+            name in ("get", "pop", "setdefault")
+            and isinstance(func, ast.Attribute)
+            and _SLOT_RECEIVERS.search(_terminal_name(func.value))
+            and node.args
+        ):
+            ids = self._ids(_string_literals(node.args[0]))
+            if ids:
+                self._record("registry-slot", ids, _skeleton(node))
+        if name in _SPEC_LOOKUPS and node.args:
+            ids = self._ids(_string_literals(node.args[0]))
+            if ids:
+                self._record("spec-lookup", ids, _skeleton(node))
         for keyword in node.keywords:
             if keyword.arg in TYPE_NAMES:
                 ids = self._ids(_string_literals(keyword.value))
@@ -527,7 +609,7 @@ HEADER = """\
 #   sql                   a type test in SQL text (D3's platform-owned marker)
 #   kb-domain             OKF knowledge-base indexing, outside the driver
 #   platform-owned        a connector SRW provisions itself (D3's managed_key)
-#   pending-d3-d4         needs a marker D3 or D4 brings; not convertible in D1
+#   pending-d3-d4         needs a marker D3 or D4 brings; frozen at its reviewed sites
 #   driver-internal       a helper only drivers call, with their own type
 # SQL files, the cockpit and prompts are outside this gate.
 #
@@ -568,6 +650,11 @@ def problems(
             found.append(f"legacy-pending is retired (convert the branch): {where}")
         elif classification not in ALLOWED_CLASSIFICATIONS:
             found.append(f"unknown classification {classification!r}: {where}")
+        elif classification == PENDING_D3_D4 and site.key not in PENDING_D3_D4_SITES:
+            found.append(
+                f"pending-d3-d4 is frozen at its reviewed sites (convert the "
+                f"branch): {where}"
+            )
         elif not reason:
             found.append(f"{classification} without a reason: {where}")
     return found

@@ -1288,7 +1288,9 @@ class SessionAttachCoordinator:
             self._logger.info(
                 "attach step: connector harness %.2fs", time.perf_counter() - _t_step
             )
-            mcp_manager = datasources_dict.get("mcp")
+            from agent.connectors.mcp import MCP_SLOT
+
+            mcp_manager = datasources_dict.get(MCP_SLOT)
 
             # Inject datasource tool categories so the correct tools are loaded
             # when config is resolved below. Shared map with the orchestrator's

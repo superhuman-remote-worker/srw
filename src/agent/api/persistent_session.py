@@ -2482,32 +2482,51 @@ class PersistentSession:
                 }
             )
         )
-        # The mailbox facts describe the email tool category's connector:
-        # its tier is the binding's access level, ranked by the driver spec.
+        # What the attached connectors' drivers deliver, from their specs:
+        # the tool categories (the mailbox is the email category's
+        # connector, the same key SessionRuntimeFacts checks) and whether a
+        # knowledge index is attached.
         from agent.connectors import deliveries_from_payload
         from agent.connectors.slots import slot_for_category
+        from agent.core.datasource_setup import (
+            EMAIL_TIER_ORDER,
+            email_effective_access,
+        )
 
+        deliveries = deliveries_from_payload(self.datasource_configs)
+        tool_categories = tuple(
+            sorted(
+                {
+                    delivery.spec.tool_category
+                    for delivery in deliveries
+                    if delivery.spec is not None and delivery.spec.tool_category
+                }
+            )
+        )
+        knowledge_index_attached = any(
+            delivery.routes_to("knowledge_index") for delivery in deliveries
+        )
+        email_category = "email"
         email_configs = [
             delivery
-            for delivery in deliveries_from_payload(self.datasource_configs)
-            if delivery.spec is not None and delivery.spec.tool_category == "email"
+            for delivery in deliveries
+            if delivery.spec is not None
+            and delivery.spec.tool_category == email_category
         ]
         email_connection = (
-            self.datasources.get(slot_for_category("email")) if email_configs else None
+            self.datasources.get(slot_for_category(email_category))
+            if email_configs
+            else None
         )
         email_tier = None
         if email_configs:
-            tier_order = email_configs[0].spec.ranked_access_ids()
+            # The tier tool binding uses (datasource_tool_categories).
             email_tier = max(
-                (
-                    delivery.binding.access
-                    for delivery in email_configs
-                    if delivery.binding is not None
-                ),
-                key=tier_order.index,
+                (email_effective_access(delivery.entry) for delivery in email_configs),
+                key=EMAIL_TIER_ORDER.index,
             )
             live_email_tier = getattr(email_connection, "access", None)
-            if live_email_tier in tier_order:
+            if live_email_tier in EMAIL_TIER_ORDER:
                 email_tier = live_email_tier
 
         backend = getattr(self.workspace_manager, "backend", None)
@@ -2594,6 +2613,8 @@ class PersistentSession:
                     getattr(backend, "supports_canvas_shared_browser", False)
                 ),
                 attached_datasource_types=datasource_types,
+                attached_tool_categories=tool_categories,
+                knowledge_index_attached=knowledge_index_attached,
                 email_access_tier=email_tier,
                 email_connection_failed=bool(
                     email_configs and email_connection is None
@@ -3125,6 +3146,7 @@ class PersistentSession:
         added = [ds for ds in new_configs if _key(ds) not in old_keys]
         removed = [ds for ds in old_configs if _key(ds) not in new_keys]
 
+        from agent.connectors.mcp import MCP_SLOT
         from agent.tools.registry import register_mcp_tools
 
         stale: Dict[str, Dict[str, Any]] = {}
@@ -3132,7 +3154,7 @@ class PersistentSession:
 
         def _swap_harness(connections: Dict[str, Any], clients: Dict[str, Any]) -> None:
             nonlocal new_connection_count
-            register_mcp_tools(connections.get("mcp"))
+            register_mcp_tools(connections.get(MCP_SLOT))
             stale["connections"] = dict(self.datasources)
             stale["clients"] = dict(self._datasource_clients)
             # ToolContext shares this dict by REFERENCE — mutate in place,

@@ -4322,7 +4322,9 @@ class UniversalAgent:
         # Discovery finished above; its tools load with the rest. Loop-mode
         # workers are process-reused, so a job without MCP clears the prior
         # job's dynamic registry entries.
-        mcp_manager = datasources_dict.get("mcp")
+        from agent.connectors.mcp import MCP_SLOT
+
+        mcp_manager = datasources_dict.get(MCP_SLOT)
         if mcp_manager is not None:
             try:
                 register_mcp_tools(mcp_manager)

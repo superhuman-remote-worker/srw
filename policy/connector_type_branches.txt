@@ -10,7 +10,7 @@
 #   sql                   a type test in SQL text (D3's platform-owned marker)
 #   kb-domain             OKF knowledge-base indexing, outside the driver
 #   platform-owned        a connector SRW provisions itself (D3's managed_key)
-#   pending-d3-d4         needs a marker D3 or D4 brings; not convertible in D1
+#   pending-d3-d4         needs a marker D3 or D4 brings; frozen at its reviewed sites
 #   driver-internal       a helper only drivers call, with their own type
 # SQL files, the cockpit and prompts are outside this gate.
 #

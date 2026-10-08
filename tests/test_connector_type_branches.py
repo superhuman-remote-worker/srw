@@ -211,6 +211,27 @@ def build(ds):
         ),
         ('slot = ctx.has_datasource("neo4j")', "registry-slot", "neo4j"),
         ('slot = ctx.get_datasource("email")', "registry-slot", "email"),
+        # Planted by the D1c review and missed before: a harness slot read
+        # by its type, a spec's legacy_type, a membership test against the
+        # attached types, a driver looked up by a literal type.
+        ('conn = ctx.datasources.get("neo4j")', "registry-slot", "neo4j"),
+        ('conn = ctx.datasources["neo4j"]', "registry-slot", "neo4j"),
+        ('conn = datasources_dict.get("mcp")', "registry-slot", "mcp"),
+        ('conn = rt.connections.pop("webdav", None)', "registry-slot", "webdav"),
+        ('conn = self._datasource_clients["mongodb"]', "registry-slot", "mongodb"),
+        ('ok = spec.legacy_type == "neo4j"', "compare", "neo4j"),
+        (
+            'ok = "email" in facts.attached_datasource_types',
+            "type-membership",
+            "email",
+        ),
+        (
+            'ok = "kb" not in attached_datasource_types',
+            "type-membership",
+            "kb",
+        ),
+        ('spec = spec_for_type("email")', "spec-lookup", "email"),
+        ('spec = builtin.spec_for_type("kb")', "spec-lookup", "kb"),
         ('rows = store.list_datasources(ds_type="kb")', "type-keyword", "kb"),
         (
             "sql = \"SELECT 1 FROM datasources d WHERE d.type = 'credentials'\"",
@@ -226,7 +247,10 @@ def build(ds):
 )
 def test_scanner_detects_each_kind_of_branch(script, statement, kind, ids):
     sites = _scan(
-        script, f"def f(ds, row, driver, ctx, store, check):\n    {statement}\n"
+        script,
+        "def f(ds, row, driver, ctx, store, check, spec, facts, rt, builtin,\n"
+        "      datasources_dict, attached_datasource_types, self):\n"
+        f"    {statement}\n",
     )
     assert _kinds(sites) == [("f", kind, ids)]
 
@@ -253,6 +277,13 @@ def route(ds):
         'TWO = {"postgresql": 1, "neo4j": 2}',
         # A slot looked up by a variable names no type.
         "slot = ctx.get_datasource(datasource_id)",
+        "conn = ctx.datasources.get(slot)",
+        "spec = spec_for_type(row.type)",
+        # Another mapping read by a word that happens to be a type id.
+        'value = row.get("email")',
+        'value = config["kb"]',
+        # A tool category tested against the categories a context binds.
+        'ok = "email" in tool_categories',
         # Prose about a type is not SQL testing one.
         'text = "the type of a kb row"',
     ),
@@ -393,6 +424,23 @@ def test_a_legacy_pending_site_fails_with_or_without_a_reason(script):
             f"deliver (compare {site.ids})"
             for site in sites
         ]
+
+
+def test_pending_d3_d4_is_frozen_at_its_reviewed_sites(script, inventory):
+    """Like the legacy-pending baseline: the class cannot take a new site."""
+    sites, classifications = inventory
+    reviewed = {
+        site.key for site in sites if classifications[site.key][0] == "pending-d3-d4"
+    }
+    assert reviewed == script.PENDING_D3_D4_SITES
+    new = _scan(script, _TWO_BRANCHES)
+    assert script.problems(
+        new, {site.key: ("pending-d3-d4", "needs D3") for site in new}
+    ) == [
+        "pending-d3-d4 is frozen at its reviewed sites (convert the branch): "
+        f"synthetic.py deliver (compare {site.ids})"
+        for site in new
+    ]
 
 
 def test_review_problems_are_reported(script):

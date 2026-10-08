@@ -977,6 +977,9 @@ class TestResetupDatasources:
             await session.resetup_datasources([email])
         failed = session.tool_context.session_runtime_facts
         assert failed.attached_datasource_types == ("email",)
+        # What the capabilities ask: the spec's tool category, not the type.
+        assert failed.attached_tool_categories == ("email",)
+        assert failed.knowledge_index_attached is False
         assert failed.email_access_tier == "send"
         assert failed.email_connection_failed is True
 
@@ -1001,6 +1004,7 @@ class TestResetupDatasources:
             await session.resetup_datasources([])
         removed = session.tool_context.session_runtime_facts
         assert removed.attached_datasource_types == ()
+        assert removed.attached_tool_categories == ()
         assert removed.email_access_tier is None
         assert removed.email_connection_failed is False
         assert removed.email_direct_send_enabled is False
@@ -1341,3 +1345,51 @@ class TestWorkspaceFactsRewrite:
         assert "Gone" not in content
         assert "## Connectors" in content
         assert "_No connectors attached._" in content
+
+
+@pytest.mark.parametrize(
+    ("configs", "categories", "knowledge"),
+    [
+        ([], (), False),
+        (
+            [{"type": "kb", "name": "Notes", "datasource_id": "kb-1"}],
+            (),
+            True,
+        ),
+        (
+            [
+                _ds("postgresql", "PG"),
+                {"type": "email", "name": "Mail", "config": {"access": "read"}},
+                {"type": "mcp", "name": "Docs", "credentials": {"transport": "http"}},
+            ],
+            ("email", "mcp", "sql"),
+            False,
+        ),
+    ],
+    ids=["none", "knowledge index", "tool categories"],
+)
+def test_runtime_facts_carry_what_the_drivers_deliver(configs, categories, knowledge):
+    """The capabilities read the specs' tool categories and knowledge index."""
+    session = _make_session(datasource_configs=configs)
+    session._refresh_runtime_facts()
+    facts = session.tool_context.session_runtime_facts
+    assert facts.attached_tool_categories == categories
+    assert facts.knowledge_index_attached is knowledge
+
+
+def test_the_mailbox_tier_is_the_one_tool_binding_uses():
+    """email_effective_access, as datasource_tool_categories ranks it."""
+    session = _make_session(
+        datasource_configs=[
+            {"type": "email", "name": "A", "config": {"access": "read"}},
+            {"type": "email", "name": "B", "config": {"access": "draft"}},
+            {
+                "type": "email",
+                "name": "C",
+                "config": {"access": "send"},
+                "project_read_only": True,
+            },
+        ]
+    )
+    session._refresh_runtime_facts()
+    assert session.tool_context.session_runtime_facts.email_access_tier == "draft"

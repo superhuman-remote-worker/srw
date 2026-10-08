@@ -30,6 +30,7 @@ from shared.runtime.core.product_capabilities import (
     UserState,
 )
 from agent.tools.context import SessionRuntimeFacts, ToolContext
+from shared.connectors.builtin import spec_for_type
 from agent.tools.email.tools import create_email_tools
 from agent.tools.product_capabilities import (
     CapabilityToolErrorCode,
@@ -133,6 +134,8 @@ def _facts(
 ) -> SessionRuntimeFacts:
     if "email" in datasource_types and email_tier is None:
         email_tier = "read"
+    # What the session derives from the attached connectors' specs.
+    specs = [spec_for_type(item) for item in datasource_types]
     return SessionRuntimeFacts(
         observed_at=_NOW,
         backend_id=backend_id,  # type: ignore[arg-type]
@@ -142,6 +145,13 @@ def _facts(
         backend_supports_canvas_live_apps=supports_live_apps,
         backend_supports_shared_browser=supports_browser,
         attached_datasource_types=datasource_types,
+        attached_tool_categories=tuple(
+            spec.tool_category for spec in specs if spec and spec.tool_category
+        ),
+        knowledge_index_attached=any(
+            spec is not None and "knowledge_index" in spec.delivery_forms
+            for spec in specs
+        ),
         email_access_tier=email_tier,  # type: ignore[arg-type]
         email_connection_failed=email_failed,
         email_direct_send_enabled=email_direct_send,
@@ -999,6 +1009,7 @@ def test_runtime_facts_are_immutable_canonical_and_reject_private_shape_drift():
             backend_supports_canvas_live_apps=True,
             backend_supports_shared_browser=True,
             attached_datasource_types=("email",),
+            attached_tool_categories=("email",),
         )
 
 
