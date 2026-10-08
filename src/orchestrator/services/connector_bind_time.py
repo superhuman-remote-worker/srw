@@ -155,6 +155,7 @@ from shared.connectors.registration import (
     declared_env_names,
     image_binding_problems,
     moved_spec_problems,
+    schema_problems,
     spec_from_json,
     wire_credentials,
 )
@@ -1066,35 +1067,39 @@ async def check_image(
         else:
             previous_digest = registration.image_digest
             previous_spec = registration.spec_json
+        moved = image.digest != previous_digest
         problems: list[str] = []
-        if image.digest == previous_digest:
-            spec_json: Mapping[str, Any] = previous_spec
-        else:
+        if moved:
             problems = moved_spec_problems(previous_spec, image.spec)
-            spec_json = image.spec or previous_spec
+            spec_json: Mapping[str, Any] = image.spec or previous_spec
+        else:
+            spec_json = previous_spec
         spec: DriverSpec | None = None
         env_names: tuple[str, ...] = ()
-        if not problems:
-            try:
-                spec = spec_from_json(spec_json)
-                env_names = declared_env_names(spec_json)
-            except ValueError as exc:
+        try:
+            spec = spec_from_json(spec_json)
+            env_names = declared_env_names(spec_json)
+        except ValueError as exc:
+            if not problems:
                 problems = [f"its spec is malformed ({exc})"]
         if spec is not None:
-            problems = custom_driver_problems(
+            # Every reason at once: the contract, the rules, the stored config.
+            problems += custom_driver_problems(
                 spec,
                 privileged=runtime.privileged(registration.image_reference),
                 env_names=env_names,
             )
-            if not problems and image.digest != previous_digest:
+            safe = not schema_problems(spec.config_schema, "config_schema")
+            if moved and safe:
                 config = await conn.fetchval(
                     "SELECT config FROM datasources WHERE id = $1",
                     UUID(str(connector_id)),
                 )
-                problems = [
+                problems += [
                     f"the stored config no longer validates: {error}"
                     for error in config_errors(spec.config_schema, _json(config) or {})
                 ]
+        problems = list(dict.fromkeys(problems))
         if problems:
             await record_lease_event(
                 conn,

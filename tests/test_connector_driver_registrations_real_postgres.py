@@ -1354,6 +1354,7 @@ class TestMovedTags:
         registration, connector, operations = await self._bound_once(db, registry, user)
         incompatible = copy.deepcopy(SPEC)
         incompatible["credential_slots"] = []
+        incompatible["config_schema"]["required"] = ["variable", "region"]
         registry.push(REFERENCE, D2, _labelled(incompatible))
         owner = LeaseOwner.job(await _job(db))
         entries = [_entry(connector)]
@@ -1363,6 +1364,8 @@ class TestMovedTags:
             await _deliver(db, entries, owner)
         assert "changed its contract" in str(caught.value)
         assert "credential slots disappeared: token" in str(caught.value)
+        # Every reason at once: the stored config is named too.
+        assert "'region' is a required property" in str(caught.value)
         status = await registrations.connector_driver_status(db, connector)
         assert status["last_bind"]["status"] == "failed"
         assert "changed its contract" in status["last_bind"]["message"]
