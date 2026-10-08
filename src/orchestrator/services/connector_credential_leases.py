@@ -795,12 +795,22 @@ async def prepare_lease_delivery(
     C3), and a registered image driver's connector is bound, in its own pod
     (D6), waiting for a new bind at most ``bind_wait`` seconds (the
     installation's bind wait when ``None``; ``0`` never blocks the caller).
-    No-op without such an entry; never raises (the delivery applies the
-    outcome).
+    The bind wait and the service part run concurrently: one budget, not
+    their sum. No-op without such an entry; never raises (the delivery
+    applies the outcome).
     """
     from orchestrator.services.connector_bind_time import prepare_bind_time_bindings
 
-    await prepare_bind_time_bindings(entries, owner=owner, wait=bind_wait)
+    await asyncio.gather(
+        prepare_bind_time_bindings(entries, owner=owner, wait=bind_wait),
+        _prepare_service_delivery(db, entries, owner=owner),
+    )
+
+
+async def _prepare_service_delivery(
+    db: Any, entries: Sequence[Any] | None, *, owner: LeaseOwner
+) -> None:
+    """:func:`prepare_lease_delivery`'s service-plane part (D5, C3)."""
     if not any(
         isinstance(entry, Mapping)
         and (spec := lease_spec(entry)) is not None
@@ -828,11 +838,20 @@ async def prepare_thread_lease_delivery(db: Any, thread_id: str) -> None:
     taken; the delivery under them then finds the answers remembered. Reads
     only the selected repository rows' URL and config (no credential).
     A registered image driver's binds start and are waited for here too, at
-    most the installation's bind wait (D6): a bind still running never takes
-    an attach reservation's release-and-successor path. Never raises."""
+    most the installation's bind wait (D6), concurrently with the git swap
+    checks, so the two share one budget under the agent's 30 s request: a
+    bind still running never takes an attach reservation's
+    release-and-successor path. Never raises."""
     from orchestrator.services.connector_bind_time import prepare_thread_bindings
 
-    await prepare_thread_bindings(db, thread_id)
+    await asyncio.gather(
+        prepare_thread_bindings(db, thread_id),
+        _prepare_thread_git_swap(db, thread_id),
+    )
+
+
+async def _prepare_thread_git_swap(db: Any, thread_id: str) -> None:
+    """:func:`prepare_thread_lease_delivery`'s git swap part (C3)."""
     try:
         from orchestrator.services.connector_git_swap_delivery import (
             candidate_entry,

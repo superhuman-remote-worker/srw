@@ -17,7 +17,9 @@ The SQL behind them is proven on Postgres in
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import dataclasses
 from contextlib import ExitStack, asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -614,7 +616,8 @@ IMAGE_ID = "ffffffff-ffff-4fff-8fff-ffffffffffff"
 async def test_a_live_detach_revokes_a_registered_driver_s_binding():
     """D6: the session's binding of a detached registered image driver moves
     to revoking in the same step, so its driver's revoke runs within one
-    reconciler pass; a selected one starts binding at once."""
+    reconciler pass. An update that selects no registered connector starts
+    no bind."""
     from orchestrator.services import connector_bind_time
     from tests.test_b06_lane_b_thread_config_update import THREAD, _pinned_thread
 
@@ -651,7 +654,45 @@ async def test_a_live_detach_revokes_a_registered_driver_s_binding():
     assert unbound == [
         ("conn", leases.LeaseOwner.thread(THREAD), [IMAGE_ID], "connector_detached")
     ]
-    started.assert_called_once_with(THREAD)
+    started.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("added", "starts"), [("image_driver", True), ("generic", False)]
+)
+async def test_a_live_selection_starts_a_bind_only_for_a_registered_driver(
+    added, starts
+):
+    """D6 re-review: a newly selected registered driver's connector binds at
+    once; a selection that adds none starts nothing."""
+    from orchestrator.services import connector_bind_time
+    from tests.test_b06_lane_b_thread_config_update import THREAD, _pinned_thread
+
+    deps = _detach_dependencies()
+    deps.store.get_datasource_policy_rows = AsyncMock(
+        return_value=[{"id": IMAGE_ID, "type": added}]
+    )
+    deps = dataclasses.replace(
+        deps,
+        authorize_thread_datasource_selection=AsyncMock(
+            return_value=([KEPT_ID, IMAGE_ID], {})
+        ),
+    )
+    started = MagicMock()
+    row = _pinned_thread(metadata={"datasource_ids": [KEPT_ID]})
+    with patch.object(connector_bind_time, "start_thread_bindings", started):
+        await tcu.apply_thread_config_update_locked(
+            THREAD,
+            row,
+            {},
+            [KEPT_ID, IMAGE_ID],
+            request=MagicMock(),
+            actor=None,
+            dependencies=deps,
+        )
+    deps.store.get_datasource_policy_rows.assert_awaited_once_with([IMAGE_ID])
+    assert started.called is starts
 
 
 @pytest.mark.asyncio
@@ -665,6 +706,50 @@ async def test_a_session_s_binds_are_prepared_before_the_lock_and_reservation():
     with patch.object(connector_bind_time, "prepare_thread_bindings", prepared):
         await leases.prepare_thread_lease_delivery("db", "thread-1")
     prepared.assert_awaited_once_with("db", "thread-1")
+
+
+@pytest.mark.asyncio
+async def test_a_session_s_bind_wait_and_git_swap_checks_share_one_budget():
+    """D6 re-review: the bind wait and the git swap checks run at once, so
+    an attach waits for the longer of the two, never their sum (under the
+    agent's 30 s request)."""
+    from orchestrator.services import connector_bind_time
+
+    swap_started = asyncio.Event()
+
+    async def bind(_db, _thread):
+        # Finishes only once the git swap part started alongside it.
+        await asyncio.wait_for(swap_started.wait(), timeout=2)
+
+    async def swap(_db, _thread):
+        swap_started.set()
+
+    with (
+        patch.object(connector_bind_time, "prepare_thread_bindings", bind),
+        patch.object(leases, "_prepare_thread_git_swap", swap),
+    ):
+        await leases.prepare_thread_lease_delivery("db", "thread-1")
+
+
+@pytest.mark.asyncio
+async def test_a_delivery_s_bind_wait_and_service_checks_share_one_budget():
+    from orchestrator.services import connector_bind_time
+
+    service_started = asyncio.Event()
+
+    async def bind(_entries, *, owner, wait):
+        await asyncio.wait_for(service_started.wait(), timeout=2)
+
+    async def service(_db, _entries, *, owner):
+        service_started.set()
+
+    with (
+        patch.object(connector_bind_time, "prepare_bind_time_bindings", bind),
+        patch.object(leases, "_prepare_service_delivery", service),
+    ):
+        await leases.prepare_lease_delivery(
+            "db", [], owner=leases.LeaseOwner.thread("thread-1")
+        )
 
 
 # =============================================================================

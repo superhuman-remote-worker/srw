@@ -443,6 +443,7 @@ async def apply_thread_config_update_locked(
     datasource_selection_provenance: dict[str, Any] | None = None
     detached_lease_ids: list[str] = []
     detached_bound_ids: list[str] = []
+    previous_ds_ids: set[str] = set()
     grant_fragment = config_override
     if datasource_ids is not None:
         if thread_row is None:
@@ -456,9 +457,8 @@ async def apply_thread_config_update_locked(
                 status_code=403,
                 detail="One or more selected connectors are unavailable",
             ) from exc
-        removed_ids = (
-            set(current_metadata.get("datasource_ids") or []) - canonical_requested
-        )
+        previous_ds_ids = {str(v) for v in current_metadata.get("datasource_ids") or []}
+        removed_ids = previous_ds_ids - canonical_requested
         if removed_ids:
             removed_rows = await dependencies.store.get_datasource_policy_rows(
                 list(removed_ids)
@@ -679,8 +679,14 @@ async def apply_thread_config_update_locked(
                         reason="connector_detached",
                     )
         # A registered driver's connector selected live binds now; the
-        # agent's refetch of the workspace waits for it.
-        connector_bind_time.start_thread_bindings(thread_id)
+        # agent's refetch of the workspace waits for it. An update that
+        # selects none starts nothing.
+        added_ids = [cid for cid in selected_ds_ids if cid not in previous_ds_ids]
+        if added_ids and any(
+            spec_for_row(row) is IMAGE_DRIVER_SPEC
+            for row in await dependencies.store.get_datasource_policy_rows(added_ids)
+        ):
+            connector_bind_time.start_thread_bindings(thread_id)
 
     # Config-change audit (live_session_settings.md Slice C): key paths only,
     # fired after every persist step succeeded. log_security_event never

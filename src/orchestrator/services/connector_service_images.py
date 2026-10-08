@@ -461,27 +461,8 @@ async def check_moved_image(
     previous image's label spec, else the installed spec; an image without a
     label keeps the installed spec, so it is compatible by definition.
     """
-    previous_digest = await _previous_digest(conn, UUID(str(connector_id)))
-    return await moved_image_problems(
-        conn,
-        spec=spec,
-        connector_id=connector_id,
-        image=image,
-        previous_digest=previous_digest,
-    )
-
-
-async def moved_image_problems(
-    conn: Any,
-    *,
-    spec: DriverSpec,
-    connector_id: str,
-    image: BoundImage,
-    previous_digest: str | None,
-) -> list[str]:
-    """:func:`check_moved_image` against a known previous digest (a
-    bind-time binding's, D6, rather than a lease's)."""
     connector_uuid = UUID(str(connector_id))
+    previous_digest = await _previous_digest(conn, connector_uuid)
     if previous_digest == image.digest or image.spec is None:
         return []
     previous_label = None
@@ -722,7 +703,6 @@ __all__ = [
     "ensure_image",
     "image_for_digest",
     "image_reference_for",
-    "moved_image_problems",
     "prepare_service_images",
     "resolve_driver_image",
     "service_image_settings",

@@ -8,11 +8,16 @@ shim posts the driver's typed JSON lines to the result route on the lease
 exchange's port. What the driver returns is data: a binding descriptor of
 ``env_file`` and ``credential_file`` entries, checked
 (``shared.connectors.registration.image_binding_problems``: only the
-variable names the spec declares, none a driver may not set, files only in
-``~/.srw-files/``, ``~/.netrc`` or ``~/.pgpass``), stored encrypted on the
-binding row and delivered by SRW's own materializers in the agent, keyed by
-delivery form, as an environment or credential-file connector's. No driver
-image gets a shell in a workspace.
+variable names the spec declares, none on the best-effort list of known
+tool hooks, files only in ``~/.srw-files/``, ``~/.netrc`` or ``~/.pgpass``),
+stored encrypted on the binding row and delivered by SRW's own materializers
+in the agent, keyed by delivery form, as an environment or credential-file
+connector's. No driver image gets a shell in a workspace; what it returns is
+data the workspace's programs then read, so the image's author is the trust
+boundary, as a workspace image's is. A binding that sets a variable another
+connector of the execution sets is never delivered (a session skips it with
+a notice, a job is refused). A driver's own error text is sanitized and
+shown only to the connector's owner and administrators.
 
 **When.** A bind starts as early as SRW knows the execution needs it: the
 leader's pass starts binds for live executions that select a registered
@@ -54,7 +59,10 @@ protocol_version}`` and the spec it ran with.
 
 **Revocation.** A binding is revoked when its execution ends or is gone,
 its connector is deleted, detached from a live session, changed (config or
-credentials), or its access changed, or its registration is disabled. A
+credentials), or its access changed, its registration is disabled, or its
+execution no longer selects the connector or may no longer use it
+(``access_lost``: the delivery's own authorization, checked by the leader,
+paused jobs included). A
 revoke requested while the bind runs takes effect when it ends: a bind that
 minted something always ends in ``revoking``, never dropped (a descriptor
 SRW refuses, a bind the reconciler gave up on, a runner that died: the
@@ -64,8 +72,12 @@ alone: its own image digest and spec, and the connector's config and
 credentials as they were at bind (kept encrypted on the binding until it is
 revoked), with the stored ``driver_state``. A transient failure is retried
 with backoff, at most :data:`MAX_REVOKE_ATTEMPTS` times; anything else
-retires it with the reason recorded. The pass also fails binds a restart
-orphaned and removes every pod and object an operation left behind.
+retires it with the reason recorded, and a revoke SRW gives up on is logged
+and audited (``connector_driver_revoke_abandoned``, outliving the
+connector). The pass also fails binds a restart orphaned (within
+:data:`MAX_BIND_ATTEMPTS`) and removes every pod and object an operation
+left behind; a row whose work fails is logged and backs off, never stopping
+the pass.
 
 **Capacity.** Live operation pods are counted under an advisory lock against
 ``connectors.servicePods.quota.bindTimePods`` for a clear message (and a
@@ -82,9 +94,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Literal
@@ -185,6 +198,15 @@ _CAPACITY_LOCK = "srw-connector-bind-time-capacity"
 #: Work per leader pass.
 REVOKES_PER_PASS = 10
 STARTS_PER_PASS = 10
+#: Executions whose selection and authorization a pass checks again.
+ACCESS_CHECKS_PER_PASS = 20
+#: The most of a driver's own message SRW keeps and shows.
+MAX_DRIVER_MESSAGE = 500
+#: What a reader who may not read a driver's own text sees instead.
+DRIVER_MESSAGE_WITHHELD = (
+    "its driver reported an error (the connector's owner sees the driver's "
+    "message on the connector)"
+)
 #: Retention of finished rows: what the connector page shows.
 RETENTION_DAYS = 30
 #: Waiting reasons that mean the image never runs.
@@ -392,8 +414,33 @@ def _repository(reference: str) -> str:
     return ImageReference.parse(reference).name
 
 
+#: Control and invisible formatting characters a driver's text loses.
+_CONTROL = re.compile(
+    r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]"
+)
+
+
+def driver_text(value: Any) -> str:
+    """A driver's own message as SRW stores and shows it: no control or
+    invisible formatting characters, whitespace collapsed, at most
+    :data:`MAX_DRIVER_MESSAGE` characters."""
+    text = " ".join(_CONTROL.sub(" ", str(value or "")).split())
+    if len(text) > MAX_DRIVER_MESSAGE:
+        text = text[: MAX_DRIVER_MESSAGE - 1] + "\u2026"
+    return text or "The connector driver reported an error without a message"
+
+
+@dataclass(frozen=True, slots=True)
+class DriverAuthoredError(DriverError):
+    """An error line the driver itself wrote: its message is the driver's
+    text (shown only to the connector's owner and administrators), never
+    SRW's."""
+
+
 def _outcome_from_post(posted: Any, operation: str) -> DriverOutcome:
-    """The outcome a shim posted, interpreted as SRW reads driver output."""
+    """The outcome a shim posted, interpreted as SRW reads driver output. An
+    error the driver wrote itself comes back as a
+    :class:`DriverAuthoredError` with its message sanitized."""
     if not isinstance(posted, Mapping):
         return DriverOutcome(
             error=DriverError("system", "The connector driver posted no outcome")
@@ -408,7 +455,30 @@ def _outcome_from_post(posted: Any, operation: str) -> DriverOutcome:
         )
     lines = posted.get("lines") or []
     stdout = "\n".join(json.dumps(line, separators=(",", ":")) for line in lines)
-    return read_output(stdout, int(posted.get("exit_code", 1)), operation=operation)
+    outcome = read_output(stdout, int(posted.get("exit_code", 1)), operation=operation)
+    error = outcome.error
+    written = [
+        line.get("error")
+        for line in lines
+        if isinstance(line, Mapping) and line.get("type") == "error"
+    ]
+    if (
+        error is not None
+        and len(written) == 1
+        and isinstance(written[0], Mapping)
+        and written[0].get("message") == error.message
+    ):
+        outcome = replace(
+            outcome,
+            error=DriverAuthoredError(
+                error.error_class,
+                driver_text(error.message),
+                error.detail,
+                error.field,
+                error.retry_after_s,
+            ),
+        )
+    return outcome
 
 
 @dataclass
@@ -620,7 +690,9 @@ class DriverOperations:
         :class:`BindTimeCapacity` at the cap; every other failure is an
         error in the outcome: ``transient`` when the pod could not run or
         answer, ``system`` when SRW cannot launch it at all. The posted
-        outcome is cleared from its row once read.
+        outcome is cleared from its row once read, except a bind's: that is
+        cleared when the binding settles (:func:`_settle`), so a runner that
+        dies in between leaves the leader the driver's ``driver_state``.
         """
         runtime = self.runtime()
         if runtime is None:
@@ -687,7 +759,8 @@ class DriverOperations:
                 )
             )
         outcome = _outcome_from_post(_decrypt(row["outcome_ciphertext"]), operation)
-        await self._consumed(pod.operation_id)
+        if operation != "bind":
+            await self._consumed(pod.operation_id)
         return outcome
 
     async def _consumed(self, operation_id: str) -> None:
@@ -855,7 +928,8 @@ def bind_time_runtime() -> BindTimeRuntime | None:
 
 _LATEST = """
 SELECT id, status, attempt, read_only, image_reference, image_digest,
-       delivery_ciphertext, error_class, error_message, retry_at, created_at
+       delivery_ciphertext, error_class, error_message, error_source, retry_at,
+       created_at
   FROM connector_bind_time_bindings
  WHERE owner_kind = $1 AND owner_id = $2 AND connector_id = $3
  ORDER BY created_at DESC
@@ -937,11 +1011,19 @@ async def _execution(conn: Any, owner: LeaseOwner) -> ExecutionRef:
 
 
 async def _fail(
-    store: Any, binding_id: str, *, error_class: str, message: str, attempt: int
+    store: Any,
+    binding_id: str,
+    *,
+    error_class: str,
+    message: str,
+    attempt: int,
+    source: str | None = None,
 ) -> None:
     """End a bind that minted nothing: a transient failure waits for a
     retry (until :data:`MAX_BIND_ATTEMPTS`), any other is final. A revoke
-    asked meanwhile retires it instead."""
+    asked meanwhile retires it instead. ``source`` is ``driver`` when
+    ``message`` is the driver's own text. A posted outcome stays for the
+    leader (:func:`_recover_unread`): a result line in it is revoked."""
     retry_at: datetime | None = None
     if error_class == "transient":
         if attempt < MAX_BIND_ATTEMPTS:
@@ -961,13 +1043,14 @@ async def _fail(
                    revoked_at = CASE WHEN revoke_requested_at IS NULL
                                      THEN NULL ELSE now() END,
                    failed_at = now(), error_class = $2, error_message = $3,
-                   retry_at = $4, inputs_ciphertext = NULL
+                   retry_at = $4, inputs_ciphertext = NULL, error_source = $5
              WHERE id = $1 AND status = 'pending'
             """,
             UUID(binding_id),
             error_class,
             message[:1000],
             retry_at,
+            source,
         )
 
 
@@ -982,9 +1065,15 @@ async def _settle(
     """End a bind whose driver answered with a binding: ``bound``, or
     ``revoking`` when SRW refused the binding, a revoke was asked while it
     ran, or the reconciler gave up on it meanwhile. Whatever it minted is
-    never dropped: its ``driver_state`` stays for the revoke."""
+    never dropped: its ``driver_state`` stays for the revoke. The bind's
+    posted outcome is cleared in the same transaction, never before."""
     state = _encrypt(driver_state) if driver_state is not None else None
-    async with store.acquire() as conn:
+    async with store.acquire() as conn, conn.transaction():
+        await conn.execute(
+            "UPDATE connector_driver_operations SET outcome_ciphertext = NULL "
+            "WHERE binding_id = $1 AND operation = 'bind'",
+            UUID(binding_id),
+        )
         if refusal is None and delivery is not None:
             bound = await conn.fetchval(
                 """
@@ -1128,11 +1217,12 @@ async def _bind(
     read_only: bool,
     attempt: int,
 ) -> None:
-    """Run one binding of ``owner`` for ``connector_id`` to its end."""
+    """Run one binding of ``owner`` for ``connector_id`` to its end. An
+    unexpected error ends the binding ``failed`` (``system``) with its
+    traceback logged: a job never waits on a binding nobody runs."""
     from orchestrator.services.connector_driver_registrations import (
         registration_for_connector,
     )
-    from orchestrator.services.connector_secrets import read_connector_credentials
 
     store = runtime.store
     row = await store.get_datasource(str(connector_id))
@@ -1161,14 +1251,59 @@ async def _bind(
     if binding_id is None:
         return  # another delivery binds it
     binding_id = str(binding_id)
+    try:
+        await _run_bind(
+            runtime,
+            owner,
+            str(connector_id),
+            row=row,
+            registration=registration,
+            binding_id=binding_id,
+            read_only=read_only,
+            attempt=attempt,
+        )
+    except Exception:
+        logger.exception(
+            "The bind of connector %s for %s %s failed unexpectedly",
+            connector_id,
+            owner.kind,
+            owner.id,
+        )
+        await _fail(
+            store,
+            binding_id,
+            error_class="system",
+            message="SRW could not finish the bind (an internal error; the "
+            "orchestrator log has the details)",
+            attempt=attempt,
+        )
 
-    async def fail(error_class: str, message: str) -> None:
+
+async def _run_bind(
+    runtime: BindTimeRuntime,
+    owner: LeaseOwner,
+    connector_id: str,
+    *,
+    row: Mapping[str, Any],
+    registration: Any,
+    binding_id: str,
+    read_only: bool,
+    attempt: int,
+) -> None:
+    """:func:`_bind`'s work once its binding row exists."""
+    from orchestrator.services.connector_secrets import read_connector_credentials
+
+    store = runtime.store
+    row = dict(row)
+
+    async def fail(error_class: str, message: str, source: str | None = None) -> None:
         await _fail(
             store,
             binding_id,
             error_class=error_class,
             message=message,
             attempt=attempt,
+            source=source,
         )
 
     if registration is None:
@@ -1259,7 +1394,9 @@ async def _bind(
         await fail("transient", str(exc))
         return
     except BindTimeUnavailable as exc:
-        await fail("system", str(exc))
+        # The installation may run driver pods again (a rollout, a config
+        # change): retried like any outage, within MAX_BIND_ATTEMPTS.
+        await fail("transient", str(exc))
         return
     if outcome.error is not None:
         if outcome.error.detail:
@@ -1268,9 +1405,14 @@ async def _bind(
                 spec.name,
                 connector_id,
                 outcome.error.message,
-                outcome.error.detail,
+                driver_text(outcome.error.detail),
             )
-        await fail(outcome.error.error_class, outcome.error.message)
+        authored = isinstance(outcome.error, DriverAuthoredError)
+        await fail(
+            outcome.error.error_class,
+            driver_text(outcome.error.message) if authored else outcome.error.message,
+            "driver" if authored else None,
+        )
         return
     if outcome.updates:
         logger.warning(
@@ -1499,6 +1641,40 @@ def start_thread_bindings(thread_id: str) -> None:
     started.add_done_callback(_background.discard)
 
 
+_READS_DRIVER_TEXT = """
+SELECT COALESCE(d.created_by = u.id OR u.is_admin, false)
+  FROM datasources d
+  LEFT JOIN users u ON u.id = (
+      CASE WHEN $2 = 'job' THEN (SELECT user_id FROM jobs WHERE id = $3)
+           ELSE (SELECT user_id FROM threads WHERE id = $3) END)
+ WHERE d.id = $1
+"""
+
+
+async def _reads_driver_text(conn: Any, owner: LeaseOwner, connector_id: str) -> bool:
+    """Whether the execution's owner may read the connector's driver's own
+    messages: the connector's owner, or an administrator. Anyone else (a
+    project member using a shared connector, and that execution's agent)
+    sees :data:`DRIVER_MESSAGE_WITHHELD`."""
+    return bool(
+        await conn.fetchval(
+            _READS_DRIVER_TEXT, UUID(str(connector_id)), owner.kind, UUID(owner.id)
+        )
+    )
+
+
+async def _shown_error(
+    conn: Any, owner: LeaseOwner, connector_id: str, row: Mapping[str, Any]
+) -> str:
+    """A binding's error as the execution's owner may read it."""
+    message = str(row["error_message"] or "")
+    if row["error_source"] == "driver" and not await _reads_driver_text(
+        conn, owner, connector_id
+    ):
+        return DRIVER_MESSAGE_WITHHELD
+    return message
+
+
 GateAction = Literal["dispatch", "wait", "fail"]
 
 
@@ -1519,11 +1695,16 @@ async def job_bind_gate(job: Mapping[str, Any]) -> tuple[GateAction, str | None]
             (target, await _latest(conn, owner, str(target["connector_id"])))
             for target in targets
         ]
+        failed = next(
+            ((target, row) for target, row in rows if decide(row) == "failed"), None
+        )
+        if failed is not None:
+            target, row = failed
+            shown = await _shown_error(conn, owner, str(target["connector_id"]), row)
+            return "fail", f"Connector {target['name']}: {shown}"
     action: GateAction = "dispatch"
     for target, row in rows:
         decision = decide(row)
-        if decision == "failed":
-            return "fail", f"Connector {target['name']}: {row['error_message']}"
         if decision != "bound":
             action = "wait"
         if decision == "start":
@@ -1537,14 +1718,15 @@ async def job_bind_gate(job: Mapping[str, Any]) -> tuple[GateAction, str | None]
     return action, None
 
 
-def _notice(decision: Decision, row: Any) -> str:
-    """Why a session's registered connector is not in its workspace."""
+def _notice(decision: Decision, message: str) -> str:
+    """Why a session's registered connector is not in its workspace
+    (``message``: the binding's error as the session's owner reads it)."""
     if decision == "failed":
-        return f"Not delivered: {row['error_message']}"
+        return f"Not delivered: {message}"
     if decision == "waiting":
         return (
-            f"Not delivered yet: {row['error_message']} (SRW tries again; it "
-            "arrives at a later attach or connector change)"
+            f"Not delivered yet: {message} (SRW tries again; it arrives at a "
+            "later attach or connector change)"
         )
     return (
         "Not delivered yet: its driver is still binding; it arrives at a later "
@@ -1563,12 +1745,22 @@ async def deliver_bind_time_entries(
     delivery raises :class:`BindTimePending` (one runs or waits to retry) or
     :class:`BindTimeRefused` (it failed for good); a session's skips the
     entry with a notice in its ``cli_hint`` (the workspace README's line).
-    Returns how many entries were filled.
+    A binding that sets a variable another connector of the execution sets
+    (an environment connector's, a file's ``env_var``, or an earlier
+    registered driver's, by connector id) is never delivered: a session
+    skips it with a notice, a job's delivery is refused with the reason, so
+    the agent never receives two values for one name. Returns how many
+    entries were filled.
     """
     filled = 0
     runtime = bind_time_runtime()
     wanted = [entry for entry in entries or () if registered_entry(entry)]
     wanted.sort(key=lambda entry: str(entry.get("datasource_id") or "").lower())
+    taken: dict[str, str] = {}
+    for entry in entries or ():
+        if isinstance(entry, Mapping) and not registered_entry(entry):
+            for name in _entry_env_names(entry.get("credentials")):
+                taken.setdefault(name, _connector_label(entry))
     for entry in wanted:
         entry["credentials"] = {}
         connector_id = str(entry.get("datasource_id") or "")
@@ -1585,7 +1777,22 @@ async def deliver_bind_time_entries(
             elif not isinstance(delivery, dict):
                 stale = "delivery_unreadable"
             if stale is None:
+                names = _entry_env_names(delivery)
+                clash = sorted(name for name in names if name in taken)
+                if clash:
+                    message = (
+                        f"it sets {', '.join(clash)}, which connector "
+                        f"{taken[clash[0]]} sets too"
+                    )
+                    if owner.kind == "thread":
+                        entry["cli_hint"] = f"Not delivered: {message}"
+                        continue
+                    raise BindTimeRefused(
+                        f"Connector {_connector_label(entry)}: {message}"
+                    )
                 entry["credentials"] = delivery
+                for name in names:
+                    taken[name] = _connector_label(entry)
                 filled += 1
                 continue
             if runtime is not None:
@@ -1606,13 +1813,37 @@ async def deliver_bind_time_entries(
         if decision == "start":
             # Started on the store's own connections, never this transaction's.
             _start_in_background(runtime, owner, connector_id, read_only)
+        shown = (
+            await _shown_error(conn, owner, connector_id, row)
+            if row is not None and row["error_message"]
+            else ""
+        )
         if owner.kind == "thread":
-            entry["cli_hint"] = _notice(decision, row)
+            entry["cli_hint"] = _notice(decision, shown)
             continue
         if decision == "failed":
-            raise BindTimeRefused(str(row["error_message"]))
+            raise BindTimeRefused(shown)
         raise BindTimePending("The connector's driver is still binding; retry shortly")
     return filled
+
+
+def _connector_label(entry: Mapping[str, Any]) -> str:
+    return str(entry.get("name") or entry.get("datasource_id") or "another")
+
+
+def _entry_env_names(credentials: Any) -> set[str]:
+    """The variables an entry's credentials set: its ``env_vars`` and every
+    file's ``env_var``."""
+    if not isinstance(credentials, Mapping):
+        return set()
+    names: set[str] = set()
+    variables = credentials.get("env_vars")
+    if isinstance(variables, Mapping):
+        names.update(str(name) for name in variables)
+    for item in credentials.get("files") or ():
+        if isinstance(item, Mapping) and item.get("env_var"):
+            names.add(str(item["env_var"]))
+    return names
 
 
 # =============================================================================
@@ -1881,10 +2112,168 @@ SELECT 'thread', t.id, a.connector_id, COALESCE(pd.read_only, false)
 """
 
 
+def _by_owner(rows: Sequence[Mapping[str, Any]]) -> dict[LeaseOwner, list[Any]]:
+    grouped: dict[LeaseOwner, list[Any]] = {}
+    for row in rows:
+        owner = LeaseOwner(str(row["kind"]), str(row["owner_id"]))
+        grouped.setdefault(owner, []).append(row)
+    return grouped
+
+
+def _canonical_ids(values: Any) -> set[str]:
+    out: set[str] = set()
+    for value in values or ():
+        try:
+            out.add(str(UUID(str(value))))
+        except ValueError:
+            continue
+    return out
+
+
+_JOB_SELECTION = """
+SELECT jd.datasource_id
+  FROM job_datasources jd
+  JOIN jobs j ON j.id = jd.job_id
+ WHERE j.id = $1
+    OR (j.parent_job_id = $1
+        AND j.status::text NOT IN ('completed', 'failed', 'cancelled'))
+"""
+
+
+async def _lost_connectors(
+    store: Any, owner: LeaseOwner, connector_ids: Sequence[str]
+) -> list[str]:
+    """Which of ``connector_ids`` the execution no longer selects or may no
+    longer use, by the delivery's own authorization
+    (``datasource_policy.classify_datasource_selection`` with the
+    arguments a job's or a session's delivery passes). A job selects what
+    it or a live child job on its workspace selects; a session what its
+    ``metadata.datasource_ids`` holds. A vanished, unapproved or
+    no-longer-member owner loses every one. A gone execution loses none
+    here: its end revokes them."""
+    from orchestrator.services.datasource_policy import (
+        DatasourceUnavailableError,
+        classify_datasource_selection,
+    )
+    from orchestrator.services.thread_mount_rows import durable_project_ids
+    from orchestrator.services.workspace_tier_policy import backend_from_override
+
+    wanted = sorted(_canonical_ids(connector_ids))
+    if not wanted:
+        return []
+    kwargs: dict[str, Any] = {}
+    async with store.acquire() as conn:
+        if owner.kind == "job":
+            execution = await conn.fetchrow(
+                "SELECT user_id, project_id, config_override FROM jobs WHERE id = $1",
+                UUID(owner.id),
+            )
+            if execution is None:
+                return []
+            selected = _canonical_ids(
+                row["datasource_id"]
+                for row in await conn.fetch(_JOB_SELECTION, UUID(owner.id))
+            )
+            projects = [str(execution["project_id"])] if execution["project_id"] else []
+            backend = backend_from_override(_json(execution["config_override"]) or {})
+            kwargs["legacy_job_id"] = owner.id
+        else:
+            execution = await conn.fetchrow(
+                "SELECT id, user_id, project_id, metadata FROM threads WHERE id = $1",
+                UUID(owner.id),
+            )
+            if execution is None:
+                return []
+            metadata = _json(execution["metadata"]) or {}
+            selected = _canonical_ids(
+                metadata.get("datasource_ids") if isinstance(metadata, dict) else ()
+            )
+            projects = None
+            backend = None
+    if owner.kind != "job":
+        thread = {**dict(execution), "metadata": metadata}
+        projects = durable_project_ids(
+            thread, legacy_mounts=await store.list_thread_mounts(owner.id)
+        )
+    lost = [value for value in wanted if value not in selected]
+    still = [value for value in wanted if value in selected]
+    if not still:
+        return lost
+    actor_id = str(execution["user_id"]) if execution["user_id"] else None
+    actor = await store.get_user(actor_id) if actor_id else None
+    try:
+        verdicts, _revisions = await classify_datasource_selection(
+            store,
+            actor,
+            actor_id,
+            still,
+            list(projects or []),
+            backend,
+            allow_admin_explicit_override=True,
+            trusted_system_inheritance=actor_id is None,
+            **kwargs,
+        )
+    except DatasourceUnavailableError:
+        return lost + still
+    return lost + [verdict.datasource_id for verdict in verdicts if verdict.denied]
+
+
+async def _access_lost(runtime: BindTimeRuntime) -> int:
+    """Revoke (``access_lost``) the live bindings whose execution no longer
+    selects their connector or may no longer use it (:func:`_lost_connectors`):
+    a job, paused ones included, or a session whose selection, project
+    membership or connector link changed by a path other than a live
+    detach. At most :data:`ACCESS_CHECKS_PER_PASS` executions a pass, the
+    least recently checked first."""
+    store = runtime.store
+    async with store.acquire() as conn:
+        owners = await conn.fetch(
+            """
+            SELECT owner_kind AS kind, owner_id,
+                   array_agg(DISTINCT connector_id) AS connector_ids
+              FROM connector_bind_time_bindings
+             WHERE status IN ('pending', 'bound') AND revoke_requested_at IS NULL
+             GROUP BY owner_kind, owner_id
+             ORDER BY bool_or(access_checked_at IS NULL) DESC,
+                      min(access_checked_at)
+             LIMIT $1
+            """,
+            ACCESS_CHECKS_PER_PASS,
+        )
+    revoked = 0
+    for row in owners:
+        owner = LeaseOwner(str(row["kind"]), str(row["owner_id"]))
+        try:
+            lost = await _lost_connectors(
+                store, owner, [str(value) for value in row["connector_ids"]]
+            )
+            async with store.acquire() as conn, conn.transaction():
+                if lost:
+                    revoked += await revoke_owner_bindings(
+                        conn, owner=owner, connector_ids=lost, reason="access_lost"
+                    )
+                await conn.execute(
+                    """
+                    UPDATE connector_bind_time_bindings
+                       SET access_checked_at = now()
+                     WHERE owner_kind = $1 AND owner_id = $2
+                       AND status IN ('pending', 'bound')
+                    """,
+                    owner.kind,
+                    UUID(owner.id),
+                )
+        except Exception:
+            logger.warning(
+                "Checking %s %s's bindings failed", owner.kind, owner.id, exc_info=True
+            )
+    return revoked
+
+
 @dataclass
 class BindTimeReport:
     revoked: list[str] = field(default_factory=list)
     marked: int = 0
+    access_lost: int = 0
     orphaned: int = 0
     recovered: int = 0
     started: int = 0
@@ -1894,6 +2283,7 @@ class BindTimeReport:
         return bool(
             self.revoked
             or self.marked
+            or self.access_lost
             or self.orphaned
             or self.recovered
             or self.started
@@ -1912,11 +2302,11 @@ async def _revoke_one(runtime: BindTimeRuntime, row: Mapping[str, Any]) -> str |
     spec_json = _json(row["spec"])
     if not row["image_digest"] or not isinstance(spec_json, Mapping):
         # The bind never got as far as an image: it minted nothing.
-        return await _retire(store, binding_id, None)
+        return await _retire(store, row, None)
     try:
         spec = spec_from_json(spec_json)
     except ValueError as exc:
-        return await _retire(store, binding_id, f"its spec is unreadable ({exc})")
+        return await _retire(store, row, f"its spec is unreadable ({exc})")
     async with store.acquire() as conn:
         try:
             image = await ensure_image(
@@ -1957,36 +2347,88 @@ async def _revoke_one(runtime: BindTimeRuntime, row: Mapping[str, Any]) -> str |
     except BindTimeCapacity as exc:
         return str(exc)
     except BindTimeUnavailable as exc:
-        return await _retire(store, binding_id, str(exc))
+        return await _retire(store, row, str(exc))
+    authored = isinstance(outcome.error, DriverAuthoredError)
     if outcome.error is not None and outcome.error.retryable:
+        if authored:
+            return _DriverText(driver_text(outcome.error.message))
         return outcome.error.message
     return await _retire(
-        store, binding_id, outcome.error.message if outcome.error else None
+        store,
+        row,
+        (
+            None
+            if outcome.error is None
+            else driver_text(outcome.error.message)
+            if authored
+            else outcome.error.message
+        ),
+        source="driver" if authored else None,
     )
 
 
-async def _retire(store: Any, binding_id: str, error: str | None) -> None:
+async def _retire(
+    store: Any,
+    row: Mapping[str, Any],
+    error: str | None,
+    *,
+    source: str | None = None,
+) -> None:
+    """End a revoke: ``error`` is ``None`` when the driver revoked, else
+    why SRW gave up. A revoke SRW gives up on is logged (WARNING) and
+    audited as ``connector_driver_revoke_abandoned``, in ``security_events``,
+    which outlives the connector and the binding: whatever the driver minted
+    may still be live upstream."""
+    binding_id = str(row["id"])
     async with store.acquire() as conn:
-        await conn.execute(
+        retired = await conn.fetchval(
             """
             UPDATE connector_bind_time_bindings
                SET status = 'revoked', revoked_at = now(), revoke_error = $2,
+                   revoke_error_source = $3,
                    delivery_ciphertext = NULL, driver_state_ciphertext = NULL,
                    inputs_ciphertext = NULL, revoke_next_at = NULL
              WHERE id = $1 AND status = 'revoking'
+            RETURNING id
             """,
             UUID(binding_id),
             error[:500] if error else None,
+            source if error else None,
         )
+        if retired is not None and error is not None:
+            logger.warning(
+                "Gave up revoking binding %s of connector %s (registration %s): %s",
+                binding_id,
+                row.get("connector_id"),
+                row.get("registration_id"),
+                error,
+            )
+            await record_lease_event(
+                conn,
+                event_type="connector_driver_revoke_abandoned",
+                resource_type="connector",
+                resource_id=str(row.get("connector_id") or "") or None,
+                detail=(
+                    f"binding={binding_id} connector={row.get('connector_id')} "
+                    f"registration={row.get('registration_id')} "
+                    f"driver={row.get('driver')} digest={row.get('image_digest')} "
+                    f"reason={error[:500]}"
+                ),
+            )
     return None
+
+
+class _DriverText(str):
+    """A revoke's reason that is the driver's own text."""
 
 
 async def _revoke_later(store: Any, row: Mapping[str, Any], why: str) -> None:
     """A transient revoke failure: back off, and give up at the bound."""
     attempts = int(row["revoke_attempts"] or 0) + 1
+    source = "driver" if isinstance(why, _DriverText) else None
     if attempts >= MAX_REVOKE_ATTEMPTS:
         await _retire(
-            store, str(row["id"]), f"gave up after {attempts} attempts: {why}"
+            store, row, f"gave up after {attempts} attempts: {why}", source=source
         )
         return
     async with store.acquire() as conn:
@@ -1994,13 +2436,15 @@ async def _revoke_later(store: Any, row: Mapping[str, Any], why: str) -> None:
             """
             UPDATE connector_bind_time_bindings
                SET revoke_error = $2, revoke_attempts = $3,
-                   revoke_next_at = now() + make_interval(secs => $4::float8)
+                   revoke_next_at = now() + make_interval(secs => $4::float8),
+                   revoke_error_source = $5
              WHERE id = $1 AND status = 'revoking'
             """,
             row["id"],
             why[:500],
             attempts,
             _backoff(attempts, REVOKE_RETRY_BASE_SECONDS, REVOKE_RETRY_MAX_SECONDS),
+            source,
         )
 
 
@@ -2021,51 +2465,74 @@ async def _recover_unread(runtime: BindTimeRuntime) -> int:
         )
     recovered = 0
     for row in rows:
-        posted = _decrypt(row["outcome_ciphertext"])
-        lines = posted.get("lines") if isinstance(posted, dict) else None
-        # A result line means the driver may have minted something, whatever
-        # SRW would have made of its binding; an error line minted nothing.
-        result = next(
-            (
-                line
-                for line in lines or ()
-                if isinstance(line, dict) and line.get("type") == "result"
-            ),
-            None,
-        )
-        if (
-            row["operation"] == "bind"
-            and row["binding_id"] is not None
-            and result is not None
-        ):
-            async with store.acquire() as conn:
-                status = await conn.fetchval(
-                    "SELECT status FROM connector_bind_time_bindings WHERE id = $1",
-                    row["binding_id"],
-                )
-            if status in ("pending", "failed"):
-                state = result.get("driver_state")
-                await _settle(
-                    store,
-                    str(row["binding_id"]),
-                    delivery=None,
-                    driver_state=state if isinstance(state, str) else None,
-                )
-                recovered += 1
-        async with store.acquire() as conn:
-            await conn.execute(
-                "UPDATE connector_driver_operations SET outcome_ciphertext = NULL "
-                "WHERE id = $1",
-                row["id"],
+        try:
+            recovered += await _recover_one(store, row)
+        except Exception:
+            logger.warning(
+                "Recovering driver operation %s failed", row["id"], exc_info=True
             )
+    return recovered
+
+
+async def _recover_one(store: Any, row: Mapping[str, Any]) -> int:
+    """One unread outcome: a bind's result line moves its binding to
+    revoking with the ``driver_state`` (a binding already revoking for
+    another reason gets the state it lacks); the outcome is cleared."""
+    recovered = 0
+    posted = _decrypt(row["outcome_ciphertext"])
+    lines = posted.get("lines") if isinstance(posted, dict) else None
+    # A result line means the driver may have minted something, whatever SRW
+    # would have made of its binding; an error line minted nothing.
+    result = next(
+        (
+            line
+            for line in lines or ()
+            if isinstance(line, dict) and line.get("type") == "result"
+        ),
+        None,
+    )
+    if row["operation"] == "bind" and row["binding_id"] is not None and result:
+        async with store.acquire() as conn:
+            status = await conn.fetchval(
+                "SELECT status FROM connector_bind_time_bindings WHERE id = $1",
+                row["binding_id"],
+            )
+        state = result.get("driver_state")
+        state = state if isinstance(state, str) else None
+        if status in ("pending", "failed"):
+            await _settle(
+                store, str(row["binding_id"]), delivery=None, driver_state=state
+            )
+            recovered += 1
+        elif status == "revoking" and state is not None:
+            async with store.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE connector_bind_time_bindings
+                       SET driver_state_ciphertext = $2
+                     WHERE id = $1 AND status = 'revoking'
+                       AND driver_state_ciphertext IS NULL
+                    """,
+                    row["binding_id"],
+                    _encrypt(state),
+                )
+            recovered += 1
+    async with store.acquire() as conn:
+        await conn.execute(
+            "UPDATE connector_driver_operations SET outcome_ciphertext = NULL "
+            "WHERE id = $1",
+            row["id"],
+        )
     return recovered
 
 
 async def reconcile_bind_time_once(
     runtime: BindTimeRuntime, pod_runtime: BindTimePodRuntime | None
 ) -> BindTimeReport:
-    """One leader pass: mark, fail orphans, recover, revoke, start, sweep,
-    prune."""
+    """One leader pass: mark (ended executions, deleted connectors), fail
+    orphans, recover, revoke what an execution may no longer use, revoke,
+    start, sweep, prune. Each row's work is its own: a failure is logged and
+    that row backs off, the rest of the pass runs."""
     report = BindTimeReport()
     store = runtime.store
     settings = runtime.operations.settings
@@ -2081,9 +2548,13 @@ async def reconcile_bind_time_once(
                 [],
                 reason=reason,
             )
+    # Before the revokes are read, so this pass revokes them too.
+    report.access_lost = await _access_lost(runtime)
+    async with store.acquire() as conn:
         # No bind outlives its pod's deadline by this much: one still pending
-        # was orphaned by a restart. Its retry is due at once; a revoke asked
-        # meanwhile retires it.
+        # was orphaned by a restart. Its retry is due at once, until
+        # MAX_BIND_ATTEMPTS (then it failed for good, and a job waiting on
+        # it fails); a revoke asked meanwhile revokes it.
         stale = settings.deadline_seconds + settings.wait_seconds + 60.0
         orphaned = await conn.fetch(
             """
@@ -2091,14 +2562,20 @@ async def reconcile_bind_time_once(
                SET status = CASE WHEN revoke_requested_at IS NULL
                                  THEN 'failed' ELSE 'revoking' END,
                    failed_at = now(), error_class = 'transient',
-                   error_message = 'The bind did not finish; it runs again at the '
-                                   'next delivery',
-                   retry_at = now()
+                   error_source = NULL,
+                   error_message = CASE
+                       WHEN attempt >= $2
+                       THEN 'The bind did not finish (gave up after '
+                            || attempt || ' attempts)'
+                       ELSE 'The bind did not finish; it runs again at the '
+                            'next delivery' END,
+                   retry_at = CASE WHEN attempt >= $2 THEN NULL ELSE now() END
              WHERE status = 'pending'
                AND created_at < now() - make_interval(secs => $1::float8)
             RETURNING id
             """,
             stale,
+            MAX_BIND_ATTEMPTS,
         )
         report.orphaned = len(orphaned)
         revoking = await conn.fetch(
@@ -2117,21 +2594,57 @@ async def reconcile_bind_time_once(
     report.recovered = await _recover_unread(runtime)
     if pod_runtime is not None:
         for row in revoking:
-            waiting = await _revoke_one(runtime, row)
-            if waiting is None:
-                report.revoked.append(str(row["id"]))
-            else:
-                await _revoke_later(store, row, waiting)
-        for row in starts:
-            owner = LeaseOwner(row["kind"], str(row["owner_id"]))
-            await ensure_binding(
-                runtime,
-                owner,
-                str(row["connector_id"]),
-                read_only=bool(row["read_only"]),
-                wait=0,
-            )
-            report.started += 1
+            try:
+                waiting = await _revoke_one(runtime, row)
+            except Exception as exc:
+                logger.warning(
+                    "Revoking binding %s failed unexpectedly", row["id"], exc_info=True
+                )
+                waiting = f"SRW could not run the revoke ({type(exc).__name__})"
+            try:
+                if waiting is None:
+                    report.revoked.append(str(row["id"]))
+                else:
+                    await _revoke_later(store, row, waiting)
+            except Exception:
+                logger.warning(
+                    "Backing off binding %s failed", row["id"], exc_info=True
+                )
+        for owner, rows in _by_owner(starts).items():
+            try:
+                lost = set(
+                    await _lost_connectors(
+                        store, owner, [str(row["connector_id"]) for row in rows]
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "Checking %s %s's connectors failed",
+                    owner.kind,
+                    owner.id,
+                    exc_info=True,
+                )
+                continue
+            for row in rows:
+                if str(row["connector_id"]) in lost:
+                    continue  # it may not use it: nothing to mint for it
+                try:
+                    await ensure_binding(
+                        runtime,
+                        owner,
+                        str(row["connector_id"]),
+                        read_only=bool(row["read_only"]),
+                        wait=0,
+                    )
+                    report.started += 1
+                except Exception:
+                    logger.warning(
+                        "Starting the bind of connector %s for %s %s failed",
+                        row["connector_id"],
+                        owner.kind,
+                        owner.id,
+                        exc_info=True,
+                    )
         report.swept = await _sweep(store, pod_runtime)
     async with store.acquire() as conn:
         await conn.execute(
@@ -2189,7 +2702,7 @@ async def _sweep(store: Any, pod_runtime: BindTimePodRuntime) -> int:
         try:
             await pod_runtime.delete_object(delete, name)
             swept += 1
-        except ServiceRuntimeError as exc:
+        except Exception as exc:
             logger.warning("Deleting %s failed: %s", name, exc)
     # A finished operation with no object left counts against the cap no more
     # (what was deleted above is recorded at the next pass).
@@ -2223,9 +2736,10 @@ async def bind_time_reconciler(
                 report = await reconcile_bind_time_once(runtime, pod_runtime())
                 if report:
                     logger.info(
-                        "bind-time drivers: marked=%d revoked=%d orphaned=%d "
-                        "recovered=%d started=%d swept=%d",
+                        "bind-time drivers: marked=%d access_lost=%d revoked=%d "
+                        "orphaned=%d recovered=%d started=%d swept=%d",
                         report.marked,
+                        report.access_lost,
                         len(report.revoked),
                         report.orphaned,
                         report.recovered,
@@ -2246,6 +2760,9 @@ __all__ = [
     "MAX_BIND_ATTEMPTS",
     "MAX_RESULT_BYTES",
     "MAX_REVOKE_ATTEMPTS",
+    "ACCESS_CHECKS_PER_PASS",
+    "DRIVER_MESSAGE_WITHHELD",
+    "MAX_DRIVER_MESSAGE",
     "BindTimeCapacity",
     "BindTimeError",
     "BindTimePending",
@@ -2255,6 +2772,7 @@ __all__ = [
     "BindTimeSettings",
     "BindTimeUnavailable",
     "CheckedImage",
+    "DriverAuthoredError",
     "DriverOperations",
     "bind_time_reconciler",
     "bind_time_runtime",
@@ -2263,6 +2781,7 @@ __all__ = [
     "connector_changed",
     "decide",
     "deliver_bind_time_entries",
+    "driver_text",
     "ensure_binding",
     "job_bind_gate",
     "operation_identity",

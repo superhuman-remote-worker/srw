@@ -1040,6 +1040,52 @@ async def test_worker_bundle_reuses_job_start_builder_and_rechecks_lease(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_a_stateless_job_claim_never_waits_on_a_bind(monkeypatch):
+    """D6 re-review: the dispatcher's preflight already held the job until
+    its registered drivers bound, so the claim prepares with no bind wait."""
+    from orchestrator import main as orch_main
+    from orchestrator.services import connector_credential_leases
+
+    row = dict(LEASED_ROW, unit_kind="worker_batch")
+    job = {
+        "id": UNIT_ID,
+        "execution_lane": "stateless",
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "context": _worker_job_context(
+            {"status": "ready", "provisioner": "k8s", "pod_ip": "10.0.0.8"}
+        ),
+    }
+    db = FakeDB(run_queue_row=row, thread=None, job=job)
+    monkeypatch.setattr(access_module, "require_internal", AsyncMock())
+    monkeypatch.setattr(orch_main.app.state.resources, "postgres_db", db)
+    built = job_runtime_module.JobStartRequest(job_id=UNIT_ID, description="work")
+    monkeypatch.setattr(
+        job_start_bundle, "build_job_start_request", AsyncMock(return_value=built)
+    )
+    monkeypatch.setattr(
+        job_workspace_authority,
+        "resolve_subjob_inherited_workspace",
+        AsyncMock(return_value=("proceed", None)),
+    )
+    _patch_worker_attestation(monkeypatch, orch_main)
+    prepare = AsyncMock()
+    monkeypatch.setattr(connector_credential_leases, "prepare_lease_delivery", prepare)
+
+    await unit_claim_bundle.claim_bundle_for_unit(
+        UNIT_ID,
+        lease_token=7,
+        pod_name=POD_NAME,
+        pod_uid=POD_UID,
+        dependencies=sessions_composition.unit_claim_bundle_dependencies(
+            orch_main.app.state.resources
+        ),
+    )
+
+    prepare.assert_awaited_once()
+    assert prepare.await_args.kwargs["bind_wait"] == 0
+
+
+@pytest.mark.asyncio
 async def test_worker_vm_bundle_uses_attested_endpoint_and_stamps_host_key_pin(
     monkeypatch,
 ):

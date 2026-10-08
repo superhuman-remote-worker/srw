@@ -743,8 +743,8 @@ async def registration_for_connector(db: Any, connector_id: Any) -> Registration
 _BINDINGS = """
 SELECT owner_kind, owner_id, status, attempt, image_reference, image_digest,
        image_stale, resolved_at, spec_hash, protocol_version, error_class,
-       error_message, retry_at, created_at, bound_at, failed_at, revoked_at,
-       revoke_reason, revoke_error
+       error_message, error_source, retry_at, created_at, bound_at, failed_at,
+       revoked_at, revoke_reason, revoke_error, revoke_error_source
   FROM connector_bind_time_bindings
  WHERE connector_id = $1
  ORDER BY created_at DESC
@@ -756,7 +756,21 @@ def _iso(value: Any) -> str | None:
     return value.isoformat() if value is not None else None
 
 
-def _binding_view(row: Mapping[str, Any], *, with_owner: bool) -> dict[str, Any]:
+def _driver_text(
+    row: Mapping[str, Any], key: str, source_key: str, *, privileged: bool
+) -> Any:
+    """A message as this reader may read it: a driver's own text only for
+    the connector's owner and administrators."""
+    from orchestrator.services.connector_bind_time import DRIVER_MESSAGE_WITHHELD
+
+    if row[source_key] == "driver" and not privileged and row[key]:
+        return DRIVER_MESSAGE_WITHHELD
+    return row[key]
+
+
+def _binding_view(
+    row: Mapping[str, Any], *, with_owner: bool, privileged: bool
+) -> dict[str, Any]:
     view = {
         "status": row["status"],
         # What the bind recorded (connector_drivers.md, "Driver versions").
@@ -769,14 +783,18 @@ def _binding_view(row: Mapping[str, Any], *, with_owner: bool) -> dict[str, Any]
         "stale": bool(row["image_stale"]),
         "attempt": row["attempt"],
         "error_class": row["error_class"],
-        "message": row["error_message"],
+        "message": _driver_text(
+            row, "error_message", "error_source", privileged=privileged
+        ),
         "retry_at": _iso(row["retry_at"]),
         "created_at": _iso(row["created_at"]),
         "bound_at": _iso(row["bound_at"]),
         "failed_at": _iso(row["failed_at"]),
         "revoked_at": _iso(row["revoked_at"]),
         "revoke_reason": row["revoke_reason"],
-        "revoke_error": row["revoke_error"],
+        "revoke_error": _driver_text(
+            row, "revoke_error", "revoke_error_source", privileged=privileged
+        ),
     }
     if with_owner:
         view["owner"] = {"kind": row["owner_kind"], "id": str(row["owner_id"])}
@@ -794,7 +812,8 @@ async def connector_driver_status(
     unreachable (``stale``). ``bindings`` (the connector's owner and
     administrators only: they name other users' executions) lists recent
     binds with the digest each used, and only they see an Account
-    registration's owner.
+    registration's owner and the driver's own error text (anyone else reads
+    ``connector_bind_time.DRIVER_MESSAGE_WITHHELD`` in its place).
     """
     registration = await registration_for_connector(db, connector_id)
     rows = await db.fetch(_BINDINGS, UUID(str(connector_id)), 20)
@@ -822,10 +841,16 @@ async def connector_driver_status(
             if registration is None
             else None
         ),
-        "last_bind": _binding_view(rows[0], with_owner=False) if rows else None,
+        "last_bind": (
+            _binding_view(rows[0], with_owner=False, privileged=with_bindings)
+            if rows
+            else None
+        ),
     }
     if with_bindings:
-        status["bindings"] = [_binding_view(row, with_owner=True) for row in rows]
+        status["bindings"] = [
+            _binding_view(row, with_owner=True, privileged=True) for row in rows
+        ]
     return status
 
 

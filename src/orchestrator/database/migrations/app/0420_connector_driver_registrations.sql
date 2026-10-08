@@ -165,8 +165,18 @@ CREATE TABLE public.connector_bind_time_bindings (
     revoke_next_at             TIMESTAMPTZ,
     revoked_at                 TIMESTAMPTZ,
     revoke_error               TEXT,
+    -- 'driver' when error_message / revoke_error is the driver's own text:
+    -- only the connector's owner and administrators read it.
+    error_source               TEXT,
+    revoke_error_source        TEXT,
+    -- When the reconciler last checked that the execution still selects
+    -- and may use the connector.
+    access_checked_at          TIMESTAMPTZ,
     CONSTRAINT connector_bind_time_bindings_owner_check
         CHECK (owner_kind IN ('job', 'thread')),
+    CONSTRAINT connector_bind_time_bindings_error_source_check
+        CHECK ((error_source IS NULL OR error_source = 'driver')
+               AND (revoke_error_source IS NULL OR revoke_error_source = 'driver')),
     CONSTRAINT connector_bind_time_bindings_driver_check
         CHECK (driver <> ''),
     CONSTRAINT connector_bind_time_bindings_status_check

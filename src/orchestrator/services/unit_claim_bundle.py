@@ -873,10 +873,13 @@ async def _assemble_claim_bundle(
         # are not one atomic transaction.
         # A service driver's image is looked up before the claim
         # transaction opens (D5): inside it the delivery only applies it.
+        # A job's binds were waited for by the dispatcher's preflight (D6):
+        # the claim never waits on one.
         await connector_credential_leases.prepare_lease_delivery(
             dependencies.db,
             job_start.datasources,
             owner=connector_credential_leases.job_lease_owner(job),
+            bind_wait=0,
         )
         async with dependencies.db.acquire() as conn:
             async with conn.transaction():
