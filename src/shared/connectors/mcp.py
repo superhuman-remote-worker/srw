@@ -137,6 +137,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from shared.connectors.env_names import CODE_ENV, CODE_ENV_PREFIXES, loads_code
+
 #: The path the front serves MCP at, on the ``srw-driver`` port.
 FRONT_PATH = "/mcp"
 READ = "read"
@@ -207,67 +209,6 @@ RESERVED_HEADERS: frozenset[str] = frozenset(
         "upgrade",
     }
 )
-#: Environment variables a runtime reads code, its search path, a command
-#: to run or a package index from: no config value is templated into one
-#: and no credential is delivered in one (drivers/mcp-bridge codeEnv holds
-#: the same lists). Compared in upper case.
-CODE_ENV: frozenset[str] = frozenset(
-    {
-        "BASH_ENV",
-        "BASHOPTS",
-        "BROWSER",
-        "BUN_OPTIONS",
-        "CLASSPATH",
-        "DOTNET_STARTUP_HOOKS",
-        "EDITOR",
-        "ELECTRON_RUN_AS_NODE",
-        "ENV",
-        "GCONV_PATH",
-        "GEM_HOME",
-        "GEM_PATH",
-        "GLIBC_TUNABLES",
-        "HOME",
-        "IFS",
-        "JAVA_OPTS",
-        "JAVA_TOOL_OPTIONS",
-        "JDK_JAVA_OPTIONS",
-        "_JAVA_OPTIONS",
-        "LESSOPEN",
-        "NODE_OPTIONS",
-        "NODE_PATH",
-        "NODE_REPL_EXTERNAL_MODULE",
-        "OPENSSL_CONF",
-        "OPENSSL_MODULES",
-        "PAGER",
-        "PATH",
-        "PERL5DB",
-        "PERL5LIB",
-        "PERL5OPT",
-        "PERLLIB",
-        "PROMPT_COMMAND",
-        "PS4",
-        "PYTHONBREAKPOINT",
-        "PYTHONHOME",
-        "PYTHONINSPECT",
-        "PYTHONPATH",
-        "PYTHONSTARTUP",
-        "PYTHONUSERBASE",
-        "PYTHONWARNINGS",
-        "RUBYGEMS_GEMDEPS",
-        "RUBYLIB",
-        "RUBYOPT",
-        "SHELLOPTS",
-        "SSH_ASKPASS",
-        "SUDO_ASKPASS",
-        # A stdio process's HOME and TMPDIR are its private directory.
-        "TMPDIR",
-        "VISUAL",
-        "ZDOTDIR",
-    }
-)
-#: Prefixes of whole families of such variables (git's commands and config,
-#: npm's, pip's and uv's settings, a package index among them).
-CODE_ENV_PREFIXES: tuple[str, ...] = ("GIT_", "NPM_CONFIG_", "PIP_", "UV_")
 #: Programs that run their arguments as code or as another command: a
 #: templated argument would be code. A program whose name ends in a shell
 #: script's suffix (``/docker-entrypoint.sh``) is one too.
@@ -528,9 +469,11 @@ def program_name(program: Sequence[str]) -> str:
 
 
 def code_env(name: str) -> bool:
-    """Whether a variable loads code, names a command or a package index."""
-    upper = name.upper()
-    return upper in CODE_ENV or upper.startswith(CODE_ENV_PREFIXES)
+    """Whether a variable loads code, names a command, a config file or a
+    package index: :func:`shared.connectors.env_names.loads_code`, the one
+    list a driver's variables are checked against (it holds
+    :data:`CODE_ENV`, which the bridge refuses on its own)."""
+    return loads_code(name)
 
 
 def _shell(item: str) -> bool:

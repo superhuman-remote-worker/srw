@@ -20,7 +20,7 @@ var envName = regexp.MustCompile(`\A[A-Za-z_][A-Za-z0-9_]{0,127}\z`)
 // codeEnv are the variables a runtime reads code, its search path, a
 // command to run or a package index from, and codeEnvPrefixes whole
 // families of them: a binding's credential is user data, so it may never
-// land in one (shared/connectors/mcp.py CODE_ENV and CODE_ENV_PREFIXES hold
+// land in one (shared/connectors/env_names.py CODE_ENV and CODE_ENV_PREFIXES hold
 // the same lists). The process's HOME and TMPDIR are the bridge's.
 var (
 	codeEnv = map[string]bool{

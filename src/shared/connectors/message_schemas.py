@@ -42,6 +42,7 @@ from .contract import (
     SUPPORTED_PROTOCOL_MAJORS,
     WORKSPACE_BACKENDS,
 )
+from .env_names import MAX_DRIVER_ENV_NAME
 from .envelope import BINDING_OPERATIONS, ERROR_CLASSES
 from .registration import MAX_ENV_NAMES
 
@@ -293,7 +294,11 @@ def spec_schema() -> dict[str, Any]:
                 "type": "array",
                 "maxItems": MAX_ENV_NAMES,
                 "uniqueItems": True,
-                "items": {"type": "string", "pattern": r"^[A-Za-z_][A-Za-z0-9_]*$"},
+                "items": {
+                    "type": "string",
+                    "maxLength": MAX_DRIVER_ENV_NAME,
+                    "pattern": r"^[A-Za-z_][A-Za-z0-9_]*$",
+                },
             },
         },
     }

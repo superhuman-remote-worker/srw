@@ -38,6 +38,7 @@ from orchestrator.services.connector_drivers.base import (
 from shared.connectors.builtin import IMAGE_DRIVER_SPEC
 from shared.connectors.contract import DriverSpec, effective_access
 from shared.connectors.envelope import unsupported_check
+from shared.connectors.registration import schema_problems
 
 #: The longest value a registered driver's credential may hold.
 _MAX_CREDENTIAL = 64 * 1024
@@ -156,6 +157,13 @@ class RegisteredImageDriver(RegisteredDriverHost):
         from jsonschema import Draft202012Validator
         from jsonschema.exceptions import SchemaError
 
+        # Registration refused these; a stored schema is never run unread.
+        if schema_problems(schema, what):
+            raise HTTPException(
+                status_code=400,
+                detail=f"The driver {self.spec.name} declares a {what} schema "
+                "SRW does not run",
+            )
         try:
             Draft202012Validator.check_schema(schema)
         except SchemaError:

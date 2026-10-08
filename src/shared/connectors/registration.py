@@ -17,9 +17,11 @@ someone registers must follow on top of :func:`~.contract.validate_spec`:
   server (imported from its ``server.json``).
 * **Environment names.** A bind-time driver that sets variables declares
   every name its bind may return (``env_names`` in its spec), so the names
-  are visible when it is registered, and none may be one a driver must not
-  set (``env_names.driver_env_problem``: nothing that runs code, redirects
-  traffic or loosens TLS in the workspace).
+  are visible when it is registered and on its connector, and none may be
+  on the list of known tool hooks (``env_names.driver_env_problem``: names
+  tools read to run code, redirect traffic or loosen TLS). The list is a
+  best-effort lint, not a sandbox: the image's author is the trust
+  boundary, as a workspace image's is.
 * **Schemas.** A registered schema is validated on SRW's event loop, so it
   may not hold a regular expression (``pattern``, ``patternProperties``,
   ``format: regex``) or a reference outside itself, and it is bounded in
@@ -43,6 +45,7 @@ registration", "The driver contract" and slice D6.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -56,7 +59,12 @@ from .contract import (
     managed_mcp_driver,
     validate_spec,
 )
-from .env_names import ENV_NAME, driver_env_problem, env_value_problem
+from .env_names import (
+    ENV_NAME,
+    MAX_DRIVER_ENV_NAME,
+    driver_env_problem,
+    env_value_problem,
+)
 from .file_targets import STORED_HOME, mode_problem, target_problem
 from .images import SPEC_LABEL, ImageReference, SpecContract, compatibility_problems
 
@@ -307,8 +315,11 @@ def declared_env_names(value: Mapping[str, Any]) -> tuple[str, ...]:
     if len(set(names)) != len(names):
         raise ValueError("env_names lists a name twice")
     for name in names:
-        if not ENV_NAME.fullmatch(name):
-            raise ValueError(f"env_names: {name!r} is not a variable name")
+        if not ENV_NAME.fullmatch(name) or len(name) > MAX_DRIVER_ENV_NAME:
+            raise ValueError(
+                f"env_names: {name[:40]!r} is not a variable name of at most "
+                f"{MAX_DRIVER_ENV_NAME} characters"
+            )
     return names
 
 
@@ -402,35 +413,109 @@ _SUBSCHEMAS = frozenset(
         "unevaluatedProperties",
         "propertyNames",
         "contains",
+        "contentSchema",
         "not",
         "if",
         "then",
         "else",
     }
 )
-#: Keywords whose value is a regular expression SRW would run.
-_REGEX_KEYWORDS = ("pattern", "patternProperties")
+#: Keywords that name a schema resource or an anchor a ``$ref`` could reach
+#: from anywhere in the document, or a reference resolved at run time:
+#: a registered schema uses none, so every reference is one SRW can read.
+_RESOLUTION_KEYWORDS = (
+    "$id",
+    "$anchor",
+    "$dynamicAnchor",
+    "$dynamicRef",
+    "$recursiveAnchor",
+    "$recursiveRef",
+    "$vocabulary",
+)
+#: The one dialect a registered schema is validated as.
+_DIALECT = "https://json-schema.org/draft/2020-12/schema"
+#: The only references a registered schema may hold: into its own ``$defs``
+#: or ``definitions``, by a plain name.
+_LOCAL_REF = re.compile(r"#/(\$defs|definitions)/([A-Za-z0-9_.-]{1,128})\Z")
+#: How deeply JSON containers (a default's, an enum's) may nest at all.
+_MAX_CONTAINER_DEPTH = 64
+
+
+def _regex_problems(schema: Mapping[str, Any], where: str) -> list[str]:
+    """Every mapping anywhere in ``schema`` that holds a regular expression
+    or a resolution keyword, whatever key it sits under: a value no keyword
+    names is never reached by a validator, but a ``$ref`` could make it one,
+    so nothing is left to the structure (belt and braces)."""
+    problems: list[str] = []
+    stack: list[tuple[Any, str, int]] = [(schema, where, 0)]
+    while stack:
+        node, path, depth = stack.pop()
+        if depth > _MAX_CONTAINER_DEPTH:
+            problems.append(f"{where} nests JSON deeper than {_MAX_CONTAINER_DEPTH}")
+            break
+        if isinstance(node, list):
+            for index, child in enumerate(node):
+                if isinstance(child, (Mapping, list)):
+                    stack.append((child, f"{path}[{index}]", depth + 1))
+            continue
+        if not isinstance(node, Mapping):
+            continue
+        if isinstance(node.get("pattern"), str):
+            problems.append(
+                f"{path} uses pattern: a registered schema runs no regular "
+                "expression (check it in the driver's check)"
+            )
+        if isinstance(node.get("patternProperties"), Mapping):
+            problems.append(
+                f"{path} uses patternProperties: a registered schema runs no "
+                "regular expression (check it in the driver's check)"
+            )
+        if node.get("format") == "regex":
+            problems.append(f"{path} uses format regex")
+        for keyword in _RESOLUTION_KEYWORDS:
+            if keyword in node:
+                problems.append(
+                    f"{path} uses {keyword}: a registered schema refers only to "
+                    "its own $defs"
+                )
+        for key, child in node.items():
+            if isinstance(child, (Mapping, list)):
+                stack.append((child, f"{path}.{key}", depth + 1))
+    return problems
 
 
 def schema_problems(schema: Any, where: str) -> list[str]:
     """Why a registered JSON Schema cannot be validated on SRW's own loop.
 
     A regular expression (``pattern``, ``patternProperties``, a ``regex``
-    format) can take time exponential in its input, a ``$ref`` outside the
-    document can make the validator fetch one, and size and depth bound
-    the rest (:data:`MAX_SCHEMA_BYTES`, :data:`MAX_SCHEMA_DEPTH`). Keywords
-    are found by the schema's own structure: a property *named* ``pattern``
-    is data, not a keyword.
+    format) can take time exponential in its input, so none may appear in
+    any mapping of the document, whatever key holds it. A ``$ref`` may point
+    only at ``#/$defs/<name>`` or ``#/definitions/<name>`` that exists, and
+    no ``$id``, ``$anchor``, ``$dynamicAnchor``, ``$dynamicRef`` or
+    ``$recursiveRef`` may name another target: a reference can reach
+    nothing the structural walk did not check, and never fetches. Size and
+    depth bound the rest (:data:`MAX_SCHEMA_BYTES`,
+    :data:`MAX_SCHEMA_DEPTH`).
     """
     if not isinstance(schema, Mapping):
         return [f"{where} must be an object"]
     try:
         size = len(canonical_spec(schema).encode("utf-8"))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return [f"{where} is not plain JSON"]
     problems: list[str] = []
     if size > MAX_SCHEMA_BYTES:
         problems.append(f"{where} exceeds {MAX_SCHEMA_BYTES // 1024} KiB")
+        return problems
+    problems += _regex_problems(schema, where)
+    dialect = schema.get("$schema")
+    if dialect is not None and dialect != _DIALECT:
+        problems.append(f"{where}.$schema is {_DIALECT} or absent")
+    definitions = {
+        keyword: schema.get(keyword)
+        for keyword in ("$defs", "definitions")
+        if isinstance(schema.get(keyword), Mapping)
+    }
 
     def walk(node: Any, path: str, depth: int) -> None:
         if isinstance(node, bool):
@@ -441,18 +526,18 @@ def schema_problems(schema: Any, where: str) -> list[str]:
         if depth > MAX_SCHEMA_DEPTH:
             problems.append(f"{where} nests deeper than {MAX_SCHEMA_DEPTH} levels")
             return
-        for keyword in _REGEX_KEYWORDS:
-            if keyword in node:
+        if "$schema" in node and depth > 1:
+            problems.append(f"{path}.$schema is the root's only")
+        if "$ref" in node:
+            ref = node["$ref"]
+            match = _LOCAL_REF.fullmatch(ref) if isinstance(ref, str) else None
+            if match is None:
                 problems.append(
-                    f"{path} uses {keyword}: a registered schema runs no regular "
-                    "expression (check it in the driver's check)"
+                    f"{path}.$ref must point inside the schema, at "
+                    "#/$defs/<name> or #/definitions/<name>"
                 )
-        if node.get("format") == "regex":
-            problems.append(f"{path} uses format regex")
-        for keyword in ("$ref", "$dynamicRef"):
-            ref = node.get(keyword)
-            if ref is not None and not (isinstance(ref, str) and ref.startswith("#")):
-                problems.append(f"{path}.{keyword} must point inside the schema")
+            elif match.group(2) not in definitions.get(match.group(1), {}):
+                problems.append(f"{path}.$ref names {ref}, which the schema lacks")
         for keyword, value in node.items():
             at = f"{path}.{keyword}"
             if keyword in _SUBSCHEMA_MAPS and isinstance(value, Mapping):
@@ -622,8 +707,9 @@ def image_binding_problems(
     ``env_var`` included) is one the spec declares in ``env_names`` and one
     a driver may set (``env_names.driver_env_problem``), with a value the
     workspace takes, no name is set twice, and every file lands at
-    :data:`IMAGE_FILE_TARGETS`, never executable. The messages never show a
-    value.
+    :data:`IMAGE_FILE_TARGETS` (one path once, at most
+    :data:`MAX_IMAGE_FILE_PATH` characters), never executable, a ``.netrc``
+    without a ``macdef``. The messages never show a value.
     """
     problems = validate_binding(descriptor)
     if problems:
@@ -638,6 +724,7 @@ def image_binding_problems(
         problems.append(f"a binding holds at most {MAX_BINDING_ENTRIES} entries")
     allowed = set(spec.delivery_forms) & set(IMAGE_BIND_FORMS)
     named: set[str] = set()
+    paths: set[str] = set()
     for index, entry in enumerate(entries):
         if entry["recipient"] != "workspace":
             problems.append(f"entries[{index}] must go to the workspace")
@@ -655,7 +742,16 @@ def image_binding_problems(
                 if why is not None:
                     problems.append(f"entries[{index}]: {why}")
         elif entry["form"] == "credential_file":
-            problems += _file_problems(value, index)
+            found = _file_problems(value, index)
+            problems += found
+            if not found:
+                relative, _why = target_problem(str(value.get("path") or ""))
+                if relative in paths:
+                    problems.append(
+                        f"entries[{index}] writes ~/{relative}, which another "
+                        "entry writes too"
+                    )
+                paths.add(str(relative))
             name = value.get("env_var") or None
         if name is None:
             continue
@@ -673,10 +769,19 @@ def image_binding_problems(
     return problems
 
 
+#: The longest path a driver's file may name.
+MAX_IMAGE_FILE_PATH = 255
+#: A ``.netrc`` macro: ftp runs the ``init`` one on login.
+_NETRC_MACRO = re.compile(r"(?:^|\s)macdef(?:\s|$)")
+
+
 def _file_problems(value: Mapping[str, Any], index: int) -> list[str]:
     at = f"entries[{index}].value"
     problems: list[str] = []
-    relative, why = target_problem(str(value.get("path") or ""))
+    path = str(value.get("path") or "")
+    if len(path) > MAX_IMAGE_FILE_PATH:
+        return [f"{at}.path is longer than {MAX_IMAGE_FILE_PATH} characters"]
+    relative, why = target_problem(path)
     if why is not None:
         problems.append(f"{at}.path is refused: {why}")
     elif relative not in IMAGE_FILE_NAMES and not relative.startswith(
@@ -692,6 +797,15 @@ def _file_problems(value: Mapping[str, Any], index: int) -> list[str]:
             problems.append(f"{at}.mode is refused: {why}")
     if value.get("transform") is not None or value.get("merge_group") is not None:
         problems.append(f"{at}: transform and merge_group are SRW's own")
+    content = value.get("content")
+    if (
+        relative == ".netrc"
+        and isinstance(content, str)
+        and _NETRC_MACRO.search(content)
+    ):
+        problems.append(
+            f"{at}: a .netrc may not define a macro (macdef): ftp runs one on login"
+        )
     return problems
 
 
@@ -745,6 +859,14 @@ def _slots(value: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
     }
 
 
+def _levels(value: Mapping[str, Any]) -> set[str]:
+    return {
+        str(level.get("id"))
+        for level in value.get("access_levels") or []
+        if isinstance(level, Mapping)
+    }
+
+
 def _hosts(value: Mapping[str, Any]) -> set[str]:
     return {
         canonical_spec(rule)
@@ -765,9 +887,11 @@ def moved_spec_problems(
     image stays at the digest it was registered at), a spec that does not
     read, another driver name or plane, an unsupported or other protocol
     major, a slot that disappeared, a new required slot, a slot whose kind
-    or schema changed, and more reach than before: new environment names,
-    delivery forms or egress. The stored config against the new
-    ``config_schema`` is the caller's (it owns the JSON Schema validator).
+    or schema changed, an access level or a workspace backend dropped (a
+    connector or an execution may hold it), and more reach than before: new
+    environment names, delivery forms, egress or DNS. The stored config
+    against the new ``config_schema`` is the caller's (it owns the JSON
+    Schema validator).
     """
     if new is None:
         return [
@@ -807,6 +931,19 @@ def moved_spec_problems(
         problems.append(f"it delivers new forms: {', '.join(map(str, forms))}")
     if _hosts(new) - _hosts(previous):
         problems.append("it reaches new egress destinations")
+    if new.get("needs_dns") and not previous.get("needs_dns"):
+        problems.append("it newly needs DNS")
+    dropped = sorted(_levels(previous) - _levels(new))
+    if dropped:
+        problems.append(f"it drops access levels: {', '.join(dropped)}")
+    narrowed = sorted(
+        set(previous.get("supported_backends") or ())
+        - set(new.get("supported_backends") or ())
+    )
+    if narrowed:
+        problems.append(
+            f"it no longer supports workspace backends: {', '.join(narrowed)}"
+        )
     return problems
 
 
@@ -815,6 +952,7 @@ __all__ = [
     "IMAGE_FILE_TARGETS",
     "MAX_BINDING_ENTRIES",
     "MAX_ENV_NAMES",
+    "MAX_IMAGE_FILE_PATH",
     "MAX_SCHEMA_BYTES",
     "MAX_SCHEMA_DEPTH",
     "RESERVED_NAMESPACE",

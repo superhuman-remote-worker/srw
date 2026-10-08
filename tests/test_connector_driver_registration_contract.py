@@ -550,9 +550,14 @@ class TestRegisteredSchemas:
             "type": "object",
             "properties": {"pattern": {"type": "string"}},
             "required": ["pattern"],
-            "default": {"pattern": "^(a+)+$"},
+            "default": {"pattern": 1},
         }
         assert schema_problems(schema, "s") == []
+
+    def test_a_regex_string_anywhere_is_refused_belt_and_braces(self):
+        """Whatever key holds it: a ``$ref`` could make any mapping a schema."""
+        schema = {"type": "object", "default": {"pattern": "^(a+)+$"}}
+        assert any("pattern" in p for p in schema_problems(schema, "s"))
 
     def test_a_reference_stays_inside_the_schema(self):
         assert schema_problems({"$ref": "#/$defs/x", "$defs": {"x": {}}}, "s") == []
@@ -640,3 +645,365 @@ class TestTheStoredType:
 
     def test_no_catalogue_lists_it(self):
         assert IMAGE_DRIVER_SPEC not in BUILTIN_SPECS
+
+
+# =============================================================================
+# The D6 re-review's probes (scratchpad d6-rereview/)
+# =============================================================================
+
+#: probe_env2.py and the re-review's list: names a tool reads to run code
+#: (an option, a flag, a command, a config file or a home) that the first
+#: list let through. The list is a best-effort lint, never a sandbox.
+REREVIEW_DENIED = [
+    "git_ssh_command",
+    "Git_Ssh_Command",
+    "ERL_AFLAGS",
+    "ERL_FLAGS",
+    "ELIXIR_ERL_OPTIONS",
+    "CFLAGS",
+    "CXXFLAGS",
+    "CPPFLAGS",
+    "LDFLAGS",
+    "CGO_CFLAGS",
+    "CGO_LDFLAGS",
+    "GNUMAKEFLAGS",
+    "MFLAGS",
+    "JAVA_OPTS",
+    "MAVEN_OPTS",
+    "MAVEN_ARGS",
+    "GRADLE_OPTS",
+    "GRADLE_USER_HOME",
+    "SBT_OPTS",
+    "ANT_OPTS",
+    "JAVA_HOME",
+    "FZF_DEFAULT_COMMAND",
+    "NODE_REPL_EXTERNAL_MODULE",
+    "CONFIG_SITE",
+    "CONFIG_SHELL",
+    "CMAKE_TOOLCHAIN_FILE",
+    "IPYTHONDIR",
+    "VIM",
+    "HGRCPATH",
+    "ANSIBLE_CONFIG",
+    "ANSIBLE_LIBRARY",
+    "YARN_YARN_PATH",
+    "YARN_RC_FILENAME",
+    "YARN_NPM_REGISTRY_SERVER",
+    "COREPACK_NPM_REGISTRY",
+    "COMPOSER",
+    "COMPOSER_HOME",
+    "RIPGREP_CONFIG_PATH",
+    "BASH_COMPLETION_USER_FILE",
+    "CLOUDSDK_PYTHON",
+    "TF_CLI_CONFIG_FILE",
+    "JUPYTER_CONFIG_DIR",
+    "JULIA_DEPOT_PATH",
+    "DENO_CERT",
+    "DENO_DIR",
+    "MAILCAPS",
+    "LOCPATH",
+    "NLSPATH",
+    "TERMINFO",
+    "GH_BROWSER",
+    "GH_CONFIG_DIR",
+    "BOTO_CONFIG",
+    "CONDARC",
+    "POETRY_REPOSITORIES_X_URL",
+    "PIPENV_PYPI_MIRROR",
+    "HELM_DATA_HOME",
+    "PERL5DB",
+    "LUA_INIT",
+    "NETRC",
+    "LESS",
+    "MANOPT",
+    "PS0",
+    "GLOBIGNORE",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "ELECTRON_RUN_AS_NODE",
+    "RUBYGEMS_GEMDEPS",
+    # The suffixes, on names no list spells out.
+    "ACME_OPTS",
+    "ACME_OPTIONS",
+    "ACME_COMMAND",
+    "ACME_ARGS",
+    "ACMERC",
+    "ACME_RCPATH",
+    "ACME_CONFIG",
+    "ACME_CONFIG_FILE",
+    "ACME_CONFIG_PATH",
+    "ACME_CONFIG_DIR",
+    "ACME_HOME",
+]
+#: Credential-shaped names stay a driver's to set.
+CREDENTIAL_SHAPED = [
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "PGPASSWORD",
+    "PGUSER",
+    "PGDATABASE",
+    "PGSSLMODE",
+    "DATABASE_URL",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "OPENAI_API_KEY",
+    "AZURE_CLIENT_SECRET",
+    "AZURE_CLIENT_ID",
+    "AZURE_TENANT_ID",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "HF_TOKEN",
+    "REDIS_URL",
+    "MONGODB_URI",
+    "EXAMPLE_TOKEN_FILE",
+]
+
+
+class TestTheOneEnvironmentList:
+    @pytest.mark.parametrize("name", REREVIEW_DENIED)
+    def test_known_tool_hooks_are_refused(self, name):
+        assert driver_env_problem(name) is not None
+        problems = _check(_env(name=name), names=(*NAMES, name))
+        assert any(name in p for p in problems)
+        declared = _problems(env_names=[*NAMES, name])
+        assert any(name in p for p in declared)
+
+    @pytest.mark.parametrize("name", CREDENTIAL_SHAPED)
+    def test_credential_shaped_names_stay_allowed(self, name):
+        assert driver_env_problem(name) is None
+        assert _check(_env(name=name), names=(name,)) == []
+        assert _problems(env_names=[name]) == []
+
+    def test_a_name_is_at_most_128_characters(self):
+        assert driver_env_problem("A" * 128) is None
+        long = "A" * 129
+        problems = _check(_env(name=long), names=(long,))
+        assert any("at most 128" in p for p in problems)
+        assert not any(long in p for p in problems)
+        with pytest.raises(ValueError, match="at most 128"):
+            _spec(env_names=["A" * 5000])
+
+    def test_the_mcp_stdio_checks_use_the_same_list(self):
+        """D5b's credential variable and templated variables read env_names:
+        what a driver may not set, a stdio template may not fill."""
+        from shared.connectors import env_names, mcp
+
+        assert mcp.CODE_ENV is env_names.CODE_ENV
+        assert mcp.CODE_ENV_PREFIXES is env_names.CODE_ENV_PREFIXES
+        assert env_names.CODE_ENV <= env_names.DRIVER_DENIED_NAMES
+        for name in ("MAVEN_OPTS", "GRADLE_USER_HOME", "JAVA_HOME", "CFLAGS"):
+            assert mcp.code_env(name)
+            assert env_names.loads_code(name)
+        for name in CREDENTIAL_SHAPED:
+            assert not mcp.code_env(name)
+
+    def test_the_list_says_it_is_a_lint_and_who_is_trusted(self):
+        from shared.connectors import env_names, registration
+
+        doc = " ".join(env_names.__doc__.split())
+        assert "best-effort lint" in doc
+        assert "trust boundary" in doc
+        assert "cannot run code" not in doc
+        assert "nothing it names may run code" not in doc
+        assert "trust boundary" in " ".join(registration.__doc__.split())
+
+
+#: probe_schema_ref.py: a ``$ref`` to a key no structural walk visits, an
+#: anchor, a keyword the walk did not know. ``EVIL`` doubles its time per
+#: character in the validator.
+EVIL = {"type": "string", "pattern": "^(a+)+$"}
+REF_ESCAPES = {
+    "ref_to_unknown_key": {
+        "type": "object",
+        "properties": {"a": {"$ref": "#/stash"}},
+        "stash": EVIL,
+    },
+    "ref_to_anchor_in_unknown": {
+        "type": "object",
+        "properties": {"a": {"$ref": "#x"}},
+        "stash": {"$anchor": "x", **EVIL},
+    },
+    "ref_to_defs": {
+        "type": "object",
+        "properties": {"a": {"$ref": "#/$defs/x"}},
+        "$defs": {"x": EVIL},
+    },
+    "ref_to_definitions": {
+        "type": "object",
+        "properties": {"a": {"$ref": "#/definitions/x"}},
+        "definitions": {"x": EVIL},
+    },
+    "ref_into_enum_value": {
+        "type": "object",
+        "properties": {"a": {"$ref": "#/properties/b/enum/0"}},
+    },
+    "dependentSchemas": {
+        "type": "object",
+        "dependentSchemas": {"a": {"properties": {"a": EVIL}}},
+    },
+    "contentSchema": {
+        "type": "object",
+        "properties": {
+            "a": {"contentMediaType": "application/json", "contentSchema": EVIL}
+        },
+    },
+    "items_obj": {
+        "type": "object",
+        "properties": {"a": {"type": "array", "items": EVIL}},
+    },
+    "anchor_alone": {
+        "type": "object",
+        "properties": {"a": {"$ref": "#x"}},
+        "$defs": {"y": {"$anchor": "x", "type": "string"}},
+    },
+    "id": {"$id": "https://evil.example/s", "type": "object"},
+    "dynamic_anchor": {"$dynamicAnchor": "x", "type": "object"},
+    "dynamic_ref": {"$dynamicRef": "#x", "type": "object"},
+    "recursive_ref": {"$recursiveRef": "#", "type": "object"},
+    "ref_to_root": {"type": "object", "properties": {"a": {"$ref": "#"}}},
+    "ref_to_a_property": {
+        "type": "object",
+        "properties": {"a": {"$ref": "#/properties/b"}, "b": {"type": "string"}},
+    },
+    "ref_to_a_missing_def": {
+        "type": "object",
+        "properties": {"a": {"$ref": "#/$defs/missing"}},
+        "$defs": {"x": {"type": "string"}},
+    },
+    "ref_with_pointer_escape": {
+        "type": "object",
+        "properties": {"a": {"$ref": "#/$defs/a~1b"}},
+        "$defs": {"a/b": {"type": "string"}},
+    },
+    "other_dialect": {
+        "$schema": "https://evil.example/meta",
+        "type": "object",
+    },
+    "format_regex_under_unknown_key": {
+        "type": "object",
+        "stash": {"type": "string", "format": "regex"},
+    },
+    "pattern_properties_under_unknown_key": {
+        "type": "object",
+        "stash": {"patternProperties": {"^(a+)+$": {}}},
+    },
+}
+
+
+class TestAReferenceReachesOnlyWhatWasChecked:
+    @pytest.mark.parametrize("case", sorted(REF_ESCAPES))
+    def test_the_config_schema_is_refused(self, case):
+        problems = _problems(config_schema=REF_ESCAPES[case])
+        assert problems, case
+
+    @pytest.mark.parametrize("case", sorted(REF_ESCAPES))
+    def test_a_credential_slot_schema_is_refused(self, case):
+        slot = copy.deepcopy(EXAMPLE["credential_slots"][0])
+        slot["schema"] = copy.deepcopy(REF_ESCAPES[case])
+        assert _problems(credential_slots=[slot]), case
+
+    def test_a_reference_into_its_own_defs_is_fine(self):
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "a": {"$ref": "#/$defs/host"},
+                "b": {"$ref": "#/definitions/port"},
+            },
+            "$defs": {"host": {"type": "string", "maxLength": 253}},
+            "definitions": {"port": {"type": "integer"}},
+        }
+        assert schema_problems(schema, "s") == []
+        assert _problems(config_schema=schema) == []
+
+    def test_the_registered_driver_never_runs_an_unsafe_stored_schema(self):
+        """probe_schema_reg.py: a schema that slipped past registration
+        (stored before this check) is refused before the validator runs."""
+        import time
+
+        from fastapi import HTTPException
+
+        from orchestrator.services.connector_drivers.registered import (
+            RegisteredImageDriver,
+        )
+
+        value = _json(config_schema=REF_ESCAPES["ref_to_unknown_key"])
+        assert any("pattern" in p for p in _problems(**value))
+
+        class Registration:
+            spec = spec_from_json(value)
+            image_reference = "ghcr.io/acme/driver:1"
+
+        driver = RegisteredImageDriver(Registration())
+        started = time.monotonic()
+        with pytest.raises(HTTPException) as caught:
+            driver._refuse_invalid(
+                Registration.spec.config_schema, {"a": "a" * 40 + "!"}, "config"
+            )
+        assert caught.value.status_code == 400
+        assert time.monotonic() - started < 1.0
+
+
+class TestReReviewFiles:
+    """probe_files.py."""
+
+    def test_one_path_is_written_once(self):
+        problems = _check(_file(), _file())
+        assert any("another entry writes too" in p for p in problems)
+        problems = _check(_file("~/.srw-files/x"), _file("~/.srw-files/./x"))
+        assert any("another entry writes too" in p for p in problems)
+        assert _check(_file("~/.srw-files/x"), _file("~/.srw-files/y")) == []
+
+    def test_a_path_is_bounded(self):
+        problems = _check(_file("~/.srw-files/" + "a" * 300))
+        assert any("longer than 255" in p for p in problems)
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "machine a login b password c\nmacdef init\n!id\n\n",
+            "macdef init\n!id\n\n",
+            "machine a login b password c macdef init\n",
+            "machine a\tmacdef\tinit\n",
+        ],
+    )
+    def test_a_netrc_defines_no_macro(self, content):
+        entry = _file("~/.netrc")
+        entry["value"]["content"] = content
+        problems = _check(entry)
+        assert any("macdef" in p for p in problems)
+        assert not any("!id" in p for p in problems)
+
+    def test_a_netrc_without_a_macro_and_a_pgpass_are_fine(self):
+        entry = _file("~/.netrc")
+        entry["value"]["content"] = "machine a login macdefault password c\n"
+        assert _check(entry) == []
+        pgpass = _file("~/.pgpass")
+        pgpass["value"]["content"] = "host:5432:db:user:macdef\n"
+        assert _check(pgpass) == []
+
+
+class TestReReviewMovedTags:
+    """probe_moved.py: what an execution or a connector may hold must not
+    disappear under a moved tag, and the image reaches no further."""
+
+    def test_a_dropped_access_level_is_refused(self):
+        moved = _moved(access_levels=[EXAMPLE["access_levels"][1]])
+        problems = moved_spec_problems(EXAMPLE, moved)
+        assert any("drops access levels: ReadOnly" in p for p in problems)
+
+    def test_a_narrowed_backend_list_is_refused(self):
+        problems = moved_spec_problems(EXAMPLE, _moved(supported_backends=["sandbox"]))
+        assert any("no longer supports workspace backends: vm" in p for p in problems)
+
+    def test_a_widened_backend_list_moves(self):
+        widened = _moved(supported_backends=["sandbox", "vm", "virtual"])
+        assert not any("backends" in p for p in moved_spec_problems(EXAMPLE, widened))
+
+    def test_newly_needing_dns_is_refused(self):
+        problems = moved_spec_problems(EXAMPLE, _moved(needs_dns="resolves its API"))
+        assert any("newly needs DNS" in p for p in problems)
+        before = _json(needs_dns="resolves its API")
+        assert moved_spec_problems(before, _moved(needs_dns="still")) == []
