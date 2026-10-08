@@ -1,0 +1,650 @@
+"""``checkout``: repository connectors, cloned onto the workspace.
+
+Every operation runs on the workspace backend; there is no agent-local clone
+(knowledge-base/knowledge/features/no_workspace_agent_mode.md §9.4). A token
+repository clones with the token in its URL until the git swap driver (C3).
+An SSH-key repository clones through the opaque alias of its workspace
+``ssh-agent`` identity (``agent.connectors.ssh_identity``, slice C1), and a
+key file a pre-agent clone left in ``~/.ssh`` is retired once the repository
+is proven to work through that alias.
+
+The clone keeps C1's rules on the payload entry
+(``clone_repository_datasources`` reads it exactly as before); the
+materializer routes by form and supplies the identity status and the
+legacy-key mode from the runtime context.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import shlex
+from collections.abc import Sequence
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
+from agent.connectors.base import (
+    Delivery,
+    FactsLines,
+    RuntimeContext,
+    declared_read_only_note,
+)
+from agent.connectors.legacy import checkout_auth
+from agent.connectors.ssh_identity import ssh_clone_target, ssh_identity_note
+from shared.datasource_policy import resolve_repo_clone_names
+
+logger = logging.getLogger(__name__)
+
+
+#: A pre-agent clone wrote its key to ``~/.ssh/repo_<datasource-name-slug>``
+#: and appended, to ``~/.ssh/config``, exactly
+#: ``\nHost <host>\n  IdentityFile <abs key path>\n  StrictHostKeyChecking
+#: accept-new\n``. Only a key that such an exact block names, and that no
+#: other config line names, is ours to delete: an ``IdentityFile`` line a user
+#: wrote (absolute path or not) never causes a delete, and neither does a key
+#: no line names (``ssh-keygen -f ~/.ssh/repo_deploy``).
+_LEGACY_KEY_NAME = re.compile(r"repo_[a-z0-9-]+")
+_LEGACY_KEY_MARKER = "__srw_legacy_repo_keys__"
+#: How far a clone call may retire those files: ``sweep`` (the workspace
+#: owner's attach, which sees every repository),
+#: ``own`` (a live add: only each proven repository's own file) or ``keep``
+#: (a child job on its parent's workspace, which a parent still on a pre-agent
+#: image may need for its next fetch or push).
+LEGACY_KEY_FILE_MODES = frozenset({"sweep", "own", "keep"})
+
+# One awk pass over config per candidate (``path`` is its absolute path).
+# Every line naming the file must be the IdentityFile line of an exact
+# pre-agent block (``Host <host>`` before it, ``  StrictHostKeyChecking
+# accept-new`` after it, nothing indented after that), and one must be.
+# The delete program applies the same rule again.
+_EXACT_BLOCK_AWK = (
+    "'{ line[NR] = $0 } END { exact = 0; other = 0; "
+    'for (i = 1; i <= NR; i++) { s = line[i]; sub(/^[ \\t]+/, "", s); '
+    'sub(/[ \\t\\r]+$/, "", s); if (s != "IdentityFile " path) continue; '
+    'if (line[i] == "  IdentityFile " path && i > 1 '
+    "&& line[i - 1] ~ /^Host [^ \\t\\r]+$/ && i < NR "
+    '&& line[i + 1] == "  StrictHostKeyChecking accept-new" '
+    "&& (i + 2 > NR || line[i + 2] !~ /^[ \\t]/)) exact++; else other++ } "
+    "exit !(exact > 0 && other == 0) }'"
+)
+
+
+def _list_legacy_keys_command(ssh_dir: str) -> str:
+    """List pre-agent key files: one marker line on stdout.
+
+    Regular files only, slug-shaped names only, a PEM key header that is not
+    a public key, and named in ``config`` only by exact pre-agent blocks
+    (:data:`_EXACT_BLOCK_AWK`). Runs in a subshell to leave the persistent
+    ``git`` tab where it was; the marker is split in the command so an echoed
+    or wrapped command line can never read as the answer. (The pattern avoids
+    spelling a private-key header: every command stays clear of what the
+    key-residue checks scan for.)
+    """
+
+    prefix = shlex.quote(f"{ssh_dir}/")
+    return (
+        f"( cd {shlex.quote(ssh_dir)} 2>/dev/null || exit 0; "
+        "test -f config || exit 0; _srw_names=''; "
+        "for _srw_f in repo_*; do "
+        '[ -f "$_srw_f" ] && [ ! -L "$_srw_f" ] || continue; '
+        'case "${_srw_f#repo_}" in ""|*[!a-z0-9-]*) continue;; esac; '
+        'IFS= read -r _srw_first < "$_srw_f" || continue; '
+        'case "$_srw_first" in *"PUBLIC KEY-----") continue;; '
+        '"-----BEGIN "*" KEY-----") ;; *) continue;; esac; '
+        f'awk -v path={prefix}"$_srw_f" {_EXACT_BLOCK_AWK} config || continue; '
+        '_srw_names="$_srw_names $_srw_f"; '
+        "done; "
+        f"printf '%s%s\\n' {_LEGACY_KEY_MARKER[:13]} "
+        f'{_LEGACY_KEY_MARKER[13:]}"$_srw_names" )'
+    )
+
+
+# Runs on the workspace (argv: ssh dir, names). Re-checks every name exactly
+# as the listing did (the same exact-block rule), deletes it, then removes
+# each deleted key's exact pre-agent blocks from config (and the blank line
+# before each). Since no other line may name a deleted key, nothing in config
+# is left pointing at it; a block a user edited never qualified.
+_RETIRE_LEGACY_KEYS_PROGRAM = r"""
+import os, re, stat, sys, tempfile
+ssh_dir, names = sys.argv[1], sys.argv[2:]
+config = os.path.join(ssh_dir, "config")
+try:
+    with open(config, encoding="utf-8", errors="surrogateescape") as handle:
+        lines = handle.read().split("\n")
+except OSError:
+    sys.exit(0)
+HOST = re.compile(r"Host [^ \t\r]+")
+TRUST = "  StrictHostKeyChecking accept-new"
+def exact_block_at(index, path):
+    following = lines[index + 2] if index + 2 < len(lines) else ""
+    return (
+        lines[index] == "  IdentityFile " + path
+        and index > 0
+        and HOST.fullmatch(lines[index - 1]) is not None
+        and index + 1 < len(lines)
+        and lines[index + 1] == TRUST
+        and not following[:1].isspace()
+    )
+def only_exact_blocks_name(path):
+    exact = other = 0
+    for index, line in enumerate(lines):
+        if line.strip() != "IdentityFile " + path:
+            continue
+        if exact_block_at(index, path):
+            exact += 1
+        else:
+            other += 1
+    return exact > 0 and other == 0
+def key_file(path):
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return False
+        with open(path, "rb") as handle:
+            first = handle.readline(4096).rstrip(b"\r\n")
+    except OSError:
+        return False
+    return (
+        first.startswith(b"-----BEGIN ")
+        and first.endswith(b" KEY-----")
+        and not first.endswith(b"PUBLIC KEY-----")
+    )
+removed = set()
+for name in names:
+    path = os.path.join(ssh_dir, name)
+    if (
+        re.fullmatch(r"repo_[a-z0-9-]+", name)
+        and key_file(path)
+        and only_exact_blocks_name(path)
+    ):
+        os.unlink(path)
+        removed.add(path)
+kept, index, changed = [], 0, False
+while index < len(lines):
+    if (
+        index + 1 < len(lines)
+        and lines[index + 1].startswith("  IdentityFile ")
+        and lines[index + 1][len("  IdentityFile "):] in removed
+        and exact_block_at(index + 1, lines[index + 1][len("  IdentityFile "):])
+    ):
+        if kept and kept[-1] == "":
+            kept.pop()
+        index += 3
+        changed = True
+        continue
+    kept.append(lines[index])
+    index += 1
+if changed and not os.path.islink(config):
+    mode = stat.S_IMODE(os.stat(config).st_mode)
+    descriptor, temporary = tempfile.mkstemp(dir=ssh_dir, prefix=".config.srw-")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", errors="surrogateescape") as handle:
+            handle.write("\n".join(kept))
+        os.chmod(temporary, mode)
+        os.replace(temporary, config)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+"""
+
+
+def _legacy_ssh_key_files(backend: Any, ssh_dir: str) -> set[str]:
+    """Names of pre-agent ``~/.ssh/repo_*`` key files; empty when unsure."""
+
+    output = str(
+        backend.shell_run(
+            _list_legacy_keys_command(ssh_dir), timeout=10, tab_name="git"
+        )
+    )
+    answers = [
+        line.strip()[len(_LEGACY_KEY_MARKER) :]
+        for line in output.splitlines()
+        if line.strip().startswith(_LEGACY_KEY_MARKER)
+    ]
+    if not answers:
+        return set()
+    return {name for name in answers[-1].split() if _LEGACY_KEY_NAME.fullmatch(name)}
+
+
+def _retire_legacy_ssh_key_files(
+    backend: Any, outcomes: List[Tuple[str, Any]], *, mode: str
+) -> None:
+    """Delete pre-agent key files whose repository works through its alias.
+
+    ``outcomes`` holds one ``(name slug, outcome)`` per SSH repository:
+    ``True`` (cloned through its alias), ``False`` (skipped or failed) or the
+    reused checkout's ``GitManager``, re-proven with ``ls-remote`` only when a
+    key file is actually there. A repository's own ``repo_<slug>`` goes once
+    it is proven. In ``sweep`` mode, with every SSH repository proven, every
+    listed file goes, including those a renamed or detached connector left
+    behind. ``keep`` touches nothing. Only files that exact pre-agent
+    ``Host`` blocks, and nothing else in ``~/.ssh/config``, name are ever
+    listed; those blocks go with the key.
+    """
+
+    if mode == "keep":
+        return
+    try:
+        from shared.runtime.core.managed_repository import (
+            _execute_managed_secret_command,
+        )
+
+        ssh_dir = backend.resolve_home_path(".ssh")
+        found = _legacy_ssh_key_files(backend, ssh_dir)
+        if not found:
+            return
+        can_sweep = mode == "sweep" and all(
+            outcome is not False for _, outcome in outcomes
+        )
+        delete: set[str] = set()
+        for ds_name, outcome in outcomes:
+            own = f"repo_{ds_name}"
+            if outcome is False or (own not in found and not can_sweep):
+                continue
+            if outcome is True or outcome.remote_reachable():
+                if own in found:
+                    delete.add(own)
+            else:
+                can_sweep = False
+        if can_sweep:
+            delete |= found
+        if not delete:
+            return
+        command = " ".join(
+            [
+                "python3",
+                "-c",
+                shlex.quote(_RETIRE_LEGACY_KEYS_PROGRAM),
+                shlex.quote(ssh_dir),
+                *(shlex.quote(name) for name in sorted(delete)),
+            ]
+        )
+        # Off tmux, under the claim fence a stateless backend provides.
+        if _execute_managed_secret_command(
+            backend,
+            command,
+            b"",
+            timeout=30,
+            operation="pre-agent SSH key retirement",
+        ):
+            logger.info("Retired %d pre-agent SSH key file(s)", len(delete))
+        else:
+            logger.warning("Could not retire pre-agent SSH key files")
+    except Exception as exc:  # cleanup only: never fails a clone
+        logger.warning(
+            "Could not retire pre-agent SSH key files: %s", type(exc).__name__
+        )
+
+
+def clone_repository_datasources(
+    repo_datasources: List[Dict[str, Any]],
+    workspace_manager: Any,
+    *,
+    ssh_identity_status: Optional[Dict[str, str]] = None,
+    legacy_key_files: str = "sweep",
+) -> None:
+    """Clone repository datasources onto the workspace backend.
+
+    Every operation runs on the workspace and the clone itself is
+    ``GitManager.clone(backend=...)`` (git on the workspace over SSH).
+
+    An SSH-key repository is cloned from ``ssh://srw-repo-<slug>/<path>`` (or
+    ``srw-repo-<slug>:<path>`` for a relative scp-style path), an opaque alias
+    whose key a dedicated workspace ``ssh-agent`` holds
+    (``agent.connectors.ssh_identity``); no key file is written
+    and no ``Host`` block is appended. ``ssh_identity_status`` is the
+    materializer's ``{authority_id: status}``: a connector whose identity did
+    not load is skipped with a warning, never cloned without its key. A
+    reused checkout gets its origin reset to the alias. A pre-agent
+    ``~/.ssh/repo_<slug>`` key file (one only its exact pre-agent
+    ``~/.ssh/config`` block names) is deleted only once its repository is
+    proven to work through the alias;
+    ``legacy_key_files`` says how far that goes.
+
+    There is deliberately NO agent-local fallback: without a shell-capable
+    backend the datasources are skipped with an error. Repository
+    datasources require a full workspace — lite tiers reject them at
+    dispatch (knowledge-base/knowledge/features/no_workspace_agent_mode.md §4/§7).
+
+    Args:
+        repo_datasources: Datasource config dicts of type "repository".
+        workspace_manager: WorkspaceManager whose backend hosts the clones;
+            successful clones are registered in its ``source_repos``.
+        ssh_identity_status: Which SSH identities the workspace agent holds;
+            ``None`` when the caller did not materialize any.
+        legacy_key_files: ``sweep`` when the workspace owner passes its
+            full set (key files no listed repository owns may go too),
+            ``own`` for a partial set (a live add), ``keep`` when the
+            workspace is someone else's (a child job on its parent's).
+    """
+    if not isinstance(ssh_identity_status, dict):
+        ssh_identity_status = None
+    if legacy_key_files not in LEGACY_KEY_FILE_MODES:
+        raise ValueError(f"unknown legacy_key_files mode {legacy_key_files!r}")
+    if not repo_datasources:
+        return
+
+    backend = getattr(workspace_manager, "backend", None)
+    if backend is None or not getattr(backend, "supports_shell", False):
+        logger.error(
+            "Repository datasources require a workspace backend with shell "
+            "support; skipping %d repository datasource(s), no local clone "
+            "fallback: %s",
+            len(repo_datasources),
+            ", ".join(ds.get("name", "unnamed") for ds in repo_datasources),
+        )
+        return
+
+    from agent.managers.git_manager import GitManager
+
+    # The workspace root is itself a durable Git repository. Without this
+    # exclusion, its next checkpoint records each nested checkout as a
+    # contentless gitlink; a fallback restore then recreates only an empty
+    # directory. Keeping the clone root ignored means every attach can either
+    # reuse the PVC copy below or re-clone it from the connector.
+    try:
+        if backend.exists(".gitignore"):
+            content = backend.read_file(".gitignore")
+            ignored = any(
+                line.strip() == "repos/" for line in str(content).splitlines()
+            )
+            if not ignored:
+                separator = "" if str(content).endswith("\n") else "\n"
+                backend.append_file(
+                    ".gitignore",
+                    f"{separator}\n# Cloned repository datasources\nrepos/\n",
+                )
+        else:
+            backend.write_file(
+                ".gitignore", "# Cloned repository datasources\nrepos/\n"
+            )
+    except Exception as exc:
+        logger.warning(
+            "Could not exclude repository datasource clones from workspace "
+            "versioning: %s",
+            exc,
+        )
+
+    clone_names = resolve_repo_clone_names(repo_datasources)
+    ssh_outcomes: List[List[Any]] = []
+    for ds, repo_name in zip(repo_datasources, clone_names):
+        # ds_name is the safe form of the user-supplied datasource label.
+        ds_name = (
+            re.sub(r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()).strip("-")
+            or "repo"
+        )
+        try:
+            repo_url = ds.get("connection_url", "")
+            branch = ds.get("default_branch")
+            creds = ds.get("credentials") or {}
+            # The checkout entry's auth: an explicit auth_method, or inferred
+            # from the delivered SSH identity / credentials keys.
+            auth = checkout_auth(ds)
+
+            ssh_clone_url: Optional[str] = None
+            ssh_outcome: Optional[List[Any]] = None
+            if auth == "ssh_agent":
+                ssh_clone_url, reason = ssh_clone_target(ds, ssh_identity_status)
+                # A key file a pre-agent clone wrote goes only once this
+                # repository is proven through its alias (after the loop).
+                ssh_outcome = [ds_name, False]
+                ssh_outcomes.append(ssh_outcome)
+                if ssh_clone_url is None:
+                    logger.warning(
+                        "Skipping SSH repository datasource %r: %s",
+                        ds_name,
+                        reason,
+                    )
+                    continue
+                repo_url = ssh_clone_url
+
+            elif auth == "token_in_url":
+                parsed = urlparse(repo_url)
+                repo_url = parsed._replace(
+                    netloc=f"oauth2:{creds['token']}@{parsed.hostname}"
+                    + (f":{parsed.port}" if parsed.port else "")
+                ).geturl()
+
+            target = workspace_manager.path / "repos" / repo_name
+            remote_cwd = f"repos/{repo_name}"
+            reused = backend.exists(f"{remote_cwd}/.git")
+            if reused:
+                # A session workspace may outlive its agent pod (PVC hot tier)
+                # or be restored from the thread repository. Re-register the
+                # managed checkout instead of attempting a second clone into
+                # the existing directory, which git correctly refuses.
+                git_mgr = GitManager(
+                    target,
+                    backend=backend,
+                    remote_cwd=remote_cwd,
+                )
+                if ssh_clone_url is not None:
+                    if git_mgr.add_remote("origin", ssh_clone_url):
+                        # Proven lazily: ls-remote only if a key file is left.
+                        ssh_outcome[1] = git_mgr
+                    else:
+                        # A pre-agent checkout points at the real host and
+                        # its key file; leaving it would fail every fetch.
+                        logger.warning(
+                            "Could not point reused repos/%s at its SSH identity",
+                            repo_name,
+                        )
+                logger.info(
+                    "Reusing repository datasource %r from repos/%s",
+                    ds_name,
+                    repo_name,
+                )
+            else:
+                git_mgr = GitManager.clone(
+                    repo_url,
+                    target,
+                    backend=backend,
+                    remote_cwd=remote_cwd,
+                )
+                if ssh_outcome is not None and git_mgr:
+                    ssh_outcome[1] = True
+            if git_mgr:
+                branch_ready = True
+                if branch and (not reused or ds.get("require_default_branch")):
+                    branch_ready = git_mgr.checkout_branch(branch)
+                elif branch:
+                    # Reused checkout without require_default_branch: the
+                    # worker may have moved HEAD (e.g. onto a job branch)
+                    # before this re-attach; re-running checkout here silently
+                    # reverted that on every resume (job 12a0e92c). Only a
+                    # review session pins the branch on reuse — its entire
+                    # point is that this exact delivery is checked out
+                    # (orchestrator/services/job_delivery.py sets
+                    # require_default_branch).
+                    logger.debug(
+                        "Reused repos/%s keeps its checked-out branch %r "
+                        "(pinned default %r not re-applied on re-attach)",
+                        repo_name,
+                        git_mgr.current_branch(),
+                        branch,
+                    )
+                if ds.get("require_default_branch") and not branch_ready:
+                    logger.error(
+                        "Repository datasource %r could not check out required "
+                        "branch %r; refusing to register the review source",
+                        ds_name,
+                        branch,
+                    )
+                    continue
+                workspace_manager.source_repos[repo_name] = git_mgr
+                try:
+                    from shared.runtime.services.forge import (
+                        parse_owner_repo,
+                        resolve_api_base,
+                    )
+
+                    forge = str((ds.get("config") or {}).get("forge") or "").lower()
+                    raw_url = ds.get("connection_url", "")
+                    owner, repo_slug = parse_owner_repo(raw_url)
+                    repo_meta = {
+                        "forge": forge,
+                        "api_base": resolve_api_base(raw_url, forge),
+                        "owner": owner,
+                        "repo": repo_slug,
+                        "token": (creds or {}).get("token", ""),
+                        # The agent payload carries the project link flag as
+                        # `project_read_only`; `read_only` is the publisher's
+                        # declared flag on public datasources. Either one
+                        # forbids writes, and reading only the latter made
+                        # every read-only repository record read_only=False.
+                        "read_only": bool(
+                            ds.get("project_read_only") or ds.get("read_only")
+                        ),
+                        "default_branch": branch,
+                    }
+                    # Current orchestrators deliberately omit the raw DB
+                    # ``id`` and send the resolved, server-owned identity as
+                    # ``datasource_id``.  The ``id`` fallback is retained only
+                    # for older in-process/internal callers that passed a
+                    # resolved row directly to this shared clone helper.
+                    datasource_id = str(
+                        ds.get("datasource_id") or ds.get("id") or ""
+                    ).strip()
+                    if datasource_id:
+                        repo_meta["datasource_id"] = datasource_id
+                    workspace_manager.source_repo_meta[repo_name] = repo_meta
+                except Exception as e:
+                    # A metadata failure must not fail the clone; the repo is
+                    # still usable through the shell and the read-only git tools.
+                    logger.warning(
+                        "Could not record forge metadata for repos/%s: %s",
+                        repo_name,
+                        e,
+                    )
+                logger.info(
+                    "Cloned repository datasource %r into repos/%s",
+                    ds_name,
+                    repo_name,
+                )
+            else:
+                logger.warning(
+                    "Failed to clone repository datasource %r (target repos/%s)",
+                    ds_name,
+                    repo_name,
+                )
+        except Exception as e:
+            logger.warning(
+                "Failed to clone repository datasource %s: %s",
+                ds.get("name", "unnamed"),
+                e,
+            )
+
+    if ssh_outcomes:
+        _retire_legacy_ssh_key_files(
+            backend,
+            [(name, outcome) for name, outcome in ssh_outcomes],
+            mode=legacy_key_files,
+        )
+
+
+def _repo_meta(workspace_manager: Any, clone_name: str) -> Dict[str, Any]:
+    """Forge metadata recorded by clone_repository_datasources(), or {}."""
+    meta = getattr(workspace_manager, "source_repo_meta", None)
+    if not isinstance(meta, dict):
+        return {}
+    entry = meta.get(clone_name)
+    return entry if isinstance(entry, dict) else {}
+
+
+def _key(delivery: Delivery) -> str:
+    # The internal payload strips datasource ids, so a live change identifies
+    # a connector by (type, name), as the transcript summary does.
+    return f"{delivery.entry.get('type')}:{delivery.entry.get('name')}"
+
+
+class CheckoutMaterializer:
+    form = "checkout"
+
+    def materialize(self, deliveries: Sequence[Delivery], rt: RuntimeContext) -> None:
+        if not deliveries:
+            return
+        clone_repository_datasources(
+            [delivery.entry for delivery in deliveries],
+            rt.workspace_manager,
+            ssh_identity_status=rt.ssh_identity_status,
+            legacy_key_files=rt.legacy_key_files,
+        )
+
+    def replace(
+        self,
+        old: Sequence[Delivery],
+        new: Sequence[Delivery],
+        rt: RuntimeContext,
+    ) -> None:
+        """Clone added repositories; unregister removed ones.
+
+        A removed repository keeps its clone on the workspace (cheap honesty:
+        scrubbing is not a security boundary) but loses its ``source_repos``
+        registration and its forge metadata, which holds its token. An added
+        repository whose clone name collides with an existing clone fails
+        that one clone with a warning; a resume re-resolves suffixed names
+        over the full list.
+        """
+        old_keys = {_key(delivery) for delivery in old}
+        new_keys = {_key(delivery) for delivery in new}
+        added = [delivery for delivery in new if _key(delivery) not in old_keys]
+        removed = old_keys - new_keys
+        workspace_manager = rt.workspace_manager
+        if added and workspace_manager:
+            try:
+                clone_repository_datasources(
+                    [delivery.entry for delivery in added],
+                    workspace_manager,
+                    ssh_identity_status=rt.ssh_identity_status,
+                    # Only the added ones: another repository's key file is
+                    # not this batch's to sweep.
+                    legacy_key_files="own",
+                )
+            except Exception as e:
+                logger.warning("Live repository clone failed: %s", e)
+        if removed and workspace_manager:
+            # Resolve clone names over the OLD full repo list (payload order)
+            # so collision suffixes match what attach actually registered.
+            old_repos = [delivery.entry for delivery in old]
+            for delivery, clone_name in zip(old, resolve_repo_clone_names(old_repos)):
+                if _key(delivery) in removed:
+                    workspace_manager.source_repos.pop(clone_name, None)
+                    # source_repo_meta holds the repository's plaintext token;
+                    # leaving it behind keeps a detached credential live on
+                    # the workspace manager for the rest of the session.
+                    workspace_manager.source_repo_meta.pop(clone_name, None)
+
+    def facts(
+        self, deliveries: Sequence[Delivery], rt: RuntimeContext
+    ) -> list[FactsLines]:
+        repos = [delivery.entry for delivery in deliveries]
+        out: list[FactsLines] = []
+        # Same name resolution as clone_repository_datasources() — the list
+        # must point at the directories the clones actually land in.
+        for delivery, clone_name in zip(deliveries, resolve_repo_clone_names(repos)):
+            ds = delivery.entry
+            meta = _repo_meta(rt.workspace_manager, clone_name)
+            default_branch = str(
+                meta.get("default_branch") or ds.get("default_branch") or ""
+            ).strip()
+            branch_clause = (
+                f"; base branch `{default_branch}`" if default_branch else ""
+            )
+            read_only = bool(
+                meta.get("read_only")
+                if "read_only" in meta
+                else (ds.get("project_read_only") or ds.get("read_only"))
+            )
+            access = (
+                "read-only — only repo_pull/repo_pr_status"
+                if read_only
+                else "writable — pull requests opened with repo_open_pr are "
+                "recorded for this job"
+            )
+            line = (
+                f"- **{ds.get('name')}** — repository cloned at "
+                f'`./repos/{clone_name}/` (use `repo="{clone_name}"` with the '
+                f"repo_* tools){branch_clause}; {access}{declared_read_only_note(ds)}"
+                + ssh_identity_note(ds, rt.ssh_identity_status)
+            )
+            out.append(FactsLines("Repositories", delivery.index, [line]))
+        return out

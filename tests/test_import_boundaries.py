@@ -141,8 +141,9 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     # 29 since R3.2 fenced the session client transport off the runtime;
     # 30 since R3.3a fenced the session input owner off the runtime and loop;
     # 32 since D1a kept the connector driver contract on the standard library;
-    # 33 since D1c kept the drivers' internal rules to the drivers.
-    assert "Contracts: 33 kept, 0 broken" in result.stdout
+    # 33 since D1c kept the drivers' internal rules to the drivers;
+    # 34 since D1b fenced the agent's connector materializers off the runtime.
+    assert "Contracts: 34 kept, 0 broken" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -178,6 +179,14 @@ def test_connector_contract_rejects_a_framework_import(boundary_tree):
         "The connector driver contract uses the standard library only BROKEN"
         in result.stdout
     )
+
+
+def test_connector_materializers_reject_the_loop(boundary_tree):
+    (boundary_tree / "src/agent/connectors.py").write_text("import langgraph\n")
+    result = lint_boundaries(boundary_tree)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "Connector materializers do not import the agent runtime" in result.stdout
+    assert "the loop BROKEN" in result.stdout
 
 
 @pytest.mark.parametrize(

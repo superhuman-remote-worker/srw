@@ -655,3 +655,15 @@ forbidden_modules = [
   "agent.agent",
   "langgraph",
 ]
+
+[[tool.importlinter.contracts]]
+name = "Connector materializers do not import the agent runtime, its APIs, the graph or the loop"
+type = "forbidden"
+source_modules = ["agent.connectors"]
+forbidden_modules = [
+  "agent.agent",
+  "agent.api",
+  "agent.persistent_graph",
+  "agent.graph",
+  "langgraph",
+]
