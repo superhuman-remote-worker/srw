@@ -143,6 +143,10 @@ GITEA_WRITE_TOOLS = (
     "create_branch",
     "delete_branch",
     "issue_write",
+    # They read Gitea, but download to a caller-chosen output_path in the
+    # shared pod (D5a review): write tools.
+    "attachment_read",
+    "actions_run_read",
 )
 _SELECTOR = (
     "app.kubernetes.io/instance=srw,app.kubernetes.io/name=superhuman-remote-worker"
