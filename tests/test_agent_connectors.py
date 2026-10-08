@@ -531,23 +531,22 @@ def test_checkouts_without_a_workspace(execution, clones, caplog):
 # =============================================================================
 
 
+#: Which slot each tool category reads: the literal map, never one built by
+#: the function under test.
+SLOT_OF_CATEGORY = {
+    "graph": "neo4j",
+    "sql": "postgresql",
+    "mongodb": "mongodb",
+    "webdav": "webdav",
+    "email": "email",
+    "mcp": "mcp",
+}
+
+
 def test_every_connection_driver_has_one_slot_for_its_tool_category():
     from agent.connectors.slots import SLOT_BY_CATEGORY, connection_slot
 
-    expected = {
-        spec.tool_category: connection_slot(spec)
-        for spec in DATASOURCE_SPECS
-        if connection_slot(spec) and spec.tool_category
-    }
-    assert SLOT_BY_CATEGORY == expected
-    assert set(SLOT_BY_CATEGORY) == {
-        "graph",
-        "sql",
-        "mongodb",
-        "webdav",
-        "email",
-        "mcp",
-    }
+    assert SLOT_BY_CATEGORY == SLOT_OF_CATEGORY
     # The slot is where the materializers put the connection.
     for spec in DATASOURCE_SPECS:
         if "managed_connection" in spec.delivery_forms:
@@ -566,6 +565,101 @@ def test_a_tool_finds_its_connection_by_category():
     assert not context.has_connection_for("graph")
     assert context.connection_for("repo") is None
     assert not hasattr(context, "get_datasource")
+
+
+_MCP_TOOL = SimpleNamespace(
+    name="docs_mcp__search", metadata={}, description="search the docs"
+)
+
+
+def _category_tool_names() -> dict[str, set[str]]:
+    from shared.connectors.builtin import tool_map
+
+    names: dict[str, set[str]] = {category: set() for category in SLOT_OF_CATEGORY}
+    for entry in tool_map().values():
+        category = entry["category"]
+        if category not in names:
+            continue
+        for key in ("read", "write"):
+            names[category].update(entry.get(key) or ())
+        for tier in (entry.get("tiers") or {}).values():
+            names[category].update(tier)
+    names["mcp"] = {_MCP_TOOL.name}
+    return names
+
+
+def _slot_sentinels() -> dict[str, Any]:
+    """A distinct stand-in in every slot; only the MCP one lists a tool."""
+    sentinels = {
+        slot: MagicMock(name=f"{slot}-sentinel") for slot in SLOT_OF_CATEGORY.values()
+    }
+    sentinels["mcp"].get_langchain_tools.return_value = [_MCP_TOOL]
+    return sentinels
+
+
+def _captured(tool: Any, sentinels: dict[str, Any]) -> set[str]:
+    """The slots whose stand-in a bound tool's closure holds (nested too)."""
+    import inspect
+
+    found: set[str] = set()
+
+    def walk(function: Any, depth: int) -> None:
+        if depth > 4 or not inspect.isfunction(function):
+            return
+        for value in inspect.getclosurevars(function).nonlocals.values():
+            found.update(
+                slot for slot, sentinel in sentinels.items() if value is sentinel
+            )
+            walk(value, depth + 1)
+
+    walk(getattr(tool, "func", None) or getattr(tool, "coroutine", None), 0)
+    return found
+
+
+@pytest.fixture
+def mcp_registered():
+    from agent.tools.registry import register_mcp_tools
+
+    sentinels = _slot_sentinels()
+    register_mcp_tools(sentinels["mcp"])
+    try:
+        yield sentinels
+    finally:
+        register_mcp_tools(None)
+
+
+@pytest.mark.parametrize("category", sorted(SLOT_OF_CATEGORY))
+def test_each_bound_tool_reads_its_own_categorys_connection(category, mcp_registered):
+    """Every slot holds a distinct stand-in: a tool bound to another's fails."""
+    from agent.tools.context import ToolContext
+    from agent.tools.registry import load_tools
+
+    sentinels = mcp_registered
+    names = _category_tool_names()[category]
+    bound = load_tools(sorted(names), ToolContext(datasources=dict(sentinels)))
+    assert {tool.name for tool in bound} == names
+    slot = SLOT_OF_CATEGORY[category]
+    for tool in bound:
+        if category == "mcp":
+            # The MCP manager's own tool: fetched from the MCP slot.
+            assert tool is _MCP_TOOL
+        else:
+            assert _captured(tool, sentinels) == {slot}, tool.name
+
+
+@pytest.mark.parametrize("category", sorted(SLOT_OF_CATEGORY))
+def test_a_category_binds_by_its_own_slot_alone(category, mcp_registered):
+    """Only its own slot opens a category's gate; every other leaves it shut."""
+    from agent.tools.context import ToolContext
+    from agent.tools.registry import load_tools
+
+    sentinels = mcp_registered
+    names = _category_tool_names()[category]
+    slot = SLOT_OF_CATEGORY[category]
+    alone = load_tools(sorted(names), ToolContext(datasources={slot: sentinels[slot]}))
+    assert {tool.name for tool in alone} == names
+    others = {key: value for key, value in sentinels.items() if key != slot}
+    assert load_tools(sorted(names), ToolContext(datasources=others)) == []
 
 
 def test_load_tools_binds_a_category_only_with_its_connection():
