@@ -1028,3 +1028,129 @@ def test_the_self_hosted_preflight_says_what_the_host_lacks(monkeypatch):
         run.forge.prepare({**SELF_HOSTED_ENV, "CONNECTOR_SERVICE_PRIVATE_TIERS": ""})
     failed = [name for name, ok, _detail in run.report.results if not ok]
     assert failed and "home-allowed" in failed[0]
+
+
+# ---------------------------------------------------------------------------
+# C3 re-review 2: the self-hosted preflight's nits
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("http://srw-gitea:3000", ("srw-gitea", "srw", 3000)),
+        ("http://srw-gitea.forge:3000/", ("srw-gitea", "forge", 3000)),
+        (
+            "http://gitea-http.git.svc.cluster.local",
+            ("gitea-http", "git", 80),
+        ),
+        ("https://gitea.forge.svc:8443", ("gitea", "forge", 8443)),
+    ],
+)
+def test_the_ingress_goes_where_giteas_service_is(url, expected):
+    assert gate.gitea_service(url) == expected
+
+
+@pytest.mark.parametrize("url", ["", "http://", "http://Bad_Name:3000"])
+def test_an_internal_url_naming_no_service_is_refused(url):
+    with pytest.raises(ValueError):
+        gate.gitea_service(url)
+
+
+def test_the_ingress_lives_in_giteas_namespace(monkeypatch):
+    cluster = _FakeCluster()
+    original = cluster.__call__
+
+    def answer(argv, **kwargs):
+        if "printenv" in argv:
+            cluster.calls.append((list(argv), None))
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="http://gitea-http.forge.svc:3000\n", stderr=""
+            )
+        return original(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", answer)
+    run = gate.GitSwapGate(_self_hosted())
+    run.namespace = "srw-connectors"
+    run.forge.prepare(SELF_HOSTED_ENV)
+    ingress = next(made for made in cluster.applied if made["kind"] == "Ingress")
+    assert ingress["metadata"]["namespace"] == "forge"
+    assert ingress["spec"]["rules"][0]["http"]["paths"][0]["backend"] == {
+        "service": {"name": "gitea-http", "port": {"number": 3000}}
+    }
+    applied = [argv for argv, _ in cluster.calls if "apply" in argv]
+    assert applied[0][:4] == ["kubectl", "--context=k3d-srw", "-n", "forge"]
+    assert run.forge.ingress == f"forge/srw-gate-{GATE_ID}"
+
+    def step(label, action):
+        action()
+
+    run.forge.cleanup(step)
+    deleted = [argv for argv, _ in cluster.calls if "ingress,secret" in argv]
+    assert deleted and deleted[0][:4] == ["kubectl", "--context=k3d-srw", "-n", "forge"]
+
+
+def test_a_lan_address_given_replaces_the_detected_one(monkeypatch):
+    # The workstation's LAN is inside k3d's pod range (10.42.0.0/24): a
+    # dummy interface's free private address, given, is used.
+    cluster = _FakeCluster(
+        ip_output="2: enp1s0    inet 10.42.0.17/24 scope global enp1s0"
+    )
+    monkeypatch.setattr(subprocess, "run", cluster)
+    run = gate.GitSwapGate(_self_hosted())
+    run.namespace = "srw-connectors"
+    with pytest.raises(gate.GateError, match="--lan-address"):
+        run.forge.prepare(SELF_HOSTED_ENV)
+    before = len(cluster.calls)
+    run = gate.GitSwapGate(_self_hosted("--lan-address", "192.168.250.1"))
+    run.namespace = "srw-connectors"
+    run.forge.prepare(SELF_HOSTED_ENV)
+    assert run.forge.address == "192.168.250.1"
+    assert run.upstream.startswith(f"https://{GATE_ID}.192-168-250-1.sslip.io/")
+    assert not any(argv[:1] == ["ip"] for argv, _ in cluster.calls[before:])
+    # Still checked against the refused ranges.
+    run = gate.GitSwapGate(_self_hosted("--lan-address", "172.20.0.5"))
+    run.namespace = "srw-connectors"
+    with pytest.raises(gate.GateError):
+        run.forge.prepare(SELF_HOSTED_ENV)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--lan-address", "192.168.250.1"],  # without --self-hosted-upstream
+        ["--self-hosted-upstream", "--lan-address", "8.8.8.8"],
+        ["--self-hosted-upstream", "--lan-address", "127.0.0.1"],
+        ["--self-hosted-upstream", "--lan-address", "fd00::1"],
+        ["--self-hosted-upstream", "--lan-address", "my-laptop"],
+    ],
+)
+def test_a_lan_address_must_be_a_private_ipv4(argv, no_cluster):
+    assert gate.main(argv) == 2
+
+
+def test_the_help_shows_the_dummy_interface(no_cluster, capsys):
+    with pytest.raises(SystemExit):
+        gate.main(["--help"])
+    out = capsys.readouterr().out
+    assert "ip link add srwgate0 type dummy" in out
+    assert "--lan-address" in out
+
+
+def test_a_failed_listing_names_the_routing_not_the_token(monkeypatch):
+    cluster = _FakeCluster()
+    monkeypatch.setattr(subprocess, "run", cluster)
+    run = gate.GitSwapGate(_self_hosted())
+    run.namespace = "srw-connectors"
+    run.forge.prepare(SELF_HOSTED_ENV)
+
+    def refused(*args, **kwargs):
+        return 128, "fatal: unable to access: The requested URL returned error: 404"
+
+    monkeypatch.setattr(run, "upstream_git", refused)
+    with pytest.raises(gate.GateError, match="Ingress"):
+        run.check_listing()
+    name, ok, detail = run.report.results[-1]
+    assert not ok and "routing, not the token" in detail
+    assert f"srw/srw-gate-{GATE_ID}" in detail
+    assert "token" not in name

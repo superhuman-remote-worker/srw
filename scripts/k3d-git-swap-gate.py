@@ -1008,6 +1008,38 @@ def sslip_host(gate_id: str, address: str) -> str:
     return f"{gate_id}.{address.replace('.', '-')}.{SSLIP_DOMAIN}"
 
 
+#: A free private address on a dummy interface, for a workstation whose LAN
+#: lies in the cluster's ranges (--lan-address).
+DUMMY_INTERFACE_HINT = (
+    "sudo ip link add srwgate0 type dummy; "
+    "sudo ip addr add 192.168.250.1/32 dev srwgate0; "
+    "sudo ip link set srwgate0 up; then --lan-address 192.168.250.1, and "
+    "sudo ip link del srwgate0 afterwards"
+)
+_K8S_NAME_RE = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?\Z")
+
+
+def gitea_service(internal_url: str) -> tuple[str, str, int]:
+    """``(service, namespace, port)`` of the in-cluster Gitea the
+    orchestrator's ``GITEA_INTERNAL_URL`` names: ``http://srw-gitea:3000``
+    (the release's namespace) or ``http://srw-gitea.<namespace>[.svc...]``.
+    The Ingress goes in that namespace (an Ingress routes only to Services
+    of its own)."""
+    parsed = urllib.parse.urlsplit(internal_url or "")
+    if not parsed.hostname:
+        raise ValueError("the orchestrator names no GITEA_INTERNAL_URL")
+    labels = parsed.hostname.split(".")
+    service = labels[0]
+    namespace = labels[1] if len(labels) > 1 else LOCAL_NAMESPACE
+    for name in (service, namespace):
+        if not _K8S_NAME_RE.fullmatch(name):
+            raise ValueError(
+                f"GITEA_INTERNAL_URL names no in-cluster Service ({parsed.hostname})"
+            )
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return service, namespace, port
+
+
 def make_gate_ca(host: str) -> tuple[str, str, str]:
     """A CA the gate makes and a server certificate for ``host`` it signs:
     ``(ca_pem, cert_pem, key_pem)``. Strict verifiers (OpenSSL 3.5's
@@ -1303,6 +1335,18 @@ class SelfHostedForge:
         self.user_started = False
         self.objects_started = False
         self.probe_started = False
+        #: The Ingress and its Secret live in Gitea's Service's namespace
+        #: (from the orchestrator's GITEA_INTERNAL_URL).
+        self.namespace = LOCAL_NAMESPACE
+
+    @property
+    def kc(self) -> list[str]:
+        """kubectl in the namespace of Gitea's Service."""
+        return ["kubectl", f"--context={LOCAL_CONTEXT}", "-n", self.namespace]
+
+    @property
+    def ingress(self) -> str:
+        return f"{self.namespace}/srw-gate-{self.gate.gate_id}"
 
     def gitea(self, action: str, **extra: Any) -> dict[str, Any]:
         return in_pod(
@@ -1341,41 +1385,51 @@ class SelfHostedForge:
             for cidr in env.get(name, "").split(",")
             if cidr.strip()
         ]
-        rc, listing, _err = run(["ip", "-4", "-o", "addr", "show"], timeout=30)
-        candidates = lan_ipv4_candidates(listing if rc == 0 else "")
+        given = getattr(gate.args, "lan_address", None)
+        if given:
+            # The operator's choice (a dummy interface's free private
+            # address when the LAN lies in the cluster's ranges), still
+            # checked against them.
+            candidates = [("--lan-address", given)]
+        else:
+            rc, listing, _err = run(["ip", "-4", "-o", "addr", "show"], timeout=30)
+            candidates = lan_ipv4_candidates(listing if rc == 0 else "")
         self.address = choose_lan_ip(candidates, refused) or ""
         gate.report.check(
-            "self-hosted: this workstation has a private LAN IPv4 address "
-            "outside clusterCidrs and refusedCidrs",
+            "self-hosted: a private IPv4 address of this workstation outside "
+            "clusterCidrs and refusedCidrs",
             bool(self.address),
             f"chose {self.address or 'none'} of {candidates}; refused {refused}",
         )
         if not self.address:
             raise GateError(
-                "no LAN IPv4 address a driver pod may reach: connect the "
-                "workstation to a LAN (an address outside the ranges above), "
-                "or use --upstream-url"
+                "no workstation address a driver pod may reach: connect the "
+                "workstation to a LAN outside the ranges above, or give one with "
+                f"--lan-address ({DUMMY_INTERFACE_HINT}), or use --upstream-url"
             )
         self.host = sslip_host(gate.gate_id, self.address)
-        internal = urllib.parse.urlsplit(gate.orchestrator_env("GITEA_INTERNAL_URL"))
-        if not internal.hostname:
-            raise GateError("the orchestrator names no GITEA_INTERNAL_URL")
-        service = internal.hostname.split(".", 1)[0]
+        try:
+            service, namespace, port = gitea_service(
+                gate.orchestrator_env("GITEA_INTERNAL_URL")
+            )
+        except ValueError as exc:
+            raise GateError(str(exc)) from None
+        self.namespace = namespace
         self.ca_pem, cert_pem, key_pem = make_gate_ca(self.host)
         secret(key_pem)
         self.objects_started = True
         command(
-            K + ["apply", "-f", "-"],
+            self.kc + ["apply", "-f", "-"],
             data=json.dumps(
                 {
                     "apiVersion": "v1",
                     "kind": "List",
                     "items": forge_objects(
                         gate_id=gate.gate_id,
-                        namespace=LOCAL_NAMESPACE,
+                        namespace=namespace,
                         host=self.host,
                         service=service,
-                        port=internal.port or 80,
+                        port=port,
                         cert_pem=cert_pem,
                         key_pem=key_pem,
                     ),
@@ -1480,7 +1534,7 @@ class SelfHostedForge:
             step(
                 "delete the self-hosted Ingress and its TLS Secret",
                 lambda: command(
-                    K
+                    self.kc
                     + ["delete", "ingress,secret", "-l", f"{GATE_LABEL}={gate.gate_id}"]
                     + ["--ignore-not-found", "--wait=true", "--timeout=120s"]
                 )
@@ -1500,7 +1554,7 @@ class SelfHostedForge:
         left: list[str] = []
         if self.objects_started:
             listed = run(
-                K
+                self.kc
                 + ["get", "ingress,secret", "-l", f"{GATE_LABEL}={gate.gate_id}"]
                 + ["-o", "name"],
                 timeout=60,
@@ -2046,14 +2100,7 @@ class GitSwapGate:
             )
             if not upstream.get("reachable"):
                 raise GateError(f"{host} is not reachable")
-        rc, out = self.upstream_git("ls-remote")
-        self.report.check(
-            "preflight: the operator's token lists the disposable repository",
-            rc == 0,
-            out[-200:] if rc else "listed",
-        )
-        if rc:
-            raise GateError("the upstream token cannot read the repository")
+        self.check_listing()
         enforced = self.default_deny_enforced()
         self.report.check(
             "preflight: the cluster enforces NetworkPolicy (12 probes under the "
@@ -2066,6 +2113,38 @@ class GitSwapGate:
         )
         if not enforced:
             raise GateError("NetworkPolicy is not enforced on this cluster")
+
+    def check_listing(self) -> None:
+        """git on this workstation lists the upstream with its token."""
+        rc, out = self.upstream_git("ls-remote")
+        if self.forge is None:
+            self.report.check(
+                "preflight: the operator's token lists the disposable repository",
+                rc == 0,
+                out[-200:] if rc else "listed",
+            )
+            if rc:
+                raise GateError("the upstream token cannot read the repository")
+        else:
+            # The token was made a moment ago, with Gitea's API: what fails
+            # here is the way to Gitea (the name, the Ingress, Traefik).
+            self.report.check(
+                "self-hosted: git on this workstation lists the repository at "
+                f"{self.forge.host} (through the Ingress and Traefik)",
+                rc == 0,
+                "listed"
+                if rc == 0
+                else f"{out[-200:]}: likely the routing, not the token: does "
+                f"Traefik serve the Ingress {self.forge.ingress} (kubectl -n "
+                f"{self.forge.namespace} describe ingress "
+                f"srw-gate-{self.gate_id}), and does {self.forge.host} resolve "
+                f"to {self.forge.address} on this workstation?",
+            )
+            if rc:
+                raise GateError(
+                    f"{self.forge.host} does not route to Gitea (the Ingress "
+                    f"{self.forge.ingress} or Traefik)"
+                )
 
     def keycloak(self, action: str) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -3061,8 +3140,12 @@ needs:
                                          the gate puts its project on it)
   connectors.servicePods.clusterCidrs and refusedCidrs must not cover the
       workstation's LAN address (the k3d profile's do not cover 192.168/16
-      or a 10.x outside 10.42/10.43; 172.16/12 is refused, so a LAN there
-      cannot be used)
+      or a 10.x outside 10.42/10.43; 172.16/12 is refused). A LAN inside
+      them (say 10.42.0.0/24): a dummy interface with a free private
+      address, given with --lan-address:
+        sudo ip link add srwgate0 type dummy
+        sudo ip addr add 192.168.250.1/32 dev srwgate0
+        sudo ip link set srwgate0 up        (afterwards: ip link del srwgate0)
   the k3d cluster in multi-host mode (scripts/local-dev-up.sh's default):
       its load balancer publishes 443 on all host addresses
   the host accepting 443 from the k3d docker network on its LAN address
@@ -3139,6 +3222,16 @@ def build_parser() -> argparse.ArgumentParser:
             "token; cleanup removes all of it (host needs: see below)"
         ),
     )
+    parser.add_argument(
+        "--lan-address",
+        help=(
+            "with --self-hosted-upstream: the workstation's private IPv4 "
+            "address to publish Gitea at, instead of the one found on its "
+            "interfaces (still checked against clusterCidrs and refusedCidrs). "
+            "For a LAN inside the cluster's ranges, add a dummy interface "
+            "with a free private address: " + DUMMY_INTERFACE_HINT
+        ),
+    )
     parser.add_argument("--forge", choices=FORGES, help="defaults from the host")
     parser.add_argument("--keep", action="store_true", help="skip cleanup")
     return parser
@@ -3167,6 +3260,22 @@ def validate(args: argparse.Namespace) -> None:
                 f"--{name.replace('_', '-')} must be a clean https://host/path URL "
                 "(lowercase host, port 443, no credentials, no trailing slash)"
             )
+    if args.lan_address is not None:
+        if not args.self_hosted_upstream:
+            raise SafetyError("--lan-address is for --self-hosted-upstream")
+        try:
+            address = ipaddress.ip_address(args.lan_address)
+        except ValueError:
+            raise SafetyError("--lan-address is no IP address") from None
+        if (
+            address.version != 4
+            or not address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_unspecified
+        ):
+            raise SafetyError("--lan-address must be a private IPv4 address")
+        args.lan_address = str(address)
     if args.self_hosted_upstream:
         if args.upstream_url or args.upstream_token_file:
             raise SafetyError(
