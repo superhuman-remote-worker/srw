@@ -219,17 +219,11 @@ class LiveManifestResolver:
         )
         dependencies.extend(deepcopy(row["dependencies"]))
         # Recheck credential scope/key existence today, even for an old revision.
-        # A datasource's Connector lends its secret by the connector policy,
-        # for work in the selecting resource's project (decision 11).
-        linked = kind == "Connector" and row.get("linked_id")
+        # (A datasource's Connector returned above: its secret is never read
+        # here, only by its delivery, under the connector policy.)
         return {
             "inline": await self.spec(
-                kind,
-                deepcopy(row["resolved"]["spec"]),
-                ref["scope"],
-                dependencies,
-                connector=row if linked else None,
-                project_ids=[scope["name"]] if scope["kind"] == "Project" else [],
+                kind, deepcopy(row["resolved"]["spec"]), ref["scope"], dependencies
             )
         }
 

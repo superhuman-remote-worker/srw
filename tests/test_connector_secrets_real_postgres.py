@@ -66,7 +66,10 @@ from orchestrator.services.thread_datasource_authorization import (
     authorize_thread_datasource_selection,
     resolve_authorized_thread_datasources,
 )
-from orchestrator.services.datasource_policy import authorize_datasource_selection
+from orchestrator.services.datasource_policy import (
+    DatasourceUnavailableError,
+    authorize_datasource_selection,
+)
 from orchestrator.services.job_datasource_selection import (
     JobDatasourceSelectionDependencies,
     resolve_authorized_job_datasources,
@@ -678,8 +681,12 @@ async def test_decision_11_the_connector_policy_lends_its_secret(database):
 
 @pytest.mark.asyncio
 async def test_a_project_member_resolves_the_projects_knowledge_base(database):
-    """The resolver path: a viewer of the project, who may not write its
-    secrets, uses its own knowledge base Connector's secret for work in it."""
+    """A viewer of the project, who may not write its secrets, names its own
+    knowledge base Connector by ref. Since D3c a ref to a datasource's
+    Connector resolves to its datasource binding and never reads the secret
+    (no srw_resource_secrets read, nothing in the resolver's secrets): the
+    connector policy decides where the work may use it, at admission and
+    delivery, which then read the secret."""
     db = database
     owner = await _user(db, "Owner")
     viewer = await _user(db, "Viewer")
@@ -708,22 +715,33 @@ async def test_a_project_member_resolves_the_projects_knowledge_base(database):
     project_scope = {"kind": "Project", "name": project}
     selection = {"ref": {"name": resource["name"], "scope": project_scope}}
 
+    assert URL_KEY in resource["document"]["spec"]["credentials"]
+
     resolver = LiveManifestResolver(ManifestStore(db), ManifestAuthority(db, viewer))
     resolved = await resolver.selection("Connector", selection, project_scope, [])
-    refs = resolved["inline"]["credentials"]
-    assert refs[URL_KEY]["secretRef"]["scope"] == project_scope
-    assert list(resolver.secrets.values()) == [1]
+    assert resolved == {
+        "inline": {"driver": "srw.datasource/v1", "config": {"datasourceId": kb}}
+    }
+    assert resolver.secrets == {}
+    selected, _ = await authorize_datasource_selection(
+        db, viewer, str(viewer["id"]), [kb], [project], "sandbox"
+    )
+    assert selected == [kb]
 
     # Work in a member's own Account is not work in the project, also for an
-    # editor, who could write the project's secrets.
+    # editor, who could write the project's secrets: the policy refuses it
+    # where the work is admitted.
     for member in (viewer, editor):
         personal = {"kind": "Account", "name": str(member["id"])}
         resolver = LiveManifestResolver(
             ManifestStore(db), ManifestAuthority(db, member)
         )
-        with pytest.raises(HTTPException) as refused:
-            await resolver.selection("Connector", selection, personal, [])
-        assert refused.value.status_code == 403, member["display_name"]
+        await resolver.selection("Connector", selection, personal, [])
+        assert resolver.secrets == {}
+        with pytest.raises(DatasourceUnavailableError):
+            await authorize_datasource_selection(
+                db, member, str(member["id"]), [kb], [], "sandbox"
+            )
 
 
 @pytest.mark.asyncio

@@ -420,6 +420,59 @@ async def test_native_project_refresh_keeps_authored_entries(database):
 
 
 @pytest.mark.asyncio
+async def test_a_linked_connector_ref_never_reads_its_secret(database, monkeypatch):
+    """Resolving a ref to a datasource's Connector returns its binding and
+    never touches the Connector's secret: no srw_resource_secrets read, no
+    entry in the resolver's secrets. Its delivery reads the secret, under the
+    connector policy (D3b)."""
+    db = database
+    owner = await _user(db, "Owner")
+    member = await _user(db, "Member")
+    project = await _project(db, "Team", owner, **{member["id"]: "editor"})
+    linked = await _connector(
+        db,
+        "Prod DB",
+        owner,
+        project_ids=[project],
+        credentials={"username": "reader", "password": "s3cret-pass"},
+    )
+    resource = await ManifestStore(db).by_id(linked)
+    assert resource["resolved"]["spec"].get("credentials"), "D3b names its secret"
+
+    statements: list[str] = []
+    for method in ("fetch", "fetchrow", "fetchval", "execute"):
+        original = getattr(db, method)
+
+        async def spy(query, *args, _original=original, **kwargs):
+            statements.append(str(query))
+            return await _original(query, *args, **kwargs)
+
+        monkeypatch.setattr(db, method, spy)
+
+    ref = await _ref_of(db, linked)
+    for user in (owner, member):
+        resolver = LiveManifestResolver(ManifestStore(db), ManifestAuthority(db, user))
+        bound = await resolver.selection(
+            "Connector", {"ref": ref}, {"kind": "Project", "name": project}, []
+        )
+        assert bound == project_connectors.datasource_binding(linked)
+        assert resolver.secrets == {}
+        # The same through a whole Project document.
+        resolver = LiveManifestResolver(ManifestStore(db), ManifestAuthority(db, user))
+        await resolver.prepare(
+            [
+                _project_document(
+                    f"project-{project}",
+                    owner,
+                    {"db": {"ref": ref}},
+                )
+            ]
+        )
+        assert resolver.secrets == {}
+    assert not [query for query in statements if "srw_resource_secrets" in query]
+
+
+@pytest.mark.asyncio
 async def test_a_member_references_and_reapplies_connectors_shared_with_them(
     database,
 ):
