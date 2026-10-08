@@ -1668,6 +1668,14 @@ jobs:
           go mod verify
           go vet ./...
           go test -count=1 -race ./...
+      # Its isolation tests need root (each binding's process runs as a
+      # user of its own); as anyone else they are skipped.
+      - name: Test the stdio bridge's isolation as root
+        working-directory: drivers/mcp-bridge
+        run: |
+          sudo env "PATH=$PATH" "GOMODCACHE=$(go env GOMODCACHE)" \
+            GOCACHE=/tmp/bridge-root-gocache GOFLAGS=-mod=readonly \
+            go test -count=1 -race -run Isolation ./...
       # The development MCP server the front's integration tests and the
       # k3d gate run behind it: tested here, never built or published.
       - name: Vet and test the MCP test server

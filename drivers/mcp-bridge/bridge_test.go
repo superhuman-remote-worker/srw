@@ -82,12 +82,14 @@ func newHarnessEnv(t *testing.T, mutate func(*options), extra ...string) *harnes
 		logDir: t.TempDir(),
 	}
 	opts := options{
-		listen:        "127.0.0.1:0",
+		socket:        filepath.Join(t.TempDir(), "bridge.sock"),
+		socketGroup:   -1,
 		path:          "/mcp",
 		credentialEnv: fakeTokenEnv,
 		maxProcesses:  4,
 		idle:          time.Minute,
 		stopGrace:     2 * time.Second,
+		homeRoot:      t.TempDir(),
 		program:       []string{os.Args[0]},
 	}
 	if mutate != nil {
@@ -890,29 +892,62 @@ func TestTheControlRoutes(t *testing.T) {
 }
 
 func TestServeRefusesWhatWouldExposeTheBridge(t *testing.T) {
-	good := []string{"--listen", "127.0.0.1:9000", "--credential-env", "GITHUB_TOKEN", "--", "node", "dist/index.js"}
-	if opts, err := parseServe(good); err != nil || opts.program[1] != "dist/index.js" || opts.maxProcesses != 8 {
+	base := []string{"--socket", "/srw/bridge/bridge.sock", "--home-root", "/srw/home"}
+	good := append(append([]string(nil), base...), "--socket-group", "65532", "--uid-base", "20000", "--credential-env", "GITHUB_TOKEN", "--", "node", "dist/index.js")
+	opts, err := parseServe(good)
+	if err != nil || opts.program[1] != "dist/index.js" || opts.maxProcesses != 8 || opts.uidBase != 20000 || opts.socketGroup != 65532 {
 		t.Fatalf("%+v %v", opts, err)
 	}
+	if strings.Join(opts.sweepDirs, ",") != "/tmp,/dev/shm" {
+		t.Fatalf("sweep dirs %v", opts.sweepDirs)
+	}
+	with := func(extra ...string) []string { return append(append([]string(nil), base...), extra...) }
 	for _, args := range [][]string{
-		{"--listen", "127.0.0.1:9000"},
-		{"--listen", "127.0.0.1:9000", "--"},
-		{"--listen", "0.0.0.0:9000", "--", "x"},
-		{"--listen", "10.0.0.1:9000", "--", "x"},
-		{"--listen", "127.0.0.1", "--", "x"},
-		{"--listen", "127.0.0.1:9000", "--path", "/srw/status", "--", "x"},
-		{"--listen", "127.0.0.1:9000", "--path", "mcp", "--", "x"},
-		{"--listen", "127.0.0.1:9000", "--max-processes", "0", "--", "x"},
-		{"--listen", "127.0.0.1:9000", "--max-processes", "65", "--", "x"},
-		{"--listen", "127.0.0.1:9000", "--idle", "0s", "--", "x"},
-		{"--listen", "127.0.0.1:9000", "--credential-env", "NODE_OPTIONS", "--", "x"},
-		{"--listen", "127.0.0.1:9000", "--credential-env", "LD_PRELOAD", "--", "x"},
-		{"--listen", "127.0.0.1:9000", "stray", "--", "x"},
-		{"--listen", "127.0.0.1:9000", "--", ""},
+		with(),
+		with("--"),
+		{"--home-root", "/srw/home", "--", "x"}, // no socket
+		{"--socket", "bridge.sock", "--home-root", "/h", "--", "x"}, // relative
+		{"--socket", "/srw/../tmp/b.sock", "--home-root", "/h", "--", "x"},
+		{"--socket", "/" + strings.Repeat("s", 100), "--home-root", "/h", "--", "x"},
+		{"--socket", "/srw/bridge/bridge.sock", "--", "x"}, // no home root
+		with("--socket-group", "0", "--", "x"),
+		with("--path", "/srw/status", "--", "x"),
+		with("--path", "mcp", "--", "x"),
+		with("--max-processes", "0", "--", "x"),
+		with("--max-processes", "65", "--", "x"),
+		with("--idle", "0s", "--", "x"),
+		with("--credential-env", "NODE_OPTIONS", "--", "x"),
+		with("--credential-env", "LD_PRELOAD", "--", "x"),
+		with("--uid-base", "500", "--", "x"),
+		with("--uid-base", "65520", "--", "x"),
+		with("--uid-base", "20000", "--socket-group", "20003", "--", "x"),
+		with("--sweep-dir", "tmp", "--", "x"),
+		with("stray", "--", "x"),
+		with("--", ""),
 	} {
 		if _, err := parseServe(args); err == nil {
 			t.Errorf("%q was accepted", args)
 		}
+	}
+}
+
+func TestTheSocketIsTheBridgesAndTheFrontsAlone(t *testing.T) {
+	dir := t.TempDir()
+	os.Chmod(dir, 0o777)
+	path := filepath.Join(dir, "bridge.sock")
+	os.WriteFile(path, []byte("left by the last run"), 0o600)
+	listener, err := listenSocket(path, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	for target, want := range map[string]os.FileMode{dir: 0o700, path: 0o600} {
+		if info, err := os.Stat(target); err != nil || info.Mode().Perm() != want {
+			t.Fatalf("%s: %v %v", target, info.Mode(), err)
+		}
+	}
+	if info, _ := os.Stat(path); info.Mode()&os.ModeSocket == 0 {
+		t.Fatal("not a socket")
 	}
 }
 
@@ -922,7 +957,12 @@ func TestCredentialEnvNames(t *testing.T) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
-	for _, name := range []string{"", "1ABC", "A-B", "A B", "SRW_TOKEN", "srw_x", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "NODE_OPTIONS", "node_options", "PYTHONPATH", "PATH", "BASH_ENV", "JAVA_TOOL_OPTIONS"} {
+	for _, name := range []string{
+		"", "1ABC", "A-B", "A B", "SRW_TOKEN", "srw_x", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES",
+		"NODE_OPTIONS", "node_options", "PYTHONPATH", "PATH", "BASH_ENV", "JAVA_TOOL_OPTIONS",
+		"GIT_SSH_COMMAND", "npm_config_node_options", "PIP_INDEX_URL", "UV_INDEX_URL",
+		"GLIBC_TUNABLES", "BROWSER", "OPENSSL_CONF", "PYTHONWARNINGS", "TMPDIR", "HOME",
+	} {
 		if checkEnvName(name) == nil {
 			t.Errorf("%q was accepted", name)
 		}
@@ -995,14 +1035,20 @@ func TestDispatch(t *testing.T) {
 	if dispatch(nil, &out, &errs) != 2 || dispatch([]string{"nope"}, &out, &errs) != 2 {
 		t.Fatal("usage")
 	}
-	if dispatch([]string{"status", "--listen", "10.0.0.1:1"}, &out, &errs) != 2 {
-		t.Fatal("status off loopback")
+	if dispatch([]string{"status", "--socket", "relative.sock"}, &out, &errs) != 2 {
+		t.Fatal("status of a relative socket")
 	}
 	h := newHarness(t, nil)
 	h.open("lease-a", "credential-a")
+	listener, err := listenSocket(h.bridge.opts.socket, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: h.bridge}
+	go server.Serve(listener)
+	defer server.Close()
 	out.Reset()
-	listen := strings.TrimPrefix(h.server.URL, "http://")
-	if dispatch([]string{"status", "--listen", listen}, &out, &errs) != 0 || !strings.Contains(out.String(), `"binding":"lease-a"`) {
+	if dispatch([]string{"status", "--socket", h.bridge.opts.socket}, &out, &errs) != 0 || !strings.Contains(out.String(), `"binding":"lease-a"`) {
 		t.Fatalf("status: %s %s", out.String(), errs.String())
 	}
 	if strings.Contains(out.String(), "credential-a") {

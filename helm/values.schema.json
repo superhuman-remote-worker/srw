@@ -1568,6 +1568,13 @@
                 }
               }
             },
+            "mcpStdioProbe": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {"type": "boolean"}
+              }
+            },
             "registry": {
               "type": "object",
               "additionalProperties": false,

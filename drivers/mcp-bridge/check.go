@@ -20,8 +20,16 @@ import (
 // The bridge decides only on that top level (a request or an answer, its
 // id, its method); params pass through byte for byte, so what a tool call
 // names is the front's decision, on the same bytes the process reads. The
-// bridge is no authorization boundary: only the front and the pod's own
-// processes reach its loopback port.
+// bridge is no authorization boundary, and only the front reaches it: it
+// serves a unix socket in a directory only the front's group may enter,
+// never a port. A binding's process cannot reach it (nor send its binding
+// header or its control routes), because each process runs as a user of
+// its own: it cannot read another binding's environment or private
+// directory, signal or trace another's process, or gain a privilege. What
+// the processes still share is the pod: its network (a loopback port is
+// open to every one of them, and the front's needs a lease), the image's
+// read-only filesystem, /tmp and /dev/shm (sticky; their files are private
+// by umask 077 and removed with their user), and the pod's CPU and memory.
 
 var (
 	errEmpty        = errors.New("the body is empty")

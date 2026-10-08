@@ -86,13 +86,20 @@ func newFront(cfg *config, a authority, upstream *http.Client, logf func(string,
 	return f
 }
 
-// newUpstreamClient reaches the server beside the front: no redirect is
-// followed, no compression is asked for (responses are filtered and
-// scrubbed), and a stream may stay open as long as the caller holds it.
-func newUpstreamClient() *http.Client {
+// newUpstreamClient reaches the server beside the front (on socket, the
+// stdio bridge's unix socket, when there is one): no redirect is followed,
+// no compression is asked for (responses are filtered and scrubbed), and a
+// stream may stay open as long as the caller holds it.
+func newUpstreamClient(socket string) *http.Client {
+	dial := (&net.Dialer{Timeout: 5 * time.Second}).DialContext
+	if socket != "" {
+		dial = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "unix", socket)
+		}
+	}
 	return &http.Client{
 		Transport: &http.Transport{
-			DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+			DialContext:           dial,
 			ResponseHeaderTimeout: 2 * time.Minute,
 			DisableCompression:    true,
 			MaxIdleConnsPerHost:   16,

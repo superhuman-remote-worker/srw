@@ -2016,9 +2016,13 @@ spec:
             {{- if .Values.connectors.drivers.mcpStdioTest.enabled }}
             {{- $_ := set $managedMcp "srw.mcp-stdio-test/v1" .Values.connectors.drivers.mcpStdioTest.image }}
             {{- end }}
+            {{- if .Values.connectors.drivers.mcpStdioProbe.enabled }}
+            {{- /* SRW's MCP test server in stdio mode: the mcpTest image. */}}
+            {{- $_ := set $managedMcp "srw.mcp-stdio-probe/v1" .Values.connectors.drivers.mcpTest.image }}
+            {{- end }}
             {{- if $managedMcp }}
             {{- if not .Values.connectors.servicePods.enabled }}
-            {{- fail "a managed MCP server (connectors.drivers.managedMcp, mcpTest, mcpStdioTest) needs connectors.servicePods.enabled: it runs as a service-plane driver" }}
+            {{- fail "a managed MCP server (connectors.drivers.managedMcp, mcpTest, mcpStdioTest, mcpStdioProbe) needs connectors.servicePods.enabled: it runs as a service-plane driver" }}
             {{- end }}
             {{- if not .Values.connectors.drivers.mcpFront.image.digest }}
             {{- fail "a managed MCP server needs connectors.drivers.mcpFront.image.digest: every managed MCP pod runs the front, so it is pinned by digest (CI stamps it; Tilt sets it in k3d)" }}

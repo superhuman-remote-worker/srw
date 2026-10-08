@@ -17,18 +17,31 @@ const maxCredential = 64 << 10
 
 var envName = regexp.MustCompile(`\A[A-Za-z_][A-Za-z0-9_]{0,127}\z`)
 
-// codeEnv are the variables a runtime reads code or its search path from:
-// a binding's credential is user data, so it may never land in one
-// (shared/connectors/mcp.py CODE_ENV holds the same list).
-var codeEnv = map[string]bool{
-	"BASH_ENV": true, "BASHOPTS": true, "CLASSPATH": true, "ENV": true,
-	"GCONV_PATH": true, "HOME": true, "IFS": true, "JAVA_TOOL_OPTIONS": true,
-	"JDK_JAVA_OPTIONS": true, "_JAVA_OPTIONS": true, "NODE_OPTIONS": true,
-	"NODE_PATH": true, "PATH": true, "PERL5LIB": true, "PERL5OPT": true,
-	"PERLLIB": true, "PROMPT_COMMAND": true, "PS4": true, "PYTHONHOME": true,
-	"PYTHONPATH": true, "PYTHONSTARTUP": true, "RUBYLIB": true, "RUBYOPT": true,
-	"SHELLOPTS": true, "ZDOTDIR": true,
-}
+// codeEnv are the variables a runtime reads code, its search path, a
+// command to run or a package index from, and codeEnvPrefixes whole
+// families of them: a binding's credential is user data, so it may never
+// land in one (shared/connectors/mcp.py CODE_ENV and CODE_ENV_PREFIXES hold
+// the same lists). The process's HOME and TMPDIR are the bridge's.
+var (
+	codeEnv = map[string]bool{
+		"BASH_ENV": true, "BASHOPTS": true, "BROWSER": true, "BUN_OPTIONS": true,
+		"CLASSPATH": true, "DOTNET_STARTUP_HOOKS": true, "EDITOR": true,
+		"ELECTRON_RUN_AS_NODE": true, "ENV": true, "GCONV_PATH": true,
+		"GEM_HOME": true, "GEM_PATH": true, "GLIBC_TUNABLES": true, "HOME": true,
+		"IFS": true, "JAVA_OPTS": true, "JAVA_TOOL_OPTIONS": true,
+		"JDK_JAVA_OPTIONS": true, "_JAVA_OPTIONS": true, "LESSOPEN": true,
+		"NODE_OPTIONS": true, "NODE_PATH": true, "NODE_REPL_EXTERNAL_MODULE": true,
+		"OPENSSL_CONF": true, "OPENSSL_MODULES": true, "PAGER": true, "PATH": true,
+		"PERL5DB": true, "PERL5LIB": true, "PERL5OPT": true, "PERLLIB": true,
+		"PROMPT_COMMAND": true, "PS4": true, "PYTHONBREAKPOINT": true,
+		"PYTHONHOME": true, "PYTHONINSPECT": true, "PYTHONPATH": true,
+		"PYTHONSTARTUP": true, "PYTHONUSERBASE": true, "PYTHONWARNINGS": true,
+		"RUBYGEMS_GEMDEPS": true, "RUBYLIB": true, "RUBYOPT": true,
+		"SHELLOPTS": true, "SSH_ASKPASS": true, "SUDO_ASKPASS": true,
+		"TMPDIR": true, "VISUAL": true, "ZDOTDIR": true,
+	}
+	codeEnvPrefixes = []string{"GIT_", "NPM_CONFIG_", "PIP_", "UV_"}
+)
 
 // checkEnvName refuses a name the credential may not be delivered in: SRW's
 // own, the loader's, and the ones that load code.
@@ -41,6 +54,11 @@ func checkEnvName(name string) error {
 		return fmt.Errorf("%q is reserved", name)
 	case codeEnv[upper]:
 		return fmt.Errorf("%q loads code or a search path", name)
+	}
+	for _, prefix := range codeEnvPrefixes {
+		if strings.HasPrefix(upper, prefix) {
+			return fmt.Errorf("%q configures a command or a package index", name)
+		}
 	}
 	return nil
 }

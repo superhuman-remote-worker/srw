@@ -49,7 +49,9 @@
 //
 // In front of a stdio server (transport "stdio", D5b) the upstream is SRW's
 // stdio bridge (drivers/mcp-bridge), which runs one process of the server
-// per binding. Every check above stays here; the front also names each
+// per binding, each as a user of its own, and which the front reaches on a
+// unix socket only its group may enter (mcp "socket"), never a port the
+// processes share. Every check above stays here; the front also names each
 // request's binding (its lease) and hands over the binding's credential in
 // headers only it sets, for the bridge to put in that process's
 // environment, and tells the bridge when a lease ended (when it refuses the
@@ -98,7 +100,7 @@ func dispatch(args []string) int {
 		logf := func(format string, a ...any) {
 			log.Printf("srw-mcp-front: "+format, a...)
 		}
-		handler := newFront(cfg, newHTTPAuthority(cfg.exchangeURL, cfg.identity), newUpstreamClient(), logf, systemNow)
+		handler := newFront(cfg, newHTTPAuthority(cfg.exchangeURL, cfg.identity), newUpstreamClient(cfg.socket), logf, systemNow)
 		if cfg.bridge {
 			go handler.probe.loop(context.Background())
 			go handler.sweepBindings(context.Background())

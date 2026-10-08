@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -57,9 +58,11 @@ type credentialRule struct {
 // orchestrator from the driver spec's mcp block (shared/connectors/mcp.py).
 type mcpBlock struct {
 	// "http", or "stdio": the upstream is SRW's stdio bridge, which runs
-	// one process of the server per binding (D5b).
+	// one process of the server per binding (D5b), on the unix socket
+	// Socket (the upstream's host is only a name then).
 	Transport string `json:"transport"`
 	Upstream  string `json:"upstream"`
+	Socket    string `json:"socket"`
 	Protocol  string `json:"protocol"`
 	Tools     struct {
 		Read []string `json:"read"`
@@ -89,8 +92,9 @@ type requestFile struct {
 type config struct {
 	// The upstream is SRW's stdio bridge: each request names its binding,
 	// a binding's end stops its process, and readiness is probed in the
-	// background (each probe starts a process).
+	// background (each probe starts a process). It is reached on socket.
 	bridge      bool
+	socket      string
 	driver      string
 	connectorID string
 	exchangeURL string
@@ -161,8 +165,28 @@ func parseConfig(request requestFile, identity string) (*config, error) {
 		return nil, errors.New("the request names no lease exchange")
 	}
 	block := request.MCP
+	bridge := false
+	switch block.Transport {
+	case "", "http":
+	case "stdio":
+		bridge = true
+	default:
+		return nil, fmt.Errorf("mcp transport %q is not one the front serves", block.Transport)
+	}
 	upstream, err := url.Parse(block.Upstream)
-	if err != nil || upstream.Scheme != "http" || !loopback(upstream.Hostname()) || upstream.Port() == "" {
+	switch {
+	case bridge:
+		// The bridge serves only a unix socket in the pod (no binding's
+		// process may reach it); the upstream URL names its path.
+		if !filepath.IsAbs(block.Socket) || filepath.Clean(block.Socket) != block.Socket {
+			return nil, errors.New("a stdio server's bridge is reached on its unix socket: the mcp socket must be an absolute path")
+		}
+		if err != nil || upstream.Scheme != "http" || upstream.Host != bridgeHost || strings.HasPrefix(upstream.Path, "/srw/") {
+			return nil, fmt.Errorf("a stdio server's mcp upstream is http://%s/PATH", bridgeHost)
+		}
+	case block.Socket != "":
+		return nil, errors.New("an http server's mcp upstream is a loopback port, not a socket")
+	case err != nil || upstream.Scheme != "http" || !loopback(upstream.Hostname()) || upstream.Port() == "":
 		// The front only ever forwards to the server beside it.
 		return nil, errors.New("the mcp upstream must be http on the pod's loopback address")
 	}
@@ -188,14 +212,6 @@ func parseConfig(request requestFile, identity string) (*config, error) {
 			access[level][class] = true
 		}
 	}
-	bridge := false
-	switch block.Transport {
-	case "", "http":
-	case "stdio":
-		bridge = true
-	default:
-		return nil, fmt.Errorf("mcp transport %q is not one the front serves", block.Transport)
-	}
 	switch {
 	case block.Credential == nil:
 	case bridge:
@@ -220,6 +236,7 @@ func parseConfig(request requestFile, identity string) (*config, error) {
 	}
 	return &config{
 		bridge:      bridge,
+		socket:      block.Socket,
 		driver:      request.Driver,
 		connectorID: strings.ToLower(request.Connector.ID),
 		exchangeURL: strings.TrimRight(request.Exchange.URL, "/"),

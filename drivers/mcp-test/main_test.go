@@ -67,6 +67,48 @@ func TestASessionListsToolsWithoutACredentialAndCallsNeedOne(t *testing.T) {
 	}
 }
 
+func TestOnStdioItTakesItsCredentialFromItsEnvironmentAndListsTheProbes(t *testing.T) {
+	s := newServer("hello", "pod-1")
+	s.stdio = true
+	dir := t.TempDir()
+	in := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"whoami"}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"probe_path","arguments":{"path":"` + dir + `"}}}`,
+		`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"probe_socket","arguments":{"path":"` + dir + `/none.sock"}}}`,
+		`{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"self_status"}}`,
+		"not json",
+	}, "\n")
+	var out strings.Builder
+	if err := s.serveStdio(strings.NewReader(in), &out, "secret-1"); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 6 {
+		t.Fatalf("%d answers: %s", len(lines), out.String())
+	}
+	digest := sha256.Sum256([]byte("secret-1"))
+	for i, want := range []string{
+		`"serverInfo"`, `"probe_socket"`, hex.EncodeToString(digest[:]),
+		`"allowed"`, `refused: dial unix`, `env_names`,
+	} {
+		if !strings.Contains(lines[i], want) {
+			t.Fatalf("answer %d lacks %s: %s", i+1, want, lines[i])
+		}
+	}
+	// Over HTTP the probe tools are neither listed nor run.
+	remote := newServer("", "pod-1")
+	session := post(t, remote, "", "", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`).Header().Get("Mcp-Session-Id")
+	if strings.Contains(post(t, remote, session, "", `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`).Body.String(), "probe_") {
+		t.Fatal("the probes are listed over HTTP")
+	}
+	if answer, failed := callText(t, post(t, remote, session, "c", `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"self_status"}}`)); !failed {
+		t.Fatalf("a probe ran over HTTP: %s", answer)
+	}
+}
+
 func TestNotesAndUnknownSessions(t *testing.T) {
 	s := newServer("", "pod-1")
 	session := post(t, s, "", "", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`).Header().Get("Mcp-Session-Id")

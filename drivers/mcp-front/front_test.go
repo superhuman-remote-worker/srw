@@ -237,7 +237,7 @@ func newHarness(t *testing.T) *harness {
 		fmt.Fprintf(logs, format+"\n", a...)
 	}
 	authority := newFakeAuthority()
-	f := newFront(cfg, authority, newUpstreamClient(), logf, clock.Now)
+	f := newFront(cfg, authority, newUpstreamClient(""), logf, clock.Now)
 	return &harness{front: f, authority: authority, server: server, logs: logs, logMu: logMu, clock: clock}
 }
 

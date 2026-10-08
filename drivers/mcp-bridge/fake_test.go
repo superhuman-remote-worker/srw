@@ -29,6 +29,8 @@ const (
 	requireTokenEnv = "BRIDGE_TEST_REQUIRE_TOKEN"
 	// How many orphans the orphans tool leaves.
 	orphanCount = 100
+	// A variable whose value names the process's private directory.
+	homeValueEnv = "BRIDGE_TEST_HOME_VALUE"
 )
 
 func TestMain(m *testing.M) {
@@ -103,9 +105,14 @@ func fakeServer() int {
 		case "tools/call":
 			calls++
 			var params struct {
-				Name string `json:"name"`
+				Name      string            `json:"name"`
+				Arguments map[string]string `json:"arguments"`
 			}
 			json.Unmarshal(message.Params, &params)
+			if found, ok := isolationTool(params.Name, params.Arguments); ok {
+				text(message.ID, found)
+				continue
+			}
 			switch params.Name {
 			case "whoami":
 				credential, held := os.LookupEnv(fakeTokenEnv)

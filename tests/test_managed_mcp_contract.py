@@ -24,6 +24,7 @@ from shared.connectors.builtin import (
     GITEA_MCP_SPEC,
     LEGACY_TYPE_IDS,
     MANAGED_MCP_SPECS,
+    MCP_STDIO_PROBE_SPEC,
     MCP_STDIO_TEST_SPEC,
     MCP_TEST_SPEC,
     MEMORY_MCP_READ_TOOLS,
@@ -36,8 +37,11 @@ from shared.connectors.contract import (
     validate_spec,
 )
 from shared.connectors.mcp import (
+    BINDING_HOME,
     BRIDGE_PATH,
+    BRIDGE_SOCKET,
     CODE_ENV,
+    CODE_ENV_PREFIXES,
     FRONT_PATH,
     RESERVED_HEADERS,
     ManagedMcp,
@@ -167,6 +171,8 @@ def test_the_front_reads_its_own_block():
         ({"command": ["env", "node"], "args": ["${config.y}"]}, "is a shell"),
         ({"env": {"NODE_OPTIONS": "${config.flags}"}}, "loads code"),
         ({"env": {"PATH": "/bin:${config.dir}"}}, "loads code"),
+        # A stdio process's private directory: an http server has none.
+        ({"env": {"DATA": "${binding.home}/x"}}, "an http server has none"),
         ({"env": {"SRW_TOKEN": "x"}}, "reserved"),
         ({"env": {"LD_PRELOAD": "/x.so"}}, "reserved"),
         ({"env": {"OK": "${secret.token}"}}, "placeholder"),
@@ -182,7 +188,12 @@ def test_a_malformed_block_is_refused(over, fragment):
 
 
 def test_the_shipped_managed_servers_are_valid_and_resolve_for_the_agent():
-    for spec in (GITEA_MCP_SPEC, MCP_TEST_SPEC, MCP_STDIO_TEST_SPEC):
+    for spec in (
+        GITEA_MCP_SPEC,
+        MCP_TEST_SPEC,
+        MCP_STDIO_TEST_SPEC,
+        MCP_STDIO_PROBE_SPEC,
+    ):
         assert validate_spec(spec) == [], spec.name
         assert managed_mcp_driver(spec)
         assert managed_mcp(spec) is not None
@@ -195,6 +206,7 @@ def test_the_shipped_managed_servers_are_valid_and_resolve_for_the_agent():
         assert spec.holds_upstream_credentials
     assert GITEA_MCP_SPEC in MANAGED_MCP_SPECS and MCP_TEST_SPEC in DEVELOPMENT_SPECS
     assert MCP_STDIO_TEST_SPEC in DEVELOPMENT_SPECS
+    assert MCP_STDIO_PROBE_SPEC in DEVELOPMENT_SPECS
     assert not any(managed_mcp_driver(spec) for spec in DATASOURCE_SPECS)
 
 
@@ -299,7 +311,6 @@ def test_an_attached_managed_server_binds_the_mcp_category():
 def _stdio(**over):
     block = {
         "transport": "stdio",
-        "port": 8091,
         "tools": {"read": ["read_graph", "search_*"]},
         "access": {"ReadOnly": ["read"], "ReadWrite": ["read", "write"]},
         "credential": {"env": "SERVICE_TOKEN"},
@@ -319,9 +330,12 @@ def test_a_stdio_server_gets_its_credential_in_its_process_environment():
         8,
         600,
     )
+    # The front reaches the bridge on its socket; the upstream's host is a
+    # name only.
     assert mcp.front_config() == {
         "transport": "stdio",
-        "upstream": "http://127.0.0.1:8091/mcp",
+        "upstream": "http://srw-mcp-bridge/mcp",
+        "socket": BRIDGE_SOCKET,
         "protocol": "legacy",
         "tools": {"read": ["read_graph", "search_*"]},
         "access": {"ReadOnly": ["read"], "ReadWrite": ["read", "write"]},
@@ -329,6 +343,7 @@ def test_a_stdio_server_gets_its_credential_in_its_process_environment():
         "max_in_flight_per_binding": 4,
         "tool_pinning": "warn",
     }
+    assert BRIDGE_SOCKET == "/srw/bridge/bridge.sock"
     # A stdio server that takes no credential (the default: none).
     bare = _stdio()
     del bare["credential"]
@@ -344,11 +359,20 @@ def test_the_bridge_is_the_command_and_the_servers_program_follows_it():
         access_levels=LEVELS,
         front_port=8080,
     )
+    # The bridge serves the front's group on its socket and runs each
+    # binding's process as a user of its own, from 20000, with a private
+    # directory under /srw/home.
     assert mcp.bridge_command(["node", "dist/index.js"]) == [
         BRIDGE_PATH,
         "serve",
-        "--listen",
-        "127.0.0.1:8091",
+        "--socket",
+        "/srw/bridge/bridge.sock",
+        "--socket-group",
+        "65532",
+        "--uid-base",
+        "20000",
+        "--home-root",
+        "/srw/home",
         "--path",
         "/rpc",
         "--max-processes",
@@ -362,10 +386,28 @@ def test_the_bridge_is_the_command_and_the_servers_program_follows_it():
         "dist/index.js",
     ]
     assert BRIDGE_PATH == "/srw/bin/srw-mcp-bridge"
-    assert mcp.upstream == "http://127.0.0.1:8091/rpc"
+    assert mcp.upstream == "http://srw-mcp-bridge/rpc"
+    # Outside a pod (a test): no group, no users.
+    assert mcp.bridge_command(
+        ["srv"], socket="/t/b.sock", socket_group=None, uid_base=0, home_root="/t/h"
+    )[2:8] == ["--socket", "/t/b.sock", "--uid-base", "0", "--home-root", "/t/h"]
     config = {"store": "graph", "root": "/data", "mode": "strict"}
     assert mcp.server_env(config) == {"DATA": "/tmp/graph.json"}
     assert mcp.server_args(config) == ["--root=/data", "strict"]
+
+
+def test_a_stdio_server_may_name_its_private_directory():
+    """${binding.home} is the process's private directory, which the bridge
+    fills in for each process; it passes the orchestrator untouched."""
+    block = _stdio(
+        env={"MEMORY_FILE_PATH": BINDING_HOME + "/memory.json"},
+        args=["--data=" + BINDING_HOME + "/data"],
+    )
+    assert mcp_problems(block, access_levels=LEVELS) == []
+    mcp = ManagedMcp.parse(block, access_levels=LEVELS)
+    assert mcp.server_env({}) == {"MEMORY_FILE_PATH": "${binding.home}/memory.json"}
+    assert mcp.server_args({}) == ["--data=${binding.home}/data"]
+    assert mcp.program_problem(["node", "index.js"]) is None
 
 
 @pytest.mark.parametrize(
@@ -403,6 +445,129 @@ def test_a_shell_program_takes_no_templated_argument():
     assert untemplated.program_problem(["/bin/sh"]) is None
 
 
+def _launch_problem(args, program, *, command=None, config=None):
+    """Why a stdio block with these args is refused, at registration, at
+    launch over the whole argv, or when the config is rendered; None when
+    it runs."""
+    block = _stdio(args=list(args), env={})
+    if command is not None:
+        block["command"] = list(command)
+    problems = mcp_problems(block, access_levels=LEVELS)
+    if problems:
+        return problems[0]
+    mcp = ManagedMcp.parse(block, access_levels=LEVELS)
+    problem = mcp.program_problem(
+        list(command) if command is not None else list(program),
+        from_image=command is None,
+    )
+    if problem:
+        return problem
+    try:
+        mcp.server_args(config or {"x": "value"})
+    except TemplateError as exc:
+        return str(exc)
+    return None
+
+
+# The D5b review's template probes (scratchpad py/templates.py): each one is
+# refused at registration, at launch or at render.
+@pytest.mark.parametrize(
+    ("args", "program", "command", "config"),
+    [
+        (["${config.x}"], ("node", "idx.js"), None, {"x": "-e"}),
+        (["--experimental-loader=${config.x}"], ("node", "idx.js"), None, None),
+        (["--env-file=${config.x}"], ("node", "idx.js"), None, None),
+        (["--inspect=${config.x}"], ("node", "idx.js"), None, None),
+        (["-r", "${config.x}"], ("node", "idx.js"), None, None),
+        (["--require", "${config.x}"], ("node", "idx.js"), None, None),
+        (["--import", "${config.x}"], ("node", "idx.js"), None, None),
+        (["--experimental-loader", "${config.x}"], ("node", "idx.js"), None, None),
+        (["-W", "${config.x}"], ("python", "-m", "srv"), None, None),
+        (["-e${config.x}"], ("node", "idx.js"), None, None),
+        (["--eval=${config.x}"], ("node", "idx.js"), None, None),
+        (["-c=${config.x}"], ("node", "idx.js"), None, None),
+        (["${config.x}"], ("uvx",), None, None),
+        (["-y", "${config.x}"], ("npx",), None, None),
+        (["${config.x}"], (), ("/bin/sh", "-c", "exec node idx $0"), None),
+        (["${config.x}"], (), ("/usr/bin/dash", "-c", "x"), None),
+        (["${config.x}"], ("/bin/busybox", "sh", "-c", "x"), None, None),
+        (["${config.x}"], ("/docker-entrypoint.sh",), None, None),
+        (["${config.x}"], ("/sbin/tini", "--", "/bin/sh", "-c", "x"), None, None),
+        (["${config.x}"], ("python", "-c"), None, None),
+        (["${config.x}"], ("node", "-e"), None, None),
+        (["${config.x}"], ("perl", "-e"), None, None),
+        (["${config.x}"], ("xargs",), None, None),
+        (["${config.x}"], ("gosu", "nobody"), None, None),
+        (["${config.x}"], ("deno", "run", "-A"), None, None),
+        (["${config.x}"], ("/bin/bash5", "-c", "x"), None, None),
+        (["${config.x}"], ("python3", "-c"), None, None),
+        (["--from", "${config.x}", "pkg"], ("uvx",), None, None),
+        # An image entrypoint SRW cannot read an argv for: name the program.
+        (["--root=${config.x}"], ("/server/github-mcp-server", "stdio"), None, None),
+        (["${config.x}"], ("/app/run",), None, None),
+    ],
+)
+def test_the_review_template_probes_are_refused(args, program, command, config):
+    assert _launch_problem(args, program, command=command, config=config)
+
+
+@pytest.mark.parametrize(
+    ("args", "program", "command"),
+    [
+        (["${config.root}"], ("npx", "-y", "@modelcontextprotocol/server-fs"), None),
+        (["--root=${config.root}"], ("node", "dist/index.js"), None),
+        (["--config", "${config.root}"], ("node", "dist/index.js"), None),
+        (["${config.root}"], ("python", "-m", "srv"), None),
+        (["${config.root}"], ("tini", "--", "node", "idx.js"), None),
+        (["--a=${config.root}"], ("/usr/local/bin/python3.12", "app.py"), None),
+        # The spec names the program: its author vouches for its argv.
+        (["--root=${config.root}"], (), ("/server/github-mcp-server", "stdio")),
+    ],
+)
+def test_ordinary_templated_arguments_still_run(args, program, command):
+    assert (
+        _launch_problem(args, program, command=command, config={"root": "/d"}) is None
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "GIT_SSH_COMMAND",
+        "BUN_OPTIONS",
+        "DOTNET_STARTUP_HOOKS",
+        "OPENSSL_CONF",
+        "npm_config_registry",
+        "NPM_CONFIG_NODE_OPTIONS",
+        "PIP_INDEX_URL",
+        "UV_INDEX_URL",
+        "PYTHONUSERBASE",
+        "PAGER",
+        "EDITOR",
+        "BROWSER",
+        "GLIBC_TUNABLES",
+        "PYTHONWARNINGS",
+        "Node_Options",
+    ],
+)
+def test_no_config_value_lands_in_a_variable_that_runs_code(name):
+    templated = mcp_problems(_stdio(env={name: "${config.x}"}), access_levels=LEVELS)
+    assert any("no config value is templated" in p for p in templated), templated
+    credential = mcp_problems(
+        _stdio(env={}, credential={"env": name}), access_levels=LEVELS
+    )
+    assert any("reserved or loads code" in p for p in credential), credential
+    # A literal value is the spec author's.
+    assert mcp_problems(_stdio(env={name: "fixed"}), access_levels=LEVELS) == []
+
+
+def test_the_deny_lists_are_a_lint_the_spec_author_is_the_boundary():
+    from shared.connectors import mcp as module
+
+    assert "lint" in module.__doc__ and "trust" in module.__doc__
+    assert CODE_ENV_PREFIXES == ("GIT_", "NPM_CONFIG_", "PIP_", "UV_")
+
+
 @pytest.mark.parametrize(
     ("over", "fragment"),
     [
@@ -423,8 +588,12 @@ def test_a_shell_program_takes_no_templated_argument():
         ({"idle_seconds": 59}, "idle_seconds"),
         ({"idle_seconds": 86401}, "idle_seconds"),
         ({"path": "/srw/status"}, "bridge's own"),
-        ({"port": 8080}, "the front's port"),
+        # The bridge serves a socket: a stdio block names no port.
+        ({"port": 8091}, "an http server's"),
         ({"args": ["--x", "${config.access}"]}, "per lease"),
+        ({"credential": {"env": "TMPDIR"}}, "reserved or loads code"),
+        ({"credential": {"env": "GIT_ASKPASS"}}, "reserved or loads code"),
+        ({"env": {"X": "${binding.other}"}}, "placeholder"),
     ],
 )
 def test_a_malformed_stdio_block_is_refused(over, fragment):
@@ -449,10 +618,37 @@ def test_the_stdio_test_server_is_the_stock_memory_image_behind_the_bridge():
         "a_tool_added_later",
     ):
         assert not mcp.allowed(name, "ReadOnly") and mcp.allowed(name, "ReadWrite")
-    # The image's root filesystem is read-only: its graph lives in /tmp.
-    assert mcp.server_env({}) == {"MEMORY_FILE_PATH": "/tmp/memory.json"}
+    # The image's root filesystem is read-only: each binding's graph lives
+    # in its process's private directory, and a process's heap is capped
+    # below the container's limit (whose OOM kill stops every process).
+    assert mcp.server_env({}) == {
+        "MEMORY_FILE_PATH": "${binding.home}/memory.json",
+        "NODE_OPTIONS": "--max-old-space-size=64",
+    }
     assert mcp.server_args({}) == []
+    assert MCP_STDIO_TEST_SPEC.service.resources["limits"]["memory"] == "640Mi"
     assert not MCP_STDIO_TEST_SPEC.publishable
+
+
+def test_the_stdio_probe_server_is_the_test_image_in_stdio_mode():
+    """The gate's isolation probes: SRW's test server with -stdio, whose
+    probe tools are read tools (they report only whether an attempt was
+    refused)."""
+    mcp = managed_mcp(MCP_STDIO_PROBE_SPEC)
+    assert mcp.stdio and mcp.credential_env == "MCP_TEST_TOKEN"
+    assert list(mcp.command) == [
+        "/srw-mcp-test",
+        "-stdio",
+        "-credential-env",
+        "MCP_TEST_TOKEN",
+    ]
+    for name in ("self_status", "probe_path", "probe_socket", "probe_signal", "whoami"):
+        assert mcp.allowed(name, "ReadOnly"), name
+    assert not mcp.allowed("notes_write", "ReadOnly")
+    source = (ROOT / "drivers/mcp-test/stdio.go").read_text()
+    for name in ("self_status", "probe_path", "probe_socket", "probe_signal"):
+        assert f'"{name}"' in source
+    assert not MCP_STDIO_PROBE_SPEC.publishable
 
 
 def test_the_bridge_and_the_contract_refuse_the_same_credential_names():
@@ -460,9 +656,15 @@ def test_the_bridge_and_the_contract_refuse_the_same_credential_names():
     depth): its codeEnv list is this module's CODE_ENV."""
     source = (ROOT / "drivers/mcp-bridge/env.go").read_text()
     block = source[
-        source.index("var codeEnv") : source.index("}\n", source.index("var codeEnv"))
+        source.index("codeEnv = map") : source.index(
+            "}\n", source.index("codeEnv = map")
+        )
     ]
     assert set(re.findall(r'"([A-Z_0-9]+)": true', block)) == set(CODE_ENV)
+    prefixes = re.search(r"codeEnvPrefixes = \[\]string\{([^}]*)\}", source)
+    assert prefixes and tuple(re.findall(r'"([A-Z_]+)"', prefixes.group(1))) == (
+        CODE_ENV_PREFIXES
+    )
     front = (ROOT / "drivers/mcp-front/bridge.go").read_text()
     for header in ("Srw-Bridge-Binding", "Srw-Bridge-Credential"):
         assert f'"{header}"' in front and header.lower() in RESERVED_HEADERS

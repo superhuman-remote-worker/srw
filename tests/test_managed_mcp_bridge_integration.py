@@ -16,6 +16,11 @@ most its cap of processes, and the D5a review's
 parsing-differential corpus never reaches a process as a write call: every
 line a process reads is in one form every reader agrees on.
 
+The bridge serves the front on a unix socket, as in a pod; without root
+every process runs as the test's own user here (``--uid-base 0``): the
+bridge's isolation tests (as root) and the k3d gate prove that each binding's
+process runs as a user of its own.
+
 Skipped where no Go toolchain is installed (the Python CI); the drivers' own
 Go tests run in their CI job.
 """
@@ -25,11 +30,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import http.client
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -76,6 +84,28 @@ def binaries(tmp_path_factory):
     return out
 
 
+class _SocketConnection(http.client.HTTPConnection):
+    """HTTP over a unix socket (the bridge serves no port)."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__("srw-mcp-bridge", timeout=5)
+        self.path = path
+
+    def connect(self) -> None:
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(5)
+        self.sock.connect(self.path)
+
+
+def _socket_request(path: str, method: str, url: str) -> bytes:
+    connection = _SocketConnection(path)
+    try:
+        connection.request(method, url)
+        return connection.getresponse().read()
+    finally:
+        connection.close()
+
+
 class StdioPod:
     """The front and the bridge, as one stdio pod runs them: the bridge is
     the server container's command, the stdio server's program follows it."""
@@ -85,12 +115,14 @@ class StdioPod:
     ) -> None:
         self.exchange = exchange
         self.front_port = _free_port()
-        self.bridge_port = _free_port()
+        # The bridge's socket, in a directory only this user may enter (in a
+        # pod: the front's group). Kept short: a socket path has 108 bytes.
+        self.socket_dir = Path(tempfile.mkdtemp(prefix="srw-bridge-"))
+        self.socket = str(self.socket_dir / "bridge.sock")
         self.processes: list[subprocess.Popen] = []
         self.mcp = ManagedMcp.parse(
             {
                 "transport": "stdio",
-                "port": self.bridge_port,
                 "tools": {"read": READ_TOOLS},
                 "access": {"ReadOnly": ["read"], "ReadWrite": ["read", "write"]},
                 "credential": {"env": "MCP_TOKEN"},
@@ -108,7 +140,7 @@ class StdioPod:
             "credentials": {},
             "service": {"port": self.front_port, "port_name": "srw-driver"},
             "exchange": {"url": exchange.url, "identity_file": "identity"},
-            "mcp": self.mcp.front_config(),
+            "mcp": self.mcp.front_config(socket=self.socket),
         }
         (workdir / "request.json").write_text(json.dumps(request))
         (workdir / "identity").write_text(exchange.identity + "\n")
@@ -117,7 +149,15 @@ class StdioPod:
         self.lines.mkdir()
         self.front_log = workdir / "front.log"
         self.bridge_log = workdir / "bridge.log"
-        command = self.mcp.bridge_command([sys.executable, str(SERVER)])
+        # Outside a pod there is no root: every process runs as this user
+        # (--uid-base 0); the bridge's own tests prove the users.
+        command = self.mcp.bridge_command(
+            [sys.executable, str(SERVER)],
+            socket=self.socket,
+            socket_group=None,
+            uid_base=0,
+            home_root=str(workdir / "home"),
+        )
         self.command = [str(binaries / "bridge"), *command[1:]]
         self.front = binaries / "front"
 
@@ -173,12 +213,11 @@ class StdioPod:
         for process in self.processes:
             process.wait(timeout=20)
         self.processes.clear()
+        shutil.rmtree(self.socket_dir, ignore_errors=True)
 
     def status(self) -> dict:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{self.bridge_port}/srw/status", timeout=5
-        ) as response:
-            return json.load(response)
+        """GET /srw/status on the bridge's socket (the front's view)."""
+        return json.loads(_socket_request(self.socket, "GET", "/srw/status"))
 
     def processes_by_binding(self) -> dict[str, int]:
         return {

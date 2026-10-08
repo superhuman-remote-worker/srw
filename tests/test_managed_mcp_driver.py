@@ -500,6 +500,24 @@ def test_the_test_server_runs_its_own_program_with_its_arguments():
 
 MEMORY_IMAGE = f"docker.io/mcp/memory@{DIGEST}"
 NO_EGRESS = EgressPins(hosts=(), resolved_at=PINS.resolved_at)
+#: The capabilities Pod Security baseline allows a container to add.
+BASELINE_CAPABILITIES = frozenset(
+    {
+        "AUDIT_WRITE",
+        "CHOWN",
+        "DAC_OVERRIDE",
+        "FOWNER",
+        "FSETID",
+        "KILL",
+        "MKNOD",
+        "NET_BIND_SERVICE",
+        "SETFCAP",
+        "SETGID",
+        "SETPCAP",
+        "SETUID",
+        "SYS_CHROOT",
+    }
+)
 
 
 def _stdio_plan(spec=MCP_STDIO_TEST_SPEC, **over):
@@ -541,13 +559,20 @@ def test_the_bridge_is_installed_from_the_front_image_after_the_canary():
 
 
 def test_the_stock_image_runs_its_own_program_behind_the_bridge():
-    server, front = _stdio_plan().pod["spec"]["containers"]
+    spec = _stdio_plan().pod["spec"]
+    server, front = spec["containers"]
     assert server["image"] == MEMORY_IMAGE
     assert server["command"] == [
         "/srw/bin/srw-mcp-bridge",
         "serve",
-        "--listen",
-        "127.0.0.1:8091",
+        "--socket",
+        "/srw/bridge/bridge.sock",
+        "--socket-group",
+        "65532",
+        "--uid-base",
+        "20000",
+        "--home-root",
+        "/srw/home",
         "--path",
         "/mcp",
         "--max-processes",
@@ -561,17 +586,62 @@ def test_the_stock_image_runs_its_own_program_behind_the_bridge():
         "dist/index.js",
     ]
     assert server["args"] == []
-    assert server["env"] == [{"name": "MEMORY_FILE_PATH", "value": "/tmp/memory.json"}]
+    # ${binding.home} is the bridge's to fill in, per process ($$ is $).
+    assert server["env"] == [
+        {"name": "MEMORY_FILE_PATH", "value": "$${binding.home}/memory.json"},
+        {"name": "NODE_OPTIONS", "value": "--max-old-space-size=64"},
+    ]
     assert server["volumeMounts"] == [
         {"name": "tmp", "mountPath": "/tmp"},
         {"name": "srw-bin", "mountPath": "/srw/bin", "readOnly": True},
+        {"name": "srw-bridge", "mountPath": "/srw/bridge"},
+        {"name": "srw-home", "mountPath": "/srw/home"},
     ]
     assert "ports" not in server
-    assert server["securityContext"]["readOnlyRootFilesystem"] is True
-    # The front is the pod's only named port, as for an HTTP server.
+    # The front is the pod's only named port, as for an HTTP server; it
+    # reaches the bridge on the socket, read-only.
     assert front["ports"] == [
         {"name": "srw-driver", "containerPort": 8080, "protocol": "TCP"}
     ]
+    assert {
+        "name": "srw-bridge",
+        "mountPath": "/srw/bridge",
+        "readOnly": True,
+    } in front["volumeMounts"]
+    for volume in (
+        {"name": "srw-bridge", "emptyDir": {"sizeLimit": "1Mi"}},
+        {"name": "srw-home", "emptyDir": {"sizeLimit": "256Mi"}},
+    ):
+        assert volume in spec["volumes"]
+
+
+def test_the_bridge_runs_as_root_with_its_own_capabilities_alone():
+    """The server container is root for the bridge, which runs each
+    binding's process as a user of its own: SETUID and SETGID to switch,
+    KILL, CHOWN, DAC_OVERRIDE and FOWNER for that user's processes and
+    files. Pod Security baseline allows each; nothing escalates."""
+    server, front = _stdio_plan().pod["spec"]["containers"]
+    security = server["securityContext"]
+    assert (security["runAsUser"], security["runAsGroup"]) == (0, 0)
+    assert security["runAsNonRoot"] is False
+    assert security["capabilities"] == {
+        "drop": ["ALL"],
+        "add": ["CHOWN", "DAC_OVERRIDE", "FOWNER", "KILL", "SETGID", "SETUID"],
+    }
+    assert set(security["capabilities"]["add"]) <= BASELINE_CAPABILITIES
+    assert security["allowPrivilegeEscalation"] is False
+    assert security["privileged"] is False
+    assert security["readOnlyRootFilesystem"] is True
+    # The front stays unprivileged, in the socket's group.
+    assert front["securityContext"]["runAsUser"] == 65532
+    assert front["securityContext"]["runAsGroup"] == 65532
+    assert front["securityContext"]["capabilities"] == {"drop": ["ALL"]}
+    # An HTTP server's pod keeps every capability dropped, as itself.
+    http_server = _plan(
+        MCP_TEST_SPEC, image=f"srw-mcp-test@{DIGEST}", config={"message": "m"}
+    ).pod["spec"]["containers"][0]
+    assert http_server["securityContext"]["capabilities"] == {"drop": ["ALL"]}
+    assert "runAsUser" not in http_server["securityContext"]
 
 
 def test_a_stdio_pod_holds_no_credential_anywhere():
@@ -581,10 +651,11 @@ def test_a_stdio_pod_holds_no_credential_anywhere():
     assert TOKEN not in json.dumps(
         [plan.pod, plan.secret, plan.service, plan.network_policy]
     )
-    # The front's block: the bridge upstream and where a binding's process
+    # The front's block: the bridge's socket and where a binding's process
     # gets its credential (from the front, per binding).
     assert request["mcp"]["transport"] == "stdio"
-    assert request["mcp"]["upstream"] == "http://127.0.0.1:8091/mcp"
+    assert request["mcp"]["upstream"] == "http://srw-mcp-bridge/mcp"
+    assert request["mcp"]["socket"] == "/srw/bridge/bridge.sock"
     assert request["mcp"]["credential"] == {"env": "MCP_STDIO_TEST_TOKEN"}
     server = plan.pod["spec"]["containers"][0]
     assert not any(e["name"] == "MCP_STDIO_TEST_TOKEN" for e in server["env"])
@@ -611,6 +682,24 @@ def test_a_config_value_never_injects_an_option_or_a_shell_at_launch():
         _stdio_plan(
             templated, entrypoint=["/bin/sh", "-c"], cmd=[], config={"root": "x"}
         )
+    # The launch checks the whole argv as registration does: a wrapper's
+    # shell, a code option at the end of the image's program, the script a
+    # runner runs, and an entrypoint SRW cannot read.
+    for entrypoint, cmd, fragment in (
+        (["/sbin/tini", "--"], ["/bin/sh", "-c", "x"], "is a shell"),
+        (["python"], ["-c"], "never code"),
+        (["node"], ["-e"], "never code"),
+        (["npx", "-y"], [], "literal one comes first"),
+        (["/docker-entrypoint.sh"], [], "is a shell"),
+        (["/server/mcp-server"], ["stdio"], "name the server's program"),
+    ):
+        with pytest.raises(ServiceLaunchError, match=fragment):
+            _stdio_plan(templated, entrypoint=entrypoint, cmd=cmd, config={"root": "x"})
+    # A program the spec names is its author's to vouch for.
+    named = _stdio_spec(args=["${config.root}"], command=["/server/mcp-server"])
+    assert _stdio_plan(named, config={"root": "x"}).pod["spec"]["containers"][0][
+        "args"
+    ] == ["x"]
     # Kubernetes never expands a $(VAR) in a value.
     plan = _stdio_plan(templated, config={"root": "/data/$(SECRET)"})
     assert plan.pod["spec"]["containers"][0]["args"] == ["/data/$$(SECRET)"]

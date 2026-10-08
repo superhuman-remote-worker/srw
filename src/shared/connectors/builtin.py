@@ -1080,12 +1080,13 @@ MEMORY_MCP_READ_TOOLS: tuple[str, ...] = ("read_graph", "search_nodes", "open_no
 
 #: A development managed MCP server for stdio images (D5b): Docker's stock
 #: mcp/memory image, unchanged, behind SRW's stdio bridge and front, one
-#: process per binding. Its graph is a file in the pod's /tmp, so every
-#: binding of one connector shares it while the pod lives. The server takes
-#: no credential; the connector's token is delivered to each binding's
-#: process anyway (MCP_STDIO_TEST_TOKEN), so the k3d gate can prove where a
-#: stdio server's credential goes. Installed only when
-#: ``connectors.drivers.mcpStdioTest`` is on; no catalogue lists it.
+#: process per binding, each as a user of its own. Its graph is a file in
+#: the process's private directory, so it is the binding's alone and lives
+#: as long as its process. The server takes no credential; the connector's
+#: token is delivered to each binding's process anyway
+#: (MCP_STDIO_TEST_TOKEN), so the k3d gate can prove where a stdio server's
+#: credential goes. Installed only when ``connectors.drivers.mcpStdioTest``
+#: is on; no catalogue lists it.
 MCP_STDIO_TEST_SPEC = DriverSpec(
     name="srw.mcp-stdio-test/v1",
     legacy_type="mcp_stdio_test",
@@ -1120,20 +1121,104 @@ MCP_STDIO_TEST_SPEC = DriverSpec(
     service=ServiceSpec(
         port=8080,
         callers=("harness",),
-        # The bridge and up to four Node processes of the server.
-        resources={"limits": {"cpu": "500m", "memory": "384Mi"}},
+        # The bridge and up to five Node processes of the server (four
+        # bindings and the probe), each held to a 64 MiB heap: one process
+        # running out of heap exits alone, while the container's memory
+        # limit is one cgroup, whose OOM kill takes every process down.
+        resources={"limits": {"cpu": "500m", "memory": "640Mi"}},
         start_seconds=20,
         mcp={
             "transport": "stdio",
-            "port": 8091,
             "path": "/mcp",
             "protocol": "legacy",
             "tools": {"read": list(MEMORY_MCP_READ_TOOLS)},
             "access": _MANAGED_MCP_TOOL_ACCESS,
             "credential": {"env": "MCP_STDIO_TEST_TOKEN"},
-            # The image's root filesystem is read-only: the graph lives in
-            # the pod's /tmp.
-            "env": {"MEMORY_FILE_PATH": "/tmp/memory.json"},
+            "env": {
+                # The image's root filesystem is read-only: each binding's
+                # graph lives in its process's private directory.
+                "MEMORY_FILE_PATH": "${binding.home}/memory.json",
+                "NODE_OPTIONS": "--max-old-space-size=64",
+            },
+            "stdio_mode": "process-per-binding",
+            "max_bindings_per_pod": 4,
+            "idle_seconds": 600,
+            "max_in_flight_per_binding": 4,
+            "tool_pinning": "warn",
+        },
+    ),
+)
+
+#: The read tools of SRW's MCP test server in stdio mode: its own, and the
+#: probe tools, which report only whether an attempt was refused.
+MCP_STDIO_PROBE_READ_TOOLS: tuple[str, ...] = (
+    "whoami",
+    "notes_list",
+    "notes_read",
+    "leak_credential",
+    "self_status",
+    "probe_path",
+    "probe_socket",
+    "probe_signal",
+)
+
+#: A development managed MCP server (D5b): SRW's srw-mcp-test image in
+#: stdio mode (``-stdio``, built by Tilt only), behind SRW's stdio bridge
+#: and front, one process per binding, each as a user of its own. Its probe
+#: tools look around the pod from inside a binding's process, as a
+#: compromised server could, so the k3d gate can prove that one binding's
+#: process reaches neither another's environment, directory or process nor
+#: the bridge. Installed only when ``connectors.drivers.mcpStdioProbe`` is on
+#: (it runs the ``mcpTest`` image); no catalogue lists it.
+MCP_STDIO_PROBE_SPEC = DriverSpec(
+    name="srw.mcp-stdio-probe/v1",
+    legacy_type="mcp_stdio_probe",
+    title="MCP stdio probe server (development)",
+    plane="service",
+    delivery_forms=("mcp_client",),
+    config_schema={
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["message"],
+        "properties": {
+            "message": {"type": "string", "maxLength": 256},
+            "access": _ACCESS_CHOICE,
+        },
+    },
+    credential_slots=(
+        CredentialSlot(
+            "token",
+            "secret_string",
+            {"type": "object", "properties": {"token": _SECRET}},
+            required=True,
+            update="replace",
+        ),
+    ),
+    tool_category="mcp",
+    access_levels=_managed_mcp_access(
+        _FRONT_HIDES_WRITE_TOOLS,
+        "The test server allows every tool.",
+    ),
+    default_access="ReadWrite",
+    supported_backends=ALL_BACKENDS,
+    workspace_requirements="None: the agent process is the MCP client.",
+    publishable=False,
+    holds_upstream_credentials=True,
+    credential_delivery="lease",
+    service=ServiceSpec(
+        port=8080,
+        callers=("harness",),
+        resources={"limits": {"cpu": "200m", "memory": "128Mi"}},
+        start_seconds=10,
+        mcp={
+            "transport": "stdio",
+            "path": "/mcp",
+            "protocol": "legacy",
+            "tools": {"read": list(MCP_STDIO_PROBE_READ_TOOLS)},
+            "access": _MANAGED_MCP_TOOL_ACCESS,
+            "credential": {"env": "MCP_TEST_TOKEN"},
+            "env": {"MCP_TEST_MESSAGE": "${config.message}"},
+            "command": ["/srw-mcp-test", "-stdio", "-credential-env", "MCP_TEST_TOKEN"],
             "stdio_mode": "process-per-binding",
             "max_bindings_per_pod": 4,
             "idle_seconds": 600,
@@ -1285,6 +1370,7 @@ DEVELOPMENT_SPECS: tuple[DriverSpec, ...] = (
     ECHO_SERVICE_SPEC,
     MCP_TEST_SPEC,
     MCP_STDIO_TEST_SPEC,
+    MCP_STDIO_PROBE_SPEC,
 )
 
 _BY_TYPE: dict[str, DriverSpec] = {

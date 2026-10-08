@@ -5,9 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -19,7 +21,9 @@ import (
 // binding's process with its lease, and probes readiness in the
 // background. Every check of the front stays as it is.
 
-func bridgeConfig(t *testing.T, upstream string) *config {
+const bridgeUpstream = "http://" + bridgeHost + "/mcp"
+
+func bridgeConfig(t *testing.T, socket string) *config {
 	t.Helper()
 	request := requestFile{ProtocolVersion: "1.0", Plane: "service", Driver: "srw.mcp-stdio-test/v1"}
 	request.Connector.ID = connectorID
@@ -27,7 +31,8 @@ func bridgeConfig(t *testing.T, upstream string) *config {
 	request.Exchange.URL = "http://exchange.srw.svc:8088"
 	request.MCP = &mcpBlock{
 		Transport:             "stdio",
-		Upstream:              upstream,
+		Upstream:              bridgeUpstream,
+		Socket:                socket,
 		Access:                map[string][]string{"ReadOnly": {"read"}, "ReadWrite": {"read", "write"}},
 		Credential:            &credentialRule{Env: "MCP_TOKEN"},
 		MaxInFlightPerBinding: 2,
@@ -40,12 +45,23 @@ func bridgeConfig(t *testing.T, upstream string) *config {
 	return cfg
 }
 
+// newBridgeHarness is the front in front of a fake bridge that serves a
+// unix socket, as the real one does.
 func newBridgeHarness(t *testing.T) *harness {
 	t.Helper()
 	h := newHarness(t)
-	upstream := h.front.cfg.upstream.String()
-	cfg := bridgeConfig(t, upstream)
-	h.front = newFront(cfg, h.authority, newUpstreamClient(), func(format string, a ...any) {
+	socket := filepath.Join(t.TempDir(), "bridge.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge := httptest.NewUnstartedServer(h.server)
+	bridge.Listener.Close()
+	bridge.Listener = listener
+	bridge.Start()
+	t.Cleanup(bridge.Close)
+	cfg := bridgeConfig(t, socket)
+	h.front = newFront(cfg, h.authority, newUpstreamClient(socket), func(format string, a ...any) {
 		h.logMu.Lock()
 		defer h.logMu.Unlock()
 		fmt.Fprintf(h.logs, format+"\n", a...)
@@ -67,8 +83,8 @@ func (s *fakeServer) at(path string) []*http.Request {
 }
 
 func TestAStdioServersConfigNamesAnEnvironmentVariable(t *testing.T) {
-	cfg := bridgeConfig(t, "http://127.0.0.1:8091/mcp")
-	if !cfg.bridge || cfg.credential.Env != "MCP_TOKEN" {
+	cfg := bridgeConfig(t, "/srw/bridge/bridge.sock")
+	if !cfg.bridge || cfg.credential.Env != "MCP_TOKEN" || cfg.socket != "/srw/bridge/bridge.sock" {
 		t.Fatalf("%+v", cfg)
 	}
 	for _, test := range []struct {
@@ -93,6 +109,9 @@ func TestAStdioServersConfigNamesAnEnvironmentVariable(t *testing.T) {
 			Access:     map[string][]string{"ReadWrite": {"read", "write"}},
 			Credential: test.credential,
 		}
+		if test.transport == "stdio" {
+			request.MCP.Upstream, request.MCP.Socket = bridgeUpstream, "/srw/bridge/bridge.sock"
+		}
 		if _, err := parseConfig(request, identity); err == nil {
 			t.Errorf("%s %+v was accepted", test.transport, test.credential)
 		}
@@ -102,9 +121,39 @@ func TestAStdioServersConfigNamesAnEnvironmentVariable(t *testing.T) {
 	request.Connector.ID = connectorID
 	request.Service.Port = 8080
 	request.Exchange.URL = "http://exchange:8088"
-	request.MCP = &mcpBlock{Transport: "stdio", Upstream: "http://127.0.0.1:8091/mcp", Access: map[string][]string{"ReadWrite": {"read"}}}
+	request.MCP = &mcpBlock{Transport: "stdio", Upstream: bridgeUpstream, Socket: "/srw/bridge/bridge.sock", Access: map[string][]string{"ReadWrite": {"read"}}}
 	if cfg, err := parseConfig(request, identity); err != nil || !cfg.bridge || cfg.credential != nil {
 		t.Fatalf("%+v %v", cfg, err)
+	}
+}
+
+func TestTheBridgeIsReachedOnItsSocketOnly(t *testing.T) {
+	for name, block := range map[string]mcpBlock{
+		"stdio on a port":         {Transport: "stdio", Upstream: "http://127.0.0.1:8091/mcp"},
+		"stdio on a port, socket": {Transport: "stdio", Upstream: "http://127.0.0.1:8091/mcp", Socket: "/srw/bridge/bridge.sock"},
+		"stdio, relative socket":  {Transport: "stdio", Upstream: bridgeUpstream, Socket: "bridge.sock"},
+		"stdio, unclean socket":   {Transport: "stdio", Upstream: bridgeUpstream, Socket: "/srw/../bridge.sock"},
+		"stdio, control path":     {Transport: "stdio", Upstream: "http://" + bridgeHost + "/srw/status", Socket: "/srw/bridge/bridge.sock"},
+		"stdio, other host":       {Transport: "stdio", Upstream: "http://evil.example/mcp", Socket: "/srw/bridge/bridge.sock"},
+		"http with a socket":      {Transport: "http", Upstream: "http://127.0.0.1:8091/mcp", Socket: "/srw/bridge/bridge.sock"},
+	} {
+		request := requestFile{ProtocolVersion: "1.0", Plane: "service"}
+		request.Connector.ID = connectorID
+		request.Service.Port = 8080
+		request.Exchange.URL = "http://exchange:8088"
+		block.Access = map[string][]string{"ReadWrite": {"read"}}
+		request.MCP = &block
+		if _, err := parseConfig(request, identity); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+	// The front dials the socket whatever the upstream's host says.
+	h := newBridgeHarness(t)
+	if code := h.do(t, http.MethodPost, tokenA, call("whoami"), nil).Code; code != http.StatusOK {
+		t.Fatalf("through the socket: %d", code)
+	}
+	if seen, _ := h.server.last(); seen == nil || seen.Host != bridgeHost {
+		t.Fatalf("the bridge saw %+v", seen)
 	}
 }
 

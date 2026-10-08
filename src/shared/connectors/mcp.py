@@ -19,7 +19,15 @@ binding: started on the binding's first request, serving the binding's
 sessions one at a time (initialized once), stopped when its lease ends (the
 front tells the bridge), when it exits or when it is idle, at most
 ``max_bindings_per_pod`` at once. The front stays the authorization
-boundary; the bridge forwards exactly the bytes the front checked.
+boundary; the bridge forwards exactly the bytes the front checked. The
+bindings of one pod are isolated from each other by user: the server
+container runs as root with only the capabilities the bridge needs
+(``BRIDGE_CAPABILITIES``), and the bridge starts each process as a user of
+its own (from ``BINDING_UID_BASE``) with no capability, no way to gain one,
+a private directory as HOME and TMPDIR and private files, so a process can
+read neither another binding's environment nor its files, signal it, nor
+reach the bridge, which serves the front only on a unix socket in a
+directory the front's group alone may enter.
 
 The block, ``ServiceSpec.mcp``, is plain JSON, so it can ride an image label:
 
@@ -27,10 +35,11 @@ The block, ``ServiceSpec.mcp``, is plain JSON, so it can ride an image label:
     ``http``: the server speaks streamable HTTP. ``stdio``: it speaks MCP on
     its stdin and stdout, behind the bridge.
 ``port``, ``path``
-    Where the server (``http``) or the bridge (``stdio``) listens inside the
-    pod, on ``127.0.0.1`` (for an HTTP image that cannot bind loopback, only
-    the front's port is reachable from outside the pod, by its
-    NetworkPolicy). Never the front's port.
+    Where the server listens inside the pod, on ``127.0.0.1`` (for an HTTP
+    image that cannot bind loopback, only the front's port is reachable
+    from outside the pod, by its NetworkPolicy). Never the front's port. A
+    stdio server names no port: the bridge serves the front ``path`` on a
+    unix socket only the front's group may reach.
 ``protocol``
     ``legacy`` (initialize-based 2025 sessions) or ``both`` (it also speaks
     the stateless 2026-07-28 protocol). SRW's own client is session-based
@@ -66,11 +75,26 @@ The block, ``ServiceSpec.mcp``, is plain JSON, so it can ride an image label:
     template can inject neither a shell nor an argument: never in
     ``command``; in ``args`` only as a whole argument or an option's value
     after ``=`` (``--root=${config.root}``), never after an option that
-    takes code (``-c``, ``-e``, ``--eval``...) and never when the program is
-    a shell; a whole-argument value may not start with ``-``; no value
-    holds a NUL or a line break; and never in a variable that loads code.
+    takes code (``-c``, ``-e``, ``--eval``, ``--require``, ``--env-file``,
+    ``-W``...); never when a shell or a shell script is anywhere in the
+    program (``tini -- /bin/sh -c``); never as the command a wrapper
+    (``tini``, ``gosu``...) runs or the script, module or package an
+    interpreter or a package runner (``node``, ``python``, ``npx``,
+    ``uvx``...) runs: a literal one comes first; a whole-argument value may
+    not start with ``-``; no value holds a NUL or a line break; and never in
+    a variable that loads code or configures a package installer
+    (``NODE_OPTIONS``, ``GIT_SSH_COMMAND``, ``npm_config_*``, ``PIP_*``...).
+    The same check runs at registration and, over the whole argv (the
+    image's entrypoint and command, or ``command``, then ``args``), at
+    launch; with no ``command``, templated arguments need an image whose
+    entrypoint is an interpreter or a package runner SRW knows. These deny
+    lists are a lint, not a sandbox: the spec's author is the trust
+    boundary (a spec is reviewed before it is installed), and the lint
+    catches the templates a connector's config would turn into code.
     Never ``${config.access}``: the front decides access per lease, so an
-    access change starts no new pod.
+    access change starts no new pod. ``${binding.home}`` (stdio only) is the
+    process's private directory, for a server that keeps state in a file
+    (``MEMORY_FILE_PATH=${binding.home}/memory.json``).
 ``max_in_flight_per_binding``
     Calls one binding may have open at once (the front answers 429 past it).
 ``tool_pinning``
@@ -109,6 +133,34 @@ STDIO_MODES: tuple[str, ...] = ("process-per-binding",)
 #: container (drivers/mcp-bridge ``install``).
 BRIDGE_DIR = "/srw/bin"
 BRIDGE_PATH = f"{BRIDGE_DIR}/srw-mcp-bridge"
+#: The bridge serves the front on a unix socket in a directory only the
+#: front's group may enter (an emptyDir both containers mount), never on a
+#: port every process of the pod could reach. The upstream URL's host is a
+#: name only: the front dials the socket.
+BRIDGE_SOCKET_DIR = "/srw/bridge"
+BRIDGE_SOCKET = f"{BRIDGE_SOCKET_DIR}/bridge.sock"
+BRIDGE_HOST = "srw-mcp-bridge"
+#: The front's user and group (SRW's images run as it): the socket's group.
+FRONT_USER = 65532
+#: Each binding's process runs as a user of its own, from this one on, with
+#: a private directory under the home root as HOME and TMPDIR.
+BINDING_UID_BASE = 20000
+BINDING_HOME_ROOT = "/srw/home"
+#: In a stdio server's environment value or argument: its process's
+#: private directory (a file only that binding's process may read).
+BINDING_HOME = "${binding.home}"
+#: What the bridge (the server container's root) needs to run each process
+#: as a user of its own and to clean up after it: switch users, kill and
+#: chown that user's processes and files. Pod Security ``baseline`` allows
+#: each; the processes themselves keep none.
+BRIDGE_CAPABILITIES: tuple[str, ...] = (
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "KILL",
+    "SETGID",
+    "SETUID",
+)
 #: Headers the front forwards or sets, or the transport owns: the
 #: credential may never be written over one (lowercase; drivers/mcp-front
 #: reservedHeaders).
@@ -136,40 +188,70 @@ RESERVED_HEADERS: frozenset[str] = frozenset(
         "upgrade",
     }
 )
-#: Environment variables a runtime reads code or its search path from: no
-#: config value is templated into one and no credential is delivered in one
-#: (drivers/mcp-bridge codeEnv holds the same list).
+#: Environment variables a runtime reads code, its search path, a command
+#: to run or a package index from: no config value is templated into one
+#: and no credential is delivered in one (drivers/mcp-bridge codeEnv holds
+#: the same lists). Compared in upper case.
 CODE_ENV: frozenset[str] = frozenset(
     {
         "BASH_ENV",
         "BASHOPTS",
+        "BROWSER",
+        "BUN_OPTIONS",
         "CLASSPATH",
+        "DOTNET_STARTUP_HOOKS",
+        "EDITOR",
+        "ELECTRON_RUN_AS_NODE",
         "ENV",
         "GCONV_PATH",
+        "GEM_HOME",
+        "GEM_PATH",
+        "GLIBC_TUNABLES",
         "HOME",
         "IFS",
+        "JAVA_OPTS",
         "JAVA_TOOL_OPTIONS",
         "JDK_JAVA_OPTIONS",
         "_JAVA_OPTIONS",
+        "LESSOPEN",
         "NODE_OPTIONS",
         "NODE_PATH",
+        "NODE_REPL_EXTERNAL_MODULE",
+        "OPENSSL_CONF",
+        "OPENSSL_MODULES",
+        "PAGER",
         "PATH",
+        "PERL5DB",
         "PERL5LIB",
         "PERL5OPT",
         "PERLLIB",
         "PROMPT_COMMAND",
         "PS4",
+        "PYTHONBREAKPOINT",
         "PYTHONHOME",
+        "PYTHONINSPECT",
         "PYTHONPATH",
         "PYTHONSTARTUP",
+        "PYTHONUSERBASE",
+        "PYTHONWARNINGS",
+        "RUBYGEMS_GEMDEPS",
         "RUBYLIB",
         "RUBYOPT",
         "SHELLOPTS",
+        "SSH_ASKPASS",
+        "SUDO_ASKPASS",
+        # A stdio process's HOME and TMPDIR are its private directory.
+        "TMPDIR",
+        "VISUAL",
         "ZDOTDIR",
     }
 )
+#: Prefixes of whole families of such variables (git's commands and config,
+#: npm's, pip's and uv's settings, a package index among them).
+CODE_ENV_PREFIXES: tuple[str, ...] = ("GIT_", "NPM_CONFIG_", "PIP_", "UV_")
 #: Programs that run their arguments as code or as another command: a
-#: templated argument would be code.
+#: templated argument would be code. A program whose name ends in a shell
+#: script's suffix (``/docker-entrypoint.sh``) is one too.
 SHELLS: frozenset[str] = frozenset(
     {
         "ash",
@@ -188,7 +270,11 @@ SHELLS: frozenset[str] = frozenset(
         "zsh",
     }
 )
-#: Options whose next argument is code or the module to run.
+_SCRIPT_SUFFIXES: tuple[str, ...] = (".sh", ".bash", ".ksh", ".zsh")
+#: A shell under a versioned name (``bash5``, ``zsh5.9``).
+_VERSIONED_SHELL = re.compile(r"(ash|bash|dash|fish|ksh|mksh|sh|zsh)[\d.]+\Z")
+#: Options whose value is code, the module or package to run, where code
+#: or packages come from, or a debugger anyone in the pod could reach.
 CODE_OPTIONS: frozenset[str] = frozenset(
     {
         "-c",
@@ -199,17 +285,88 @@ CODE_OPTIONS: frozenset[str] = frozenset(
         "-m",
         "-p",
         "-r",
+        "-W",
         "--command",
+        "--env-file",
+        "--env-file-if-exists",
         "--eval",
         "--exec",
+        "--experimental-loader",
+        "--extra-index-url",
+        "--from",
         "--import",
+        "--index-url",
+        "--inspect",
+        "--inspect-brk",
+        "--inspect-port",
+        "--inspect-wait",
         "--loader",
+        "--package",
         "--print",
+        "--python",
+        "--registry",
         "--require",
+        "--with",
         "/c",
         "/k",
     }
 )
+#: Programs that run the command their arguments name, after the
+#: positional arguments they take first (a user, a duration, a
+#: directory): the program behind them is the one that runs.
+WRAPPERS: Mapping[str, int] = {
+    "catatonit": 0,
+    "chroot": 1,
+    "doas": 0,
+    "dumb-init": 0,
+    "gosu": 1,
+    "nice": 0,
+    "nohup": 0,
+    "s6-setuidgid": 1,
+    "setpriv": 0,
+    "setsid": 0,
+    "stdbuf": 0,
+    "su-exec": 1,
+    "sudo": 0,
+    "timeout": 1,
+    "tini": 0,
+    "unbuffer": 0,
+    "xargs": 0,
+}
+#: Interpreters and package runners: each runs the script, module or
+#: package its first argument that is no option names, so that argument is
+#: never templated. With no ``command`` in the block, templated arguments
+#: need an image entrypoint that is one of these: SRW can read no other
+#: program's argv.
+SCRIPT_RUNNERS: frozenset[str] = frozenset(
+    {
+        "bun",
+        "bunx",
+        "deno",
+        "java",
+        "node",
+        "nodejs",
+        "npm",
+        "npx",
+        "perl",
+        "php",
+        "pipx",
+        "pnpm",
+        "pnpx",
+        "pypy",
+        "pypy3",
+        "python",
+        "python3",
+        "ruby",
+        "uv",
+        "uvx",
+        "yarn",
+    }
+)
+_VERSIONED_RUNNER = re.compile(r"(python3|pypy3|node|ruby|php)[.\d]*\d\Z")
+#: A runner's subcommands that run what follows them (``deno run``,
+#: ``bun x``, ``uv tool run``, ``deno eval``).
+_RUNNER_SUBCOMMANDS = frozenset({"dlx", "eval", "exec", "run", "tool", "x"})
 #: Config keys a server's arguments and environment may not name.
 _UNTEMPLATED = frozenset({"access"})
 TOOL_PINNING: tuple[str, ...] = ("warn", "block")
@@ -294,6 +451,47 @@ def program_name(program: Sequence[str]) -> str:
     return posixpath.basename(program[0]) if program else ""
 
 
+def code_env(name: str) -> bool:
+    """Whether a variable loads code, names a command or a package index."""
+    upper = name.upper()
+    return upper in CODE_ENV or upper.startswith(CODE_ENV_PREFIXES)
+
+
+def _shell(item: str) -> bool:
+    name = program_name([item])
+    return (
+        name in SHELLS
+        or name.endswith(_SCRIPT_SUFFIXES)
+        or _VERSIONED_SHELL.fullmatch(name) is not None
+    )
+
+
+def _runner(name: str) -> bool:
+    return name in SCRIPT_RUNNERS or _VERSIONED_RUNNER.fullmatch(name) is not None
+
+
+def _real_program(argv: Sequence[str]) -> tuple[str, int] | None:
+    """The program that runs behind any wrappers, and its index in
+    ``argv``; ``None`` when a template stands where a wrapper's argument or
+    command is."""
+    index = 0
+    while index < len(argv):
+        if _TEMPLATE.search(argv[index]):
+            return None
+        name = program_name([argv[index]])
+        if name not in WRAPPERS:
+            return name, index
+        index += 1
+        positionals = WRAPPERS[name]
+        while index < len(argv) and (argv[index].startswith("-") or positionals > 0):
+            if _TEMPLATE.search(argv[index]):
+                return None
+            if not argv[index].startswith("-"):
+                positionals -= 1
+            index += 1
+    return None
+
+
 @dataclass(frozen=True)
 class ManagedMcp:
     """A parsed, valid ``mcp`` block."""
@@ -336,7 +534,8 @@ class ManagedMcp:
         credential = block.get("credential", None if stdio else _HTTP_CREDENTIAL)
         return cls(
             transport=transport,
-            port=int(block["port"]),
+            # A stdio server's bridge serves a unix socket, no port.
+            port=int(block.get("port", 0)),
             path=str(block.get("path", "/mcp")),
             protocol=str(block.get("protocol", "legacy")),
             read_tools=tuple(
@@ -386,7 +585,10 @@ class ManagedMcp:
 
     @property
     def upstream(self) -> str:
-        """Where the front reaches the server (or the bridge), in the pod."""
+        """Where the front reaches the server (or, by its socket, the
+        bridge), in the pod."""
+        if self.stdio:
+            return f"http://{BRIDGE_HOST}{self.path}"
         return f"http://127.0.0.1:{self.port}{self.path}"
 
     def server_env(self, config: Mapping[str, Any]) -> dict[str, str]:
@@ -407,27 +609,38 @@ class ManagedMcp:
             out.append(rendered)
         return out
 
-    def program_problem(self, program: Sequence[str]) -> str | None:
-        """Why the server's program may not take this block's templated
-        arguments (a shell runs them as code), else ``None``. The image's own
-        program is known only at launch."""
-        templated = any(_TEMPLATE.search(arg) for arg in self.args)
-        if templated and program_name(program) in SHELLS:
-            return (
-                f"the server's program {program_name(program)!r} is a shell: "
-                "it may not take templated arguments"
-            )
-        return None
+    def program_problem(
+        self, program: Sequence[str], *, from_image: bool = True
+    ) -> str | None:
+        """Why the program the pod runs may not take this block's templated
+        arguments, else ``None``: the registration check again, over the
+        whole argv (the image's own entrypoint and command are known only at
+        launch; ``from_image`` is false when the block names ``command``)."""
+        problems = _argv_problems(program, self.args, from_image=from_image)
+        return problems[0] if problems else None
 
-    def bridge_command(self, program: Sequence[str]) -> list[str]:
+    def bridge_command(
+        self,
+        program: Sequence[str],
+        *,
+        socket: str = BRIDGE_SOCKET,
+        socket_group: int | None = FRONT_USER,
+        uid_base: int = BINDING_UID_BASE,
+        home_root: str = BINDING_HOME_ROOT,
+    ) -> list[str]:
         """The server container's command for a stdio server: the bridge,
-        serving the front on the block's loopback port and path, then the
-        server's own program."""
-        command = [
-            BRIDGE_PATH,
-            "serve",
-            "--listen",
-            f"127.0.0.1:{self.port}",
+        serving the front on its socket at the block's path and running
+        each binding's process as a user of its own, then the server's own
+        program. The keywords are for a test outside a pod (no root: every
+        process runs as the bridge's user, ``uid_base`` 0)."""
+        command = [BRIDGE_PATH, "serve", "--socket", socket]
+        if socket_group is not None:
+            command += ["--socket-group", str(socket_group)]
+        command += [
+            "--uid-base",
+            str(uid_base),
+            "--home-root",
+            home_root,
             "--path",
             self.path,
             "--max-processes",
@@ -439,7 +652,7 @@ class ManagedMcp:
             command += ["--credential-env", self.credential_env]
         return [*command, "--", *program]
 
-    def front_config(self) -> dict[str, Any]:
+    def front_config(self, *, socket: str = BRIDGE_SOCKET) -> dict[str, Any]:
         """What the front reads from the pod's request file (``mcp``)."""
         if self.stdio:
             credential = {"env": self.credential_env} if self.credential_env else None
@@ -449,7 +662,7 @@ class ManagedMcp:
                 if self.credential_header
                 else None
             )
-        return {
+        config: dict[str, Any] = {
             "transport": self.transport,
             "upstream": self.upstream,
             "protocol": self.protocol,
@@ -459,6 +672,9 @@ class ManagedMcp:
             "max_in_flight_per_binding": self.max_in_flight_per_binding,
             "tool_pinning": self.tool_pinning,
         }
+        if self.stdio:
+            config["socket"] = socket
+        return config
 
 
 def _strings(value: Any) -> bool:
@@ -467,8 +683,15 @@ def _strings(value: Any) -> bool:
     )
 
 
-def _template_problems(where: str, value: str) -> list[str]:
+def _template_problems(where: str, value: str, *, stdio: bool) -> list[str]:
     stripped = _TEMPLATE.sub("", value)
+    if BINDING_HOME in stripped:
+        if not stdio:
+            return [
+                f"{where} names {BINDING_HOME}, a stdio process's private "
+                "directory: an http server has none"
+            ]
+        stripped = stripped.replace(BINDING_HOME, "")
     if "${" in stripped:
         return [f"{where} has a placeholder that is not ${{config.<key>}}"]
     named = sorted(set(_TEMPLATE.findall(value)) & _UNTEMPLATED)
@@ -480,38 +703,73 @@ def _template_problems(where: str, value: str) -> list[str]:
     return []
 
 
-def _argument_problems(args: Sequence[str], command: Sequence[str]) -> list[str]:
-    """Templates that could inject a shell or an argument."""
+def _argv_problems(
+    program: Sequence[str], args: Sequence[str], *, from_image: bool = False
+) -> list[str]:
+    """Templates in the argv (``program`` then ``args``) that could inject a
+    shell, an option, a command or a script.
+
+    ``program`` is the block's ``command`` (registration, launch) or the
+    image's entrypoint and command (``from_image``, at launch); empty, the
+    program is not known yet and only the arguments are checked.
+    """
     problems = [
         f"mcp command {item!r} holds a template: the program is the spec's"
-        for item in command
+        for item in program
         if _TEMPLATE.search(item)
     ]
-    templated = False
-    for index, item in enumerate(args):
-        if not _TEMPLATE.search(item):
-            continue
-        templated = True
+    argv = [*program, *args]
+    templated = [
+        index
+        for index in range(len(program), len(argv))
+        if _TEMPLATE.search(argv[index])
+    ]
+    if templated and any(_shell(item) for item in program):
+        problems.append(
+            "mcp args are templated, but the program is a shell or runs one: "
+            "a template is never code"
+        )
+    for index in templated:
+        item = argv[index]
         if not _ARG_TEMPLATE.fullmatch(item):
             problems.append(
                 f"mcp args {item!r}: a template is a whole argument or an "
                 "option's value after '='"
             )
-        before = args[index - 1] if index else (command[-1] if command else "")
+        before = argv[index - 1] if index else ""
         option = item.split("=", 1)[0] if "=" in item else ""
-        if before in CODE_OPTIONS or option in CODE_OPTIONS:
+        if option in CODE_OPTIONS or before in CODE_OPTIONS:
+            which = option if option in CODE_OPTIONS else before
             problems.append(
-                f"mcp args {item!r} is the value of {option or before!r}: a "
-                "template is never code"
+                f"mcp args {item!r} is the value of {which!r}: a template is never code"
             )
-    if templated and (
-        program_name(command) in SHELLS
-        or any(program_name([item]) in SHELLS for item in command[1:])
-    ):
+    if not templated or not program or problems:
+        return problems
+    found = _real_program(argv)
+    if found is None:
         problems.append(
-            "mcp args are templated, but the program is a shell: a template "
-            "is never code"
+            "mcp args put a template where a wrapper's command is: a "
+            "template is never the program"
         )
+        return problems
+    name, index = found
+    if not _runner(name):
+        if from_image:
+            problems.append(
+                f"mcp args are templated, but the image's program {name!r} is "
+                "no interpreter or package runner SRW can check: name the "
+                "server's program in mcp command"
+            )
+        return problems
+    for item in argv[index + 1 :]:
+        if item.startswith("-") or item in _RUNNER_SUBCOMMANDS:
+            continue
+        if _TEMPLATE.search(item):
+            problems.append(
+                f"mcp args {item!r} would be the script, module or package "
+                f"{name!r} runs: a literal one comes first"
+            )
+        break
     return problems
 
 
@@ -527,7 +785,7 @@ def _credential_problems(credential: Any, *, stdio: bool, env: Any) -> list[str]
         name = credential["env"]
         if not isinstance(name, str) or not _ENV_NAME.fullmatch(name):
             return ["mcp credential.env must be an environment name"]
-        if _RESERVED_ENV.fullmatch(name) or name.upper() in CODE_ENV:
+        if _RESERVED_ENV.fullmatch(name) or code_env(name):
             return [f"mcp credential.env {name!r} is reserved or loads code"]
         if isinstance(env, Mapping) and name in env:
             return [f"mcp credential.env {name!r} is also set in mcp env"]
@@ -571,7 +829,13 @@ def mcp_problems(
     if transport not in TRANSPORTS:
         problems.append(f"mcp transport {transport!r} is not one of {TRANSPORTS}")
     port = block.get("port")
-    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+    if stdio:
+        if "port" in block:
+            problems.append(
+                "mcp port is an http server's: a stdio server's bridge serves "
+                "the front on a unix socket"
+            )
+    elif isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         problems.append("mcp port must be the server's port number")
     elif front_port is not None and port == front_port:
         problems.append("mcp port is the front's port; the server needs its own")
@@ -621,15 +885,11 @@ def mcp_problems(
             if not isinstance(value, str):
                 problems.append(f"mcp env {name!r} must be a string")
             else:
-                problems += _template_problems(f"mcp env {name!r}", value)
-                if (
-                    isinstance(name, str)
-                    and name.upper() in CODE_ENV
-                    and _TEMPLATE.search(value)
-                ):
+                problems += _template_problems(f"mcp env {name!r}", value, stdio=stdio)
+                if isinstance(name, str) and code_env(name) and _TEMPLATE.search(value):
                     problems.append(
-                        f"mcp env {name!r} loads code: no config value is "
-                        "templated into it"
+                        f"mcp env {name!r} loads code or names a command or a "
+                        "package index: no config value is templated into it"
                     )
     lists = {}
     for key in ("args", "command"):
@@ -639,9 +899,9 @@ def mcp_problems(
         else:
             lists[key] = value
             for item in value:
-                problems += _template_problems(f"mcp {key}", item)
+                problems += _template_problems(f"mcp {key}", item, stdio=stdio)
     if len(lists) == 2:
-        problems += _argument_problems(lists["args"], lists["command"])
+        problems += _argv_problems(lists["command"], lists["args"])
     in_flight = block.get("max_in_flight_per_binding", 4)
     if not _bounded(in_flight, 1, 64):
         problems.append("mcp max_in_flight_per_binding must be between 1 and 64")
@@ -682,22 +942,34 @@ def managed_mcp(spec: Any) -> ManagedMcp | None:
 
 
 __all__ = [
+    "BINDING_HOME",
+    "BINDING_HOME_ROOT",
+    "BINDING_UID_BASE",
+    "BRIDGE_CAPABILITIES",
     "BRIDGE_DIR",
+    "BRIDGE_HOST",
     "BRIDGE_PATH",
+    "BRIDGE_SOCKET",
+    "BRIDGE_SOCKET_DIR",
     "CODE_ENV",
+    "CODE_ENV_PREFIXES",
     "CODE_OPTIONS",
     "FRONT_PATH",
+    "FRONT_USER",
     "PROTOCOLS",
     "RESERVED_HEADERS",
     "READ",
+    "SCRIPT_RUNNERS",
     "SHELLS",
     "STDIO_MODES",
     "TOOL_CLASSES",
     "TOOL_PINNING",
     "TRANSPORTS",
+    "WRAPPERS",
     "WRITE",
     "ManagedMcp",
     "TemplateError",
+    "code_env",
     "managed_mcp",
     "mcp_problems",
     "pattern_matches",

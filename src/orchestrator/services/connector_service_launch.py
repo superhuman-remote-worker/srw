@@ -16,8 +16,9 @@ credential generation. One launch is five objects, all named after the pod's
 * the **Pod**: ``restartPolicy: Always``, the driver image pinned by digest,
   no ServiceAccount token, a ServiceAccount with no bindings, no service
   links, no host namespaces, seccomp ``RuntimeDefault``, every capability
-  dropped and no privilege escalation (the image's own user, root included:
-  the namespace enforces Pod Security ``baseline``), the pinned hosts in
+  dropped (but the stdio bridge's, below) and no privilege escalation (the
+  image's own user, root included: the namespace enforces Pod Security
+  ``baseline``), the pinned hosts in
   ``hostAliases`` and, without declared DNS, a resolver that answers nothing.
 
 Two SRW init containers run first, from the static shim image: the
@@ -43,7 +44,12 @@ front's image: it copies SRW's static stdio bridge into an ``emptyDir``, and
 the bridge becomes the server container's command, with the image's own
 program after it. The bridge runs one process of the server per binding,
 each with its binding's credential in its environment (from the front, per
-binding: still none in the pod).
+binding: still none in the pod) and each as a user of its own: the server
+container runs as root with only the bridge's capabilities
+(``BRIDGE_CAPABILITIES``, all allowed by ``baseline``; the processes keep
+none), the processes' private directories are an ``emptyDir``, and the
+bridge serves the front on a unix socket in another one, which the front
+mounts read-only and only its group may enter.
 
 Labels deliberately omit SRW's agent and chart labels, which grant access to
 internal services under existing NetworkPolicies.
@@ -70,7 +76,11 @@ from shared.connectors.contract import (
     DriverSpec,
 )
 from shared.connectors.mcp import (
+    BINDING_HOME_ROOT,
+    BRIDGE_CAPABILITIES,
     BRIDGE_DIR,
+    BRIDGE_SOCKET_DIR,
+    FRONT_USER,
     ManagedMcp,
     TemplateError,
     managed_mcp,
@@ -94,8 +104,9 @@ AGENT_APPS: tuple[str, ...] = (
     "srw-persistent-agent",
     "srw-agent-stateless",
 )
-#: The unprivileged user SRW's own init containers run as.
-SHIM_USER = 65532
+#: The unprivileged user SRW's own init containers and the front run as
+#: (the stdio bridge's socket is this group's).
+SHIM_USER = FRONT_USER
 _MAX_DELIVERY_BYTES = 512 * 1024
 _NAMESPACE = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?\Z")
 _DIGEST_REFERENCE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
@@ -618,7 +629,8 @@ def build_service_launch(
         # A managed MCP server: the image runs as itself (no shim, no
         # identity, no request file, no credential) beside SRW's front,
         # which holds the identity and is the pod's only named port.
-        problem = mcp.program_problem(program)
+        # The registration check again, over the whole argv the pod runs.
+        problem = mcp.program_problem(program, from_image=not mcp.command)
         if problem:
             raise ServiceLaunchError(problem)
         try:
@@ -635,19 +647,33 @@ def build_service_launch(
         if mcp.stdio:
             # The stdio bridge, from the front's image, before the server.
             init_containers.append(_bridge_install_container(policy))
+        front_mounts = driver["volumeMounts"][1:]
+        if mcp.stdio:
+            front_mounts.append(
+                {"name": "srw-bridge", "mountPath": BRIDGE_SOCKET_DIR, "readOnly": True}
+            )
         containers = [
             server,
             _mcp_front_container(
                 policy=policy,
                 port=spec.service.port,
                 env=driver["env"],
-                mounts=driver["volumeMounts"][1:],
+                mounts=front_mounts,
             ),
         ]
         volumes = [
             volumes[1],
             {"name": "tmp", "emptyDir": {"sizeLimit": "256Mi"}},
-            *([volumes[0]] if mcp.stdio else []),
+            *(
+                [
+                    volumes[0],
+                    # The bridge's socket, and the processes' directories.
+                    {"name": "srw-bridge", "emptyDir": {"sizeLimit": "1Mi"}},
+                    {"name": "srw-home", "emptyDir": {"sizeLimit": "256Mi"}},
+                ]
+                if mcp.stdio
+                else []
+            ),
         ]
     host_aliases = pins.host_aliases()
     host_aliases.append(
@@ -716,11 +742,31 @@ def _mcp_server_container(
     and environment from the connector's config, nothing of SRW's. A stdio
     server's program runs behind the bridge: the bridge is the command, the
     program follows it, and the bridge starts one process of it per
-    binding."""
+    binding, each as a user of its own (the container runs as root for the
+    bridge alone: the processes keep no capability and gain none)."""
     mounts = [{"name": "tmp", "mountPath": "/tmp"}]
+    # The image writes nowhere but /tmp, a small emptyDir: a tool that
+    # writes files (a download to a caller-chosen path) cannot leave them
+    # in the shared pod's image for another binding.
+    security: dict[str, Any] = {
+        "allowPrivilegeEscalation": False,
+        "privileged": False,
+        "readOnlyRootFilesystem": True,
+        "capabilities": {"drop": ["ALL"]},
+    }
     if mcp.stdio:
         program = mcp.bridge_command(program)
-        mounts.append({"name": "srw-bin", "mountPath": BRIDGE_DIR, "readOnly": True})
+        mounts += [
+            {"name": "srw-bin", "mountPath": BRIDGE_DIR, "readOnly": True},
+            {"name": "srw-bridge", "mountPath": BRIDGE_SOCKET_DIR},
+            {"name": "srw-home", "mountPath": BINDING_HOME_ROOT},
+        ]
+        security.update(
+            runAsUser=0,
+            runAsGroup=0,
+            runAsNonRoot=False,
+            capabilities={"drop": ["ALL"], "add": list(BRIDGE_CAPABILITIES)},
+        )
     return {
         "name": "driver",
         "image": image,
@@ -732,15 +778,7 @@ def _mcp_server_container(
             for key, value in sorted(mcp.server_env(config).items())
         ],
         "resources": resources,
-        # The image writes nowhere but /tmp, a small emptyDir: a tool that
-        # writes files (a download to a caller-chosen path) cannot leave
-        # them in the shared pod's image for another binding.
-        "securityContext": {
-            "allowPrivilegeEscalation": False,
-            "privileged": False,
-            "readOnlyRootFilesystem": True,
-            "capabilities": {"drop": ["ALL"]},
-        },
+        "securityContext": security,
         "volumeMounts": mounts,
     }
 

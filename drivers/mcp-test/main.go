@@ -19,6 +19,12 @@
 //
 // Listing tools needs no credential (the front's readiness probe has none);
 // every call does. It never logs a credential.
+//
+// With -stdio (D5b) it serves one client on stdin and stdout instead, behind
+// SRW's stdio bridge, with its credential in -credential-env, and lists the
+// probe tools the stdio gate uses (stdio.go). That mode is the image behind
+// srw.mcp-stdio-probe/v1, which scripts/k3d-managed-mcp-stdio-gate.py runs
+// to prove one binding's process cannot reach another's.
 package main
 
 import (
@@ -40,6 +46,9 @@ import (
 type server struct {
 	message  string
 	hostname string
+	// Serving one client on stdin and stdout (D5b): the probe tools are
+	// listed too.
+	stdio    bool
 	mu       sync.Mutex
 	sessions map[string]bool
 	notes    map[string]string
@@ -178,19 +187,26 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
-	switch request.Method {
-	case "ping":
-		writeJSON(w, http.StatusOK, result(request.ID, map[string]any{}))
-	case "tools/list":
-		writeJSON(w, http.StatusOK, result(request.ID, map[string]any{"tools": tools}))
-	case "tools/call":
-		writeJSON(w, http.StatusOK, result(request.ID, s.call(r, request.Params)))
-	default:
-		writeJSON(w, http.StatusOK, rpcError(request.ID, -32601, "method not found"))
-	}
+	writeJSON(w, http.StatusOK, s.answer(request, credentialOf(r)))
 }
 
-func (s *server) call(r *http.Request, raw json.RawMessage) map[string]any {
+// answer is the JSON-RPC answer to a request that is no initialize.
+func (s *server) answer(request rpcRequest, credential string) map[string]any {
+	switch request.Method {
+	case "ping":
+		return result(request.ID, map[string]any{})
+	case "tools/list":
+		if s.stdio {
+			return result(request.ID, map[string]any{"tools": append(append([]tool(nil), tools...), probeTools...)})
+		}
+		return result(request.ID, map[string]any{"tools": tools})
+	case "tools/call":
+		return result(request.ID, s.call(credential, request.Params))
+	}
+	return rpcError(request.ID, -32601, "method not found")
+}
+
+func (s *server) call(credential string, raw json.RawMessage) map[string]any {
 	var params struct {
 		Name      string            `json:"name"`
 		Arguments map[string]string `json:"arguments"`
@@ -198,7 +214,11 @@ func (s *server) call(r *http.Request, raw json.RawMessage) map[string]any {
 	if err := json.Unmarshal(raw, &params); err != nil {
 		return text("invalid arguments", true)
 	}
-	credential := credentialOf(r)
+	if s.stdio {
+		if found, ok := probeTool(params.Name, params.Arguments); ok {
+			return text(found, false)
+		}
+	}
 	if credential == "" {
 		return text("no upstream credential reached this server", true)
 	}
@@ -242,9 +262,19 @@ func (s *server) call(r *http.Request, raw json.RawMessage) map[string]any {
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:8091", "address to serve MCP on")
+	stdio := flag.Bool("stdio", false, "serve one client on stdin and stdout instead (D5b)")
+	credentialEnv := flag.String("credential-env", "MCP_TEST_TOKEN", "with -stdio: the variable the credential is in")
 	flag.Parse()
 	hostname, _ := os.Hostname()
 	s := newServer(os.Getenv("MCP_TEST_MESSAGE"), hostname)
+	if *stdio {
+		s.stdio = true
+		log.SetOutput(os.Stderr)
+		if err := s.serveStdio(os.Stdin, os.Stdout, os.Getenv(*credentialEnv)); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	server := &http.Server{Addr: *listen, Handler: s, ReadHeaderTimeout: 10 * time.Second}
 	log.Printf("srw-mcp-test: serving on %s", *listen)
 	log.Fatal(server.ListenAndServe())

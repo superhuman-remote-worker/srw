@@ -58,7 +58,7 @@ func concurrentPeak(t *testing.T, n int, answer []byte, stream bool) ([]int, []i
 		w.Write(answer)
 	}))
 	defer upstream.Close()
-	f := newFront(testConfig(t, upstream.URL+"/mcp"), everyLease{}, newUpstreamClient(), func(string, ...any) {}, time.Now)
+	f := newFront(testConfig(t, upstream.URL+"/mcp"), everyLease{}, newUpstreamClient(""), func(string, ...any) {}, time.Now)
 	runtime.GC()
 	var base runtime.MemStats
 	runtime.ReadMemStats(&base)

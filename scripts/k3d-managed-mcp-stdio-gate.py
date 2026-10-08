@@ -20,10 +20,22 @@ Node, stdio only), pinned by digest in the chart. Chosen because it needs no
 external account and no egress, it has real read and write tools (read_graph,
 search_nodes and open_nodes read the knowledge graph; create_entities and
 five more change it), so ReadOnly has something to hide, and the graph it
-writes shows which pod a call reached. It takes no credential of its own;
+writes shows which process a call reached (each binding's graph is a file in
+its process's private directory). It takes no credential of its own;
 srw.mcp-stdio-test/v1 delivers the connector's token to each binding's
-process as MCP_STDIO_TEST_TOKEN anyway, which is what this gate traces. Its
-image has a shell, which the gate uses to read a process's environment.
+process as MCP_STDIO_TEST_TOKEN anyway. Its image has a shell, which the gate
+uses to read a process's parent, user and command line (never its
+environment: the server container's root has no CAP_SYS_PTRACE, so it cannot
+read another user's, which is the point).
+
+mcp/memory has no tool that looks around the pod, so the isolation checks
+run against a second development server, srw.mcp-stdio-probe/v1: SRW's own
+MCP test server (the mcpTest image) in stdio mode, whose probe tools report,
+from inside a binding's process, its user, capabilities, no_new_privs,
+directories and variables' names, and whether it may read a path, connect
+to a socket or signal a process (never what it read). Its whoami reports the
+SHA-256 of the credential in its environment, which is how the gate traces
+a stdio credential to its binding's process.
 
 Fixtures (all disposable, named after the gate id):
 
@@ -31,12 +43,13 @@ Fixtures (all disposable, named after the gate id):
   projects    two of the owner: ``rw``, and ``ro``, whose link of the memory
               connector is read-only
   connectors  of the owner: ``memory`` (srw.mcp-stdio-test/v1, ReadWrite,
-              a random fake token); of the second account: ``stranger``
-              (the same driver, its own token)
-  sessions    ``one`` (the owner, project rw, memory: a ReadWrite binding),
-              ``two`` (the owner, project ro, memory: a ReadOnly binding of
-              the same connector, so the same pod) and ``three`` (the second
-              account, stranger only)
+              a random fake token) and ``probe`` (srw.mcp-stdio-probe/v1,
+              ReadWrite, its own token); of the second account: ``stranger``
+              (srw.mcp-stdio-test/v1, its own token)
+  sessions    ``one`` (the owner, project rw, memory and probe: ReadWrite
+              bindings), ``two`` (the owner, project ro, memory: a ReadOnly
+              binding of the same connector, so the same pod, and probe) and
+              ``three`` (the second account, stranger only)
 
 Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
 
@@ -44,28 +57,39 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               D5a and D5b modules, byte for byte; hosting on with an exchange
               and canary port, a digest-pinned shim and front (whose image
               carries the bridge), the stdio test server installed at a
-              pinned digest, room for two pods; migrations 0360-0363 and
-              0390-0392; the driver namespace's baseline and default deny,
-              enforced (12-probe harness); refusedCidrs covers the node;
-              Docker Hub's registry and token hosts resolve and answer from
-              the orchestrator (a bind reads the stock image's config there)
+              pinned digest and the probe server, room for three pods;
+              migrations 0360-0363 and 0390-0392; the driver namespace's
+              baseline and default deny, enforced (12-probe harness);
+              refusedCidrs covers the node; Docker Hub's registry and token
+              hosts resolve and answer from the orchestrator (a bind reads the
+              stock image's config there)
   startup     each pod's canary wait ran first and exited 0, then the bridge
               install from the pinned front image; the server container runs
-              the stock image at its digest with the bridge as its command
-              and the image's own program (node dist/index.js) after it,
-              nothing of SRW's in its environment and no delivery mount; its
-              Secret holds no credential; the bridge answers its status
+              the image at its digest with the bridge as its command (on its
+              socket, each process as a user of its own) and the image's own
+              program after it, as root with the bridge's capabilities alone,
+              the socket's and the homes' emptyDirs mounted, the front with
+              the socket's read-only; nothing of SRW's in its environment and
+              no delivery mount; its Secret holds no credential; the bridge
+              answers its status on its socket
   processes   both sessions' own clients connected the server (README: mcp,
               N tools, managed by SRW); the bridge in the one memory pod runs
               two processes, one per binding (session one's and session two's
-              leases), with two process ids, both children of the bridge
-              running node; each process's environment holds the connector's
-              token as MCP_STDIO_TEST_TOKEN and no SRW_ variable; the agent's
-              own client, connecting with session one's lease, keeps that
-              binding's process (the same id): a process serves its binding's
-              sessions; an entity session one creates is read by session two
-              (one pod, one graph)
-  credential  the agent pod holds no token of either connector (environments,
+              leases), with two process ids and two users, both children of
+              the bridge running node; the agent's own client, connecting with
+              session one's lease, keeps that binding's process (the same id):
+              a process serves its binding's sessions; an entity session one
+              creates is not in session two's graph (each binding's process
+              has its own private directory)
+  isolation   in the probe pod, from inside session one's process: it runs as
+              a pool user (not root, not session two's), with no capability
+              (permitted, effective, ambient) and no_new_privs, its private
+              directory as HOME and TMPDIR, the probe connector's token in its
+              environment (whoami's digest) and no SRW_ variable; it may not
+              read session two's process environment or list its directory,
+              signal it, or connect to the bridge's socket (so it cannot name
+              a binding or take session two's process over)
+  credential  the agent pod holds no token of any connector (environments,
               command lines, files under /app, /tmp, /home, /root, /var/tmp,
               /run), nor does session one's workspace; the front's and the
               bridge's logs hold no token and no lease token
@@ -86,8 +110,9 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               names create_entities, the well-formed write is "Unknown tool",
               and the graph is unchanged
   ending      session two ends: its lease is revoked, and its binding's
-              process stops (it leaves the bridge's status and the pod's
-              process table) while session one's runs on
+              processes stop (they leave the bridge's status and the pod's
+              process table, in the memory and the probe pod) while session
+              one's run on
   cleanup     sessions, connectors, projects, the second account, the OAuth
               client and probe pods are gone, and no object in the driver
               namespace names this run's connectors
@@ -104,6 +129,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import importlib.util
 import json
 import re
@@ -158,9 +184,19 @@ STDIO_DRIVER = "srw.mcp-stdio-test/v1"
 STOCK_IMAGE = "docker.io/mcp/memory"
 STOCK_DIGEST = "sha256:db0c2db07a44b6797eba7a832b1bda142ffc899588aae82c92780cbb2252407f"
 STOCK_PROGRAM = ["node", "dist/index.js"]
+#: SRW's MCP test server in stdio mode (the mcpTest image): the probes.
+PROBE_TYPE = "mcp_stdio_probe"
+PROBE_DRIVER = "srw.mcp-stdio-probe/v1"
+PROBE_PROGRAM = ["/srw-mcp-test", "-stdio", "-credential-env", "MCP_TEST_TOKEN"]
+PROBE_TOKEN_ENV = "MCP_TEST_TOKEN"
 BRIDGE = "/srw/bin/srw-mcp-bridge"
-#: Where the bridge listens in the pod (the spec's mcp port).
-BRIDGE_LISTEN = "127.0.0.1:8091"
+#: The bridge's socket (shared/connectors/mcp.py BRIDGE_SOCKET): the front's
+#: group's alone.
+BRIDGE_SOCKET = "/srw/bridge/bridge.sock"
+#: The processes' users and directories (BINDING_UID_BASE, BINDING_HOME_ROOT).
+UID_BASE = 20000
+HOME_ROOT = "/srw/home"
+BRIDGE_CAPABILITIES = ["CHOWN", "DAC_OVERRIDE", "FOWNER", "KILL", "SETGID", "SETUID"]
 TOKEN_ENV = "MCP_STDIO_TEST_TOKEN"
 READ_TOOLS = ("read_graph", "search_nodes", "open_nodes")
 WRITE_TOOLS = (
@@ -175,26 +211,18 @@ CORPUS = ROOT / "drivers" / "mcp-front" / "testdata" / "bypass_corpus.json"
 REGISTRY_HOSTS = ("registry-1.docker.io", "auth.docker.io")
 _GATE_ID_RE = re.compile(r"d5b-[0-9a-f]{10}\Z")
 
-# A process's environment, read in the server container by its shell. The
-# token comes on stdin and is compared by shell builtins only (never in an
-# argument of a program another process could read); only counts come back.
-_ENVIRON_SCRIPT = r"""
+# A process's parent, user and command line, read in the server container by
+# its shell (all world-readable; its environment is not, even to the
+# container's root, which has no CAP_SYS_PTRACE).
+_PROCESS_SCRIPT = r"""
 pid=$1
-IFS= read -r token
-[ -r "/proc/$pid/environ" ] || { echo missing; exit 0; }
-tr '\0' '\n' < "/proc/$pid/environ" | {
-  tokens=0; srw=0
-  while IFS= read -r line; do
-    case "$line" in
-      "MCP_STDIO_TEST_TOKEN=$token") tokens=$((tokens + 1)) ;;
-      SRW_*) srw=$((srw + 1)) ;;
-    esac
-  done
-  printf 'token=%s\nsrw=%s\n' "$tokens" "$srw"
-}
+[ -e "/proc/$pid/stat" ] || { echo missing; exit 0; }
 stat=$(cat "/proc/$pid/stat" 2>/dev/null)
 set -- ${stat##*) }
-printf 'parent=%s\n' "$2"
+printf 'state=%s\nparent=%s\n' "$1" "$2"
+while read -r key real rest; do
+  [ "$key" = "Uid:" ] && printf 'uid=%s\n' "$real"
+done < "/proc/$pid/status" 2>/dev/null
 printf 'program=%s\n' "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
 """
 
@@ -353,17 +381,67 @@ def processes_verdict(
     )
 
 
-def environ_verdict(lines: str) -> tuple[bool, str]:
-    """A process's environment holds the token once and nothing of SRW's;
-    it is the bridge's child running the server's program."""
+def process_verdict(lines: str, uid: int) -> tuple[bool, str]:
+    """A binding's process is the bridge's child running the server's
+    program, as the user the bridge reports (a pool user, not root)."""
     found = dict(line.split("=", 1) for line in lines.splitlines() if "=" in line)
     ok = (
-        found.get("token") == "1"
-        and found.get("srw") == "0"
-        and found.get("parent") == "1"
+        found.get("parent") == "1"
+        and found.get("state") not in (None, "Z")
         and found.get("program", "").startswith(" ".join(STOCK_PROGRAM))
+        and found.get("uid") == str(uid)
+        and UID_BASE <= uid < UID_BASE + 64 * 2 + 2
     )
     return ok, json.dumps(found)
+
+
+def process_gone(lines: str) -> bool:
+    """The process left the pod's process table (or is a zombie)."""
+    found = dict(line.split("=", 1) for line in lines.splitlines() if "=" in line)
+    return "missing" in lines or found.get("state") == "Z"
+
+
+def _refused(outcome: str) -> bool:
+    return outcome.startswith("refused:") and (
+        "permission denied" in outcome or "operation not permitted" in outcome
+    )
+
+
+def isolation_verdict(
+    one: dict, two: dict, probes: dict[str, str], *, token_sha256: str, whoami: dict
+) -> tuple[bool, str]:
+    """From inside session one's probe process: it runs as a pool user of its
+    own with no capability and no_new_privs, its private directory as HOME
+    and TMPDIR, the probe connector's token and nothing of SRW's in its
+    environment; and every probe of session two's process and of the
+    bridge's socket was refused."""
+    uid = one.get("uid")
+    pool = range(UID_BASE, UID_BASE + 64 * 2 + 2)
+    home = f"{HOME_ROOT}/{uid}"
+    names = one.get("env_names") or []
+    problems = []
+    if not isinstance(uid, int) or uid not in pool or uid == two.get("uid"):
+        problems.append(f"user {uid} (session two's {two.get('uid')})")
+    if one.get("gid") != uid:
+        problems.append(f"group {one.get('gid')}")
+    for capability in ("CapPrm", "CapEff", "CapAmb"):
+        if (one.get(capability) or "x").strip("0") != "":
+            problems.append(f"{capability}={one.get(capability)}")
+    if one.get("NoNewPrivs") != "1":
+        problems.append(f"NoNewPrivs={one.get('NoNewPrivs')}")
+    if one.get("home") != home or one.get("tmpdir") != home:
+        problems.append(f"home={one.get('home')} tmpdir={one.get('tmpdir')}")
+    if any(name.upper().startswith("SRW_") for name in names):
+        problems.append("an SRW_ variable")
+    if PROBE_TOKEN_ENV not in names or whoami.get("credential_sha256") != token_sha256:
+        problems.append("not its binding's credential")
+    allowed = sorted(name for name, outcome in probes.items() if not _refused(outcome))
+    if allowed:
+        problems.append(f"allowed {allowed}")
+    return not problems, (
+        f"uid={uid} two={two.get('uid')} probes={probes} "
+        + ("; ".join(problems) if problems else "isolated")
+    )
 
 
 def stdio_init_passed(pod: dict) -> bool:
@@ -379,25 +457,61 @@ def stdio_init_passed(pod: dict) -> bool:
     )
 
 
-def stdio_layout_problems(pod: dict, front_image: str) -> list[str]:
-    """How a stdio pod differs from the stock image at its digest behind
-    the bridge (installed from the pinned front image) beside the front."""
+def _flag(command_: list[str], name: str) -> str | None:
+    return command_[command_.index(name) + 1] if name in command_[:-1] else None
+
+
+def stdio_layout_problems(
+    pod: dict,
+    front_image: str,
+    *,
+    image: str = f"{STOCK_IMAGE}@{STOCK_DIGEST}",
+    program: list[str] = STOCK_PROGRAM,
+    token_env: str = TOKEN_ENV,
+) -> list[str]:
+    """How a stdio pod differs from the image at its digest behind the
+    bridge (installed from the pinned front image, serving the front on its
+    socket, each process as a user of its own) beside the front."""
     problems = base.layout_problems(pod, front_image)
     spec = pod.get("spec") or {}
     containers = {c.get("name"): c for c in spec.get("containers") or []}
     server = containers.get("driver") or {}
-    if server.get("image") != f"{STOCK_IMAGE}@{STOCK_DIGEST}":
-        problems.append(f"the server runs {server.get('image')}")
+    front = containers.get("front") or {}
+    if server.get("image") != image:
+        problems.append(f"the server runs {server.get('image')}, not {image}")
     command_ = server.get("command") or []
-    if command_[:2] != [BRIDGE, "serve"] or command_[-3:] != ["--", *STOCK_PROGRAM]:
+    tail = ["--", *program]
+    if command_[:2] != [BRIDGE, "serve"] or command_[-len(tail) :] != tail:
         problems.append(f"the server's command is {command_}")
-    if "--credential-env" not in command_ or TOKEN_ENV not in command_:
+    if _flag(command_, "--credential-env") != token_env:
         problems.append("the bridge names no credential variable")
+    if (
+        _flag(command_, "--socket") != BRIDGE_SOCKET
+        or _flag(command_, "--socket-group") != "65532"
+        or _flag(command_, "--uid-base") != str(UID_BASE)
+        or _flag(command_, "--home-root") != HOME_ROOT
+        or "--listen" in command_
+    ):
+        problems.append("the bridge does not serve its socket with users of its own")
     mounts = {m.get("name"): m for m in server.get("volumeMounts") or []}
     if not (mounts.get("srw-bin") or {}).get("readOnly"):
         problems.append("the bridge is not mounted read-only")
-    if (server.get("securityContext") or {}).get("readOnlyRootFilesystem") is not True:
+    if (mounts.get("srw-bridge") or {}).get("mountPath") != "/srw/bridge" or (
+        mounts.get("srw-home") or {}
+    ).get("mountPath") != HOME_ROOT:
+        problems.append("the socket's or the homes' emptyDir is not mounted")
+    front_mounts = {m.get("name"): m for m in front.get("volumeMounts") or []}
+    if not (front_mounts.get("srw-bridge") or {}).get("readOnly"):
+        problems.append("the front does not mount the socket's directory read-only")
+    security = server.get("securityContext") or {}
+    if security.get("readOnlyRootFilesystem") is not True:
         problems.append("the server's root filesystem is writable")
+    if (
+        security.get("runAsUser") != 0
+        or security.get("allowPrivilegeEscalation") is not False
+        or security.get("capabilities") != {"drop": ["ALL"], "add": BRIDGE_CAPABILITIES}
+    ):
+        problems.append(f"the server's securityContext is {security}")
     install = next(
         (
             c
@@ -410,7 +524,7 @@ def stdio_layout_problems(pod: dict, front_image: str) -> list[str]:
         problems.append(
             f"the bridge comes from {install.get('image')}, not the front's image"
         )
-    if any(e.get("name") == TOKEN_ENV for e in server.get("env") or []):
+    if any(e.get("name") == token_env for e in server.get("env") or []):
         problems.append("the pod sets the credential variable itself")
     return problems
 
@@ -419,20 +533,25 @@ PLAN = [
     "preflight: orchestrator and stateless agent pods serve this checkout's "
     "D5a and D5b modules; hosting on with an exchange and canary port, a "
     "digest-pinned shim and front (carrying the bridge), the stdio test server "
-    "installed at its pinned stock digest, room for two pods; migrations "
-    "0360-0363 and 0390-0392; the driver namespace's baseline and default deny, "
-    "enforced (12-probe harness); refusedCidrs covers the node; Docker Hub "
-    "resolves and answers from the orchestrator",
+    "installed at its pinned stock digest and the stdio probe server, room for "
+    "three pods; migrations 0360-0363 and 0390-0392; the driver namespace's "
+    "baseline and default deny, enforced (12-probe harness); refusedCidrs "
+    "covers the node; Docker Hub resolves and answers from the orchestrator",
     "accounts: a disposable OAuth client and second account; the owner is an "
     "administrator, the second account is not",
     "startup: each pod's canary wait, then the bridge install from the front's "
-    "image; the stock mcp/memory image at its digest behind the bridge, with "
-    "node dist/index.js after it and nothing of SRW's; no credential in its "
-    "Secret; the bridge answers its status",
+    "image; the image at its digest behind the bridge (its socket, users of "
+    "its own, root with the bridge's capabilities alone), its program after "
+    "it and nothing of SRW's; no credential in its Secret; the bridge answers "
+    "its status on its socket",
     "processes: both sessions' clients connected; the one memory pod runs two "
-    "processes, one per binding, children of the bridge, each with the token "
-    "in MCP_STDIO_TEST_TOKEN and no SRW_ variable; a new session of a binding "
-    "keeps its process; session two reads what session one wrote",
+    "processes, one per binding, children of the bridge, as two users; a new "
+    "session of a binding keeps its process; session two's graph does not "
+    "hold what session one wrote",
+    "isolation: from inside session one's probe process: a pool user, no "
+    "capability, no_new_privs, a private HOME and TMPDIR, its binding's token "
+    "and no SRW_ variable; session two's environment, directory and process "
+    "and the bridge's socket are refused to it",
     "credential: the agent pod and session one's workspace hold no token; the "
     "front's and the bridge's logs hold no token or lease token",
     "denied: no token, a malformed one and session three's lease of another "
@@ -440,8 +559,8 @@ PLAN = [
     "workspace: session one's workspace cannot connect to the memory endpoint",
     "readonly: session two lists only the three read tools and create_entities "
     "is 'Unknown tool'; the D5a review's corpus sent with its lease never "
-    "reaches the server as a write call; the graph is unchanged",
-    "ending: session two ends; its binding's process stops, session one's runs on",
+    "reaches the server as a write call; its graph is unchanged",
+    "ending: session two ends; its binding's processes stop, session one's runs on",
     "cleanup: sessions, connectors, projects, account, OAuth client and probe "
     "pods are gone; no driver-namespace object names this run's connectors",
 ]
@@ -453,12 +572,16 @@ class StdioGate(base.ManagedMcpGate):
         self.projects: dict[str, str] = {}
         self.tokens = {
             label: secret(f"d5b-upstream-{label}-{secrets.token_hex(16)}")
-            for label in ("memory", "stranger")
+            for label in ("memory", "stranger", "probe")
         }
         self.memory_pod = ""
+        self.probe_pod = ""
+        self.probe_image = ""
         self.read_write_tools: list[str] = []
-        # The process id of each memory binding (session label -> pid).
+        # The process id and user of each memory binding (session label ->).
         self.pids: dict[str, int] = {}
+        self.uids: dict[str, int] = {}
+        self.probe_pids: dict[str, int] = {}
 
     # -- naming and helpers ------------------------------------------------
     def title(self, label: str) -> str:
@@ -466,26 +589,46 @@ class StdioGate(base.ManagedMcpGate):
 
     def entry(self, label: str, session: str, *, token: str | None = None) -> dict:
         found = super().entry(label, session, token=token)
-        found["type"] = STDIO_TYPE
+        found["type"] = PROBE_TYPE if label == "probe" else STDIO_TYPE
         return found
 
     def bridge_status(self, pod: str) -> dict:
+        """GET /srw/status on the bridge's socket, from the server container
+        (its root may enter the socket's directory; no binding's process
+        may)."""
         out = command(
             self.kc
             + ["exec", pod, "-c", "driver", "--", BRIDGE, "status"]
-            + ["--listen", BRIDGE_LISTEN],
+            + ["--socket", BRIDGE_SOCKET],
             timeout=60,
         )
         return json.loads(out.splitlines()[-1])
 
-    def environ(self, pod: str, pid: int, token: str) -> str:
+    def process(self, pod: str, pid: int) -> str:
         return command(
             self.kc
-            + ["exec", "-i", pod, "-c", "driver", "--"]
-            + ["sh", "-c", _ENVIRON_SCRIPT, "environ", str(pid)],
-            data=token + "\n",
+            + ["exec", pod, "-c", "driver", "--"]
+            + ["sh", "-c", _PROCESS_SCRIPT, "process", str(pid)],
             timeout=60,
         )
+
+    def probe_calls(self, session: str, calls: list[tuple[str, dict]]) -> list[str]:
+        """Probe tools, from inside session ``session``'s probe process (one
+        client session, so one process)."""
+        result = self.client(
+            self.entry("probe", session),
+            [
+                {"tool": tool, **({"arguments": arguments} if arguments else {})}
+                for tool, arguments in calls
+            ],
+        )
+        found = result.get("calls") or []
+        if len(found) != len(calls) or any(call.get("error") for call in found):
+            raise GateError(
+                f"probes for session {session}: {result.get('status')} "
+                f"{[call.get('error') for call in found]}"
+            )
+        return [call.get("text") or "" for call in found]
 
     def lease_id(self, label: str, session: str) -> str:
         lease = self.live_lease(label, self.threads[session])
@@ -598,22 +741,27 @@ class StdioGate(base.ManagedMcpGate):
             and "@sha256:" in env["CONNECTOR_DRIVER_SHIM_IMAGE"]
             and "@sha256:" in env["CONNECTOR_MCP_FRONT_IMAGE"]
             and str(managed.get(STDIO_DRIVER, "")).endswith(f"@{STOCK_DIGEST}")
+            and bool(managed.get(PROBE_DRIVER))
         )
         self.report.check(
             "preflight: hosting on with an exchange and canary port, a "
             "digest-pinned shim and front, the stdio test server installed at "
-            "its pinned stock digest",
+            "its pinned stock digest, and the stdio probe server",
             configured,
             json.dumps(env),
         )
         if not configured:
             raise GateError(
-                "set connectors.servicePods.enabled, connectors.drivers.mcpFront "
-                "and connectors.drivers.mcpStdioTest.enabled as the k3d profile "
-                "does, under Tilt"
+                "set connectors.servicePods.enabled, connectors.drivers.mcpFront, "
+                "connectors.drivers.mcpStdioTest.enabled and "
+                "connectors.drivers.mcpStdioProbe.enabled (with mcpTest's image) "
+                "as the k3d profile does, under Tilt"
             )
         self.namespace = env["CONNECTOR_SERVICE_NAMESPACE"]
         self.front_image = env["CONNECTOR_MCP_FRONT_IMAGE"]
+        # The pod runs the image by the digest a bind resolved: compared by
+        # repository then.
+        self.probe_image = str(managed[PROBE_DRIVER]).split("@")[0].rsplit(":", 1)[0]
         self.reconcile_seconds = int(
             float(env["CONNECTOR_SERVICE_RECONCILE_SECONDS"] or 15)
         )
@@ -643,9 +791,9 @@ class StdioGate(base.ManagedMcpGate):
             "credential_generation IS NOT NULL AND removed_at IS NULL"
         )
         cap = int(env["CONNECTOR_SERVICE_MAX_INSTALLATION"] or 0)
-        room = live.isdigit() and int(live) + 2 <= cap
+        room = live.isdigit() and int(live) + 3 <= cap
         self.report.check(
-            "preflight: the installation has room for this run's two pods",
+            "preflight: the installation has room for this run's three pods",
             room,
             f"{live} live of {cap}",
         )
@@ -746,6 +894,15 @@ class StdioGate(base.ManagedMcpGate):
             },
             "other",
         )
+        self.create_connector(
+            "probe",
+            {
+                "type": PROBE_TYPE,
+                "credentials": {"token": self.tokens["probe"]},
+                "config": {"access": "ReadWrite", "message": self.gate_id},
+            },
+            "owner",
+        )
         # Session two binds the same connector through a read-only link.
         self.owner.ok(
             "POST",
@@ -756,8 +913,8 @@ class StdioGate(base.ManagedMcpGate):
         print(f"fixture: projects {self.projects}, connectors {self.connectors}")
 
     def startup_checks(self) -> None:
-        self.create_session("one", ["memory"], "owner", project="rw")
-        self.create_session("two", ["memory"], "owner", project="ro")
+        self.create_session("one", ["memory", "probe"], "owner", project="rw")
+        self.create_session("two", ["memory", "probe"], "owner", project="ro")
         self.create_session("three", ["stranger"], "other")
         rows = {label: self.wait_ready_pod(label) for label in self.connectors}
         for label, row in rows.items():
@@ -771,10 +928,35 @@ class StdioGate(base.ManagedMcpGate):
                 stdio_init_passed(pod) and "default deny enforced" in canary_log,
                 canary_log.splitlines()[-1][:200] if canary_log else "no log",
             )
-            problems = stdio_layout_problems(pod, self.front_image)
+            if label == "probe":
+                # The mcpTest image, at the digest the bind resolved.
+                running = next(
+                    (
+                        c.get("image", "")
+                        for c in (pod.get("spec") or {}).get("containers") or []
+                        if c.get("name") == "driver"
+                    ),
+                    "",
+                )
+                expected = (
+                    running
+                    if running.startswith(f"{self.probe_image}@sha256:")
+                    else f"{self.probe_image}@sha256:<a pinned digest>"
+                )
+                problems = stdio_layout_problems(
+                    pod,
+                    self.front_image,
+                    image=expected,
+                    program=PROBE_PROGRAM,
+                    token_env=PROBE_TOKEN_ENV,
+                )
+            else:
+                problems = stdio_layout_problems(pod, self.front_image)
             self.report.check(
-                f"startup: {label}'s pod runs the stock image at its digest behind "
-                "the bridge from the pinned front image, with nothing of SRW's",
+                f"startup: {label}'s pod runs its image at its digest behind the "
+                "bridge from the pinned front image (on its socket, each process "
+                "as a user of its own, the container root with the bridge's "
+                "capabilities alone), with nothing of SRW's",
                 not problems,
                 "; ".join(problems),
             )
@@ -789,27 +971,34 @@ class StdioGate(base.ManagedMcpGate):
                 for name, token in self.tokens.items()
                 if token in json.dumps(request)
             ]
+            variable = PROBE_TOKEN_ENV if label == "probe" else TOKEN_ENV
             self.report.check(
                 f"startup: {label}'s pod Secret holds no credential; the front's "
-                "block names the stdio bridge and the credential's variable",
+                "block names the stdio bridge's socket and the credential's "
+                "variable",
                 request.get("credentials") == {}
                 and not held
                 and (request.get("mcp") or {}).get("transport") == "stdio"
-                and (request.get("mcp") or {}).get("credential") == {"env": TOKEN_ENV},
+                and (request.get("mcp") or {}).get("socket") == BRIDGE_SOCKET
+                and (request.get("mcp") or {}).get("credential") == {"env": variable},
                 f"credentials={sorted(request.get('credentials') or {})} held={held}",
             )
         self.memory_pod = rows["memory"]["pod_name"]
+        self.probe_pod = rows["probe"]["pod_name"]
         try:
             status = self.bridge_status(self.memory_pod)
         except (GateError, ValueError) as exc:
             status = {"error": str(exc)}
-        # "session" is this checkout's bridge's (a process per binding that
-        # serves its later sessions).
+        # "session" and "uid" are this checkout's bridge's (a process per
+        # binding that serves its later sessions, each as a user of its own).
         self.report.check(
-            "startup: the memory pod's bridge answers its status (this "
-            "checkout's: it reports each process's session)",
+            "startup: the memory pod's bridge answers its status on its socket "
+            "(this checkout's: it reports each process's session and user)",
             status.get("credential_env") == TOKEN_ENV
-            and all("session" in item for item in status.get("processes") or []),
+            and all(
+                "session" in item and int(item.get("uid") or 0) >= UID_BASE
+                for item in status.get("processes") or []
+            ),
             json.dumps(status)[:300],
         )
 
@@ -853,20 +1042,34 @@ class StdioGate(base.ManagedMcpGate):
         )
         ok, pids, detail = processes_verdict(status, leases)
         self.pids = dict(pids)
+        self.uids = {
+            label: int(
+                next(
+                    (
+                        item.get("uid") or 0
+                        for item in status.get("processes") or []
+                        if item.get("binding") == lease
+                    ),
+                    0,
+                )
+            )
+            for label, lease in leases.items()
+        }
         self.report.check(
             "processes: two sessions get two processes in one pod, one per "
-            "binding, each holding its credential",
-            ok and len(self.live_pods("memory")) == 1,
-            detail,
+            "binding, each holding its credential, as two users",
+            ok
+            and len(self.live_pods("memory")) == 1
+            and len(set(self.uids.values())) == 2,
+            f"{detail} uids={self.uids}",
         )
         for label, pid in pids.items():
-            ok, detail = environ_verdict(
-                self.environ(self.memory_pod, pid, self.tokens["memory"])
+            ok, detail = process_verdict(
+                self.process(self.memory_pod, pid), self.uids.get(label, 0)
             )
             self.report.check(
                 f"processes: session {label}'s process is the bridge's child "
-                "running node, with the connector's token in "
-                "MCP_STDIO_TEST_TOKEN and no SRW_ variable",
+                "running node as its binding's user (not root)",
                 ok,
                 detail,
             )
@@ -904,10 +1107,63 @@ class StdioGate(base.ManagedMcpGate):
         )
         (opened,) = read["calls"] or [{}]
         self.report.check(
-            "processes: session two's binding reads the entity session one's "
-            "wrote (one pod, one graph)",
-            marker in (opened.get("text") or ""),
+            "processes: session two's binding does not see the entity session "
+            "one wrote (each binding's graph is in its own process's private "
+            "directory)",
+            read["status"] == "connected"
+            and not opened.get("error")
+            and marker not in (opened.get("text") or ""),
             (opened.get("text") or opened.get("error") or "")[:160],
+        )
+
+    def isolation_checks(self) -> None:
+        """From inside session one's probe process (the probe server's tools
+        run as that process): its own user and privileges, and what it may
+        reach of session two's process and of the bridge."""
+        leases = {label: self.lease_id("probe", label) for label in ("one", "two")}
+        (raw_two,) = self.probe_calls("two", [("self_status", {})])
+        two = json.loads(raw_two)
+        attempts = {
+            "session two's environment": (
+                "probe_path",
+                {"path": f"/proc/{two.get('pid')}/environ"},
+            ),
+            "session two's directory": ("probe_path", {"path": str(two.get("home"))}),
+            "the home root": ("probe_path", {"path": HOME_ROOT}),
+            "session two's process": ("probe_signal", {"pid": str(two.get("pid"))}),
+            "the bridge's socket": ("probe_socket", {"path": BRIDGE_SOCKET}),
+            "the bridge's environment": ("probe_path", {"path": "/proc/1/environ"}),
+        }
+        raw_one, raw_whoami, *outcomes = self.probe_calls(
+            "one", [("self_status", {}), ("whoami", {}), *attempts.values()]
+        )
+        one, whoami = json.loads(raw_one), json.loads(raw_whoami)
+        probes = dict(zip(attempts, outcomes))
+        status = self.bridge_status(self.probe_pod)
+        token_sha256 = hashlib.sha256(self.tokens["probe"].encode()).hexdigest()
+        ok, detail = isolation_verdict(
+            one, two, probes, token_sha256=token_sha256, whoami=whoami
+        )
+        listed = {
+            item.get("binding"): item.get("uid")
+            for item in status.get("processes") or []
+            if not item.get("probe")
+        }
+        self.probe_pids = {
+            "one": int(one.get("pid") or 0),
+            "two": int(two.get("pid") or 0),
+        }
+        self.report.check(
+            "isolation: session one's process runs as a user of its own with no "
+            "capability and no_new_privs, its private directory as HOME and "
+            "TMPDIR, its binding's credential and nothing of SRW's; it may not "
+            "read session two's environment or directory, signal its process, "
+            "or connect to the bridge (so it cannot take session two's process "
+            "over or end it)",
+            ok
+            and listed.get(leases["one"]) == one.get("uid")
+            and listed.get(leases["two"]) == two.get("uid"),
+            f"{detail} bridge={listed}",
         )
 
     def credential_checks(self) -> None:
@@ -1011,13 +1267,15 @@ class StdioGate(base.ManagedMcpGate):
             json.dumps(answers),
         )
 
-    def graph_names(self) -> set[str]:
-        graph = self.client(self.entry("memory", "one"), [{"tool": "read_graph"}])
+    def graph_names(self, session: str) -> set[str] | None:
+        """The entities in the graph of ``session``'s memory process (each
+        binding's own), or None when it cannot be read."""
+        graph = self.client(self.entry("memory", session), [{"tool": "read_graph"}])
         (read,) = graph["calls"] or [{}]
         try:
-            parsed = json.loads(read.get("text") or "{}")
+            parsed = json.loads(read.get("text") or "")
         except ValueError:
-            return set()
+            return None
         return {entity.get("name") for entity in parsed.get("entities") or []}
 
     def readonly_checks(self) -> None:
@@ -1039,7 +1297,9 @@ class StdioGate(base.ManagedMcpGate):
             f"read-only lists {sorted(tools)}; read-write {len(self.read_write_tools)}; "
             f"create_entities: {call.get('error') or call}",
         )
-        before = self.graph_names()
+        # The corpus goes with session two's lease, to session two's process:
+        # its graph is the one a write would change.
+        before = self.graph_names("two")
         marker = f"{self.gate_id}-bypass"
         bodies = corpus_bodies("create_entities", "read_graph") + [
             control_body("create_entities", marker)
@@ -1056,14 +1316,18 @@ class StdioGate(base.ManagedMcpGate):
             timeout=600,
         )
         ok, detail = corpus_verdict(raw, sent=len(bodies), write_tool="create_entities")
-        after = self.graph_names()
+        after = self.graph_names("two")
         self.report.check(
             "readonly: the D5a review's parsing-differential corpus, sent with the "
             "ReadOnly lease through the front and the bridge, never reaches the "
             "stock server as a write call; the well-formed write is 'Unknown "
-            "tool'; the graph is unchanged",
-            ok and before == after and marker not in after and bool(before),
-            f"{detail} graph {len(before)}->{len(after)}",
+            "tool'; the ReadOnly binding's graph is unchanged",
+            ok
+            and before is not None
+            and after is not None
+            and before == after
+            and marker not in after,
+            f"{detail} graph {before}->{after}",
         )
         writes = sql(
             "SELECT count(*) FROM security_events WHERE resource_id = "
@@ -1078,6 +1342,7 @@ class StdioGate(base.ManagedMcpGate):
     def ending_checks(self) -> None:
         lease_two = self.lease_id("memory", "two")
         lease_one = self.lease_id("memory", "one")
+        probe_two = self.lease_id("probe", "two") if self.probe_pod else ""
         pids = self.pids
         self.owner.ok(
             "DELETE", f"/api/persistent/threads/{self.threads['two']}?force=true"
@@ -1096,26 +1361,33 @@ class StdioGate(base.ManagedMcpGate):
         def stopped() -> dict | None:
             status = self.bridge_status(self.memory_pod)
             bindings = {item.get("binding") for item in status.get("processes") or []}
-            return status if lease_two not in bindings else None
+            if lease_two in bindings:
+                return None
+            if probe_two:
+                probe = self.bridge_status(self.probe_pod)
+                if probe_two in {
+                    item.get("binding") for item in probe.get("processes") or []
+                }:
+                    return None
+            return status
 
         try:
             # The front's revocation lag (30 s) and its sweep (30 s).
             status = wait_for(
-                "session two's process stops", stopped, timeout=150, interval=5
+                "session two's processes stop", stopped, timeout=150, interval=5
             )
             ended = True
         except GateError:
             status, ended = self.bridge_status(self.memory_pod), False
-        gone = "missing" in self.environ(
-            self.memory_pod, pids.get("two", 0), self.tokens["memory"]
-        )
+        gone = process_gone(self.process(self.memory_pod, pids.get("two", 0)))
         bindings = {
             item.get("binding"): item.get("pid")
             for item in status.get("processes") or []
         }
         self.report.check(
-            "ending: session two's End revokes its lease and its binding's process "
-            "stops (gone from the bridge and the pod), while session one's runs on",
+            "ending: session two's End revokes its lease and its binding's "
+            "processes stop (gone from the bridges and the pod), while session "
+            "one's runs on",
             ended
             and gone
             and bindings.get(lease_one) == pids.get("one")
@@ -1174,6 +1446,7 @@ class StdioGate(base.ManagedMcpGate):
             self.startup_checks()
             for phase in (
                 self.processes_checks,
+                self.isolation_checks,
                 self.credential_checks,
                 self.denied_checks,
                 self.workspace_checks,
@@ -1228,11 +1501,16 @@ VALUES_LOCAL_KEYS = """values-local.yaml keys (the k3d profile of values-local.y
   connectors.servicePods.reconcileIntervalSeconds: 5
   connectors.servicePods.refusedCidrs: [172.16.0.0/12, 10.42.0.0/16, 10.43.0.0/16, 169.254.0.0/16]
   connectors.drivers.mcpFront.image: {repository: srw-registry:5000/srw-driver-mcp-front, tag: dev, digest: <any sha256>}
+  connectors.drivers.mcpTest: {enabled: true, image: {repository: srw-registry:5000/srw-driver-mcp-test, tag: dev}}
   connectors.drivers.mcpStdioTest.enabled: true
+  connectors.drivers.mcpStdioProbe.enabled: true
 The stock image is the chart's default (docker.io/mcp/memory:latest at a
-pinned digest), pulled from Docker Hub by the node. Tilt builds the shim and
-the front (whose image now carries the stdio bridge, from drivers/mcp-bridge)
-and pins both by digest.
+pinned digest), pulled from Docker Hub by the node. Tilt builds the shim, the
+front (whose image now carries the stdio bridge, from drivers/mcp-bridge) and
+the MCP test server (whose -stdio mode is the probe server), and pins them by
+digest. The driver namespace stays at Pod Security baseline: a stdio server's
+container runs as root with SETUID, SETGID, KILL, CHOWN, DAC_OVERRIDE and
+FOWNER (all allowed by baseline) for the bridge alone.
 """
 
 

@@ -12,18 +12,23 @@ import (
 )
 
 // A stdio server (D5b) runs behind SRW's stdio bridge, one process per
-// binding (drivers/mcp-bridge). The front stays the authorization boundary
-// and tells the bridge three things: which binding (lease) a request is
-// for, the binding's credential (which the bridge puts in its process's
-// environment, never the pod's Secret), and when a binding ended, so its
-// process stops with it. A caller can never set the two headers: the
-// front forwards only the headers it lists.
+// binding (drivers/mcp-bridge), each as a user of its own. The front stays
+// the authorization boundary and tells the bridge three things: which
+// binding (lease) a request is for, the binding's credential (which the
+// bridge puts in its process's environment, never the pod's Secret), and
+// when a binding ended, so its process stops with it. A caller can never
+// set the two headers: the front forwards only the headers it lists. The
+// bridge serves a unix socket only the front's group may reach, so no
+// binding's process can send them either.
 const (
 	bridgeBindingHeader    = "Srw-Bridge-Binding"
 	bridgeCredentialHeader = "Srw-Bridge-Credential"
 	bridgeBindingsPath     = "/srw/bindings/"
 	bridgeLivenessPath     = "/srw/livez"
 	maxBridgeBindings      = 4096
+	// The upstream's host behind the bridge: a name only, the socket is
+	// dialed.
+	bridgeHost = "srw-mcp-bridge"
 )
 
 // A binding with a process is re-checked this often, so its process stops

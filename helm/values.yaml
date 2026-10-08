@@ -381,6 +381,12 @@ connectors:
         repository: docker.io/mcp/memory
         tag: latest
         digest: "sha256:db0c2db07a44b6797eba7a832b1bda142ffc899588aae82c92780cbb2252407f"
+    # -- Development only: srw.mcp-stdio-probe/v1 (D5b), SRW's MCP test
+    # server in stdio mode (the mcpTest image, so it needs mcpTest's image),
+    # whose probe tools let scripts/k3d-managed-mcp-stdio-gate.py prove one
+    # binding's process cannot reach another's. Never in production.
+    mcpStdioProbe:
+      enabled: false
 
 orchestrator:
   # -- 1 replica by default. NOT a statement about what HA needs: leader

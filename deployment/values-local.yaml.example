@@ -378,6 +378,10 @@ connectors:
     # managed MCP stdio gate drives it.
     mcpStdioTest:
       enabled: true
+    # The MCP test server in stdio mode (srw.mcp-stdio-probe/v1, D5b, the
+    # mcpTest image): the stdio gate's isolation probes.
+    mcpStdioProbe:
+      enabled: true
 
 databases:
   # Non-HA local default. All five PostgreSQL engines continue to inherit

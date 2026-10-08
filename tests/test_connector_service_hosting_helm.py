@@ -711,13 +711,17 @@ def test_the_k3d_profile_installs_the_test_server_and_gitea_behind_the_front():
     assert drivers["mcpTest"]["enabled"] is True
     assert drivers["managedMcp"]["gitea"]["enabled"] is True
     assert drivers["mcpStdioTest"]["enabled"] is True
+    assert drivers["mcpStdioProbe"]["enabled"] is True
     env = orchestrator_env(render(values=(example,)))
     images = json.loads(env["CONNECTOR_MANAGED_MCP_IMAGES"])
     assert set(images) == {
         "srw.gitea-mcp/v1",
         "srw.mcp-test/v1",
         "srw.mcp-stdio-test/v1",
+        "srw.mcp-stdio-probe/v1",
     }
+    # The probe server is the test server's image, in stdio mode.
+    assert images["srw.mcp-stdio-probe/v1"] == images["srw.mcp-test/v1"]
     assert env["CONNECTOR_MCP_FRONT_IMAGE"].startswith(
         "srw-registry:5000/srw-driver-mcp-front@sha256:"
     )
@@ -742,12 +746,33 @@ def test_the_stdio_test_server_runs_the_pinned_stock_image():
     assert env["CONNECTOR_MCP_FRONT_IMAGE"].endswith(f"@{FRONT_DIGEST}")
 
 
+def test_the_stdio_probe_server_runs_the_test_servers_image():
+    import json
+
+    env = orchestrator_env(
+        render(
+            EXCHANGE,
+            ON,
+            FRONT,
+            "connectors.drivers.mcpTest.image.repository=reg/srw-driver-mcp-test",
+            "connectors.drivers.mcpTest.image.tag=dev",
+            "connectors.drivers.mcpStdioProbe.enabled=true",
+        )
+    )
+    assert json.loads(env["CONNECTOR_MANAGED_MCP_IMAGES"]) == {
+        "srw.mcp-stdio-probe/v1": "reg/srw-driver-mcp-test:dev"
+    }
+
+
 @pytest.mark.parametrize(
     "settings",
     [
         (FRONT, MCP_STDIO_TEST),  # without service hosting
         (EXCHANGE, ON, MCP_STDIO_TEST),  # no pinned front (nor bridge)
         (EXCHANGE, ON, FRONT, MCP_STDIO_TEST, "connectors.drivers.mcpStdioTest.x=1"),
+        # The probe server without the test server's image.
+        (EXCHANGE, ON, FRONT, "connectors.drivers.mcpStdioProbe.enabled=true"),
+        (EXCHANGE, ON, FRONT, "connectors.drivers.mcpStdioProbe.image.tag=x"),
     ],
 )
 def test_an_incomplete_stdio_setup_fails_to_render(settings):

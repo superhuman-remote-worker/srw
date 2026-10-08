@@ -61,6 +61,7 @@ def test_dry_run_prints_the_plan_and_the_values_keys(no_cluster, capsys):
         "accounts",
         "startup",
         "processes",
+        "isolation",
         "credential",
         "denied",
         "workspace",
@@ -72,6 +73,8 @@ def test_dry_run_prints_the_plan_and_the_values_keys(no_cluster, capsys):
     for key in (
         "connectors.servicePods.enabled: true",
         "connectors.drivers.mcpStdioTest.enabled: true",
+        "connectors.drivers.mcpStdioProbe.enabled: true",
+        "connectors.drivers.mcpTest:",
         "connectors.drivers.mcpFront.image",
         "orchestrator.connectorLeases.exchangePort: 8088",
     ):
@@ -86,8 +89,10 @@ def test_the_values_keys_are_the_k3d_profile_and_the_chart_pins_the_image():
     )
     drivers = example["connectors"]["drivers"]
     assert example["connectors"]["servicePods"]["enabled"] is True
-    assert example["connectors"]["servicePods"]["maxInstallation"] >= 2
+    assert example["connectors"]["servicePods"]["maxInstallation"] >= 3
     assert drivers["mcpStdioTest"]["enabled"] is True
+    assert drivers["mcpStdioProbe"]["enabled"] is True
+    assert drivers["mcpTest"]["enabled"] is True
     assert drivers["mcpFront"]["image"]["repository"].endswith("srw-driver-mcp-front")
     chart = yaml.safe_load((ROOT / "helm/values.yaml").read_text())
     image = chart["connectors"]["drivers"]["mcpStdioTest"]["image"]
@@ -104,8 +109,15 @@ def test_embedded_programs_compile_and_cap_their_memory():
 
 
 def test_the_gate_builds_on_the_d5a_gate_and_its_spec():
-    from shared.connectors.builtin import MCP_STDIO_TEST_SPEC
-    from shared.connectors.mcp import BRIDGE_PATH, managed_mcp
+    from shared.connectors.builtin import MCP_STDIO_PROBE_SPEC, MCP_STDIO_TEST_SPEC
+    from shared.connectors.mcp import (
+        BINDING_HOME_ROOT,
+        BINDING_UID_BASE,
+        BRIDGE_CAPABILITIES,
+        BRIDGE_PATH,
+        BRIDGE_SOCKET,
+        managed_mcp,
+    )
 
     assert issubclass(gate.StdioGate, gate.base.ManagedMcpGate)
     mcp = managed_mcp(MCP_STDIO_TEST_SPEC)
@@ -113,68 +125,128 @@ def test_the_gate_builds_on_the_d5a_gate_and_its_spec():
     assert gate.STDIO_TYPE == MCP_STDIO_TEST_SPEC.legacy_type
     assert gate.TOKEN_ENV == mcp.credential_env
     assert gate.BRIDGE == BRIDGE_PATH
-    assert gate.BRIDGE_LISTEN == f"127.0.0.1:{mcp.port}"
+    assert gate.BRIDGE_SOCKET == BRIDGE_SOCKET
+    assert (gate.UID_BASE, gate.HOME_ROOT) == (BINDING_UID_BASE, BINDING_HOME_ROOT)
+    assert gate.BRIDGE_CAPABILITIES == list(BRIDGE_CAPABILITIES)
     assert set(gate.READ_TOOLS) == set(mcp.read_tools)
-    assert gate._ENVIRON_SCRIPT.count("MCP_STDIO_TEST_TOKEN") == 1
-    assert "MCP_STDIO_TEST_TOKEN" == mcp.credential_env
+    probe = managed_mcp(MCP_STDIO_PROBE_SPEC)
+    assert gate.PROBE_DRIVER == MCP_STDIO_PROBE_SPEC.name
+    assert gate.PROBE_TYPE == MCP_STDIO_PROBE_SPEC.legacy_type
+    assert gate.PROBE_PROGRAM == list(probe.command)
+    assert gate.PROBE_TOKEN_ENV == probe.credential_env
+    # The probe tools the gate calls are read tools of the probe server.
+    for tool in ("self_status", "whoami", "probe_path", "probe_signal", "probe_socket"):
+        assert probe.allowed(tool, "ReadWrite")
 
 
 @pytest.mark.skipif(shutil.which("sh") is None, reason="no shell")
-def test_the_environ_script_reads_a_process_and_takes_the_token_on_stdin():
-    token = "d5b-upstream-memory-" + "0" * 32
+def test_the_process_script_reads_a_process_but_never_its_environment():
     child = subprocess.Popen(
         ["sleep", "30"],
-        env={
-            "PATH": os.environ.get("PATH", ""),
-            "MCP_STDIO_TEST_TOKEN": token,
-            "SRW_LEAK": "1",
-        },
+        env={"PATH": os.environ.get("PATH", ""), "MCP_STDIO_TEST_TOKEN": "x"},
     )
     try:
         out = subprocess.run(
-            ["sh", "-c", gate._ENVIRON_SCRIPT, "environ", str(child.pid)],
-            input=token + "\n",
+            ["sh", "-c", gate._PROCESS_SCRIPT, "process", str(child.pid)],
             capture_output=True,
             text=True,
             timeout=30,
         ).stdout
         found = dict(line.split("=", 1) for line in out.splitlines())
-        assert found["token"] == "1" and found["srw"] == "1"
         assert found["program"].startswith("sleep 30")
         assert found["parent"] == str(os.getpid())
-        # A wrong token is not counted; a process that is gone is missing.
-        out = subprocess.run(
-            ["sh", "-c", gate._ENVIRON_SCRIPT, "environ", str(child.pid)],
-            input="other\n",
-            capture_output=True,
-            text=True,
-            timeout=30,
-        ).stdout
-        assert "token=0" in out
+        assert found["uid"] == str(os.getuid())
+        assert found["state"] in ("S", "R")
+        assert "environ" not in gate._PROCESS_SCRIPT
     finally:
         child.kill()
         child.wait()
     out = subprocess.run(
-        ["sh", "-c", gate._ENVIRON_SCRIPT, "environ", "999999999"],
-        input=token + "\n",
+        ["sh", "-c", gate._PROCESS_SCRIPT, "process", "999999999"],
         capture_output=True,
         text=True,
         timeout=30,
     ).stdout
-    assert out.strip() == "missing"
+    assert out.strip() == "missing" and gate.process_gone(out)
 
 
-def test_environ_verdict():
-    good = "token=1\nsrw=0\nparent=1\nprogram=node dist/index.js \n"
-    assert gate.environ_verdict(good)[0]
-    for bad in (
-        good.replace("token=1", "token=0"),
-        good.replace("srw=0", "srw=2"),
-        good.replace("parent=1", "parent=7"),
-        good.replace("program=node", "program=sh"),
-        "missing\n",
+def test_process_verdict():
+    good = "state=S\nparent=1\nuid=20001\nprogram=node dist/index.js \n"
+    assert gate.process_verdict(good, 20001)[0]
+    for bad, uid in (
+        (good, 20002),  # another user than the bridge reports
+        (good.replace("uid=20001", "uid=0"), 0),  # root
+        (good.replace("parent=1", "parent=7"), 20001),
+        (good.replace("program=node", "program=sh"), 20001),
+        (good.replace("state=S", "state=Z"), 20001),
+        ("missing\n", 20001),
     ):
-        assert not gate.environ_verdict(bad)[0], bad
+        assert not gate.process_verdict(bad, uid)[0], bad
+    assert gate.process_gone("state=Z\nparent=1\n")
+    assert not gate.process_gone(good)
+
+
+def _isolated():
+    one = {
+        "pid": 41,
+        "uid": 20001,
+        "gid": 20001,
+        "home": "/srw/home/20001",
+        "tmpdir": "/srw/home/20001",
+        "CapPrm": "0000000000000000",
+        "CapEff": "0000000000000000",
+        "CapAmb": "0000000000000000",
+        "NoNewPrivs": "1",
+        "env_names": ["HOME", "MCP_TEST_TOKEN", "PATH", "TMPDIR"],
+    }
+    two = {"pid": 42, "uid": 20002, "home": "/srw/home/20002"}
+    probes = {
+        "session two's environment": "refused: open /proc/42/environ: permission denied",
+        "session two's directory": "refused: open /srw/home/20002: permission denied",
+        "the bridge's socket": "refused: dial unix /srw/bridge/bridge.sock: connect: permission denied",
+        "session two's process": "refused: operation not permitted",
+    }
+    return one, two, probes
+
+
+def test_isolation_verdict():
+    one, two, probes = _isolated()
+    digest = "ab" * 32
+    whoami = {"credential_sha256": digest}
+    assert gate.isolation_verdict(one, two, probes, token_sha256=digest, whoami=whoami)[
+        0
+    ]
+    for change in (
+        {"uid": 0},
+        {"uid": 20002},  # session two's user
+        {"uid": 1000},  # outside the pool
+        {"gid": 0},
+        {"CapEff": "00000000000000c0"},
+        {"CapPrm": "0000000000000080"},
+        {"CapAmb": "0000000000000001"},
+        {"NoNewPrivs": "0"},
+        {"home": "/root"},
+        {"tmpdir": "/tmp"},
+        {"env_names": ["HOME", "MCP_TEST_TOKEN", "SRW_REQUEST_FILE"]},
+        {"env_names": ["HOME"]},
+    ):
+        assert not gate.isolation_verdict(
+            {**one, **change}, two, probes, token_sha256=digest, whoami=whoami
+        )[0], change
+    assert not gate.isolation_verdict(
+        one, two, probes, token_sha256=digest, whoami={"credential_sha256": "x"}
+    )[0]
+    for name in probes:
+        allowed = {**probes, name: "allowed"}
+        assert not gate.isolation_verdict(
+            one, two, allowed, token_sha256=digest, whoami=whoami
+        )[0], name
+    # Refused for another reason than permission (a path that is not there)
+    # proves nothing.
+    absent = {**probes, "session two's directory": "refused: no such file or directory"}
+    assert not gate.isolation_verdict(
+        one, two, absent, token_sha256=digest, whoami=whoami
+    )[0]
 
 
 def test_processes_verdict_needs_one_process_per_binding_with_its_credential():
@@ -280,30 +352,35 @@ def test_corpus_verdict():
     )[0]
 
 
-def _stdio_pod() -> dict:
-    """A real launch plan of the stdio test server, as the pod the gate
-    reads, with every init container exited 0."""
+PROBE_DIGEST = "sha256:" + "12" * 32
+PROBE_IMAGE = f"srw-registry:5000/srw-driver-mcp-test@{PROBE_DIGEST}"
+
+
+def _stdio_pod(probe: bool = False) -> dict:
+    """A real launch plan of the stdio test server (or the probe server),
+    as the pod the gate reads, with every init container exited 0."""
     from orchestrator.services.connector_egress import EgressPins
     from orchestrator.services.connector_service_launch import (
         ServiceLaunchPolicy,
         ServicePodIdentity,
         build_service_launch,
     )
-    from shared.connectors.builtin import MCP_STDIO_TEST_SPEC
+    from shared.connectors.builtin import MCP_STDIO_PROBE_SPEC, MCP_STDIO_TEST_SPEC
 
+    spec = MCP_STDIO_PROBE_SPEC if probe else MCP_STDIO_TEST_SPEC
     plan = build_service_launch(
         ServicePodIdentity(
             identity_id="11111111-2222-4333-8444-555555555555",
             connector_id="66666666-7777-4888-8999-aaaaaaaaaaaa",
-            driver=MCP_STDIO_TEST_SPEC.name,
-            digest=gate.STOCK_DIGEST,
+            driver=spec.name,
+            digest=PROBE_DIGEST if probe else gate.STOCK_DIGEST,
             generation="hmac-sha256:" + "cd" * 32,
         ),
-        spec=MCP_STDIO_TEST_SPEC,
-        image=f"{gate.STOCK_IMAGE}@{gate.STOCK_DIGEST}",
-        entrypoint=gate.STOCK_PROGRAM,
+        spec=spec,
+        image=PROBE_IMAGE if probe else f"{gate.STOCK_IMAGE}@{gate.STOCK_DIGEST}",
+        entrypoint=["/srw-mcp-test"] if probe else gate.STOCK_PROGRAM,
         cmd=[],
-        config={},
+        config={"message": "d5b-0123456789"} if probe else {},
         credentials={"token": "t"},
         identity_token="sdi_" + "A" * 49,
         pins=EgressPins(hosts=(), resolved_at=datetime.now(timezone.utc)),
@@ -326,6 +403,44 @@ def _stdio_pod() -> dict:
         ]
     }
     return pod
+
+
+def test_the_layout_checks_hold_for_the_probe_pod_srw_launches():
+    pod = _stdio_pod(probe=True)
+    assert gate.stdio_init_passed(pod)
+    check = {
+        "image": PROBE_IMAGE,
+        "program": gate.PROBE_PROGRAM,
+        "token_env": gate.PROBE_TOKEN_ENV,
+    }
+    assert gate.stdio_layout_problems(pod, FRONT, **check) == []
+    # The probe pod is no memory pod.
+    assert gate.stdio_layout_problems(pod, FRONT) != []
+
+
+def test_the_layout_checks_name_a_bridge_that_isolates_nothing():
+    pod = _stdio_pod()
+    for mutate, fragment in (
+        (lambda s, f: s["command"].__setitem__(3, "/tmp/b.sock"), "socket"),
+        (lambda s, f: s["command"].__setitem__(7, "0"), "socket"),
+        (
+            lambda s, f: s["securityContext"].__setitem__("runAsUser", 1000),
+            "securityContext",
+        ),
+        (
+            lambda s, f: s["securityContext"]["capabilities"]["add"].append(
+                "SYS_ADMIN"
+            ),
+            "securityContext",
+        ),
+        (lambda s, f: s["volumeMounts"].pop(), "emptyDir"),
+        (lambda s, f: f["volumeMounts"][-1].pop("readOnly"), "read-only"),
+    ):
+        changed = json.loads(json.dumps(pod))
+        server, front = changed["spec"]["containers"]
+        mutate(server, front)
+        problems = gate.stdio_layout_problems(changed, FRONT)
+        assert any(fragment in p for p in problems), (fragment, problems)
 
 
 def test_the_layout_checks_hold_for_the_pod_srw_launches():

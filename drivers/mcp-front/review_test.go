@@ -292,7 +292,7 @@ func peakHeap(t *testing.T, size int) (int, int, uint64) {
 		w.Write(body)
 	}))
 	defer upstream.Close()
-	f := newFront(testConfig(t, upstream.URL+"/mcp"), newFakeAuthority(), newUpstreamClient(), func(string, ...any) {}, time.Now)
+	f := newFront(testConfig(t, upstream.URL+"/mcp"), newFakeAuthority(), newUpstreamClient(""), func(string, ...any) {}, time.Now)
 	runtime.GC()
 	var base runtime.MemStats
 	runtime.ReadMemStats(&base)

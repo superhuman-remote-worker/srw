@@ -297,8 +297,9 @@ class DeploymentSettings:
     #: reference (``connectors.drivers.echo``); empty installs nothing.
     connector_echo_driver_image: str = ""
     #: Managed MCP servers to install (D5a, D5b), driver name -> image
-    #: reference (``connectors.drivers.managedMcp``, ``mcpTest`` and
-    #: ``mcpStdioTest``), and SRW's front image every such pod runs beside
+    #: reference (``connectors.drivers.managedMcp``, ``mcpTest``,
+    #: ``mcpStdioTest`` and ``mcpStdioProbe``), and SRW's front image every
+    #: such pod runs beside
     #: the server, which also carries the stdio bridge
     #: (``connectors.drivers.mcpFront.image``, pinned by digest).
     connector_managed_mcp_images: dict[str, str] = field(default_factory=dict)

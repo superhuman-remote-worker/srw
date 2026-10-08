@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"os"
 	"os/exec"
 	"regexp"
 	"sort"
@@ -24,7 +26,8 @@ import (
 const (
 	// Set by the front on every request it forwards: the binding (its
 	// lease's id) and that binding's credential (base64). The front never
-	// forwards a caller's own header of these names.
+	// forwards a caller's own header of these names, and only the front
+	// reaches the bridge's socket.
 	bindingHeader    = "Srw-Bridge-Binding"
 	credentialHeader = "Srw-Bridge-Credential"
 	sessionHeader    = "Mcp-Session-Id"
@@ -56,13 +59,22 @@ var testHookRead atomic.Pointer[func(jsonrpc.Message)]
 var bindingShape = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\z`)
 
 type options struct {
-	listen        string
+	socket        string
+	socketGroup   int
 	path          string
 	credentialEnv string
 	maxProcesses  int
 	idle          time.Duration
 	stopGrace     time.Duration
-	program       []string
+	// The first of the users the processes run as (0: every process runs
+	// as the bridge itself, for tests only).
+	uidBase int
+	// Where each process's private directory is made.
+	homeRoot string
+	// The writable directories the processes share, swept of a user's
+	// files before the user is handed out again.
+	sweepDirs []string
+	program   []string
 }
 
 // bridge serves the front and runs one process per binding.
@@ -81,10 +93,14 @@ type bridge struct {
 	// orphan reaper never does.
 	mains    map[int]bool
 	stopping sync.WaitGroup
+	// The users the processes run as (nil: as the bridge itself), and the
+	// last private directory's number when they do not.
+	users    *userPool
+	sequence uint64
 }
 
 func newBridge(opts options, env []string, logf func(string, ...any), now func() time.Time) *bridge {
-	return &bridge{
+	b := &bridge{
 		opts:      opts,
 		env:       env,
 		logf:      logf,
@@ -93,6 +109,10 @@ func newBridge(opts options, env []string, logf func(string, ...any), now func()
 		sessions:  map[string]*session{},
 		mains:     map[int]bool{},
 	}
+	if opts.uidBase > 0 {
+		b.users = newUserPool(opts.uidBase, poolSize(opts.maxProcesses))
+	}
+	return b
 }
 
 // process is one binding's stdio process. It starts with the binding's
@@ -114,6 +134,9 @@ type process struct {
 	stderr     *lineLogger
 	credential bool
 	started    time.Time
+	// The user it runs as (0: the bridge's own) and its private directory.
+	uid  int
+	home string
 
 	mu sync.Mutex
 	// The session the process serves now; nil between sessions.
@@ -375,6 +398,11 @@ func (b *bridge) open(binding, credential string) (*session, int, error) {
 		return nil, http.StatusServiceUnavailable, fmt.Errorf("this server's pod runs at most %d binding processes", b.opts.maxProcesses)
 	}
 	started, err := b.start(binding, credential)
+	if errors.Is(err, errNoUser) {
+		b.mu.Unlock()
+		b.logf("refused %s: every user of the pod belongs to a process still stopping", labelOf(binding))
+		return nil, http.StatusServiceUnavailable, errors.New("this server's pod is stopping processes; try again")
+	}
 	if err != nil {
 		b.mu.Unlock()
 		b.logf("%s: the server's program did not start: %v", labelOf(binding), err)
@@ -450,10 +478,25 @@ func (b *bridge) attach(p *process, fresh bool) (s, previous *session, ok bool, 
 	return s, previous, true, nil
 }
 
-// start runs the program for one binding and connects to it.
+// start runs the program for one binding, as a user of its own with a
+// private directory, and connects to it. The caller holds b.mu.
 func (b *bridge) start(binding, credential string) (*process, error) {
-	cmd := exec.Command(b.opts.program[0], b.opts.program[1:]...)
-	cmd.Env = childEnv(b.env, b.opts.credentialEnv, credential)
+	uid := 0
+	if b.users != nil {
+		var ok bool
+		if uid, ok = b.users.take(); !ok {
+			return nil, errNoUser
+		}
+	}
+	b.sequence++
+	home, err := makeHome(b.opts.homeRoot, homeName(uid, b.sequence), uid)
+	if err != nil {
+		b.unused(uid, "")
+		return nil, fmt.Errorf("its directory: %w", err)
+	}
+	program := homeArgs(b.opts.program, home)
+	cmd := exec.Command(program[0], program[1:]...)
+	cmd.Env = homeEnv(childEnv(b.env, b.opts.credentialEnv, credential), home)
 	if binding == "" {
 		credential = "" // the probe's placeholder is no credential
 	}
@@ -462,8 +505,15 @@ func (b *bridge) start(binding, credential string) (*process, error) {
 	// A process that leaves its stderr open in a child never holds Wait.
 	cmd.WaitDelay = b.opts.stopGrace + time.Second
 	ownGroup(cmd)
-	child, err := (&mcp.CommandTransport{Command: cmd, TerminateDuration: b.opts.stopGrace}).Connect(context.Background())
+	if uid > 0 {
+		runAs(cmd.SysProcAttr, uid)
+	}
+	var child mcp.Connection
+	onSpawner(func() {
+		child, err = (&mcp.CommandTransport{Command: cmd, TerminateDuration: b.opts.stopGrace}).Connect(context.Background())
+	})
 	if err != nil {
+		b.unused(uid, home) // nothing started
 		return nil, err
 	}
 	now := b.now()
@@ -475,14 +525,55 @@ func (b *bridge) start(binding, credential string) (*process, error) {
 		stderr:     stderr,
 		credential: credential != "",
 		started:    now,
+		uid:        uid,
+		home:       home,
 		lastUsed:   now,
 		pending:    map[jsonrpc.ID]*session{},
 		done:       make(chan struct{}),
 		stopped:    make(chan struct{}),
 	}
 	go p.toFront()
-	b.logf("%s: started process %d", p.label(), p.pid())
+	if uid > 0 {
+		b.logf("%s: started process %d as user %d", p.label(), p.pid(), uid)
+	} else {
+		b.logf("%s: started process %d", p.label(), p.pid())
+	}
 	return p, nil
+}
+
+// unused returns a user and directory no process ever ran with.
+func (b *bridge) unused(uid int, home string) {
+	if home != "" {
+		os.RemoveAll(home)
+	}
+	if uid > 0 {
+		b.users.give(uid)
+	}
+}
+
+// release returns a stopped process's user to the pool once none of its
+// processes or files is left; a user with a process that survived SIGKILL
+// is never handed out again.
+func (b *bridge) release(uid int, home string) {
+	gone := true
+	if uid > 0 {
+		b.mu.Lock()
+		mains := maps.Clone(b.mains)
+		b.mu.Unlock()
+		gone = killUser(uid, mains, reapWithin)
+	}
+	if err := os.RemoveAll(home); err != nil {
+		b.logf("the directory %s was not removed: %v", home, err)
+	}
+	if uid <= 0 {
+		return
+	}
+	if !gone {
+		b.logf("user %d keeps a process: it is not handed out again", uid)
+		return
+	}
+	sweepUser(b.opts.sweepDirs, uid)
+	b.users.give(uid)
 }
 
 // toProcess copies the session's messages to its process's stdin. Each was
@@ -626,7 +717,8 @@ func (p *process) failPending(reason string) {
 // stop ends the process's session at once (each call in flight is answered
 // with a closed-connection error) and the process within the grace: stdin
 // closed, then SIGTERM, then SIGKILL, and its process group killed after
-// it.
+// it; then every other process of its user (one that left its group or
+// session), its directory and the files its user left.
 func (p *process) stop(reason string) {
 	p.stopOnce.Do(func() {
 		p.failPending(reason)
@@ -655,6 +747,7 @@ func (p *process) stop(reason string) {
 			b.mu.Lock()
 			delete(b.mains, pid)
 			b.mu.Unlock()
+			b.release(p.uid, p.home)
 			outcome := "exited"
 			if err != nil {
 				outcome = err.Error()
@@ -753,6 +846,7 @@ type processStatus struct {
 	Active     int       `json:"active"`
 	Session    bool      `json:"session"`
 	Credential bool      `json:"credential"`
+	UID        int       `json:"uid,omitempty"`
 }
 
 type bridgeStatus struct {
@@ -789,6 +883,7 @@ func (b *bridge) status() bridgeStatus {
 			Active:     p.active,
 			Session:    p.current != nil,
 			Credential: p.credential,
+			UID:        p.uid,
 		})
 		p.mu.Unlock()
 	}
