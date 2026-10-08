@@ -30,8 +30,11 @@
 --                two pods of one key would both hold a live identity and the
 --                endpoint Service would serve from either.
 --                This index IS the uniqueness enforcement; there is no
---                follow-up constraint migration to adopt it.
+--                follow-up constraint migration to adopt it. The squawk-ignore
+--                below acknowledges exactly that prefer-robust-stmts
+--                trade-off (as 0207 does).
 
+-- squawk-ignore prefer-robust-stmts
 CREATE UNIQUE INDEX CONCURRENTLY uq_connector_driver_identities_serving_key
     ON public.connector_driver_identities (connector_id, image_digest, credential_generation)
     WHERE revoked_at IS NULL AND credential_generation IS NOT NULL AND replaced_at IS NULL;
