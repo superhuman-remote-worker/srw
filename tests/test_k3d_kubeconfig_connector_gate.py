@@ -178,3 +178,134 @@ def test_the_kubeconfig_reaches_the_shell_under_the_names_the_gate_checks():
     (context,) = merged["contexts"]
     assert context["context"]["namespace"] == runner.namespace
     assert merged["users"][0]["user"] == {"token": "token-value"}
+
+
+# -- the live attach/detach on a pinned session ---------------------------------
+
+
+def _live_runner(monkeypatch, *, attach=None, detach=None):
+    runner = gate.KubeconfigConnectorGate(_args())
+    runner.connectors = {"kubeconfig": "ds-kube", "file": "ds-file"}
+    names = sorted(runner.name(label) for label in ("kubeconfig", "file"))
+    order: list[str] = []
+    monkeypatch.setattr(runner, "check_pinned_pool", lambda: order.append("pool"))
+
+    def session():
+        order.append("session")
+        runner.live_thread = "00000000-0000-4000-8000-0000000000cc"
+
+    monkeypatch.setattr(runner, "live_session", session)
+    monkeypatch.setattr(
+        runner,
+        "open_egress",
+        lambda unit, selector: order.append(f"egress {unit} {selector}"),
+    )
+    answers = {
+        "attach": attach
+        or {"outcome": "config.changed", "datasources": {"added": names}},
+        "detach": detach
+        or {"outcome": "config.changed", "datasources": {"removed": names}},
+    }
+
+    def update(ids, label):
+        order.append(f"update {label} {ids}")
+        return answers[label]
+
+    monkeypatch.setattr(runner, "live_update", update)
+    monkeypatch.setattr(runner, "live_workspace", lambda: "ws-thread-pod")
+    monkeypatch.setattr(
+        runner, "workspace_checks", lambda label, pod: order.append(f"{label} {pod}")
+    )
+    monkeypatch.setattr(
+        runner, "live_detached_checks", lambda pod: order.append(f"detached {pod}")
+    )
+    monkeypatch.setattr(
+        runner, "delete_thread", lambda thread: order.append("delete") or True
+    )
+    return runner, order
+
+
+def test_the_live_phase_attaches_then_detaches_both_connectors(monkeypatch):
+    runner, order = _live_runner(monkeypatch)
+    runner.live_phase()
+    assert order == [
+        "pool",
+        "session",
+        "egress live {'srw/thread-id': '00000000-0000-4000-8000-0000000000cc'}",
+        "update attach ['ds-kube', 'ds-file']",
+        "live attach ws-thread-pod",
+        "update detach []",
+        "detached ws-thread-pod",
+        "delete",
+    ]
+    assert runner.report.passed, runner.report.results
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        {"attach": {"outcome": "error", "message": "rejected"}},
+        {"detach": {"outcome": "config.changed", "datasources": {"removed": []}}},
+    ],
+)
+def test_a_live_update_that_did_not_land_fails(monkeypatch, fault):
+    runner, _order = _live_runner(monkeypatch, **fault)
+    runner.live_phase()
+    assert not runner.report.passed
+
+
+@pytest.mark.parametrize(
+    ("out", "passed"),
+    [
+        (
+            "kubelink=no\nfilelink=no\nstore=no\nkubeconfig=\nvar=\n"
+            "marker=error: no configuration has been provided\n",
+            True,
+        ),
+        (
+            "kubelink=yes\nfilelink=no\nstore=no\nkubeconfig=\nvar=\nmarker=x\n",
+            False,
+        ),
+        (
+            "kubelink=no\nfilelink=no\nstore=yes\nkubeconfig=\nvar=\nmarker=x\n",
+            False,
+        ),
+        (
+            "kubelink=no\nfilelink=no\nstore=no\n"
+            "kubeconfig=/home/agent-host/.srw-credentials/files-x/kubeconfig\n"
+            "var=\nmarker=x\n",
+            False,
+        ),
+    ],
+)
+def test_the_detached_workspace_is_read_from_one_script(monkeypatch, out, passed):
+    runner = gate.KubeconfigConnectorGate(_args())
+    monkeypatch.setattr(runner, "ws", lambda pod, script, check=True: (0, out))
+    runner.live_detached_checks("ws-thread-pod")
+    assert runner.report.passed is passed
+
+
+def test_skip_live_skips_only_the_live_phase(monkeypatch):
+    for argv, expected in (([], True), (["--skip-live"], False)):
+        args = gate.build_parser().parse_args(["--gate-id", GATE_ID, *argv])
+        runner = gate.KubeconfigConnectorGate(args)
+        ran: list[str] = []
+        for phase in ("preflight", "fixture", "session", "run_job"):
+            monkeypatch.setattr(runner, phase, lambda: None)
+        monkeypatch.setattr(runner, "live_phase", lambda: ran.append("live"))
+        monkeypatch.setattr(runner, "cleanup", lambda: [])
+        monkeypatch.setattr(runner, "residue", lambda: [])
+        runner.run()
+        assert (ran == ["live"]) is expected
+
+
+def test_cleanup_deletes_the_live_session_too(monkeypatch):
+    runner = gate.KubeconfigConnectorGate(_args())
+    runner.live_thread = "00000000-0000-4000-8000-0000000000cc"
+    deleted: list[str] = []
+    monkeypatch.setattr(runner, "titled_threads", lambda: [runner.live_thread])
+    monkeypatch.setattr(
+        runner, "delete_thread", lambda thread: deleted.append(thread) or True
+    )
+    assert runner.cleanup() == []
+    assert deleted == [runner.live_thread]

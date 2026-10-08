@@ -47,6 +47,15 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
              kubectl and write the marker to output/d1d.txt: the same
              workspace checks while it runs, the job settles completed, and
              an audited LLM request carries the marker (the tool result)
+  live       a PINNED session (an Officer conference, sandbox) with no
+             connectors, after every pooled pinned pod is checked for this
+             checkout's code (the drivers gate's pool check: an idle pooled
+             pod keeps its old image). A live ``config.update`` attaches
+             both connectors: the ack lists them and the same workspace
+             checks pass. A second one detaches both: the links, the store
+             and the files are gone, KUBECONFIG and the file's variable are
+             empty, and kubectl no longer reads the marker. ``--skip-live``
+             skips it
   cleanup    nothing this run created is left: sessions, the job, both
              connectors, the project, the NetworkPolicies and the namespace
 
@@ -127,8 +136,14 @@ AGENT_FILES = (
     "src/shared/runtime/core/credential_env.py",
     "src/shared/runtime/core/backends/remote.py",
     "src/shared/connectors/builtin.py",
+    "src/shared/connectors/file_targets.py",
 )
-ORCHESTRATOR_FILES = ("src/shared/connectors/builtin.py",)
+ORCHESTRATOR_FILES = (
+    "src/shared/connectors/builtin.py",
+    "src/shared/connectors/file_targets.py",
+    "src/orchestrator/security/credential_files.py",
+    "src/orchestrator/services/connector_drivers/credential_files.py",
+)
 
 # Reads JSON ``{"root": ..., "paths": [...]}`` on stdin; prints
 # ``{path: sha256 | null}``. Nothing secret crosses it.
@@ -152,7 +167,7 @@ PLAN = [
     "fixture: scratch namespace srw-gate-<gate id> with a read-only "
     "ServiceAccount (get/list ConfigMaps and Pods), a marker ConfigMap and a "
     "one-hour token; a project; a kubeconfig and a generic-file connector",
-    "egress: one NetworkPolicy per unit (session, job) letting only that "
+    "egress: one NetworkPolicy per unit (session, job, live session) letting only that "
     "unit's workspace pod reach the API server",
     "session: stateless sandbox session; workspace links into "
     "~/.srw-credentials, modes, kubectl as agent-host reads the marker, "
@@ -162,6 +177,10 @@ PLAN = [
     "job: stateless sandbox job asked to run kubectl; the same workspace "
     "checks while it runs; settles completed; an audited request carries "
     "the marker",
+    "live: pooled pinned pods checked for this checkout's code first; a pinned "
+    "Officer-conference session; a live config.update attaches both "
+    "connectors (same workspace checks), a second detaches both (links, "
+    "store and variables gone) (--skip-live skips it)",
     "cleanup: sessions, job, connectors, project, NetworkPolicies, namespace",
 ]
 
@@ -656,6 +675,80 @@ class KubeconfigConnectorGate(base.ConnectorDriversGate):
             f"{used} audited requests",
         )
 
+    # -- live attach and detach on a pinned session -----------------------
+    def live_phase(self) -> None:
+        """Attach and detach both connectors live (``live_attach`` is true).
+
+        The pool check, the pinned session, its assigned pod's byte check and
+        the live ``config.update`` are the drivers gate's own.
+        """
+        self.check_pinned_pool()
+        self.live_session()
+        self.open_egress("live", {"srw/thread-id": self.live_thread})
+        labels = ("kubeconfig", "file")
+        names = sorted(self.name(label) for label in labels)
+        attached = self.live_update(
+            [self.connectors[label] for label in labels], "attach"
+        )
+        added = sorted((attached.get("datasources") or {}).get("added") or [])
+        self.report.check(
+            "live attach: config.changed lists both connectors added",
+            attached.get("outcome") == "config.changed" and added == names,
+            f"outcome {attached.get('outcome')}, added {added}",
+        )
+        pod = self.live_workspace()
+        self.workspace_checks("live attach", pod)
+        detached = self.live_update([], "detach")
+        removed = sorted((detached.get("datasources") or {}).get("removed") or [])
+        self.report.check(
+            "live detach: config.changed lists both connectors removed",
+            detached.get("outcome") == "config.changed" and removed == names,
+            f"outcome {detached.get('outcome')}, removed {removed}",
+        )
+        self.live_detached_checks(pod)
+        self.report.check(
+            "live: session ended and deleted",
+            self.delete_thread(self.live_thread),
+            "thread row",
+        )
+
+    def live_detached_checks(self, pod: str) -> None:
+        """After a live detach: no link, no store file, no variable."""
+        _rc, out = self.ws(
+            pod,
+            'for env in ~/.srw-credentials/*.sh; do . "$env"; done\n'
+            'test -L ~/.kube/config && echo "kubelink=yes" || echo "kubelink=no"\n'
+            f"test -e ~/.config/d1d/{self.suffix}.json "
+            '&& echo "filelink=yes" || echo "filelink=no"\n'
+            "ls ~/.srw-credentials/files-*/ >/dev/null 2>&1 "
+            '&& echo "store=yes" || echo "store=no"\n'
+            'echo "kubeconfig=${KUBECONFIG-}"\n'
+            f'echo "var=${{{self.file_var}-}}"\n'
+            f'echo "marker=$({self.kubectl_command} 2>&1 | head -c 200)"\n'
+            "exit 0\n",
+            check=False,
+        )
+        facts = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+        self.report.check(
+            "live detach: the links and the store are gone",
+            facts.get("kubelink") == "no"
+            and facts.get("filelink") == "no"
+            and facts.get("store") == "no",
+            f"~/.kube/config link {facts.get('kubelink')}, file link "
+            f"{facts.get('filelink')}, store {facts.get('store')}",
+        )
+        self.report.check(
+            "live detach: KUBECONFIG and the file's variable are empty",
+            facts.get("kubeconfig") == "" and facts.get("var") == "",
+            f"KUBECONFIG {facts.get('kubeconfig', '').replace(HOME, '~')!r}, "
+            f"{self.file_var} {facts.get('var', '').replace(HOME, '~')!r}",
+        )
+        self.report.check(
+            "live detach: kubectl no longer reads the marker",
+            facts.get("marker") != self.kube_marker,
+            f"kubectl said {facts.get('marker', '')[:120]!r}",
+        )
+
     # -- cleanup -----------------------------------------------------------
     def cleanup(self) -> list[str]:
         problems: list[str] = []
@@ -669,8 +762,10 @@ class KubeconfigConnectorGate(base.ConnectorDriversGate):
 
         if self.thread:
             step("delete session", self.end_session)
+        if self.live_thread:
+            step("delete live session", lambda: self.delete_thread(self.live_thread))
         for leftover in self.titled_threads():
-            if leftover != self.thread:
+            if leftover not in (self.thread, self.live_thread):
                 step(
                     f"delete leftover session {leftover}",
                     lambda leftover=leftover: self.delete_thread(leftover),
@@ -747,6 +842,7 @@ class KubeconfigConnectorGate(base.ConnectorDriversGate):
         for table, value in (
             ("jobs", self.job),
             ("threads", self.thread),
+            ("threads", self.live_thread),
             ("projects", self.project),
         ):
             if (
@@ -769,6 +865,7 @@ class KubeconfigConnectorGate(base.ConnectorDriversGate):
             [
                 f"srw/job-id={self.job}" if self.job else "",
                 f"srw/thread-id={self.thread}" if self.thread else "",
+                f"srw/thread-id={self.live_thread}" if self.live_thread else "",
             ],
         ):
             try:
@@ -795,6 +892,11 @@ class KubeconfigConnectorGate(base.ConnectorDriversGate):
                 # The job still runs.
                 self.report.check("session: infrastructure", False, str(exc))
             self.run_job()
+            if not self.args.skip_live:
+                try:
+                    self.live_phase()
+                except GateError as exc:
+                    self.report.check("live: infrastructure", False, str(exc))
         except GateError as exc:
             self.report.check("gate infrastructure", False, str(exc))
         finally:
@@ -809,6 +911,7 @@ class KubeconfigConnectorGate(base.ConnectorDriversGate):
                             "project": self.project,
                             "job": self.job,
                             "thread": self.thread,
+                            "live_thread": self.live_thread,
                         }
                     )
                 )
@@ -846,6 +949,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--turn-timeout", type=int, default=420)
     parser.add_argument("--job-timeout", type=int, default=900)
+    parser.add_argument(
+        "--skip-live",
+        action="store_true",
+        help="skip the live attach/detach on a pinned session",
+    )
     parser.add_argument("--keep", action="store_true", help="skip cleanup")
     return parser
 
