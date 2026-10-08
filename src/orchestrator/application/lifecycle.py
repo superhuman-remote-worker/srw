@@ -144,6 +144,9 @@ async def open_stores(resources: ApplicationResources) -> tuple[bool, Any]:
     )
 
     resources.postgres_db.manifest_runtime_image = installed_srw_image()
+    # The datasource write-through describes a row's Connector with the
+    # application's own drivers (manifest_connectors).
+    resources.postgres_db.connector_drivers = resources.connector_drivers
     resources.postgres_db.manifest_skills_provider = (
         lambda *args, **kwargs: catalogue_composition.expert_catalog_service(
             resources
@@ -176,6 +179,10 @@ async def open_stores(resources: ApplicationResources) -> tuple[bool, Any]:
             "Workspace defaults backfill failed; it retries at the next start"
         )
     await check_installation_workspace_defaults(resources.postgres_db)
+    from orchestrator.services.manifest_connectors import migrate_stored_connectors
+
+    # Connectors before the Projects that will reference them (slice D3c).
+    await migrate_stored_connectors(resources.postgres_db)
     from orchestrator.services.manifest_projects import migrate_projects
 
     await migrate_projects(resources.postgres_db)

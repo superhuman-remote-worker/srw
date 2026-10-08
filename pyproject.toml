@@ -134,6 +134,7 @@ source_modules = [
   "orchestrator.services.manifest_execution_snapshot",
   "orchestrator.services.manifest_session_delivery",
   "orchestrator.services.manifest_experts",
+  "orchestrator.services.manifest_connectors",
   "orchestrator.services.manifest_projects",
   "orchestrator.services.manifest_workspaces",
 ]

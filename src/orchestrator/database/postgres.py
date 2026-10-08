@@ -12,7 +12,9 @@ This is the canonical database layer for the orchestrator.
 
 import asyncio
 import base64
+import functools
 import hashlib
+import inspect
 import ipaddress
 import json
 import logging
@@ -50,6 +52,7 @@ from shared.connectors.builtin import (
     legacy_types_where,
     legacy_types_with_config_key,
 )
+from shared.connectors.platform import platform_owned_sql
 
 try:
     import asyncpg
@@ -1248,6 +1251,44 @@ async def _transaction_if(conn, enabled: bool):
             yield
     else:
         yield
+
+
+def _writes_connector(*, from_result: bool = False):
+    """Write a datasource and its manifest Connector in one transaction.
+
+    The datasource API writes the row; this writes the row's Connector
+    resource after it (``manifest_connectors.persist_connector_resource``),
+    in the same ``transaction_scope``, so a failure in either half rolls both
+    back. The catalog lock comes first, the order every manifest write and
+    execution admission takes it in, so a write never waits for the catalog
+    while holding a row lock another catalog holder needs. The datasource is
+    the method's ``datasource_id`` argument, or with ``from_result`` the id
+    of the row it returns. A falsy result (nothing found, nothing changed)
+    writes nothing more.
+    """
+
+    def decorate(method):
+        signature = inspect.signature(method)
+
+        @functools.wraps(method)
+        async def wrapper(self, *args, **kwargs):
+            async with self.transaction_scope():
+                await self._lock_connector_catalog()
+                result = await method(self, *args, **kwargs)
+                if result:
+                    datasource_id = (
+                        result["id"]
+                        if from_result
+                        else signature.bind(self, *args, **kwargs).arguments[
+                            "datasource_id"
+                        ]
+                    )
+                    await self._persist_connector_resource(datasource_id)
+            return result
+
+        return wrapper
+
+    return decorate
 
 
 async def _require_project_owner_for_link_additions(
@@ -50109,7 +50150,7 @@ class PostgresDB:
 
         conditions = [
             "d.job_id IS NULL",
-            "NOT (d.type = 'kb' AND d.config ? 'native_project_id')",
+            f"NOT {platform_owned_sql('d')}",
             "NOT EXISTS ("
             "SELECT 1 FROM project_datasources linked_pd "
             "WHERE linked_pd.datasource_id = d.id "
@@ -50311,7 +50352,7 @@ class PostgresDB:
                 SELECT id, name, description, type, connection_url, credentials,
                        config, cli_hint, default_branch, job_id, created_by, is_global,
                        read_only, scope_mode, auto_attach, policy_revision,
-                       created_at, updated_at
+                       managed_key, created_at, updated_at
                 FROM datasources
                 WHERE id = $1
                 """,
@@ -50347,6 +50388,18 @@ class PostgresDB:
             )
         return _datasource_row_to_dict(row) if row else None
 
+    async def _lock_connector_catalog(self) -> None:
+        from orchestrator.services.manifest_store import ManifestStore
+
+        await ManifestStore(self).lock_catalog()
+
+    async def _persist_connector_resource(self, datasource_id: Any) -> str:
+        from orchestrator.services.manifest_connectors import (
+            persist_connector_resource,
+        )
+
+        return await persist_connector_resource(self, datasource_id)
+
     async def get_datasource_tombstones(self, ids: list[str]) -> dict[str, str]:
         """Names of deleted connectors, for labelling drifted session config."""
         if not ids:
@@ -50362,6 +50415,7 @@ class PostgresDB:
             )
         return {str(row["id"]): row["name"] for row in rows}
 
+    @_writes_connector(from_result=True)
     async def create_datasource(
         self,
         name: str,
@@ -50501,6 +50555,7 @@ class PostgresDB:
 
         return _datasource_row_to_dict(row)
 
+    @_writes_connector()
     async def update_datasource(
         self,
         datasource_id: str,
@@ -50732,6 +50787,7 @@ class PostgresDB:
             authority_project_scope_id=authority_project_scope_id,
         )
 
+    @_writes_connector()
     async def update_datasource_with_policy(
         self,
         datasource_id: str,
@@ -51036,6 +51092,7 @@ class PostgresDB:
         result["project_ids"] = [str(row["project_id"]) for row in final_links]
         return result
 
+    @_writes_connector()
     async def delete_datasource(
         self,
         datasource_id: str,
@@ -51678,6 +51735,7 @@ class PostgresDB:
 
     # -- Project ↔ Datasource junction (N:M) ----------------------------------
 
+    @_writes_connector()
     async def link_datasource_to_project(
         self,
         project_id: str,
@@ -51701,13 +51759,9 @@ class PostgresDB:
         async with self.acquire() as conn:
             async with conn.transaction():
                 datasource = await conn.fetchrow(
-                    """
+                    f"""
                     SELECT id, created_by, is_global, scope_mode,
-                           (
-                               type = 'kb'
-                               AND NULLIF(config->>'native_project_id', '')
-                                   IS NOT NULL
-                           ) AS is_native
+                           {platform_owned_sql()} AS is_native
                     FROM datasources
                     WHERE id = $1
                     FOR UPDATE
@@ -51779,6 +51833,7 @@ class PostgresDB:
 
         return "INSERT" in result or "UPDATE" in result
 
+    @_writes_connector()
     async def unlink_datasource_from_project(
         self,
         project_id: str,
@@ -52337,6 +52392,7 @@ class PostgresDB:
 
         return {"stripped": stripped, "skipped": skipped, "errors": errors}
 
+    @_writes_connector(from_result=True)
     async def upsert_default_datasource(
         self,
         name: str,

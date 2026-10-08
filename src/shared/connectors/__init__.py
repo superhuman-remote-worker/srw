@@ -4,7 +4,8 @@
 * :mod:`.binding` — the binding descriptor, its JSON Schema and validator;
 * :mod:`.envelope` — the request, the typed output lines and error classes;
 * :mod:`.builtin` — the specs of the drivers SRW ships;
-* :mod:`.leases` — credential lease and driver identity tokens (C2).
+* :mod:`.leases` — credential lease and driver identity tokens (C2);
+* :mod:`.platform` — the platform-owned marker (``managed_key``).
 
 The control-plane drivers live in ``orchestrator.services.connector_drivers``;
 the agent's materializers will live in ``agent.connectors``.  Import-linter

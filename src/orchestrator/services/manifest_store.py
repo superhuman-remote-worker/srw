@@ -31,6 +31,15 @@ def decoded(row):
 INSTALLATION_MANAGED_MESSAGE = (
     "This template is managed by the installation. Duplicate it to change it."
 )
+#: A resource mirroring a platform-owned connector (``platform_managed``).
+PLATFORM_MANAGED_MESSAGE = (
+    "SRW manages this connector; it cannot be changed or deleted here."
+)
+#: A Connector resource written through from a datasource row.
+LINKED_CONNECTOR_MESSAGE = (
+    "Change or delete this connector on the Connectors page "
+    "(/api/datasources); its resource is written from there."
+)
 
 
 def resource_view(row):
@@ -42,6 +51,7 @@ def resource_view(row):
         "revision": row["revision"],
         "activeRevision": row.get("active_revision"),
         "installationManaged": bool(row.get("installation_managed")),
+        "platformManaged": row.get("platform_managed"),
     }
 
 
@@ -140,8 +150,13 @@ class ManifestStore:
         expected_version=None,
         uid=None,
         installation_managed=False,
+        platform_managed=None,
     ):
-        """Call inside transaction_scope, with this identity already locked."""
+        """Call inside transaction_scope, with this identity already locked.
+
+        ``platform_managed`` is the managed key of a platform-owned row this
+        resource mirrors; only that row's write-through passes it.
+        """
         metadata = document["metadata"]
         old = await self.by_name(document["kind"], metadata["scope"], metadata["name"])
         if old:
@@ -158,6 +173,19 @@ class ManifestStore:
                     else "A resource with this name exists and isn't managed "
                     "by the installation.",
                 )
+            if old.get("platform_managed") and (
+                old["platform_managed"] != platform_managed
+            ):
+                raise HTTPException(409, PLATFORM_MANAGED_MESSAGE)
+            if (
+                old["kind"] == "Connector"
+                and old.get("linked_id")
+                and str(old["linked_id"]) != str(linked_id or "")
+            ):
+                # Its datasource row decides it until readers move to the
+                # resource; an edit here would be overwritten by the next
+                # write-through, or diverge from what executions bind.
+                raise HTTPException(409, LINKED_CONNECTOR_MESSAGE)
             if (
                 expected_version is not None
                 and old["resource_version"] != expected_version
@@ -217,8 +245,8 @@ class ManifestStore:
                 )
             resource_id, version = UUID(str(uid)) if uid else uuid4(), 1
             row = await self.db.fetchrow(
-                """INSERT INTO srw_resources(id,kind,scope_kind,scope_name,name,owner_id,project_id,linked_id,managed_by,document,resolved,revision,dependencies,installation_managed)
-                VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13::jsonb,$14) RETURNING *""",
+                """INSERT INTO srw_resources(id,kind,scope_kind,scope_name,name,owner_id,project_id,linked_id,managed_by,document,resolved,revision,dependencies,installation_managed,platform_managed)
+                VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13::jsonb,$14,$15) RETURNING *""",
                 resource_id,
                 document["kind"],
                 metadata["scope"]["kind"],
@@ -233,6 +261,7 @@ class ManifestStore:
                 revision,
                 json.dumps(dependencies),
                 installation_managed,
+                platform_managed,
             )
         await self.db.execute(
             "INSERT INTO srw_resource_revisions(resource_id,resource_version,document,resolved,revision,dependencies) VALUES($1,$2,$3::jsonb,$4::jsonb,$5,$6::jsonb)",
@@ -261,6 +290,12 @@ class ManifestStore:
                 raise HTTPException(
                     409, "Remove this resource through its owning Project definition."
                 )
+            if current.get("platform_managed"):
+                raise HTTPException(409, PLATFORM_MANAGED_MESSAGE)
+            if current["kind"] == "Connector" and current.get("linked_id"):
+                # The datasource delete keeps its own semantics: tombstone,
+                # thread scrub, and no wait for running work (decision 12).
+                raise HTTPException(409, LINKED_CONNECTOR_MESSAGE)
             if current["kind"] == "Expert" and current.get("linked_id"):
                 managed_key = await self.db.fetchval(
                     "SELECT managed_key FROM experts WHERE id=$1", current["linked_id"]

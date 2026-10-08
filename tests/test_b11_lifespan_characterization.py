@@ -388,10 +388,12 @@ def _lifespan_environment(
     _owner("agent_provisioner").agent_provisioner.list_pods = AsyncMock(return_value=[])
 
     # Startup steps that would otherwise reach real services or schemas.
+    import orchestrator.services.manifest_connectors as manifest_connectors
     import orchestrator.services.manifest_experts as manifest_experts
     import orchestrator.services.manifest_projects as manifest_projects
 
     monkeypatch.setattr(manifest_experts, "migrate_stored_experts", AsyncMock())
+    monkeypatch.setattr(manifest_connectors, "migrate_stored_connectors", AsyncMock())
     monkeypatch.setattr(manifest_experts, "seed_bundled_expert_manifests", AsyncMock())
     monkeypatch.setattr(manifest_experts, "installed_srw_image", lambda: None)
     monkeypatch.setattr(manifest_projects, "migrate_projects", AsyncMock())

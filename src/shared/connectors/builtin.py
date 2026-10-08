@@ -561,6 +561,11 @@ MCP_SPEC = DriverSpec(
     deployment_gate="mcp_datasources",
     holds_upstream_credentials=True,
 )
+#: The driver a remote (http or sse) MCP connector's resource names. The
+#: design gives remote and stdio servers separate drivers; stdio keeps
+#: ``srw.mcp/v1``, whose subprocess path managed MCP images replace (D5).
+#: Until that split, MCP_SPEC serves both names (slice D3a stores them).
+MCP_REMOTE_DRIVER = "srw.mcp-remote/v1"
 
 
 def _credential_file(

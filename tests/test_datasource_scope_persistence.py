@@ -48,6 +48,16 @@ def _make_db(conn: AsyncMock) -> PostgresDB:
 
     conn.transaction = MagicMock(side_effect=transaction)
     db.acquire = acquire
+
+    # The Connector write-through (tests/test_manifest_connectors*.py) runs
+    # around these row writes; here only the row SQL is pinned.
+    @asynccontextmanager
+    async def transaction_scope():
+        yield conn
+
+    db.transaction_scope = transaction_scope
+    db._lock_connector_catalog = AsyncMock()
+    db._persist_connector_resource = AsyncMock(return_value="unchanged")
     return db
 
 
@@ -737,7 +747,10 @@ async def test_project_linkable_datasources_are_target_aware_and_paginated():
     assert query == "data"
     assert fetch_limit == 2
     assert "d.job_id IS NULL" in sql
-    assert "d.config ? 'native_project_id'" in sql
+    # Platform-owned rows (the managed key, or the native KB marker an older
+    # orchestrator wrote) are never linkable.
+    assert "NOT (d.managed_key IS NOT NULL OR (d.type = 'kb'" in sql
+    assert "d.config->>'native_project_id'" in sql
     assert "NOT EXISTS" in sql
     assert "linked_pd.project_id = $2" in sql
     assert "d.created_by = $1" in sql

@@ -120,6 +120,9 @@ class CredentialFileDriver(DatasourceDriver):
             draft.connection_url, self.no_config(draft, existing), credentials
         )
 
+    def credential_config(self, credentials: Mapping[str, Any]) -> dict[str, Any]:
+        return self.credential_file_targets(credentials)
+
     async def check(
         self, row: Mapping[str, Any], credentials: dict[str, Any], *, ctx: CheckContext
     ) -> dict[str, Any]:

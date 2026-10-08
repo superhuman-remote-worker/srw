@@ -66,7 +66,7 @@ from orchestrator.services.connector_drivers.base import (
     ValidationContext,
 )
 from shared.credential_connectors import CredentialConnectorAttachedError
-from shared.native_kb import native_kb_project_id
+from shared.connectors.platform import platform_owned
 from shared.runtime.utils.ssh_key import (
     generate_ed25519_keypair as _generate_ed25519_keypair,
 )
@@ -519,10 +519,9 @@ async def update_datasource(
     if effective_global and read_only is None and existing_ds.get("read_only") is None:
         read_only = True  # invariant: public ⇒ read_only set
 
-    native_project = native_kb_project_id(existing_ds)
     policy_fields = {"scope_mode", "project_ids", "auto_attach"}
     policy_changed = bool(policy_fields.intersection(body.model_fields_set))
-    if native_project and policy_changed:
+    if platform_owned(existing_ds) and policy_changed:
         raise HTTPException(
             status_code=409,
             detail="The native project knowledge connector policy is managed by its project",
@@ -723,7 +722,7 @@ async def delete_datasource(
     A connector SRW indexes is deleted through its driver, behind the index
     fence; every other connector is a plain row delete.
     """
-    if native_kb_project_id(datasource):
+    if platform_owned(datasource):
         raise HTTPException(
             status_code=409,
             detail="The project knowledge connector is managed by its project",

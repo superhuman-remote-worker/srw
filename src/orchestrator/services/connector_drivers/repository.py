@@ -26,6 +26,7 @@ from orchestrator.services.connector_drivers.base import (
     ConnectorDraft,
     NormalizedConnector,
     ValidationContext,
+    auth_method_config,
     payload_entry,
 )
 from orchestrator.services.connector_drivers.workspace_ssh import WorkspaceSshDriver
@@ -55,6 +56,10 @@ class RepositoryDriver(WorkspaceSshDriver):
 
     def retrieval_messages(self, row: Mapping[str, Any]) -> list[str]:
         return knowledge_note.repository_phrases(row)
+
+    def credential_config(self, credentials: Mapping[str, Any]) -> dict[str, Any]:
+        """The auth method; the token and the key stay secret."""
+        return auth_method_config(credentials)
 
     def unread_pins_dropped(
         self, config: dict[str, Any], credentials: Mapping[str, Any]

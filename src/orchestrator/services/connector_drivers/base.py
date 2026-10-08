@@ -12,7 +12,10 @@ The orchestrator asks a driver of a stored connector type four things:
   byte for byte; the agent builds binding descriptors from it.
 
 ``revoke`` retires what a binding delivered; nothing a built-in driver
-delivers outlives the execution, so it is a no-op for all of them.  Optional
+delivers outlives the execution, so it is a no-op for all of them.
+``resource_driver`` and ``credential_config`` describe a stored row as its
+manifest Connector resource (``orchestrator.services.manifest_connectors``):
+the driver name it stores and which credential fields are not secret.  Optional
 capabilities are protocols checked with ``isinstance``, as in
 ``services/cloud/base.py``.
 
@@ -43,6 +46,8 @@ logger = logging.getLogger(__name__)
 NO_CONFIG_DETAIL = (
     "Connector config is only supported for OKF Knowledge Bases and email connectors"
 )
+#: A credential file's non-secret fields; ``contents`` is the secret.
+_FILE_TARGET_KEYS = ("name", "target_path", "mode", "env_var")
 
 
 @dataclass(frozen=True)
@@ -136,6 +141,13 @@ class BindContext:
     logger: logging.Logger
     #: The deployment's default SSH host-key pins (known_hosts text).
     default_known_hosts: str
+
+
+def auth_method_config(credentials: Mapping[str, Any]) -> dict[str, Any]:
+    """A repository's stored ``auth_method``, the one non-secret field of its
+    credentials (repository and knowledge-base drivers)."""
+    method = credentials.get("auth_method")
+    return {"auth_method": method} if isinstance(method, str) and method else {}
 
 
 def probe_failure(message: str, ds_type: str) -> dict[str, Any]:
@@ -285,7 +297,40 @@ class DatasourceDriver:
         """The phrases the connector's knowledge note is retrieved by."""
         return knowledge_note.connection_phrases(row)
 
+    # -- the Connector resource of a stored row (slice D3a) ----------------
+
+    def resource_driver(self, credentials: Mapping[str, Any]) -> str:
+        """The ``driver`` the row's Connector resource names."""
+        return self.spec.name
+
+    def credential_config(self, credentials: Mapping[str, Any]) -> dict[str, Any]:
+        """The non-secret parts of stored credentials, as Connector config.
+
+        Whatever this leaves out counts as secret: it stays on the row, and
+        slice D3b moves it into the Connector's resource secret.  The default
+        keeps nothing.
+        """
+        return {}
+
     # -- helpers shared by the built-in drivers -----------------------------
+
+    @staticmethod
+    def credential_file_targets(credentials: Mapping[str, Any]) -> dict[str, Any]:
+        """Where each stored credential file lands, without its contents."""
+        files = credentials.get("files")
+        if not isinstance(files, list):
+            return {}
+        return {
+            "files": [
+                {
+                    key: entry[key]
+                    for key in _FILE_TARGET_KEYS
+                    if isinstance(entry.get(key), str)
+                }
+                for entry in files
+                if isinstance(entry, Mapping)
+            ]
+        }
 
     @staticmethod
     def no_config(

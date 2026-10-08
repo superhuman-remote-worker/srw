@@ -73,6 +73,7 @@ from orchestrator.services.officer_metadata import (
     thread_officer_meta as _thread_officer_meta,
 )
 from shared.connectors.builtin import spec_for_row
+from shared.connectors.platform import platform_owned
 
 
 def _link_forced_read_only(datasource: dict[str, Any]) -> bool:
@@ -1181,9 +1182,7 @@ async def link_datasource_to_project(
             status_code=403, detail="Not authorized to link this connector"
         )
 
-    from orchestrator.services.kb_datasources import native_kb_project_id
-
-    if native_kb_project_id(ds):
+    if platform_owned(ds):
         raise HTTPException(
             status_code=409,
             detail="The native knowledge connector cannot be linked to another project",
@@ -1286,9 +1285,7 @@ async def resolve_datasource_unlink(
     ds = await dependencies.store.get_datasource(datasource_id)
     if not ds:
         raise HTTPException(status_code=404, detail="Connector not found")
-    from orchestrator.services.kb_datasources import native_kb_project_id
-
-    if native_kb_project_id(ds):
+    if platform_owned(ds):
         raise HTTPException(
             status_code=409,
             detail="The native knowledge connector link is managed by its project",

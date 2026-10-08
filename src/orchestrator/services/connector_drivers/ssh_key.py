@@ -42,6 +42,9 @@ class SshKeyDriver(WorkspaceSshDriver):
     def holds_ssh_key(self, row: Mapping[str, Any]) -> bool:
         return True
 
+    def credential_config(self, credentials: Mapping[str, Any]) -> dict[str, Any]:
+        return self.credential_file_targets(credentials)
+
     def _normalize_files(
         self, name: str, credentials: dict[str, Any] | None
     ) -> dict[str, Any] | None:

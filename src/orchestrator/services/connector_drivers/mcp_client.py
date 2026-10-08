@@ -10,6 +10,8 @@ so a read-only project link changes nothing.
 
 The design splits this into ``srw.mcp-remote/v1`` and a stdio driver once
 managed MCP images ship (D5); until then one driver serves the stored type.
+Its Connector resources already name the split (slice D3a): a remote server
+stores ``srw.mcp-remote/v1``, a stdio server ``srw.mcp/v1``.
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ from orchestrator.services.connector_drivers.base import (
     NormalizedConnector,
     ValidationContext,
 )
-from shared.connectors.builtin import MCP_SPEC
+from shared.connectors.builtin import MCP_REMOTE_DRIVER, MCP_SPEC
 
 _CONFIG_REFUSED = "Connector config is not supported for MCP connectors"
 
@@ -124,6 +126,35 @@ class McpDriver(DatasourceDriver):
             else "http"
         )
         return str(transport).lower() != "stdio" or gates.mcp_stdio_enabled()
+
+    @staticmethod
+    def _transport(credentials: Mapping[str, Any]) -> str:
+        return str(credentials.get("transport") or "http").lower().strip()
+
+    def resource_driver(self, credentials: Mapping[str, Any]) -> str:
+        """``srw.mcp/v1`` for a stdio server, ``srw.mcp-remote/v1`` otherwise."""
+        if self._transport(credentials) == "stdio":
+            return self.spec.name
+        return MCP_REMOTE_DRIVER
+
+    def credential_config(self, credentials: Mapping[str, Any]) -> dict[str, Any]:
+        """The transport and the stdio command, or the remote auth kind and
+        header names.  Arguments, environment values, the bearer token and
+        header values stay secret: arguments often carry a key."""
+        transport = self._transport(credentials)
+        config: dict[str, Any] = {"transport": transport}
+        if transport == "stdio":
+            command = credentials.get("command")
+            if isinstance(command, str):
+                config["command"] = command
+            return config
+        auth = credentials.get("auth")
+        auth = auth if isinstance(auth, Mapping) else {}
+        config["auth_type"] = str(auth.get("type") or "none")
+        headers = auth.get("headers")
+        if config["auth_type"] == "headers" and isinstance(headers, Mapping):
+            config["header_names"] = sorted(str(name) for name in headers)
+        return config
 
 
 async def test_mcp_datasource(

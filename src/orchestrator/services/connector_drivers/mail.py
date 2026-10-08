@@ -137,6 +137,23 @@ class EmailDriver(DatasourceDriver):
     def effective_access(self, row: Mapping[str, Any]) -> str | None:
         return email_effective_access(dict(row))
 
+    def credential_config(self, credentials: Mapping[str, Any]) -> dict[str, Any]:
+        """The mailbox user and its servers; only the password is secret."""
+        config: dict[str, Any] = {
+            key: credentials[key]
+            for key in ("backend", "username")
+            if isinstance(credentials.get(key), str)
+        }
+        for block in ("imap", "smtp"):
+            server = credentials.get(block)
+            if isinstance(server, Mapping):
+                config[block] = {
+                    key: server[key]
+                    for key in ("host", "port", "security")
+                    if key in server
+                }
+        return config
+
     def bind(
         self, row: Mapping[str, Any], credentials: Any, *, ctx: BindContext
     ) -> dict[str, Any] | None:

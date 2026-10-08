@@ -30,6 +30,7 @@ from orchestrator.services.connector_drivers.base import (
     DatasourceDriver,
     NormalizedConnector,
     ValidationContext,
+    auth_method_config,
     payload_entry,
     probe_failure,
 )
@@ -39,6 +40,7 @@ from orchestrator.services.datasource_config import (
     validate_kb_repository_url,
 )
 from shared.connectors.builtin import KB_SPEC
+from shared.connectors.platform import platform_owned
 from shared.native_kb import NATIVE_PROJECT_CONFIG_KEY, native_kb_project_id
 
 
@@ -148,6 +150,10 @@ class KnowledgeBaseDriver(DatasourceDriver):
     def effective_access(self, row: Mapping[str, Any]) -> str | None:
         return "ReadOnly"
 
+    def credential_config(self, credentials: Mapping[str, Any]) -> dict[str, Any]:
+        """The auth method; the token and the key stay secret."""
+        return auth_method_config(credentials)
+
     def bind(
         self, row: Mapping[str, Any], credentials: Any, *, ctx: BindContext
     ) -> dict[str, Any] | None:
@@ -204,7 +210,7 @@ class KnowledgeBaseDriver(DatasourceDriver):
         full: bool,
         knowledge_index: kb_index.KnowledgeIndexDependencies,
     ) -> dict[str, Any]:
-        if native_kb_project_id(row):
+        if platform_owned(row):
             # Indexing it here would write its project's notes a second time
             # under this datasource's id and duplicate every search hit.
             raise HTTPException(

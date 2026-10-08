@@ -15,9 +15,9 @@ from typing import Any, Iterable, Mapping
 from uuid import UUID
 
 from shared.connectors.builtin import spec_for_row
+from shared.connectors.platform import native_kb_project
 
 LITE_WORKSPACE_BACKENDS = frozenset({"virtual", "none"})
-NATIVE_PROJECT_CONFIG_KEY = "native_project_id"
 GENERIC_UNAVAILABLE_DETAIL = "One or more selected connectors are unavailable"
 SHELL_WORKSPACE_DETAIL = (
     "Connectors that need a shell (repositories, credential and generic "
@@ -57,20 +57,10 @@ def _row_project_ids(row: dict[str, Any]) -> set[str]:
 
 
 def _native_project_id(row: dict[str, Any]) -> str | None:
-    if str(row.get("type") or "").lower() != "kb":
-        return None
-    config = row.get("config") or {}
-    if not isinstance(config, dict):
-        return None
-    raw = config.get(NATIVE_PROJECT_CONFIG_KEY)
-    if not raw:
-        return None
-    try:
-        return str(UUID(str(raw)))
-    except (TypeError, ValueError):
-        # A malformed server-owned marker is never treated as a portable
-        # ordinary connector. Migration 0082 leaves it restricted/unavailable.
-        return None
+    # A malformed server-owned marker names no project, so the row is never
+    # treated as a portable ordinary connector either: migration 0082 leaves
+    # it restricted and unavailable.
+    return native_kb_project(row)
 
 
 def _scope_matches(row: dict[str, Any], target_project_ids: set[str]) -> bool:
