@@ -351,25 +351,49 @@ print(json.dumps(sorted(
 
 
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
-#: Found anywhere, it may be a key the gate does not know about.
-GENERIC_KEY_NEEDLE = b"PRIVATE KEY"
+#: A private key the gate does not know about: a PEM private-key header
+#: line, up to two RFC 1421 header lines and a blank line, then a base64 body
+#: line. The bare words "PRIVATE KEY" are not enough: the k3d run of
+#: 2026-10-08 found them only in library code under /usr/local
+#: (cryptography's ``_SK_START = b"-----BEGIN OPENSSH PRIVATE KEY-----"``,
+#: PyJWT's PEM type list, rsa and google-auth docstrings, Node's string
+#: table), never followed by a key body.
+GENERIC_KEY_PATTERN = re.compile(
+    rb"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----\r?\n"
+    rb"(?:[A-Za-z][A-Za-z0-9-]{0,40}: [^\r\n]{0,100}\r?\n){0,2}(?:\r?\n)?"
+    rb"[A-Za-z0-9+/]{40}"
+)
+#: The longest text GENERIC_KEY_PATTERN can match; consecutive scan windows
+#: overlap by at least this much less one byte.
+GENERIC_KEY_SPAN = 512
 STREAM_CHUNK = 1 << 20
+
+
+def _needle_span(needle: Any) -> int:
+    return len(needle) if isinstance(needle, bytes) else GENERIC_KEY_SPAN
+
+
+def _needle_in(needle: Any, window: bytes) -> bool:
+    if isinstance(needle, bytes):
+        return needle in window
+    return needle.search(window) is not None
 
 
 def scan_stream(
     read: Callable[[int], bytes],
-    needles: list[bytes],
+    needles: list[Any],
     *,
     chunk_size: int = STREAM_CHUNK,
 ) -> tuple[set[int], int, bytes]:
     """Scan a byte stream chunk by chunk: ``(needle indexes found, size, head)``.
 
-    Consecutive windows overlap by the longest needle less one byte, so a
-    needle split across two reads is still found; nothing larger than one
-    chunk plus that overlap is ever held.
+    A needle is literal bytes or a compiled pattern no longer than
+    GENERIC_KEY_SPAN. Consecutive windows overlap by the longest needle less
+    one byte, so a needle split across two reads is still found; nothing
+    larger than one chunk plus that overlap is ever held.
     """
 
-    overlap = max((len(needle) for needle in needles), default=1) - 1
+    overlap = max((_needle_span(needle) for needle in needles), default=1) - 1
     found: set[int] = set()
     size, head, tail = 0, b"", b""
     while True:
@@ -380,7 +404,9 @@ def scan_stream(
             head = (head + chunk)[:4]
         size += len(chunk)
         window = tail + chunk
-        found.update(index for index, needle in enumerate(needles) if needle in window)
+        found.update(
+            index for index, needle in enumerate(needles) if _needle_in(needle, window)
+        )
         tail = window[-overlap:] if overlap > 0 else b""
 
 
@@ -416,7 +442,7 @@ class _Counted:
 
 
 def scan_tar_stream(
-    stream: Any, needles: list[bytes]
+    stream: Any, needles: list[Any]
 ) -> tuple[dict[int, set[str]], int, int]:
     """Scan a tar stream member by member: ``(hits, members, size)``.
 
@@ -440,7 +466,11 @@ def scan_tar_stream(
                     json.dumps(member.pax_headers, sort_keys=True),
                 ]
             ).encode("utf-8", "surrogateescape")
-            found = {index for index, needle in enumerate(needles) if needle in header}
+            found = {
+                index
+                for index, needle in enumerate(needles)
+                if _needle_in(needle, header)
+            }
             body = archive.extractfile(member) if member.isfile() else None
             if body is not None:
                 found |= scan_stream(body.read, needles)[0]
@@ -462,7 +492,7 @@ def snapshot_stream_command() -> list[str]:
 
 def scan_snapshot_object(
     key: str,
-    needles: list[bytes],
+    needles: list[Any],
     labels: list[str] | None = None,
     *,
     timeout: int = 900,
@@ -1368,7 +1398,7 @@ class SshAgentConnectorsGate:
             + (f"; incomplete {incomplete}" if incomplete else ""),
         )
 
-    def labelled_needles(self) -> tuple[list[bytes], list[str]]:
+    def labelled_needles(self) -> tuple[list[Any], list[str]]:
         """Every needle with the label a report may print instead of it."""
 
         needles: list[bytes] = []
@@ -1377,8 +1407,8 @@ class SshAgentConnectorsGate:
             for needle in key.needles:
                 needles.append(needle.encode())
                 labels.append(f"key {label.upper()}")
-        needles.append(GENERIC_KEY_NEEDLE)
-        labels.append("generic PRIVATE KEY")
+        needles.append(GENERIC_KEY_PATTERN)
+        labels.append("generic private key (PEM header and body)")
         return needles, labels
 
     def snapshot_settled(self, prefix: str) -> bool:

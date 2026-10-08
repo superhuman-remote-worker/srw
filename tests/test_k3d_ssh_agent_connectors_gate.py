@@ -311,8 +311,9 @@ def _store(monkeypatch, *, configured=True, job=([],), thread=(), hits=()):
             objects = list(thread)
         return {"configured": True, "objects": list(objects)}
 
-    def scan_object(key, needles, timeout=900):
-        assert b"PRIVATE KEY" in needles
+    def scan_object(key, needles, labels=None, timeout=900):
+        assert gate.GENERIC_KEY_PATTERN in needles
+        assert labels is not None and len(labels) == len(needles)
         log.append(("job" if key.startswith("jobs/") else "thread", "scan"))
         return gate.ObjectScan(
             complete=True,
@@ -770,7 +771,18 @@ def test_the_pod_program_passes_an_object_larger_than_the_cap_through(tmp_path):
     assert found == {0}
 
 
-_GENERIC = b"-----BEGIN RSA " + b"PRIVATE KEY-----"
+# A PEM private-key shape (header, base64 body); not a real key.
+_GENERIC = b"-----BEGIN RSA " + b"PRIVATE KEY-----\n" + b"MIIEow" * 12 + b"\n"
+_LIBRARY_LINES = [
+    # What the k3d run of 2026-10-08 found under /usr/local: no key in any.
+    b'_SK_START = b"-----BEGIN OPENSSH ' + b'PRIVATE KEY-----"\n',
+    b'# "-----BEGIN ' + b'PRIVATE KEY-----...",\n',
+    b'"private_key": "-----BEGIN EC ' + b'PRIVATE KEY-----\\n<key bytes>\\n",\n',
+    b'    b"OPENSSH ' + b'PRIVATE KEY",\n',
+    b"NEW CERTIFICATE REQUEST X509 CRL PKCS7 RSA " + b"PRIVATE KEY RSA PUBLIC\n",
+    b'The contents of the file before the "-----BEGIN RSA '
+    + b'PRIVATE KEY-----" and\n',
+]
 
 
 def _local_scan(tmp_path, segments, key="jobs/x/env.tar.zst") -> dict:
@@ -782,7 +794,7 @@ def _local_scan(tmp_path, segments, key="jobs/x/env.tar.zst") -> dict:
         "gate.snapshot_stream_command = lambda: "
         "[sys.executable, '-c', gate._SNAPSHOT_PROGRAM]\n"
         f"scan = gate.scan_snapshot_object({key!r}, "
-        f"[{_NEEDLE!r}, gate.GENERIC_KEY_NEEDLE], ['key A', 'generic PRIVATE KEY'])\n"
+        f"[{_NEEDLE!r}, gate.GENERIC_KEY_PATTERN], ['key A', 'generic private key (PEM header and body)'])\n"
         "print(json.dumps(scan.__dict__))\n"
     )
     return json.loads(
@@ -813,7 +825,9 @@ def test_the_local_scan_names_the_member_and_the_label_of_each_hit(tmp_path):
     assert scan["complete"] is True, scan["detail"]
     assert scan["members"] == 4
     assert scan["hits"] == {
-        "generic PRIVATE KEY": ["usr/local/lib/python3/site-packages/lib/tls.py"],
+        "generic private key (PEM header and body)": [
+            "usr/local/lib/python3/site-packages/lib/tls.py"
+        ],
         "key A": ["home/agent-host/.cache/leak"],
     }
     assert scan["size"] > _BIG
@@ -898,7 +912,58 @@ def test_labelled_needles_name_each_gate_key_and_the_generic_header():
     needles, labels = runner.labelled_needles()
 
     assert len(needles) == len(labels)
-    assert set(labels) == {"key A", "key B", "key C", "key D", "generic PRIVATE KEY"}
+    assert set(labels) == {
+        "key A",
+        "key B",
+        "key C",
+        "key D",
+        "generic private key (PEM header and body)",
+    }
     for label, key in runner.keys.items():
         for needle in key.needles:
             assert labels[needles.index(needle.encode())] == f"key {label.upper()}"
+
+
+def test_the_generic_needle_ignores_library_mentions_of_private_keys():
+    for line in _LIBRARY_LINES:
+        found, _size, _head = gate.scan_stream(
+            __import__("io").BytesIO(b"x" * 100 + line + b"y" * 100).read,
+            [gate.GENERIC_KEY_PATTERN],
+        )
+        assert not found, line
+
+
+@pytest.mark.parametrize("chunk_size", [1, 13, 64, 1 << 20])
+def test_the_generic_needle_finds_a_real_key_split_across_reads(chunk_size):
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
+    from cryptography.hazmat.primitives.serialization import (
+        BestAvailableEncryption,
+        Encoding,
+        NoEncryption,
+        PrivateFormat,
+    )
+
+    keys = [
+        ed25519.Ed25519PrivateKey.generate().private_bytes(
+            Encoding.PEM, PrivateFormat.OpenSSH, NoEncryption()
+        ),
+        rsa.generate_private_key(65537, 2048).private_bytes(
+            Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()
+        ),
+        rsa.generate_private_key(65537, 2048).private_bytes(
+            Encoding.PEM,
+            PrivateFormat.TraditionalOpenSSL,
+            BestAvailableEncryption(b"x"),
+        ),
+        ec.generate_private_key(ec.SECP256R1()).private_bytes(
+            Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
+        ),
+    ]
+    for key in keys:
+        data = b"z" * 777 + key + b"z" * 10
+        found, _size, _head = gate.scan_stream(
+            __import__("io").BytesIO(data).read,
+            [gate.GENERIC_KEY_PATTERN],
+            chunk_size=chunk_size,
+        )
+        assert found == {0}, key.splitlines()[0]
