@@ -89,56 +89,81 @@ func config() canaryConfig {
 
 func silent(string, ...any) {}
 
-func TestCanaryWaitsForConsecutiveRefusalsThenTheAllows(t *testing.T) {
+func TestCanaryCountsARefusalOnlyWhileTheExchangeAnswers(t *testing.T) {
 	var calls []string
-	// Unprotected for two probes, then denied; one refusal in between is
-	// followed by a reachable probe, which resets the count.
+	// Round 1: nothing answers (the network is down): no count. Round 2: the
+	// exchange answers but the canary too (no policy yet): reset. Round 3:
+	// the exchange answers and the canary is refused (1). Round 4: the
+	// exchange stops answering (the orchestrator restarts): reset, although
+	// the canary would be refused. Rounds 5 to 7: enforced (1, 2, 3).
 	targets := scripted{
-		"10.43.0.20:8085": {true, true, false, true, false, false, false},
-		"10.43.0.20:8088": {false, true},
+		"10.43.0.20:8088": {false, true, true, false, true, true, true},
+		"10.43.0.20:8085": {true, false, false, false, false},
 		"1.1.1.1:443":     {true},
 	}
 	clock := &fakeClock{now: time.Unix(0, 0)}
 	if err := canaryWait(config(), targets.probe(&calls), clock, silent); err != nil {
 		t.Fatal(err)
 	}
-	denyProbes := 0
-	firstAllow := -1
-	for i, call := range calls {
-		if call == "10.43.0.20:8085" {
+	allowProbes, denyProbes := 0, 0
+	for _, call := range calls {
+		switch call {
+		case "10.43.0.20:8088":
+			allowProbes++
+		case "10.43.0.20:8085":
 			denyProbes++
 		}
-		if call == "10.43.0.20:8088" && firstAllow < 0 {
-			firstAllow = i
-		}
 	}
-	if denyProbes != 7 {
-		t.Fatalf("deny probed %d times, want 7: %v", denyProbes, calls)
+	// The canary is probed only in rounds where the exchange answered.
+	if allowProbes != 7 || denyProbes != 5 {
+		t.Fatalf("allow probed %d times, deny %d: %v", allowProbes, denyProbes, calls)
 	}
-	// No allow probe before the deny held: an unprotected pod reaches it too.
-	for _, call := range calls[:firstAllow] {
-		if call != "10.43.0.20:8085" {
-			t.Fatalf("probed %s before the deny was enforced", call)
+	// Every round probes the allowed target first.
+	if calls[0] != "10.43.0.20:8088" {
+		t.Fatalf("first probe %s", calls[0])
+	}
+}
+
+// The reviewer's case: the pod network is down for the first dials, then
+// up with no policy ever applied. Every refusal came from a dead network,
+// never from a policy, so the canary must not pass.
+func TestCanaryRefusesANetworkThatWasDownAndIsNowUnenforced(t *testing.T) {
+	dials := 0
+	reach := func(addr string) bool {
+		dials++
+		return dials > 3 // nothing enforced, ever
+	}
+	cfg := config()
+	cfg.expect = nil
+	err := canaryWait(cfg, reach, &fakeClock{now: time.Unix(0, 0)}, silent)
+	if err == nil || !strings.Contains(err.Error(), "default deny is not enforced") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestCanaryRefusesWhenTheOrchestratorHasNoEndpoints(t *testing.T) {
+	// Both ports of the Service refuse for the whole wait: not one refusal
+	// may count, and the wait fails naming the exchange.
+	var calls []string
+	targets := scripted{"10.43.0.20:8085": {false}, "10.43.0.20:8088": {false}}
+	clock := &fakeClock{now: time.Unix(0, 0)}
+	err := canaryWait(config(), targets.probe(&calls), clock, silent)
+	if err == nil || !strings.Contains(err.Error(), "10.43.0.20:8088 stayed unreachable") {
+		t.Fatalf("err = %v", err)
+	}
+	for _, call := range calls {
+		if call == "10.43.0.20:8085" {
+			t.Fatal("the canary was probed while the exchange did not answer")
 		}
 	}
 }
 
 func TestCanaryFailsWhenTheDenyNeverHolds(t *testing.T) {
 	var calls []string
-	targets := scripted{"10.43.0.20:8085": {true}}
+	targets := scripted{"10.43.0.20:8085": {true}, "10.43.0.20:8088": {true}}
 	clock := &fakeClock{now: time.Unix(0, 0)}
 	err := canaryWait(config(), targets.probe(&calls), clock, silent)
 	if err == nil || !strings.Contains(err.Error(), "default deny is not enforced") {
-		t.Fatalf("err = %v", err)
-	}
-}
-
-func TestCanaryFailsWhenTheAllowNeverAnswers(t *testing.T) {
-	var calls []string
-	targets := scripted{"10.43.0.20:8085": {false}, "10.43.0.20:8088": {false}}
-	clock := &fakeClock{now: time.Unix(0, 0)}
-	err := canaryWait(config(), targets.probe(&calls), clock, silent)
-	if err == nil || !strings.Contains(err.Error(), "egress policy is not enforced") {
 		t.Fatalf("err = %v", err)
 	}
 }

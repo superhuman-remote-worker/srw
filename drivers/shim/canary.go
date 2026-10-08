@@ -12,17 +12,19 @@ import (
 // The canary wait closes the start-up window without an isolation gate
 // (connector drivers D5, "Reachability"): kube-router let 5 of 12 new pods
 // through before their policy applied, and those connections stayed open.
-// The driver's code starts only after this init container has seen, in
-// order:
 //
-//  1. every --deny target refused --consecutive times in a row: the
-//     namespace's default deny (or the pod's own policy) is enforced;
-//  2. every --allow target answer once: the pod's egress rules are in place
-//     too (an allow seen before step 1 proves nothing, since a pod with no
-//     policy yet reaches everything);
-//  3. every --expect target answer, waited for at most --expect-timeout and
-//     never fatal: an upstream that is down must not keep the pod from
-//     starting.
+// A refusal alone proves nothing: with the network down or the orchestrator
+// without endpoints (a node restart, k3d stopping and starting) every
+// connect fails, policy or not. So each round probes every --allow target
+// first, and a --deny refusal counts only in a round where every allow
+// target answered. The deny and allow targets are the same Service (the
+// orchestrator's API port and its lease exchange port), so "the exchange
+// answers and the API port is refused" in one round can only mean the pod's
+// policy is in force. Any other round resets every count. The driver's code
+// starts after --consecutive such rounds in a row.
+//
+// Then every --expect target is waited for at most --expect-timeout, never
+// fatally: an upstream that is down must not keep the pod from starting.
 //
 // Connections this container opens end when it exits. Only TCP connects are
 // made; no byte is sent.
@@ -109,50 +111,49 @@ func (systemClock) Sleep(d time.Duration) { time.Sleep(d) }
 
 func canaryWait(cfg canaryConfig, reach probe, c clock, logf func(string, ...any)) error {
 	deadline := c.Now().Add(cfg.timeout)
-	refusals := make(map[string]int, len(cfg.deny))
-	for {
-		enforced := true
-		for _, target := range cfg.deny {
-			if reach(target) {
-				logf("canary %s is still reachable: the policy is not enforced yet", target)
-				refusals[target] = 0
-				enforced = false
-				continue
-			}
-			refusals[target]++
-			if refusals[target] < cfg.consecutive {
-				enforced = false
-			}
-		}
-		if enforced {
-			break
-		}
-		if !c.Now().Before(deadline) {
-			return fmt.Errorf("a canary stayed reachable for %s: the namespace default deny is not enforced", cfg.timeout)
-		}
-		c.Sleep(cfg.interval)
-	}
-	logf("default deny enforced (%d refusals in a row per canary)", cfg.consecutive)
-	pending := append([]string(nil), cfg.allow...)
-	for len(pending) > 0 {
-		var still []string
-		for _, target := range pending {
+	rounds := 0 // rounds in a row where every allow answered and every deny was refused
+	for rounds < cfg.consecutive {
+		var unreachable []string
+		for _, target := range cfg.allow {
 			if !reach(target) {
-				still = append(still, target)
+				unreachable = append(unreachable, target)
 			}
 		}
-		pending = still
-		if len(pending) == 0 {
+		if len(unreachable) > 0 {
+			// Without an answer from the allowed targets a refusal could be
+			// a network that is down, not a policy: nothing counts.
+			if rounds > 0 {
+				logf("%s stopped answering; counting again", strings.Join(unreachable, ", "))
+			}
+			rounds = 0
+		} else {
+			enforced := true
+			for _, target := range cfg.deny {
+				if reach(target) {
+					logf("canary %s is still reachable: the policy is not enforced yet", target)
+					enforced = false
+				}
+			}
+			if enforced {
+				rounds++
+			} else {
+				rounds = 0
+			}
+		}
+		if rounds >= cfg.consecutive {
 			break
 		}
 		if !c.Now().Before(deadline) {
-			return fmt.Errorf("%s stayed unreachable: the pod's egress policy is not enforced", strings.Join(pending, ", "))
+			if len(unreachable) > 0 {
+				return fmt.Errorf("%s stayed unreachable for %s: the pod's egress policy is not in force", strings.Join(unreachable, ", "), cfg.timeout)
+			}
+			return fmt.Errorf("no %d rounds in a row with the allowed targets answering and the canaries refused in %s: the default deny is not enforced", cfg.consecutive, cfg.timeout)
 		}
 		c.Sleep(cfg.interval)
 	}
-	logf("egress allowed to %s", strings.Join(cfg.allow, ", "))
+	logf("default deny enforced: %d rounds in a row with %s answering and %s refused", cfg.consecutive, strings.Join(cfg.allow, ", "), strings.Join(cfg.deny, ", "))
 	expectDeadline := c.Now().Add(cfg.expectTimeout)
-	pending = append([]string(nil), cfg.expect...)
+	pending := append([]string(nil), cfg.expect...)
 	for len(pending) > 0 {
 		var still []string
 		for _, target := range pending {
