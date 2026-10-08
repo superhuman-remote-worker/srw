@@ -4,6 +4,17 @@ One manager holds every MCP datasource for a job or session because
 ``ToolContext`` stores datasource connections by type. Each server is owned
 by one asyncio task: that task enters and exits the MCP transport and session
 contexts, satisfying anyio's cancel-scope ownership rule.
+
+A **managed** MCP server (connector drivers D5a) runs in a pod SRW hosts
+behind its front. Its entry carries the endpoint URL and a lease token,
+which is the client's bearer; the upstream credential never reaches this
+process. The pod may still be starting when a session binds it, so the
+connect first waits for the front's ``/readyz`` (up to
+:data:`MANAGED_MCP_START_TIMEOUT`), and a pod replaced mid-session (a lost
+pod, a re-pin, a new credential generation) is reconnected transparently
+within a budget (:data:`MANAGED_MCP_RECONNECTS` per
+:data:`MANAGED_MCP_RECONNECT_WINDOW`) instead of the single reconnect a
+remote server gets.
 """
 
 from __future__ import annotations
@@ -11,9 +22,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
+from collections import deque
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from agent.tools.mcp.naming import mcp_server_slug, namespace_mcp_tool
 from shared.mcp_sdk import ensure_mcp_sdk
@@ -22,7 +36,21 @@ logger = logging.getLogger(__name__)
 
 MCP_CONNECT_TIMEOUT = 10.0
 MCP_CALL_TIMEOUT = 60.0
+#: How long a managed server's pod may take to become ready (the service
+#: pod start timeout's default): scheduling, the image pull, the start-up
+#: wait and the server's own start.
+MANAGED_MCP_START_TIMEOUT = 180.0
+#: Connect, initialize and list tools once the pod is ready.
+MANAGED_MCP_CONNECT_TIMEOUT = 30.0
+#: Reconnects a managed server may use in a sliding window.
+MANAGED_MCP_RECONNECTS = 3
+MANAGED_MCP_RECONNECT_WINDOW = 600.0
+_READY_POLL_SECONDS = (1.0, 2.0, 3.0, 5.0)
 _TRANSPORTS = ("http", "sse", "stdio")
+#: JSON-RPC errors that mean the session is gone, not that a tool failed:
+#: the transport's "Session terminated" (a 404 from the server) and a
+#: closed connection.
+_SESSION_ERROR_CODES = frozenset({32600, -32000})
 
 
 @dataclass
@@ -36,10 +64,48 @@ class MCPServerConfig:
     command: str | None = None
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
+    #: A managed server's front readiness URL (``None`` for any other).
+    ready_url: str | None = None
+
+    @property
+    def managed(self) -> bool:
+        return self.ready_url is not None
+
+
+def _managed_spec(ds: dict[str, Any]) -> bool:
+    from shared.connectors.builtin import spec_for_type
+    from shared.connectors.contract import managed_mcp_driver
+
+    spec = spec_for_type(ds.get("type"))
+    return spec is not None and managed_mcp_driver(spec)
+
+
+def _parse_managed(ds: dict[str, Any], name: str) -> MCPServerConfig:
+    """A managed server: its endpoint and the lease token as the bearer."""
+    from shared.connectors.leases import LEASE_TOKEN_PREFIX, token_shape_valid
+
+    credentials = ds.get("credentials") or {}
+    lease = credentials.get("lease") if isinstance(credentials, dict) else None
+    token = lease.get("token") if isinstance(lease, dict) else None
+    if not token_shape_valid(token, LEASE_TOKEN_PREFIX):
+        raise ValueError("no credential lease was delivered for this server")
+    url = ds.get("connection_url")
+    parts = urlsplit(url) if isinstance(url, str) else None
+    if parts is None or parts.scheme not in ("http", "https") or not parts.netloc:
+        raise ValueError("the managed server has no endpoint")
+    return MCPServerConfig(
+        name=name,
+        transport="http",
+        url=url,
+        headers={"Authorization": f"Bearer {token}"},
+        ready_url=f"{parts.scheme}://{parts.netloc}/readyz",
+    )
 
 
 def parse_mcp_config(ds: dict[str, Any]) -> MCPServerConfig:
     """Validate a raw datasource without including credential values in errors."""
+    if _managed_spec(ds):
+        return _parse_managed(ds, str(ds.get("name") or "unnamed"))
     credentials = ds.get("credentials") or {}
     if not isinstance(credentials, dict):
         raise ValueError("credentials must be an object")
@@ -123,11 +189,23 @@ class _ServerHandle:
     shutdown: asyncio.Event = field(default_factory=asyncio.Event)
     restart_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     reconnected_once: bool = False
+    #: When a managed server reconnected, within the budget's window.
+    reconnects: deque[float] = field(default_factory=deque)
     generation: int = 0
 
     @property
     def name(self) -> str:
         return str(self.ds.get("name") or "unnamed")
+
+    @property
+    def managed(self) -> bool:
+        return self.config is not None and self.config.managed
+
+    @property
+    def connect_timeout(self) -> float:
+        if self.managed:
+            return MANAGED_MCP_START_TIMEOUT + MANAGED_MCP_CONNECT_TIMEOUT
+        return MCP_CONNECT_TIMEOUT
 
 
 class MCPManager:
@@ -197,17 +275,43 @@ class MCPManager:
         )
 
     async def _await_ready(self, handle: _ServerHandle) -> None:
+        timeout = handle.connect_timeout
         try:
             await asyncio.wait_for(
                 handle.ready.wait(),
-                timeout=MCP_CONNECT_TIMEOUT,
+                timeout=timeout,
             )
         except TimeoutError:
-            handle.status = (
-                f"unavailable: connect timed out after {int(MCP_CONNECT_TIMEOUT)}s"
-            )
+            handle.status = f"unavailable: connect timed out after {int(timeout)}s"
             if handle.task is not None:
                 handle.task.cancel()
+
+    async def _wait_until_serving(self, config: MCPServerConfig) -> None:
+        """Wait for a managed server's front to report ready.
+
+        The pod may not exist yet (its endpoint does not resolve or refuses
+        connections) or may still be starting (503). The readiness route
+        carries no credential and answers nothing secret.
+        """
+        import httpx
+
+        deadline = time.monotonic() + MANAGED_MCP_START_TIMEOUT
+        attempt = 0
+        async with _ready_client() as client:
+            while True:
+                try:
+                    response = await client.get(config.ready_url)
+                    if response.status_code == 200:
+                        return
+                except httpx.HTTPError:
+                    pass
+                pause = _READY_POLL_SECONDS[min(attempt, len(_READY_POLL_SECONDS) - 1)]
+                attempt += 1
+                if time.monotonic() + pause > deadline:
+                    raise TimeoutError(
+                        f"not ready after {int(MANAGED_MCP_START_TIMEOUT)}s"
+                    )
+                await asyncio.sleep(pause)
 
     async def _run_server(self, handle: _ServerHandle) -> None:
         """Enter, use, and exit one server entirely within its owner task."""
@@ -218,6 +322,13 @@ class MCPManager:
 
         try:
             ensure_mcp_sdk()
+            if config.managed:
+                try:
+                    await self._wait_until_serving(config)
+                except TimeoutError as exc:
+                    handle.status = f"unavailable: {exc}"
+                    logger.warning("Managed MCP server %s %s", handle.name, exc)
+                    return
             async with AsyncExitStack() as stack:
                 if config.transport == "stdio":
                     from mcp import StdioServerParameters
@@ -372,26 +483,43 @@ class MCPManager:
             and not handle.task.done()
         )
 
+    @staticmethod
+    def _may_reconnect(handle: _ServerHandle) -> bool:
+        """A remote or stdio server reconnects once per runtime; a managed
+        one within its budget, since its pod is replaced on a re-pin, a lost
+        pod or a credential change while the session lives on."""
+        if not handle.managed:
+            return not handle.reconnected_once
+        now = time.monotonic()
+        while (
+            handle.reconnects
+            and now - handle.reconnects[0] > MANAGED_MCP_RECONNECT_WINDOW
+        ):
+            handle.reconnects.popleft()
+        return len(handle.reconnects) < MANAGED_MCP_RECONNECTS
+
     async def _restart_server(
         self,
         handle: _ServerHandle,
         *,
         force: bool = False,
     ) -> bool:
-        """Perform the server's one permitted reconnect attempt."""
+        """Reconnect a server, within what it may still use."""
         async with handle.restart_lock:
             if self._closing:
                 return False
-            if handle.reconnected_once:
+            if not self._may_reconnect(handle):
                 return self._is_live(handle)
             if not force and self._is_live(handle):
                 return True
 
             handle.reconnected_once = True
+            handle.reconnects.append(time.monotonic())
             old_task = handle.task
             handle.shutdown.set()
             if old_task is not None and not old_task.done():
                 try:
+                    # The old transport's own teardown, never a pod start.
                     await asyncio.wait_for(
                         asyncio.shield(old_task),
                         timeout=MCP_CONNECT_TIMEOUT,
@@ -425,10 +553,40 @@ class MCPManager:
         tool_name: str,
         arguments: dict[str, Any],
     ) -> str:
-        result = await handle.session.call_tool(tool_name, arguments)
+        result = await self._raced(
+            handle, handle.session.call_tool(tool_name, arguments)
+        )
         if getattr(result, "isError", False):
             return _tool_error(handle, tool_name, "server reported an error")
         return _content_to_str(result)
+
+    @staticmethod
+    async def _raced(handle: _ServerHandle, call: Any) -> Any:
+        """A managed server's call, failed as soon as its session ends.
+
+        The SDK does not fail a request in flight when its transport dies
+        (a replaced pod refuses the connection), so the call would wait for
+        the call timeout and then never reconnect. Racing it against the
+        owner task turns a dead session into an error the reconnect path
+        handles at once.
+        """
+        owner = handle.task
+        if not handle.managed or owner is None:
+            return await call
+        pending = asyncio.ensure_future(call)
+        try:
+            done, _ = await asyncio.wait(
+                {pending, owner}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except BaseException:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+            raise
+        if pending in done:
+            return pending.result()
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        raise ConnectionError("the server's session ended")
 
     def _guarded(self, handle: _ServerHandle, tool: Any):
         """Bound calls, reconnect one dead server once, and return string errors."""
@@ -443,8 +601,8 @@ class MCPManager:
                     kwargs,
                 )
             if tool.coroutine is not None:
-                return await tool.coroutine(**kwargs)
-            return await tool.ainvoke(kwargs)
+                return await self._raced(handle, tool.coroutine(**kwargs))
+            return await self._raced(handle, tool.ainvoke(kwargs))
 
         async def _call(**kwargs):
             if not self._is_live(handle):
@@ -464,7 +622,7 @@ class MCPManager:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    handle.status = f"unavailable: {type(exc).__name__}"
+                    _mark_failed(handle, exc)
                     return _tool_error(handle, original_name, type(exc).__name__)
 
             try:
@@ -481,6 +639,11 @@ class MCPManager:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if handle.managed and _tool_level(exc):
+                    # The server answered: the session is alive, the tool
+                    # (or the front, for a tool this binding may not call)
+                    # refused. Reconnecting would only spend the budget.
+                    return _tool_error(handle, original_name, type(exc).__name__)
                 handle.status = f"unavailable: {type(exc).__name__}"
                 if await self._restart_server(handle, force=True):
                     try:
@@ -497,7 +660,7 @@ class MCPManager:
                     except asyncio.CancelledError:
                         raise
                     except Exception as retry_exc:
-                        handle.status = f"unavailable: {type(retry_exc).__name__}"
+                        _mark_failed(handle, retry_exc)
                         return _tool_error(
                             handle,
                             original_name,
@@ -506,6 +669,39 @@ class MCPManager:
                 return _tool_error(handle, original_name, type(exc).__name__)
 
         return _call
+
+
+def _ready_client() -> Any:
+    """The HTTP client a managed server's readiness is polled with: no
+    credential, no redirect."""
+    import httpx
+
+    return httpx.AsyncClient(timeout=5.0, follow_redirects=False)
+
+
+def _mark_failed(handle: _ServerHandle, exc: BaseException) -> None:
+    """A failed call marks the server unavailable, unless a managed server
+    answered with a tool error (its session is alive)."""
+    if not (handle.managed and _tool_level(exc)):
+        handle.status = f"unavailable: {type(exc).__name__}"
+
+
+def _tool_level(exc: BaseException) -> bool:
+    """Whether a call failed in the tool, not in the session: the adapter's
+    ToolException (a result with isError) or a JSON-RPC error other than a
+    terminated session or a closed connection."""
+    from langchain_core.tools import ToolException
+
+    if isinstance(exc, ToolException):
+        return True
+    try:
+        from mcp.shared.exceptions import McpError
+    except ImportError:  # pragma: no cover - the SDK is a dependency
+        return False
+    if isinstance(exc, McpError):
+        code = getattr(getattr(exc, "error", None), "code", None)
+        return code not in _SESSION_ERROR_CODES
+    return False
 
 
 def _tool_error(handle: _ServerHandle, tool_name: str, detail: str) -> str:

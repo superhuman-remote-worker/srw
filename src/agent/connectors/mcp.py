@@ -17,6 +17,7 @@ from collections.abc import Sequence
 from agent.connectors.base import Delivery, FactsLines, RuntimeContext
 from agent.connectors.slots import connection_slot
 from shared.connectors.builtin import MCP_SPEC
+from shared.connectors.contract import managed_mcp_driver
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,10 @@ class McpClientMaterializer:
             transport = str(
                 (ds.get("credentials") or {}).get("transport") or "http"
             ).lower()
+            if delivery.spec is not None and managed_mcp_driver(delivery.spec):
+                # Hosted by SRW behind its front (D5a): the agent holds a
+                # lease token, never the server's upstream credential.
+                transport = "managed by SRW"
             status = ds.get("_mcp_status") or "not connected yet"
             tools = ds.get("_mcp_tools") or []
             if status == "connected":
