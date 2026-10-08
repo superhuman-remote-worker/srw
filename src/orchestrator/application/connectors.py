@@ -37,6 +37,11 @@ from orchestrator.services.connector_lease_exchange import (
     ConnectorLeaseExchange,
     DenialLimiter,
 )
+from orchestrator.services.connector_service_hosting import (
+    ServiceHostingReconciler,
+    ServiceHostingSettings,
+    ServicePodRuntime,
+)
 from orchestrator.services.connector_service_images import ServiceImageSettings
 from shared.oci_registry import DEFAULT_TOKEN_HOSTS, RegistryResolver
 
@@ -160,6 +165,76 @@ def service_image_settings(resources: ApplicationResources) -> ServiceImageSetti
     )
 
 
+def service_hosting_settings(
+    resources: ApplicationResources,
+) -> ServiceHostingSettings | None:
+    """This installation's service-pod hosting, or ``None`` when it is off
+    or incomplete (no shim image, no exchange)."""
+    settings = resources.settings
+    if not settings.connector_service_pods_enabled:
+        return None
+    missing = [
+        name
+        for name, value in (
+            ("namespace", settings.connector_service_namespace),
+            ("release namespace", settings.connector_service_release_namespace),
+            ("shim image", settings.connector_driver_shim_image),
+            ("exchange host", settings.connector_service_exchange_host),
+            ("exchange port", settings.connector_lease_exchange_port),
+            ("orchestrator labels", settings.connector_service_orchestrator_labels),
+        )
+        if not value
+    ]
+    if missing:
+        logger.error(
+            "Service-pod hosting is on but not configured (%s); no driver pod starts",
+            ", ".join(missing),
+        )
+        return None
+    return ServiceHostingSettings(
+        namespace=settings.connector_service_namespace,
+        release_namespace=settings.connector_service_release_namespace,
+        shim_image=settings.connector_driver_shim_image,
+        exchange_host=settings.connector_service_exchange_host,
+        exchange_port=int(settings.connector_lease_exchange_port or 0),
+        orchestrator_labels=dict(settings.connector_service_orchestrator_labels),
+        max_installation=settings.connector_service_max_installation,
+        idle_seconds=settings.connector_service_idle_seconds,
+        start_timeout_seconds=settings.connector_service_start_timeout_seconds,
+        cluster_cidrs=tuple(settings.connector_service_cluster_cidrs),
+        private_tiers=frozenset(settings.connector_service_private_tiers),
+        ipv6=settings.connector_service_ipv6,
+        resources=dict(settings.connector_service_resources),
+    )
+
+
+def connector_service_reconciler(
+    resources: ApplicationResources, hosting: ServiceHostingSettings
+) -> ServiceHostingReconciler | None:
+    """One reconciler over the current stores, or ``None`` while the
+    Kubernetes API is unavailable."""
+    from kubernetes.client import NetworkingV1Api
+
+    from orchestrator.services import (
+        agent_provisioner as agent_provisioner_module,
+        container_provisioner as container_provisioner_module,
+    )
+
+    if not agent_provisioner_module.agent_provisioner._k8s_available:
+        return None
+    core_api = container_provisioner_module.container_provisioner._core_api
+    if core_api is None:
+        return None
+    return ServiceHostingReconciler(
+        store=resources.postgres_db,
+        runtime=ServicePodRuntime(
+            core_api, NetworkingV1Api(), namespace=hosting.namespace
+        ),
+        drivers=resources.connector_drivers,
+        settings=hosting,
+    )
+
+
 def connector_lease_exchange(
     resources: ApplicationResources, limiter: DenialLimiter | None = None
 ) -> ConnectorLeaseExchange:
@@ -280,6 +355,8 @@ __all__ = [
     "BodyLimit",
     "connector_lease_exchange",
     "connector_lease_exchange_app",
+    "connector_service_reconciler",
+    "service_hosting_settings",
     "exchange_server_config",
     "serve_connector_lease_exchange",
     "service_image_settings",

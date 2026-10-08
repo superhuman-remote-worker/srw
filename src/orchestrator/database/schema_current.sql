@@ -26764,11 +26764,23 @@ CREATE TABLE public.connector_driver_identities (
     last_used_at timestamp with time zone,
     revoked_at timestamp with time zone,
     revoke_reason text,
+    credential_generation text,
+    image_reference text,
+    egress jsonb,
+    egress_resolved_at timestamp with time zone,
+    ready_at timestamp with time zone,
+    last_bound_at timestamp with time zone,
+    idle_since timestamp with time zone,
+    removed_at timestamp with time zone,
+    launch_error text,
     CONSTRAINT connector_driver_identities_digest_check CHECK (((image_digest IS NULL) OR (image_digest ~ '^sha256:[0-9a-f]{64}$'::text))),
     CONSTRAINT connector_driver_identities_driver_check CHECK ((driver <> ''::text)),
+    CONSTRAINT connector_driver_identities_egress_check CHECK ((((egress IS NULL) OR (jsonb_typeof(egress) = 'object'::text)) AND ((egress IS NULL) = (egress_resolved_at IS NULL)))),
     CONSTRAINT connector_driver_identities_hash_check CHECK ((octet_length(token_hash) = 32)),
     CONSTRAINT connector_driver_identities_last_four_check CHECK ((char_length(token_last_four) = 4)),
-    CONSTRAINT connector_driver_identities_revoke_check CHECK (((revoked_at IS NULL) = (revoke_reason IS NULL)))
+    CONSTRAINT connector_driver_identities_removed_check CHECK (((removed_at IS NULL) OR (revoked_at IS NOT NULL))),
+    CONSTRAINT connector_driver_identities_revoke_check CHECK (((revoked_at IS NULL) = (revoke_reason IS NULL))),
+    CONSTRAINT connector_driver_identities_service_pod_check CHECK (((credential_generation IS NULL) OR ((credential_generation <> ''::text) AND (image_digest IS NOT NULL) AND (pod_namespace IS NOT NULL) AND (pod_name IS NOT NULL) AND (image_reference IS NOT NULL))))
 );
 
 
@@ -26777,6 +26789,34 @@ CREATE TABLE public.connector_driver_identities (
 --
 
 COMMENT ON TABLE public.connector_driver_identities IS 'Connector driver identities (sdi_ tokens, SHA-256 only). The lease exchange authenticates a driver by one of these plus a lease token; the binding is read from the row, never from the request.';
+
+
+--
+-- Name: COLUMN connector_driver_identities.credential_generation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.connector_driver_identities.credential_generation IS 'Service pods only: a keyed fingerprint (hmac-sha256) of what the pod''s immutable Secret holds and of its egress tier, part of the pod key with connector_id and image_digest. A change starts a new pod; the old one drains.';
+
+
+--
+-- Name: COLUMN connector_driver_identities.egress; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.connector_driver_identities.egress IS 'The pod''s pinned egress: each declared host with the addresses written into its NetworkPolicy and hostAliases, and the DNS status. egress_resolved_at is when they were resolved.';
+
+
+--
+-- Name: COLUMN connector_driver_identities.idle_since; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.connector_driver_identities.idle_since IS 'When the pod''s last binding ended (or a newer pod superseded it); the reconciler stops it after the idle timeout.';
+
+
+--
+-- Name: COLUMN connector_driver_identities.removed_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.connector_driver_identities.removed_at IS 'When the pod''s Kubernetes objects were seen gone, after its identity was revoked. A live row with removed_at NULL counts against the installation cap.';
 
 
 --
@@ -38386,6 +38426,13 @@ CREATE UNIQUE INDEX uq_connector_credential_leases_live_job ON public.connector_
 --
 
 CREATE UNIQUE INDEX uq_connector_credential_leases_live_thread ON public.connector_credential_leases USING btree (thread_id, connector_id) WHERE ((revoked_at IS NULL) AND (thread_id IS NOT NULL));
+
+
+--
+-- Name: uq_connector_driver_identities_live_service; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_connector_driver_identities_live_service ON public.connector_driver_identities USING btree (connector_id, image_digest, credential_generation) WHERE ((revoked_at IS NULL) AND (credential_generation IS NOT NULL));
 
 
 --

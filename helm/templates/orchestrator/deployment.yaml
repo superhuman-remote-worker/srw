@@ -1909,6 +1909,27 @@ spec:
               value: {{ join "," .privateTiers | quote }}
             - name: CONNECTOR_SERVICE_IPV6
               value: {{ .ipv6 | quote }}
+            - name: CONNECTOR_SERVICE_NAMESPACE
+              value: {{ include "srw.connectorsNamespace" $ | quote }}
+            - name: CONNECTOR_SERVICE_RELEASE_NAMESPACE
+              value: {{ $.Release.Namespace | quote }}
+            - name: CONNECTOR_SERVICE_MAX_INSTALLATION
+              value: {{ .maxInstallation | quote }}
+            - name: CONNECTOR_SERVICE_IDLE_SECONDS
+              value: {{ .idleSeconds | quote }}
+            - name: CONNECTOR_SERVICE_START_TIMEOUT_SECONDS
+              value: {{ .startTimeoutSeconds | quote }}
+            - name: CONNECTOR_SERVICE_RECONCILE_SECONDS
+              value: {{ .reconcileIntervalSeconds | quote }}
+            # The lease exchange as driver pods dial it: the orchestrator
+            # Service, pinned into each pod's hostAliases (no DNS there).
+            - name: CONNECTOR_SERVICE_EXCHANGE_HOST
+              value: {{ printf "%s.%s.svc" (include "srw.serviceName" (dict "context" $ "component" "orchestrator")) $.Release.Namespace | quote }}
+            # The exchange peer in each driver pod's egress policy.
+            - name: CONNECTOR_SERVICE_ORCHESTRATOR_LABELS
+              value: {{ include "srw.componentSelectorLabels" (dict "context" $ "component" "orchestrator") | fromYaml | toJson | quote }}
+            - name: CONNECTOR_SERVICE_RESOURCES
+              value: {{ .driverResources | toJson | quote }}
             {{- end }}
             - name: CONNECTOR_DRIVER_SHIM_IMAGE
               value: {{ include "srw.imageRef" (dict "image" .Values.connectors.drivers.shim.image) | quote }}

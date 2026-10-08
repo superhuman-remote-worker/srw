@@ -164,6 +164,14 @@ connectors:
     # with a capacity error; the namespace's NotTerminating pod quota is the
     # backstop.
     maxInstallation: 10
+    # -- Seconds a pod stays up after its last binding ended (or after a
+    # newer generation of its connector superseded it, while it drains).
+    idleSeconds: 600
+    # -- Seconds a new pod may take to become ready (canary wait included)
+    # before it is stopped and its key backed off.
+    startTimeoutSeconds: 180
+    # -- Seconds between the leader's reconcile passes.
+    reconcileIntervalSeconds: 15
     # -- Driver pod egress is pinned per pod: each declared host is resolved
     # once and written into the pod's NetworkPolicy ipBlocks and hostAliases.
     # These are the cluster's REAL pod and service ranges (k3s defaults

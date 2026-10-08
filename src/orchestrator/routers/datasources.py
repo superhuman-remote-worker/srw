@@ -47,7 +47,9 @@ from orchestrator.services import datasources
 from orchestrator.services.connector_drivers.matrix import (
     HostingStatus,
     capability_matrix,
+    egress_columns,
 )
+from orchestrator.services.connector_service_hosting import connector_egress_view
 
 router = APIRouter()
 
@@ -226,6 +228,34 @@ async def list_connector_drivers(
         dependencies.operations.connector_drivers,
         hosting=dependencies.service_hosting,
     )
+
+
+@router.get("/api/datasources/{datasource_id}/egress")
+async def get_connector_egress(
+    request: Request,
+    datasource_id: str,
+    *,
+    dependencies: DatasourcesDependencies = Depends(get_datasources_dependencies),
+) -> dict[str, Any]:
+    """What one connector's driver pods enforce (connector drivers D5).
+
+    The matrix's ``enforced`` column per connector: each recent service pod's
+    pinned addresses, their resolution time and the DNS status, beside the
+    driver's declaration and this installation's status. Only a caller who
+    may read the connector sees where it connects.
+    """
+    _user, ds = await dependencies.require_datasource_access(
+        request, dependencies.store, datasource_id
+    )
+    driver = dependencies.operations.connector_drivers.for_type(ds.get("type"))
+    spec = driver.spec if driver is not None else None
+    view = await connector_egress_view(dependencies.store, datasource_id, spec=spec)
+    if spec is not None:
+        _enforced, installation = egress_columns(
+            spec, in_process=False, hosting=dependencies.service_hosting
+        )
+        view["installation"] = installation
+    return view
 
 
 @router.get("/api/datasources/{datasource_id}")

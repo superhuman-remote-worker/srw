@@ -303,6 +303,10 @@ connectors:
   servicePods:
     enabled: true
     maxInstallation: 4
+    # Short enough for the gate to watch an idle pod stop and its identity
+    # be revoked.
+    idleSeconds: 60
+    reconcileIntervalSeconds: 5
   drivers:
     registry:
       # The k3d registry Tilt pushes driver images to; the orchestrator pod

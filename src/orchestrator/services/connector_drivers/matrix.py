@@ -120,7 +120,7 @@ def capability_matrix(
     }
 
 
-def _egress_columns(
+def egress_columns(
     spec: DriverSpec, *, in_process: bool, hosting: HostingStatus | None
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """The ``enforced`` and ``installation`` columns of one driver."""
@@ -157,7 +157,7 @@ def driver_entry(
     """One driver's row: its spec, its trust and its egress columns."""
     spec = driver.spec
     in_process = isinstance(driver, (DatasourceDriver, ManifestDeliveryDriver))
-    enforced, installation = _egress_columns(
+    enforced, installation = egress_columns(
         spec, in_process=in_process, hosting=hosting
     )
     return {

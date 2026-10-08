@@ -33,6 +33,7 @@ from orchestrator.services import (
     cloud_pricing,
     completion_recovery as completion_recovery_operations,
     connector_credential_leases,
+    connector_service_hosting,
     container_provisioner as container_provisioner_module,
     cron_dispatcher,
     ide_session,
@@ -111,6 +112,7 @@ BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
     "ssh_attachments_prune",
     "connector_lease_sweeper",
     "connector_lease_exchange",
+    "connector_service_reconciler",
     "checkpoint_retention",
     "headless_notify",
     "attention_sleep",
@@ -471,6 +473,22 @@ async def start_background_tasks(
                 resources,
                 port=exchange_port,
                 shutdown_event=resources.shutdown_event,
+            ),
+        )
+    # Service-plane driver pods (connector drivers D5): start the shared pods
+    # bindings need, stop idle ones, enforce the installation cap. Leader-
+    # gated: one reconciler owns the namespace; every pass re-reads durable
+    # state. Off unless connectors.servicePods.enabled.
+    service_hosting = connectors_composition.service_hosting_settings(resources)
+    if service_hosting is not None:
+        tasks.start_leader_gated(
+            "connector_service_reconciler",
+            functools.partial(
+                connector_service_hosting.connector_service_reconciler,
+                build=lambda: connectors_composition.connector_service_reconciler(
+                    resources, service_hosting
+                ),
+                interval_seconds=resources.settings.connector_service_reconcile_seconds,
             ),
         )
     # In-flight checkpoint retention: bound every live thread's LangGraph

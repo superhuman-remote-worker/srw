@@ -12,9 +12,11 @@ its own application's settings.
 from __future__ import annotations
 
 import ipaddress
+import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 from orchestrator.services.connector_drivers.workspace_ssh import (
     WORKSPACE_SSH_KNOWN_HOSTS_ENV,
@@ -82,6 +84,22 @@ def parse_positive_number(
         logger.warning("%s=%r is not a number; using %s", name, raw, default)
         return default
     return max(minimum, number)
+
+
+def parse_json_object(name: str, raw: str | None) -> dict[str, Any]:
+    """A JSON object from an environment value; ``{}`` (with a warning when
+    set) for anything else."""
+    value = (raw or "").strip()
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        parsed = None
+    if not isinstance(parsed, dict):
+        logger.warning("%s is not a JSON object; ignoring it", name)
+        return {}
+    return parsed
 
 
 def parse_name_list(raw: str | None) -> frozenset[str]:
@@ -221,6 +239,20 @@ class DeploymentSettings:
     #: Development only: install ``srw.echo-service/v1`` running this image
     #: reference (``connectors.drivers.echo``); empty installs nothing.
     connector_echo_driver_image: str = ""
+    #: Where service pods run and how the leader reconciles them
+    #: (``connectors.servicePods``): the driver and release namespaces, the
+    #: installation cap, the idle and start timeouts, the pass interval, the
+    #: lease exchange's in-cluster host, the orchestrator pods' labels (the
+    #: driver policy's exchange peer) and the driver resource defaults.
+    connector_service_namespace: str = ""
+    connector_service_release_namespace: str = ""
+    connector_service_max_installation: int = 10
+    connector_service_idle_seconds: float = 600.0
+    connector_service_start_timeout_seconds: float = 180.0
+    connector_service_reconcile_seconds: float = 15.0
+    connector_service_exchange_host: str = ""
+    connector_service_orchestrator_labels: dict[str, str] = field(default_factory=dict)
+    connector_service_resources: dict[str, Any] = field(default_factory=dict)
 
     def session_subagent_fanout(self, lane: str | None) -> bool:
         """Whether a session on ``lane`` may fan out right now."""
@@ -311,6 +343,52 @@ class DeploymentSettings:
             connector_echo_driver_image=os.environ.get(
                 "CONNECTOR_ECHO_DRIVER_IMAGE", ""
             ).strip(),
+            connector_service_namespace=os.environ.get(
+                "CONNECTOR_SERVICE_NAMESPACE", ""
+            ).strip(),
+            connector_service_release_namespace=os.environ.get(
+                "CONNECTOR_SERVICE_RELEASE_NAMESPACE", ""
+            ).strip(),
+            connector_service_max_installation=int(
+                parse_positive_number(
+                    "CONNECTOR_SERVICE_MAX_INSTALLATION",
+                    os.environ.get("CONNECTOR_SERVICE_MAX_INSTALLATION"),
+                    default=10,
+                    minimum=1,
+                )
+            ),
+            connector_service_idle_seconds=parse_positive_number(
+                "CONNECTOR_SERVICE_IDLE_SECONDS",
+                os.environ.get("CONNECTOR_SERVICE_IDLE_SECONDS"),
+                default=600.0,
+                minimum=0.0,
+            ),
+            connector_service_start_timeout_seconds=parse_positive_number(
+                "CONNECTOR_SERVICE_START_TIMEOUT_SECONDS",
+                os.environ.get("CONNECTOR_SERVICE_START_TIMEOUT_SECONDS"),
+                default=180.0,
+                minimum=30.0,
+            ),
+            connector_service_reconcile_seconds=parse_positive_number(
+                "CONNECTOR_SERVICE_RECONCILE_SECONDS",
+                os.environ.get("CONNECTOR_SERVICE_RECONCILE_SECONDS"),
+                default=15.0,
+                minimum=5.0,
+            ),
+            connector_service_exchange_host=os.environ.get(
+                "CONNECTOR_SERVICE_EXCHANGE_HOST", ""
+            ).strip(),
+            connector_service_orchestrator_labels={
+                str(key): str(value)
+                for key, value in parse_json_object(
+                    "CONNECTOR_SERVICE_ORCHESTRATOR_LABELS",
+                    os.environ.get("CONNECTOR_SERVICE_ORCHESTRATOR_LABELS"),
+                ).items()
+            },
+            connector_service_resources=parse_json_object(
+                "CONNECTOR_SERVICE_RESOURCES",
+                os.environ.get("CONNECTOR_SERVICE_RESOURCES"),
+            ),
         )
 
 
@@ -320,6 +398,7 @@ __all__ = [
     "DeploymentSettings",
     "parse_cidr_list",
     "parse_exchange_port",
+    "parse_json_object",
     "parse_name_list",
     "parse_positive_number",
     "parse_session_subagent_fanout_lanes",

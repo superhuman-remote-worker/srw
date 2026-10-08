@@ -236,6 +236,37 @@ def test_egress_settings_reach_the_orchestrator():
     assert env["CONNECTOR_SERVICE_PODS_ENABLED"] == "true"
 
 
+def test_the_reconciler_settings_reach_the_orchestrator():
+    import json
+
+    env = orchestrator_env(render(EXCHANGE, ON))
+    assert env["CONNECTOR_SERVICE_NAMESPACE"] == NAMESPACE
+    assert env["CONNECTOR_SERVICE_RELEASE_NAMESPACE"] == "srw"
+    assert env["CONNECTOR_SERVICE_MAX_INSTALLATION"] == "10"
+    assert env["CONNECTOR_SERVICE_IDLE_SECONDS"] == "600"
+    assert env["CONNECTOR_SERVICE_START_TIMEOUT_SECONDS"] == "180"
+    assert env["CONNECTOR_SERVICE_RECONCILE_SECONDS"] == "15"
+    assert env["CONNECTOR_SERVICE_EXCHANGE_HOST"] == (
+        "srw-superhuman-remote-worker-orchestrator.srw.svc"
+    )
+    labels = json.loads(env["CONNECTOR_SERVICE_ORCHESTRATOR_LABELS"])
+    assert labels == {
+        "app.kubernetes.io/name": "superhuman-remote-worker",
+        "app.kubernetes.io/instance": "srw",
+        "app.kubernetes.io/component": "orchestrator",
+    }
+    # The exchange's Service and the orchestrator pods carry these names.
+    docs = render(EXCHANGE, ON)
+    service = one(docs, "Service", "srw-superhuman-remote-worker-orchestrator")
+    assert service["spec"]["selector"] == labels
+    resources = json.loads(env["CONNECTOR_SERVICE_RESOURCES"])
+    assert resources["max"]["memory"] == "2Gi"
+    example = yaml.safe_load(
+        (ROOT / "deployment/values-local.yaml.example").read_text()
+    )
+    assert example["connectors"]["servicePods"]["idleSeconds"] <= 120
+
+
 def test_the_shim_image_reaches_the_orchestrator_pinned_when_a_digest_is_set():
     env = orchestrator_env(render())
     assert env["CONNECTOR_DRIVER_SHIM_IMAGE"] == (

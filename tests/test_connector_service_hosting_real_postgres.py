@@ -6,8 +6,9 @@ Driver image resolutions and the moved-tag refusal at bind run against
 
 from __future__ import annotations
 
+import base64
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -21,13 +22,26 @@ from orchestrator.security.crypto import encrypt
 from orchestrator.services import connector_credential_leases as leases
 from orchestrator.services import connector_service_images as images
 from orchestrator.services.connector_egress import private_addresses_allowed
+from orchestrator.services.connector_drivers import builtin_connector_drivers
+from orchestrator.services.connector_lease_exchange import (
+    ConnectorLeaseExchange,
+    DenialLimiter,
+)
+from orchestrator.services.connector_service_hosting import (
+    PodState,
+    ServiceHostingReconciler,
+    ServiceHostingSettings,
+    connector_egress_view,
+)
 from shared.connectors.contract import (
     AccessLevel,
     CredentialSlot,
     DriverSpec,
     ServiceSpec,
 )
+from shared.connectors.builtin import ECHO_SERVICE_SPEC
 from shared.connectors.images import SPEC_LABEL
+from shared.connectors.leases import token_digest
 from shared.oci_registry import ResolvedImage
 
 SCHEMA_FILE = (
@@ -436,3 +450,396 @@ def test_resolved_at_is_a_timestamp():
         protocol_version="1.0",
     )
     assert bound.record()["resolved_at"] == "2026-10-08T00:00:00+00:00"
+
+
+# =============================================================================
+# The reconciler: start, share, ready, idle stop, cap, identities
+# =============================================================================
+
+ECHO = "srw.echo-service/v1"
+ECHO_REFERENCE = "srw-registry:5000/srw-driver-echo:tilt-1"
+ADDRESSES = {
+    "one.one.one.one": ["1.1.1.1"],
+    "srw-orchestrator.srw.svc": ["10.43.0.20"],
+    "nas.home": ["192.168.178.20"],
+}
+
+
+class FakeRuntime:
+    """The Kubernetes side: launches recorded, pod states set by the test."""
+
+    def __init__(self) -> None:
+        self.plans: dict[str, object] = {}
+        self.states: dict[str, object] = {}
+        self.removed: list[str] = []
+        self.binding_policies: dict[str, set[str]] = {}
+        self.objects: list[tuple[object, str, str]] = []
+        self.deleted: list[str] = []
+
+    async def launch(self, plan):
+        identity = plan.identity.identity_id
+        self.plans[identity] = plan
+        self.states[identity] = PodState("Pending", uid=f"uid-{identity[:8]}")
+        return f"uid-{identity[:8]}"
+
+    async def observe(self, identity):
+        return self.states.get(identity.identity_id, PodState("Absent"))
+
+    async def remove(self, identity):
+        self.removed.append(identity.identity_id)
+        self.states.pop(identity.identity_id, None)
+        return True
+
+    async def sync_binding_policies(self, identity, desired):
+        self.binding_policies[identity.identity_id] = set(desired)
+
+    async def managed_objects(self):
+        return list(self.objects)
+
+    async def delete_object(self, delete, name):
+        self.deleted.append(name)
+
+    def ready(self, identity_id: str) -> None:
+        self.states[identity_id] = PodState("Running", uid="u", ready=True)
+
+
+async def _echo_connector(db, *, host="one.one.one.one", secret="s") -> str:
+    connector_id = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO datasources (id, name, type, scope_mode, policy_revision, "
+            "credentials, config) VALUES ($1, $2, 'echo_service', 'all', 1, "
+            "$3::jsonb, $4::jsonb)",
+            connector_id,
+            f"echo-{str(connector_id)[:8]}",
+            json.dumps(encrypt(json.dumps({"secret": secret}))),
+            json.dumps({"host": host, "port": 443}),
+        )
+    return str(connector_id)
+
+
+async def _bind_echo(db, connector: str, thread: str, digest: str = D1):
+    async with db.acquire() as conn:
+        return await leases.issue_or_redeliver(
+            conn,
+            owner=leases.LeaseOwner.thread(thread),
+            connector_id=connector,
+            driver=ECHO,
+            access="ReadWrite",
+            image_digest=digest,
+        )
+
+
+async def _echo_image(db, digest: str = D1) -> None:
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO connector_driver_images (driver, reference, digest, "
+            "entrypoint, cmd, protocol_version) VALUES ($1, $2, $3, "
+            "'[\"/srw-driver-echo\"]'::jsonb, '[]'::jsonb, '1.0') "
+            "ON CONFLICT DO NOTHING",
+            ECHO,
+            ECHO_REFERENCE,
+            digest,
+        )
+
+
+async def _pods(db) -> list:
+    async with db.acquire() as conn:
+        return list(
+            await conn.fetch(
+                "SELECT * FROM connector_driver_identities "
+                "WHERE credential_generation IS NOT NULL ORDER BY created_at"
+            )
+        )
+
+
+async def _end(db, thread: str) -> None:
+    async with db.acquire() as conn:
+        await leases.revoke_execution_leases(
+            conn, thread_id=thread, reason="session_end"
+        )
+
+
+@pytest.fixture
+def reconciler(db):
+    images.configure_service_images(
+        images.ServiceImageSettings(references={ECHO: ECHO_REFERENCE})
+    )
+    offset = [timedelta()]
+
+    async def resolver(host, ipv6):
+        if host not in ADDRESSES:
+            raise OSError("unknown host")
+        return ADDRESSES[host]
+
+    runtime = FakeRuntime()
+    built = ServiceHostingReconciler(
+        store=db,
+        runtime=runtime,
+        drivers=builtin_connector_drivers(echo_service_image=ECHO_REFERENCE),
+        settings=ServiceHostingSettings(
+            namespace="srw-connectors",
+            release_namespace="srw",
+            shim_image="srw-registry:5000/srw-driver-shim@sha256:" + "e" * 64,
+            exchange_host="srw-orchestrator.srw.svc",
+            exchange_port=8088,
+            orchestrator_labels={"app.kubernetes.io/component": "orchestrator"},
+            max_installation=2,
+            idle_seconds=60,
+            start_timeout_seconds=120,
+        ),
+        resolver=resolver,
+        clock=lambda: datetime.now(timezone.utc) + offset[0],
+    )
+    built.offset = offset
+    built.fake = runtime
+    return built
+
+
+@pytest.mark.asyncio
+async def test_a_binding_starts_one_shared_pod_with_its_own_identity(db, reconciler):
+    connector = await _echo_connector(db)
+    await _echo_image(db)
+    thread_a, thread_b = await _thread(db), await _thread(db)
+    await _bind_echo(db, connector, thread_a)
+    report = await reconciler.reconcile_once()
+    (pod,) = await _pods(db)
+    assert report.started == [str(pod["id"])]
+    assert pod["image_digest"] == D1
+    assert pod["image_reference"] == ECHO_REFERENCE
+    assert pod["pod_name"] == f"srw-drv-{UUID(str(pod['id'])).hex}"
+    assert pod["pod_namespace"] == "srw-connectors"
+    assert pod["pod_uid"] == f"uid-{str(pod['id'])[:8]}"
+    assert pod["credential_generation"].startswith("hmac-sha256:")
+    egress = json.loads(pod["egress"])
+    assert egress["hosts"][0]["addresses"] == ["1.1.1.1"]
+    assert egress["dns"] == "none"
+    assert pod["egress_resolved_at"] is not None
+    plan = reconciler.fake.plans[str(pod["id"])]
+    # The pod runs the image at the binding's digest; its Secret holds the
+    # identity the row stores the digest of, and no upstream secret.
+    driver = plan.pod["spec"]["containers"][0]
+    assert driver["image"] == f"srw-registry:5000/srw-driver-echo@{D1}"
+    assert driver["args"] == ["/srw-driver-echo"]
+    token = base64.b64decode(plan.secret["data"]["identity"]).decode()
+    assert token_digest(token) == bytes(pod["token_hash"])
+    request = json.loads(base64.b64decode(plan.secret["data"]["request.json"]))
+    assert request["credentials"] == {}
+    assert plan.pod["spec"]["hostAliases"][-1] == {
+        "ip": "10.43.0.20",
+        "hostnames": ["srw-orchestrator.srw.svc"],
+    }
+    # Each workspace binding gets its own ingress policy.
+    assert len(reconciler.fake.binding_policies[str(pod["id"])]) == 1
+
+    # A second binding of the same connector and digest shares the pod.
+    await _bind_echo(db, connector, thread_b)
+    report = await reconciler.reconcile_once()
+    assert report.started == []
+    assert len(await _pods(db)) == 1
+    assert len(reconciler.fake.binding_policies[str(pod["id"])]) == 2
+
+    reconciler.fake.ready(str(pod["id"]))
+    report = await reconciler.reconcile_once()
+    assert report.ready == [str(pod["id"])]
+    (pod,) = await _pods(db)
+    assert pod["ready_at"] is not None and pod["idle_since"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_idle_stop_revokes_the_identity_then_removes_the_pod(db, reconciler):
+    connector = await _echo_connector(db)
+    await _echo_image(db)
+    thread = await _thread(db)
+    await _bind_echo(db, connector, thread)
+    await reconciler.reconcile_once()
+    (pod,) = await _pods(db)
+    reconciler.fake.ready(str(pod["id"]))
+    await _end(db, thread)
+    await reconciler.reconcile_once()
+    (pod,) = await _pods(db)
+    assert pod["idle_since"] is not None and pod["revoked_at"] is None
+    # Not idle long enough yet.
+    assert (await reconciler.reconcile_once()).stopped == []
+    reconciler.offset[0] = timedelta(seconds=61)
+    report = await reconciler.reconcile_once()
+    assert report.stopped == [(str(pod["id"]), "idle")]
+    (pod,) = await _pods(db)
+    assert pod["revoke_reason"] == "idle"
+    assert pod["removed_at"] is not None
+    assert reconciler.fake.removed == [str(pod["id"])]
+    async with db.acquire() as conn:
+        event = await conn.fetchrow(
+            "SELECT * FROM security_events "
+            "WHERE event_type = 'connector_driver_identity_revoked' "
+            "AND resource_id = $1",
+            str(pod["id"]),
+        )
+    assert event is not None and "reason=idle" in event["detail"]
+
+
+@pytest.mark.asyncio
+async def test_a_new_binding_after_the_idle_stop_starts_a_new_pod(db, reconciler):
+    connector = await _echo_connector(db)
+    await _echo_image(db)
+    thread = await _thread(db)
+    await _bind_echo(db, connector, thread)
+    await reconciler.reconcile_once()
+    await _end(db, thread)
+    await reconciler.reconcile_once()
+    reconciler.offset[0] = timedelta(seconds=61)
+    await reconciler.reconcile_once()
+    await _bind_echo(db, connector, await _thread(db))
+    report = await reconciler.reconcile_once()
+    assert len(report.started) == 1
+    first, second = await _pods(db)
+    assert first["revoked_at"] is not None and second["revoked_at"] is None
+    assert first["pod_name"] != second["pod_name"]
+
+
+@pytest.mark.asyncio
+async def test_the_installation_cap_refuses_a_pod_past_it(db, reconciler):
+    await _echo_image(db)
+    for _ in range(3):
+        await _bind_echo(db, await _echo_connector(db), await _thread(db))
+    report = await reconciler.reconcile_once()
+    assert len(report.started) == 2
+    assert report.capacity == 1
+    assert len(await _pods(db)) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_credential_change_starts_a_new_pod_and_the_old_one_drains(
+    db, reconciler
+):
+    connector = await _echo_connector(db)
+    await _echo_image(db)
+    await _bind_echo(db, connector, await _thread(db))
+    await reconciler.reconcile_once()
+    # A config change is a new generation: the request file is immutable.
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE datasources SET config = $2::jsonb WHERE id = $1",
+            UUID(connector),
+            json.dumps({"host": "one.one.one.one", "port": 443, "message": "v2"}),
+        )
+    report = await reconciler.reconcile_once()
+    assert len(report.started) == 1
+    old, new = await _pods(db)
+    assert old["credential_generation"] != new["credential_generation"]
+    assert old["idle_since"] is not None and old["revoked_at"] is None
+    reconciler.offset[0] = timedelta(seconds=61)
+    report = await reconciler.reconcile_once()
+    assert (str(old["id"]), "idle") in report.stopped
+    assert all(identity != str(new["id"]) for identity, _ in report.stopped)
+
+
+@pytest.mark.asyncio
+async def test_an_egress_the_tier_forbids_refuses_the_launch_and_backs_off(
+    db, reconciler
+):
+    connector = await _echo_connector(db, host="nas.home")
+    await _echo_image(db)
+    await _bind_echo(db, connector, await _thread(db))
+    report = await reconciler.reconcile_once()
+    assert report.started == []
+    assert "network tier" in report.refused[0][1]
+    (pod,) = await _pods(db)
+    assert pod["revoke_reason"] == "launch_refused"
+    assert "192.168.178.20" in pod["launch_error"]
+    assert pod["removed_at"] is not None
+    assert reconciler.fake.plans == {}
+    # Backed off: the next pass mints nothing.
+    await reconciler.reconcile_once()
+    assert len(await _pods(db)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_lost_or_never_ready_pod_is_stopped_and_replaced(db, reconciler):
+    connector = await _echo_connector(db)
+    await _echo_image(db)
+    await _bind_echo(db, connector, await _thread(db))
+    await reconciler.reconcile_once()
+    (pod,) = await _pods(db)
+    reconciler.fake.states.pop(str(pod["id"]))  # deleted behind SRW's back
+    report = await reconciler.reconcile_once()
+    assert (str(pod["id"]), "pod_lost") in report.stopped
+    assert len(report.started) == 1  # bindings remain: a new pod
+    _lost, replacement = await _pods(db)
+    reconciler.offset[0] = timedelta(seconds=121)
+    report = await reconciler.reconcile_once()
+    assert (str(replacement["id"]), "start_timeout") in report.stopped
+    # A start timeout backs the key off.
+    assert report.started == []
+
+
+@pytest.mark.asyncio
+async def test_objects_no_live_row_names_are_swept(db, reconciler):
+    connector = await _echo_connector(db)
+    await _echo_image(db)
+    await _bind_echo(db, connector, await _thread(db))
+    await reconciler.reconcile_once()
+    (pod,) = await _pods(db)
+    reconciler.fake.objects = [
+        ("delete_pod", "srw-drv-orphan", str(uuid4())),
+        ("delete_pod", pod["pod_name"], str(pod["id"])),
+    ]
+    report = await reconciler.reconcile_once()
+    assert report.swept == 1
+    assert reconciler.fake.deleted == ["srw-drv-orphan"]
+
+
+@pytest.mark.asyncio
+async def test_the_exchange_answers_the_pods_identity_until_it_is_revoked(
+    db, reconciler
+):
+    """The pod's sdi_ identity exchanges its connector's lease, never another
+    connector's, and stops working when the pod is stopped."""
+    connector, other = await _echo_connector(db), await _echo_connector(db)
+    await _echo_image(db)
+    thread = await _thread(db)
+    lease = await _bind_echo(db, connector, thread)
+    other_lease = await _bind_echo(db, other, thread)
+    await reconciler.reconcile_once()
+    pods = {str(p["connector_id"]): p for p in await _pods(db)}
+    plan = reconciler.fake.plans[str(pods[connector]["id"])]
+    token = base64.b64decode(plan.secret["data"]["identity"]).decode()
+    exchange = ConnectorLeaseExchange(
+        store=db,
+        drivers=builtin_connector_drivers(echo_service_image=ECHO_REFERENCE),
+        limiter=DenialLimiter(),
+    )
+    ok = await exchange.exchange(
+        identity_token=token, lease_token=lease.token, operation="read"
+    )
+    assert ok.status == 200 and ok.body["credential"] == "s"
+    refused = await exchange.exchange(
+        identity_token=token, lease_token=other_lease.token, operation="read"
+    )
+    assert refused.status == 403
+    assert refused.body == {"error": "driver_identity_of_another_connector"}
+    await _end(db, thread)
+    await reconciler.reconcile_once()
+    reconciler.offset[0] = timedelta(seconds=61)
+    await reconciler.reconcile_once()
+    revoked = await exchange.exchange(
+        identity_token=token, lease_token=lease.token, operation="read"
+    )
+    assert revoked.status == 401
+    assert revoked.body == {"error": "driver_identity_revoked"}
+
+
+@pytest.mark.asyncio
+async def test_the_connector_egress_view_shows_what_its_pods_enforce(db, reconciler):
+    connector = await _echo_connector(db)
+    await _echo_image(db)
+    await _bind_echo(db, connector, await _thread(db))
+    await reconciler.reconcile_once()
+    view = await connector_egress_view(db, connector, spec=ECHO_SERVICE_SPEC)
+    assert view["declared"]["rules"] == [
+        {"host": "${config.host}", "ports": ["${config.port}"], "protocol": "tcp"}
+    ]
+    (pod,) = view["pods"]
+    assert pod["live"] is True and pod["ready"] is False
+    assert pod["enforced"]["hosts"][0]["addresses"] == ["1.1.1.1"]
+    assert pod["resolved_at"] is not None

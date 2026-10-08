@@ -1403,6 +1403,9 @@
               "pattern": "^v1\\.[0-9]+$"
             },
             "maxInstallation": {"type": "integer", "minimum": 1},
+            "idleSeconds": {"type": "integer", "minimum": 0},
+            "startTimeoutSeconds": {"type": "integer", "minimum": 30},
+            "reconcileIntervalSeconds": {"type": "integer", "minimum": 5},
             "clusterCidrs": {
               "type": "array",
               "minItems": 1,
