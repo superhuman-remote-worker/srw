@@ -38,9 +38,10 @@ LEGACY_PENDING_SCOPE = (
     "src/agent/",
     "src/orchestrator/services/knowledge_projection.py",
 )
-#: How many sites the baseline froze (2026-10-08). Lower it when --write
-#: shrinks the baseline; never raise it. It stops a hand-added baseline line.
-LEGACY_PENDING_CEILING = 63
+#: How many sites the baseline froze (2026-10-08: 63; 24 after D1b's
+#: materializers). Lower it when --write shrinks the baseline; never raise
+#: it. It stops a hand-added baseline line.
+LEGACY_PENDING_CEILING = 24
 
 
 def _load_script():
