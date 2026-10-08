@@ -100,6 +100,13 @@ import {
         </fieldset>
       }
 
+      <!-- The API stores an update's credentials whole (schema-form.ts formValue). -->
+      @if (editMode() && form.slots.length > 0) {
+        <div class="gf-hint gf-replace-hint" data-hint="replace-all">
+          {{ 'datasources.generic.replaceAll' | transloco }}
+        </div>
+      }
+
       @for (entry of form.slots; track entry.slot.name) {
         <fieldset class="gf-section gf-slot" [attr.data-slot]="entry.slot.name">
           <legend>
@@ -108,9 +115,6 @@ import {
             @if (entry.slot.required) { <span class="gf-required">*</span> }
           </legend>
           <div class="gf-hint">
-            @if (editMode()) {
-              {{ 'datasources.generic.update.' + entry.slot.update | transloco }}
-            }
             @if (entry.slot.access_levels.length > 0) {
               {{ 'datasources.generic.slotLevels' | transloco: {levels: entry.slot.access_levels.join(', ')} }}
             }
@@ -560,7 +564,7 @@ export class GenericConnectorFormComponent {
     return model ? initialFormState(model, this.prefill()) : null;
   });
   private readonly version = signal(0);
-  /** Fields the user changed: their local problems show, untouched ones wait. */
+  /** Fields the user changed (see `problemAt`). */
   private readonly touched = linkedSignal(() => {
     this.state();
     return new Set<string>();
@@ -669,8 +673,11 @@ export class GenericConnectorFormComponent {
     return typeof option === 'string' ? option : JSON.stringify(option);
   }
 
+  /** A field's local problem. A pristine form shows only the required
+   *  markers; once anything is typed every problem shows, since they hold
+   *  back Save (one typed credential on an edit asks for the others). */
   protected problemAt(pointer: string): ProblemReason | null {
-    if (!this.touched().has(pointer)) return null;
+    if (this.touched().size === 0) return null;
     return this.value()?.problems.find((problem) => problem.pointer === pointer)?.reason ?? null;
   }
 

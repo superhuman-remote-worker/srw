@@ -182,20 +182,89 @@ describe('writeOnly secrets', () => {
     expect(fieldsOf(model.slots[0].node)[0].widget).toBe('password');
   });
 
-  it('blank keeps the stored value on an edit and is required on a create', () => {
+  it('blank keeps every stored secret on an edit that enters no credential, and is required on a create', () => {
     const model = buildFormModel(driver({type: 'object', maxProperties: 0}, slots));
     const state = initialFormState(model);
     expect(formValue(model, state, true)).toEqual({problems: []});
     expect(formValue(model, state, false).problems).toEqual([
       {pointer: '/credentials/key', reason: 'required'},
     ]);
+  });
 
-    // Changing the non-secret part of a slot on an edit keeps the secret.
+  it('must be re-entered once an edit enters any credential, which replaces them all', () => {
+    // The API stores an update's credentials whole: user alone would drop key.
+    const model = buildFormModel(driver({type: 'object', maxProperties: 0}, slots));
+    const state = initialFormState(model);
     setStateAt(state, 'slots/api/user', 'svc');
-    expect(formValue(model, state, true)).toEqual({credentials: {user: 'svc'}, problems: []});
-
+    expect(formValue(model, state, true)).toEqual({
+      credentials: {user: 'svc'},
+      problems: [{pointer: '/credentials/key', reason: 'required'}],
+    });
     setStateAt(state, 'slots/api/key', 's3cret');
-    expect(formValue(model, state, true).credentials).toEqual({key: 's3cret', user: 'svc'});
+    expect(formValue(model, state, true)).toEqual({
+      credentials: {key: 's3cret', user: 'svc'},
+      problems: [],
+    });
+  });
+
+  it('protects a Neo4j password and an email mailbox the same way', () => {
+    const neo4j = buildFormModel(builtin('srw.neo4j/v1'));
+    const login = initialFormState(neo4j);
+    setStateAt(login, 'slots/login/username', 'neo');
+    expect(formValue(neo4j, login, true).problems).toEqual([
+      {pointer: '/credentials/password', reason: 'required'},
+    ]);
+
+    const email = buildFormModel(builtin('srw.email/v1'));
+    const mailbox = initialFormState(email);
+    // Only SMTP typed: the required mailbox must be re-entered, or it is lost.
+    setStateAt(mailbox, 'slots/smtp/smtp/host', 'smtp.example.com');
+    expect(formValue(email, mailbox, true).problems.map((p) => p.pointer)).toEqual([
+      '/credentials/username',
+      '/credentials/password',
+      '/credentials/imap',
+    ]);
+  });
+
+  it('do not ask for an unused alternative slot', () => {
+    // A repository takes a token or an SSH key: typing the token on an edit
+    // does not demand the key.
+    const model = buildFormModel(builtin('srw.repository/v1'));
+    const state = initialFormState(model);
+    setStateAt(state, 'slots/token/token', 'ghp_x');
+    expect(formValue(model, state, true)).toEqual({credentials: {token: 'ghp_x'}, problems: []});
+  });
+
+  it('are never prefilled, not even from a stored config that holds one', () => {
+    const model = buildFormModel(
+      driver({
+        type: 'object',
+        properties: {
+          host: {type: 'string'},
+          token: {type: 'string', writeOnly: true, default: 'author-default'},
+        },
+      }),
+    );
+    const state = initialFormState(model, {config: {host: 'h', token: 'stored-leak'}});
+    expect(stateAt(state, 'config/host')).toBe('h');
+    expect(stateAt(state, 'config/token')).toBe('');
+    expect(formValue(model, state, true).config).toEqual({host: 'h'});
+  });
+
+  it('make everything under a writeOnly object secret', () => {
+    const model = buildFormModel(
+      driver({
+        type: 'object',
+        properties: {
+          auth: {type: 'object', writeOnly: true, properties: {user: {type: 'string'}}},
+        },
+      }),
+    );
+    const user = fieldsOf(fieldsOf(model.config)[0])[0];
+    expect(user.secret).toBe(true);
+    expect(user.widget).toBe('password');
+    const state = initialFormState(model, {config: {auth: {user: 'stored-leak'}}});
+    expect(stateAt(state, 'config/auth/user')).toBe('');
   });
 });
 

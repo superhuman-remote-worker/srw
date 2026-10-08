@@ -2689,11 +2689,7 @@
         "oauth2": "OAuth 2",
         "kubeconfig": "Kubeconfig"
       },
-      "update": {
-        "keep_if_blank": "Leer lassen, um den gespeicherten Wert zu behalten.",
-        "merge": "Neue Einträge werden zu den gespeicherten hinzugefügt; leer lassen, um sie zu behalten.",
-        "replace": "Jeder eingegebene Wert ersetzt die gespeicherten Zugangsdaten; alles leer lassen, um sie zu behalten."
-      },
+      "replaceAll": "Alle Zugangsdaten leer lassen, um die gespeicherten zu behalten. Jede Eingabe ersetzt sie alle, also jedes Geheimnis erneut eingeben.",
       "problem": {
         "required": "Erforderlich",
         "pattern": "Entspricht nicht dem erwarteten Format",

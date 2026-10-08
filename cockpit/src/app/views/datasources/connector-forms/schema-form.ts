@@ -11,9 +11,10 @@
  * UI hints `x-srw-widget` (`file`, `textarea`, `password`, `json`),
  * `x-srw-order`, `x-srw-group` and `x-srw-multiline`.
  *
- * The checks here only stop an obviously incomplete submit. The orchestrator's
- * driver `validate` is the authority: its 400 detail is shown at the field it
- * names, or above the form.
+ * The checks here stop an obviously incomplete submit (the editor's Save waits
+ * for them), including an edit that would wipe stored secrets (`formValue`).
+ * The orchestrator's driver `validate` is the authority on the rest: its 400
+ * detail is shown at the field it names, or above the form.
  */
 import {
   ConnectorCredentialSlot,
@@ -371,7 +372,9 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 export function initialState(node: FormNode, existing: unknown): FieldState {
-  const known = existing === undefined || node.secret ? node.defaultValue : existing;
+  // A secret is never prefilled: not from a stored config that holds one by
+  // mistake, not from an author's default.
+  const known = node.secret ? undefined : existing === undefined ? node.defaultValue : existing;
   switch (node.kind) {
     case 'text':
       return typeof known === 'string' ? known : '';
@@ -640,6 +643,16 @@ export function formValue(
   if (config !== undefined) value.config = config as Record<string, unknown>;
   problems.push(...problemsOf(model.config, state.config, '/config', editing, false));
 
+  // The API replaces the whole stored credentials object whenever an update
+  // carries any (only the `credentials` driver merges). So an edit either
+  // sends none, keeping every stored secret, or re-enters them all: once a
+  // credential is typed, the required slots are checked as on a create and
+  // every secret in a slot in use is required, a blank one no longer keeping
+  // anything. Per-slot `update` rules (keep_if_blank, merge) wait for D3b,
+  // when the API applies them.
+  const replacing =
+    editing && model.slots.some(({slot, node}) => toValue(node, state.slots[slot.name]) !== undefined);
+  const keepsSecrets = editing && !replacing;
   const credentials: Record<string, unknown> = {};
   for (const {slot, node} of model.slots) {
     const slotState = state.slots[slot.name];
@@ -647,10 +660,11 @@ export function formValue(
     // A slot's keys sit at the top of the credentials object.
     const values = slotState as {[key: string]: FieldState};
     const blank = toValue(node, slotState) === undefined;
-    if (blank && !(slot.required && !editing)) continue;
+    if (blank && !(slot.required && !keepsSecrets)) continue;
     const before = problems.length;
     for (const field of fieldsOf(node)) {
-      problems.push(...problemsOf(field, values[field.key], slotPointer(field), editing, field.required));
+      const needed = field.required || (replacing && field.secret && field.kind === 'text');
+      problems.push(...problemsOf(field, values[field.key], slotPointer(field), keepsSecrets, needed));
     }
     // A required slot whose schema requires no key still needs one.
     const first = fieldsOf(node).find((field) => field.kind !== 'const');

@@ -2689,11 +2689,7 @@
         "oauth2": "OAuth 2",
         "kubeconfig": "Kubeconfig"
       },
-      "update": {
-        "keep_if_blank": "Leave blank to keep the stored value.",
-        "merge": "New entries are added to the stored ones; leave blank to keep them.",
-        "replace": "Any value entered replaces the stored credentials; leave all blank to keep them."
-      },
+      "replaceAll": "Leave every credential blank to keep the stored ones. Entering any replaces them all, so enter every secret again.",
       "problem": {
         "required": "Required",
         "pattern": "Does not match the expected format",

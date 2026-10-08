@@ -2930,9 +2930,10 @@ export class DatasourceListComponent implements OnInit {
         return false;
       }
     }
-    // The generic form submits what it holds: the driver's validate is the
-    // authority, and its refusal shows at the field it names.
-    if (this.useGenericForm()) return this.genericFormValue() !== null;
+    // The generic form holds back an obviously incomplete submit (including
+    // an edit that would wipe stored secrets); the driver's validate is the
+    // authority on the rest, and its refusal shows at the field it names.
+    if (this.useGenericForm()) return this.genericFormValue()?.problems.length === 0;
     if (this.formData.type === 'credentials') {
       return this.editingId() !== null || this.envVars.some(row => row.key.trim() && row.value);
     }

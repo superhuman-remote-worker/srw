@@ -1385,12 +1385,18 @@ describe('DatasourceListComponent bespoke and generic forms', () => {
     expect(component.useGenericForm()).toBe(true);
   });
 
-  it('submits what the generic form holds, and lets the API decide', () => {
+  it('submits what the generic form holds once it has no problem left, and lets the API decide', () => {
     const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
     component.openCreateForm();
     component.formData.name = 'Graph';
     component.onTypeSelect('neo4j');
     component.setGenericFormPreview(true);
+    expect(component.canSave()).toBe(false);
+    // An edit that would wipe the stored password holds back Save.
+    component.genericFormValue.set({
+      credentials: {username: 'neo'},
+      problems: [{pointer: '/credentials/password', reason: 'required'}],
+    });
     expect(component.canSave()).toBe(false);
     component.genericFormValue.set({
       connection_url: 'bolt://graph:7687',

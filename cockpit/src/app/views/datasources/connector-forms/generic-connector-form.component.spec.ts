@@ -200,8 +200,8 @@ describe('GenericConnectorFormComponent', () => {
       const input = field(host, '/credentials/key').querySelector('app-input');
       expect(prop(input, 'type')).toBe('password');
       expect(prop(input, 'placeholder')).toBe(en.datasources.generic.keepStored);
-      expect(host.querySelector('[data-slot="api"] .gf-hint')?.textContent).toContain(
-        en.datasources.generic.update.keep_if_blank,
+      expect(host.querySelector('[data-hint="replace-all"]')?.textContent?.trim()).toBe(
+        en.datasources.generic.replaceAll,
       );
       // Not required on an edit: blank keeps.
       expect(field(host, '/credentials/key').querySelector('.gf-required')).toBeNull();
@@ -223,6 +223,21 @@ describe('GenericConnectorFormComponent', () => {
       expect(field(host, '/credentials/key').querySelector('.gf-error')?.textContent?.trim()).toBe(
         en.datasources.generic.problem.required,
       );
+    });
+
+    it('ask again on an edit for every secret once one credential is typed', () => {
+      // A Neo4j edit that changes the username would otherwise store no password.
+      const {host, type, last} = render(builtin('srw.neo4j/v1'), {editing: true});
+      expect(host.querySelector('[data-hint="replace-all"]')).toBeTruthy();
+      expect(last().problems).toEqual([]);
+      type('slots/login/username', '/credentials/username', 'neo');
+      expect(last().problems).toEqual([{pointer: '/credentials/password', reason: 'required'}]);
+      // Shown though the password was never touched: it holds back Save.
+      expect(field(host, '/credentials/password').querySelector('.gf-error')?.textContent?.trim()).toBe(
+        en.datasources.generic.problem.required,
+      );
+      type('slots/login/password', '/credentials/password', 'pw');
+      expect(last()).toEqual({credentials: {username: 'neo', password: 'pw'}, problems: []});
     });
   });
 
