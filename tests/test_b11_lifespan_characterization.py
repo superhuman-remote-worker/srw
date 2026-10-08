@@ -1032,3 +1032,63 @@ async def test_a_failing_cleanup_does_not_replace_the_startup_error(monkeypatch)
     with pytest.raises(_Boom):
         await _run_lifespan(monkeypatch, recorder)
     assert "postgres_db.disconnect" in recorder.events
+
+
+# --------------------------------------------------------------------------- #
+# The legacy main-cloud overlay row (main_cloud_as_connectors.md, slice 2)
+# --------------------------------------------------------------------------- #
+
+_LEGACY_ROW = {
+    "key": "main_cloud",
+    "value": {"backend_id": "opencloud", "base_url": "https://legacy.example"},
+    "credentials_ref": None,
+}
+
+
+async def _run_with_legacy_row(monkeypatch, initialize):
+    deleted: list[str] = []
+
+    async def get_system_setting(_self, key, *_a, **_k):
+        return dict(_LEGACY_ROW) if key == "main_cloud" else None
+
+    async def delete_system_setting(_self, key, *_a, **_k):
+        deleted.append(key)
+        return True
+
+    monkeypatch.setattr(_FakeStore, "get_system_setting", get_system_setting)
+    monkeypatch.setattr(_FakeStore, "delete_system_setting", delete_system_setting)
+    real_environment = _lifespan_environment
+
+    @contextlib.contextmanager
+    def environment(*args, **kwargs):
+        with real_environment(*args, **kwargs) as world:
+            monkeypatch.setattr(
+                instance_registry_module,
+                "initialize_main_cloud_instance_authority",
+                initialize,
+            )
+            yield world
+
+    monkeypatch.setattr(sys.modules[__name__], "_lifespan_environment", environment)
+    await _run_lifespan(monkeypatch, _Recorder())
+    return deleted
+
+
+@pytest.mark.asyncio
+async def test_the_legacy_row_is_removed_once_an_instance_is_active(monkeypatch):
+    initialize = AsyncMock()
+    deleted = await _run_with_legacy_row(monkeypatch, initialize)
+
+    assert (
+        initialize.await_args.kwargs["legacy_overlay"]["value"]
+        == (_LEGACY_ROW["value"])
+    )
+    assert deleted == ["main_cloud"]
+
+
+@pytest.mark.asyncio
+async def test_the_legacy_row_is_kept_when_no_instance_was_adopted(monkeypatch):
+    initialize = AsyncMock(side_effect=RuntimeError("differs from Helm"))
+    deleted = await _run_with_legacy_row(monkeypatch, initialize)
+
+    assert deleted == []

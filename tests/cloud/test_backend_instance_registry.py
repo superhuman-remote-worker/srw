@@ -797,3 +797,155 @@ async def test_an_activation_that_does_not_take_effect_is_logged(monkeypatch, ca
         )
 
     assert "attested but not activated" in caplog.text
+
+
+# =============================================================================
+# A legacy system_settings.main_cloud row before any instance is active
+# =============================================================================
+
+
+def _helm_nextcloud(monkeypatch, **extra):
+    env = {
+        "MAIN_CLOUD_BACKEND": "nextcloud",
+        "NEXTCLOUD_URL": "http://srw-nextcloud",
+        "NEXTCLOUD_PUBLIC_URL": "https://cloud.localhost",
+        "NEXTCLOUD_ADMIN_USER": "admin",
+        "NEXTCLOUD_ADMIN_PASSWORD": "admin-secret",
+        "NEXTCLOUD_AGENT_PASSWORD": "agent-secret",
+        **extra,
+    }
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+
+@pytest.mark.parametrize(
+    ("value", "credentials_ref", "expected"),
+    [
+        ({}, None, []),
+        (
+            {
+                "backend_id": "nextcloud",
+                "base_url": "http://srw-nextcloud/",
+                "public_url": "https://cloud.localhost",
+                "admin_user": "admin",
+                "__secret_fields__": ["admin_password", "agent_password"],
+            },
+            None,
+            [],
+        ),
+        ({"backend_id": "opencloud"}, None, ["backend_id"]),
+        (
+            {"backend_id": "nextcloud", "base_url": "https://other.example"},
+            None,
+            ["base_url"],
+        ),
+        (
+            {
+                "backend_id": "nextcloud",
+                "__secret_fields__": ["agent_password"],
+            },
+            "env:VAULT_AGENT_PASSWORD",
+            ["agent_password"],
+        ),
+    ],
+)
+def test_a_legacy_row_is_compared_with_helm_by_field_name(
+    monkeypatch, value, credentials_ref, expected
+):
+    import orchestrator.services.cloud.instance_registry as registry
+
+    _helm_nextcloud(monkeypatch)
+    overlay = {"value": value, "credentials_ref": credentials_ref}
+    assert registry.legacy_overlay_differences(overlay) == expected
+
+
+def test_the_legacy_summary_names_no_secret():
+    import orchestrator.services.cloud.instance_registry as registry
+
+    overlay = {
+        "value": {
+            "backend_id": "nextcloud",
+            "base_url": "https://x",
+            "admin_user": "a",
+        },
+        "credentials_ref": "env:SECRET_NAME",
+    }
+    assert registry.legacy_overlay_summary(overlay) == {
+        "backend_id": "nextcloud",
+        "base_url": "https://x",
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_first_boot_refuses_helm_when_a_legacy_row_describes_another_cloud(
+    monkeypatch, caplog
+):
+    import orchestrator.services.cloud.instance_registry as registry
+
+    _helm_nextcloud(monkeypatch)
+    builder = AsyncMock()
+    monkeypatch.setattr(registry, "build_attested_main_cloud_candidate", builder)
+    db = type("DB", (), {})()
+    db.get_active_main_cloud_backend_instance = AsyncMock(return_value=None)
+    db.install_initial_main_cloud_backend_instance = AsyncMock()
+    overlay = {
+        "value": {"backend_id": "opencloud", "base_url": "https://legacy.example"},
+        "credentials_ref": None,
+    }
+
+    with caplog.at_level("ERROR", logger=registry.__name__):
+        with pytest.raises(RuntimeError, match="differs from Helm"):
+            await initialize_main_cloud_instance_authority(
+                db, MainCloudRouter(_backend(_authority())), legacy_overlay=overlay
+            )
+
+    builder.assert_not_awaited()
+    db.install_initial_main_cloud_backend_instance.assert_not_awaited()
+    assert "opencloud" in caplog.text and "https://legacy.example" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_first_boot_adopts_helm_when_the_legacy_row_agrees(monkeypatch):
+    import orchestrator.services.cloud.instance_registry as registry
+
+    _helm_nextcloud(monkeypatch)
+    authority = _authority()
+    candidate = _backend(authority)
+    monkeypatch.setattr(
+        registry,
+        "build_attested_main_cloud_candidate",
+        AsyncMock(return_value=(candidate, authority)),
+    )
+    db = type("DB", (), {})()
+    db.get_active_main_cloud_backend_instance = AsyncMock(return_value=None)
+    db.install_initial_main_cloud_backend_instance = AsyncMock(
+        return_value=_active(authority, 1)
+    )
+    overlay = {"value": {"backend_id": "nextcloud"}, "credentials_ref": None}
+
+    result = await initialize_main_cloud_instance_authority(
+        db, MainCloudRouter(_backend(_authority(_B))), legacy_overlay=overlay
+    )
+
+    assert result == _active(authority, 1)
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_row_is_not_consulted_once_an_instance_is_active(monkeypatch):
+    import orchestrator.services.cloud.instance_registry as registry
+
+    active = _authority()
+    _describe(monkeypatch, active)
+    reload = AsyncMock(return_value=True)
+    monkeypatch.setattr(registry, "reload_active_main_cloud_instance", reload)
+    differences = AsyncMock()
+    monkeypatch.setattr(registry, "legacy_overlay_differences", differences)
+
+    await initialize_main_cloud_instance_authority(
+        _Startup(_active(active, 2)),
+        MainCloudRouter(_backend(active)),
+        legacy_overlay={"value": {"backend_id": "opencloud"}},
+    )
+
+    differences.assert_not_called()
+    reload.assert_awaited_once()

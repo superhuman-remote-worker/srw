@@ -330,8 +330,14 @@ async def bind_services(resources: ApplicationResources) -> None:
     # later boots reconcile the active instance with it (instance_registry),
     # and the immutable instance snapshot + singleton CAS pointer stay the
     # sole routing authority. A legacy ``system_settings.main_cloud`` overlay
-    # row is ignored and removed: it was one-time input before 0186 and has
-    # been inert since.
+    # row (one-time input before 0186) is no configuration: it is removed once
+    # an instance is active, and until then it only stops a first boot from
+    # adopting a Helm description of another cloud (instance_registry).
+    try:
+        _legacy_overlay = await resources.postgres_db.get_system_setting("main_cloud")
+    except Exception as _e:
+        logger.warning("Legacy main cloud overlay read failed at startup: %s", _e)
+        _legacy_overlay = None
     try:
         await instance_registry.initialize_main_cloud_instance_authority(
             resources.postgres_db,
@@ -340,10 +346,26 @@ async def bind_services(resources: ApplicationResources) -> None:
                 resources.settings.main_cloud_replace_installation or None
             ),
             notify=lambda instance_id: fire_reload(resources.postgres_db, instance_id),
+            legacy_overlay=_legacy_overlay,
         )
         await instance_registry.preload_retained_main_cloud_instances(
             resources.postgres_db, resources.main_cloud_router
         )
+        if _legacy_overlay is not None:
+            try:
+                await resources.postgres_db.delete_system_setting("main_cloud")
+                logger.warning(
+                    "Removed the legacy main_cloud settings row (backend %s); "
+                    "the main cloud is configured by Helm only",
+                    instance_registry.legacy_overlay_summary(_legacy_overlay)[
+                        "backend_id"
+                    ],
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to remove inert legacy main_cloud setting",
+                    exc_info=True,
+                )
     except Exception as _e:
         # Main cloud is optional for the rest of the orchestrator, but an
         # unbound env adapter must never become a fallback routing authority.
@@ -352,17 +374,6 @@ async def bind_services(resources: ApplicationResources) -> None:
             "Main cloud installation authority is unavailable; cloud effects "
             "remain disabled: %s",
             _e,
-        )
-
-    try:
-        if await resources.postgres_db.delete_system_setting("main_cloud"):
-            logger.warning(
-                "Removed an ignored legacy main_cloud settings row; the main "
-                "cloud is configured by Helm only"
-            )
-    except Exception:
-        logger.warning(
-            "Failed to remove inert legacy main_cloud setting", exc_info=True
         )
 
     # Issue 5: warn loudly if the *active* backend's required secrets are not

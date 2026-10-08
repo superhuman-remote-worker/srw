@@ -26,6 +26,11 @@ describes with the active instance and reconciles them:
   description that matches, so a cloud reinstalled at the same address (a new
   proof) can be adopted;
 * a description that fails to attest leaves the active instance serving.
+
+A legacy ``system_settings.main_cloud`` row (the removed form's input before
+migration 0186) is no configuration any more. It is removed once an instance
+is active; before that, a first boot refuses to adopt Helm's description if
+the row describes another cloud, and keeps the row.
 """
 
 from __future__ import annotations
@@ -223,17 +228,74 @@ async def preload_retained_main_cloud_instances(
     return failures
 
 
+#: The legacy overlay's routing fields that hold a URL (compared without a
+#: trailing slash, as the settings model may add one).
+_URL_FIELDS = frozenset(
+    {"base_url", "public_url", "keycloak_issuer", "protected_effect_url"}
+)
+
+
+def legacy_overlay_summary(overlay: Any) -> dict[str, Any]:
+    """The non-secret identity of a legacy ``system_settings.main_cloud`` row,
+    for a log line: its provider and internal URL."""
+    value = overlay.get("value") if isinstance(overlay, dict) else None
+    value = value if isinstance(value, dict) else {}
+    return {"backend_id": value.get("backend_id"), "base_url": value.get("base_url")}
+
+
+def legacy_overlay_differences(overlay: Any) -> list[str]:
+    """The fields in which a legacy overlay row differs from Helm's description.
+
+    The row was the removed form's one-time input before migration 0186. A
+    deployment that never adopted an instance since may still hold it; if it
+    describes another cloud than Helm, adopting Helm's would silently move
+    the deployment. Names only, never a value. Raises when Helm describes
+    nothing adoptable (the first boot would fail on it anyway).
+    """
+    value = overlay.get("value") if isinstance(overlay, dict) else None
+    if not isinstance(value, dict) or not value:
+        return []
+    settings = load_main_cloud_config()
+    routing = main_cloud_routing_snapshot(settings)
+    differences: list[str] = []
+    for key, stored in sorted(value.items()):
+        if key == "__secret_fields__" or stored in (None, ""):
+            continue
+        described = routing.get(key)
+        if key in _URL_FIELDS:
+            same = str(stored).rstrip("/") == str(described or "").rstrip("/")
+        else:
+            same = stored == described
+        if not same:
+            differences.append(key)
+    credentials_ref = overlay.get("credentials_ref")
+    secret_fields = value.get("__secret_fields__") or []
+    if isinstance(credentials_ref, str) and credentials_ref.startswith("env:"):
+        refs = main_cloud_secret_references(settings.backend_id)
+        differences += [
+            field
+            for field in secret_fields
+            if isinstance(field, str) and refs.get(field) != credentials_ref
+        ]
+    return differences
+
+
 async def initialize_main_cloud_instance_authority(
     db: Any,
     router: MainCloudRouter,
     *,
     replace_installation: str | None = None,
     notify: Callable[[str], Awaitable[None]] | None = None,
+    legacy_overlay: dict[str, Any] | None = None,
     activated_by: str = "orchestrator-startup",
 ) -> dict[str, Any]:
     """Resolve existing authority, reconciled with Helm (module docstring).
 
-    The first boot adopts Helm's description transactionally. Afterwards the
+    The first boot adopts Helm's description transactionally, unless a
+    legacy ``system_settings.main_cloud`` row (``legacy_overlay``) describes
+    another cloud: then nothing is adopted, the row's non-secret identity is
+    logged and the caller keeps it, so cloud effects stay disabled until Helm
+    describes the same cloud or an operator removes the row. Afterwards the
     active instance is loaded, and Helm's description replaces it only as the
     module docstring says. ``notify`` receives the instance id after such a
     replacement, to fan it out to the other replicas.
@@ -255,6 +317,21 @@ async def initialize_main_cloud_instance_authority(
         if loaded is not True:
             raise RuntimeError("main-cloud active instance changed during startup")
         return active
+
+    if legacy_overlay is not None:
+        differences = legacy_overlay_differences(legacy_overlay)
+        if differences:
+            summary = legacy_overlay_summary(legacy_overlay)
+            logger.error(
+                "Main cloud: a legacy main_cloud settings row (backend %s, base "
+                "URL %s) differs from Helm's description in %s; no installation "
+                "is adopted and the row is kept. Describe that cloud in Helm, or "
+                "delete the row, then restart.",
+                summary["backend_id"],
+                summary["base_url"],
+                differences,
+            )
+            raise RuntimeError("legacy main_cloud settings row differs from Helm")
 
     backend, proposed = await build_attested_main_cloud_candidate()
     try:
@@ -590,6 +667,8 @@ __all__ = [
     "build_attested_main_cloud_candidate",
     "helm_configuration_status",
     "initialize_main_cloud_instance_authority",
+    "legacy_overlay_differences",
+    "legacy_overlay_summary",
     "preload_retained_main_cloud_instances",
     "reload_active_main_cloud_instance",
 ]
