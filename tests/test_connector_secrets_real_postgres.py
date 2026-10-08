@@ -58,7 +58,7 @@ from orchestrator.services.manifest_connectors import (
 )
 from orchestrator.services.manifest_resolution import LiveManifestResolver
 from orchestrator.services.manifest_resources import ManifestResourceService
-from orchestrator.services.manifest_store import ManifestStore
+from orchestrator.services.manifest_store import LINKED_CONNECTOR_MESSAGE, ManifestStore
 from orchestrator.services.thread_datasource_authorization import (
     ThreadDatasourceAuthorizationDependencies,
     resolve_authorized_thread_datasources,
@@ -713,6 +713,53 @@ async def test_no_other_resource_may_reference_a_connector_secret(database):
             materialize=True,
         )
     assert refused.value.detail == FOREIGN_CONNECTOR_SECRET_DETAIL
+
+
+@pytest.mark.asyncio
+async def test_an_edit_of_a_linked_connector_is_refused_as_before(database):
+    """Its own document names its own secret: the apply reaches the store's
+    refusal, as in D3a. A new document borrowing that secret does not."""
+    db = database
+    user = await _user(db, "Owner")
+    created = await db.create_datasource(
+        name="orders",
+        ds_type="postgresql",
+        connection_url="postgresql://app:s3cret-pass@db/app",
+        created_by=str(user["id"]),
+    )
+    current = await ManifestStore(db).by_id(str(created["id"]))
+    assert current["document"]["spec"]["credentials"]
+    edited = json.loads(json.dumps(current["document"]))
+    edited["metadata"]["labels"] = {"edited": "yes"}
+    with pytest.raises(HTTPException) as applied:
+        await ManifestResourceService(db).apply(
+            json.dumps(edited),
+            user,
+            format="json",
+            expected_versions={
+                f"Connector/Account/{user['id']}/{current['name']}": current[
+                    "resource_version"
+                ]
+            },
+        )
+    assert (applied.value.status_code, applied.value.detail) == (
+        409,
+        LINKED_CONNECTOR_MESSAGE,
+    )
+
+    borrowed = json.loads(json.dumps(current["document"]))
+    borrowed["metadata"] = {"name": "borrowed", "scope": borrowed["metadata"]["scope"]}
+    with pytest.raises(HTTPException) as refused:
+        await ManifestResourceService(db).apply(
+            json.dumps(borrowed), user, format="json"
+        )
+    assert refused.value.detail == FOREIGN_CONNECTOR_SECRET_DETAIL
+    assert (
+        await ManifestStore(db).by_name(
+            "Connector", borrowed["metadata"]["scope"], "borrowed"
+        )
+        is None
+    )
 
 
 # =============================================================================

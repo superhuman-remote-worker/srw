@@ -31,6 +31,7 @@ class LiveManifestResolver:
         self.prepared = {}
         self.observed = {}
         self.secrets = {}
+        self.linked_connectors = {}
         self.expansion_budget = [MAX_NODES]
 
     async def scope(self, value, *, write=False):
@@ -114,6 +115,10 @@ class LiveManifestResolver:
         if row:
             await self.authority.resource(row, write=True)
             self.observe(row)
+            if row["kind"] == "Connector" and row.get("linked_id"):
+                # An edit of a datasource's Connector names that Connector's
+                # own secret; the store then refuses the edit itself.
+                self.linked_connectors[key] = row
 
     def observe(self, row):
         self.observed[resource_key(row["document"])] = {
@@ -383,12 +388,15 @@ class LiveManifestResolver:
             else None
         )
         resolved = deepcopy(doc)
+        scope = doc["metadata"]["scope"]
         resolved["spec"] = await self.spec(
             doc["kind"],
             deepcopy(doc["spec"]),
-            doc["metadata"]["scope"],
+            scope,
             dependencies,
             project_id=project_id,
+            connector=self.linked_connectors.get(key),
+            project_ids=[scope["name"]] if scope["kind"] == "Project" else [],
         )
         result = {
             "document": deepcopy(doc),
