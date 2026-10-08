@@ -138,6 +138,9 @@ def _datasource_payload_deps() -> (
         workspace_ssh_known_hosts=lambda: (
             main.app.state.resources.settings.workspace_ssh_known_hosts
         ),
+        git_swap_fallback=lambda: (
+            main.app.state.resources.settings.connector_git_swap_fallback
+        ),
     )
 
 
@@ -3599,6 +3602,13 @@ LATE_BINDING_TABLE = [
         "workspace_ssh_known_hosts",
         _SETTING,
         "workspace_ssh_known_hosts",
+        None,
+    ),
+    (
+        _datasource_payload_deps,
+        "git_swap_fallback",
+        _SETTING,
+        "connector_git_swap_fallback",
         None,
     ),
     (_datasource_selection_deps, "store", _RESOURCE, "postgres_db", None),
