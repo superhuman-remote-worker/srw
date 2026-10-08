@@ -26,6 +26,7 @@ from orchestrator.routers import (
 from orchestrator.security import access, auth
 from orchestrator.services import (
     citations as citations_operations,
+    connector_secrets,
     datasource_config,
     datasources as datasources_operations,
     deployment_gates,
@@ -80,6 +81,11 @@ def datasources_dependencies(
             mcp_stdio_enabled=deployment_gates.mcp_stdio_enabled,
             validate_mcp_datasource=datasource_config.validate_mcp_datasource,
             connector_drivers=resources.connector_drivers,
+            connector_credentials=bound(
+                connector_secrets.read_connector_credentials,
+                datasources_dependencies,
+                resources,
+            ),
         ),
         require_approved_user=auth.require_approved_user,
         require_project_member=access.require_project_member,

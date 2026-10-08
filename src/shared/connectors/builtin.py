@@ -11,6 +11,14 @@ the delivery-form type sets.
 
 The access levels describe today's behaviour.  ``enforced_by`` names what
 really holds a level; ``advisory`` marks a level only told to the agent.
+
+So do the credential slots' ``update`` rules, which are the datasource API's:
+an edit that sends no credentials keeps every stored one, and an edit that
+sends any replaces the whole stored object (``replace``), except that a
+``credentials`` connector merges the variables it is sent into the stored
+set (``merge``).  No built-in slot keeps a blank field of an edit that sends
+others (``keep_if_blank``).  The Connector's resource secret is written from
+the stored row, so it follows the same rules (slice D3b).
 """
 
 from __future__ import annotations
@@ -765,6 +773,7 @@ LEASE_PROBE_SPEC = DriverSpec(
             "secret_string",
             {"type": "object", "properties": {"secret": _SECRET}},
             required=True,
+            update="replace",
         ),
     ),
     access_levels=(

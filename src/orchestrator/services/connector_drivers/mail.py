@@ -24,9 +24,11 @@ from orchestrator.services.connector_drivers.base import (
     ConnectorDraft,
     DatasourceDriver,
     NormalizedConnector,
+    SecretLeaf,
     ValidationContext,
     payload_entry,
     probe_failure,
+    top_level_leaves,
 )
 from orchestrator.services.email_datasource import (
     email_dispatch_config,
@@ -136,6 +138,10 @@ class EmailDriver(DatasourceDriver):
 
     def effective_access(self, row: Mapping[str, Any]) -> str | None:
         return email_effective_access(dict(row))
+
+    def secret_leaves(self, credentials: Mapping[str, Any]) -> list[SecretLeaf]:
+        """The mailbox password; the user and its servers are config."""
+        return top_level_leaves(credentials, ("password",))
 
     def credential_config(self, credentials: Mapping[str, Any]) -> dict[str, Any]:
         """The mailbox user and its servers; only the password is secret."""

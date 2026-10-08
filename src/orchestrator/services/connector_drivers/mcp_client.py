@@ -32,7 +32,10 @@ from orchestrator.services.connector_drivers.base import (
     DeploymentGates,
     DriverEnvironment,
     NormalizedConnector,
+    SecretLeaf,
     ValidationContext,
+    string_leaves,
+    top_level_leaves,
 )
 from shared.connectors.builtin import MCP_SPEC, mcp_spec_for
 from shared.connectors.contract import DriverSpec
@@ -157,6 +160,24 @@ class McpDriver(DatasourceDriver):
         if config["auth_type"] == "headers" and isinstance(headers, Mapping):
             config["header_names"] = sorted(str(name) for name in headers)
         return config
+
+    def secret_leaves(self, credentials: Mapping[str, Any]) -> list[SecretLeaf]:
+        """A stdio server's ``command``, each ``arg.<n>`` and ``env.<NAME>``;
+        a remote server's bearer ``token`` and each ``header.<Name>``.  The
+        transport and the auth type stay with the structure."""
+        leaves = top_level_leaves(credentials, ("command",))
+        leaves += string_leaves(
+            credentials.get("args"), ("args",), lambda n: f"arg.{n}"
+        )
+        leaves += string_leaves(credentials.get("env"), ("env",), lambda n: f"env.{n}")
+        auth = credentials.get("auth")
+        if isinstance(auth, Mapping):
+            if isinstance(auth.get("token"), str):
+                leaves.append((("auth", "token"), "token"))
+            leaves += string_leaves(
+                auth.get("headers"), ("auth", "headers"), lambda n: f"header.{n}"
+            )
+        return leaves
 
 
 async def test_mcp_datasource(

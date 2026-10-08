@@ -25,6 +25,7 @@ from orchestrator.services.connector_drivers.base import (
     ConnectorDraft,
     DatasourceDriver,
     NormalizedConnector,
+    SecretLeaf,
     ValidationContext,
 )
 from shared.connectors.builtin import GENERIC_FILE_SPEC, KUBECONFIG_SPEC
@@ -122,6 +123,9 @@ class CredentialFileDriver(DatasourceDriver):
 
     def credential_config(self, credentials: Mapping[str, Any]) -> dict[str, Any]:
         return self.credential_file_targets(credentials)
+
+    def secret_leaves(self, credentials: Mapping[str, Any]) -> list[SecretLeaf]:
+        return self.credential_file_leaves(credentials)
 
     async def check(
         self, row: Mapping[str, Any], credentials: dict[str, Any], *, ctx: CheckContext

@@ -80,6 +80,7 @@ from orchestrator.services import (
     agent_datasource_payload as agent_datasource_payload_module,
 )
 from orchestrator.services import config_resolver as config_resolver_module
+from orchestrator.services import connector_secrets as connector_secrets_module
 from orchestrator.services import container_provisioner as container_provisioner_module
 from orchestrator.services import deployment_gates as deployment_gates_module
 from orchestrator.services import dispatch_credentials as dispatch_credentials_module
@@ -153,6 +154,11 @@ def _datasource_selection_deps() -> (
         backend_from_override=workspace_tier_policy_module.backend_from_override,
         revalidate_selection=bound(
             job_datasource_selection_module.revalidate_job_datasource_selection,
+            preparation_composition.job_datasource_selection_dependencies,
+            main.app.state.resources,
+        ),
+        connector_credentials=bound(
+            connector_secrets_module.read_connector_credentials,
             preparation_composition.job_datasource_selection_dependencies,
             main.app.state.resources,
         ),
@@ -3618,6 +3624,13 @@ LATE_BINDING_TABLE = [
         "revalidate_selection",
         _BOUND,
         (job_datasource_selection_module, "revalidate_job_datasource_selection"),
+        _PREP.job_datasource_selection_dependencies,
+    ),
+    (
+        _datasource_selection_deps,
+        "connector_credentials",
+        _BOUND,
+        (connector_secrets_module, "read_connector_credentials"),
         _PREP.job_datasource_selection_dependencies,
     ),
     (_workspace_runtime_deps, "store", _RESOURCE, "postgres_db", None),

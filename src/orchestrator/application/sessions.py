@@ -32,6 +32,7 @@ from orchestrator.services import (
     agent_thread_status as agent_thread_status_service,
     commissioned_officer_provisioning as commissioned_officer_provisioning_service,
     config_resolver,
+    connector_secrets,
     container_provisioner as container_provisioner_module,
     deployment_gates,
     dispatch_credentials,
@@ -436,6 +437,11 @@ def thread_datasource_authorization_dependencies(
         thread_project_ids=bound(
             thread_mount_rows.thread_project_ids,
             preparation_composition.thread_mount_dependencies,
+            resources,
+        ),
+        connector_credentials=bound(
+            connector_secrets.read_connector_credentials,
+            thread_datasource_authorization_dependencies,
             resources,
         ),
     )

@@ -100,6 +100,10 @@ class DatasourceDependencies:
     validate_mcp_datasource: Callable[[str | None, dict[str, Any]], None]
     #: The application's installed connector drivers.
     connector_drivers: ConnectorDriverRegistry
+    #: Reads a connector's credentials from its Connector's resource secret,
+    #: in place (``connector_secrets.read_connector_credentials``); ``None``
+    #: tests with the row's own.
+    connector_credentials: Callable[..., Awaitable[None]] | None = None
 
     def driver_environment(self) -> DriverEnvironment:
         return DriverEnvironment(
@@ -854,9 +858,13 @@ async def test_datasource(
     uses live credentials and probes the target). ``overrides`` is the
     endpoint a connector form is editing; a driver that can test an edit
     validates it like an update, and every other driver ignores it.
+    The credentials come from the Connector's resource secret, which the
+    owner may always use, or from the row where the resource has none yet.
     """
     try:
         _, ds = await resolve_datasource()
+        if dependencies.connector_credentials is not None:
+            await dependencies.connector_credentials([ds], authorized=[str(ds["id"])])
         driver = dependencies.connector_drivers.for_type(ds.get("type"))
         if overrides and isinstance(driver, SupportsTestOverrides):
             ds = driver.apply_test_overrides(ds, overrides)

@@ -1257,9 +1257,9 @@ def _writes_connector(*, from_result: bool = False):
     """Write a datasource and its manifest Connector in one transaction.
 
     The datasource API writes the row; this writes the row's Connector
-    resource after it (``manifest_connectors.persist_connector_resource``),
-    in the same ``transaction_scope``, so a failure in either half rolls both
-    back. The catalog lock comes first, the order every manifest write and
+    resource and its secret after it
+    (``manifest_connectors.persist_connector_resource``), in the same
+    ``transaction_scope``, so a failure in either half rolls both back. The catalog lock comes first, the order every manifest write and
     execution admission takes it in, so a write never waits for the catalog
     while holding a row lock another catalog holder needs. The datasource is
     the method's ``datasource_id`` argument, or with ``from_result`` the id

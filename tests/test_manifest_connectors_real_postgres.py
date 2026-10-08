@@ -395,7 +395,11 @@ async def test_the_migrations_and_the_backfill_map_every_stored_row(legacy_datab
         assert document["metadata"]["annotations"][DISPLAY_NAME] == row["name"]
         assert document["spec"]["driver"] == driver, label
         assert document["spec"].get("access") == access, label
-        assert "credentials" not in document["spec"]
+        # Since D3b the spec names its secret's keys, never their values.
+        secret_name = "connector-" + datasource_id.replace("-", "")
+        assert {
+            ref["secretRef"]["name"] for ref in document["spec"]["credentials"].values()
+        } <= {secret_name}, label
         assert resource["platform_managed"] == key, label
         assert row["managed_key"] == key, label
         assert str(row["manifest_resource_id"]) == datasource_id

@@ -311,7 +311,7 @@ class ManifestExecutionService:
         return job["id"]
 
     async def secret(self, ref, authority, *, materialize):
-        await authority.secret(ref["scope"])
+        await authority.secret(ref["scope"], name=ref["name"])
         row = await self.db.fetchrow(
             "SELECT ciphertext,keys FROM srw_resource_secrets WHERE scope_kind=$1 AND scope_name=$2 AND name=$3",
             ref["scope"]["kind"],

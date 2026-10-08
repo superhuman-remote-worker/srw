@@ -20,7 +20,10 @@ from orchestrator.services.connector_drivers.base import (
     ConnectorDraft,
     DatasourceDriver,
     NormalizedConnector,
+    SecretLeaf,
     ValidationContext,
+    string_leaves,
+    top_level_leaves,
 )
 from shared.connectors.builtin import CREDENTIALS_SPEC, GENERIC_SPEC
 from shared.credential_connectors import normalize_credential_env
@@ -34,6 +37,13 @@ class EnvironmentDriver(DatasourceDriver):
 
     def retrieval_messages(self, row: Mapping[str, Any]) -> list[str]:
         return knowledge_note.environment_phrases(row)
+
+    def secret_leaves(self, credentials: Mapping[str, Any]) -> list[SecretLeaf]:
+        """Each variable as ``env.<NAME>``; any other top-level string a
+        ``generic`` row stores under its own name."""
+        return string_leaves(
+            credentials.get("env_vars"), ("env_vars",), lambda name: f"env.{name}"
+        ) + top_level_leaves(credentials)
 
 
 class GenericDriver(EnvironmentDriver):

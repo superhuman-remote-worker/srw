@@ -82,6 +82,10 @@ class JobDatasourceSelectionDependencies:
     revalidate_selection: Callable[
         [dict[str, Any]], Awaitable[tuple[list[str], dict[str, int]]]
     ]
+    #: Reads each authorized row's credentials from its Connector's resource
+    #: secret, in place (``connector_secrets.read_connector_credentials``);
+    #: ``None`` delivers the row's own.
+    connector_credentials: Callable[..., Awaitable[None]] | None = None
 
 
 def shell_connector_names(datasources: Any, workspace_backend: str | None) -> list[str]:
@@ -300,13 +304,21 @@ async def resolve_authorized_job_datasources(
     *,
     dependencies: JobDatasourceSelectionDependencies,
 ) -> list[dict[str, Any]]:
-    """Authorize and exactly resolve a job's immutable connector snapshot."""
+    """Authorize and exactly resolve a job's immutable connector snapshot.
+
+    The credentials come from each Connector's resource secret, which the
+    connector policy has just authorized this job to use (decision 11), or
+    from the row where the resource has none yet.
+    """
     selected, policy_revisions = await dependencies.revalidate_selection(job)
     resolved = await dependencies.store.resolve_datasources_for_job(
         str(job["id"]),
         project_id=(str(job["project_id"]) if job.get("project_id") else None),
     )
-    return require_exact_datasource_resolution(selected, policy_revisions, resolved)
+    rows = require_exact_datasource_resolution(selected, policy_revisions, resolved)
+    if dependencies.connector_credentials is not None:
+        await dependencies.connector_credentials(rows, authorized=selected)
+    return rows
 
 
 async def revalidate_job_datasource_ids(

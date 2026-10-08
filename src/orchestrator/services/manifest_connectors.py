@@ -1,4 +1,5 @@
-"""Datasources written through to manifest Connector resources (slice D3a).
+"""Datasources written through to manifest Connector resources (slices D3a
+and D3b).
 
 Datasources become Connectors on the Expert precedent
 (``manifest_experts``), with one difference: the ``datasources`` row cannot
@@ -37,8 +38,14 @@ The mapping (connector_drivers.md, "Datasources become Connectors"):
   pasted command line), and so does the ``native_project_id`` marker: the
   resource carries the row's managed key in ``srw_resources.platform_managed``;
 * ``spec.access`` is ``ReadOnly`` when the row is ``read_only``;
-* there is no ``spec.credentials``: the secrets stay encrypted on the row
-  until slice D3b moves them into the Connector's resource secret.
+* ``spec.credentials`` names the keys of the Connector's resource secret,
+  ``connector-<32 hex of the id>`` in the Connector's scope, which holds the
+  row's secrets flattened per driver slot and its full connection URL
+  (``connector_secrets``, slice D3b).  The row keeps its encrypted copy for
+  rollback; a delivery and Test read the secret and fall back to the row.
+
+The secret is written with the resource, in the same transaction, moves with
+it when its scope changes, and is deleted when it is retired.
 
 Sharing (``is_global``, ``scope_mode``, project links, ``auto_attach``) is
 never written to a resource.  Nothing here writes ``policy_revision`` or
@@ -56,6 +63,14 @@ from typing import Any, Mapping
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from orchestrator.services.connector_secrets import (
+    STALE_SECRETS,
+    connector_secret_name,
+    credential_refs,
+    drop_connector_secret,
+    secret_values,
+    write_connector_secret,
+)
 from orchestrator.services.manifest_store import ManifestStore, decoded, resource_key
 from shared.connectors.platform import (
     NATIVE_PROJECT_CONFIG_KEY,
@@ -83,13 +98,21 @@ BACKFILL_BATCH = 50
 #: is its transaction's start time, which can be *earlier* than the last sync
 #: (an older replica's transaction began first, waited for the row lock, and
 #: committed after the write-through), so the test is inequality, never
-#: "newer". Legacy job clones are never Connectors and are not looked at.
+#: "newer". A resource written before D3b (no ``spec.credentials``), or one
+#: whose secret is missing, needs its secret. Legacy job clones are never
+#: Connectors and are not looked at.
 _NEEDS_WORK = """
 SELECT d.id FROM datasources d LEFT JOIN srw_resources r ON r.id = d.id
 WHERE d.id > $1 AND d.job_id IS NULL
   AND (d.manifest_resource_id IS NULL OR r.id IS NULL
        OR r.deleted_at IS NOT NULL
-       OR r.linked_updated_at IS DISTINCT FROM d.updated_at)
+       OR r.linked_updated_at IS DISTINCT FROM d.updated_at
+       OR NOT (r.document->'spec' ? 'credentials')
+       OR (r.document->'spec'->'credentials' <> '{}'::jsonb
+           AND NOT EXISTS (
+               SELECT 1 FROM srw_resource_secrets s
+               WHERE s.scope_kind = r.scope_kind AND s.scope_name = r.scope_name
+                 AND s.name = 'connector-' || replace(r.id::text, '-', ''))))
 ORDER BY d.id
 LIMIT $2
 """
@@ -201,11 +224,14 @@ def connector_document(
     credential_config: Mapping[str, Any],
     existing: Mapping[str, Any] | None = None,
     declared: frozenset[str] = frozenset({"endpoint", "default_branch"}),
+    credentials: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The Connector document of a row.
 
     ``existing`` is the resource's current document: its name stays (the
     identity), its other metadata is kept, and the spec is the row's.
+    ``credentials`` is the spec's references to the Connector's secret
+    (``connector_secrets.credential_refs``).
     """
     if existing is not None:
         document = deepcopy(dict(existing))
@@ -224,6 +250,8 @@ def connector_document(
         "driver": driver,
         "config": connector_config(row, credential_config, declared=declared),
     }
+    if credentials is not None:
+        spec["credentials"] = deepcopy(dict(credentials))
     if row.get("read_only") is True:
         spec["access"] = "ReadOnly"
     document["spec"] = spec
@@ -269,7 +297,7 @@ async def _own_resource(db, datasource_id: UUID) -> dict[str, Any] | None:
 
 async def _retire(db, resource: Mapping[str, Any] | None) -> bool:
     """Soft-delete a deleted row's live resource, without the
-    execution-retirement wait.
+    execution-retirement wait, and delete its secret.
 
     Executions record their connectors by datasource id, never as resource
     dependencies, so nothing waits on a Connector (decision 12): a session
@@ -277,6 +305,9 @@ async def _retire(db, resource: Mapping[str, Any] | None) -> bool:
     """
     if resource is None or resource.get("deleted_at") is not None:
         return False
+    await drop_connector_secret(
+        db, resource["id"], resource["document"]["metadata"]["scope"]
+    )
     await db.execute(
         "UPDATE srw_resources SET deleted_at=now(),updated_at=now(),"
         "resource_version=resource_version+1 WHERE id=$1",
@@ -311,12 +342,14 @@ async def _free_name(store: ManifestStore, row, scope, name: str, uid: UUID) -> 
 
 
 async def persist_connector_resource(db, datasource_id: Any, *, registry=None) -> str:
-    """Write a row's Connector resource from the row; return what happened.
+    """Write a row's Connector resource and its secret from the row; return
+    what happened.
 
     Call inside ``transaction_scope``: a failure here rolls the datasource
-    write back with it.  Outcomes: ``created``, ``updated``, ``unchanged``,
-    ``legacy`` (no resource for this row) and ``deleted`` (the row is gone;
-    its resource is retired).
+    write back with it.  Outcomes: ``created``, ``updated`` (the resource or
+    its secret changed), ``unchanged``, ``legacy`` (no resource for this
+    row) and ``deleted`` (the row is gone; its resource is retired and its
+    secret deleted).
     """
     uid = UUID(str(datasource_id))
     store = ManifestStore(db)
@@ -341,6 +374,7 @@ async def persist_connector_resource(db, datasource_id: Any, *, registry=None) -
     credentials = credentials if isinstance(credentials, Mapping) else {}
     driver_name = driver.resource_driver(credentials)
     named = drivers.get(driver_name)
+    secret = secret_values(driver, row)
     document = connector_document(
         row,
         scope=scope,
@@ -348,6 +382,7 @@ async def persist_connector_resource(db, datasource_id: Any, *, registry=None) -
         credential_config=driver.credential_config(credentials),
         existing=live["document"] if live else None,
         declared=declared_config(named.spec if named else driver.spec),
+        credentials=credential_refs(connector_secret_name(uid), secret),
     )
     metadata = document["metadata"]
     metadata["name"] = await _free_name(store, row, scope, metadata["name"], uid)
@@ -362,6 +397,10 @@ async def persist_connector_resource(db, datasource_id: Any, *, registry=None) -
         or resource_key(current["document"]) != resource_key(document)
     )
     if relocated:
+        # The secret follows the resource into its new scope.
+        old_scope = current["document"]["metadata"]["scope"]
+        if dict(old_scope) != dict(scope):
+            await drop_connector_secret(db, uid, old_scope)
         current = await _relocate(db, store, current, document, owner_id, project_id)
     resolved = preview_documents([document])["resolved"][0]
     await store.lock_identity(document)
@@ -376,6 +415,9 @@ async def persist_connector_resource(db, datasource_id: Any, *, registry=None) -
         uid=uid,
         expected_version=current["resource_version"] if current else None,
         platform_managed=key,
+    )
+    secret_changed = await write_connector_secret(
+        db, uid, scope, owner_id=owner_id, values=secret
     )
     if resource.get("platform_managed") != key:
         # A row that became platform-owned after its resource was written
@@ -414,7 +456,7 @@ async def persist_connector_resource(db, datasource_id: Any, *, registry=None) -
     )
     if current is None:
         return "created"
-    return "updated" if changed or relocated else "unchanged"
+    return "updated" if changed or relocated or secret_changed else "unchanged"
 
 
 async def _relocate(db, store, current, document, owner_id, project_id):
@@ -450,16 +492,19 @@ async def _relocate(db, store, current, document, owner_id, project_id):
 async def migrate_stored_connectors(
     db, *, registry=None, batch_size: int = BACKFILL_BATCH
 ) -> dict[str, int]:
-    """Write the Connector of every row that needs one; idempotent.
+    """Write the Connector and its secret of every row that needs them;
+    idempotent.
 
     Runs at startup between ``migrate_stored_experts`` and
     ``migrate_projects``, on every replica.  It only touches rows whose
-    resource is missing, retired or written from another version of the row
-    (``_NEEDS_WORK``), in
+    resource is missing, retired, written from another version of the row
+    or without its secret (``_NEEDS_WORK``), in
     batches of ``batch_size``, each its own transaction under the catalog
     lock with one savepoint per row.  That also reconciles what an older
     orchestrator wrote without the write-through during a rollout.  Then one
-    statement retires the resources whose row is gone.  A row that cannot be
+    statement retires the resources whose row is gone, and another deletes
+    the secrets of retired Connectors and those left in a scope a Connector
+    moved out of.  A row that cannot be
     written is logged and left for the next start; it does not stop this one.
     Rows on the legacy path are looked at again on every start: they have no
     resource to be in step with.
@@ -500,7 +545,11 @@ async def migrate_stored_connectors(
                  AND NOT EXISTS (SELECT 1 FROM datasources d WHERE d.id=r.linked_id)""",
             KIND,
         )
+        # Their secrets, and any a write without D3b left behind.
+        stale = await db.execute(STALE_SECRETS)
     counts["deleted"] += int(retired.split()[-1])
+    if stale != "DELETE 0":
+        logger.info("Connector resources: dropped stale secrets (%s)", stale)
     if counts["deferred"]:
         logger.error("Connector resources: %s", counts)
     else:

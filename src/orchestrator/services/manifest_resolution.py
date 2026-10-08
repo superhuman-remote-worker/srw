@@ -190,19 +190,33 @@ class LiveManifestResolver:
         )
         dependencies.extend(deepcopy(row["dependencies"]))
         # Recheck credential scope/key existence today, even for an old revision.
+        # A datasource's Connector lends its secret by the connector policy,
+        # for work in the selecting resource's project (decision 11).
+        linked = kind == "Connector" and row.get("linked_id")
         return {
             "inline": await self.spec(
-                kind, deepcopy(row["resolved"]["spec"]), ref["scope"], dependencies
+                kind,
+                deepcopy(row["resolved"]["spec"]),
+                ref["scope"],
+                dependencies,
+                connector=row if linked else None,
+                project_ids=[scope["name"]] if scope["kind"] == "Project" else [],
             )
         }
 
-    async def secret_values(self, values, scope):
+    async def secret_values(self, values, scope, *, connector=None, project_ids=()):
         for value in values.values():
             if not isinstance(value, dict) or "secretRef" not in value:
                 continue
             ref = value["secretRef"]
-            ref["scope"] = await self.scope(ref.get("scope", scope))
-            await self.authority.secret(ref["scope"])
+            if connector is None:
+                ref["scope"] = await self.scope(ref.get("scope", scope))
+                await self.authority.secret(ref["scope"], name=ref["name"])
+            else:
+                ref["scope"] = deepcopy(ref.get("scope", scope))
+                await self.authority.connector_secret(
+                    ref, connector, project_ids=project_ids
+                )
             row = await self.store.db.fetchrow(
                 "SELECT id,version,keys FROM srw_resource_secrets WHERE scope_kind=$1 AND scope_name=$2 AND name=$3",
                 ref["scope"]["kind"],
@@ -246,11 +260,26 @@ class LiveManifestResolver:
         dependencies.extend(deepcopy(active["dependencies"]))
         return deepcopy(active["resolved"]["spec"])
 
-    async def spec(self, kind, spec, scope, dependencies, *, project_id=None):
+    async def spec(
+        self,
+        kind,
+        spec,
+        scope,
+        dependencies,
+        *,
+        project_id=None,
+        connector=None,
+        project_ids=(),
+    ):
         if kind == "Expert":
             await self.secret_values(spec["runtime"].get("env", {}), scope)
         elif kind == "Connector":
-            await self.secret_values(spec.get("credentials", {}), scope)
+            await self.secret_values(
+                spec.get("credentials", {}),
+                scope,
+                connector=connector,
+                project_ids=project_ids,
+            )
         elif kind == "WorkspaceTemplate":
             if "network" in spec:
                 ref = spec["network"]["profileRef"]

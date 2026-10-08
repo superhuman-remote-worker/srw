@@ -24,6 +24,7 @@ from orchestrator.services.connector_drivers.base import (
     CheckContext,
     ConnectorDraft,
     NormalizedConnector,
+    SecretLeaf,
     ValidationContext,
     payload_entry,
 )
@@ -44,6 +45,9 @@ class SshKeyDriver(WorkspaceSshDriver):
 
     def credential_config(self, credentials: Mapping[str, Any]) -> dict[str, Any]:
         return self.credential_file_targets(credentials)
+
+    def secret_leaves(self, credentials: Mapping[str, Any]) -> list[SecretLeaf]:
+        return self.credential_file_leaves(credentials)
 
     def _normalize_files(
         self, name: str, credentials: dict[str, Any] | None

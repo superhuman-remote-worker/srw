@@ -29,10 +29,12 @@ from orchestrator.services.connector_drivers.base import (
     ConnectorDraft,
     DatasourceDriver,
     NormalizedConnector,
+    SecretLeaf,
     ValidationContext,
     auth_method_config,
     payload_entry,
     probe_failure,
+    top_level_leaves,
 )
 from orchestrator.services.datasource_config import (
     normalize_kb_config,
@@ -153,6 +155,9 @@ class KnowledgeBaseDriver(DatasourceDriver):
     def credential_config(self, credentials: Mapping[str, Any]) -> dict[str, Any]:
         """The auth method; the token and the key stay secret."""
         return auth_method_config(credentials)
+
+    def secret_leaves(self, credentials: Mapping[str, Any]) -> list[SecretLeaf]:
+        return top_level_leaves(credentials, ("token", "ssh_key"))
 
     def bind(
         self, row: Mapping[str, Any], credentials: Any, *, ctx: BindContext

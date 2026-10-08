@@ -10,6 +10,13 @@ from orchestrator.security.access import (
     _scope_permits_project,
     mcp_scope_project_id,
 )
+from orchestrator.services.connector_secrets import (
+    CATALOG_SECRET_DETAIL,
+    FOREIGN_CONNECTOR_SECRET_DETAIL,
+    connector_policy_authorizes,
+    is_connector_secret_name,
+    is_own_connector_secret,
+)
 from orchestrator.services.project_status import project_is_archived
 
 
@@ -122,10 +129,40 @@ class ManifestAuthority:
         else:
             await self.scope(row["document"]["metadata"]["scope"], write=write)
 
-    async def secret(self, scope):
+    async def secret(self, scope, *, name=None):
+        """Authority to attach the secret ``name`` in ``scope`` to a process.
+
+        A Connector's own secret (``connector-<32 hex>``) is never lent this
+        way: only its Connector uses it (:meth:`connector_secret`), so a
+        reference from another resource cannot bypass the connector policy
+        or carry a credential the connector's driver never forwards.
+        """
         if scope["kind"] == "Catalog":
-            await self.deny(
-                "Shared catalog definitions cannot distribute catalog credentials."
-            )
+            await self.deny(CATALOG_SECRET_DETAIL)
+        if is_connector_secret_name(name):
+            await self.deny(FOREIGN_CONNECTOR_SECRET_DETAIL)
         # Reading the manifest is weaker than attaching credentials to a process.
         return await self.scope(scope, write=True)
+
+    async def connector_secret(self, ref, connector, *, project_ids=()):
+        """Authority to use a linked Connector's own credentials (decision 11).
+
+        A connector shared with other users (public, or linked to their
+        project) lends its creator's credentials to their executions, as a
+        datasource always did.  So when ``ref`` names ``connector``'s own
+        resource secret, in the Connector's own scope, the connector policy
+        decides: the secret is usable by work in ``project_ids`` the policy
+        authorizes this caller to attach the connector to, although the
+        caller cannot write the secret's scope.  Otherwise the ordinary
+        rule (:meth:`secret`) decides, so the owner and an administrator
+        keep their access.  A Catalog secret is refused either way.
+        """
+        scope = ref["scope"]
+        if scope["kind"] == "Catalog":
+            await self.deny(CATALOG_SECRET_DETAIL)
+        own = is_own_connector_secret(ref, connector)
+        if own and await connector_policy_authorizes(
+            self.db, self.user, connector["linked_id"], project_ids
+        ):
+            return dict(scope)
+        return await self.secret(scope, name=None if own else ref.get("name"))

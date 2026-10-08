@@ -26,6 +26,7 @@ from orchestrator.services import (
     agent_datasource_payload,
     agent_toolset_probe,
     config_resolver,
+    connector_secrets,
     container_provisioner as container_provisioner_module,
     deployment_gates,
     dispatch_credentials,
@@ -373,6 +374,11 @@ def job_datasource_selection_dependencies(
         backend_from_override=workspace_tier_policy.backend_from_override,
         revalidate_selection=bound(
             job_datasource_selection.revalidate_job_datasource_selection,
+            job_datasource_selection_dependencies,
+            resources,
+        ),
+        connector_credentials=bound(
+            connector_secrets.read_connector_credentials,
             job_datasource_selection_dependencies,
             resources,
         ),

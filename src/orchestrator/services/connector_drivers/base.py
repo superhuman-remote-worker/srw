@@ -13,9 +13,12 @@ The orchestrator asks a driver of a stored connector type four things:
 
 ``revoke`` retires what a binding delivered; nothing a built-in driver
 delivers outlives the execution, so it is a no-op for all of them.
-``resource_driver`` and ``credential_config`` describe a stored row as its
-manifest Connector resource (``orchestrator.services.manifest_connectors``):
-the driver name it stores and which credential fields are not secret.  Optional
+``resource_driver``, ``credential_config`` and ``secret_leaves`` describe a
+stored row as its manifest Connector resource
+(``orchestrator.services.manifest_connectors``): the driver name it stores,
+which credential fields are not secret, and the key each secret is kept
+under in the Connector's resource secret
+(``orchestrator.services.connector_secrets``).  Optional
 capabilities are protocols checked with ``isinstance``, as in
 ``services/cloud/base.py``.
 
@@ -48,6 +51,10 @@ NO_CONFIG_DETAIL = (
 )
 #: A credential file's non-secret fields; ``contents`` is the secret.
 _FILE_TARGET_KEYS = ("name", "target_path", "mode", "env_var")
+#: Where one secret value sits in a stored credentials object (a path of
+#: object keys and list indexes) and the key it is kept under in the
+#: Connector's resource secret.
+SecretLeaf = tuple[tuple[str | int, ...], str]
 
 
 @dataclass(frozen=True)
@@ -141,6 +148,36 @@ class BindContext:
     logger: logging.Logger
     #: The deployment's default SSH host-key pins (known_hosts text).
     default_known_hosts: str
+
+
+def string_leaves(
+    value: Any, path: tuple[str | int, ...], key: Callable[[str | int], str]
+) -> list[SecretLeaf]:
+    """The string members of an object or a list at ``path``, each kept
+    under ``key(member)``; anything else there is skipped."""
+    if isinstance(value, Mapping):
+        members: Any = value.items()
+    elif isinstance(value, list):
+        members = enumerate(value)
+    else:
+        return []
+    return [
+        ((*path, member), key(member))
+        for member, item in members
+        if isinstance(item, str)
+    ]
+
+
+def top_level_leaves(
+    credentials: Mapping[str, Any], names: tuple[str, ...] | None = None
+) -> list[SecretLeaf]:
+    """Top-level string fields kept under their own names: ``names`` only,
+    or every one when ``names`` is ``None``."""
+    return [
+        ((name,), name)
+        for name, value in credentials.items()
+        if isinstance(value, str) and (names is None or name in names)
+    ]
 
 
 def auth_method_config(credentials: Mapping[str, Any]) -> dict[str, Any]:
@@ -310,11 +347,25 @@ class DatasourceDriver:
     def credential_config(self, credentials: Mapping[str, Any]) -> dict[str, Any]:
         """The non-secret parts of stored credentials, as Connector config.
 
-        Whatever this leaves out counts as secret: it stays on the row, and
-        slice D3b moves it into the Connector's resource secret.  The default
+        Whatever this leaves out counts as secret: it goes into the
+        Connector's resource secret (:meth:`secret_leaves`).  The default
         keeps nothing.
         """
         return {}
+
+    def secret_leaves(self, credentials: Mapping[str, Any]) -> list[SecretLeaf]:
+        """Where the secrets of stored credentials are, flattened per slot.
+
+        Each leaf is a string value's path and the key it is kept under in
+        the Connector's resource secret (``token``, ``env.<NAME>``,
+        ``header.<Name>``, ``file.<n>``, ...).  Only string values move;
+        the rest of the object (its non-secret structure, and any value a
+        driver names no key for) is kept whole beside them, so the stored
+        object is rebuilt exactly (``connector_secrets``).  The default
+        names every top-level string field under its own name: a login's
+        ``username`` and ``password``, a probe's ``secret``.
+        """
+        return top_level_leaves(credentials)
 
     # -- helpers shared by the built-in drivers -----------------------------
 
@@ -335,6 +386,18 @@ class DatasourceDriver:
                 if isinstance(entry, Mapping)
             ]
         }
+
+    @staticmethod
+    def credential_file_leaves(credentials: Mapping[str, Any]) -> list[SecretLeaf]:
+        """Each stored credential file's contents, kept as ``file.<n>``."""
+        files = credentials.get("files")
+        if not isinstance(files, list):
+            return []
+        return [
+            (("files", index, "contents"), f"file.{index}")
+            for index, entry in enumerate(files)
+            if isinstance(entry, Mapping) and isinstance(entry.get("contents"), str)
+        ]
 
     @staticmethod
     def no_config(

@@ -8,6 +8,10 @@ from fastapi import HTTPException
 
 from orchestrator.security.config_redaction import redact_public_config_override
 from orchestrator.security.crypto import encrypt
+from orchestrator.services.connector_secrets import (
+    CONNECTOR_SECRET_DETAIL,
+    is_connector_secret_name,
+)
 from orchestrator.services.datasource_policy_errors import (
     DatasourceMaterializationAuthorizationError,
     DatasourceProjectAuthorizationError,
@@ -470,6 +474,10 @@ class ManifestResourceService:
         authority = ManifestAuthority(self.db, user, request=request)
         scope = await authority.scope(scope, write=True)
         await authority.secret(scope)
+        if is_connector_secret_name(name):
+            # A Connector's secret is written with its datasource row, and
+            # must stay what that row holds (connector_secrets).
+            raise HTTPException(409, CONNECTOR_SECRET_DETAIL)
         async with self.db.transaction_scope():
             await self.store.lock_catalog()
             old = await self.db.fetchrow(
