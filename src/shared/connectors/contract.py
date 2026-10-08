@@ -67,6 +67,7 @@ DRIVER_NAME_PATTERN = r"^[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)+/v[1-9][0-9]*$"
 _DRIVER_NAME = re.compile(DRIVER_NAME_PATTERN)
 _PROTOCOL = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 _EGRESS_PROTOCOLS = frozenset({"tcp", "udp"})
+_FIELD_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +98,9 @@ class CredentialSlot:
     workspace (an environment file, a file, or a key in its ssh-agent), or
     ``None`` when it never does (SRW or the agent process holds it).  ``update`` is
     how an edit treats the stored value: a blank edit keeps it, a merge adds
-    keys, a replace swaps the whole object.
+    keys, a replace swaps the whole object.  ``names_field``, when set, is the
+    field a connector read shows the slot's key names under (never their
+    values), so an editor can tell what a merge adds to.
     """
 
     name: str
@@ -108,6 +111,7 @@ class CredentialSlot:
     access_levels: tuple[str, ...] = ()
     delivery: CredentialDelivery | None = None
     update: CredentialUpdate = "keep_if_blank"
+    names_field: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,6 +314,8 @@ def _slot_problems(spec: DriverSpec) -> list[str]:
             problems.append(f"slot {slot.name!r} update {slot.update!r} is invalid")
         if not isinstance(slot.schema, Mapping):
             problems.append(f"slot {slot.name!r} schema must be an object")
+        if slot.names_field is not None and not _FIELD_NAME.fullmatch(slot.names_field):
+            problems.append(f"slot {slot.name!r} names_field is not a field name")
         unknown = sorted(set(slot.access_levels) - level_ids)
         if unknown:
             problems.append(f"slot {slot.name!r} names unknown access levels {unknown}")

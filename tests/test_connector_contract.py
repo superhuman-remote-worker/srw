@@ -45,7 +45,18 @@ from shared.connectors import (
     validate_spec,
 )
 from shared.connectors.binding import VALUE_FIELDS
-from shared.connectors.builtin import FORGES, GENERIC_SPEC, legacy_types_with_form
+from shared.connectors.builtin import (
+    FORGES,
+    GENERIC_SPEC,
+    delivers_in,
+    legacy_types_where,
+    legacy_types_with_config_key,
+    legacy_types_with_form,
+    needs_knowledge_profile,
+    spec_for_row,
+    tool_categories,
+    tool_map,
+)
 from shared.connectors.contract import WORKSPACE_BACKENDS
 
 _PACKAGE = Path(__file__).resolve().parents[1] / "src" / "shared" / "connectors"
@@ -159,6 +170,101 @@ class TestValidateSpec:
     )
     def test_refuses_malformed_names(self, name):
         assert validate_spec(replace(GENERIC_SPEC, name=name))
+
+    def test_a_slot_names_field_must_be_a_field_name(self):
+        slot = GENERIC_SPEC.credential_slots[0]
+        for good in ("env_var_names", None):
+            spec = replace(
+                GENERIC_SPEC, credential_slots=(replace(slot, names_field=good),)
+            )
+            assert validate_spec(spec) == []
+        spec = replace(
+            GENERIC_SPEC, credential_slots=(replace(slot, names_field="Env Names"),)
+        )
+        assert "names_field is not a field name" in "\n".join(validate_spec(spec))
+
+
+# =============================================================================
+# What other code asks the specs (slice D1c)
+# =============================================================================
+
+
+class _Record:
+    """A database record: ``get`` without being a ``Mapping``."""
+
+    def __init__(self, **values):
+        self._values = values
+
+    def get(self, key, default=None):
+        return self._values.get(key, default)
+
+
+class TestSpecQueries:
+    @pytest.mark.parametrize(
+        ("row", "name"),
+        [
+            ({"type": "kb"}, "srw.kb/v1"),
+            ({"type": "Repository"}, "srw.repository/v1"),
+            (_Record(type="ssh_key"), "srw.ssh-key/v1"),
+            ({"type": "ftp"}, None),
+            ({}, None),
+            (None, None),
+            ("kb", None),
+        ],
+    )
+    def test_spec_for_row(self, row, name):
+        spec = spec_for_row(row)
+        assert (spec.name if spec else None) == name
+
+    def test_only_the_repository_checks_out(self):
+        assert {
+            spec.legacy_type
+            for spec in DATASOURCE_SPECS
+            if delivers_in({"type": spec.legacy_type}, "checkout")
+        } == {"repository"}
+        assert not delivers_in(None, "checkout")
+
+    def test_only_the_kb_needs_the_knowledge_profile(self):
+        assert {
+            spec.legacy_type
+            for spec in DATASOURCE_SPECS
+            if needs_knowledge_profile({"type": spec.legacy_type})
+        } == {"kb"}
+        assert needs_knowledge_profile({"type": "KB"})
+        assert not needs_knowledge_profile({"type": "ftp"})
+
+    def test_the_behaviour_flags_name_the_types_they_replaced(self):
+        assert legacy_types_where(lambda s: s.live_detach == "refused") == {
+            "credentials"
+        }
+        assert legacy_types_where(lambda s: not s.delete_while_attached) == {
+            "credentials"
+        }
+        assert legacy_types_where(lambda s: s.forced_read_only) == {"kb"}
+        assert legacy_types_with_config_key("unattended_send") == {"email"}
+        assert legacy_types_with_config_key("nothing-declares-this") == frozenset()
+
+    def test_only_the_credentials_environment_shows_its_names(self):
+        assert {
+            (spec.legacy_type, slot.name, slot.names_field)
+            for spec in DATASOURCE_SPECS
+            for slot in spec.credential_slots
+            if slot.names_field
+        } == {("credentials", "env_vars", "env_var_names")}
+
+    def test_tool_categories_follow_the_tool_map(self):
+        assert tool_categories() == tuple(
+            entry["category"] for entry in tool_map().values()
+        )
+        assert set(tool_categories()) == {
+            "sql",
+            "mongodb",
+            "graph",
+            "webdav",
+            "email",
+            "mcp",
+            "repo",
+        }
 
 
 # =============================================================================

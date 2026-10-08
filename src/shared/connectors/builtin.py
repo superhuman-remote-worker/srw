@@ -14,7 +14,7 @@ really holds a level; ``advisory`` marks a level only told to the agent.
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .contract import AccessLevel, CredentialKind, CredentialSlot, DriverSpec
 
@@ -205,6 +205,7 @@ CREDENTIALS_SPEC = DriverSpec(
             required=True,
             delivery="env",
             update="merge",
+            names_field="env_var_names",
         ),
     ),
     access_levels=_declared_only("environment"),
@@ -673,6 +674,50 @@ def spec_for_type(legacy_type: str | None) -> DriverSpec | None:
     return _BY_TYPE.get(legacy_type or "")
 
 
+def spec_for_row(row: Any) -> DriverSpec | None:
+    """The built-in spec serving a stored connector row or payload entry.
+
+    A row is anything with ``get`` (a dict, a database record).  Its
+    ``type`` is matched case-insensitively, as the type checks this replaces
+    did.  ``None`` for an unknown type or a value that is no row.
+    """
+    get = getattr(row, "get", None)
+    if not callable(get):
+        return None
+    return spec_for_type(str(get("type") or "").lower())
+
+
+def delivers_in(row: Any, form: str) -> bool:
+    """Whether a connector row's driver delivers in ``form`` (a checkout is
+    what a pull request is opened from)."""
+    spec = spec_for_row(row)
+    return spec is not None and form in spec.delivery_forms
+
+
+def needs_knowledge_profile(row: Any) -> bool:
+    """Whether a connector row's driver needs the system KB embedding profile
+    delivered with the work it is attached to."""
+    spec = spec_for_row(row)
+    return spec is not None and spec.needs_knowledge_profile
+
+
+def legacy_types_where(predicate: Callable[[DriverSpec], bool]) -> frozenset[str]:
+    """Stored types whose spec satisfies ``predicate``, for SQL that filters
+    rows by type."""
+    return frozenset(
+        spec.legacy_type
+        for spec in DATASOURCE_SPECS
+        if spec.legacy_type and predicate(spec)
+    )
+
+
+def legacy_types_with_config_key(key: str) -> frozenset[str]:
+    """Stored types whose config schema declares ``key``."""
+    return legacy_types_where(
+        lambda spec: key in (spec.config_schema.get("properties") or {})
+    )
+
+
 def legacy_types_with_slot(slot: str) -> frozenset[str]:
     """Stored types whose credentials have the named slot."""
     return frozenset(
@@ -722,3 +767,8 @@ def tool_map() -> dict[str, dict[str, Any]]:
         for spec in _TOOL_MAP_ORDER
         if spec.legacy_type
     }
+
+
+def tool_categories() -> tuple[str, ...]:
+    """The tool categories datasource drivers bind, in tool-map order."""
+    return tuple(entry["category"] for entry in tool_map().values())
