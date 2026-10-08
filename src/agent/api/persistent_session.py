@@ -3880,9 +3880,7 @@ class PersistentSession:
             or self.shell_manager is None
             or not callable(getattr(backend_for_cleanup, "retire", None))
         ):
-            raise WorkspaceUnavailableError(
-                "VM local drain lacks a strict shell/backend"
-            )
+            raise WorkspaceUnavailableError("VM local drain lacks a strict shell/backend")
 
         # Belt for partial-attach and non-standard cleanup call sites. The
         # ordinary app teardown invokes this before its journal closes; this
@@ -3988,8 +3986,7 @@ class PersistentSession:
                         self.cloud_mount_manager = None
 
         if (
-            self.shell_manager
-            and not preserve_shell
+            self.shell_manager and not preserve_shell
             and not (vm_actuator_handoff and self.terminal_vm_shell_drained)
         ):
             try:

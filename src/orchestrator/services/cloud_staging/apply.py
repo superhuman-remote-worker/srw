@@ -150,16 +150,23 @@ async def apply_staged_diff(
         )
     ):
         raise StagedApplyError(409, {"code": "staged_source_invalid"})
-    expected_backend_id = protected_provider(source.backend)
+    expected_backend_id: str | None = None
     try:
+        # A source whose provider offers no protected level refuses like an
+        # unavailable installation (409), never as an unhandled error.
+        expected_backend_id = protected_provider(source.backend)
         backend = main_cloud_router.for_backend_instance(
             source.backend_instance_id,
             expected_backend_id=expected_backend_id,
         )
     except Exception:
-        authority = await postgres_db.get_main_cloud_backend_instance(
-            source.backend_instance_id,
-            expected_backend_id=expected_backend_id,
+        authority = (
+            await postgres_db.get_main_cloud_backend_instance(
+                source.backend_instance_id,
+                expected_backend_id=expected_backend_id,
+            )
+            if expected_backend_id is not None
+            else None
         )
         if authority is None:
             raise StagedApplyError(
