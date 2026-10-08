@@ -288,3 +288,44 @@ def test_secrets_reach_the_cluster_only_on_stdin(monkeypatch):
     assert gate._scrub("x s3cret-pw y") == "x <redacted> y"
     for value in run.secrets.values():
         assert gate._scrub(value) == "<redacted>"
+
+
+def test_the_default_deny_probe_verdict_is_its_last_rounds():
+    raced = "\n".join(["canary=open"] * 3 + ["canary=closed"] * 9)
+    assert gate.parse_denyprobe(raced) is True
+    unenforced = "\n".join(["canary=closed"] * 2 + ["canary=open"] * 10)
+    assert gate.parse_denyprobe(unenforced) is False
+    flapping = "\n".join(["canary=closed"] * 10 + ["canary=open", "canary=closed"])
+    assert gate.parse_denyprobe(flapping) is False
+    with pytest.raises(gate.GateError):
+        gate.parse_denyprobe("canary=closed\n" * 3)
+
+
+def test_a_pod_that_never_gets_ready_is_diagnosed():
+    pod = {
+        "status": {
+            "phase": "Pending",
+            "initContainerStatuses": [
+                {
+                    "name": "canary-wait",
+                    "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                    "lastState": {"terminated": {"exitCode": 1}},
+                    "restartCount": 2,
+                },
+                {
+                    "name": "install-shim",
+                    "state": {"waiting": {"reason": "PodInitializing"}},
+                },
+            ],
+        }
+    }
+    log = (
+        "srw-driver-shim: canary 10.43.0.1:8085 is still reachable\n"
+        "srw-driver-shim: canary-wait: no 3 rounds ...: the default deny is not "
+        "enforced\n"
+    )
+    found = gate.pod_diagnosis(pod, log)
+    assert "phase=Pending" in found
+    assert "canary-wait=waiting/CrashLoopBackOff restarts=2 last-exit=1" in found
+    assert found.endswith("the default deny is not enforced")
+    assert gate.pod_diagnosis(None) == "no pod"

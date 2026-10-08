@@ -29,7 +29,10 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               for byte; hosting on with an exchange port, a digest-pinned shim
               image, the echo driver, a short idle time and the k3d registry
               reachable over HTTP; migrations 0360-0363 applied; the driver
-              namespace has Pod Security baseline and its static default deny
+              namespace has Pod Security baseline and its static default deny,
+              and the cluster enforces it: a busybox pod under that deny never
+              reaches the orchestrator's API port (without enforcement every
+              driver pod's canary wait refuses to start the driver)
   pod         session 1 binds A and B; A gets exactly one service pod in the
               driver namespace, ready, its canary wait passed (exit 0, "default
               deny enforced"), no ServiceAccount token (spec and in the pod),
@@ -492,6 +495,64 @@ done
 """
 
 
+# A busybox pod in the driver namespace, under its static default deny and
+# nothing else: it must not reach the orchestrator's API port. "open" is any
+# TCP answer (an HTTP status included), "closed" a refusal or a timeout. The
+# first rounds may race the policy's arrival (kube-router applies it after the
+# pod starts); the verdict is the last rounds.
+_DENYPROBE_SCRIPT = r"""
+for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  out=$(wget -q -T 3 -O /dev/null "http://$1:$2/" 2>&1)
+  if [ $? -eq 0 ] || echo "$out" | grep -q "server returned error"; then
+    echo canary=open
+  else
+    echo canary=closed
+  fi
+  sleep 2
+done
+"""
+DENYPROBE_SETTLED = 5
+
+
+def parse_denyprobe(log: str) -> bool:
+    """Whether the default deny held in the probe's last rounds."""
+    verdicts = [
+        line.split("=", 1)[1] for line in log.splitlines() if line.startswith("canary=")
+    ]
+    if len(verdicts) < DENYPROBE_SETTLED:
+        raise GateError("the default-deny probe printed too few verdicts")
+    return all(verdict == "closed" for verdict in verdicts[-DENYPROBE_SETTLED:])
+
+
+def pod_diagnosis(pod: dict | None, canary_log: str = "") -> str:
+    """Why a driver pod is not ready, from its status and canary log."""
+    if not pod:
+        return "no pod"
+    status = pod.get("status") or {}
+    parts = [f"phase={status.get('phase')}"]
+    for item in status.get("initContainerStatuses") or []:
+        state = item.get("state") or {}
+        last = (item.get("lastState") or {}).get("terminated") or {}
+        detail = next(iter(state), "?")
+        reason = (state.get(detail) or {}).get("reason") or ""
+        exit_code = (state.get("terminated") or {}).get("exitCode")
+        parts.append(
+            f"{item.get('name')}={detail}"
+            + (f"/{reason}" if reason else "")
+            + (f" exit={exit_code}" if exit_code is not None else "")
+            + (
+                f" restarts={item.get('restartCount')}"
+                if item.get("restartCount")
+                else ""
+            )
+            + (f" last-exit={last.get('exitCode')}" if last else "")
+        )
+    lines = [line for line in canary_log.splitlines() if line.strip()]
+    if lines:
+        parts.append(f"canary-wait log: {lines[-1].strip()[:300]}")
+    return "; ".join(parts)
+
+
 def parse_netprobe(log: str) -> bool:
     """Whether the probe reached the driver in its last round."""
     verdicts = [
@@ -696,6 +757,8 @@ class ServiceDriverGate:
         self.project: str | None = None
         self.probe_pod = f"{self.gate_id}-netprobe"
         self.probe_started = False
+        self.deny_probe = f"{self.gate_id}-denyprobe"
+        self.deny_probe_started = False
         self.images_pushed = False
         self.user_id = ""
         self.namespace = ""
@@ -856,14 +919,66 @@ class ServiceDriverGate:
             pod = self.driver_pod(live[0])
             return live[0] if pod and pod_ready(pod) else None
 
-        row = wait_for(
-            f"connector {label}'s pod ready",
-            probe,
-            timeout=self.args.start_timeout,
-            interval=5,
-        )
+        try:
+            row = wait_for(
+                f"connector {label}'s pod ready",
+                probe,
+                timeout=self.args.start_timeout,
+                interval=5,
+            )
+        except GateError as exc:
+            raise GateError(f"{exc} ({self.why_not_ready(label)})") from None
         self.pods[label] = row
         return row
+
+    def why_not_ready(self, label: str) -> str:
+        """The latest pod's state, its canary log and the recorded error."""
+        rows = self.identity_rows(label)
+        if not rows:
+            return "no driver identity was minted (no binding, or the image refused)"
+        row = rows[-1]
+        rc, log, _err = run(
+            self.kc + ["logs", row["pod_name"], "-c", "canary-wait", "--tail=5"],
+            timeout=60,
+        )
+        recorded = (
+            f"; stopped: {row['revoke_reason']} ({row['launch_error'] or 'no error'})"
+            if row["revoked"]
+            else ""
+        )
+        return pod_diagnosis(self.driver_pod(row), log if rc == 0 else "") + recorded
+
+    def default_deny_enforced(self) -> bool:
+        """A busybox pod under the driver namespace's default deny only."""
+        self.deny_probe_started = True
+        command(
+            self.kc
+            + ["run", self.deny_probe, "--image=busybox:1.36", "--restart=Never"]
+            + [f"--labels={GATE_LABEL}={self.gate_id}"]
+            + [
+                "--overrides",
+                json.dumps(
+                    {
+                        "spec": {
+                            "activeDeadlineSeconds": 180,
+                            "automountServiceAccountToken": False,
+                        }
+                    }
+                ),
+            ]
+            + ["--command", "--", "sh", "-c", _DENYPROBE_SCRIPT, "denyprobe"]
+            + [self.orchestrator_ip, "8085"]
+        )
+
+        def finished() -> bool:
+            phase = command(
+                self.kc
+                + ["get", "pod", self.deny_probe, "-o", "jsonpath={.status.phase}"]
+            )
+            return phase in ("Succeeded", "Failed")
+
+        wait_for("default-deny probe finished", finished, timeout=240, interval=5)
+        return parse_denyprobe(command(self.kc + ["logs", self.deny_probe]))
 
     # -- phases --------------------------------------------------------------
     def preflight(self) -> None:
@@ -972,6 +1087,20 @@ class ServiceDriverGate:
         )
         if not _IPV4_RE.fullmatch(self.orchestrator_ip):
             raise GateError("the orchestrator Service has no IPv4 ClusterIP")
+        enforced = self.default_deny_enforced()
+        self.report.check(
+            "preflight: the cluster enforces NetworkPolicy (a pod under the driver "
+            "namespace's default deny is refused the orchestrator's API port)",
+            enforced,
+            "enforced"
+            if enforced
+            else "reached: k3s's network policy controller enforces nothing. "
+            "After a k3d restart it may hold the node's old IP (k3s log "
+            "'Successfully retrieved node IP(s)' differs from the node's "
+            "InternalIP); restart the node: docker restart k3d-srw-server-0",
+        )
+        if not enforced:
+            raise GateError("NetworkPolicy is not enforced on this cluster")
         self.user_id = sql(
             f"SELECT id FROM users WHERE preferred_username = {lit(self.args.user)}"
         )
@@ -1488,6 +1617,16 @@ class ServiceDriverGate:
                     )
                 ),
             )
+        if self.deny_probe_started:
+            step(
+                "delete the default-deny probe pod",
+                lambda: command(
+                    self.kc
+                    + ["delete", "pod", self.deny_probe]
+                    + ["--ignore-not-found", "--wait=true", "--timeout=120s"]
+                )
+                is not None,
+            )
         if self.probe_started:
             step(
                 "delete network probe pod",
@@ -1605,6 +1744,23 @@ class ServiceDriverGate:
                 )
             except GateError:
                 left.append(f"pods {selector}")
+        if (
+            self.deny_probe_started
+            and json.loads(
+                command(
+                    self.kc
+                    + [
+                        "get",
+                        "pods",
+                        "-l",
+                        f"{GATE_LABEL}={self.gate_id}",
+                        "-o",
+                        "json",
+                    ]
+                )
+            )["items"]
+        ):
+            left.append(f"pods {GATE_LABEL}={self.gate_id} in {self.namespace}")
         return left
 
     # -- run -------------------------------------------------------------------
