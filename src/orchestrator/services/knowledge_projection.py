@@ -18,6 +18,8 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from shared.connectors.builtin import spec_for_type
+
 
 class KnowledgeGraphHandle:
     """App-owned lazy ``KnowledgeGraphDB`` singleton.
@@ -158,29 +160,33 @@ def build_repository_note(name: str, desc: str, ds: dict) -> str:
     return "\n".join(lines)
 
 
+#: What each managed-connection tool does, for the read-write KB note.
+_MANAGED_TOOL_HELP = {
+    "sql_query": "execute SELECT queries",
+    "sql_schema": "inspect tables, columns, types, constraints",
+    "sql_execute": "execute write statements (INSERT, UPDATE, DELETE, DDL)",
+    "cypher_query": "execute read-only Cypher queries",
+    "cypher_execute": "execute write Cypher statements (CREATE, MERGE, DELETE, SET)",
+    "get_database_schema": "inspect labels, relationships, properties",
+    "mongo_query": "document queries with filters",
+    "mongo_aggregate": "aggregation pipelines",
+    "mongo_schema": "collections, fields, indexes",
+    "mongo_insert": "insert documents",
+    "mongo_update": "update documents",
+}
+
+
 def build_managed_readwrite_note(name: str, desc: str, ds_type: str) -> str:
-    """KB entry for managed connectors in read-write mode: the read and write
-    tools the agent's connection serves (there is no CLI access)."""
-    tool_info = {
-        "postgresql": [
-            "- `sql_query` — execute SELECT queries",
-            "- `sql_schema` — inspect tables, columns, types, constraints",
-            "- `sql_execute` — execute write statements (INSERT, UPDATE, DELETE, DDL)",
-        ],
-        "neo4j": [
-            "- `cypher_query` — execute read-only Cypher queries",
-            "- `cypher_execute` — execute write Cypher statements (CREATE, MERGE, DELETE, SET)",
-            "- `get_database_schema` — inspect labels, relationships, properties",
-        ],
-        "mongodb": [
-            "- `mongo_query` — document queries with filters",
-            "- `mongo_aggregate` — aggregation pipelines",
-            "- `mongo_schema` — collections, fields, indexes",
-            "- `mongo_insert` — insert documents",
-            "- `mongo_update` — update documents",
-        ],
-    }
-    tools = tool_info.get(ds_type, ["- Check available tools for this connector type"])
+    """KB entry for managed connectors in read-write mode: the tools the
+    driver's ReadWrite level binds (there is no CLI access)."""
+    spec = spec_for_type(ds_type)
+    level = spec.access_level("ReadWrite") if spec else None
+    level_tools = level.tools if level and level.tools != "*" else ()
+    tools = [
+        f"- `{tool}` — {_MANAGED_TOOL_HELP[tool]}"
+        for tool in level_tools
+        if tool in _MANAGED_TOOL_HELP
+    ] or ["- Check available tools for this connector type"]
     lines = [
         f"## Connector: {name}",
         f"**Type:** {ds_type} | **Access:** read-write (tools)",
