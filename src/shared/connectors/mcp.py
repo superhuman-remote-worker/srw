@@ -15,9 +15,10 @@ A **stdio** image (D5b) runs unchanged behind SRW's **stdio bridge**
 front's image and which becomes the server container's command, with the
 image's own program as its arguments. A stdio server serves one client at a
 time, so the pod is shared but the bridge runs one process of the server per
-binding: started on the binding's first request, stopped when its lease ends
-(the front tells the bridge), when its session ends or when it is idle, at
-most ``max_bindings_per_pod`` at once. The front stays the authorization
+binding: started on the binding's first request, serving the binding's
+sessions one at a time (initialized once), stopped when its lease ends (the
+front tells the bridge), when it exits or when it is idle, at most
+``max_bindings_per_pod`` at once. The front stays the authorization
 boundary; the bridge forwards exactly the bytes the front checked.
 
 The block, ``ServiceSpec.mcp``, is plain JSON, so it can ride an image label:
