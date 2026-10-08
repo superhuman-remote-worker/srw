@@ -652,8 +652,9 @@ export function formValue(
   // sends none, keeping every stored secret, or re-enters them all: once a
   // credential is typed, the required slots are checked as on a create and
   // every secret in a slot in use is required, a blank one no longer keeping
-  // anything. Per-slot `update` rules (keep_if_blank, merge) wait for D3b,
-  // when the API applies them.
+  // anything. The built-in slots declare this as their `update` rule
+  // (`replace`, and `merge` for the `credentials` driver); no built-in slot
+  // keeps a blank field of an edit that sends others (`keep_if_blank`).
   const replacing =
     editing && model.slots.some(({slot, node}) => toValue(node, state.slots[slot.name]) !== undefined);
   const keepsSecrets = editing && !replacing;
