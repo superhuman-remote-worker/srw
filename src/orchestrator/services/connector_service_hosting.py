@@ -947,6 +947,15 @@ SELECT connector_id, driver, image_digest, job_id, thread_id, issued_at
  WHERE revoked_at IS NULL AND expires_at > now()
    AND image_digest IS NOT NULL AND driver = ANY($1::text[])
 """
+#: Whether a pod's key has a live binding now (an eviction candidate is read
+#: again just before it is stopped).
+_KEY_BOUND = """
+SELECT EXISTS (
+  SELECT 1 FROM connector_credential_leases
+   WHERE revoked_at IS NULL AND expires_at > now()
+     AND connector_id = $1 AND image_digest = $2
+)
+"""
 _POD_ROWS = """
 SELECT id, connector_id, driver, image_digest, credential_generation,
        image_reference, pod_namespace, pod_name, pod_uid, created_at, ready_at,
@@ -1076,6 +1085,34 @@ class ServiceHostingReconciler:
         await self._revoke(row, reason, error=error)
         report.stopped.append((str(row["id"]), reason))
         await self._remove(row, report)
+
+    async def _evict_one(self, connector_id: str, report: ReconcileReport) -> bool:
+        """At the installation's cap, stop the longest-idle pod no binding
+        uses, to make room for ``connector_id``'s. The candidates were read
+        at the start of the pass, so each one's key is read again first: a
+        binding issued since spares its pod. For a stdio managed MCP server
+        (D5b), whose bridge runs each binding's process in that pod, the
+        workspace that just bound it keeps it instead of waiting for a new
+        one."""
+        while self._evictable:
+            victim = self._evictable.pop(0)
+            async with self.store.acquire() as conn:
+                bound = await conn.fetchval(
+                    _KEY_BOUND,
+                    UUID(str(victim["connector_id"])),
+                    str(victim["image_digest"]),
+                )
+            if bound:
+                continue
+            logger.warning(
+                "At the installation's cap: stopping idle driver pod %s for "
+                "connector %s",
+                victim["pod_name"],
+                connector_id,
+            )
+            await self._stop(victim, IDLE_EVICTED, report)
+            return True
+        return False
 
     async def _remove(self, row: Mapping[str, Any], report: ReconcileReport) -> None:
         try:
@@ -1216,18 +1253,9 @@ class ServiceHostingReconciler:
                 spec, binding, generation, reference, replaces=replaces
             )
         except ServiceCapacityError as exc:
-            if replaces is None and self._evictable:
-                # Make room: stop the longest-idle pod no binding uses. Its
-                # row counts until its objects are gone, so the claim may
-                # succeed only on a later pass.
-                victim = self._evictable.pop(0)
-                logger.warning(
-                    "At the installation's cap: stopping idle driver pod %s for "
-                    "connector %s",
-                    victim["pod_name"],
-                    binding.connector_id,
-                )
-                await self._stop(victim, IDLE_EVICTED, report)
+            if replaces is None and await self._evict_one(binding.connector_id, report):
+                # Room made: the stopped pod's row counts until its objects
+                # are gone, so the claim may succeed only on a later pass.
                 try:
                     claimed = await self._claim(
                         spec, binding, generation, reference, replaces=replaces

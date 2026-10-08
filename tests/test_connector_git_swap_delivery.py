@@ -1306,6 +1306,8 @@ class TestReconciler:
         self, monkeypatch
     ):
         reconciler = _reconciler(PodState("Running"), max_installation=1)
+        # Each candidate's key is read again before it is stopped: unbound.
+        reconciler.store = _store(FakeConn())
         claims: list[str] = []
 
         async def claim(spec, binding, generation, reference, *, replaces=None):
@@ -1347,6 +1349,68 @@ class TestReconciler:
             report=report,
         )
         assert report.capacity == 1
+
+    @pytest.mark.asyncio
+    async def test_eviction_spares_a_pod_bound_since_the_pass_read_the_bindings(
+        self, monkeypatch
+    ):
+        # D5b: a managed MCP server's stdio bridge runs a process per
+        # binding, so a binding issued after the pass read the bindings
+        # spares its pod; the next candidate makes room instead.
+        reconciler = _reconciler(PodState("Running"), max_installation=1)
+        conn = FakeConn(values=[True, False])
+        reconciler.store = _store(conn)
+        stopped: list[str] = []
+
+        async def stop(row, reason, report, *, error=None):
+            stopped.append(row["pod_name"])
+
+        async def claim(spec, binding, generation, reference, *, replaces=None):
+            raise hosting.ServiceCapacityError("cap")
+
+        monkeypatch.setattr(reconciler, "_stop", stop)
+        monkeypatch.setattr(reconciler, "_claim", claim)
+        monkeypatch.setattr(
+            images, "image_reference_for", lambda driver: "ghcr.io/x/y:1"
+        )
+        bound_now = _pod_row(
+            id="22222222-2222-4222-8222-222222222222",
+            driver="srw.mcp-stdio-test/v1",
+            pod_name="stdio",
+        )
+        unbound = _pod_row(id="33333333-3333-4333-8333-333333333333", pod_name="idle")
+        reconciler._evictable = [bound_now, unbound]
+        report = hosting.ReconcileReport()
+        await reconciler._start(
+            GIT_SWAP_SPEC,
+            hosting._Binding(OTHER, GIT_SWAP_SPEC.name, DIGEST),
+            {},
+            generation="g1",
+            private_allowed=False,
+            exchange_address="10.43.0.5",
+            report=report,
+        )
+        assert stopped == ["idle"]
+        assert [q for q in conn.queries if "connector_credential_leases" in q] == [
+            hosting._KEY_BOUND,
+            hosting._KEY_BOUND,
+        ]
+        assert reconciler._evictable == []
+        # Only bound candidates left: nothing is stopped, the start waits.
+        conn.values = [True]
+        reconciler._evictable = [bound_now]
+        stopped.clear()
+        report = hosting.ReconcileReport()
+        await reconciler._start(
+            GIT_SWAP_SPEC,
+            hosting._Binding(OTHER, GIT_SWAP_SPEC.name, DIGEST),
+            {},
+            generation="g1",
+            private_allowed=False,
+            exchange_address="10.43.0.5",
+            report=report,
+        )
+        assert stopped == [] and report.capacity == 1
 
     @pytest.mark.asyncio
     async def test_a_committed_delivery_wakes_the_leaders_loop(self, monkeypatch):

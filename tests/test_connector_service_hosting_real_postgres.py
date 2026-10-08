@@ -32,6 +32,7 @@ from orchestrator.services.connector_lease_exchange import (
     DenialLimiter,
 )
 from orchestrator.services.connector_service_hosting import (
+    IDLE_EVICTED,
     ServiceRuntimeError,
     PodState,
     ServiceHostingReconciler,
@@ -1947,6 +1948,147 @@ async def test_a_managed_mcp_binding_starts_the_server_behind_the_front(db):
     assert runtime.endpoints == {
         endpoint_service_name(str(connector), D1): str(pod["id"])
     }
+
+
+def _stdio_and_echo_reconciler(db) -> ServiceHostingReconciler:
+    """Room for two pods: a stdio managed MCP server's (D5b) and echo pods."""
+    from shared.connectors.builtin import MCP_STDIO_TEST_SPEC
+
+    memory = "docker.io/mcp/memory:latest"
+    images.configure_service_images(
+        images.ServiceImageSettings(
+            references={MCP_STDIO_TEST_SPEC.name: memory, ECHO: ECHO_REFERENCE}
+        )
+    )
+
+    async def resolver(host, ipv6):
+        return ADDRESSES[host]
+
+    return ServiceHostingReconciler(
+        store=db,
+        runtime=FakeRuntime(),
+        drivers=builtin_connector_drivers(
+            echo_service_image=ECHO_REFERENCE,
+            managed_mcp_images={MCP_STDIO_TEST_SPEC.name: memory},
+        ),
+        settings=ServiceHostingSettings(
+            namespace="srw-connectors",
+            release_namespace="srw",
+            shim_image="srw-registry:5000/srw-driver-shim@sha256:" + "e" * 64,
+            exchange_host="srw-orchestrator.srw.svc",
+            exchange_port=8088,
+            orchestrator_labels={"app.kubernetes.io/component": "orchestrator"},
+            max_installation=2,
+            idle_seconds=3600,
+            refused_cidrs=("10.0.50.0/24",),
+            pod_ip="10.42.0.9",
+            node_ip="10.0.50.11",
+            front_image="srw-registry:5000/srw-driver-mcp-front@sha256:" + "f" * 64,
+        ),
+        resolver=resolver,
+    )
+
+
+async def _stdio_connector(db) -> str:
+    from shared.connectors.builtin import MCP_STDIO_TEST_SPEC
+
+    connector = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO datasources (id, name, type, scope_mode, policy_revision, "
+            "credentials, config) VALUES ($1, 'memory', 'mcp_stdio_test', 'all', "
+            "1, $2::jsonb, '{}'::jsonb)",
+            connector,
+            json.dumps(encrypt(json.dumps({"token": "memory-token"}))),
+        )
+        await conn.execute(
+            "INSERT INTO connector_driver_images (driver, reference, digest, "
+            "entrypoint, cmd, protocol_version) VALUES ($1, $2, $3, "
+            "'[\"node\", \"dist/index.js\"]'::jsonb, '[]'::jsonb, '1.0')",
+            MCP_STDIO_TEST_SPEC.name,
+            "docker.io/mcp/memory:latest",
+            D1,
+        )
+    return str(connector)
+
+
+async def _bind_stdio(db, connector: str, thread: str):
+    from shared.connectors.builtin import MCP_STDIO_TEST_SPEC
+
+    async with db.acquire() as conn:
+        return await leases.issue_or_redeliver(
+            conn,
+            owner=leases.LeaseOwner.thread(thread),
+            connector_id=connector,
+            driver=MCP_STDIO_TEST_SPEC.name,
+            access="ReadWrite",
+            image_digest=D1,
+        )
+
+
+async def _idle_stdio_and_echo_pods(db, reconciler) -> tuple[str, str]:
+    """Both pods up, then idle: the stdio pod for longer."""
+    stdio = await _stdio_connector(db)
+    await _echo_image(db)
+    stdio_thread, echo_thread = await _thread(db), await _thread(db)
+    await _bind_stdio(db, stdio, stdio_thread)
+    await _bind_echo(db, await _echo_connector(db), echo_thread)
+    await reconciler.reconcile_once()
+    pods = {str(pod["driver"]): str(pod["id"]) for pod in await _pods(db)}
+    stdio_pod, echo_pod = pods["srw.mcp-stdio-test/v1"], pods[ECHO]
+    for pod in pods.values():
+        reconciler.runtime.ready(pod)
+    await reconciler.reconcile_once()
+    await _end(db, stdio_thread)
+    await reconciler.reconcile_once()
+    await _end(db, echo_thread)
+    await reconciler.reconcile_once()
+    idle = {str(pod["id"]): pod["idle_since"] for pod in await _pods(db)}
+    assert idle[stdio_pod] < idle[echo_pod]
+    return stdio, stdio_pod
+
+
+@pytest.mark.asyncio
+async def test_at_the_cap_eviction_never_picks_a_bound_stdio_mcp_pod(db):
+    """C3's eviction with D5b's pods: a stdio server's bridge runs a process
+    per binding, so the longest-idle pod is evicted only while no binding
+    uses it. Bound again, the stdio pod stays; the echo pod makes room."""
+    reconciler = _stdio_and_echo_reconciler(db)
+    stdio, stdio_pod = await _idle_stdio_and_echo_pods(db, reconciler)
+    await _bind_stdio(db, stdio, await _thread(db))
+    await _bind_echo(db, await _echo_connector(db), await _thread(db))
+    report = await reconciler.reconcile_once()
+    reasons = {str(pod["id"]): pod["revoke_reason"] for pod in await _pods(db)}
+    assert reasons[stdio_pod] is None
+    assert sorted(r for r in reasons.values() if r) == [IDLE_EVICTED]
+    assert [reason for _, reason in report.stopped] == [IDLE_EVICTED]
+
+
+@pytest.mark.asyncio
+async def test_a_stdio_pod_bound_during_the_pass_is_not_evicted(db):
+    """A binding of the longest-idle stdio pod issued after the pass read
+    the bindings (as a workspace binds while the pass runs) spares it."""
+    reconciler = _stdio_and_echo_reconciler(db)
+    stdio, stdio_pod = await _idle_stdio_and_echo_pods(db, reconciler)
+    claim = reconciler._claim
+    bound_late = await _thread(db)
+
+    async def claim_after_a_bind(*args, **kwargs):
+        if not kwargs.get("replaces"):
+            await _bind_stdio(db, stdio, bound_late)
+        return await claim(*args, **kwargs)
+
+    reconciler._claim = claim_after_a_bind
+    await _bind_echo(db, await _echo_connector(db), await _thread(db))
+    report = await reconciler.reconcile_once()
+    reasons = {str(pod["id"]): pod["revoke_reason"] for pod in await _pods(db)}
+    assert reasons[stdio_pod] is None
+    assert [reason for _, reason in report.stopped] == [IDLE_EVICTED]
+    # The next pass sees the stdio binding: its pod serves on.
+    report = await reconciler.reconcile_once()
+    assert stdio_pod not in [pod for pod, _ in report.stopped]
+    (stdio_row,) = [p for p in await _pods(db) if str(p["id"]) == stdio_pod]
+    assert stdio_row["idle_since"] is None and stdio_row["revoked_at"] is None
 
 
 @pytest.mark.asyncio
