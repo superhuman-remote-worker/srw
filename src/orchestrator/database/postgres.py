@@ -50442,13 +50442,21 @@ class PostgresDB:
         self, datasource_id: Any, before: set[str]
     ) -> None:
         """Refresh the Project manifests of the projects the connector was
-        linked to before the write and is linked to after it."""
+        linked to before the write and is linked to after it; a project it is
+        no longer linked to may lose the entries naming it, and only those."""
         from orchestrator.services.project_connectors import (
             refresh_project_connectors,
         )
 
         after = await self._connector_link_projects(datasource_id)
-        await refresh_project_connectors(self, before | after)
+        if not before | after:
+            return
+        connector = str(UUID(str(datasource_id)))
+        await refresh_project_connectors(
+            self,
+            before | after,
+            unlinked={project: {connector} for project in before - after},
+        )
 
     async def get_datasource_tombstones(self, ids: list[str]) -> dict[str, str]:
         """Names of deleted connectors, for labelling drifted session config."""

@@ -204,6 +204,19 @@ class ManifestResourceService:
                         422,
                         "Active team reconciliation is not available on this installation.",
                     )
+                if project_id not in resolver.authority.new_projects:
+                    # Connector defaults are the Project owner's (slice D3c).
+                    from orchestrator.services.project_connectors import (
+                        require_connector_defaults_authority,
+                    )
+
+                    await require_connector_defaults_authority(
+                        self.db,
+                        prepared["document"],
+                        user,
+                        project_id=project_id,
+                        previous=old_rows[resource_key(project)],
+                    )
                 if project_id in resolver.authority.new_projects:
                     await self.db.create_project(
                         project["metadata"]["name"],
@@ -331,11 +344,15 @@ class ManifestResourceService:
                 await sync_project_connector_links(
                     self.db, row, user, previous=old_rows[key]
                 )
-                _, refreshed = await refresh_project(self.db, project_id)
+                _, refreshed = await refresh_project(
+                    self.db, project_id, author=str(user["id"])
+                )
                 if refreshed is not None:
                     row = refreshed
                     saved[key] = (row, True)
-                await sync_manifest_connector_defaults(self.db, row)
+                await sync_manifest_connector_defaults(
+                    self.db, row, author=str(user["id"])
+                )
 
             executions = {}
             for key, (row, _) in saved.items():

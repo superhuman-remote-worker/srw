@@ -10,23 +10,29 @@ on the legacy path has no resource, so it keeps the old inline
 **Refreshed with the links.**  The datasource store's write-through calls
 ``refresh_project_connectors`` for every Project a write linked or unlinked
 (link, unlink, a policy edit of a connector's projects, a connector created
-with links or deleted), in the write's transaction.  A legacy-authored
-Project (one with a source recipe) is rebuilt from its rows; a natively
-authored one keeps its own entries and only loses the entries of links that
-are gone and gains entries for links it does not list.  ``defaults.connectors``
-loses the aliases it loses.  A refresh never fails the write that caused it:
-it runs in a savepoint, and a Project it could not refresh is logged and
-brought in step by the startup heal.
+with links or deleted), in the write's transaction, naming the connector the
+write unlinked from each.  A legacy-authored Project (one with a source
+recipe) is rebuilt from its rows.  A natively authored one keeps what its
+author wrote: it loses only the entries naming the connector this write
+unlinked (and their aliases in every binding), and gains entries for links it
+does not list.  An entry naming a connector that was never linked (before
+D3c an apply linked nothing) is the author's, and stays.  A refresh never
+fails the write that caused it: it runs in a savepoint, and a Project it
+could not refresh is logged and brought in step by the startup heal.
 
 **Applied with the links.**  Applying a Project manifest links the connectors
-its entries name and unlinks those its previous revision named and this one
-drops (``sync_project_connector_links``), with the link API's own authority
-checks.  The project's own knowledge base is never unlinked.
+it newly names and unlinks those its previous revision named and it drops
+(``sync_project_connector_links``), with the link API's own authority
+checks; entries it carries over are left as they are.  The project's own
+knowledge base is never unlinked.  Changing ``defaults.connectors`` needs the
+authority the Settings API needs: a Project owner or an administrator.
 
-**Older Projects.**  A stored Project that still holds inline
+**Older Projects.**  A stored legacy-authored Project that still holds inline
 ``datasource-<hex>`` children is read like any entry (``entry_datasource_ids``
 understands the inline driver), and the startup heal
 (``heal_project_connectors``) rebuilds it with refs and retires the children.
+The heal never edits a natively authored Project: it reports the ones whose
+entries differ from their links.
 """
 
 from __future__ import annotations
@@ -209,6 +215,26 @@ async def entry_datasource_ids(
     }
 
 
+async def document_author(db, resource: Mapping[str, Any] | None) -> str | None:
+    """Who ``me`` meant in a Project document: whoever last applied it.
+
+    A server write (a refresh, a legacy rebuild) never adds a ``me`` ref, so
+    the latest manifest operation that saved this resource is the author;
+    without one, the Account the document lives in.
+    """
+    if not resource:
+        return None
+    author = await db.fetchval(
+        """SELECT owner_id FROM srw_manifest_operations
+           WHERE result->'resources' @> jsonb_build_array(
+                     jsonb_build_object('uid', $1::text))
+           ORDER BY created_at DESC LIMIT 1""",
+        str(resource["id"]),
+    )
+    author = author or resource.get("owner_id")
+    return str(author) if author else None
+
+
 async def stale_connector_children(db, manager_id, keep: Iterable[str]) -> list[dict]:
     """The Project's managed Connector children no inline entry keeps."""
     rows = await db.fetch(
@@ -223,21 +249,51 @@ async def stale_connector_children(db, manager_id, keep: Iterable[str]) -> list[
     return [dict(row) for row in rows]
 
 
+async def _child_held(db, child: Mapping[str, Any]) -> bool:
+    """Whether unfinished work or another live resource still names a child."""
+    if await execution_references_block_retirement(
+        db, resource_ids=[child["id"]], dependency_ids=[str(child["id"])]
+    ):
+        return True
+    return bool(
+        await db.fetchval(
+            """SELECT EXISTS(SELECT 1 FROM srw_resources r
+               WHERE r.deleted_at IS NULL AND r.id <> $1 AND (r.managed_by = $1
+                 OR EXISTS(SELECT 1 FROM jsonb_array_elements(r.dependencies) d
+                           WHERE d->>'uid' = $2)))""",
+            child["id"],
+            str(child["id"]),
+        )
+    )
+
+
+async def retirable_connector_children(
+    db, manager_id, keep: Iterable[str]
+) -> list[dict]:
+    """The stale children (``stale_connector_children``) nothing holds."""
+    return [
+        child
+        for child in await stale_connector_children(db, manager_id, keep)
+        if not await _child_held(db, child)
+    ]
+
+
 async def retire_stale_connector_children(db, manager_id, keep: Iterable[str]) -> int:
     """Retire the Project's managed Connector children no inline entry keeps.
 
     Executions record their connectors by datasource id, so normally nothing
-    waits on a child; one that unfinished work still names stays until a later
-    refresh, and never fails the write that triggered this.
+    waits on a child. One that unfinished work or a saved resource (a Job that
+    names it, say) still names stays, logged, until a later refresh finds it
+    free, and never fails the write that triggered this: the same blockers
+    ``retire_removed_children`` refuses on.
     """
     retired = 0
     for child in await stale_connector_children(db, manager_id, keep):
-        if await execution_references_block_retirement(
-            db, resource_ids=[child["id"]], dependency_ids=[str(child["id"])]
-        ):
+        if await _child_held(db, child):
             logger.warning(
                 "Connector child %s of Project resource %s is still named by "
-                "unfinished work; it is retired by a later refresh",
+                "unfinished work or a saved resource; it is retired by a later "
+                "refresh",
                 child["name"],
                 manager_id,
             )
@@ -261,12 +317,19 @@ def project_refresh_suspended():
         _REFRESH_SUSPENDED.reset(token)
 
 
-async def refresh_project_connectors(db, project_ids: Iterable[Any]) -> dict[str, str]:
+async def refresh_project_connectors(
+    db,
+    project_ids: Iterable[Any],
+    *,
+    unlinked: Mapping[str, Iterable[str]] | None = None,
+    heal: bool = False,
+) -> dict[str, str]:
     """Bring each Project's connector entries in step with its links.
 
-    Called by the datasource store's write-through inside its transaction.
-    Each Project gets a savepoint: a failure is logged as ``deferred`` and
-    left for the startup heal, never raised into the write.
+    Called by the datasource store's write-through inside its transaction,
+    with ``unlinked``: the connectors the write unlinked, by project. Each
+    Project gets a savepoint: a failure is logged as ``deferred`` and left
+    for the startup heal, never raised into the write.
     """
     outcomes: dict[str, str] = {}
     if _REFRESH_SUSPENDED.get():
@@ -274,7 +337,12 @@ async def refresh_project_connectors(db, project_ids: Iterable[Any]) -> dict[str
     for project_id in sorted({str(value) for value in project_ids}):
         try:
             async with db.transaction_scope():
-                outcome, _ = await refresh_project(db, project_id)
+                outcome, _ = await refresh_project(
+                    db,
+                    project_id,
+                    unlinked=(unlinked or {}).get(project_id, ()),
+                    heal=heal,
+                )
         except Exception:
             logger.exception(
                 "Project %s connector entries not refreshed; the startup heal "
@@ -286,12 +354,26 @@ async def refresh_project_connectors(db, project_ids: Iterable[Any]) -> dict[str
     return outcomes
 
 
-async def refresh_project(db, project_id) -> tuple[str, dict | None]:
+async def refresh_project(
+    db,
+    project_id,
+    *,
+    unlinked: Iterable[str] = (),
+    heal: bool = False,
+    author: str | None = None,
+) -> tuple[str, dict | None]:
     """Refresh one Project's entries; return the outcome and the saved row.
 
+    ``unlinked``: the connectors the triggering write unlinked from this
+    Project, the only entries a natively authored Project may lose. ``heal``:
+    the startup pass, which never edits a natively authored Project and only
+    reports whether its entries differ from its links. ``author``: who ``me``
+    means in the document (the applier during an apply).
+
     Outcomes: ``none`` (no active Project manifest yet; it is built from the
-    links when it is), ``unchanged``, ``rebuilt`` (legacy-authored) and
-    ``updated`` (natively authored).  Call inside ``transaction_scope``.
+    links when it is), ``unchanged``, ``rebuilt`` (legacy-authored),
+    ``updated`` (natively authored), and in a heal ``native`` or
+    ``native-drift``.  Call inside ``transaction_scope``.
     """
     from orchestrator.services.manifest_projects import (
         persist_project_resource,
@@ -314,21 +396,50 @@ async def refresh_project(db, project_id) -> tuple[str, dict | None]:
         )
         wanted = {alias: entry for alias, (_, entry) in desired.items()}
         keep = [alias for alias, entry in wanted.items() if "inline" in entry]
-        if current == wanted and not await stale_connector_children(
+        if current == wanted and not await retirable_connector_children(
             db, resource["id"], keep
         ):
             return "unchanged", None
         saved = await persist_project_resource(db, project_id)
         # None: the project row is gone (a delete racing this refresh).
         return ("rebuilt", saved) if saved else ("none", None)
-    saved = await _refresh_authored(db, store, resource, desired)
+    if heal:
+        drift = await _authored_drift(db, resource, desired)
+        return ("native-drift" if drift else "native"), None
+    saved = await _refresh_authored(
+        db,
+        store,
+        resource,
+        desired,
+        set(unlinked),
+        author=author or await document_author(db, resource),
+    )
     return ("updated", saved) if saved else ("unchanged", None)
 
 
-async def _refresh_authored(db, store, resource, desired):
-    """A natively authored Project: drop the entries of links that are gone,
-    add entries for links it does not list, keep everything else as written.
-    Returns the saved row, or None when nothing changed."""
+async def _authored_drift(db, resource, desired) -> bool:
+    """Whether a natively authored Project's datasource entries differ from
+    its links (reported by the heal, never edited by it)."""
+    authored = (resource["document"]["spec"].get("resources") or {}).get(
+        "connectors", {}
+    )
+    named = await entry_datasource_ids(
+        db,
+        authored,
+        project_id=str(resource["linked_id"]),
+        account_id=await document_author(db, resource),
+    )
+    listed = {value for value in named.values() if value}
+    return listed != {datasource_id for datasource_id, _ in desired.values()}
+
+
+async def _refresh_authored(
+    db, store, resource, desired, unlinked: set[str], *, author: str | None
+):
+    """A natively authored Project: drop the entries naming a connector the
+    triggering write unlinked, add entries for links it does not list, keep
+    everything else as written. Returns the saved row, or None when nothing
+    changed."""
     from orchestrator.services.project_connector_defaults import (
         sync_manifest_connector_defaults,
     )
@@ -337,7 +448,7 @@ async def _refresh_authored(db, store, resource, desired):
     )
 
     project_id = str(resource["linked_id"])
-    owner = str(resource["owner_id"]) if resource.get("owner_id") else None
+    owner = author
     authored = (resource["document"]["spec"].get("resources") or {}).get(
         "connectors", {}
     )
@@ -345,7 +456,13 @@ async def _refresh_authored(db, store, resource, desired):
         db, authored, project_id=project_id, account_id=owner
     )
     linked = {datasource_id: alias for alias, (datasource_id, _) in desired.items()}
-    removed = [alias for alias, value in named.items() if value and value not in linked]
+    # Only the link this write removed: an entry naming a connector that was
+    # never linked is the author's own (before D3c an apply linked nothing).
+    removed = [
+        alias
+        for alias, value in named.items()
+        if value and value in unlinked and value not in linked
+    ]
     covered = {value for value in named.values() if value}
     added = [
         (alias, datasource_id)
@@ -440,14 +557,15 @@ async def _refresh_authored(db, store, resource, desired):
     )
     saved["active_revision"] = saved["revision"]
     await sync_manifest_defaults(db, saved)
-    await sync_manifest_connector_defaults(db, saved)
+    await sync_manifest_connector_defaults(db, saved, author=author)
     return saved
 
 
 async def sync_project_connector_links(db, project_row, user, *, previous=None) -> None:
-    """Make an applied Project manifest's links: link every connector its
-    entries name, unlink those ``previous`` (its prior revision) named and it
-    drops.
+    """Make an applied Project manifest's links: link every connector it newly
+    names, unlink those ``previous`` (its prior revision) named and it drops.
+    Entries it carries over are left as they are, linked or not: before D3c an
+    apply linked nothing, and re-applying such a document changes no link.
 
     The link API's authority applies, checked by the store under its locks:
     adding a link needs the Project's owner and the connector's owner (or a
@@ -455,6 +573,7 @@ async def sync_project_connector_links(db, project_row, user, *, previous=None) 
     never linked elsewhere and never unlinked.  Refreshes are held meanwhile;
     the caller refreshes the Project once afterwards.
     """
+    from orchestrator.security.access import user_can_access_datasource
     from orchestrator.services.datasource_policy_errors import (
         DatasourceProjectAuthorizationError,
     )
@@ -473,21 +592,34 @@ async def sync_project_connector_links(db, project_row, user, *, previous=None) 
     wanted = [value for value in dict.fromkeys(named.values()) if value]
     before = (
         await entry_datasource_ids(
-            db, connectors_of(previous), project_id=project_id, account_id=account
+            db,
+            connectors_of(previous),
+            project_id=project_id,
+            account_id=await document_author(db, previous),
         )
         if previous
         else {}
     )
-    dropped = {value for value in before.values() if value} - set(wanted)
+    named_before = {value for value in before.values() if value}
+    dropped = named_before - set(wanted)
     links = {row["id"]: row for row in await linked_connectors(db, project_id)}
     with project_refresh_suspended():
         for datasource_id in wanted:
-            if datasource_id in links:
+            if datasource_id in links or datasource_id in named_before:
                 continue
             datasource = await db.get_datasource(datasource_id)
             if datasource is None:
                 raise HTTPException(
                     422, "A connector this Project references no longer exists."
+                )
+            # Authority first, so a connector the caller cannot see answers
+            # 403 like any other refused link, whatever kind it is.
+            if not (
+                datasource.get("is_global")
+                or await user_can_access_datasource(user, db, datasource)
+            ):
+                raise HTTPException(
+                    403, "Not authorized to add one or more project links"
                 )
             if platform_owned(datasource):
                 raise HTTPException(
@@ -527,24 +659,98 @@ async def sync_project_connector_links(db, project_row, user, *, previous=None) 
                 ) from None
 
 
-async def heal_project_connectors(db) -> dict[str, int]:
-    """Startup: bring every Project's connector entries in step with its links.
+DEFAULTS_AUTHORITY_DETAIL = (
+    "Only a Project owner or an administrator may change its connector defaults."
+)
 
-    Rebuilds Projects that still hold inline ``datasource-<hex>`` children
-    or entries that drifted from their links before D3c; a Project in step
-    is only compared.  Each Project is its own transaction; one that cannot
-    be refreshed is logged and retried at the next start.
+
+async def connector_default_ids(
+    db, document: Mapping[str, Any], *, project_id, account_id
+) -> list[str] | None:
+    """The connector ids a Project document's ``defaults.connectors`` names,
+    in order, or None when it does not set the field."""
+    spec = document["spec"]
+    defaults = spec.get("defaults") or {}
+    if "connectors" not in defaults:
+        return None
+    connectors = (spec.get("resources") or {}).get("connectors") or {}
+    named = await entry_datasource_ids(
+        db,
+        {
+            alias: connectors[alias]
+            for alias in defaults["connectors"]
+            if alias in connectors
+        },
+        project_id=project_id,
+        account_id=account_id,
+    )
+    return [named[alias] for alias in defaults["connectors"] if named.get(alias)]
+
+
+async def require_connector_defaults_authority(
+    db, document: Mapping[str, Any], user, *, project_id, previous=None
+) -> None:
+    """A manifest apply that changes the connectors ``defaults.connectors``
+    names needs the authority ``PUT /api/projects/{id}/connector-defaults``
+    needs: a Project owner or an administrator. Editors may apply a Project
+    whose defaults stay as they are. (The workspace defaults have the same
+    gap through ``defaults.workspace``; not changed here.)"""
+    if user.get("is_admin"):
+        return
+    after = await connector_default_ids(
+        db, document, project_id=project_id, account_id=str(user["id"])
+    )
+    before = (
+        await connector_default_ids(
+            db,
+            previous["document"],
+            project_id=project_id,
+            account_id=await document_author(db, previous),
+        )
+        if previous
+        else None
+    )
+    if after == before:
+        return
+    role = await db.get_user_role_in_project(str(project_id), str(user["id"]))
+    if role != "owner":
+        raise HTTPException(403, DEFAULTS_AUTHORITY_DETAIL)
+
+
+async def heal_project_connectors(db) -> dict[str, int]:
+    """Startup: bring every legacy-authored Project's entries in step with its
+    links, and report the natively authored ones that differ.
+
+    Rebuilds legacy-authored Projects that still hold inline
+    ``datasource-<hex>`` children or entries that drifted from their links
+    before D3c; one in step is only compared.  A natively authored Project is
+    its author's and is never edited here: one whose datasource entries differ
+    from its links (an entry naming a connector an apply never linked, a link
+    it does not list) is counted ``native-drift`` and named in a warning.
+    Each Project is its own transaction; one that cannot be refreshed is logged
+    and retried at the next start.
     """
     counts: dict[str, int] = {}
+    drifted: list[str] = []
     rows = await db.fetch(
         "SELECT linked_id FROM srw_resources WHERE kind='Project' "
         "AND linked_id IS NOT NULL AND deleted_at IS NULL ORDER BY linked_id"
     )
     for row in rows:
-        outcome = (await refresh_project_connectors(db, [row["linked_id"]])).get(
-            str(row["linked_id"]), "none"
+        project_id = str(row["linked_id"])
+        outcome = (await refresh_project_connectors(db, [project_id], heal=True)).get(
+            project_id, "none"
         )
         counts[outcome] = counts.get(outcome, 0) + 1
+        if outcome == "native-drift":
+            drifted.append(project_id)
+    if drifted:
+        logger.warning(
+            "%d natively authored Project manifests list connectors other than "
+            "their links; left as their authors wrote them: %s",
+            len(drifted),
+            ", ".join(drifted),
+        )
     log = logger.error if counts.get("deferred") else logger.info
     log("Project connector entries: %s", counts)
     return counts

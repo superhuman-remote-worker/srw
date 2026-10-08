@@ -97,22 +97,31 @@ async def read_current_project_connector_defaults(
 
     A manifest row holds only while its revision is the Project's active one,
     as for the workspace defaults: re-sync it from the active revision, or
-    release it when the Project no longer has an active manifest.
+    release it when the Project no longer has an active manifest. The heal
+    takes the catalog lock, the order every Project activation writes the row
+    in, and decides again under it.
     """
     current = await read_project_connector_defaults(db, project_id)
     if current is None or current.source != "manifest":
         return current
     from orchestrator.services.manifest_projects import active_project_resource
+    from orchestrator.services.manifest_store import ManifestStore
 
     active = await active_project_resource(db, project_id)
-    if active is None:
-        await release_manifest_connector_defaults(db, project_id)
-    elif active["revision"] != current.manifest_revision:
-        await sync_manifest_connector_defaults(
-            db, {**active, "linked_id": str(project_id)}
-        )
-    else:
+    if active is not None and active["revision"] == current.manifest_revision:
         return current
+    async with db.transaction_scope():
+        await ManifestStore(db).lock_catalog()
+        current = await read_project_connector_defaults(db, project_id)
+        if current is None or current.source != "manifest":
+            return current
+        active = await active_project_resource(db, project_id)
+        if active is None:
+            await release_manifest_connector_defaults(db, project_id)
+        elif active["revision"] != current.manifest_revision:
+            await sync_manifest_connector_defaults(
+                db, {**active, "linked_id": str(project_id)}
+            )
     return await read_project_connector_defaults(db, project_id)
 
 
@@ -224,9 +233,12 @@ async def prune_unlinked_connector_defaults(db, project_id) -> None:
     )
 
 
-async def sync_manifest_connector_defaults(db, resource: dict) -> None:
+async def sync_manifest_connector_defaults(
+    db, resource: dict, *, author: str | None = None
+) -> None:
     """Project activation: own the row when the manifest sets the field, else
-    release it.
+    release it. ``author`` is who ``me`` means in the document: the applier
+    during an apply, else its last author (``document_author``).
 
     ``defaults.connectors`` names aliases of ``resources.connectors``; the
     row stores the connector ids of the aliases that name a datasource's
@@ -235,37 +247,29 @@ async def sync_manifest_connector_defaults(db, resource: dict) -> None:
     connector for a generic image) is not a job or session connector and is
     not stored.
     """
-    from orchestrator.services.project_connectors import entry_datasource_ids
+    from orchestrator.services.project_connectors import (
+        connector_default_ids,
+        document_author,
+    )
 
     if resource.get("kind") != "Project" or not resource.get("linked_id"):
         return
     project_id = str(resource["linked_id"])
-    spec = resource["document"]["spec"]
-    defaults = spec.get("defaults") or {}
-    if "connectors" not in defaults:
+    named = await connector_default_ids(
+        db,
+        resource["document"],
+        project_id=project_id,
+        account_id=author or await document_author(db, resource),
+    )
+    if named is None:
         await release_manifest_connector_defaults(db, project_id)
         return
-    connectors = (spec.get("resources") or {}).get("connectors") or {}
-    named = await entry_datasource_ids(
-        db,
-        {
-            alias: connectors[alias]
-            for alias in defaults["connectors"]
-            if alias in connectors
-        },
-        project_id=project_id,
-        account_id=str(resource["owner_id"]) if resource.get("owner_id") else None,
-    )
     platform = {
         row["id"]
         for row in await linked_connectors(db, project_id)
         if row["platform_owned"]
     }
-    ids = [
-        named[alias]
-        for alias in defaults["connectors"]
-        if named.get(alias) and named[alias] not in platform
-    ]
+    ids = [value for value in named if value not in platform]
     await write_manifest_connector_defaults(
         db, project_id, ids, revision=resource["revision"]
     )
