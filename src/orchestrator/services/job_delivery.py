@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
+from shared.connectors.builtin import delivers_in
 from shared.runtime.services.forge import (
     SUPPORTED_FORGES,
     ForgeError,
@@ -102,7 +103,7 @@ def find_pull_request_repository(
     """Find the attached connector named by the persisted delivery record."""
     wanted = pull_request.repo.casefold()
     for datasource in datasources:
-        if datasource.get("type") != "repository":
+        if not delivers_in(datasource, "checkout"):
             continue
         config = datasource.get("config")
         config = config if isinstance(config, dict) else {}
@@ -230,7 +231,7 @@ def apply_review_delivery_branch(
     for index, datasource in enumerate(datasources):
         if str(datasource.get("id") or "") != datasource_id:
             continue
-        if datasource.get("type") != "repository":
+        if not delivers_in(datasource, "checkout"):
             raise ReviewDeliveryError(
                 "The review delivery connector is no longer a repository"
             )

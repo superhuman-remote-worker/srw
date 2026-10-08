@@ -8,6 +8,7 @@ execution layer. Registration and tool construction remain agent-owned.
 
 from typing import Any, Dict, List
 
+from shared.connectors.builtin import tool_map
 from shared.tool_catalog import definitions as _definitions
 
 
@@ -128,23 +129,36 @@ del _metadata_group
 #     sentinel rather than expanding against the registry, so there is nothing
 #     here to mark.
 
+
+def _datasource_code_grants() -> Dict[str, str]:
+    """Datasource-derived categories, from the connector drivers' specs.
+
+    ``DATASOURCE_TOOL_MAP`` maps an attached datasource type to a whole
+    category list, and the result is written straight onto
+    ``config.tools.<category>`` at attach/dispatch time.  The bases ship these
+    keys as ``[]`` with a comment saying config does not manage them.  A
+    driver whose tools are discovered at runtime (``mcp``) is left out, as
+    above.
+    """
+    grants: Dict[str, str] = {}
+    for ds_type, entry in tool_map().items():
+        if entry.get("dynamic"):
+            continue
+        article = "an" if ds_type[:1] in "aeiou" else "a"
+        gate = f"{article} {ds_type} datasource is attached"
+        if "tiers" in entry:
+            gate += " (tier from its config.access)"
+        grants[entry["category"]] = gate
+    return grants
+
+
 #: Categories whose every tool is bound by runtime code rather than by a
 #: config's tool list.  Expressed per category because that is the truth: a new
 #: tool added to any of these is code-granted by construction.  Per-tool
 #: ``gate`` strings win over the category default (``setdefault`` below), which
 #: is how ``product_help``'s two differently-gated floors stay accurate.
 CODE_GRANTED_CATEGORIES: Dict[str, str] = {
-    # Datasource-derived.  ``DATASOURCE_TOOL_MAP``
-    # (src/core/datasource_setup.py) maps an attached datasource type to a
-    # whole category list, and the result is written straight onto
-    # ``config.tools.<category>`` at attach/dispatch time.  The bases ship
-    # these keys as ``[]`` with a comment saying config does not manage them.
-    "graph": "a neo4j datasource is attached",
-    "sql": "a postgresql datasource is attached",
-    "mongodb": "a mongodb datasource is attached",
-    "webdav": "a webdav datasource is attached",
-    "repo": "a repository datasource is attached",
-    "email": "an email datasource is attached (tier from its config.access)",
+    **_datasource_code_grants(),
     # Persistent-session floors.  Neither category has a ``ToolsConfig`` field,
     # so ``tools.product_help: [...]`` in a YAML file is silently discarded
     # today (src/core/loader.py).  Recording it as a code grant makes that a

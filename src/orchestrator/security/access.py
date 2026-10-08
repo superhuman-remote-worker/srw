@@ -51,6 +51,7 @@ from orchestrator.services.project_status import (
     PROJECT_ARCHIVED_DETAIL as PROJECT_ARCHIVED_DETAIL,
     project_is_archived as project_is_archived,
 )
+from shared.connectors.builtin import spec_for_row
 
 logger = logging.getLogger(__name__)
 
@@ -1027,8 +1028,14 @@ def redact_datasource(ds: dict[str, Any]) -> dict[str, Any]:
     if not ds:
         return ds
     out = dict(ds)
-    if ds.get("type") == "credentials":
-        out["env_var_names"] = sorted((ds.get("credentials") or {}).get("env_vars", {}))
+    # A slot whose key names the spec makes visible (the credentials
+    # connector's environment) shows them, never their values.
+    spec = spec_for_row(ds)
+    for slot in spec.credential_slots if spec is not None else ():
+        if slot.names_field:
+            out[slot.names_field] = sorted(
+                (ds.get("credentials") or {}).get(slot.name, {})
+            )
     out.pop("credentials", None)
     out.pop("connection_url_redacted", None)
     if "connection_url" in out:

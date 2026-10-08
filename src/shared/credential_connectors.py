@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from shared.connectors.builtin import legacy_types_with_form
+from shared.connectors.builtin import legacy_types_with_form, spec_for_type
 
 #: Stored types whose driver delivers an environment file to the workspace.
 ENV_CONNECTOR_TYPES = legacy_types_with_form("env_file")
@@ -68,10 +68,18 @@ def collect_credential_env(datasources: list[dict[str, Any]]) -> dict[str, str]:
             continue
         values = normalize_credential_env(
             (ds.get("credentials") or {}).get("env_vars", {}),
-            required=ds.get("type") == "credentials",
+            required=_env_vars_required(ds.get("type")),
         )
         for name, secret in values.items():
             if name in result:
                 raise ValueError(f"Multiple attached connectors define {name}")
             result[name] = secret
     return result
+
+
+def _env_vars_required(ds_type: Any) -> bool:
+    """Whether the type's driver requires its environment slot (credentials)."""
+    spec = spec_for_type(ds_type)
+    return spec is not None and any(
+        slot.name == "env_vars" and slot.required for slot in spec.credential_slots
+    )

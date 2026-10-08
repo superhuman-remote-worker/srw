@@ -89,10 +89,17 @@ from orchestrator.services.vm_workspace_recovery_store import (
     complete_vm_cleanup_permit,
 )
 from shared.backend_kinds import LITE_BACKENDS, VM_BACKENDS
+from shared.connectors.builtin import spec_for_row
 from shared.run_queue import LANE_PINNED
 from shared.runtime.core.loader import canonical_config_name
 
 logger = logging.getLogger(__name__)
+
+
+def _live_detach_refused(row: Mapping[str, Any]) -> bool:
+    """Whether the connector's driver refuses a live detach (credentials)."""
+    spec = spec_for_row(row)
+    return spec is not None and spec.live_detach == "refused"
 
 
 class ThreadConfigStore(Protocol):
@@ -453,7 +460,7 @@ async def apply_thread_config_update_locked(
             removed_rows = await dependencies.store.get_datasource_policy_rows(
                 list(removed_ids)
             )
-            if any(row.get("type") == "credentials" for row in removed_rows):
+            if any(_live_detach_refused(row) for row in removed_rows):
                 raise HTTPException(
                     status_code=409,
                     detail="Credential connectors stay attached for the lifetime of the session",

@@ -53,6 +53,7 @@ from orchestrator.services.config_drift import (
     acknowledged_drift_ids,
     strip_acknowledged,
 )
+from shared.connectors.builtin import needs_knowledge_profile
 
 ONE_PROJECT_PER_SESSION_DETAIL = (
     "A Session can belong to one project at most. Pick one project, or none."
@@ -263,7 +264,7 @@ async def thread_has_knowledge_scope(
         return True
     for datasource_id in datasource_ids or []:
         datasource = await dependencies.store.get_datasource(str(datasource_id))
-        if datasource and str(datasource.get("type") or "").lower() == "kb":
+        if datasource and needs_knowledge_profile(datasource):
             return True
     return False
 

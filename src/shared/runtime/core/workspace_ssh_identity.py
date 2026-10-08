@@ -28,6 +28,7 @@ from typing import Any, Iterable, Mapping, MutableMapping
 from urllib.parse import urlparse
 from uuid import UUID
 
+from shared.connectors.builtin import legacy_types_with_form
 from shared.runtime.core.managed_repository import (
     _SSH_AGENT_RETIRE_PROGRAM,
     RESERVED_SSH_HOST_PREFIX,
@@ -396,7 +397,8 @@ def select_known_hosts(
 # ---------------------------------------------------------------------------
 
 WORKSPACE_SSH_IDENTITY_VERSION = 1
-WORKSPACE_SSH_IDENTITY_KINDS = frozenset({"repository", "ssh_key"})
+#: The stored types whose driver delivers an ssh-agent identity.
+WORKSPACE_SSH_IDENTITY_KINDS = legacy_types_with_form("ssh_identity")
 #: Status of an identity the workspace agent holds and has proven.
 IDENTITY_READY = "ready"
 _FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")

@@ -13,20 +13,14 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+from shared.connectors.builtin import tool_categories
+
 _AUTONOMY_ORDER = ["dependent", "guided", "partial", "review", "full"]
 _PERMISSION_ORDER = ["supervised", "auto_accept", "autonomous"]
 #: Every tool category the `datasource_tools` grant gates, shared by `evaluate`
-#: (the check) and `strip_to_grants` (the fix) so the two enumerations of the
-#: same seven categories cannot quietly drift apart from each other.
-_DATASOURCE_TOOL_CATEGORIES = (
-    "sql",
-    "mongodb",
-    "graph",
-    "webdav",
-    "email",
-    "mcp",
-    "repo",
-)
+#: (the check) and `strip_to_grants` (the fix) so the two cannot drift apart.
+#: The connector drivers' specs say which categories they bind.
+_DATASOURCE_TOOL_CATEGORIES = tool_categories()
 
 CATALOG: dict[str, dict[str, Any]] = {
     # Lets a user fork/set a personal worker/session default.  Clearing an

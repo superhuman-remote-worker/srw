@@ -72,6 +72,13 @@ from orchestrator.services.managed_repository_authority import (
 from orchestrator.services.officer_metadata import (
     thread_officer_meta as _thread_officer_meta,
 )
+from shared.connectors.builtin import spec_for_row
+
+
+def _link_forced_read_only(datasource: dict[str, Any]) -> bool:
+    """Whether the connector's driver keeps every project link read-only (KB)."""
+    spec = spec_for_row(datasource)
+    return spec is not None and spec.forced_read_only
 
 
 @dataclass(frozen=True)
@@ -1192,7 +1199,7 @@ async def link_datasource_to_project(
 
     try:
         effective_read_only = (
-            True if ds.get("type") == "kb" else (body.read_only if body else None)
+            True if _link_forced_read_only(ds) else (body.read_only if body else None)
         )
         await store.link_datasource_to_project(
             project_id,
@@ -1231,7 +1238,7 @@ async def update_project_datasource(
         raise HTTPException(
             status_code=404, detail=f"Connector '{datasource_id}' not found"
         )
-    effective_read_only = True if ds.get("type") == "kb" else body.read_only
+    effective_read_only = True if _link_forced_read_only(ds) else body.read_only
     try:
         success = await store.update_project_datasource(
             project_id,

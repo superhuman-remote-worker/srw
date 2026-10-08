@@ -29,6 +29,7 @@ from orchestrator.services.managed_repository_authority import (
 from orchestrator.services.manifest_runtime_ownership import uses_srw_runtime
 from orchestrator.services.workspace_tier_policy import LiteWorkspaceConfigError
 from shared.backend_kinds import LITE_BACKENDS
+from shared.connectors.builtin import needs_knowledge_profile
 from shared.runtime.core.loader import canonical_config_name
 from shared.workspace_contract import WORKSPACE_RUNTIME_CONTEXT_KEY
 from shared.pinned_job_delivery import (
@@ -471,7 +472,7 @@ async def resume_job_on_agent(
             return False
 
         has_knowledge_scope = bool(job.get("project_id")) or any(
-            str(ds.get("type") or "").lower() == "kb" for ds in (resolved_ds or [])
+            needs_knowledge_profile(ds) for ds in (resolved_ds or [])
         )
         job_context = job.get("context") or {}
         if isinstance(job_context, str):

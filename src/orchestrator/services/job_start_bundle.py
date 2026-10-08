@@ -54,6 +54,7 @@ from orchestrator.services.manifest_execution_snapshot import (
     srw_snapshot_config,
 )
 from shared.backend_kinds import LITE_BACKENDS
+from shared.connectors.builtin import needs_knowledge_profile
 from orchestrator.services.job_mutation_target import (
     FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS,
     FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S,
@@ -361,7 +362,7 @@ async def build_job_start_request(
             return None
 
         has_knowledge_scope = bool(job.get("project_id")) or any(
-            str(ds.get("type") or "").lower() == "kb" for ds in (resolved_ds or [])
+            needs_knowledge_profile(ds) for ds in (resolved_ds or [])
         )
         dependencies.apply_cloud_storage_override(resolved_ds, job_context)
         datasources_payload = dependencies.build_datasources_payload(resolved_ds)

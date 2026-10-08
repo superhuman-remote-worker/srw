@@ -1079,3 +1079,56 @@ async def test_policy_rows_admit_only_the_exact_legacy_job_binding():
     assert "d.job_id IS NULL OR d.job_id = $2::uuid" in sql
     assert datasource_ids == [UUID(DATASOURCE_ID)]
     assert legacy_job_id == UUID(LEGACY_JOB_ID)
+
+
+# =============================================================================
+# Type rules come from the connector driver specs (slice D1c)
+# =============================================================================
+
+
+def test_the_store_type_rules_come_from_the_driver_specs():
+    from orchestrator.database import postgres
+
+    assert postgres._LIVE_DETACH_REFUSED_TYPES == {"credentials"}
+    assert postgres._DELETE_WHILE_ATTACHED_REFUSED_TYPES == {"credentials"}
+    assert postgres._FORCED_READ_ONLY_TYPES == {"kb"}
+    assert postgres._UNATTENDED_SEND_TYPES == {"email"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("ds_type", "read_only"), [("kb", True), ("postgresql", None)])
+async def test_initial_project_links_of_a_forced_read_only_driver_are_read_only(
+    ds_type, read_only
+):
+    conn = AsyncMock()
+    conn.fetchrow.side_effect = [
+        _datasource_row(),
+        _datasource_row(revision=2, scope="projects"),
+    ]
+    db = _make_db(conn)
+
+    await db.create_datasource(
+        name="Notes",
+        ds_type=ds_type,
+        scope_mode="projects",
+        project_ids=[PROJECT_A],
+    )
+
+    link_rows = conn.executemany.await_args.args[1]
+    assert [row[2] for row in link_rows] == [read_only]
+
+
+@pytest.mark.asyncio
+async def test_only_a_driver_with_unattended_send_is_stamped_with_the_grant():
+    db = PostgresDB.__new__(PostgresDB)
+    db.get_user = AsyncMock(return_value={"id": USER_ID})
+    db.user_can_autonomous_send = AsyncMock(return_value=True)
+    config = {"unattended_send": True}
+    email = {"type": "email", "created_by": USER_ID, "config": dict(config)}
+    other = {"type": "webdav", "created_by": USER_ID, "config": dict(config)}
+
+    await db._stamp_email_autonomous_send([email, other])
+
+    assert email["_owner_can_autonomous_send"] is True
+    assert "_owner_can_autonomous_send" not in other
+    db.user_can_autonomous_send.assert_awaited_once()

@@ -79,6 +79,7 @@ from orchestrator.services.workspace_suspension import (
     WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY,
 )
 from shared.backend_kinds import LITE_BACKENDS
+from shared.connectors.builtin import needs_knowledge_profile
 from shared.session_subagent_batch import (
     SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT,
     SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
@@ -978,8 +979,7 @@ async def agent_get_thread_workspace_locked(
     # stripping, so user_settings isn't needed to repopulate the keys.
     co = metadata.get("config_override") or {}
     include_kb_profile = bool(project_ids) or any(
-        str(datasource.get("type") or "").lower() == "kb"
-        for datasource in datasources_payload or []
+        needs_knowledge_profile(datasource) for datasource in datasources_payload or []
     )
     if co or include_kb_profile:
         co = await _inject_thread_dispatch_credentials(

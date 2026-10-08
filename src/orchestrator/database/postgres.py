@@ -46,6 +46,10 @@ if TYPE_CHECKING:
 
 from shared.helm_provenance import provenance_from_breadcrumb
 from shared.credential_connectors import CredentialConnectorAttachedError
+from shared.connectors.builtin import (
+    legacy_types_where,
+    legacy_types_with_config_key,
+)
 
 try:
     import asyncpg
@@ -225,6 +229,19 @@ if PINNED_K8S_CREATE_FENCE_HORIZON_SECONDS < 600:
     raise RuntimeError("PINNED_K8S_CREATE_FENCE_HORIZON_SECONDS must be at least 600")
 
 _WORKSPACE_REQUEST_UNSET = object()
+
+# Connector types whose driver spec refuses a live detach, and a delete
+# while attached to unfinished work (the credentials connector), and the
+# types whose config can ask for unattended sending (email).
+_LIVE_DETACH_REFUSED_TYPES = legacy_types_where(
+    lambda spec: spec.live_detach == "refused"
+)
+_DELETE_WHILE_ATTACHED_REFUSED_TYPES = legacy_types_where(
+    lambda spec: not spec.delete_while_attached
+)
+_UNATTENDED_SEND_TYPES = legacy_types_with_config_key("unattended_send")
+# A connector type whose project links are always read-only (the KB).
+_FORCED_READ_ONLY_TYPES = legacy_types_where(lambda spec: spec.forced_read_only)
 
 # Non-lifecycle workspace metadata which may be written independently while a
 # static Docker lease is allocated. Allocation replaces every authority-bearing
@@ -26219,13 +26236,17 @@ class PostgresDB:
                         SELECT d.id, d.type FROM threads t
                         JOIN datasources d ON
                             COALESCE(t.metadata->'datasource_ids', '[]'::jsonb) ? d.id::text
-                        WHERE t.id = $1 AND d.type = 'credentials'
+                        WHERE t.id = $1 AND d.type = ANY($3::text[])
                             AND NOT (d.id = ANY($2::uuid[]))
                         """,
                         thread_uuid,
                         datasource_uuids,
+                        sorted(_LIVE_DETACH_REFUSED_TYPES),
                     )
-                    if any(row.get("type") == "credentials" for row in retained):
+                    if any(
+                        row.get("type") in _LIVE_DETACH_REFUSED_TYPES
+                        for row in retained
+                    ):
                         raise CredentialConnectorAttachedError(
                             "Credential connectors stay attached for the lifetime of the session"
                         )
@@ -50352,7 +50373,7 @@ class PostgresDB:
                             (
                                 project_uuid,
                                 datasource_uuid,
-                                True if ds_type == "kb" else None,
+                                True if ds_type in _FORCED_READ_ONLY_TYPES else None,
                             )
                             for project_uuid in project_uuids
                         ],
@@ -50814,7 +50835,9 @@ class PostgresDB:
                                 (
                                     project_uuid,
                                     datasource_uuid,
-                                    True if current["type"] == "kb" else None,
+                                    True
+                                    if current["type"] in _FORCED_READ_ONLY_TYPES
+                                    else None,
                                 )
                                 for project_uuid in additions
                             ],
@@ -50981,7 +51004,10 @@ class PostgresDB:
                         "SELECT name, type FROM datasources WHERE id = $1 FOR UPDATE",
                         uuid_val,
                     )
-                    if doomed and doomed.get("type") == "credentials":
+                    if (
+                        doomed
+                        and doomed.get("type") in _DELETE_WHILE_ATTACHED_REFUSED_TYPES
+                    ):
                         in_use = await conn.fetchval(
                             """
                             SELECT EXISTS (
@@ -51062,7 +51088,7 @@ class PostgresDB:
         that never got stamped reads as no-grant (fail closed).
         """
         for ds in datasources:
-            if ds.get("type") != "email":
+            if ds.get("type") not in _UNATTENDED_SEND_TYPES:
                 continue
             config = ds.get("config") or {}
             if not config.get("unattended_send"):

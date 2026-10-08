@@ -149,7 +149,9 @@ class TestSetThreadDatasourceIds:
         assert patch["datasource_ids"] == []
         assert patch["datasource_selection"]["policy_revisions"] == {}
         conn.fetch.assert_awaited_once()
-        assert "d.type = 'credentials'" in conn.fetch.await_args.args[0]
+        # The detach lock is the specs' live_detach="refused" set: credentials.
+        assert "d.type = ANY($3::text[])" in conn.fetch.await_args.args[0]
+        assert conn.fetch.await_args.args[3] == ["credentials"]
         assert db._test_datasource_lock_keys
         conn.transaction.assert_called_once()
 

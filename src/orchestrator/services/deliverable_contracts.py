@@ -7,6 +7,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+from shared.connectors.builtin import delivers_in
 from shared.datasource_policy import resolve_repo_clone_names
 from shared.runtime.services.forge import ForgeError, parse_owner_repo
 from shared.deliverable_contract import (
@@ -50,7 +51,8 @@ class DeliveryContractPlan:
 
 
 def _repository_rows(datasources: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    return [dict(row) for row in datasources if row.get("type") == "repository"]
+    """The connectors a pull request can come from: their driver checks out."""
+    return [dict(row) for row in datasources if delivers_in(row, "checkout")]
 
 
 def _repository_identity(datasource: Mapping[str, Any]) -> str | None:
