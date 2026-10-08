@@ -317,6 +317,25 @@ class ManifestResourceService:
                     row["revision"],
                 )
                 row["active_revision"] = row["revision"]
+                # A Project's connector entries are its links (slice D3c):
+                # link what it names, unlink what it dropped, then list any
+                # link it leaves out (its knowledge base, which stays).
+                from orchestrator.services.project_connector_defaults import (
+                    sync_manifest_connector_defaults,
+                )
+                from orchestrator.services.project_connectors import (
+                    refresh_project,
+                    sync_project_connector_links,
+                )
+
+                await sync_project_connector_links(
+                    self.db, row, user, previous=old_rows[key]
+                )
+                _, refreshed = await refresh_project(self.db, project_id)
+                if refreshed is not None:
+                    row = refreshed
+                    saved[key] = (row, True)
+                await sync_manifest_connector_defaults(self.db, row)
 
             executions = {}
             for key, (row, _) in saved.items():

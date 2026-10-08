@@ -187,6 +187,16 @@ async def open_stores(resources: ApplicationResources) -> tuple[bool, Any]:
     from orchestrator.services.manifest_projects import migrate_projects
 
     await migrate_projects(resources.postgres_db)
+    from orchestrator.services.project_connectors import heal_project_connectors
+
+    # Project manifests list their links as Connector refs; older ones still
+    # hold inline datasource children or drifted (slice D3c). Never fatal.
+    try:
+        await heal_project_connectors(resources.postgres_db)
+    except Exception:
+        logger.exception(
+            "Project connector entries were not healed; it retries at the next start"
+        )
     resources.postgres_db.manifests_ready = True
     # Service-pod hosting off (or not configured): no reconciler will stop
     # the driver pods a previous configuration started, so the exchange must

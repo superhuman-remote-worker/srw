@@ -220,17 +220,12 @@ def project_document(
     if datasources:
         # Availability is distinct from selection: historical auto-attach is
         # actor-specific and stays under the existing datasource admission gate.
+        # Each link is a ref to its connector's Connector resource; a row with
+        # no resource keeps the inline srw.datasource/v1 entry (D3c).
+        from orchestrator.services.project_connectors import link_entries
+
         doc["spec"]["resources"]["connectors"] = {
-            f"datasource-{str(row['id']).replace('-', '')}": {
-                "inline": {
-                    "driver": "srw.datasource/v1",
-                    "config": {
-                        "datasourceId": str(row["id"]),
-                        "policyRevision": row["policy_revision"],
-                    },
-                }
-            }
-            for row in datasources
+            alias: entry for alias, (_, entry) in link_entries(datasources).items()
         }
     if post:
         config = _object(post.get("config_override"))
@@ -543,11 +538,15 @@ async def persist_project_resource(
             resource["id"],
             resource["revision"],
         )
+        from orchestrator.services.project_connector_defaults import (
+            sync_manifest_connector_defaults,
+        )
         from orchestrator.services.project_workspace_defaults import (
             sync_manifest_defaults,
         )
 
         await sync_manifest_defaults(db, resource)
+        await sync_manifest_connector_defaults(db, resource)
         return resource
     owner_id = (
         (previous.get("owner_id") if previous else None)
@@ -586,11 +585,12 @@ async def persist_project_resource(
         FROM project_officers po LEFT JOIN threads t ON t.id=po.thread_id WHERE po.project_id=$1""",
         UUID(str(project_id)),
     )
-    datasources = await db.fetch(
-        """SELECT d.id,d.policy_revision FROM datasources d
-        JOIN project_datasources pd ON pd.datasource_id=d.id WHERE pd.project_id=$1 ORDER BY d.id""",
-        UUID(str(project_id)),
+    from orchestrator.services.project_connectors import (
+        project_link_rows,
+        retire_stale_connector_children,
     )
+
+    datasources = await project_link_rows(db, project_id)
     document, recipe = project_document(
         dict(project),
         owner_id=owner_id,
@@ -605,6 +605,9 @@ async def persist_project_resource(
     children, dependencies = [], [recipe]
     for category, kind in _KINDS.items():
         for alias, selection in document["spec"]["resources"].get(category, {}).items():
+            if "inline" not in selection:
+                # A Connector ref names an independent resource, not a child.
+                continue
             child = {
                 "apiVersion": API_VERSION,
                 "kind": kind,
@@ -668,17 +671,34 @@ async def persist_project_resource(
             uid=child_uid,
             expected_version=old_child["resource_version"] if old_child else None,
         )
+    # Inline datasource children the links no longer make (a link that is
+    # gone, or one that is a Connector ref now) are retired with this rebuild.
+    await retire_stale_connector_children(
+        db,
+        uid,
+        [
+            alias
+            for alias, selection in document["spec"]["resources"]
+            .get("connectors", {})
+            .items()
+            if "inline" in selection
+        ],
+    )
     await db.execute(
         "UPDATE srw_resources SET active_revision=$2 WHERE id=$1",
         uid,
         resource["revision"],
     )
     resource["active_revision"] = resource["revision"]
+    from orchestrator.services.project_connector_defaults import (
+        sync_manifest_connector_defaults,
+    )
     from orchestrator.services.project_workspace_defaults import (
         sync_manifest_defaults,
     )
 
     await sync_manifest_defaults(db, resource)
+    await sync_manifest_connector_defaults(db, resource)
     await db.execute(
         "UPDATE projects SET manifest_resource_id=$2,default_config_name=NULL,default_config_override=NULL WHERE id=$1",
         UUID(str(project_id)),
@@ -838,11 +858,15 @@ async def persist_officer_controller(db, project_id, post):
     )
     # team.controller is part of the content revision: the manifest-owned
     # workspace defaults row must follow the new active revision.
+    from orchestrator.services.project_connector_defaults import (
+        sync_manifest_connector_defaults,
+    )
     from orchestrator.services.project_workspace_defaults import (
         sync_manifest_defaults,
     )
 
     await sync_manifest_defaults(db, saved)
+    await sync_manifest_connector_defaults(db, saved)
     return saved
 
 

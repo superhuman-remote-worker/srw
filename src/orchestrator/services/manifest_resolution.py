@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 from fastapi import HTTPException
 
 from orchestrator.services.manifest_store import resource_key
+from orchestrator.services.project_connectors import datasource_binding
 from shared.manifests import API_VERSION, preview_documents, validate_documents
 from shared.manifests.resolution import content_revision
 from shared.manifests.validation import MAX_NODES, check_json_value
@@ -151,9 +152,11 @@ class LiveManifestResolver:
         target_scope = deepcopy(ref.get("scope", scope))
         # A saved Expert may have an explicit global/project grant while its
         # authored identity remains in its owner's Account scope. Resolve the
-        # identity first, then consult that domain grant in resource().
+        # identity first, then consult that domain grant in resource(). A
+        # datasource's Connector is shared the same way (public, or linked to
+        # a project), by the connector policy.
         if (
-            kind == "Expert"
+            kind in ("Expert", "Connector")
             and target_scope["kind"] == "Account"
             and target_scope["name"] not in ("me", "personal")
         ):
@@ -185,6 +188,13 @@ class LiveManifestResolver:
             )
         await self.authority.resource(row)
         self.observe(row)
+        if kind == "Connector" and row.get("linked_id"):
+            # A datasource's Connector binds as its datasource, the form the
+            # SRW snapshot records: re-authorized by the connector policy
+            # wherever work uses it, never frozen as a dependency (decision
+            # 12: deleting it never waits for work), its credentials the
+            # datasource's, delivered under that policy.
+            return datasource_binding(row["linked_id"])
         await self.authorize_dependencies(row["dependencies"])
         dependencies.append(
             {

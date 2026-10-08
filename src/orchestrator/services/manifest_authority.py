@@ -9,6 +9,7 @@ from orchestrator.security.access import (
     _role_satisfies,
     _scope_permits_project,
     mcp_scope_project_id,
+    user_can_access_datasource,
 )
 from orchestrator.services.connector_secrets import (
     CATALOG_SECRET_DETAIL,
@@ -121,6 +122,18 @@ class ManifestAuthority:
                     await self.deny(
                         "The selected Expert is outside this token's Project scope."
                     )
+            return
+        if row["kind"] == "Connector" and row.get("linked_id") and not write:
+            # A datasource's Connector is visible as its datasource is to the
+            # link API: public, or to an administrator, its creator or a member
+            # of a project it is linked to. Writes stay with its scope (and the
+            # store refuses them: the datasource API writes it).
+            datasource = await self.db.get_datasource(str(row["linked_id"]))
+            if not datasource or not (
+                datasource.get("is_global")
+                or await user_can_access_datasource(self.user, self.db, datasource)
+            ):
+                await self.deny("The selected connector is not visible to this caller.")
             return
         # Projects retain their actual membership authority, even when the
         # portable Project document is in its creator's Account scope.

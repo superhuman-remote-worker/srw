@@ -49,6 +49,8 @@ def _make_db(conn: AsyncMock) -> PostgresDB:
     db.transaction_scope = transaction_scope
     db._lock_connector_catalog = AsyncMock()
     db._persist_connector_resource = AsyncMock(return_value="unchanged")
+    db._connector_link_projects = AsyncMock(return_value=set())
+    db._refresh_connector_projects = AsyncMock()
     return db
 
 

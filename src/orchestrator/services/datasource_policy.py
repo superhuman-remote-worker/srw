@@ -326,8 +326,11 @@ async def default_datasource_selection(
     """Return default IDs and the policy revisions used to select them.
 
     Shared/public connector publisher preferences never affect another user.
-    Native project KB rows are the sole v1 project-managed exception.
-    Connectors a lite workspace tier cannot serve (``workspace_tier_refuses``)
+    Native project KB rows are the project-managed exception, and a project
+    admin's connector defaults (``project_connector_defaults``, slice D3c)
+    add the connectors linked to every target project that the project chose
+    (candidate rows flagged ``project_default``), whatever their owner's own
+    ``auto_attach``. Connectors a lite workspace tier cannot serve (``workspace_tier_refuses``)
     are silently omitted because this is an implicit default rather than an
     explicit user requirement.
 
@@ -348,14 +351,21 @@ async def default_datasource_selection(
     selected: list[str] = []
     revisions: dict[str, int] = {}
     for row in rows:
-        if not row.get("auto_attach") or not _scope_matches(row, target_set):
+        if not _scope_matches(row, target_set):
             continue
         native_project_id = _native_project_id(row)
         owned = str(row.get("created_by") or "") == owner_id
         native_default = (
             native_project_id is not None and native_project_id in target_set
         )
-        if not (owned or native_default):
+        project_default = (
+            bool(row.get("project_default"))
+            and bool(target_set)
+            and target_set.issubset(_row_project_ids(row))
+        )
+        if not (
+            (row.get("auto_attach") and (owned or native_default)) or project_default
+        ):
             continue
         if workspace_tier_refuses(row, workspace_backend):
             continue

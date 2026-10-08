@@ -126,7 +126,10 @@ async def database(pg_url, monkeypatch):
         CREATE TABLE jobs(id uuid PRIMARY KEY, status text DEFAULT 'created', error_message text,
             assigned_agent_id uuid, lease_expires_at timestamptz, execution_lane text DEFAULT 'pinned');
         CREATE TABLE threads(id uuid PRIMARY KEY, status text DEFAULT 'created');
-        CREATE TABLE datasources(id uuid PRIMARY KEY);
+        CREATE TABLE datasources(id uuid PRIMARY KEY, type text,
+            config jsonb DEFAULT '{}', managed_key text, policy_revision integer DEFAULT 1);
+        CREATE TABLE project_datasources(project_id uuid, datasource_id uuid,
+            read_only boolean, description text, PRIMARY KEY(project_id, datasource_id));
     """)
     migration = (
         Path(__file__).resolve().parents[1]
@@ -138,6 +141,10 @@ async def database(pg_url, monkeypatch):
     )
     await db.execute(
         migration.with_name("0308_project_workspace_defaults.sql").read_text()
+    )
+    # A Project activation owns or releases its connector defaults (D3c).
+    await db.execute(
+        migration.with_name("0380_project_connector_defaults.sql").read_text()
     )
     # A final retire revokes the execution's credential leases (C2).
     await db.execute(

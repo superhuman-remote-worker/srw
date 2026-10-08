@@ -414,6 +414,8 @@ GET    /api/projects/{project_id}/api-keys                                      
 DELETE /api/projects/{project_id}/api-keys/{provider}                                   pat=admin           gated:require_approved_user
 PUT    /api/projects/{project_id}/api-keys/{provider}                                   pat=admin           gated:require_approved_user
 GET    /api/projects/{project_id}/backlog                                               pat=jobs:read       gated:require_project_member
+GET    /api/projects/{project_id}/connector-defaults                                    pat=jobs:read       gated:require_project_member
+PUT    /api/projects/{project_id}/connector-defaults                                    pat=admin           gated:require_project_owner
 GET    /api/projects/{project_id}/contacts                                              pat=admin           gated:require_project_member
 POST   /api/projects/{project_id}/contacts                                              pat=admin           gated:require_project_member
 GET    /api/projects/{project_id}/datasources                                           pat=jobs:read       gated:require_project_member

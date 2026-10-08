@@ -3,7 +3,10 @@
 The request shape, the 400 for a second selector, the edge resolver (names in
 a scope, ``me``, the execution's own scope, uids, the row fallback) and its
 one non-enumerating refusal, the funnels taking the resolved ids down the
-explicit ``datasource_ids`` branch.
+explicit ``datasource_ids`` branch, the project-defaults source of
+``default_datasource_selection`` and the Project manifest's link entries.
+The same bindings both ways, on a real database, are in
+``tests/test_project_connectors_real_postgres.py``.
 """
 
 from __future__ import annotations
@@ -28,7 +31,10 @@ from orchestrator.services.connector_refs import (
     resolve_connector_refs,
     resolve_execution_connectors,
 )
-from orchestrator.services.datasource_policy import GENERIC_UNAVAILABLE_DETAIL
+from orchestrator.services.datasource_policy import (
+    GENERIC_UNAVAILABLE_DETAIL,
+    default_datasource_selection,
+)
 from orchestrator.services.job_admission import (
     JobAdmissionDependencies,
     admit_job,
@@ -38,6 +44,7 @@ from orchestrator.services.job_admission_datasources import (
     prepare_job_admission_datasources,
 )
 from orchestrator.services.job_admission_scope import JobAdmissionActor
+from orchestrator.services.project_connectors import legacy_alias, link_entries
 from orchestrator.services.thread_admission import (
     resolve_thread_creation_plan,
     select_thread_datasources,
@@ -507,4 +514,133 @@ async def test_session_refs_are_an_explicit_selection(monkeypatch):
     assert dependencies.authorize_thread_datasource_selection.await_args.args[1] == [
         CONNECTOR,
         KB,
+    ]
+
+
+# =============================================================================
+# Project connector defaults in creation-time defaults
+# =============================================================================
+
+
+def _row(datasource_id, *, owner=OWNER, projects=(PROJECT,), automatic=False, **extra):
+    return {
+        "id": datasource_id,
+        "type": "postgresql",
+        "created_by": owner,
+        "is_global": False,
+        "scope_mode": "projects",
+        "auto_attach": automatic,
+        "policy_revision": 1,
+        "project_ids": list(projects),
+        "config": {},
+        **extra,
+    }
+
+
+def _policy_db(rows):
+    db = AsyncMock()
+    db.get_user = AsyncMock(
+        side_effect=lambda user_id: {"id": user_id, "is_approved": True}
+    )
+    db.user_is_member_of_projects = AsyncMock(return_value=True)
+    db.list_default_datasource_candidates = AsyncMock(return_value=rows)
+    return db
+
+
+@pytest.mark.asyncio
+async def test_a_project_default_attaches_for_every_member_while_linked():
+    member = "55555555-5555-4555-8555-555555555555"
+    rows = [
+        _row(CONNECTOR, project_default=True),
+        _row(SECOND),  # linked, but neither a default nor the member's own
+        _row(KB, owner=member, projects=(), automatic=True, scope_mode="all"),
+    ]
+    selected, revisions = await default_datasource_selection(
+        _policy_db(rows), member, [PROJECT], "sandbox"
+    )
+    assert selected == [CONNECTOR, KB]
+    assert revisions == {CONNECTOR: 1, KB: 1}
+
+
+@pytest.mark.asyncio
+async def test_a_project_default_needs_its_link_to_every_target():
+    rows = [
+        _row(
+            CONNECTOR,
+            projects=("66666666-6666-4666-8666-666666666666",),
+            project_default=True,
+        )
+    ]
+    selected, _ = await default_datasource_selection(
+        _policy_db(rows), OWNER, [PROJECT], "sandbox"
+    )
+    assert selected == []
+    selected, _ = await default_datasource_selection(
+        _policy_db([_row(CONNECTOR, project_default=True)]), OWNER, [], "sandbox"
+    )
+    assert selected == []
+
+
+@pytest.mark.asyncio
+async def test_a_project_default_a_lite_tier_cannot_serve_is_left_out():
+    rows = [_row(CONNECTOR, project_default=True, type="repository")]
+    selected, _ = await default_datasource_selection(
+        _policy_db(rows), OWNER, [PROJECT], "virtual"
+    )
+    assert selected == []
+
+
+# =============================================================================
+# A Project manifest's link entries
+# =============================================================================
+
+
+def test_links_are_refs_with_the_row_fallback():
+    rows = [
+        {
+            "id": UUID(CONNECTOR),
+            "policy_revision": 4,
+            "resource_name": "prod-db-aaaaaaaaaaaa",
+            "scope_kind": "Account",
+            "scope_name": OWNER,
+        },
+        {"id": UUID(SECOND), "policy_revision": 2, "resource_name": None},
+    ]
+    entries = link_entries(rows)
+    assert entries == {
+        "prod-db-aaaaaaaaaaaa": (
+            CONNECTOR,
+            {
+                "ref": {
+                    "name": "prod-db-aaaaaaaaaaaa",
+                    "scope": {"kind": "Account", "name": OWNER},
+                }
+            },
+        ),
+        legacy_alias(SECOND): (
+            SECOND,
+            {
+                "inline": {
+                    "driver": "srw.datasource/v1",
+                    "config": {"datasourceId": SECOND, "policyRevision": 2},
+                }
+            },
+        ),
+    }
+
+
+def test_two_links_with_one_resource_name_get_distinct_aliases():
+    rows = [
+        {
+            "id": UUID(value),
+            "policy_revision": 1,
+            "resource_name": "prod-0123456789ab",
+            "scope_kind": "Account",
+            "scope_name": scope,
+        }
+        for value, scope in ((CONNECTOR, OWNER), (SECOND, OTHER_ACCOUNT))
+    ]
+    assert list(link_entries(rows)) == [
+        "prod-0123456789ab",
+        "connector-" + SECOND.replace("-", ""),
     ]

@@ -28979,6 +28979,29 @@ CREATE TABLE public.project_api_keys (
 
 
 --
+-- Name: project_connector_defaults; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.project_connector_defaults (
+    project_id uuid NOT NULL,
+    connector_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL,
+    source text DEFAULT 'settings'::text NOT NULL,
+    manifest_revision text,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_by uuid,
+    CONSTRAINT project_connector_defaults_revision_follows_source CHECK (((source = 'manifest'::text) = (manifest_revision IS NOT NULL))),
+    CONSTRAINT project_connector_defaults_source_check CHECK ((source = ANY (ARRAY['settings'::text, 'manifest'::text])))
+);
+
+
+--
+-- Name: TABLE project_connector_defaults; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.project_connector_defaults IS 'Connector defaults per Project: the linked connectors (datasource ids, which are their Connector uids) attached to new work that takes its defaults. The project knowledge base is implied, never stored.';
+
+
+--
 -- Name: project_contacts; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -34392,6 +34415,14 @@ ALTER TABLE ONLY public.processed_inbound_emails
 
 ALTER TABLE ONLY public.project_api_keys
     ADD CONSTRAINT project_api_keys_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: project_connector_defaults project_connector_defaults_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_connector_defaults
+    ADD CONSTRAINT project_connector_defaults_pkey PRIMARY KEY (project_id);
 
 
 --
@@ -41981,6 +42012,22 @@ ALTER TABLE ONLY public.pinned_job_wait_receipts
 
 ALTER TABLE ONLY public.project_api_keys
     ADD CONSTRAINT project_api_keys_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: project_connector_defaults project_connector_defaults_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_connector_defaults
+    ADD CONSTRAINT project_connector_defaults_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: project_connector_defaults project_connector_defaults_updated_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_connector_defaults
+    ADD CONSTRAINT project_connector_defaults_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES public.users(id) ON DELETE SET NULL;
 
 
 --

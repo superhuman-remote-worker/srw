@@ -391,9 +391,11 @@ def _lifespan_environment(
     import orchestrator.services.manifest_connectors as manifest_connectors
     import orchestrator.services.manifest_experts as manifest_experts
     import orchestrator.services.manifest_projects as manifest_projects
+    import orchestrator.services.project_connectors as project_connectors
 
     monkeypatch.setattr(manifest_experts, "migrate_stored_experts", AsyncMock())
     monkeypatch.setattr(manifest_connectors, "migrate_stored_connectors", AsyncMock())
+    monkeypatch.setattr(project_connectors, "heal_project_connectors", AsyncMock())
     monkeypatch.setattr(manifest_experts, "seed_bundled_expert_manifests", AsyncMock())
     monkeypatch.setattr(manifest_experts, "installed_srw_image", lambda: None)
     monkeypatch.setattr(manifest_projects, "migrate_projects", AsyncMock())

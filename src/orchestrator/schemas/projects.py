@@ -1,6 +1,8 @@
 """Project, membership, repository and promotion request contracts."""
 
 from typing import Any, Literal
+from uuid import UUID
+
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -137,6 +139,21 @@ class ProjectWorkspaceDefaultsUpdate(BaseModel):
     sessions: WorkspaceMode | None = None
     container: WorkspaceTemplateRef | None = None
     vm: WorkspaceTemplateRef | None = None
+
+
+class ProjectConnectorDefaultsUpdate(BaseModel):
+    """Body for PUT /api/projects/{id}/connector-defaults: the linked
+    connectors new work in the Project attaches when it takes its defaults.
+    The project knowledge base is always the first default and is not listed."""
+
+    model_config = ConfigDict(extra="forbid")
+    connector_ids: list[UUID] = Field(
+        default_factory=list,
+        description=(
+            "Connector ids (their Connector uids), each linked to the Project, "
+            "in order."
+        ),
+    )
 
 
 class ProjectMemberAdd(BaseModel):

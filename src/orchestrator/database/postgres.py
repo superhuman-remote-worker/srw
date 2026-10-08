@@ -1265,6 +1265,10 @@ def _writes_connector(*, from_result: bool = False):
     the method's ``datasource_id`` argument, or with ``from_result`` the id
     of the row it returns. A falsy result (nothing found, nothing changed)
     writes nothing more.
+
+    The Project manifests of every project the connector was or is linked
+    to are refreshed last (``project_connectors``, slice D3c): a Project
+    lists its links as Connector refs.
     """
 
     def decorate(method):
@@ -1274,16 +1278,19 @@ def _writes_connector(*, from_result: bool = False):
         async def wrapper(self, *args, **kwargs):
             async with self.transaction_scope():
                 await self._lock_connector_catalog()
+                named = (
+                    None
+                    if from_result
+                    else signature.bind(self, *args, **kwargs).arguments[
+                        "datasource_id"
+                    ]
+                )
+                before = await self._connector_link_projects(named) if named else set()
                 result = await method(self, *args, **kwargs)
                 if result:
-                    datasource_id = (
-                        result["id"]
-                        if from_result
-                        else signature.bind(self, *args, **kwargs).arguments[
-                            "datasource_id"
-                        ]
-                    )
+                    datasource_id = result["id"] if from_result else named
                     await self._persist_connector_resource(datasource_id)
+                    await self._refresh_connector_projects(datasource_id, before)
             return result
 
         return wrapper
@@ -50419,6 +50426,30 @@ class PostgresDB:
 
         return await persist_connector_resource(self, datasource_id)
 
+    async def _connector_link_projects(self, datasource_id: Any) -> set[str]:
+        """The projects a connector is linked to (none for a malformed id)."""
+        try:
+            uid = UUID(str(datasource_id))
+        except ValueError:
+            return set()
+        rows = await self.fetch(
+            "SELECT project_id FROM project_datasources WHERE datasource_id=$1",
+            uid,
+        )
+        return {str(row["project_id"]) for row in rows}
+
+    async def _refresh_connector_projects(
+        self, datasource_id: Any, before: set[str]
+    ) -> None:
+        """Refresh the Project manifests of the projects the connector was
+        linked to before the write and is linked to after it."""
+        from orchestrator.services.project_connectors import (
+            refresh_project_connectors,
+        )
+
+        after = await self._connector_link_projects(datasource_id)
+        await refresh_project_connectors(self, before | after)
+
     async def get_datasource_tombstones(self, ids: list[str]) -> dict[str, str]:
         """Names of deleted connectors, for labelling drifted session config."""
         if not ids:
@@ -51679,10 +51710,13 @@ class PostgresDB:
         """Load only rows that may participate in automatic defaulting.
 
         Ordinary candidates must be owned by ``effective_work_owner_id`` and
-        have ``auto_attach=true``. Native project KB rows are the sole
-        ownerless/project-managed exception. The central policy service still
-        applies scope, membership, tier, and native-marker checks before it
-        returns IDs.
+        have ``auto_attach=true``. Native project KB rows are the
+        ownerless/project-managed exception, and the target projects'
+        connector defaults (``project_connector_defaults``, slice D3c) add the
+        connectors a project admin chose, while they stay linked; those rows
+        carry ``project_default``. The central policy service still applies
+        scope, membership, tier, and native-marker checks before it returns
+        IDs.
         """
         try:
             owner_uuid = (
@@ -51700,29 +51734,48 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
+                WITH project_defaults AS (
+                    SELECT DISTINCT stored.connector_id
+                    FROM project_connector_defaults pcd
+                    CROSS JOIN LATERAL unnest(pcd.connector_ids)
+                        AS stored(connector_id)
+                    JOIN project_datasources linked
+                      ON linked.project_id = pcd.project_id
+                     AND linked.datasource_id = stored.connector_id
+                    WHERE pcd.project_id = ANY($3::uuid[])
+                )
                 SELECT d.id, d.type, d.created_by, d.is_global, d.config,
                        d.scope_mode, d.auto_attach, d.policy_revision,
                        COALESCE(
                            array_agg(pd.project_id ORDER BY pd.project_id)
                                FILTER (WHERE pd.project_id IS NOT NULL),
                            ARRAY[]::uuid[]
-                       ) AS project_ids
+                       ) AS project_ids,
+                       d.id IN (SELECT connector_id FROM project_defaults)
+                           AS project_default
                 FROM datasources d
                 LEFT JOIN project_datasources pd ON pd.datasource_id = d.id
                 WHERE d.job_id IS NULL
-                  AND d.auto_attach = TRUE
                   AND (
-                      d.created_by = $1
-                      OR (
-                          d.type = 'kb'
-                          AND d.config->>'native_project_id' = ANY($2::text[])
+                      (
+                          d.auto_attach = TRUE
+                          AND (
+                              d.created_by = $1
+                              OR (
+                                  d.type = 'kb'
+                                  AND d.config->>'native_project_id'
+                                      = ANY($2::text[])
+                              )
+                          )
                       )
+                      OR d.id IN (SELECT connector_id FROM project_defaults)
                   )
                 GROUP BY d.id
                 ORDER BY d.type, d.id
                 """,
                 owner_uuid,
                 project_id_strings,
+                project_uuids,
             )
         return [_datasource_row_to_dict(row) for row in rows]
 
