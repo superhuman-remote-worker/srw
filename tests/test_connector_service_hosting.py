@@ -385,6 +385,60 @@ def test_the_egress_route_needs_access_to_the_connector_and_shows_its_pods():
 
 
 @pytest.mark.asyncio
+async def test_preparing_a_delivery_without_service_drivers_touches_nothing():
+    from orchestrator.services import connector_credential_leases as leases
+
+    class Untouchable:
+        def acquire(self):
+            raise AssertionError("no service entry: no database work")
+
+    await leases.prepare_lease_delivery(
+        Untouchable(),
+        [{"type": "lease_probe", "datasource_id": IDENTITY.connector_id}, "junk"],
+        owner=leases.LeaseOwner.thread(IDENTITY.identity_id),
+    )
+
+
+@pytest.mark.parametrize(
+    ("module", "function", "delivery"),
+    [
+        (
+            "job_start_bundle",
+            "build_job_start_request",
+            "deliver_connector_leases_with(",
+        ),
+        (
+            "job_control_delivery",
+            "resume_job_on_agent",
+            "deliver_connector_leases_with(",
+        ),
+        ("unit_claim_bundle", "_assemble_claim_bundle", "_deliver_claim_leases("),
+    ],
+)
+def test_every_dispatch_prepares_service_images_before_its_transaction(
+    module, function, delivery
+):
+    """The registry lookup happens before the delivery's transaction opens:
+    each delivery is preceded by a prepare, and in the claim, by a prepare
+    before its ``conn.transaction()``."""
+    import importlib
+    import inspect
+
+    source = inspect.getsource(
+        getattr(importlib.import_module(f"orchestrator.services.{module}"), function)
+    )
+    prepares = [
+        i for i in range(len(source)) if source.startswith("prepare_lease_delivery(", i)
+    ]
+    deliveries = [i for i in range(len(source)) if source.startswith(delivery, i)]
+    assert prepares and len(prepares) == len(deliveries)
+    for prepare, deliver in zip(prepares, deliveries):
+        assert prepare < deliver
+        if module == "unit_claim_bundle":
+            assert prepare < source.index("conn.transaction()", prepare) < deliver
+
+
+@pytest.mark.asyncio
 async def test_the_loop_runs_passes_until_shutdown_and_survives_errors():
     shutdown = asyncio.Event()
     passes: list[str] = []

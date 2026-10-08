@@ -738,10 +738,16 @@ async def build_job_start_request(
         # bundle mints nothing. The stateless claim defers this to its claim
         # transaction, where the run_queue lease is re-checked.
         if deliver_connector_leases:
+            lease_owner = connector_credential_leases.job_lease_owner(job)
+            # A service driver's image is looked up first, outside any
+            # transaction (D5); the delivery then only applies it.
+            await connector_credential_leases.prepare_lease_delivery(
+                postgres_db, datasources_payload, owner=lease_owner
+            )
             await connector_credential_leases.deliver_connector_leases_with(
                 postgres_db,
                 datasources_payload,
-                owner=connector_credential_leases.job_lease_owner(job),
+                owner=lease_owner,
             )
 
         # Build job start request. resolved_config and config_override are

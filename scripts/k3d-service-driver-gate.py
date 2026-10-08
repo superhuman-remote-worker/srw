@@ -402,26 +402,31 @@ from shared.connectors.builtin import ECHO_SERVICE_SPEC
 from shared.oci_registry import DEFAULT_TOKEN_HOSTS, RegistryResolver
 cap_memory()
 request = json.loads(sys.stdin.readline())
-images.configure_service_images(images.ServiceImageSettings(
-    references={ECHO_SERVICE_SPEC.name: request["reference"]},
-    resolver=RegistryResolver(
-        hosts=None, insecure_hosts=set(request["insecure_hosts"]),
-        token_hosts=DEFAULT_TOKEN_HOSTS, same_host_tokens=True, timeout=20,
-    ),
-    cache_seconds=0, timeout_seconds=30,
-))
 
 async def main():
-    db = PostgresDB(min_connections=1, max_connections=2)
+    db = PostgresDB(min_connections=1, max_connections=3)
     await db.connect()
+    images.configure_service_images(images.ServiceImageSettings(
+        references={ECHO_SERVICE_SPEC.name: request["reference"]},
+        resolver=RegistryResolver(
+            hosts=None, insecure_hosts=set(request["insecure_hosts"]),
+            token_hosts=DEFAULT_TOKEN_HOSTS, same_host_tokens=True, timeout=20,
+        ),
+        cache_seconds=30, timeout_seconds=30, store=db,
+    ))
     try:
         owner = leases.LeaseOwner.thread(request["owner"])
+        entry = {"type": "echo_service", "datasource_id": request["connector"]}
+        # As a dispatch does: the image is decided before the transaction,
+        # and the bind inside it applies the decision.
+        await leases.prepare_lease_delivery(db, [entry], owner=owner)
         async with db.acquire() as conn:
             try:
-                digest = await images.bind_service_image(
-                    conn, spec=ECHO_SERVICE_SPEC,
-                    connector_id=request["connector"], owner=owner,
-                )
+                async with conn.transaction():
+                    digest = await images.bind_service_image(
+                        conn, spec=ECHO_SERVICE_SPEC,
+                        connector_id=request["connector"], owner=owner,
+                    )
             except images.ServiceImageRefused as exc:
                 return {"refused": str(exc)}
             if request.get("record"):

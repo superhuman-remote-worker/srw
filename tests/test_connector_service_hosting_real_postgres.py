@@ -6,10 +6,14 @@ Driver image resolutions and the moved-tag refusal at bind run against
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import dataclasses
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -179,11 +183,14 @@ def _label(**over) -> dict:
 
 
 @pytest.fixture
-def registry():
+def registry(db):
     resolver = _Resolver()
     images.configure_service_images(
         images.ServiceImageSettings(
-            references={DRIVER: REFERENCE}, resolver=resolver, cache_seconds=0
+            references={DRIVER: REFERENCE},
+            resolver=resolver,
+            cache_seconds=0,
+            store=db,
         )
     )
     return resolver
@@ -246,13 +253,9 @@ async def test_image_rows_reject_malformed_values(db):
 @pytest.mark.asyncio
 async def test_a_resolution_is_recorded_once_per_digest_and_refreshed(db, registry):
     registry.push(D1, _label())
+    first = await images.resolve_driver_image(db, driver=DRIVER, reference=REFERENCE)
+    again = await images.resolve_driver_image(db, driver=DRIVER, reference=REFERENCE)
     async with db.acquire() as conn:
-        first = await images.resolve_driver_image(
-            conn, driver=DRIVER, reference=REFERENCE
-        )
-        again = await images.resolve_driver_image(
-            conn, driver=DRIVER, reference=REFERENCE
-        )
         rows = await conn.fetch("SELECT * FROM connector_driver_images")
     assert first.digest == again.digest == D1
     assert len(rows) == 1
@@ -358,6 +361,196 @@ async def test_a_driver_without_an_image_fails_the_bind(db, registry):
         await _bind(db, await _connector(db), await _thread(db))
 
 
+# =============================================================================
+# No registry lookup and no write inside the caller's transaction
+# =============================================================================
+
+
+async def _count(db, query: str, *args) -> int:
+    async with db.acquire() as conn:
+        return int(await conn.fetchval(query, *args))
+
+
+@pytest.mark.asyncio
+async def test_a_bind_inside_a_transaction_commits_its_image_row_apart(db, registry):
+    connector, thread = await _connector(db), await _thread(db)
+    registry.push(D1, _label())
+    owner = leases.LeaseOwner.thread(thread)
+    async with db.acquire() as conn:
+        transaction = conn.transaction()
+        await transaction.start()
+        digest = await images.bind_service_image(
+            conn, spec=SERVICE, connector_id=connector, owner=owner
+        )
+        # Committed on its own connection while the caller's is still open.
+        assert await _count(db, "SELECT count(*) FROM connector_driver_images") == 1
+        await transaction.rollback()
+    assert digest == D1
+    assert await _count(db, "SELECT count(*) FROM connector_driver_images") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_bind_inside_a_transaction_scope_still_writes_apart(db, registry):
+    """Inside ``transaction_scope`` the task's acquisitions share the scope's
+    connection; the bind's writes run in a task of their own."""
+    connector, thread = await _connector(db), await _thread(db)
+    registry.push(D1, _label())
+    owner = leases.LeaseOwner.thread(thread)
+    with pytest.raises(RuntimeError, match="caller rolls back"):
+        async with db.transaction_scope():
+            async with db.acquire() as conn:
+                await images.bind_service_image(
+                    conn, spec=SERVICE, connector_id=connector, owner=owner
+                )
+            raise RuntimeError("caller rolls back")
+    assert await _count(db, "SELECT count(*) FROM connector_driver_images") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_audit_survives_the_callers_rollback(db, registry):
+    connector = await _connector(db)
+    registry.push(D1, _label())
+    await _bind(db, connector, await _thread(db))
+    registry.push(D2, _label(protocol_version="2.0"))
+    owner = leases.LeaseOwner.thread(await _thread(db))
+    async with db.acquire() as conn:
+        transaction = conn.transaction()
+        await transaction.start()
+        with pytest.raises(images.ServiceImageRefused):
+            await images.bind_service_image(
+                conn, spec=SERVICE, connector_id=connector, owner=owner
+            )
+        await transaction.rollback()
+    assert (
+        await _count(
+            db,
+            "SELECT count(*) FROM security_events "
+            "WHERE event_type = 'connector_driver_image_refused' AND resource_id = $1",
+            connector,
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_slow_registry_costs_a_bind_its_cap_and_is_remembered(db, registry):
+    calls: list[str] = []
+
+    class Slow:
+        async def resolve_image(self, image):
+            calls.append(image)
+            await asyncio.sleep(30)
+
+    images.configure_service_images(
+        images.ServiceImageSettings(
+            references={DRIVER: REFERENCE},
+            resolver=Slow(),
+            cache_seconds=60,
+            bind_timeout_seconds=0.5,
+            store=db,
+        )
+    )
+    connector = await _connector(db)
+    for _ in range(2):
+        started = time.monotonic()
+        with pytest.raises(images.ServiceImageUnavailable):
+            await _bind(db, connector, await _thread(db))
+        assert time.monotonic() - started < 5
+    # The failure is remembered for the window: the registry was asked once.
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_prepared_decision_spares_the_bind_the_registry(db, registry):
+    connector, thread = await _connector(db), await _thread(db)
+    registry.push(D1, _label())
+    images.configure_service_images(
+        dataclasses.replace(images.service_image_settings(), cache_seconds=60)
+    )
+    entry = {"type": "echo_service", "name": "e", "datasource_id": connector}
+    owner = leases.LeaseOwner.thread(thread)
+    with mock.patch.object(leases, "lease_spec", lambda entry: SERVICE):
+        await leases.prepare_lease_delivery(db, [entry], owner=owner)
+    calls = registry.calls
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            digest = await images.bind_service_image(
+                conn, spec=SERVICE, connector_id=connector, owner=owner
+            )
+    assert digest == D1 and registry.calls == calls
+
+
+SERVICE_B = dataclasses.replace(SERVICE, name="srw.test-service-b/v1")
+REFERENCE_B = "ghcr.io/org/other:latest"
+
+
+class _TwoImages:
+    """A registry with one image per repository."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def resolve_image(self, image: str) -> ResolvedImage:
+        self.calls += 1
+        await asyncio.sleep(0.05)  # let the two claims interleave
+        digest = D2 if "/other" in image else D1
+        return ResolvedImage(
+            reference=f"{image.rsplit(':', 1)[0]}@{digest}",
+            digest=digest,
+            entrypoint=("/echo",),
+        )
+
+
+@pytest.mark.asyncio
+async def test_two_claims_binding_two_service_drivers_do_not_deadlock(db):
+    """Two claim transactions, each binding a connector of each of two
+    service drivers, at once: neither waits on the other's image rows."""
+    images.configure_service_images(
+        images.ServiceImageSettings(
+            references={DRIVER: REFERENCE, SERVICE_B.name: REFERENCE_B},
+            resolver=_TwoImages(),
+            cache_seconds=0,
+            store=db,
+        )
+    )
+    a = await _connector(db)
+    b = await _connector(db)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE datasources SET type = 'echo_service_b' WHERE id = $1", UUID(b)
+        )
+    specs = {"echo_service": SERVICE, "echo_service_b": SERVICE_B}
+
+    async def claim(thread: str) -> int:
+        entries = [
+            {"type": "echo_service", "name": "a", "datasource_id": a},
+            {"type": "echo_service_b", "name": "b", "datasource_id": b},
+        ]
+        async with db.acquire() as conn:
+            async with conn.transaction():
+                delivered = await leases.deliver_connector_leases(
+                    conn, entries, owner=leases.LeaseOwner.thread(thread)
+                )
+                await asyncio.sleep(0.2)  # hold the claim open
+                return delivered
+
+    with mock.patch.object(
+        leases, "lease_spec", lambda entry: specs.get(entry.get("type"))
+    ):
+        delivered = await asyncio.wait_for(
+            asyncio.gather(claim(await _thread(db)), claim(await _thread(db))),
+            timeout=30,
+        )
+    assert delivered == [2, 2]
+    digests = await _count(
+        db,
+        "SELECT count(DISTINCT image_digest) FROM connector_credential_leases "
+        "WHERE image_digest IS NOT NULL",
+    )
+    assert digests == 2
+    assert await _count(db, "SELECT count(*) FROM connector_driver_images") == 2
+
+
 @pytest.mark.asyncio
 async def test_ensure_image_resolves_a_digest_no_row_holds(db, registry):
     registry.push(D1, _label())
@@ -367,7 +560,7 @@ async def test_ensure_image_resolves_a_digest_no_row_holds(db, registry):
         )
         assert image.entrypoint == ("/echo",)
         assert await conn.fetchval("SELECT count(*) FROM connector_driver_images") == 1
-        with pytest.raises(images.ServiceImageUnavailable, match="another digest"):
+        with pytest.raises(images.ServiceImageUnavailable, match="cannot be resolved"):
             await images.ensure_image(
                 conn, driver=DRIVER, reference=REFERENCE, digest=D2
             )

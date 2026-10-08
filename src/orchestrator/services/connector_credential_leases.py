@@ -530,6 +530,31 @@ async def deliver_connector_leases(
     return delivered
 
 
+async def prepare_lease_delivery(
+    db: Any, entries: Sequence[Any] | None, *, owner: LeaseOwner
+) -> None:
+    """What a delivery needs done before its caller opens a transaction.
+
+    A new binding of a service-plane driver runs on an image digest the
+    registry answers (D5): the lookup, the image row and a refusal audit
+    happen here, on ``db``'s own connections, so the delivery inside the
+    caller's transaction does no network and no write of its own. No-op
+    without such an entry; never raises (the delivery applies the outcome).
+    """
+    if not any(
+        isinstance(entry, Mapping)
+        and (spec := lease_spec(entry)) is not None
+        and spec.plane == "service"
+        for entry in entries or ()
+    ):
+        return
+    from orchestrator.services.connector_service_images import (
+        prepare_service_images,
+    )
+
+    await prepare_service_images(entries, owner=owner, store=db)
+
+
 async def deliver_connector_leases_with(
     db: Any,
     entries: Sequence[Any] | None,
@@ -930,6 +955,7 @@ __all__ = [
     "lease_sweep_seconds",
     "lease_ttl_seconds",
     "needs_leases",
+    "prepare_lease_delivery",
     "record_lease_event",
     "renew_live_leases",
     "retire_expired_leases",

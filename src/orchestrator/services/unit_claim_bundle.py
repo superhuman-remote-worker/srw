@@ -871,6 +871,13 @@ async def _assemble_claim_bundle(
         # not authorize a later stolen lease, and the transactional recheck
         # keeps that window to milliseconds. The Kubernetes/DB observations
         # are not one atomic transaction.
+        # A service driver's image is looked up before the claim
+        # transaction opens (D5): inside it the delivery only applies it.
+        await connector_credential_leases.prepare_lease_delivery(
+            dependencies.db,
+            job_start.datasources,
+            owner=connector_credential_leases.job_lease_owner(job),
+        )
         async with dependencies.db.acquire() as conn:
             async with conn.transaction():
                 await _validate_worker_lease(
@@ -1006,6 +1013,13 @@ async def _assemble_claim_bundle(
 
     lease_still_current = False
     pending_memory: dict[str, Any] | None = None
+    # A service driver's image is looked up before the claim transaction
+    # opens and outside the datasource lock (D5).
+    await connector_credential_leases.prepare_lease_delivery(
+        dependencies.db,
+        attach.get("datasources"),
+        owner=connector_credential_leases.LeaseOwner.thread(unit_id),
+    )
     async with dependencies.db.acquire() as conn:
         async with conn.transaction():
             final_thread = await conn.fetchrow(

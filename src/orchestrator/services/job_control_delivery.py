@@ -880,10 +880,14 @@ async def resume_job_on_agent(
         # leases lapsed while it waited, so resume issues new ones; a lease
         # still live is delivered again. In place, in ``datasources``.
         try:
+            lease_owner = connector_credential_leases.job_lease_owner(job)
+            await connector_credential_leases.prepare_lease_delivery(
+                dependencies.store, datasources_payload, owner=lease_owner
+            )
             await connector_credential_leases.deliver_connector_leases_with(
                 dependencies.store,
                 datasources_payload,
-                owner=connector_credential_leases.job_lease_owner(job),
+                owner=lease_owner,
             )
         except connector_credential_leases.LeaseDeliveryError as exc:
             dependencies.logger.warning(

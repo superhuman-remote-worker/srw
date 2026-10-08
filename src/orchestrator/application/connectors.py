@@ -162,6 +162,9 @@ def service_image_settings(resources: ApplicationResources) -> ServiceImageSetti
         ),
         cache_seconds=settings.connector_driver_resolve_cache_seconds,
         timeout_seconds=settings.connector_driver_resolve_timeout_seconds,
+        # Image rows and refusal audits are written on this store's own
+        # connections, never in a bind's caller's transaction.
+        store=resources.postgres_db,
     )
 
 

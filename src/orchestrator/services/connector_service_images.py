@@ -9,9 +9,17 @@ the digest it was issued with, so a moved tag starts a new pod for new
 bindings while the old pod serves the existing ones.
 
 * **Pin or follow.** A digest reference is exact; any tag is looked up
-  (:mod:`shared.connectors.images`). Lookups are cached for a few seconds per
-  reference and bounded by a deadline, since a bind may run inside its
-  caller's transaction.
+  (:mod:`shared.connectors.images`). A lookup, failed or not, is reused for
+  the cache window.
+* **Never inside a caller's transaction.** A bind runs inside its caller's
+  transaction and under its locks (the stateless claim, the thread
+  datasource lock, pinned dispatch). Callers that can call
+  :func:`prepare_service_images` before they open it: the registry lookup,
+  the image row and a refusal audit happen there, on the store's own
+  connections, and the bind applies the remembered decision. A bind with no
+  decision makes one on the store's own connections too, capped at
+  ``bind_timeout_seconds``; it only reads on the caller's connection, so
+  two claims never wait on each other's image rows.
 * **Registry unreachable.** A reference reuses the last digest it resolved
   to, marked stale in the log; a reference that never resolved fails the
   bind.
@@ -30,10 +38,10 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, TypeVar
 from uuid import UUID
 
 from orchestrator.services.connector_credential_leases import (
@@ -55,8 +63,13 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CACHE_SECONDS = 60.0
 DEFAULT_TIMEOUT_SECONDS = 10.0
+#: The longest a bind waits on a registry it has no answer for: a bind may
+#: run inside its caller's transaction and under its locks.
+DEFAULT_BIND_TIMEOUT_SECONDS = 2.0
 #: The most schema errors a refusal lists.
 _MAX_CONFIG_ERRORS = 3
+
+T = TypeVar("T")
 
 
 class ServiceImageUnavailable(LeaseDeliveryError):
@@ -74,12 +87,18 @@ class ServiceImageSettings:
     ``references`` maps a driver name to its image reference (the
     registration's, D6; the development echo driver's from the chart).
     ``resolver`` is a :class:`shared.oci_registry.RegistryResolver`.
+    ``store`` is the application's database: image rows and refusal audits
+    are written on its connections, in their own short transactions, never in
+    a caller's. ``bind_timeout_seconds`` caps a bind that finds no answer
+    prepared before its transaction.
     """
 
     references: Mapping[str, str] = field(default_factory=dict)
     resolver: Any = None
     cache_seconds: float = DEFAULT_CACHE_SECONDS
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    bind_timeout_seconds: float = DEFAULT_BIND_TIMEOUT_SECONDS
+    store: Any = None
 
 
 @dataclass(frozen=True)
@@ -108,17 +127,35 @@ class BoundImage:
         }
 
 
+@dataclass(frozen=True)
+class _Failure:
+    """A reference that did not resolve, remembered for the cache window."""
+
+
+@dataclass(frozen=True)
+class _Decision:
+    """What a bind of one connector gets: a digest, or why not."""
+
+    digest: str | None = None
+    refusal: str | None = None
+    unavailable: str | None = None
+
+
 #: The process's image settings, set when the application is built (as
-#: ``connector_credential_leases.configure_lease_window`` does), and the
-#: resolution cache: reference -> (monotonic expiry, resolved image).
+#: ``connector_credential_leases.configure_lease_window`` does); the
+#: resolution cache, (driver, reference) -> (monotonic expiry, image or
+#: failure); and the bind decisions, (driver, reference, connector) ->
+#: (monotonic expiry, decision).
 _state: dict[str, Any] = {"settings": ServiceImageSettings()}
 _cache: dict[tuple[str, str], tuple[float, Any]] = {}
+_decisions: dict[tuple[str, str, str], tuple[float, _Decision]] = {}
 
 
 def configure_service_images(settings: ServiceImageSettings) -> None:
-    """Install the image settings and forget every cached resolution."""
+    """Install the image settings and forget every cached answer."""
     _state["settings"] = settings
     _cache.clear()
+    _decisions.clear()
 
 
 def service_image_settings() -> ServiceImageSettings:
@@ -128,6 +165,22 @@ def service_image_settings() -> ServiceImageSettings:
 def image_reference_for(driver: str) -> str | None:
     """The image reference a service driver runs, if one is configured."""
     return service_image_settings().references.get(driver)
+
+
+def _unavailable(driver: str) -> str:
+    # Generic on purpose: the registry's own answer can describe internal
+    # services, and this message reaches the connector's readers.
+    return f"The image of the service driver {driver} cannot be resolved"
+
+
+async def _apart(work: Callable[[], Awaitable[T]], *, timeout: float) -> T:
+    """Run ``work`` in a task of its own, bounded by ``timeout``.
+
+    A child task never shares its parent's ``transaction_scope`` connection,
+    so every store connection ``work`` acquires is a new one: what it writes
+    commits on its own, and it holds no lock of the caller's transaction.
+    """
+    return await asyncio.wait_for(asyncio.create_task(work()), timeout)
 
 
 def _json_list(value: Any) -> tuple[str, ...]:
@@ -218,23 +271,30 @@ async def _last_resolution(
 
 
 async def resolve_driver_image(
-    conn: Any,
+    store: Any,
     *,
     driver: str,
     reference: str,
+    timeout: float | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> BoundImage:
     """Resolve ``reference`` for ``driver`` now (or from the brief cache).
 
-    Raises :class:`ServiceImageUnavailable` when the registry cannot answer
-    and this reference never resolved before.
+    The registry is asked at most once per cache window, a failure included;
+    the resolution is recorded on a connection of ``store``. Raises
+    :class:`ServiceImageUnavailable` when the registry cannot answer and this
+    reference never resolved before. Call it outside any transaction, or
+    through :func:`_apart`.
     """
     settings = service_image_settings()
     parsed = ImageReference.parse(reference)
     key = (driver, reference)
+    window = max(0.0, settings.cache_seconds)
     cached = _cache.get(key)
     now = clock()
     if cached is not None and cached[0] > now:
+        if isinstance(cached[1], _Failure):
+            raise ServiceImageUnavailable(_unavailable(driver))
         return cached[1]
     resolved = None
     if settings.resolver is None:
@@ -243,29 +303,29 @@ async def resolve_driver_image(
         try:
             resolved = await asyncio.wait_for(
                 settings.resolver.resolve_image(parsed.lookup()),
-                timeout=settings.timeout_seconds,
+                timeout=timeout or settings.timeout_seconds,
             )
         except (TimeoutError, asyncio.TimeoutError):
             problem = "the registry did not answer in time"
         except Exception as exc:  # resolution, transport, protocol
             problem = str(exc) or type(exc).__name__
     if resolved is None:
-        last = await _last_resolution(
-            conn, driver=driver, reference=reference, digest=parsed.digest
-        )
-        if last is None:
-            raise ServiceImageUnavailable(
-                f"The image {reference} cannot be resolved ({problem})"
+        async with store.acquire() as conn:
+            last = await _last_resolution(
+                conn, driver=driver, reference=reference, digest=parsed.digest
             )
         logger.warning(
-            "Driver %s image %s did not resolve (%s); reusing digest %s "
-            "resolved at %s (stale)",
+            "Driver %s image %s did not resolve (%s)%s",
             driver,
             reference,
             problem,
-            last.digest,
-            last.resolved_at,
+            f"; reusing digest {last.digest} resolved at {last.resolved_at} (stale)"
+            if last is not None
+            else "",
         )
+        if last is None:
+            _cache[key] = (now + window, _Failure())
+            raise ServiceImageUnavailable(_unavailable(driver))
         return last
     try:
         spec = label_spec(resolved.labels)
@@ -278,10 +338,11 @@ async def resolve_driver_image(
         raise ServiceImageRefused(
             refusal_message(reference, [f"its spec label is unreadable: {exc}"])
         ) from exc
-    bound = await _record(
-        conn, driver=driver, reference=reference, resolved=resolved, spec=spec
-    )
-    _cache[key] = (now + max(0.0, settings.cache_seconds), bound)
+    async with store.acquire() as conn:
+        bound = await _record(
+            conn, driver=driver, reference=reference, resolved=resolved, spec=spec
+        )
+    _cache[key] = (now + window, bound)
     return bound
 
 
@@ -300,13 +361,13 @@ async def ensure_image(
     conn: Any, *, driver: str, reference: str, digest: str
 ) -> BoundImage:
     """The recorded image of ``digest``, resolving it by digest if no row
-    holds it (a bind whose transaction rolled back recorded nothing)."""
+    holds it. For the reconciler, which holds no caller's transaction."""
     image = await image_for_digest(conn, driver=driver, digest=digest)
     if image is not None:
         return image
     settings = service_image_settings()
     if settings.resolver is None:
-        raise ServiceImageUnavailable("no image resolver is configured")
+        raise ServiceImageUnavailable(_unavailable(driver))
     pinned = ImageReference.parse(reference).at(digest)
     try:
         resolved = await asyncio.wait_for(
@@ -315,13 +376,11 @@ async def ensure_image(
         )
         spec = label_spec(resolved.labels)
     except Exception as exc:
-        raise ServiceImageUnavailable(
-            f"The image {pinned} cannot be resolved ({exc or type(exc).__name__})"
-        ) from exc
+        logger.warning("Driver %s image %s did not resolve: %s", driver, pinned, exc)
+        raise ServiceImageUnavailable(_unavailable(driver)) from exc
     if resolved.digest != digest:
-        raise ServiceImageUnavailable(
-            f"The registry answered {pinned} with another digest"
-        )
+        logger.warning("The registry answered %s with another digest", pinned)
+        raise ServiceImageUnavailable(_unavailable(driver))
     return await _record(
         conn, driver=driver, reference=reference, resolved=resolved, spec=spec
     )
@@ -408,6 +467,145 @@ async def check_moved_image(
     )
 
 
+_HELD = """
+SELECT image_digest FROM connector_credential_leases
+ WHERE {column} = $1 AND connector_id = $2
+   AND revoked_at IS NULL AND expires_at > now()
+   AND image_digest IS NOT NULL
+"""
+
+
+async def _held_digest(conn: Any, owner: LeaseOwner, connector_id: str) -> str | None:
+    """The digest a live lease of ``owner`` already binds the connector at."""
+    held = await conn.fetchval(
+        _HELD.format(column=owner.column), UUID(owner.id), UUID(str(connector_id))
+    )
+    return str(held) if held else None
+
+
+async def _decide(
+    store: Any,
+    *,
+    spec: DriverSpec,
+    reference: str,
+    connector_id: str,
+    owner: LeaseOwner,
+    timeout: float,
+) -> _Decision:
+    """Resolve, check and audit one bind on ``store``'s own connections."""
+    try:
+        image = await resolve_driver_image(
+            store, driver=spec.name, reference=reference, timeout=timeout
+        )
+    except ServiceImageRefused as exc:
+        return _Decision(refusal=str(exc))
+    except ServiceImageUnavailable as exc:
+        return _Decision(unavailable=str(exc))
+    async with store.acquire() as conn:
+        problems = await check_moved_image(
+            conn, spec=spec, connector_id=connector_id, image=image
+        )
+        if not problems:
+            return _Decision(digest=image.digest)
+        # Audited on this connection, so the record survives a caller that
+        # rolls back after the refusal.
+        await record_lease_event(
+            conn,
+            event_type="connector_driver_image_refused",
+            resource_type="connector",
+            resource_id=str(UUID(str(connector_id))),
+            detail=(
+                f"driver={spec.name} reference={reference} digest={image.digest} "
+                f"owner={owner.kind}:{owner.id} problems={'; '.join(problems)}"
+            ),
+        )
+    return _Decision(refusal=refusal_message(reference, problems))
+
+
+def _remember(
+    key: tuple[str, str, str],
+    decision: _Decision,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+) -> None:
+    window = max(0.0, service_image_settings().cache_seconds)
+    _decisions[key] = (clock() + window, decision)
+
+
+def _recalled(
+    key: tuple[str, str, str], *, clock: Callable[[], float] = time.monotonic
+) -> _Decision | None:
+    found = _decisions.get(key)
+    return found[1] if found is not None and found[0] > clock() else None
+
+
+def _service_lease_entries(entries: Any) -> list[tuple[DriverSpec, str]]:
+    """``(spec, connector id)`` of every service-driver lease entry."""
+    from orchestrator.services.connector_credential_leases import lease_spec
+
+    found = []
+    for entry in entries or ():
+        spec = lease_spec(entry) if isinstance(entry, Mapping) else None
+        if spec is None or spec.plane != "service":
+            continue
+        connector_id = str(entry.get("datasource_id") or "")
+        try:
+            UUID(connector_id)
+        except ValueError:
+            continue
+        found.append((spec, connector_id))
+    return found
+
+
+async def prepare_service_images(
+    entries: Any, *, owner: LeaseOwner, store: Any
+) -> None:
+    """Decide the image of every new service-driver binding in ``entries``,
+    before the caller opens its transaction.
+
+    The registry lookup (with its full deadline), the image row and a refusal
+    audit happen here, each on ``store``'s own connections; the decision is
+    remembered for the cache window, so the bind inside the caller's
+    transaction reads it and does no network or write of its own. A binding a
+    live lease already holds needs no decision. Never raises: the bind
+    applies what was decided.
+    """
+    settings = service_image_settings()
+    for spec, connector_id in _service_lease_entries(entries):
+        reference = image_reference_for(spec.name)
+        if not reference:
+            continue
+        try:
+            async with store.acquire() as conn:
+                if await _held_digest(conn, owner, connector_id):
+                    continue
+            decision = await _apart(
+                lambda spec=spec, reference=reference, connector_id=connector_id: (
+                    _decide(
+                        store,
+                        spec=spec,
+                        reference=reference,
+                        connector_id=connector_id,
+                        owner=owner,
+                        timeout=settings.timeout_seconds,
+                    )
+                ),
+                timeout=settings.timeout_seconds + 5,
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            decision = _Decision(unavailable=_unavailable(spec.name))
+        except Exception:
+            # The bind decides again under its own cap.
+            logger.warning(
+                "Preparing the image of %s for connector %s failed",
+                spec.name,
+                connector_id,
+                exc_info=True,
+            )
+            continue
+        _remember((spec.name, reference, connector_id), decision)
+
+
 async def bind_service_image(
     conn: Any,
     *,
@@ -418,46 +616,49 @@ async def bind_service_image(
     """The digest a service driver's binding of ``owner`` runs on.
 
     A live lease already holds one (re-delivery is no new bind). Otherwise the
-    driver's reference is resolved and, when the digest is new for the
-    connector, checked; an incompatible image refuses the bind
-    (:class:`ServiceImageRefused`) and is audited.
+    decision :func:`prepare_service_images` made before the caller's
+    transaction applies. Without one, the bind decides now on the store's own
+    connections, capped at ``bind_timeout_seconds``; ``conn`` is only read.
+    An incompatible image refuses the bind (:class:`ServiceImageRefused`,
+    audited); an image that cannot be resolved fails it
+    (:class:`ServiceImageUnavailable`). Both are remembered for the cache
+    window.
     """
+    settings = service_image_settings()
     reference = image_reference_for(spec.name)
     if not reference:
         raise ServiceImageUnavailable(
             f"No image is configured for the service driver {spec.name}"
         )
-    connector_uuid = UUID(str(connector_id))
-    held = await conn.fetchval(
-        f"""
-        SELECT image_digest FROM connector_credential_leases
-         WHERE {owner.column} = $1 AND connector_id = $2
-           AND revoked_at IS NULL AND expires_at > now()
-           AND image_digest IS NOT NULL
-        """,
-        UUID(owner.id),
-        connector_uuid,
-    )
+    held = await _held_digest(conn, owner, connector_id)
     if held:
-        return str(held)
-    image = await resolve_driver_image(conn, driver=spec.name, reference=reference)
-    problems = await check_moved_image(
-        conn, spec=spec, connector_id=connector_id, image=image
-    )
-    if problems:
-        message = refusal_message(reference, problems)
-        await record_lease_event(
-            conn,
-            event_type="connector_driver_image_refused",
-            resource_type="connector",
-            resource_id=str(connector_uuid),
-            detail=(
-                f"driver={spec.name} reference={reference} digest={image.digest} "
-                f"owner={owner.kind}:{owner.id} problems={'; '.join(problems)}"
-            ),
-        )
-        raise ServiceImageRefused(message)
-    return image.digest
+        return held
+    key = (spec.name, reference, str(connector_id))
+    decision = _recalled(key)
+    if decision is None:
+        if settings.store is None:
+            raise ServiceImageUnavailable(_unavailable(spec.name))
+        cap = settings.bind_timeout_seconds
+        try:
+            decision = await _apart(
+                lambda: _decide(
+                    settings.store,
+                    spec=spec,
+                    reference=reference,
+                    connector_id=connector_id,
+                    owner=owner,
+                    timeout=cap,
+                ),
+                timeout=cap,
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            decision = _Decision(unavailable=_unavailable(spec.name))
+        _remember(key, decision)
+    if decision.refusal is not None:
+        raise ServiceImageRefused(decision.refusal)
+    if decision.digest is None:
+        raise ServiceImageUnavailable(decision.unavailable or _unavailable(spec.name))
+    return decision.digest
 
 
 __all__ = [
@@ -469,8 +670,10 @@ __all__ = [
     "check_moved_image",
     "config_errors",
     "configure_service_images",
+    "ensure_image",
     "image_for_digest",
     "image_reference_for",
+    "prepare_service_images",
     "resolve_driver_image",
     "service_image_settings",
 ]

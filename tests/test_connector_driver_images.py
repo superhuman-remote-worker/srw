@@ -9,6 +9,7 @@ tests/test_connector_service_hosting_real_postgres.py.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -241,11 +242,18 @@ class TestCompatibility:
 
 
 class _Conn:
-    """The two queries resolution runs: the upsert and the last resolution."""
+    """The two queries resolution runs: the upsert and the last resolution.
+
+    It is its own store: resolution writes on a connection it acquires.
+    """
 
     def __init__(self) -> None:
         self.rows: dict[tuple[str, str, str], dict[str, Any]] = {}
         self.writes = 0
+
+    @contextlib.asynccontextmanager
+    async def acquire(self):
+        yield self
 
     async def fetchrow(self, query: str, *args: Any):
         if query.lstrip().startswith("INSERT INTO connector_driver_images"):
@@ -367,10 +375,30 @@ async def test_a_reference_that_never_resolved_fails_the_bind(configure):
             _Conn(), driver=SERVICE.name, reference="ghcr.io/org/echo:latest"
         )
     configure(None)
-    with pytest.raises(images.ServiceImageUnavailable, match="no image resolver"):
+    with pytest.raises(images.ServiceImageUnavailable, match="cannot be resolved"):
         await images.resolve_driver_image(
             _Conn(), driver=SERVICE.name, reference="ghcr.io/org/echo:latest"
         )
+
+
+@pytest.mark.asyncio
+async def test_a_failure_is_remembered_for_the_window_and_says_nothing_internal(
+    configure,
+):
+    resolver = _Resolver(RegistryResolutionError("10.0.0.7:5000 answered HTTP 418"))
+    configure(resolver, cache_seconds=30)
+    clock = iter([100.0, 110.0]).__next__
+    for _ in range(2):
+        with pytest.raises(images.ServiceImageUnavailable) as failed:
+            await images.resolve_driver_image(
+                _Conn(),
+                driver=SERVICE.name,
+                reference="ghcr.io/org/echo:latest",
+                clock=clock,
+            )
+        assert "418" not in str(failed.value) and "10.0.0.7" not in str(failed.value)
+    # The registry was asked once in the window.
+    assert len(resolver.calls) == 1
 
 
 @pytest.mark.asyncio
