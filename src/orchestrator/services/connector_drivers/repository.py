@@ -105,7 +105,9 @@ class RepositoryDriver(WorkspaceSshDriver):
         # metadata and graph state. An SSH-key repository's entry keeps the
         # non-secret alias the key is reached through instead, and a token
         # repository's clone never reads a key, so a stray one is dropped too.
-        ssh_identity = self.ssh_identity_descriptor(row)
+        ssh_identity = self.ssh_identity_descriptor(
+            row, default_known_hosts=ctx.default_known_hosts
+        )
         if isinstance(credentials, Mapping):
             credentials = {
                 key: value for key, value in credentials.items() if key != "ssh_key"

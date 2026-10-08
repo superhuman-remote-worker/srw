@@ -231,6 +231,7 @@ def build_payload(case: PayloadCase) -> tuple[list[dict] | None, list[str]]:
             mcp_datasources_enabled=mcp_datasources_enabled,
             mcp_stdio_enabled=mcp_stdio_enabled,
             connector_drivers=builtin_connector_drivers(),
+            workspace_ssh_known_hosts=lambda: "",
         ),
     )
     return payload, logged

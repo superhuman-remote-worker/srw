@@ -494,13 +494,17 @@ def datasource_payload_dependencies(
     resources: ApplicationResources,
 ) -> agent_datasource_payload.DatasourcePayloadDependencies:
     """The two connector gates are **callables**: they are deployment env
-    reads made on every use."""
+    reads made on every use. The default SSH host-key pins come from the
+    application's settings."""
 
     return agent_datasource_payload.DatasourcePayloadDependencies(
         logger=logger,
         mcp_datasources_enabled=deployment_gates.mcp_datasources_enabled,
         mcp_stdio_enabled=deployment_gates.mcp_stdio_enabled,
         connector_drivers=resources.connector_drivers,
+        workspace_ssh_known_hosts=lambda: (
+            resources.settings.workspace_ssh_known_hosts
+        ),
     )
 
 

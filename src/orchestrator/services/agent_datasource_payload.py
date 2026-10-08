@@ -41,7 +41,6 @@ from orchestrator.services.connector_drivers.base import (
 )
 from orchestrator.services.workspace_ssh_connector import (
     WorkspaceSshConnectorError,
-    default_workspace_ssh_known_hosts,
 )
 from shared.datasource_policy import datasource_tool_categories
 
@@ -60,6 +59,11 @@ class DatasourcePayloadDependencies:
     mcp_stdio_enabled: Callable[[], bool]
     #: The application's installed connector drivers.
     connector_drivers: ConnectorDriverRegistry
+    #: The deployment's default SSH host-key pins, as known_hosts
+    #: text, for SSH connectors without a pin of their own. Both the
+    #: ``ssh_identity`` descriptor and the delivered identity read it
+    #: here, so they always agree.
+    workspace_ssh_known_hosts: Callable[[], str]
 
     def deployment_gates(self) -> DeploymentGates:
         return DeploymentGates(
@@ -159,7 +163,11 @@ def build_datasources_payload(
         return None
 
     gates = dependencies.deployment_gates()
-    ctx = BindContext(gates=gates, logger=dependencies.logger)
+    ctx = BindContext(
+        gates=gates,
+        logger=dependencies.logger,
+        default_known_hosts=dependencies.workspace_ssh_known_hosts(),
+    )
     payload = []
     bound_per_driver: dict[str, int] = {}
     for ds in resolved_ds:
@@ -219,7 +227,7 @@ def build_workspace_ssh_identities(
     delivery. ``None`` when nothing is delivered, so the field is absent from
     the wire.
     """
-    default_known_hosts = default_workspace_ssh_known_hosts()
+    default_known_hosts = dependencies.workspace_ssh_known_hosts()
     identities: list[dict[str, Any]] = []
     for ds in resolved_ds or []:
         driver = dependencies.connector_drivers.for_type(ds.get("type"))

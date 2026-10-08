@@ -162,7 +162,9 @@ def _bind_context() -> BindContext:
     gates = DeploymentGates(
         mcp_datasources_enabled=lambda: True, mcp_stdio_enabled=lambda: True
     )
-    return BindContext(gates=gates, logger=logging.getLogger(__name__))
+    return BindContext(
+        gates=gates, logger=logging.getLogger(__name__), default_known_hosts=""
+    )
 
 
 @pytest.mark.parametrize("type_id", _REGISTRY.type_ids())
@@ -201,6 +203,9 @@ def test_the_application_composes_its_registry_into_both_seams():
     payload = preparation.datasource_payload_dependencies(resources)
     assert crud.connector_drivers is resources.connector_drivers
     assert payload.connector_drivers is resources.connector_drivers
+    # The default SSH pins are the application's settings, read per use.
+    resources.settings.workspace_ssh_known_hosts = "github.com ssh-ed25519 K"
+    assert payload.workspace_ssh_known_hosts() == "github.com ssh-ed25519 K"
 
 
 def test_every_type_has_a_driver_of_its_own():
@@ -287,12 +292,15 @@ def test_no_seam_falls_back_to_a_registry_of_its_own():
     from orchestrator.services.datasources import DatasourceDependencies
     from orchestrator.services.manifest_execution import ManifestExecutionService
 
-    for dependencies in (DatasourceDependencies, DatasourcePayloadDependencies):
-        registry = {f.name: f for f in dataclasses.fields(dependencies)}[
-            "connector_drivers"
-        ]
-        assert registry.default is dataclasses.MISSING
-        assert registry.default_factory is dataclasses.MISSING
+    required = [
+        (DatasourceDependencies, "connector_drivers"),
+        (DatasourcePayloadDependencies, "connector_drivers"),
+        (DatasourcePayloadDependencies, "workspace_ssh_known_hosts"),
+    ]
+    for dependencies, name in required:
+        declared = {f.name: f for f in dataclasses.fields(dependencies)}[name]
+        assert declared.default is dataclasses.MISSING
+        assert declared.default_factory is dataclasses.MISSING
     parameter = inspect.signature(ManifestExecutionService).parameters[
         "connector_drivers"
     ]
@@ -500,6 +508,7 @@ def test_workspace_ssh_identities_are_the_drivers_answer():
                 mcp_datasources_enabled=lambda: True,
                 mcp_stdio_enabled=lambda: True,
                 connector_drivers=ConnectorDriverRegistry(drivers),
+                workspace_ssh_known_hosts=lambda: "",
             ),
         )
 

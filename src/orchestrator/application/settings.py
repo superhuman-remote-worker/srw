@@ -15,6 +15,9 @@ import logging
 import os
 from dataclasses import dataclass
 
+from orchestrator.services.workspace_ssh_connector import (
+    WORKSPACE_SSH_KNOWN_HOSTS_ENV,
+)
 from shared.run_queue import LANE_PINNED, LANE_STATELESS
 
 logger = logging.getLogger(__name__)
@@ -101,6 +104,11 @@ class DeploymentSettings:
     #: a lane off reaches every stateless session at its next claim, while
     #: batches already in flight are still settled by the recovery path.
     session_subagent_fanout_lanes: frozenset[str] = frozenset()
+    #: The deployment's default SSH host-key pins
+    #: (``orchestrator.workspaceSshKnownHosts``): known_hosts lines
+    #: an SSH connector without a pin of its own is checked against.
+    #: Empty means such connectors trust a host on first use.
+    workspace_ssh_known_hosts: str = ""
 
     def session_subagent_fanout(self, lane: str | None) -> bool:
         """Whether a session on ``lane`` may fan out right now."""
@@ -135,6 +143,7 @@ class DeploymentSettings:
             session_subagent_fanout_lanes=parse_session_subagent_fanout_lanes(
                 os.environ.get(SESSION_SUBAGENT_FANOUT_LANES_ENV)
             ),
+            workspace_ssh_known_hosts=os.environ.get(WORKSPACE_SSH_KNOWN_HOSTS_ENV, ""),
         )
 
 

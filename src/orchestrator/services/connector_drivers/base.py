@@ -133,6 +133,8 @@ class CheckContext:
 class BindContext:
     gates: DeploymentGates
     logger: logging.Logger
+    #: The deployment's default SSH host-key pins (known_hosts text).
+    default_known_hosts: str
 
 
 def probe_failure(message: str, ds_type: str) -> dict[str, Any]:

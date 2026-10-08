@@ -36,18 +36,19 @@ _KEY_ID = "00000000-0000-4000-8000-0000000000a2"
 _TOKEN_ID = "00000000-0000-4000-8000-0000000000a3"
 
 
-def _deps() -> DatasourcePayloadDependencies:
+def _deps(known_hosts: str = "") -> DatasourcePayloadDependencies:
     return DatasourcePayloadDependencies(
         logger=logging.getLogger("test"),
         mcp_datasources_enabled=lambda: True,
         mcp_stdio_enabled=lambda: True,
         connector_drivers=builtin_connector_drivers(),
+        workspace_ssh_known_hosts=lambda: known_hosts,
     )
 
 
-def build_workspace_ssh_identities(rows):
+def build_workspace_ssh_identities(rows, known_hosts: str = ""):
     """The delivery field, built through the connector drivers."""
-    return _build_identities(rows, dependencies=_deps())
+    return _build_identities(rows, dependencies=_deps(known_hosts))
 
 
 def _host_key() -> str:
@@ -167,8 +168,7 @@ class TestDatasourcesPayload:
 
 
 class TestWorkspaceSshIdentities:
-    def test_identity_payload_shape(self, monkeypatch):
-        monkeypatch.delenv(WORKSPACE_SSH_KNOWN_HOSTS_ENV, raising=False)
+    def test_identity_payload_shape(self):
         repository = _repository()
         identities = build_workspace_ssh_identities(
             [repository, _ssh_key(), _token_repository()]
@@ -209,52 +209,63 @@ class TestWorkspaceSshIdentities:
         assert len({item["alias"] for item in identities}) == 2
         assert {item["ssh_host"] for item in identities} == {"github.com"}
 
-    def test_connector_pin_wins_and_is_strict(self, monkeypatch):
-        monkeypatch.setenv(WORKSPACE_SSH_KNOWN_HOSTS_ENV, f"github.com {_host_key()}")
+    def test_connector_pin_wins_and_is_strict(self):
         pin = _host_key()
         (identity,) = build_workspace_ssh_identities(
-            [_repository(config={"forge": "github", "known_hosts": pin})]
+            [_repository(config={"forge": "github", "known_hosts": pin})],
+            known_hosts=f"github.com {_host_key()}",
         )
         assert identity["known_hosts"] == [pin]
         assert identity["strict_host_key_checking"] is True
 
-    def test_deployment_default_pins_only_its_own_hosts(self, monkeypatch):
+    def test_deployment_default_pins_only_its_own_hosts(self):
         github, gitlab = _host_key(), _host_key()
-        monkeypatch.setenv(
-            WORKSPACE_SSH_KNOWN_HOSTS_ENV,
-            f"github.com {github}\ngitlab.com {gitlab}\n{_host_key()}\n",
-        )
         on_github, on_bastion = build_workspace_ssh_identities(
-            [_repository(), _ssh_key()]
+            [_repository(), _ssh_key()],
+            known_hosts=f"github.com {github}\ngitlab.com {gitlab}\n{_host_key()}\n",
         )
         assert on_github["known_hosts"] == [github]
         assert on_github["strict_host_key_checking"] is True
         assert on_bastion["known_hosts"] == []
         assert on_bastion["strict_host_key_checking"] is False
 
-    def test_one_bad_default_line_degrades_only_its_host(self, monkeypatch, caplog):
+    def test_one_bad_default_line_degrades_only_its_host(self, caplog):
         """Review: one unusable line used to disable every SSH connector."""
         github = _host_key()
-        monkeypatch.setenv(
-            WORKSPACE_SSH_KNOWN_HOSTS_ENV,
-            "@cert-authority *.corp.example ssh-ed25519 AAAA\n"
-            "github.com ssh-dss AAAAB3NzaC1kc3M=\n"
-            f"github.com {github}\n",
-        )
         on_github, on_bastion = build_workspace_ssh_identities(
-            [_repository(), _ssh_key()]
+            [_repository(), _ssh_key()],
+            known_hosts=(
+                "@cert-authority *.corp.example ssh-ed25519 AAAA\n"
+                "github.com ssh-dss AAAAB3NzaC1kc3M=\n"
+                f"github.com {github}\n"
+            ),
         )
         assert on_github["known_hosts"] == [github]
         assert on_bastion["known_hosts"] == []
         assert caplog.text.count(WORKSPACE_SSH_KNOWN_HOSTS_ENV) == 1
         assert "PRIVATE KEY" not in caplog.text
 
-    def test_an_unreadable_default_list_fails_closed(self, monkeypatch, caplog):
+    def test_an_unreadable_default_list_fails_closed(self, caplog):
+        unreadable = "x" * (65 * 1024)
+        row = _repository()
+        assert build_workspace_ssh_identities([row], known_hosts=unreadable) is None
+        (entry,) = build_datasources_payload([row], dependencies=_deps(unreadable))
+        assert entry["ssh_identity"]["unavailable"] == "default_known_hosts_invalid"
+
+    def test_the_pins_are_the_injected_ones_not_the_environment(self, monkeypatch):
+        """The payload builders read the pins they are given; the composition
+        reads them from the application's settings, once."""
+        github = _host_key()
         monkeypatch.setenv(WORKSPACE_SSH_KNOWN_HOSTS_ENV, "x" * (65 * 1024))
         row = _repository()
-        assert build_workspace_ssh_identities([row]) is None
-        (entry,) = build_datasources_payload([row], dependencies=_deps())
-        assert entry["ssh_identity"]["unavailable"] == "default_known_hosts_invalid"
+        (identity,) = build_workspace_ssh_identities(
+            [row], known_hosts=f"github.com {github}"
+        )
+        assert identity["known_hosts"] == [github]
+        (entry,) = build_datasources_payload(
+            [row], dependencies=_deps(f"github.com {github}")
+        )
+        assert "unavailable" not in entry["ssh_identity"]
 
     def test_unavailable_reasons_are_fixed_codes(self, caplog):
         """Review: the reason used to quote key lines into READMEs and logs."""
@@ -363,3 +374,13 @@ def test_chart_default_pins_reach_the_orchestrator():
         )
     )
     assert env[WORKSPACE_SSH_KNOWN_HOSTS_ENV] == pins
+
+
+def test_the_settings_carry_the_deployment_default_pins(monkeypatch):
+    from orchestrator.application.settings import DeploymentSettings
+
+    pins = f"github.com {_host_key()}"
+    monkeypatch.setenv(WORKSPACE_SSH_KNOWN_HOSTS_ENV, pins)
+    assert DeploymentSettings.from_environment().workspace_ssh_known_hosts == pins
+    monkeypatch.delenv(WORKSPACE_SSH_KNOWN_HOSTS_ENV)
+    assert DeploymentSettings.from_environment().workspace_ssh_known_hosts == ""

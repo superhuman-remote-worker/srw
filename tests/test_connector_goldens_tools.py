@@ -169,6 +169,7 @@ def test_tool_categories_match_golden(case_id, golden, gates):
         mcp_datasources_enabled=mcp_datasources_enabled,
         mcp_stdio_enabled=mcp_stdio_enabled,
         connector_drivers=builtin_connector_drivers(),
+        workspace_ssh_known_hosts=lambda: "",
     )
     rows = [dict(row) for row in case.rows]
 

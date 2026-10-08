@@ -134,6 +134,9 @@ def _datasource_payload_deps() -> (
         mcp_datasources_enabled=deployment_gates_module.mcp_datasources_enabled,
         mcp_stdio_enabled=deployment_gates_module.mcp_stdio_enabled,
         connector_drivers=main.app.state.resources.connector_drivers,
+        workspace_ssh_known_hosts=lambda: (
+            main.app.state.resources.settings.workspace_ssh_known_hosts
+        ),
     )
 
 
@@ -3484,6 +3487,13 @@ LATE_BINDING_TABLE = [
         "connector_drivers",
         _RESOURCE,
         "connector_drivers",
+        None,
+    ),
+    (
+        _datasource_payload_deps,
+        "workspace_ssh_known_hosts",
+        _SETTING,
+        "workspace_ssh_known_hosts",
         None,
     ),
     (_datasource_selection_deps, "store", _RESOURCE, "postgres_db", None),

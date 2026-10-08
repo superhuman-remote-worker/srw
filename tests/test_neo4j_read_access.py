@@ -150,6 +150,7 @@ def _tools_for(server, *, read_only: bool):
         mcp_datasources_enabled=lambda: False,
         mcp_stdio_enabled=lambda: False,
         connector_drivers=builtin_connector_drivers(),
+        workspace_ssh_known_hosts=lambda: "",
     )
     row = {
         "id": "00000000-0000-0000-0000-0000000000d1",

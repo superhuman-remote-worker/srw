@@ -119,9 +119,11 @@ class WorkspaceSshDriver(DatasourceDriver):
         except WorkspaceSshConnectorError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    def ssh_identity_descriptor(self, row: Mapping[str, Any]) -> dict[str, Any] | None:
+    def ssh_identity_descriptor(
+        self, row: Mapping[str, Any], *, default_known_hosts: str
+    ) -> dict[str, Any] | None:
         """The non-secret ``ssh_identity`` a payload entry carries, if any."""
-        return workspace_ssh_descriptor(row)
+        return workspace_ssh_descriptor(row, default_known_hosts=default_known_hosts)
 
     def workspace_ssh_identity(
         self, row: Mapping[str, Any], *, default_known_hosts: str

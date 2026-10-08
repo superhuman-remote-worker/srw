@@ -111,7 +111,9 @@ class SshKeyDriver(WorkspaceSshDriver):
             },
             read_only=row.get("project_read_only", False),
         )
-        ssh_identity = self.ssh_identity_descriptor(row)
+        ssh_identity = self.ssh_identity_descriptor(
+            row, default_known_hosts=ctx.default_known_hosts
+        )
         if ssh_identity is not None:
             entry["ssh_identity"] = ssh_identity
         return entry

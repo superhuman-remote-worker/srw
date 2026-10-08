@@ -267,6 +267,7 @@ def _payload(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 mcp_datasources_enabled=mcp_datasources_enabled,
                 mcp_stdio_enabled=mcp_stdio_enabled,
                 connector_drivers=builtin_connector_drivers(),
+                workspace_ssh_known_hosts=lambda: "",
             ),
         )
         or []
