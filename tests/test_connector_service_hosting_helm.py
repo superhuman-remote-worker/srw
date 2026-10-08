@@ -22,7 +22,10 @@ pytestmark = pytest.mark.skipif(
 
 NAMESPACE = "srw-superhuman-remote-worker-connectors"
 EXCHANGE = "orchestrator.connectorLeases.exchangePort=8088"
+SHIM_DIGEST = "sha256:" + "5" * 64
+#: Hosting needs the shim pinned by digest.
 ON = "connectors.servicePods.enabled=true"
+SHIM = f"connectors.drivers.shim.image.digest={SHIM_DIGEST}"
 
 
 def render(*settings: str, values: tuple[Path, ...] = ()) -> list[dict]:
@@ -38,6 +41,8 @@ def render(*settings: str, values: tuple[Path, ...] = ()) -> list[dict]:
     ]
     for path in values:
         command.extend(["-f", str(path)])
+    if ON in settings and not any("shim.image.digest" in s for s in settings):
+        settings = (*settings, SHIM)
     for setting in settings:
         command.extend(["--set", setting])
     result = subprocess.run(command, capture_output=True, text=True, check=True)
@@ -380,6 +385,14 @@ def test_the_reconciler_settings_reach_the_orchestrator():
         (ROOT / "deployment/values-local.yaml.example").read_text()
     )
     assert example["connectors"]["servicePods"]["idleSeconds"] <= 120
+
+
+def test_hosting_without_a_pinned_shim_fails_to_render():
+    with pytest.raises(subprocess.CalledProcessError) as raised:
+        render(EXCHANGE, ON, "connectors.drivers.shim.image.digest=")
+    assert "connectors.drivers.shim.image.digest" in raised.value.stderr
+    # Hosting off: no digest needed.
+    render(EXCHANGE)
 
 
 def test_the_shim_image_reaches_the_orchestrator_pinned_when_a_digest_is_set():

@@ -228,7 +228,8 @@ connectors:
   drivers:
     # -- SRW's static driver shim (docker/Dockerfile.driver-shim): the
     # canary-wait and shim-install init containers of every driver pod, and
-    # the driver container's command. Pin a digest in production.
+    # the driver container's command. servicePods.enabled needs a digest
+    # (the chart fails to render without one); CI stamps tag and digest.
     shim:
       image:
         repository: ghcr.io/superhuman-remote-worker/srw-driver-shim

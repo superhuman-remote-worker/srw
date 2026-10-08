@@ -8,17 +8,26 @@
 # root filesystem read-only.
 #
 #   docker build -f docker/Dockerfile.driver-shim -t srw-driver-shim .
+#
+# The Go toolchain is a supported release pinned by digest (bump both
+# together). It runs on the build platform and cross-compiles for the
+# target platform BuildKit names (TARGETARCH); without BuildKit, for the
+# build platform's own architecture.
 # =============================================================================
-FROM golang:1.22-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.8-alpine3.24@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c AS build
 
 ARG SRW_SOURCE_REVISION="dev"
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /src
 COPY drivers/shim/ ./
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+RUN set -eu; \
+    goarch="${TARGETARCH:-$(go env GOARCH)}"; \
+    CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="$goarch" go build -trimpath \
         -ldflags "-s -w -X main.version=${SRW_SOURCE_REVISION}" \
-        -o /out/srw-driver-shim . \
-    && /out/srw-driver-shim version
+        -o /out/srw-driver-shim .; \
+    if [ "$goarch" = "$(go env GOHOSTARCH)" ]; then /out/srw-driver-shim version; fi
 
 FROM scratch
 COPY --from=build /out/srw-driver-shim /srw-driver-shim

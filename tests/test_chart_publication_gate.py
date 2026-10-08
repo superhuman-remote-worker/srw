@@ -247,3 +247,42 @@ def test_develop_rebuilds_when_either_workspace_image_is_missing():
     text, _ = workflow("develop")
     assert "docker/assert-workspace-contract.sh" in text
     assert 'image_missing workspace-minimal "$WORKSPACE_SHA"' in text
+
+
+@pytest.mark.parametrize(
+    ("name", "publication"),
+    [("develop", "deploy-experimental"), ("main", "release-chart")],
+)
+def test_the_driver_shim_is_vetted_tested_built_and_pinned_by_digest(name, publication):
+    """Every service driver pod runs the shim: CI vets and tests it with the
+    toolchain its pinned base carries, and the chart pins its digest."""
+    import re
+
+    _, jobs = workflow(name)
+    steps = jobs["build-driver-shim"]["steps"]
+    runs = "\n".join(step.get("run", "") for step in steps)
+    assert "go vet ./..." in runs and "go test" in runs
+    go = next(s for s in steps if s.get("uses", "").startswith("actions/setup-go@"))
+    dockerfile = (SCRIPT.parents[1] / "docker/Dockerfile.driver-shim").read_text()
+    base = re.search(
+        r"FROM --platform=\$BUILDPLATFORM golang:([0-9.]+)-alpine[0-9.]*"
+        r"@sha256:[0-9a-f]{64} AS build",
+        dockerfile,
+    )
+    assert base is not None and base.group(1) == go["with"]["go-version"]
+    assert 'GOARCH="$goarch"' in dockerfile and "TARGETARCH" in dockerfile
+    build = next(
+        s["with"] for s in steps if s.get("uses", "").startswith("docker/build-push")
+    )
+    assert build["file"] == "./docker/Dockerfile.driver-shim"
+    scripts = "\n".join(step.get("run", "") for step in jobs[publication]["steps"])
+    assert ".connectors.drivers.shim.image.digest = strenv(DRIVER_SHIM_DIGEST)" in (
+        scripts
+    )
+    assert "driver-shim" in gate.COMPONENTS
+
+
+def test_develop_rebuilds_the_shim_when_its_inputs_change():
+    text, _ = workflow("develop")
+    assert "DRIVER_SHIM_PATHS=(drivers/shim/" in text
+    assert 'image_missing driver-shim "$DRIVER_SHIM_SHA"' in text

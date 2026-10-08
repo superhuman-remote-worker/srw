@@ -1948,6 +1948,9 @@ spec:
             - name: CONNECTOR_SERVICE_RESOURCES
               value: {{ .driverResources | toJson | quote }}
             {{- end }}
+            {{- if and .Values.connectors.servicePods.enabled (not .Values.connectors.drivers.shim.image.digest) }}
+            {{- fail "connectors.servicePods.enabled needs connectors.drivers.shim.image.digest: every driver pod runs the shim, so it is pinned by digest (CI stamps it; Tilt sets it in k3d)" }}
+            {{- end }}
             - name: CONNECTOR_DRIVER_SHIM_IMAGE
               value: {{ include "srw.imageRef" (dict "image" .Values.connectors.drivers.shim.image) | quote }}
             {{- with .Values.connectors.drivers.echo }}

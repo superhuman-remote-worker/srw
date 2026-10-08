@@ -316,6 +316,14 @@ connectors:
       privateHosts: ["srw-registry:5000"]
       # A re-pushed tag is seen within seconds (the gate's moved-tag check).
       resolveCacheSeconds: 5
+    # Hosting needs the shim pinned by digest. Tilt builds srw-driver-shim and
+    # overrides repository, tag and digest; this placeholder only keeps a
+    # plain `helm install` rendering (its driver pods would not start).
+    shim:
+      image:
+        repository: srw-registry:5000/srw-driver-shim
+        tag: dev
+        digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     # The development echo service driver (srw.echo-service/v1). Tilt builds
     # srw-driver-echo and overrides repository, tag and digest; these
     # placeholders only keep a plain `helm install` rendering.

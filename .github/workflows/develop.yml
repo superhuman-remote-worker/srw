@@ -617,6 +617,7 @@ jobs:
       vm-base-stage1: ${{ steps.check.outputs.vm-base-stage1 }}
       vm-controller: ${{ steps.check.outputs.vm-controller }}
       vm-preparer: ${{ steps.check.outputs.vm-preparer }}
+      driver-shim: ${{ steps.check.outputs.driver-shim }}
       workspace: ${{ steps.check.outputs.workspace }}
       # Per-component image identity: full sha of the newest commit that
       # touched the component's build inputs. Consumed by the build jobs
@@ -629,6 +630,7 @@ jobs:
       workspace-sha: ${{ steps.check.outputs.workspace-sha }}
       vm-controller-sha: ${{ steps.check.outputs.vm-controller-sha }}
       vm-preparer-sha: ${{ steps.check.outputs.vm-preparer-sha }}
+      driver-shim-sha: ${{ steps.check.outputs.driver-shim-sha }}
       vm-base-sha: ${{ steps.check.outputs.vm-base-sha }}
       vm-base-stage1-sha: ${{ steps.check.outputs.vm-base-stage1-sha }}
       chart: ${{ steps.check.outputs.chart }}
@@ -896,6 +898,11 @@ jobs:
           VM_PREPARER_SHA=$(last_input_sha "${VM_PREPARER_PATHS[@]}")
           VM_PREPARER=$(image_missing vm-preparer "$VM_PREPARER_SHA")
 
+          # The connector driver shim (D5): one static Go binary, stdlib only.
+          DRIVER_SHIM_PATHS=(drivers/shim/ .dockerignore docker/Dockerfile.driver-shim)
+          DRIVER_SHIM_SHA=$(last_input_sha "${DRIVER_SHIM_PATHS[@]}")
+          DRIVER_SHIM=$(image_missing driver-shim "$DRIVER_SHIM_SHA")
+
           AGENT_SHA=$(last_input_sha "${AGENT_PATHS[@]}")
           AGENT=$(image_missing agent "$AGENT_SHA")
 
@@ -996,6 +1003,7 @@ jobs:
           echo "  agent=$AGENT  orchestrator=$ORCHESTRATOR  cockpit=$COCKPIT"
           echo "  mcp=$MCP  workspace=$WORKSPACE"
           echo "  vm-controller=$VM_CONTROLLER  vm-base=$VM_BASE  vm-base-stage1=$VM_BASE_STAGE1"
+          echo "  vm-preparer=$VM_PREPARER  driver-shim=$DRIVER_SHIM (${DRIVER_SHIM_SHA::7})"
           echo "  vm input shas: vm-controller=${VM_CONTROLLER_SHA::7} vm-base=${VM_BASE_SHA::7} vm-base-stage1=${VM_BASE_STAGE1_SHA::7}"
           echo "  chart=$CHART"
           echo "  input shas: agent=${AGENT_SHA::7} orchestrator=${ORCHESTRATOR_SHA::7} cockpit=${COCKPIT_SHA::7} mcp=${MCP_SHA::7} workspace=${WORKSPACE_SHA::7}"
@@ -1015,6 +1023,8 @@ jobs:
             echo "vm-controller-sha=$VM_CONTROLLER_SHA"
             echo "vm-preparer=$VM_PREPARER"
             echo "vm-preparer-sha=$VM_PREPARER_SHA"
+            echo "driver-shim=$DRIVER_SHIM"
+            echo "driver-shim-sha=$DRIVER_SHIM_SHA"
             echo "vm-base=$VM_BASE"
             echo "vm-base-sha=$VM_BASE_SHA"
             echo "vm-base-stage1=$VM_BASE_STAGE1"
@@ -2129,6 +2139,89 @@ jobs:
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-preparer:buildcache-develop
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-preparer:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
+  # The connector driver shim (D5): every service driver pod's canary-wait
+  # and shim-install init containers and its driver command. Vetted and
+  # tested with the toolchain the image builds with, then published; the
+  # chart is stamped with its digest (hosting refuses an unpinned shim).
+  build-driver-shim:
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
+    if: >-
+      needs.architecture.result == 'success' &&
+      always() && !cancelled() &&
+      (needs.changes.outputs.driver-shim == 'true' || github.event_name == 'workflow_dispatch') &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result != 'failure' && needs.test-python.result != 'cancelled' &&
+      needs.test-cockpit.result != 'failure' && needs.test-cockpit.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      # The same release as docker/Dockerfile.driver-shim's pinned base.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - name: Vet and test the shim
+        working-directory: drivers/shim
+        run: |
+          go vet ./...
+          go test -count=1 ./...
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Image identity = newest input commit, not push HEAD (see build-agent).
+      - name: Resolve component identity
+        id: ident
+        run: |
+          FULL="${{ needs.changes.outputs.driver-shim-sha }}"
+          : "${FULL:?component identity is required}"
+          {
+            echo "full=$FULL"
+            echo "short=${FULL::7}"
+            echo "version=0.0.0-dev.sha-${FULL}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-driver-shim
+          tags: |
+            type=raw,value=sha-${{ steps.ident.outputs.short }}
+            type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.driver-shim
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ steps.ident.outputs.full }}
+            org.opencontainers.image.version=${{ steps.ident.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=driver-shim
+          provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ steps.ident.outputs.full }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-driver-shim:buildcache-develop
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-driver-shim:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
+
 
   # ---------------------------------------------------------------------------
   # Publish the dev Helm chart. The chart version (monotonic 0.0.<run_number>)
@@ -2150,6 +2243,7 @@ jobs:
       - build-workspace
       - build-vm-controller
       - build-vm-preparer
+      - build-driver-shim
       - chart-test
       - chart-schema-negative
     if: >-
@@ -2233,7 +2327,8 @@ jobs:
           needs.build-mcp.result == 'success' ||
           needs.build-workspace.result == 'success' ||
           needs.build-vm-controller.result == 'success' ||
-          needs.build-vm-preparer.result == 'success'
+          needs.build-vm-preparer.result == 'success' ||
+          needs.build-driver-shim.result == 'success'
         env:
           SHA_ORCHESTRATOR: ${{ needs.changes.outputs.orchestrator-sha }}
           SHA_AGENT: ${{ needs.changes.outputs.agent-sha }}
@@ -2242,6 +2337,7 @@ jobs:
           SHA_WORKSPACE: ${{ needs.changes.outputs.workspace-sha }}
           SHA_VMCONTROLLER: ${{ needs.changes.outputs.vm-controller-sha }}
           SHA_VMPREPARER: ${{ needs.changes.outputs.vm-preparer-sha }}
+          SHA_DRIVERSHIM: ${{ needs.changes.outputs.driver-shim-sha }}
         run: |
           helm repo add collabora https://collaboraonline.github.io/online --force-update
           helm dependency build helm/
@@ -2275,6 +2371,8 @@ jobs:
           export TAG_VMCONTROLLER="sha-${SHA_VMCONTROLLER::7}"
           : "${SHA_VMPREPARER:?verified component identity is required}"
           export TAG_VMPREPARER="sha-${SHA_VMPREPARER::7}"
+          : "${SHA_DRIVERSHIM:?verified component identity is required}"
+          export TAG_DRIVERSHIM="sha-${SHA_DRIVERSHIM::7}"
           export REV_ORCHESTRATOR="$SHA_ORCHESTRATOR"
           export REV_AGENT="$SHA_AGENT"
           export REV_COCKPIT="$SHA_COCKPIT"
@@ -2285,6 +2383,7 @@ jobs:
 
           # The prior gate verified every expected image, including reused ones.
           : "${MCP_DIGEST:?verified MCP image digest is required}"
+          : "${DRIVER_SHIM_DIGEST:?verified driver shim image digest is required}"
 
           yq -i '
             .image.orchestrator.tag = strenv(TAG_ORCHESTRATOR) |
@@ -2297,6 +2396,8 @@ jobs:
             .vmController.image.tag = strenv(TAG_VMCONTROLLER) |
             .vmController.preparation.image.tag = strenv(TAG_VMPREPARER) |
             .vmController.preparation.image.digest = strenv(VM_PREPARER_DIGEST) |
+            .connectors.drivers.shim.image.tag = strenv(TAG_DRIVERSHIM) |
+            .connectors.drivers.shim.image.digest = strenv(DRIVER_SHIM_DIGEST) |
             .provenance.releaseVersion = strenv(CHART_VERSION) |
             .provenance.components.orchestrator.sourceRevision = strenv(REV_ORCHESTRATOR) |
             .provenance.components.agent.sourceRevision        = strenv(REV_AGENT) |

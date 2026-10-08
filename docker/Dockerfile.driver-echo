@@ -10,12 +10,16 @@
 #   docker build -f docker/Dockerfile.driver-echo \
 #     --build-arg SRW_DRIVER_SPEC='{"name":"srw.echo-service/v1","protocol_version":"2.0"}' .
 # =============================================================================
-FROM golang:1.22-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.8-alpine3.24@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c AS build
+
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /src
 COPY drivers/echo/ ./
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" \
-        -o /out/srw-driver-echo .
+RUN CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" \
+        GOARCH="${TARGETARCH:-$(go env GOARCH)}" \
+        go build -trimpath -ldflags "-s -w" -o /out/srw-driver-echo .
 
 FROM scratch
 ARG SRW_DRIVER_SPEC='{"name":"srw.echo-service/v1","protocol_version":"1.0","config_schema":{"type":"object","additionalProperties":false,"required":["host","port"],"properties":{"host":{"type":"string","minLength":1,"maxLength":253},"port":{"type":"integer","minimum":1,"maximum":65535},"message":{"type":"string","maxLength":256}}},"credential_slots":[{"name":"secret"}]}'

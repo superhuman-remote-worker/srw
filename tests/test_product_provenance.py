@@ -515,10 +515,10 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
 
     assert _count_full_revision(main, "SRW_SOURCE_REVISION") >= 7
     assert _count_full_revision(develop, "SRW_SOURCE_REVISION") >= 7
-    # Seven build identities, and the workspace job labels two images: the
+    # Eight build identities, and the workspace job labels two images: the
     # full one and the minimal one it is built on.
-    assert _count_full_revision(main, "org.opencontainers.image.revision") == 8
-    assert _count_full_revision(develop, "org.opencontainers.image.revision") == 8
+    assert _count_full_revision(main, "org.opencontainers.image.revision") == 9
+    assert _count_full_revision(develop, "org.opencontainers.image.revision") == 9
     for component in (
         "agent",
         "orchestrator",
@@ -527,6 +527,7 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
         "workspace",
         "vm-controller",
         "vm-preparer",
+        "driver-shim",
     ):
         assert f"io.srw.component={component}" in main
         assert f"io.srw.component={component}" in develop
@@ -546,12 +547,13 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
 
     # ...and it must stay *derived* from the full sha, so the two cannot drift
     # apart into an image tagged with one commit and labeled with another.
-    # Seven build identities: the five services, controller and disk builder.
-    assert develop.count("short=${FULL::7}") == 7
+    # Eight build identities: the five services, controller, disk builder and
+    # the connector driver shim.
+    assert develop.count("short=${FULL::7}") == 8
     # The chart-stamping step derives every baked tag from the same identity
     # sha whose full form ships as that component's provenance revision —
-    # seven including the ephemeral preparation builder.
-    assert len(re.findall(r'="sha-\$\{SHA_[A-Z]+::7\}"', develop)) == 7
+    # eight including the ephemeral preparation builder and the driver shim.
+    assert len(re.findall(r'="sha-\$\{SHA_[A-Z]+::7\}"', develop)) == 8
 
     assert (
         ".provenance.components[strenv(component)].sourceRevision = strenv(GITHUB_SHA)"
