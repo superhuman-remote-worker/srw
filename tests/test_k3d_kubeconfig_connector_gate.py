@@ -179,14 +179,49 @@ def test_whether_the_agent_calls_run_command_is_only_noted(monkeypatch):
     monkeypatch.setattr(runner, "workspace_pod", lambda selector: "ws-pod")
     monkeypatch.setattr(runner, "tool_use", lambda tool, text: (0, 0))
     monkeypatch.setattr(runner, "session_tool_calls", lambda: set())
-    monkeypatch.setattr(runner, "session_shell_tools", lambda: [])
+    monkeypatch.setattr(
+        runner, "session_shell_tools", lambda: "none (off, decided by expert: x)"
+    )
     monkeypatch.setattr(runner, "end_session", lambda: True)
     runner.session()
     assert runner.report.passed
     assert any(
-        "0 run_command calls" in note and "binds no shell" in note
+        "0 run_command calls" in note and "none (off, decided by expert" in note
         for note in runner.report.notes
     )
+
+
+@pytest.mark.parametrize(
+    ("body", "said"),
+    [
+        (
+            {"categories": {"shell": {"state": "on", "tools": ["run_command"]}}},
+            "['run_command']",
+        ),
+        (
+            {
+                "categories": {
+                    "shell": {
+                        "state": "off",
+                        "decided_by": "expert",
+                        "reason": "the expert lists no shell tool",
+                        "settable": True,
+                        "tools": [],
+                    }
+                }
+            },
+            "none (off, decided by expert: the expert lists no shell tool)",
+        ),
+        ({}, "unknown (no shell category in the report)"),
+    ],
+)
+def test_the_session_shell_is_read_from_its_tool_groups(monkeypatch, body, said):
+    runner = gate.KubeconfigConnectorGate(_args())
+    runner.thread = "00000000-0000-4000-8000-0000000000aa"
+    monkeypatch.setattr(
+        runner.api, "call", lambda method, path, body_=None: (200, body)
+    )
+    assert runner.session_shell_tools() == said
 
 
 @pytest.mark.parametrize(

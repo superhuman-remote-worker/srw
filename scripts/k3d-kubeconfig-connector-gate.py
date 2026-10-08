@@ -628,8 +628,7 @@ class KubeconfigConnectorGate(base.ConnectorDriversGate):
         called, returned = self.tool_use("run_command", self.kube_marker)
         tools = self.session_tool_calls()
         self.report.note(
-            "session agent: shell tools bound: "
-            f"{shell or 'none (the default session expert binds no shell)'}; "
+            f"session agent: shell tools bound: {shell}; "
             f"{called} run_command calls, {returned} tool results with the "
             f"marker; tools called: {sorted(tools) or 'none'} (not gated: the "
             "workspace check above runs kubectl as agent-host with the same "
@@ -639,16 +638,30 @@ class KubeconfigConnectorGate(base.ConnectorDriversGate):
             "session: ended and deleted", self.end_session(), "thread row"
         )
 
-    def session_shell_tools(self) -> list[str]:
-        """The shell tools the live session holds (its tool-groups report)."""
+    def session_shell_tools(self) -> str:
+        """What the live session's tool-groups report says about its shell.
+
+        Each category is ``{state, reason, settable, decided_by, tools}``
+        (``shared.runtime.core.tool_report``): ``on`` names the bound tools,
+        ``off`` or ``unavailable`` comes with who decided and why.
+        """
         status, body = self.api.call(
             "GET", f"/api/persistent/threads/{self.thread}/tool-groups"
         )
         if status != 200 or not isinstance(body, dict):
-            return []
+            return f"unknown (tool-groups answered HTTP {status})"
         categories = body.get("categories") or {}
         shell = categories.get("shell") if isinstance(categories, dict) else None
-        return sorted(str(name) for name in shell or [])
+        if not isinstance(shell, dict):
+            return "unknown (no shell category in the report)"
+        tools = sorted(str(name) for name in shell.get("tools") or [])
+        if tools:
+            return str(tools)
+        reason = shell.get("reason") or "no tool bound"
+        return (
+            f"none ({shell.get('state')}, decided by {shell.get('decided_by')}: "
+            f"{reason})"
+        )
 
     def session_tool_calls(self) -> set[str]:
         """The tool names the session's agent called (from its messages)."""
