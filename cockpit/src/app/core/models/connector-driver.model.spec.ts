@@ -3,14 +3,18 @@ import {
   ConnectorDriver,
   ConnectorDriverMatrix,
   driverForType,
+  managedConnectorDrivers,
   offeredAccess,
   publicReadWrite,
 } from './connector-driver.model';
-// The API's own response for the built-in drivers
-// (tests/test_connector_capability_matrix.py pins it).
+// The API's own response for the built-in drivers, and the rows the managed
+// MCP servers add where the chart installs them
+// (tests/test_connector_capability_matrix.py pins both).
 import fixture from './fixtures/connector-drivers.json';
+import managedFixture from './fixtures/connector-drivers-managed.json';
 
 const matrix = fixture as unknown as ConnectorDriverMatrix;
+const managed = managedFixture as unknown as ConnectorDriverMatrix;
 const byName = (name: string): ConnectorDriver =>
   matrix.drivers.find((driver) => driver.name === name)!;
 
@@ -88,5 +92,26 @@ describe('driverForType', () => {
     expect(remoteFirst[0].name).toBe('srw.mcp-remote/v1');
     expect(remoteFirst[0].serves_stored_type).toBe(false);
     expect(driverForType(remoteFirst, 'mcp')?.name).toBe('srw.mcp/v1');
+  });
+});
+
+describe('managedConnectorDrivers', () => {
+  it('lists the installed managed MCP servers, each owning its type', () => {
+    const installed = [...matrix.drivers, ...managed.drivers];
+    expect(managed.drivers.map((driver) => driver.name)).toContain('srw.gitea-mcp/v1');
+    expect(managedConnectorDrivers(installed)).toEqual(managed.drivers);
+    expect(driverForType(installed, 'gitea_mcp')?.name).toBe('srw.gitea-mcp/v1');
+  });
+
+  it('lists none the deployment does not install, and none before the matrix loads', () => {
+    expect(managedConnectorDrivers(matrix.drivers)).toEqual([]);
+    expect(managedConnectorDrivers(null)).toEqual([]);
+  });
+
+  it('never lists another tier, though it runs the same way', () => {
+    const [gitea] = managed.drivers;
+    for (const tier of ['development', 'custom', 'trusted'] as const) {
+      expect(managedConnectorDrivers([{...gitea, trust: {...gitea.trust, tier}}])).toEqual([]);
+    }
   });
 });

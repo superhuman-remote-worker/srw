@@ -2725,7 +2725,8 @@
       "ssh_key": "SSH-Schlüssel",
       "generic_file": "Datei",
       "credentials": "Zugangsdaten",
-      "image_driver": "Registrierter Treiber"
+      "image_driver": "Registrierter Treiber",
+      "gitea_mcp": "Gitea-MCP (verwaltet)"
     },
     "catalog": {
       "search": "Konnektoren durchsuchen…",
@@ -3057,6 +3058,7 @@
       "builtin": "Eingebaut, vertrauenswürdig",
       "trusted": "Vertrauenswürdiges Image",
       "custom": "Eigenes, nicht geprüft",
+      "managed": "Von SRW verwaltet, Fremd-Image",
       "development": "Nur für die Entwicklung, nicht für echte Konnektoren"
     },
     "shipsWithSrw": "Wird mit SRW ausgeliefert",

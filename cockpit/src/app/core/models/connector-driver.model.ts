@@ -6,7 +6,9 @@
  *
  * Design: knowledge-base/knowledge/features/connector_drivers.md,
  * "A generated capability matrix" and slice D2. `fixtures/connector-drivers.json`
- * is the API's own response for the built-in drivers, pinned by
+ * is the API's own response for the built-in drivers, and
+ * `fixtures/connector-drivers-managed.json` the rows the managed MCP servers
+ * add where the chart installs them, both pinned by
  * tests/test_connector_capability_matrix.py.
  */
 
@@ -93,10 +95,14 @@ export interface ConnectorEgressStatus {
 export interface ConnectorDriverTrust {
   /** `builtin` ships with SRW; `development` too, but only where a
    *  deployment switch installs it (the lease probe), never trusted;
-   *  `trusted` and `custom` are registered images (D6). */
-  tier: 'builtin' | 'development' | 'trusted' | 'custom';
+   *  `managed` is a managed MCP server from SRW's catalogue (the Gitea MCP
+   *  server, D5a): SRW wrote its spec and SRW's front enforces its levels,
+   *  but its image is a third party's, so never trusted; `trusted` is SRW's
+   *  own service driver image (the git swap driver) or a registered image
+   *  (D6) on the trusted list, `custom` any other registered image. */
+  tier: 'builtin' | 'development' | 'managed' | 'trusted' | 'custom';
   trusted: boolean;
-  /** The registered image reference; null for drivers inside SRW. */
+  /** The image a driver's pods run; null for drivers inside SRW. */
   image: string | null;
   /** Outside the trusted list every claim is the author's, unverified. */
   claims_declared_by_author: boolean;
@@ -230,5 +236,17 @@ export function driverForType(
   if (!drivers || !type) return null;
   return (
     drivers.find((driver) => driver.legacy_type === type && driver.serves_stored_type) ?? null
+  );
+}
+
+/** The managed MCP servers this deployment installs (tier `managed`), each
+ *  a connector type of its own, in matrix order. None until the matrix
+ *  loads: the chart turns each on by naming its image. */
+export function managedConnectorDrivers(
+  drivers: readonly ConnectorDriver[] | null | undefined,
+): ConnectorDriver[] {
+  return (drivers ?? []).filter(
+    (driver) =>
+      driver.trust.tier === 'managed' && driver.legacy_type !== null && driver.serves_stored_type,
   );
 }

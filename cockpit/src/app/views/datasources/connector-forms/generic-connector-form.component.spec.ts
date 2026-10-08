@@ -11,6 +11,8 @@ import {
 } from '../../../core/models/connector-driver.model';
 import {ConnectorFormError, ExistingConnector, FieldState, GenericFormValue} from './schema-form';
 import fixture from '../../../core/models/fixtures/connector-drivers.json';
+// The rows the managed MCP servers add where the chart installs them.
+import managedFixture from '../../../core/models/fixtures/connector-drivers-managed.json';
 // The real catalogue, so these specs also prove the keys exist.
 import en from '../../../../assets/i18n/en.json';
 
@@ -24,6 +26,7 @@ import en from '../../../../assets/i18n/en.json';
  */
 
 const matrix = fixture as unknown as ConnectorDriverMatrix;
+const managed = managedFixture as unknown as ConnectorDriverMatrix;
 const builtin = (name: string): ConnectorDriver =>
   matrix.drivers.find((driver) => driver.name === name)!;
 
@@ -151,6 +154,43 @@ describe('GenericConnectorFormComponent', () => {
       expect(last().credentials).toBeUndefined();
     },
   );
+
+  describe('a managed MCP server (no bespoke form: this is its form)', () => {
+    const gitea = managed.drivers.find((driver) => driver.name === 'srw.gitea-mcp/v1')!;
+
+    it('offers exactly its access levels, asks for its URL and token, and no connection URL', () => {
+      const {host} = render(gitea);
+      const options = [...field(host, '/config/access').querySelectorAll('app-select option')];
+      // The first option leaves it unset: the driver's default level applies.
+      expect(options.map((o) => o.textContent?.trim())).toEqual([
+        en.datasources.generic.unset,
+        ...gitea.access_levels.map((level) => level.id),
+      ]);
+      expect(gitea.access_levels.map((level) => level.id)).toEqual(['ReadOnly', 'ReadWrite']);
+      expect(field(host, '/config/url')).toBeTruthy();
+      expect(host.querySelector('[data-pointer="/config/host"]')).toBeNull();
+      expect(host.querySelector('[data-pointer="/connection_url"]')).toBeNull();
+      expect(prop(field(host, '/credentials/token').querySelector('app-input'), 'type')).toBe('password');
+    });
+
+    it('submits the URL, the chosen level and the token', () => {
+      const {type, last} = render(gitea);
+      expect(last().problems).toEqual([{pointer: '/credentials/token', reason: 'required'}]);
+      // Once the config is in use, its required URL is too (a blank config
+      // is the API's to refuse, as for every driver).
+      type('config/access', '/config/access', '0');
+      expect(last().problems).toContainEqual({pointer: '/config/url', reason: 'required'});
+      type('config/url', '/config/url', 'https://gitea.example.com/path');
+      expect(last().problems).toContainEqual({pointer: '/config/url', reason: 'pattern'});
+      type('config/url', '/config/url', 'https://gitea.example.com');
+      type('slots/token/token', '/credentials/token', 'gitea-token');
+      expect(last()).toEqual({
+        config: {url: 'https://gitea.example.com', access: 'ReadOnly'},
+        credentials: {token: 'gitea-token'},
+        problems: [],
+      });
+    });
+  });
 
   it('submits a typed built-in: a Neo4j URL and login', () => {
     const {host, type, last} = render(builtin('srw.neo4j/v1'));

@@ -18,9 +18,12 @@ import {
 } from '../../core/models/connector-driver.model';
 // The API's own capability matrix for the built-in drivers.
 import driversFixture from '../../core/models/fixtures/connector-drivers.json';
+// The rows the managed MCP servers add where the chart installs them.
+import managedFixture from '../../core/models/fixtures/connector-drivers-managed.json';
 
 // The real catalogue, so these specs also prove the keys they name exist.
 import en from '../../../assets/i18n/en.json';
+import de from '../../../assets/i18n/de-DE.json';
 
 function emailDatasource(overrides: Partial<Datasource> = {}): Datasource {
   return {
@@ -66,6 +69,7 @@ function kbDatasource(overrides: Partial<Datasource> = {}): Datasource {
 }
 
 const BUILTIN_DRIVERS = (driversFixture as unknown as ConnectorDriverMatrix).drivers;
+const MANAGED_DRIVERS = (managedFixture as unknown as ConnectorDriverMatrix).drivers;
 
 /** `drivers: null` is the matrix not (yet) loaded: the pre-matrix rules. */
 function createComponent(
@@ -1479,5 +1483,77 @@ describe('DatasourceListComponent bespoke and generic forms', () => {
       connection_url_redacted: undefined,
       config: email.config,
     });
+  });
+});
+
+describe('DatasourceListComponent managed MCP servers', () => {
+  const INSTALLED = [...BUILTIN_DRIVERS, ...MANAGED_DRIVERS];
+  const gitea = MANAGED_DRIVERS.find((driver) => driver.legacy_type === 'gitea_mcp')!;
+
+  function create(drivers: ConnectorDriver[] | null = INSTALLED) {
+    const created = createComponent(false, null, drivers);
+    created.component.openCreateForm();
+    created.component.formData.name = 'Forge';
+    created.component.onTypeSelect('gitea_mcp' as Datasource['type']);
+    return created;
+  }
+
+  it('offers each managed server the matrix installs as a type, and no other', () => {
+    expect(gitea).toBeTruthy();
+    expect(createComponent(false, null, INSTALLED).component.managedDrivers()).toEqual(MANAGED_DRIVERS);
+    // Not installed (the chart names no image), or the matrix not loaded yet.
+    expect(createComponent(false, null, BUILTIN_DRIVERS).component.managedDrivers()).toEqual([]);
+    expect(createComponent(false, null, null).component.managedDrivers()).toEqual([]);
+    // A development MCP server is in no catalogue, though it runs the same way.
+    const testServer: ConnectorDriver = {
+      ...gitea,
+      name: 'srw.mcp-test/v1',
+      legacy_type: 'mcp_test',
+      trust: {...gitea.trust, tier: 'development'},
+    };
+    expect(
+      createComponent(false, null, [...INSTALLED, testServer]).component.managedDrivers(),
+    ).toEqual(MANAGED_DRIVERS);
+  });
+
+  it('labels every managed type in both languages', () => {
+    const enTypes = en.datasources.filter as Record<string, string>;
+    const deTypes = de.datasources.filter as Record<string, string>;
+    for (const driver of MANAGED_DRIVERS) {
+      expect(enTypes[driver.legacy_type!], driver.name).toBeTruthy();
+      expect(deTypes[driver.legacy_type!], driver.name).toBeTruthy();
+    }
+  });
+
+  it("renders one through the generic form, offering the driver's own levels", () => {
+    const {component} = create();
+    expect(component.formDriver()).toBe(gitea);
+    expect(component.hasBespokeForm()).toBe(false);
+    expect(component.useGenericForm()).toBe(true);
+    // Public: both of its levels, with the declared-only credential hint.
+    component.formData.is_global = true;
+    expect(component.offersReadOnly()).toBe(true);
+    expect(component.offersReadWrite()).toBe(true);
+    expect(component.publicHintKey()).toBe('datasources.form.visibilityCredentialHint');
+  });
+
+  it('creates it from what the generic form holds: config and token, no connection URL', () => {
+    const {api, component} = create();
+    expect(component.canSave()).toBe(false);
+    component.genericFormValue.set({
+      config: {url: 'https://gitea.example.com', access: 'ReadOnly'},
+      credentials: {token: 'gitea-token'},
+      problems: [],
+    });
+    expect(component.canSave()).toBe(true);
+    component.doSave();
+    expect(api.createDatasource).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'gitea_mcp',
+        connection_url: undefined,
+        config: {url: 'https://gitea.example.com', access: 'ReadOnly'},
+        credentials: {token: 'gitea-token'},
+      }),
+    );
   });
 });

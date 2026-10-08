@@ -39,6 +39,7 @@ import {ActivatedRoute, RouterLink} from '@angular/router';
 import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
 import {
   ConnectorDriver,
+  managedConnectorDrivers,
   OfferedAccess,
   offeredAccess,
   publicReadWrite,
@@ -258,6 +259,11 @@ type KeyValueRow = {key: string; value: string};
                   </optgroup>
                   <optgroup [label]="'datasources.form.typeGroupMcp' | transloco">
                     <option value="mcp">{{ 'datasources.form.optMcp' | transloco }}</option>
+                    <!-- The managed MCP servers this deployment installs (the
+                         matrix's managed tier): each takes the generic form. -->
+                    @for (driver of managedDrivers(); track driver.name) {
+                      <option [value]="driver.legacy_type">{{ 'datasources.filter.' + driver.legacy_type | transloco }}</option>
+                    }
                   </optgroup>
                 </app-select>
               </app-form-field>
@@ -2696,6 +2702,11 @@ export class DatasourceListComponent implements OnInit {
   readonly genericFormError = signal<ConnectorFormError | null>(null);
   /** What the generic form prefills on an edit; set once per open. */
   genericFormExisting: ExistingConnector | null = null;
+
+  /** The managed MCP servers the matrix installs, offered as types of their
+   *  own: none has a bespoke section, so the generic form renders its spec
+   *  (its config's `access` choice is the driver's own levels). */
+  readonly managedDrivers = computed(() => managedConnectorDrivers(this.connectorDrivers.drivers()));
 
   /** The installed driver behind the form's type; null until the matrix loads. */
   formDriver(): ConnectorDriver | null {

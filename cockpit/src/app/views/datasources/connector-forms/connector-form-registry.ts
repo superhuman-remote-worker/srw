@@ -10,8 +10,9 @@ import {DatasourceType} from '../../../core/models/api.model';
  * knowledge-base lock. The value names that section; the editor still
  * switches its blocks on the connector type, which is the same word.
  *
- * A driver missing here — any driver a later slice registers — gets the
- * generic form, rendered from its spec (generic-connector-form.component.ts).
+ * A driver missing here — a managed MCP server (srw.gitea-mcp/v1), any
+ * driver a later slice registers — gets the generic form, rendered from its
+ * spec (generic-connector-form.component.ts).
  */
 export const BESPOKE_CONNECTOR_FORMS: Readonly<Record<string, DatasourceType>> = {
   'srw.generic/v1': 'generic',

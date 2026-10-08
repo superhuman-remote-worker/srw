@@ -15,10 +15,14 @@ import {ConnectorDriver, ConnectorDriverMatrix} from '../../core/models/connecto
 // The API's own response for the built-in drivers
 // (tests/test_connector_capability_matrix.py pins it).
 import fixture from '../../core/models/fixtures/connector-drivers.json';
+// The rows the managed MCP servers add where the chart installs them.
+import managedFixture from '../../core/models/fixtures/connector-drivers-managed.json';
 // The real catalogue, so these specs also prove the keys exist.
 import en from '../../../assets/i18n/en.json';
+import de from '../../../assets/i18n/de-DE.json';
 
 const matrix = fixture as unknown as ConnectorDriverMatrix;
+const managed = managedFixture as unknown as ConnectorDriverMatrix;
 const page = en.connectorDrivers;
 
 /** A driver outside the trusted list, as D6 will register one. */
@@ -143,6 +147,30 @@ describe('ConnectorDriversPageComponent', () => {
     expect(text(card.querySelector('.driver-badges'))).toContain(page.trust.development);
     expect(text(card.querySelector('.driver-badges'))).not.toContain(page.trust.builtin);
     expect(card.querySelector('[data-claims="author"]')).toBeNull();
+  });
+
+  it("labels a managed MCP server managed, with its image, its claims SRW's", () => {
+    const {host} = mount([...matrix.drivers, ...managed.drivers]);
+    for (const driver of managed.drivers) {
+      const server = card(host, driver.name);
+      expect(text(server.querySelector('.driver-badges'))).toContain(page.trust.managed);
+      expect(text(server.querySelector('.driver-badges'))).not.toContain(page.trust.custom);
+      // Its image is shown where a built-in says it ships with SRW.
+      expect(text(server)).toContain(driver.trust.image!);
+      expect(text(server)).not.toContain(page.shipsWithSrw);
+      // SRW wrote its spec and its front enforces the levels: no author's word.
+      expect(server.querySelector('[data-claims="author"]')).toBeNull();
+      expect(server.querySelector('.claim-source')).toBeNull();
+      expect(text(server.querySelector('[data-level="ReadOnly"] .enforced-by'))).toContain("SRW's front");
+    }
+  });
+
+  it('has a trust label for every tier the API sends, in both languages', () => {
+    const tiers = new Set([...matrix.drivers, ...managed.drivers].map((d) => d.trust.tier));
+    for (const tier of [...tiers, 'trusted', 'custom', 'development'] as const) {
+      expect(en.connectorDrivers.trust[tier], tier).toBeTruthy();
+      expect(de.connectorDrivers.trust[tier], tier).toBeTruthy();
+    }
   });
 
   it("marks every claim of a driver outside the trusted list as its author's", () => {
