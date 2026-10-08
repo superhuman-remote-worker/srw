@@ -216,31 +216,45 @@ def service_hosting_settings(
     )
 
 
-def connector_service_reconciler(
+def connector_service_reconciler_builder(
     resources: ApplicationResources, hosting: ServiceHostingSettings
-) -> ServiceHostingReconciler | None:
-    """One reconciler over the current stores, or ``None`` while the
-    Kubernetes API is unavailable."""
-    from kubernetes.client import NetworkingV1Api
+) -> Callable[[], ServiceHostingReconciler | None]:
+    """What the leader's loop calls each pass: one reconciler over the
+    current stores, or ``None`` while the Kubernetes API is unavailable.
 
-    from orchestrator.services import (
-        agent_provisioner as agent_provisioner_module,
-        container_provisioner as container_provisioner_module,
-    )
+    The networking API client is created once, over the core API's own
+    client (again only if the provisioner replaced its core API).
+    """
+    cached: dict[str, Any] = {}
 
-    if not agent_provisioner_module.agent_provisioner._k8s_available:
-        return None
-    core_api = container_provisioner_module.container_provisioner._core_api
-    if core_api is None:
-        return None
-    return ServiceHostingReconciler(
-        store=resources.postgres_db,
-        runtime=ServicePodRuntime(
-            core_api, NetworkingV1Api(), namespace=hosting.namespace
-        ),
-        drivers=resources.connector_drivers,
-        settings=hosting,
-    )
+    def build() -> ServiceHostingReconciler | None:
+        from kubernetes.client import NetworkingV1Api
+
+        from orchestrator.services import (
+            agent_provisioner as agent_provisioner_module,
+            container_provisioner as container_provisioner_module,
+        )
+
+        if not agent_provisioner_module.agent_provisioner._k8s_available:
+            return None
+        core_api = container_provisioner_module.container_provisioner._core_api
+        if core_api is None:
+            return None
+        if cached.get("core") is not core_api:
+            cached["core"] = core_api
+            cached["networking"] = NetworkingV1Api(
+                getattr(core_api, "api_client", None)
+            )
+        return ServiceHostingReconciler(
+            store=resources.postgres_db,
+            runtime=ServicePodRuntime(
+                core_api, cached["networking"], namespace=hosting.namespace
+            ),
+            drivers=resources.connector_drivers,
+            settings=hosting,
+        )
+
+    return build
 
 
 def connector_lease_exchange(
@@ -363,7 +377,7 @@ __all__ = [
     "BodyLimit",
     "connector_lease_exchange",
     "connector_lease_exchange_app",
-    "connector_service_reconciler",
+    "connector_service_reconciler_builder",
     "service_hosting_settings",
     "exchange_server_config",
     "serve_connector_lease_exchange",

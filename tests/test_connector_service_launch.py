@@ -421,6 +421,25 @@ def test_a_declared_dns_need_keeps_the_cluster_resolver():
     ]
 
 
+def test_a_dollar_in_the_image_command_is_never_expanded():
+    """Kubernetes expands $(VAR) in args; an image's own command is literal."""
+    plan = build_service_launch(
+        _identity(),
+        spec=SPEC,
+        image=f"ghcr.io/org/echo@{DIGEST}",
+        entrypoint=("/bin/echo",),
+        cmd=("$(SRW_DRIVER_PORT)", "cost: $5"),
+        config={"host": "one.one.one.one", "port": 443},
+        credentials=None,
+        identity_token=TOKEN,
+        pins=PINS,
+        policy=POLICY,
+    )
+    driver = plan.pod["spec"]["containers"][0]
+    assert driver["args"] == ["/bin/echo", "$$(SRW_DRIVER_PORT)", "cost: $$5"]
+    assert "runtimeClassName" not in plan.pod["spec"]
+
+
 def test_the_vm_peer_matches_the_launcher_labels_the_chart_stamps():
     """The VM peer selects exactly the labels the VM controller's VMI
     template puts on every virt-launcher pod."""

@@ -115,7 +115,6 @@ async def test_any_registry_resolves_the_digest_and_the_runtime_config():
     assert image.entrypoint == ("/srw-driver-echo",)
     assert image.cmd == ("--port", "8080")
     assert image.labels == {"io.srw.driver.spec": '{"name": "srw.echo-service/v1"}'}
-    assert image.user == "65532"
 
 
 @pytest.mark.asyncio
@@ -225,7 +224,6 @@ def test_an_image_without_runtime_config_has_empty_fields():
         "entrypoint": (),
         "cmd": (),
         "labels": {},
-        "user": None,
     }
 
 

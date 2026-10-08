@@ -159,6 +159,27 @@ async def test_a_quota_refusal_is_a_capacity_error_not_unconfirmed(api, runtime)
 
 
 @pytest.mark.asyncio
+async def test_an_admission_refusal_records_the_api_servers_reason(api, runtime):
+    """A Pod Security (or other 4xx) refusal says why, so the pod's
+    launch_error shows it; a server error says only its status."""
+    message = (
+        'pods "srw-drv-x" is forbidden: violates PodSecurity "baseline:v1.31": '
+        "host namespaces (hostNetwork=true)"
+    )
+    api.fail["create_namespaced_pod"] = ApiError(
+        403, json.dumps({"kind": "Status", "message": message, "code": 403})
+    )
+    with pytest.raises(hosting.ServiceRuntimeError) as raised:
+        await runtime.launch(_plan())
+    assert "(HTTP 403): " in str(raised.value)
+    assert 'violates PodSecurity "baseline:v1.31"' in str(raised.value)
+    api.fail["create_namespaced_pod"] = ApiError(500, "internal detail")
+    with pytest.raises(hosting.ServiceRuntimeError) as raised:
+        await runtime.launch(_plan())
+    assert str(raised.value).endswith("(HTTP 500)")
+
+
+@pytest.mark.asyncio
 async def test_observe_reads_readiness_of_the_driver_container(api, runtime):
     assert (await runtime.observe(IDENTITY)).absent
     api.objects[("pod", POD)] = {
@@ -420,6 +441,33 @@ def test_startup_revokes_unhosted_identities_whenever_hosting_is_off():
         and "revoke_unhosted_identities" in ast.unparse(node.body)
     ]
     assert guarded and guarded[0].handlers
+
+
+def test_the_reconciler_builder_creates_the_networking_api_once(monkeypatch):
+    from orchestrator.services import agent_provisioner, container_provisioner
+
+    monkeypatch.setattr(
+        agent_provisioner.agent_provisioner, "_k8s_available", True, raising=False
+    )
+    core = SimpleNamespace(api_client=None)
+    monkeypatch.setattr(
+        container_provisioner.container_provisioner, "_core_api", core, raising=False
+    )
+    resources = SimpleNamespace(
+        settings=_settings(), postgres_db=None, connector_drivers=None
+    )
+    settings = connectors_composition.service_hosting_settings(resources)
+    build = connectors_composition.connector_service_reconciler_builder(
+        resources, settings
+    )
+    first, second = build(), build()
+    assert first is not second
+    assert first.runtime.networking_api is second.runtime.networking_api
+    assert first.runtime.core_api is core
+    monkeypatch.setattr(
+        agent_provisioner.agent_provisioner, "_k8s_available", False, raising=False
+    )
+    assert build() is None
 
 
 def test_driver_images_resolve_at_public_addresses_unless_listed():

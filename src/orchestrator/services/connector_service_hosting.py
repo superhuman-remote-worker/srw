@@ -168,6 +168,26 @@ def _quota_refusal(exc: BaseException) -> bool:
     )
 
 
+def _api_reason(exc: BaseException, limit: int = 400) -> str | None:
+    """The API server's own message for a refusal (Pod Security admission,
+    an invalid object), or ``None``. It describes SRW's object, not a
+    secret, so it is recorded with the pod."""
+    body = getattr(exc, "body", None)
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", "replace")
+    if not isinstance(body, str) or not body:
+        return None
+    try:
+        status = json.loads(body)
+    except ValueError:
+        return None
+    message = status.get("message") if isinstance(status, dict) else None
+    if not isinstance(message, str) or not message:
+        return None
+    message = " ".join(message.split())
+    return message if len(message) <= limit else message[: limit - 3] + "..."
+
+
 class ServicePodRuntime:
     """Bounded Kubernetes effects in the connector driver namespace."""
 
@@ -188,9 +208,10 @@ class ServicePodRuntime:
                 raise ServiceCapacityError(
                     "the connector driver namespace's quota is exhausted"
                 ) from None
+            reason = _api_reason(exc) if _status(exc) in (400, 403, 422) else None
             raise ServiceRuntimeError(
                 f"creating {body['kind']} {body['metadata']['name']} failed "
-                f"(HTTP {_status(exc)})"
+                f"(HTTP {_status(exc)})" + (f": {reason}" if reason else "")
             ) from None
 
     async def launch(self, plan: Any) -> str | None:

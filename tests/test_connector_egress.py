@@ -87,6 +87,11 @@ class TestExpandRule:
         ("fe80::1", "link-local"),
         ("::ffff:10.42.0.1", "cluster"),
         ("::ffff:127.0.0.1", "loopback"),
+        ("64:ff9b::a2a:1", "NAT64"),
+        ("64:ff9b:1::1", "NAT64"),
+        ("2002:a00:1::1", "6to4"),
+        ("fd00:ec2::254", "metadata"),
+        ("168.63.129.16", "metadata"),
     ],
 )
 def test_cluster_and_special_ranges_are_always_refused(address, reason):
@@ -228,6 +233,39 @@ async def test_dns_stays_off_unless_declared():
     ]
     assert on.record()["dns"] == "cluster_resolver"
     assert on.record()["dns_reason"] == "mongodb+srv"
+
+
+@pytest.mark.asyncio
+async def test_an_ipv6_literal_is_pinned_only_on_dual_stack():
+    rule = (EgressRule("2606:4700:4700::1111", (443,)),)
+    with pytest.raises(EgressRefused, match="IPv4 only"):
+        await pin_egress(rule, {}, policy=PUBLIC, resolver=resolver({}))
+    dual = EgressPolicy(ipv6=True)
+    pins = await pin_egress(rule, {}, policy=dual, resolver=resolver({}))
+    assert pins.hosts[0].addresses == ("2606:4700:4700::1111",)
+
+
+@pytest.mark.asyncio
+async def test_a_lookup_that_hangs_counts_as_not_resolving(monkeypatch):
+    import asyncio
+
+    from orchestrator.services import connector_egress
+
+    async def hang(*args, **kwargs):
+        await asyncio.sleep(30)
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", hang)
+    monkeypatch.setattr(connector_egress, "RESOLVE_TIMEOUT_SECONDS", 0.05)
+    with pytest.raises(OSError, match="no answer"):
+        await connector_egress.system_resolver("slow.example", False)
+    with pytest.raises(EgressRefused, match="does not resolve"):
+        await pin_egress(
+            (EgressRule("slow.example", (443,)),),
+            {},
+            policy=PUBLIC,
+            resolver=connector_egress.system_resolver,
+        )
 
 
 @pytest.mark.asyncio

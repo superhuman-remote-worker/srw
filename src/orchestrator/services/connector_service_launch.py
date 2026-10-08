@@ -149,7 +149,6 @@ class ServiceLaunchPolicy:
     max_cpu: str = "2"
     max_memory: str = "2Gi"
     termination_grace_seconds: int = 30
-    runtime_class_name: str | None = None
 
     def __post_init__(self) -> None:
         for name in (self.namespace, self.release_namespace):
@@ -447,7 +446,8 @@ def build_service_launch(
         "image": image,
         "imagePullPolicy": "IfNotPresent",
         "command": [SHIM_PATH, "serve", "--"],
-        "args": program,
+        # Kubernetes expands $(VAR) in args; $$ is a literal $.
+        "args": [part.replace("$", "$$") for part in program],
         "ports": [
             {
                 "name": SERVICE_PORT_NAME,
@@ -519,8 +519,6 @@ def build_service_launch(
         # a resolver the policy blocks. The pinned names are in /etc/hosts.
         pod_spec["dnsPolicy"] = "None"
         pod_spec["dnsConfig"] = {"nameservers": ["127.0.0.1"]}
-    if policy.runtime_class_name is not None:
-        pod_spec["runtimeClassName"] = policy.runtime_class_name
     pod = {
         "apiVersion": "v1",
         "kind": "Pod",

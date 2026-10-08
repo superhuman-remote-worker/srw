@@ -485,7 +485,7 @@ async def start_background_tasks(
             "connector_service_reconciler",
             functools.partial(
                 connector_service_hosting.connector_service_reconciler,
-                build=lambda: connectors_composition.connector_service_reconciler(
+                build=connectors_composition.connector_service_reconciler_builder(
                     resources, service_hosting
                 ),
                 interval_seconds=resources.settings.connector_service_reconcile_seconds,

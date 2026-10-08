@@ -76,6 +76,14 @@ _ALWAYS_REFUSED: tuple[tuple[IPNetwork, str], ...] = tuple(
         ("::1/128", "is loopback"),
         ("fe80::/10", "is link-local"),
         ("ff00::/8", "is multicast"),
+        # Public by the registry of special addresses, yet able to carry (and
+        # reach) a private or cluster IPv4 address.
+        ("64:ff9b::/96", "is a NAT64 address"),
+        ("64:ff9b:1::/48", "is a NAT64 address"),
+        ("2002::/16", "is a 6to4 address"),
+        # Cloud metadata outside link-local: AWS over IPv6, Azure's wireserver.
+        ("fd00:ec2::254/128", "is a cloud metadata address"),
+        ("168.63.129.16/32", "is a cloud metadata address"),
     )
 )
 _PRIVATE: tuple[IPNetwork, ...] = tuple(
@@ -280,11 +288,21 @@ def refusal(address: IPAddress | IPNetwork, policy: EgressPolicy) -> str | None:
 Resolver = Callable[[str, bool], Awaitable[Sequence[str]]]
 
 
+#: Seconds one lookup may take before the host counts as not resolving.
+RESOLVE_TIMEOUT_SECONDS = 5.0
+
+
 async def system_resolver(host: str, ipv6: bool) -> Sequence[str]:
     """A and (on dual-stack) AAAA answers of the orchestrator's resolver."""
     loop = asyncio.get_running_loop()
     family = socket.AF_UNSPEC if ipv6 else socket.AF_INET
-    infos = await loop.getaddrinfo(host, None, family=family, type=socket.SOCK_STREAM)
+    try:
+        async with asyncio.timeout(RESOLVE_TIMEOUT_SECONDS):
+            infos = await loop.getaddrinfo(
+                host, None, family=family, type=socket.SOCK_STREAM
+            )
+    except TimeoutError:
+        raise OSError(f"no answer within {RESOLVE_TIMEOUT_SECONDS:.0f}s") from None
     return [str(info[4][0]) for info in infos]
 
 
@@ -308,6 +326,10 @@ async def pin_egress(
         except ValueError:
             network = None
         if network is not None:
+            if network.version == 6 and not policy.ipv6:
+                raise EgressRefused(
+                    f"{host} is an IPv6 address, and this cluster pins IPv4 only"
+                )
             reason = refusal(network, policy)
             if reason:
                 raise EgressRefused(f"{host} {reason}")
@@ -393,6 +415,7 @@ __all__ = [
     "DEFAULT_PRIVATE_TIERS",
     "DNS_PEER",
     "MANY_ADDRESSES",
+    "RESOLVE_TIMEOUT_SECONDS",
     "EgressPins",
     "EgressPolicy",
     "EgressRefused",

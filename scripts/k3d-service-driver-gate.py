@@ -81,6 +81,7 @@ import secrets
 import subprocess
 import sys
 import time
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -106,6 +107,14 @@ GATE_LABEL = "srw.io/gate"
 LOCAL_REGISTRY = "localhost:5005"
 CLUSTER_REGISTRY = "srw-registry:5000"
 ECHO_REPOSITORY = "srw-driver-echo"
+#: The k3d registry's container (scripts/local-dev-up.sh) and where it keeps
+#: a repository's tags. It runs without REGISTRY_STORAGE_DELETE_ENABLED, and a
+#: manifest delete by digest would untag every tag on that digest (Tilt's own
+#: tag can share the gate's): the gate removes its tag's link only.
+REGISTRY_CONTAINER = "srw-registry"
+REGISTRY_TAGS = (
+    "/var/lib/registry/docker/registry/v2/repositories/{repository}/_manifests/tags"
+)
 _SELECTOR = (
     "app.kubernetes.io/instance=srw,app.kubernetes.io/name=superhuman-remote-worker"
 )
@@ -1498,6 +1507,7 @@ class ServiceDriverGate:
             is not None,
         )
         if self.images_pushed:
+            step("delete the gate's tag from the k3d registry", self.delete_pushed_tag)
             step(
                 "remove the local image tag",
                 lambda: run(
@@ -1513,9 +1523,28 @@ class ServiceDriverGate:
             print(f"cleanup: {problem} failed", flush=True)
         return problems
 
+    def registry_tags(self) -> list[str]:
+        url = f"http://{LOCAL_REGISTRY}/v2/{ECHO_REPOSITORY}/tags/list"
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response:
+                return list(json.load(response).get("tags") or [])
+        except (OSError, ValueError) as exc:
+            raise GateError(f"registry tag list failed: {exc}") from None
+
+    def delete_pushed_tag(self) -> bool:
+        """Remove the gate's tag from the k3d registry, and nothing else."""
+        tags = REGISTRY_TAGS.format(repository=ECHO_REPOSITORY)
+        command(
+            ["docker", "exec", REGISTRY_CONTAINER, "rm", "-rf"]
+            + [f"{tags}/{self.gate_id}"]
+        )
+        return self.gate_id not in self.registry_tags()
+
     def residue(self) -> list[str]:
         """What this run created and cleanup did not remove."""
         left: list[str] = []
+        if self.images_pushed and self.gate_id in self.registry_tags():
+            left.append(f"registry tag {ECHO_REPOSITORY}:{self.gate_id}")
         titled = self.titled_threads()
         if titled:
             left.append(f"sessions titled with the gate id: {titled}")

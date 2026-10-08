@@ -232,6 +232,30 @@ def test_the_incompatible_label_breaks_the_echo_contract():
     assert any("credential slots disappeared" in problem for problem in problems)
 
 
+def test_cleanup_removes_only_the_gates_own_registry_tag(monkeypatch):
+    seen: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        seen.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(gate.ServiceDriverGate, "registry_tags", lambda self: ["dev"])
+    run = gate.ServiceDriverGate(_args("--gate-id", "d5-0123456789"))
+    assert run.delete_pushed_tag() is True
+    (argv,) = seen
+    assert argv[:5] == ["docker", "exec", gate.REGISTRY_CONTAINER, "rm", "-rf"]
+    assert argv[5].endswith("/srw-driver-echo/_manifests/tags/d5-0123456789")
+    # Never a manifest delete: a digest may be shared with another tag.
+    assert all("DELETE" not in part for part in argv)
+
+    run.images_pushed = True
+    monkeypatch.setattr(
+        gate.ServiceDriverGate, "registry_tags", lambda self: ["dev", "d5-0123456789"]
+    )
+    assert run.delete_pushed_tag() is False
+
+
 def test_secrets_reach_the_cluster_only_on_stdin(monkeypatch):
     seen: list[tuple[list[str], str | None]] = []
 

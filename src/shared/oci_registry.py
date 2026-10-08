@@ -143,7 +143,6 @@ class ResolvedImage:
     entrypoint: tuple[str, ...] = ()
     cmd: tuple[str, ...] = ()
     labels: dict[str, str] = field(default_factory=dict)
-    user: str | None = None
 
 
 def _string_list(value: Any, what: str) -> tuple[str, ...]:
@@ -176,12 +175,10 @@ def image_config(content: bytes) -> dict[str, Any]:
         isinstance(k, str) and isinstance(v, str) for k, v in labels.items()
     ):
         raise RegistryResolutionError("Registry image config has invalid labels.")
-    user = config.get("User")
     return {
         "entrypoint": _string_list(config.get("Entrypoint"), "entrypoint"),
         "cmd": _string_list(config.get("Cmd"), "command"),
         "labels": dict(labels),
-        "user": user if isinstance(user, str) and user else None,
     }
 
 
