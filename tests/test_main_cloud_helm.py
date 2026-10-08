@@ -20,7 +20,7 @@ CHART = ROOT / "helm"
 INSTANCE = "75e453dc-78a1-4f4a-8d7e-312b098ce4ad"
 
 
-def _config(*extra: str) -> dict[str, str]:
+def _render(*extra: str) -> list[dict]:
     if shutil.which("helm") is None:
         pytest.skip("helm is not installed")
     rendered = subprocess.run(
@@ -37,15 +37,34 @@ def _config(*extra: str) -> dict[str, str]:
         capture_output=True,
         text=True,
     ).stdout
-    for document in yaml.safe_load_all(rendered):
+    return [doc for doc in yaml.safe_load_all(rendered) if isinstance(doc, dict)]
+
+
+def _config_map(documents: list[dict]) -> dict:
+    for document in documents:
         if (
-            isinstance(document, dict)
-            and document.get("kind") == "ConfigMap"
+            document.get("kind") == "ConfigMap"
             and document["metadata"]["name"].endswith("-config")
             and "MAIN_CLOUD_BACKEND" in (document.get("data") or {})
         ):
-            return document["data"]
+            return document
     pytest.fail("no orchestrator ConfigMap carries MAIN_CLOUD_BACKEND")
+
+
+def _config(*extra: str) -> dict[str, str]:
+    return _config_map(_render(*extra))["data"]
+
+
+def _orchestrator_env(documents: list[dict]) -> dict[str, dict]:
+    """The orchestrator container's env, by name (the Deployment lists it by
+    hand, so a ConfigMap key reaches the process only through an entry)."""
+    for document in documents:
+        if document.get("kind") != "Deployment":
+            continue
+        for container in document["spec"]["template"]["spec"]["containers"]:
+            if container.get("name") == "orchestrator":
+                return {entry["name"]: entry for entry in container.get("env") or []}
+    pytest.fail("no orchestrator container rendered")
 
 
 @pytest.mark.parametrize(
@@ -104,3 +123,41 @@ def test_the_orchestrator_reads_the_confirmation(monkeypatch):
     )
     monkeypatch.delenv("MAIN_CLOUD_REPLACE_INSTALLATION")
     assert DeploymentSettings.from_environment().main_cloud_replace_installation == ""
+
+
+def test_the_confirmation_reaches_the_orchestrator_container():
+    documents = _render(
+        "--set",
+        "opencloud.enabled=false",
+        "--set",
+        "nextcloud.enabled=true",
+        "--set",
+        f"cloud.replaceInstallation={INSTANCE}",
+    )
+    config_map = _config_map(documents)
+    entry = _orchestrator_env(documents)["MAIN_CLOUD_REPLACE_INSTALLATION"]
+    ref = entry["valueFrom"]["configMapKeyRef"]
+    assert ref == {
+        "name": config_map["metadata"]["name"],
+        "key": "MAIN_CLOUD_REPLACE_INSTALLATION",
+        "optional": True,
+    }
+    assert config_map["data"][ref["key"]] == INSTANCE
+
+
+def test_every_main_cloud_key_in_the_config_map_reaches_the_orchestrator():
+    """The ConfigMap is not mounted whole: a MAIN_CLOUD_* key without an env
+    entry is a value the orchestrator never sees."""
+    documents = _render(
+        "--set",
+        "opencloud.enabled=false",
+        "--set",
+        "nextcloud.enabled=true",
+        "--set",
+        f"cloud.replaceInstallation={INSTANCE}",
+    )
+    keys = {
+        key for key in _config_map(documents)["data"] if key.startswith("MAIN_CLOUD_")
+    }
+    assert keys >= {"MAIN_CLOUD_BACKEND", "MAIN_CLOUD_REPLACE_INSTALLATION"}
+    assert keys <= set(_orchestrator_env(documents))

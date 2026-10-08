@@ -1056,6 +1056,15 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: MAIN_CLOUD_BACKEND
                   optional: true
+            # The operator's confirmation that Helm's main cloud may replace
+            # the active installation with a different one
+            # (cloud.replaceInstallation; absent unless set).
+            - name: MAIN_CLOUD_REPLACE_INSTALLATION
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: MAIN_CLOUD_REPLACE_INSTALLATION
+                  optional: true
             - name: CLOUD_WORKSPACE_DRIVER
               valueFrom:
                 configMapKeyRef:
