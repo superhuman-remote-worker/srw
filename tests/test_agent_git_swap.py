@@ -521,6 +521,27 @@ class TestWait:
         reason = wait_for_driver(backend, self._binding(), sleep=lambda _s: None)
         assert "did not serve" in reason and backend.shell_run.call_count == 1
 
+    @pytest.mark.parametrize("status", ["404", "403", "502"])
+    def test_any_answer_of_the_driver_is_final(self, status):
+        # A redirecting upstream is a 502 the driver gives at once: waiting
+        # minutes for it would only delay the attach.
+        backend = MagicMock()
+        backend.shell_run.return_value = (
+            "Exit code: 128\nfatal: unable to access 'https://github.com/o/r.git/': "
+            f"The requested URL returned error: {status}"
+        )
+        reason = wait_for_driver(backend, self._binding(), sleep=lambda _s: None)
+        assert status in reason and backend.shell_run.call_count == 1
+
+    def test_a_503_is_retried(self):
+        backend = MagicMock()
+        backend.shell_run.side_effect = [
+            "Exit code: 128\nfatal: The requested URL returned error: 503",
+            "Exit code: 0",
+        ]
+        assert wait_for_driver(backend, self._binding(), sleep=lambda _s: None) is None
+        assert backend.shell_run.call_count == 2
+
     def test_it_gives_up_at_the_deadline(self):
         backend = MagicMock()
         backend.shell_run.return_value = "Exit code: 124"

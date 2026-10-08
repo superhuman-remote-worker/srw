@@ -53,13 +53,12 @@ _TRY_SECONDS = 20
 #: Paths and URLs written into git config: nothing that needs quoting.
 _SAFE_PATH = re.compile(r"[A-Za-z0-9._/-]+")
 _SAFE_URL = re.compile(r"https://[A-Za-z0-9._:/~-]+")
-#: What git prints when retrying cannot help: the lease is refused, the push
-#: or the repository is not this binding's.
-_FINAL_FAILURES = (
-    "Authentication failed",
-    "returned error: 403",
-    "returned error: 404",
-)
+#: Git's report of an HTTP answer: once the driver answers at all, its pod is
+#: serving and its answer stands (the lease refused, the repository not
+#: served, the upstream refusing or redirecting), except a 503 (the driver
+#: stopping, the lease exchange unavailable), which may pass.
+_HTTP_ANSWER = re.compile(r"returned error: (\d{3})")
+_FINAL_FAILURES = ("Authentication failed",)
 
 
 @dataclass(frozen=True)
@@ -199,7 +198,10 @@ def wait_for_driver(
         if first.startswith("Exit code: 0"):
             return None
         last = output
-        if any(marker in output for marker in _FINAL_FAILURES):
+        answered = _HTTP_ANSWER.search(output)
+        if any(marker in output for marker in _FINAL_FAILURES) or (
+            answered is not None and answered.group(1) != "503"
+        ):
             break
         if clock() + _WAIT_INTERVAL_SECONDS > deadline:
             break
