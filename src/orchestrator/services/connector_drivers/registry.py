@@ -51,6 +51,10 @@ class ConnectorDriverRegistry:
     def specs(self) -> tuple[DriverSpec, ...]:
         return tuple(driver.spec for driver in self._by_name.values())
 
+    def drivers(self) -> tuple[ConnectorDriver, ...]:
+        """Every installed driver, in registration order."""
+        return tuple(self._by_name.values())
+
     def type_ids(self) -> tuple[str, ...]:
         """Stored types with a driver, in registration order."""
         return tuple(self._by_type)

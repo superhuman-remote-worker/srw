@@ -184,6 +184,7 @@ POST   /api/contacts/{contact_id}/projects/{project_id}                         
 GET    /api/datasources                                                                 pat=jobs:read       gated:require_approved_user
 POST   /api/datasources                                                                 pat=admin           gated:require_project_owner
 GET    /api/datasources/catalog                                                         pat=jobs:read       gated:require_project_member
+GET    /api/datasources/drivers                                                         pat=jobs:read       gated:require_approved_user
 GET    /api/datasources/eligible                                                        pat=jobs:read       gated:require_project_member
 POST   /api/datasources/ssh-keys/generate                                               pat=admin           gated:require_approved_user
 DELETE /api/datasources/{datasource_id}                                                 pat=admin           gated:require_datasource_owner

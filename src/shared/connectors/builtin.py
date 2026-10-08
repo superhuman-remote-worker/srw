@@ -25,6 +25,12 @@ FORGES: tuple[str, ...] = ("gitea", "github", "gitlab")
 
 _NO_CONFIG: Mapping[str, Any] = {"type": "object", "maxProperties": 0}
 _SECRET: Mapping[str, Any] = {"type": "string", "writeOnly": True}
+#: A secret the user pastes or uploads from a file (a key, a kubeconfig).
+_SECRET_FILE: Mapping[str, Any] = {
+    **_SECRET,
+    "x-srw-multiline": True,
+    "x-srw-widget": "file",
+}
 _LOGIN: Mapping[str, Any] = {
     "type": "object",
     "properties": {"username": {"type": "string"}, "password": _SECRET},
@@ -53,7 +59,7 @@ _FILES: Mapping[str, Any] = {
                 "required": ["contents"],
                 "properties": {
                     "name": {"type": "string"},
-                    "contents": {**_SECRET, "x-srw-multiline": True},
+                    "contents": _SECRET_FILE,
                     "target_path": {"type": "string"},
                     "mode": {"type": "string", "pattern": "^0[0-7]{3}$"},
                     "env_var": {"type": "string"},
@@ -250,7 +256,7 @@ REPOSITORY_SPEC = DriverSpec(
         CredentialSlot(
             "ssh_key",
             "ssh_private_key",
-            {"type": "object", "properties": {"ssh_key": _SECRET}},
+            {"type": "object", "properties": {"ssh_key": _SECRET_FILE}},
             delivery="ssh_agent",
             update="replace",
         ),
@@ -306,7 +312,7 @@ KB_SPEC = DriverSpec(
         CredentialSlot(
             "ssh_key",
             "ssh_private_key",
-            {"type": "object", "properties": {"ssh_key": _SECRET}},
+            {"type": "object", "properties": {"ssh_key": _SECRET_FILE}},
             update="replace",
         ),
     ),

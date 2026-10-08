@@ -1,7 +1,8 @@
 """HTTP adapters for the connector (datasource) surface.
 
-Route order is part of the contract: ``/api/datasources/catalog`` and
-``/api/datasources/eligible`` are declared before
+Route order is part of the contract: ``/api/datasources/catalog``,
+``/api/datasources/eligible`` and ``/api/datasources/drivers`` are declared
+before
 ``/api/datasources/{datasource_id}`` so the literal segments win, and
 ``/api/projects/linkable-datasource-targets`` is declared here rather than on
 the projects router for the same reason.
@@ -43,6 +44,7 @@ from orchestrator.security.access import (
 )
 from orchestrator.security.auth import require_approved_user
 from orchestrator.services import datasources
+from orchestrator.services.connector_drivers.matrix import capability_matrix
 
 router = APIRouter()
 
@@ -196,6 +198,21 @@ async def list_eligible_datasources(
         require_project_member=member_of,
         dependencies=dependencies.operations,
     )
+
+
+@router.get("/api/datasources/drivers")
+async def list_connector_drivers(
+    request: Request,
+    *,
+    dependencies: DatasourcesDependencies = Depends(get_datasources_dependencies),
+) -> dict[str, Any]:
+    """The capability matrix of every installed connector driver.
+
+    It describes installed software and reads no connector, so any approved
+    user may read it, as the catalog without a project filter.
+    """
+    await dependencies.require_approved_user(request, dependencies.store)
+    return capability_matrix(dependencies.operations.connector_drivers)
 
 
 @router.get("/api/datasources/{datasource_id}")

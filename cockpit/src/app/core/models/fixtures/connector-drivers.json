@@ -1,0 +1,1709 @@
+{
+  "protocol_version": "1.0",
+  "drivers": [
+    {
+      "name": "srw.env/v1",
+      "title": "Environment variables",
+      "legacy_type": null,
+      "protocol_version": "1.0",
+      "plane": "bind_time",
+      "delivery_forms": [
+        "pod_env"
+      ],
+      "supported_backends": [
+        "none",
+        "sandbox",
+        "virtual",
+        "vm"
+      ],
+      "workspace_requirements": "None: delivered into the generic-hosting pod.",
+      "tool_category": null,
+      "operations": [],
+      "access_levels": [],
+      "default_access": null,
+      "forced_read_only": false,
+      "holds_upstream_credentials": true,
+      "credential_slots": [],
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "env": {
+            "type": "object",
+            "additionalProperties": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "credential"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "credential": {
+                      "type": "string"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "legacy_connection_url": "forbidden",
+      "egress": {
+        "declared": {
+          "rules": [],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        },
+        "installation": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        }
+      },
+      "publishable": true,
+      "live_attach": true,
+      "live_detach": "immediate",
+      "delete_while_attached": true,
+      "max_per_execution": null,
+      "needs_knowledge_profile": false,
+      "deployment_gate": null,
+      "service": null,
+      "trust": {
+        "tier": "builtin",
+        "trusted": true,
+        "image": null,
+        "claims_declared_by_author": false
+      }
+    },
+    {
+      "name": "srw.files/v1",
+      "title": "Files",
+      "legacy_type": null,
+      "protocol_version": "1.0",
+      "plane": "bind_time",
+      "delivery_forms": [
+        "pod_file"
+      ],
+      "supported_backends": [
+        "none",
+        "sandbox",
+        "virtual",
+        "vm"
+      ],
+      "workspace_requirements": "None: delivered into the generic-hosting pod under /run/srw/bindings/.",
+      "tool_category": null,
+      "operations": [],
+      "access_levels": [],
+      "default_access": null,
+      "forced_read_only": false,
+      "holds_upstream_credentials": true,
+      "credential_slots": [],
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "files": {
+            "type": "object",
+            "propertyNames": {
+              "pattern": "^/run/srw/bindings/"
+            },
+            "additionalProperties": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "credential"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "credential": {
+                      "type": "string"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "legacy_connection_url": "forbidden",
+      "egress": {
+        "declared": {
+          "rules": [],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        },
+        "installation": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        }
+      },
+      "publishable": true,
+      "live_attach": true,
+      "live_detach": "immediate",
+      "delete_while_attached": true,
+      "max_per_execution": null,
+      "needs_knowledge_profile": false,
+      "deployment_gate": null,
+      "service": null,
+      "trust": {
+        "tier": "builtin",
+        "trusted": true,
+        "image": null,
+        "claims_declared_by_author": false
+      }
+    },
+    {
+      "name": "srw.generic/v1",
+      "title": "Generic",
+      "legacy_type": "generic",
+      "protocol_version": "1.0",
+      "plane": "bind_time",
+      "delivery_forms": [
+        "env_file"
+      ],
+      "supported_backends": [
+        "sandbox",
+        "vm"
+      ],
+      "workspace_requirements": "A POSIX shell: the variables are written under ~/.srw-credentials/ and sourced for every command.",
+      "tool_category": null,
+      "operations": [],
+      "access_levels": [
+        {
+          "id": "ReadOnly",
+          "rank": 0,
+          "tools": [],
+          "enforced_by": "Told to the agent only; the same environment is delivered either way.",
+          "advisory": true
+        },
+        {
+          "id": "ReadWrite",
+          "rank": 1,
+          "tools": [],
+          "enforced_by": "The upstream credential decides what is allowed.",
+          "advisory": false
+        }
+      ],
+      "default_access": null,
+      "forced_read_only": false,
+      "holds_upstream_credentials": true,
+      "credential_slots": [
+        {
+          "name": "env_vars",
+          "kind": "secret_string",
+          "required": false,
+          "rotatable": false,
+          "access_levels": [],
+          "delivery": "env",
+          "update": "replace",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "env_vars": {
+                "type": "object",
+                "propertyNames": {
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                },
+                "additionalProperties": {
+                  "type": "string",
+                  "writeOnly": true
+                },
+                "maxProperties": 100
+              }
+            }
+          }
+        }
+      ],
+      "config_schema": {
+        "type": "object",
+        "maxProperties": 0
+      },
+      "legacy_connection_url": "optional",
+      "egress": {
+        "declared": {
+          "rules": [],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        },
+        "installation": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        }
+      },
+      "publishable": true,
+      "live_attach": true,
+      "live_detach": "immediate",
+      "delete_while_attached": true,
+      "max_per_execution": null,
+      "needs_knowledge_profile": false,
+      "deployment_gate": null,
+      "service": null,
+      "trust": {
+        "tier": "builtin",
+        "trusted": true,
+        "image": null,
+        "claims_declared_by_author": false
+      }
+    },
+    {
+      "name": "srw.credentials/v1",
+      "title": "Credentials",
+      "legacy_type": "credentials",
+      "protocol_version": "1.0",
+      "plane": "bind_time",
+      "delivery_forms": [
+        "env_file"
+      ],
+      "supported_backends": [
+        "sandbox",
+        "vm"
+      ],
+      "workspace_requirements": "A POSIX shell: the variables are written under ~/.srw-credentials/ and sourced for every command.",
+      "tool_category": null,
+      "operations": [],
+      "access_levels": [
+        {
+          "id": "ReadOnly",
+          "rank": 0,
+          "tools": [],
+          "enforced_by": "Told to the agent only; the same environment is delivered either way.",
+          "advisory": true
+        },
+        {
+          "id": "ReadWrite",
+          "rank": 1,
+          "tools": [],
+          "enforced_by": "The upstream credential decides what is allowed.",
+          "advisory": false
+        }
+      ],
+      "default_access": null,
+      "forced_read_only": false,
+      "holds_upstream_credentials": true,
+      "credential_slots": [
+        {
+          "name": "env_vars",
+          "kind": "secret_string",
+          "required": true,
+          "rotatable": false,
+          "access_levels": [],
+          "delivery": "env",
+          "update": "merge",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "env_vars": {
+                "type": "object",
+                "propertyNames": {
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                },
+                "additionalProperties": {
+                  "type": "string",
+                  "writeOnly": true
+                },
+                "maxProperties": 100
+              }
+            }
+          }
+        }
+      ],
+      "config_schema": {
+        "type": "object",
+        "maxProperties": 0
+      },
+      "legacy_connection_url": "optional",
+      "egress": {
+        "declared": {
+          "rules": [],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        },
+        "installation": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        }
+      },
+      "publishable": false,
+      "live_attach": true,
+      "live_detach": "refused",
+      "delete_while_attached": false,
+      "max_per_execution": null,
+      "needs_knowledge_profile": false,
+      "deployment_gate": null,
+      "service": null,
+      "trust": {
+        "tier": "builtin",
+        "trusted": true,
+        "image": null,
+        "claims_declared_by_author": false
+      }
+    },
+    {
+      "name": "srw.repository/v1",
+      "title": "Repository",
+      "legacy_type": "repository",
+      "protocol_version": "1.0",
+      "plane": "bind_time",
+      "delivery_forms": [
+        "checkout",
+        "ssh_identity"
+      ],
+      "supported_backends": [
+        "sandbox",
+        "vm"
+      ],
+      "workspace_requirements": "git and a POSIX shell: the repository is cloned there.",
+      "tool_category": "repo",
+      "operations": [],
+      "access_levels": [
+        {
+          "id": "ReadOnly",
+          "rank": 0,
+          "tools": [
+            "repo_pull",
+            "repo_pr_status"
+          ],
+          "enforced_by": "Only the repo tools are read-only; the workspace shell can still push with the checkout's credentials.",
+          "advisory": true
+        },
+        {
+          "id": "ReadWrite",
+          "rank": 1,
+          "tools": [
+            "repo_checkout",
+            "repo_commit",
+            "repo_push",
+            "repo_pull",
+            "repo_open_pr",
+            "repo_pr_status"
+          ],
+          "enforced_by": "The forge token or deploy key decides which pushes succeed.",
+          "advisory": false
+        }
+      ],
+      "default_access": null,
+      "forced_read_only": false,
+      "holds_upstream_credentials": true,
+      "credential_slots": [
+        {
+          "name": "token",
+          "kind": "secret_string",
+          "required": false,
+          "rotatable": false,
+          "access_levels": [],
+          "delivery": "file",
+          "update": "replace",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "token": {
+                "type": "string",
+                "writeOnly": true
+              }
+            }
+          }
+        },
+        {
+          "name": "ssh_key",
+          "kind": "ssh_private_key",
+          "required": false,
+          "rotatable": false,
+          "access_levels": [],
+          "delivery": "ssh_agent",
+          "update": "replace",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "ssh_key": {
+                "type": "string",
+                "writeOnly": true,
+                "x-srw-multiline": true,
+                "x-srw-widget": "file"
+              }
+            }
+          }
+        }
+      ],
+      "config_schema": {
+        "type": "object",
+        "properties": {
+          "forge": {
+            "enum": [
+              "gitea",
+              "github",
+              "gitlab"
+            ]
+          },
+          "known_hosts": {
+            "type": "string",
+            "x-srw-multiline": true
+          }
+        }
+      },
+      "legacy_connection_url": "required",
+      "egress": {
+        "declared": {
+          "rules": [],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        },
+        "installation": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        }
+      },
+      "publishable": true,
+      "live_attach": true,
+      "live_detach": "immediate",
+      "delete_while_attached": true,
+      "max_per_execution": null,
+      "needs_knowledge_profile": false,
+      "deployment_gate": null,
+      "service": null,
+      "trust": {
+        "tier": "builtin",
+        "trusted": true,
+        "image": null,
+        "claims_declared_by_author": false
+      }
+    },
+    {
+      "name": "srw.kb/v1",
+      "title": "OKF Knowledge Base",
+      "legacy_type": "kb",
+      "protocol_version": "1.0",
+      "plane": "harness",
+      "delivery_forms": [
+        "knowledge_index"
+      ],
+      "supported_backends": [
+        "none",
+        "sandbox",
+        "virtual",
+        "vm"
+      ],
+      "workspace_requirements": "None: SRW indexes the repository centrally.",
+      "tool_category": null,
+      "operations": [
+        "status",
+        "reindex"
+      ],
+      "access_levels": [
+        {
+          "id": "ReadOnly",
+          "rank": 0,
+          "tools": [],
+          "enforced_by": "SRW indexes the repository itself; the agent receives an index id, never the URL or the repository credentials.",
+          "advisory": false
+        }
+      ],
+      "default_access": "ReadOnly",
+      "forced_read_only": true,
+      "holds_upstream_credentials": true,
+      "credential_slots": [
+        {
+          "name": "token",
+          "kind": "secret_string",
+          "required": false,
+          "rotatable": false,
+          "access_levels": [],
+          "delivery": null,
+          "update": "replace",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "token": {
+                "type": "string",
+                "writeOnly": true
+              }
+            }
+          }
+        },
+        {
+          "name": "ssh_key",
+          "kind": "ssh_private_key",
+          "required": false,
+          "rotatable": false,
+          "access_levels": [],
+          "delivery": null,
+          "update": "replace",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "ssh_key": {
+                "type": "string",
+                "writeOnly": true,
+                "x-srw-multiline": true,
+                "x-srw-widget": "file"
+              }
+            }
+          }
+        }
+      ],
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "root_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "forge": {
+            "enum": [
+              "gitea",
+              "github",
+              "gitlab"
+            ]
+          }
+        }
+      },
+      "legacy_connection_url": "required",
+      "egress": {
+        "declared": {
+          "rules": [],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        },
+        "installation": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        }
+      },
+      "publishable": true,
+      "live_attach": false,
+      "live_detach": "next_attach",
+      "delete_while_attached": true,
+      "max_per_execution": null,
+      "needs_knowledge_profile": true,
+      "deployment_gate": null,
+      "service": null,
+      "trust": {
+        "tier": "builtin",
+        "trusted": true,
+        "image": null,
+        "claims_declared_by_author": false
+      }
+    },
+    {
+      "name": "srw.postgresql/v1",
+      "title": "PostgreSQL",
+      "legacy_type": "postgresql",
+      "protocol_version": "1.0",
+      "plane": "harness",
+      "delivery_forms": [
+        "managed_connection"
+      ],
+      "supported_backends": [
+        "none",
+        "sandbox",
+        "virtual",
+        "vm"
+      ],
+      "workspace_requirements": "None: the agent process holds the connection.",
+      "tool_category": "sql",
+      "operations": [],
+      "access_levels": [
+        {
+          "id": "ReadOnly",
+          "rank": 0,
+          "tools": [
+            "sql_query",
+            "sql_schema"
+          ],
+          "enforced_by": "Only the read tools are bound, and sql_query runs in a READ ONLY transaction; the login in the URL is the connector's own.",
+          "advisory": false
+        },
+        {
+          "id": "ReadWrite",
+          "rank": 1,
+          "tools": [
+            "sql_query",
+            "sql_schema",
+            "sql_execute"
+          ],
+          "enforced_by": "The PostgreSQL login decides which writes succeed.",
+          "advisory": false
+        }
+      ],
+      "default_access": null,
+      "forced_read_only": false,
+      "holds_upstream_credentials": true,
+      "credential_slots": [],
+      "config_schema": {
+        "type": "object",
+        "maxProperties": 0
+      },
+      "legacy_connection_url": "optional",
+      "egress": {
+        "declared": {
+          "rules": [],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        },
+        "installation": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        }
+      },
+      "publishable": true,
+      "live_attach": true,
+      "live_detach": "immediate",
+      "delete_while_attached": true,
+      "max_per_execution": null,
+      "needs_knowledge_profile": false,
+      "deployment_gate": null,
+      "service": null,
+      "trust": {
+        "tier": "builtin",
+        "trusted": true,
+        "image": null,
+        "claims_declared_by_author": false
+      }
+    },
+    {
+      "name": "srw.neo4j/v1",
+      "title": "Neo4j",
+      "legacy_type": "neo4j",
+      "protocol_version": "1.0",
+      "plane": "harness",
+      "delivery_forms": [
+        "managed_connection"
+      ],
+      "supported_backends": [
+        "none",
+        "sandbox",
+        "virtual",
+        "vm"
+      ],
+      "workspace_requirements": "None: the agent process holds the connection.",
+      "tool_category": "graph",
+      "operations": [],
+      "access_levels": [
+        {
+          "id": "ReadOnly",
+          "rank": 0,
+          "tools": [
+            "cypher_query",
+            "get_database_schema"
+          ],
+          "enforced_by": "Only the read tools are bound, and the connection opens only read-access sessions, in which the Neo4j server refuses every write.",
+          "advisory": false
+        },
+        {
+          "id": "ReadWrite",
+          "rank": 1,
+          "tools": [
+            "cypher_query",
+            "cypher_execute",
+            "get_database_schema"
+          ],
+          "enforced_by": "The Neo4j login decides which writes succeed.",
+          "advisory": false
+        }
+      ],
+      "default_access": null,
+      "forced_read_only": false,
+      "holds_upstream_credentials": true,
+      "credential_slots": [
+        {
+          "name": "login",
+          "kind": "secret_string",
+          "required": false,
+          "rotatable": false,
+          "access_levels": [],
+          "delivery": null,
+          "update": "replace",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "username": {
+                "type": "string"
+              },
+              "password": {
+                "type": "string",
+                "writeOnly": true
+              }
+            }
+          }
+        }
+      ],
+      "config_schema": {
+        "type": "object",
+        "maxProperties": 0
+      },
+      "legacy_connection_url": "optional",
+      "egress": {
+        "declared": {
+          "rules": [],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        },
+        "installation": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        }
+      },
+      "publishable": true,
+      "live_attach": true,
+      "live_detach": "immediate",
+      "delete_while_attached": true,
+      "max_per_execution": null,
+      "needs_knowledge_profile": false,
+      "deployment_gate": null,
+      "service": null,
+      "trust": {
+        "tier": "builtin",
+        "trusted": true,
+        "image": null,
+        "claims_declared_by_author": false
+      }
+    },
+    {
+      "name": "srw.mongodb/v1",
+      "title": "MongoDB",
+      "legacy_type": "mongodb",
+      "protocol_version": "1.0",
+      "plane": "harness",
+      "delivery_forms": [
+        "managed_connection"
+      ],
+      "supported_backends": [
+        "none",
+        "sandbox",
+        "virtual",
+        "vm"
+      ],
+      "workspace_requirements": "None: the agent process holds the connection.",
+      "tool_category": "mongodb",
+      "operations": [],
+      "access_levels": [
+        {
+          "id": "ReadOnly",
+          "rank": 0,
+          "tools": [
+            "mongo_query",
+            "mongo_aggregate",
+            "mongo_schema"
+          ],
+          "enforced_by": "Only the find, aggregate and schema tools are bound; an aggregate pipeline is not checked for $out or $merge.",
+          "advisory": false
+        },
+        {
+          "id": "ReadWrite",
+          "rank": 1,
+          "tools": [
+            "mongo_query",
+            "mongo_aggregate",
+            "mongo_schema",
+            "mongo_insert",
+            "mongo_update"
+          ],
+          "enforced_by": "The MongoDB login decides which writes succeed.",
+          "advisory": false
+        }
+      ],
+      "default_access": null,
+      "forced_read_only": false,
+      "holds_upstream_credentials": true,
+      "credential_slots": [],
+      "config_schema": {
+        "type": "object",
+        "maxProperties": 0
+      },
+      "legacy_connection_url": "optional",
+      "egress": {
+        "declared": {
+          "rules": [],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        },
+        "installation": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        }
+      },
+      "publishable": true,
+      "live_attach": true,
+      "live_detach": "immediate",
+      "delete_while_attached": true,
+      "max_per_execution": null,
+      "needs_knowledge_profile": false,
+      "deployment_gate": null,
+      "service": null,
+      "trust": {
+        "tier": "builtin",
+        "trusted": true,
+        "image": null,
+        "claims_declared_by_author": false
+      }
+    },
+    {
+      "name": "srw.webdav/v1",
+      "title": "WebDAV",
+      "legacy_type": "webdav",
+      "protocol_version": "1.0",
+      "plane": "harness",
+      "delivery_forms": [
+        "managed_connection"
+      ],
+      "supported_backends": [
+        "none",
+        "sandbox",
+        "virtual",
+        "vm"
+      ],
+      "workspace_requirements": "None: the agent process holds the connection.",
+      "tool_category": "webdav",
+      "operations": [],
+      "access_levels": [
+        {
+          "id": "ReadOnly",
+          "rank": 0,
+          "tools": [
+            "webdav_list",
+            "webdav_read",
+            "webdav_info"
+          ],
+          "enforced_by": "Only the list, read and info tools are bound; the login is the connector's own.",
+          "advisory": false
+        },
+        {
+          "id": "ReadWrite",
+          "rank": 1,
+          "tools": [
+            "webdav_list",
+            "webdav_read",
+            "webdav_info",
+            "webdav_write",
+            "webdav_delete"
+          ],
+          "enforced_by": "The WebDAV login decides which writes succeed.",
+          "advisory": false
+        }
+      ],
+      "default_access": null,
+      "forced_read_only": false,
+      "holds_upstream_credentials": true,
+      "credential_slots": [
+        {
+          "name": "login",
+          "kind": "secret_string",
+          "required": false,
+          "rotatable": false,
+          "access_levels": [],
+          "delivery": null,
+          "update": "replace",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "username": {
+                "type": "string"
+              },
+              "password": {
+                "type": "string",
+                "writeOnly": true
+              }
+            }
+          }
+        }
+      ],
+      "config_schema": {
+        "type": "object",
+        "maxProperties": 0
+      },
+      "legacy_connection_url": "optional",
+      "egress": {
+        "declared": {
+          "rules": [],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        },
+        "installation": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        }
+      },
+      "publishable": true,
+      "live_attach": true,
+      "live_detach": "immediate",
+      "delete_while_attached": true,
+      "max_per_execution": null,
+      "needs_knowledge_profile": false,
+      "deployment_gate": null,
+      "service": null,
+      "trust": {
+        "tier": "builtin",
+        "trusted": true,
+        "image": null,
+        "claims_declared_by_author": false
+      }
+    },
+    {
+      "name": "srw.email/v1",
+      "title": "Email",
+      "legacy_type": "email",
+      "protocol_version": "1.0",
+      "plane": "harness",
+      "delivery_forms": [
+        "managed_connection"
+      ],
+      "supported_backends": [
+        "none",
+        "sandbox",
+        "virtual",
+        "vm"
+      ],
+      "workspace_requirements": "None: the agent process holds the mailbox connection.",
+      "tool_category": "email",
+      "operations": [],
+      "access_levels": [
+        {
+          "id": "read",
+          "rank": 0,
+          "tools": [
+            "email_list_folders",
+            "email_list",
+            "email_search",
+            "email_read"
+          ],
+          "enforced_by": "Only the reading tools are bound, and every email tool re-checks the connection's tier before it acts.",
+          "advisory": false
+        },
+        {
+          "id": "read_write",
+          "rank": 1,
+          "tools": [
+            "email_list_folders",
+            "email_list",
+            "email_search",
+            "email_read",
+            "email_move",
+            "email_flag"
+          ],
+          "enforced_by": "Moving and flagging tools are added; every email tool re-checks the connection's tier before it acts.",
+          "advisory": false
+        },
+        {
+          "id": "draft",
+          "rank": 2,
+          "tools": [
+            "email_list_folders",
+            "email_list",
+            "email_search",
+            "email_read",
+            "email_move",
+            "email_flag",
+            "email_draft"
+          ],
+          "enforced_by": "Drafts are filed over IMAP, nothing is sent; every email tool re-checks the connection's tier before it acts.",
+          "advisory": false
+        },
+        {
+          "id": "send",
+          "rank": 3,
+          "tools": [
+            "email_list_folders",
+            "email_list",
+            "email_search",
+            "email_read",
+            "email_move",
+            "email_flag",
+            "email_draft",
+            "email_send"
+          ],
+          "enforced_by": "email_send needs a folder allowlist and pauses for a person's approval unless unattended sending is granted; every email tool re-checks the connection's tier before it acts.",
+          "advisory": false
+        }
+      ],
+      "default_access": "draft",
+      "forced_read_only": false,
+      "holds_upstream_credentials": true,
+      "credential_slots": [
+        {
+          "name": "mailbox",
+          "kind": "secret_string",
+          "required": true,
+          "rotatable": false,
+          "access_levels": [],
+          "delivery": null,
+          "update": "replace",
+          "schema": {
+            "type": "object",
+            "required": [
+              "username",
+              "password",
+              "imap"
+            ],
+            "properties": {
+              "backend": {
+                "const": "imap_smtp"
+              },
+              "username": {
+                "type": "string"
+              },
+              "password": {
+                "type": "string",
+                "writeOnly": true
+              },
+              "imap": {
+                "type": "object",
+                "required": [
+                  "host"
+                ],
+                "properties": {
+                  "host": {
+                    "type": "string"
+                  },
+                  "port": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65535
+                  },
+                  "security": {
+                    "enum": [
+                      "ssl",
+                      "starttls"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "smtp",
+          "kind": "secret_string",
+          "required": false,
+          "rotatable": false,
+          "access_levels": [
+            "send"
+          ],
+          "delivery": null,
+          "update": "replace",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "smtp": {
+                "type": "object",
+                "required": [
+                  "host"
+                ],
+                "properties": {
+                  "host": {
+                    "type": "string"
+                  },
+                  "port": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65535
+                  },
+                  "security": {
+                    "enum": [
+                      "ssl",
+                      "starttls"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "access": {
+            "enum": [
+              "read",
+              "read_write",
+              "draft",
+              "send"
+            ]
+          },
+          "folders": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "drafts_folder": {
+            "type": "string",
+            "minLength": 1
+          },
+          "from_address": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "recipient_allowlist": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "unattended_send": {
+            "type": "boolean"
+          }
+        }
+      },
+      "legacy_connection_url": "optional",
+      "egress": {
+        "declared": {
+          "rules": [],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        },
+        "installation": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        }
+      },
+      "publishable": false,
+      "live_attach": true,
+      "live_detach": "immediate",
+      "delete_while_attached": true,
+      "max_per_execution": 1,
+      "needs_knowledge_profile": false,
+      "deployment_gate": null,
+      "service": null,
+      "trust": {
+        "tier": "builtin",
+        "trusted": true,
+        "image": null,
+        "claims_declared_by_author": false
+      }
+    },
+    {
+      "name": "srw.mcp/v1",
+      "title": "MCP Server",
+      "legacy_type": "mcp",
+      "protocol_version": "1.0",
+      "plane": "harness",
+      "delivery_forms": [
+        "mcp_client"
+      ],
+      "supported_backends": [
+        "none",
+        "sandbox",
+        "virtual",
+        "vm"
+      ],
+      "workspace_requirements": "None: the agent process is the MCP client; a stdio server runs as its subprocess.",
+      "tool_category": "mcp",
+      "operations": [],
+      "access_levels": [
+        {
+          "id": "ReadWrite",
+          "rank": 1,
+          "tools": "*",
+          "enforced_by": "The MCP server and its credentials are the access boundary; SRW binds every tool the server lists.",
+          "advisory": false
+        }
+      ],
+      "default_access": "ReadWrite",
+      "forced_read_only": false,
+      "holds_upstream_credentials": true,
+      "credential_slots": [
+        {
+          "name": "server",
+          "kind": "secret_string",
+          "required": false,
+          "rotatable": false,
+          "access_levels": [],
+          "delivery": null,
+          "update": "replace",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "transport": {
+                "enum": [
+                  "http",
+                  "sse",
+                  "stdio"
+                ]
+              },
+              "auth": {
+                "type": "object",
+                "writeOnly": true
+              },
+              "command": {
+                "type": "string"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "env": {
+                "type": "object",
+                "writeOnly": true
+              }
+            }
+          }
+        }
+      ],
+      "config_schema": {
+        "type": "object",
+        "maxProperties": 0
+      },
+      "legacy_connection_url": "optional",
+      "egress": {
+        "declared": {
+          "rules": [],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        },
+        "installation": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        }
+      },
+      "publishable": true,
+      "live_attach": true,
+      "live_detach": "immediate",
+      "delete_while_attached": true,
+      "max_per_execution": null,
+      "needs_knowledge_profile": false,
+      "deployment_gate": "mcp_datasources",
+      "service": null,
+      "trust": {
+        "tier": "builtin",
+        "trusted": true,
+        "image": null,
+        "claims_declared_by_author": false
+      }
+    },
+    {
+      "name": "srw.kubeconfig/v1",
+      "title": "Kubeconfig",
+      "legacy_type": "kubeconfig",
+      "protocol_version": "1.0",
+      "plane": "bind_time",
+      "delivery_forms": [
+        "credential_file"
+      ],
+      "supported_backends": [
+        "none",
+        "sandbox",
+        "virtual",
+        "vm"
+      ],
+      "workspace_requirements": "None today: the files land on the agent pod, for worker jobs only.",
+      "tool_category": null,
+      "operations": [],
+      "access_levels": [
+        {
+          "id": "ReadOnly",
+          "rank": 0,
+          "tools": [],
+          "enforced_by": "Told to the agent only; the same kubeconfig is delivered either way.",
+          "advisory": true
+        },
+        {
+          "id": "ReadWrite",
+          "rank": 1,
+          "tools": [],
+          "enforced_by": "The upstream credential decides what is allowed.",
+          "advisory": false
+        }
+      ],
+      "default_access": null,
+      "forced_read_only": false,
+      "holds_upstream_credentials": true,
+      "credential_slots": [
+        {
+          "name": "files",
+          "kind": "kubeconfig",
+          "required": true,
+          "rotatable": false,
+          "access_levels": [],
+          "delivery": "file",
+          "update": "replace",
+          "schema": {
+            "type": "object",
+            "required": [
+              "files"
+            ],
+            "properties": {
+              "files": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 5,
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "contents"
+                  ],
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "contents": {
+                      "type": "string",
+                      "writeOnly": true,
+                      "x-srw-multiline": true,
+                      "x-srw-widget": "file"
+                    },
+                    "target_path": {
+                      "type": "string"
+                    },
+                    "mode": {
+                      "type": "string",
+                      "pattern": "^0[0-7]{3}$"
+                    },
+                    "env_var": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "config_schema": {
+        "type": "object",
+        "maxProperties": 0
+      },
+      "legacy_connection_url": "optional",
+      "egress": {
+        "declared": {
+          "rules": [],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        },
+        "installation": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        }
+      },
+      "publishable": true,
+      "live_attach": false,
+      "live_detach": "immediate",
+      "delete_while_attached": true,
+      "max_per_execution": null,
+      "needs_knowledge_profile": false,
+      "deployment_gate": null,
+      "service": null,
+      "trust": {
+        "tier": "builtin",
+        "trusted": true,
+        "image": null,
+        "claims_declared_by_author": false
+      }
+    },
+    {
+      "name": "srw.ssh-key/v1",
+      "title": "SSH Key",
+      "legacy_type": "ssh_key",
+      "protocol_version": "1.0",
+      "plane": "bind_time",
+      "delivery_forms": [
+        "ssh_identity"
+      ],
+      "supported_backends": [
+        "sandbox",
+        "vm"
+      ],
+      "workspace_requirements": "A shell workspace: the key is loaded into a dedicated ssh-agent there and reached through an opaque alias; it never lands on disk.",
+      "tool_category": null,
+      "operations": [],
+      "access_levels": [
+        {
+          "id": "ReadOnly",
+          "rank": 0,
+          "tools": [],
+          "enforced_by": "Told to the agent only; the same key is delivered either way.",
+          "advisory": true
+        },
+        {
+          "id": "ReadWrite",
+          "rank": 1,
+          "tools": [],
+          "enforced_by": "The upstream credential decides what is allowed.",
+          "advisory": false
+        }
+      ],
+      "default_access": null,
+      "forced_read_only": false,
+      "holds_upstream_credentials": true,
+      "credential_slots": [
+        {
+          "name": "files",
+          "kind": "ssh_private_key",
+          "required": true,
+          "rotatable": false,
+          "access_levels": [],
+          "delivery": "ssh_agent",
+          "update": "replace",
+          "schema": {
+            "type": "object",
+            "required": [
+              "files"
+            ],
+            "properties": {
+              "files": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 5,
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "contents"
+                  ],
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "contents": {
+                      "type": "string",
+                      "writeOnly": true,
+                      "x-srw-multiline": true,
+                      "x-srw-widget": "file"
+                    },
+                    "target_path": {
+                      "type": "string"
+                    },
+                    "mode": {
+                      "type": "string",
+                      "pattern": "^0[0-7]{3}$"
+                    },
+                    "env_var": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "host": {
+            "type": "string"
+          },
+          "user": {
+            "type": "string"
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "known_hosts": {
+            "type": "string",
+            "x-srw-multiline": true
+          }
+        }
+      },
+      "legacy_connection_url": "optional",
+      "egress": {
+        "declared": {
+          "rules": [],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        },
+        "installation": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        }
+      },
+      "publishable": true,
+      "live_attach": true,
+      "live_detach": "immediate",
+      "delete_while_attached": true,
+      "max_per_execution": null,
+      "needs_knowledge_profile": false,
+      "deployment_gate": null,
+      "service": null,
+      "trust": {
+        "tier": "builtin",
+        "trusted": true,
+        "image": null,
+        "claims_declared_by_author": false
+      }
+    },
+    {
+      "name": "srw.generic-file/v1",
+      "title": "Generic file",
+      "legacy_type": "generic_file",
+      "protocol_version": "1.0",
+      "plane": "bind_time",
+      "delivery_forms": [
+        "credential_file"
+      ],
+      "supported_backends": [
+        "none",
+        "sandbox",
+        "virtual",
+        "vm"
+      ],
+      "workspace_requirements": "None today: the files land on the agent pod, for worker jobs only.",
+      "tool_category": null,
+      "operations": [],
+      "access_levels": [
+        {
+          "id": "ReadOnly",
+          "rank": 0,
+          "tools": [],
+          "enforced_by": "Told to the agent only; the same file is delivered either way.",
+          "advisory": true
+        },
+        {
+          "id": "ReadWrite",
+          "rank": 1,
+          "tools": [],
+          "enforced_by": "The upstream credential decides what is allowed.",
+          "advisory": false
+        }
+      ],
+      "default_access": null,
+      "forced_read_only": false,
+      "holds_upstream_credentials": true,
+      "credential_slots": [
+        {
+          "name": "files",
+          "kind": "file",
+          "required": true,
+          "rotatable": false,
+          "access_levels": [],
+          "delivery": "file",
+          "update": "replace",
+          "schema": {
+            "type": "object",
+            "required": [
+              "files"
+            ],
+            "properties": {
+              "files": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 5,
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "contents"
+                  ],
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "contents": {
+                      "type": "string",
+                      "writeOnly": true,
+                      "x-srw-multiline": true,
+                      "x-srw-widget": "file"
+                    },
+                    "target_path": {
+                      "type": "string"
+                    },
+                    "mode": {
+                      "type": "string",
+                      "pattern": "^0[0-7]{3}$"
+                    },
+                    "env_var": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "config_schema": {
+        "type": "object",
+        "maxProperties": 0
+      },
+      "legacy_connection_url": "optional",
+      "egress": {
+        "declared": {
+          "rules": [],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        },
+        "installation": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        }
+      },
+      "publishable": true,
+      "live_attach": false,
+      "live_detach": "immediate",
+      "delete_while_attached": true,
+      "max_per_execution": null,
+      "needs_knowledge_profile": false,
+      "deployment_gate": null,
+      "service": null,
+      "trust": {
+        "tier": "builtin",
+        "trusted": true,
+        "image": null,
+        "claims_declared_by_author": false
+      }
+    }
+  ]
+}
