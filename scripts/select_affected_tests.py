@@ -120,6 +120,8 @@ ALWAYS_RUN = (
     "tests/test_notification_producer_manifest.py",
     "tests/test_runtime_coordinate_inventory.py",
     "tests/test_connector_type_branches.py",
+    # Scans every orchestrator module's imports against the orchestrator lock.
+    "tests/test_dependency_locks.py",
 )
 
 
