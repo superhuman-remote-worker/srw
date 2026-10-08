@@ -544,7 +544,8 @@ class _TwoImages:
 @pytest.mark.asyncio
 async def test_two_claims_binding_two_service_drivers_do_not_deadlock(db):
     """Two claim transactions, each binding a connector of each of two
-    service drivers, at once: neither waits on the other's image rows."""
+    service drivers: the second finishes while the first still holds its
+    transaction open, so neither waits on the other's image rows."""
     images.configure_service_images(
         images.ServiceImageSettings(
             references={DRIVER: REFERENCE, SERVICE_B.name: REFERENCE_B},
@@ -561,24 +562,42 @@ async def test_two_claims_binding_two_service_drivers_do_not_deadlock(db):
         )
     specs = {"echo_service": SERVICE, "echo_service_b": SERVICE_B}
 
-    async def claim(thread: str) -> int:
-        entries = [
-            {"type": "echo_service", "name": "a", "datasource_id": a},
-            {"type": "echo_service_b", "name": "b", "datasource_id": b},
-        ]
-        async with db.acquire() as conn:
-            async with conn.transaction():
+    entries = [
+        {"type": "echo_service", "name": "a", "datasource_id": a},
+        {"type": "echo_service_b", "name": "b", "datasource_id": b},
+    ]
+    first_bound, second_done = asyncio.Event(), asyncio.Event()
+
+    # Each claim runs in a task-bound transaction_scope, as a real claim
+    # does: a store acquisition in the claim's own task would join it.
+    async def first(thread: str) -> int:
+        async with db.transaction_scope():
+            async with db.acquire() as conn:
                 delivered = await leases.deliver_connector_leases(
                     conn, entries, owner=leases.LeaseOwner.thread(thread)
                 )
-                await asyncio.sleep(0.2)  # hold the claim open
+                first_bound.set()
+                # Hold the transaction (and any row lock it took) until the
+                # second claim has committed: if the second waited on this
+                # one, this times out.
+                await asyncio.wait_for(second_done.wait(), timeout=10)
                 return delivered
+
+    async def second(thread: str) -> int:
+        await first_bound.wait()
+        async with db.transaction_scope():
+            async with db.acquire() as conn:
+                delivered = await leases.deliver_connector_leases(
+                    conn, entries, owner=leases.LeaseOwner.thread(thread)
+                )
+        second_done.set()
+        return delivered
 
     with mock.patch.object(
         leases, "lease_spec", lambda entry: specs.get(entry.get("type"))
     ):
         delivered = await asyncio.wait_for(
-            asyncio.gather(claim(await _thread(db)), claim(await _thread(db))),
+            asyncio.gather(first(await _thread(db)), second(await _thread(db))),
             timeout=30,
         )
     assert delivered == [2, 2]

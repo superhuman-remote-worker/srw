@@ -294,6 +294,14 @@ def test_the_orchestrator_knows_its_own_pod_address():
     }
 
 
+def test_a_zero_resolve_cache_is_refused():
+    """A bind applies the decision made before its caller's transaction
+    opened; a window of 0 would forget it before the bind reads it."""
+    with pytest.raises(subprocess.CalledProcessError) as raised:
+        render("connectors.drivers.registry.resolveCacheSeconds=0")
+    assert "resolveCacheSeconds" in raised.value.stderr
+
+
 def test_the_k3d_profile_refuses_its_docker_network_to_driver_pods():
     """k3d nodes are docker containers (172.x): the profile lists that range
     so the node check lets it host and no driver pod reaches the node."""

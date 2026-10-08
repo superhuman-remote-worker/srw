@@ -354,11 +354,13 @@ class DeploymentSettings:
             connector_driver_registry_token_hosts=parse_name_list(
                 os.environ.get("CONNECTOR_DRIVER_REGISTRY_TOKEN_HOSTS")
             ),
+            # At least a second: a bind inside its caller's transaction
+            # applies the decision made just before it opened.
             connector_driver_resolve_cache_seconds=parse_positive_number(
                 "CONNECTOR_DRIVER_RESOLVE_CACHE_SECONDS",
                 os.environ.get("CONNECTOR_DRIVER_RESOLVE_CACHE_SECONDS"),
                 default=60.0,
-                minimum=0.0,
+                minimum=1.0,
             ),
             connector_driver_resolve_timeout_seconds=parse_positive_number(
                 "CONNECTOR_DRIVER_RESOLVE_TIMEOUT_SECONDS",
