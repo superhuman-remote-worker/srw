@@ -41,7 +41,11 @@ type fakeAuthority struct {
 	revoked      bool
 	ended        bool // introspection: every lease has ended
 	down         bool // introspection: the exchange does not answer
+	stopping     bool // introspection: this pod's identity is revoked
 	introspected int
+	credential   string        // the forge token (testCredential when empty)
+	cache        time.Duration // the exchange's max_cache_seconds (30 s when 0)
+	expires      time.Time     // the ReadWrite lease's expiry (none when zero)
 }
 
 func (f *fakeAuthority) introspect(_ context.Context, token string) (lease, error) {
@@ -51,12 +55,15 @@ func (f *fakeAuthority) introspect(_ context.Context, token string) (lease, erro
 	if f.down {
 		return lease{}, errUnavailable
 	}
+	if f.stopping {
+		return lease{}, errDriverRevoked
+	}
 	if f.ended {
 		return lease{}, nil
 	}
 	switch token {
 	case readWriteLease:
-		return lease{active: true, id: "lease-rw", connectorID: testConnector, access: "ReadWrite"}, nil
+		return lease{active: true, id: "lease-rw", connectorID: testConnector, access: "ReadWrite", expires: f.expires}, nil
 	case readOnlyLease:
 		return lease{active: true, id: "lease-ro", connectorID: strings.ToUpper(testConnector), access: "ReadOnly"}, nil
 	case otherLease:
@@ -79,7 +86,14 @@ func (f *fakeAuthority) exchange(_ context.Context, token, operation string) (gr
 	if allowed == nil {
 		allowed = []string{"https://example.com/o/r.git"}
 	}
-	return grant{credential: testCredential, allowed: allowed, status: http.StatusOK, cache: 30 * time.Second}, nil
+	credential, cache := f.credential, f.cache
+	if credential == "" {
+		credential = testCredential
+	}
+	if cache == 0 {
+		cache = 30 * time.Second
+	}
+	return grant{credential: credential, allowed: allowed, status: http.StatusOK, cache: cache}, nil
 }
 
 func (f *fakeAuthority) asked() []string {
@@ -149,7 +163,7 @@ func newHarness(t *testing.T) *harness {
 	pool := x509.NewCertPool()
 	pool.AddCert(h.upstream.Certificate())
 	address := h.upstream.Listener.Addr().String()
-	client := newUpstreamClient()
+	client := newUpstreamClient(nil)
 	transport := client.Transport.(*http.Transport)
 	transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
 	transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
@@ -694,41 +708,52 @@ func TestAnIdleTransferIsCut(t *testing.T) {
 	}
 }
 
+// longTransfer starts a fetch whose answer keeps streaming progress (never
+// idle) until the test ends; it returns once the first packet is sent.
+func longTransfer(t *testing.T, h *harness) *http.Response {
+	t.Helper()
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	sent := make(chan struct{})
+	h.stream = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+		w.Write([]byte(pkt("NAK\n")))
+		w.(http.Flusher).Flush()
+		close(sent)
+		tick := time.NewTicker(20 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-r.Context().Done():
+				return
+			case <-tick.C:
+				if _, err := w.Write([]byte(pkt("\x02progress\n"))); err != nil {
+					return
+				}
+				w.(http.Flusher).Flush()
+			}
+		}
+	}
+	response := h.do("POST", repoPath+"/git-upload-pack", readWriteLease, strings.NewReader(flushPkt), rpc("git-upload-pack"))
+	<-sent
+	return response
+}
+
 func TestALeaseThatEndsDuringATransferCutsIt(t *testing.T) {
 	for name, end := range map[string]func(*fakeAuthority){
-		"revoked":     func(f *fakeAuthority) { f.ended = true },
+		"revoked": func(f *fakeAuthority) { f.ended = true },
+		// Unconfirmed past the grace: the exchange down, or this pod's own
+		// identity refused (it is being stopped).
 		"unconfirmed": func(f *fakeAuthority) { f.down = true },
+		"stopping":    func(f *fakeAuthority) { f.stopping = true },
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t)
 			h.driver.recheck = 100 * time.Millisecond
-			stop := make(chan struct{})
-			t.Cleanup(func() { close(stop) })
-			sent := make(chan struct{})
-			h.stream = func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
-				w.Write([]byte(pkt("NAK\n")))
-				w.(http.Flusher).Flush()
-				close(sent)
-				// A long clone keeps its bytes moving: never idle.
-				tick := time.NewTicker(20 * time.Millisecond)
-				defer tick.Stop()
-				for {
-					select {
-					case <-stop:
-						return
-					case <-r.Context().Done():
-						return
-					case <-tick.C:
-						if _, err := w.Write([]byte(pkt("\x02progress\n"))); err != nil {
-							return
-						}
-						w.(http.Flusher).Flush()
-					}
-				}
-			}
-			response := h.do("POST", repoPath+"/git-upload-pack", readWriteLease, strings.NewReader(flushPkt), rpc("git-upload-pack"))
-			<-sent
+			h.driver.grace = 250 * time.Millisecond
+			response := longTransfer(t, h)
 			// The lease lives through several checks: the transfer goes on.
 			time.Sleep(350 * time.Millisecond)
 			h.auth.mu.Lock()
@@ -750,6 +775,38 @@ func TestALeaseThatEndsDuringATransferCutsIt(t *testing.T) {
 				t.Fatalf("log %q", h.logText())
 			}
 		})
+	}
+}
+
+func TestAnUnreachableExchangeDoesNotCutATransferInItsGrace(t *testing.T) {
+	// An orchestrator rollout: the exchange is gone for a while. Work in
+	// flight finishes; only a definite revoke cuts at once.
+	h := newHarness(t)
+	h.driver.recheck = 50 * time.Millisecond
+	h.driver.grace = time.Minute
+	response := longTransfer(t, h)
+	h.auth.mu.Lock()
+	h.auth.down = true
+	h.auth.mu.Unlock()
+	time.Sleep(400 * time.Millisecond)
+	h.auth.mu.Lock()
+	checks := h.auth.introspected
+	h.auth.mu.Unlock()
+	if checks < 4 {
+		t.Fatalf("asked %d times", checks)
+	}
+	// Still streaming: read a few packets after the outage.
+	reader := newPktReader(bufio.NewReader(response.Body), 1<<20)
+	for i := 0; i < 5; i++ {
+		if _, _, err := reader.read(); err != nil {
+			t.Fatalf("the transfer was cut in its grace: %v", err)
+		}
+	}
+	if strings.Contains(h.logText(), "cut") {
+		t.Fatalf("log %q", h.logText())
+	}
+	if defaultUnconfirmedGrace < 5*time.Minute || defaultLeaseRecheck > maxCache {
+		t.Fatal("the defaults would cut transfers during an orchestrator rollout")
 	}
 }
 

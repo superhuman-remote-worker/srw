@@ -8,6 +8,12 @@
 //	srw-git-swap serve      serve the srw-driver port over TLS
 //	srw-git-swap version
 //
+// Before it serves, it checks that its upstream answers HTTPS with a
+// certificate it trusts (public roots, or only the connector's upstream CA
+// when it names one); an upstream it cannot reach or trust ends the
+// process with exit code 78 and the reason as the container's termination
+// message, which SRW records with the pod (deliveries then fall back).
+//
 // For every request it
 //
 //   - serves only GET info/refs?service=git-upload-pack|git-receive-pack,
@@ -43,6 +49,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"log"
@@ -81,7 +88,15 @@ func dispatch(args []string) int {
 		logf := func(format string, a ...any) {
 			log.Printf("srw-git-swap: "+format, a...)
 		}
-		handler := newDriver(cfg, newHTTPAuthority(cfg.exchangeURL, cfg.identity), newUpstreamClient(), logf, systemNow)
+		client := newUpstreamClient(cfg.upstreamRoots)
+		// An upstream the driver cannot reach or trust is reported, not
+		// served: SRW stops the pod and token repositories fall back.
+		if problem := probeUpstream(context.Background(), client, cfg.upstream, probeAttempts, probePause); problem != "" {
+			logf("%s", problem)
+			writeTermination(terminationLog, problem)
+			return upstreamExitCode
+		}
+		handler := newDriver(cfg, newHTTPAuthority(cfg.exchangeURL, cfg.identity), client, logf, systemNow)
 		server := newServer(":"+cfg.port, handler)
 		logf("serving %s for connector %s on :%s (upstream %s)", cfg.driver, cfg.connectorID, cfg.port, cfg.upstream.url)
 		if err := server.ListenAndServeTLS(cfg.certFile, cfg.keyFile); err != nil {

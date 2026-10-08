@@ -106,7 +106,7 @@ func newRealGit(t *testing.T) *realGit {
 	t.Cleanup(upstream.Close)
 	pool := x509.NewCertPool()
 	pool.AddCert(upstream.Certificate())
-	client := newUpstreamClient()
+	client := newUpstreamClient(nil)
 	transport := client.Transport.(*http.Transport)
 	transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
 	address := upstream.Listener.Addr().String()

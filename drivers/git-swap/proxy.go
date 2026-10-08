@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -29,9 +30,16 @@ const (
 	// minutes before its first progress line).
 	defaultIdleTimeout = 15 * time.Minute
 	// While a transfer runs, the lease is asked about again this often, past
-	// the cache: a revoked lease stops a long clone or push within about
-	// two intervals instead of at its end (the managed MCP front's rule).
+	// the cache: a revoked lease stops a long clone or push within an
+	// interval instead of at its end (the managed MCP front's rule).
 	defaultLeaseRecheck = maxCache
+	// A transfer whose lease the exchange cannot confirm (an orchestrator
+	// rollout, this pod's identity revoked as it stops) goes on this long:
+	// work in flight finishes; only a definite revoke cuts at once.
+	defaultUnconfirmedGrace = 10 * time.Minute
+	// The shortest forge token the driver handles: it masks the token in
+	// every answer, packs included, and a short one could match pack bytes.
+	minCredentialLength = 16
 	maxInFlightPerLease = 32
 	maxInFlight         = 512
 	copyBuffer          = 32 * 1024
@@ -54,6 +62,7 @@ type driver struct {
 	now      func() time.Time
 	idle     time.Duration
 	recheck  time.Duration
+	grace    time.Duration
 	inflight *inflight
 }
 
@@ -66,20 +75,22 @@ func newDriver(cfg *config, a authority, upstream *http.Client, logf func(string
 		now:      now,
 		idle:     defaultIdleTimeout,
 		recheck:  defaultLeaseRecheck,
+		grace:    defaultUnconfirmedGrace,
 		inflight: &inflight{perLease: map[string]int{}},
 	}
 }
 
 // newUpstreamClient reaches the connector's upstream: HTTPS with the system
-// roots, no proxy from the environment, no compression asked for (answers
-// are filtered and scrubbed), and no redirect followed (go-git
-// CVE-2026-41506: a followed redirect carries the credential elsewhere).
-func newUpstreamClient() *http.Client {
+// roots, or only the connector's upstream CA (roots) when it names one, no
+// proxy from the environment, no compression asked for (answers are
+// filtered and scrubbed), and no redirect followed (go-git CVE-2026-41506:
+// a followed redirect carries the credential elsewhere).
+func newUpstreamClient(roots *x509.CertPool) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
 			Proxy:                 nil,
 			DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-			TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+			TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots},
 			TLSHandshakeTimeout:   15 * time.Second,
 			ResponseHeaderTimeout: defaultIdleTimeout,
 			DisableCompression:    true,
@@ -278,6 +289,12 @@ func (d *driver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.logf("lease=%s: the exchange no longer allows %s", found.id, d.cfg.upstream.url)
 		fail(w, http.StatusForbidden, "the connector's repository changed; this driver pod is being replaced, retry in a moment")
 		return
+	case len(issued.credential) < minCredentialLength:
+		// Masking a short token in every answer could match pack bytes and
+		// corrupt a transfer; such a token is no forge token anyway.
+		d.logf("lease=%s: the connector's credential is shorter than %d characters; refused", found.id, minCredentialLength)
+		fail(w, http.StatusBadGateway, fmt.Sprintf("the connector's token is shorter than %d characters; SRW's git swap driver does not use it", minCredentialLength))
+		return
 	}
 	watching := make(chan struct{})
 	go func() {
@@ -293,9 +310,11 @@ func (d *driver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // watchLease asks the exchange about the lease every recheck interval while
-// a transfer runs, past the cache, and cuts the transfer once the lease has
-// ended or the exchange could not confirm it for a whole interval. It
-// returns when ctx ends.
+// a transfer runs, past the cache, and cuts the transfer once the exchange
+// says the lease has ended (revoked, expired, another connector's). An
+// exchange that does not answer, or refuses this pod's own identity (the
+// pod is stopping), is no revoke: the transfer goes on until it could not
+// be confirmed for the grace period. It returns when ctx ends.
 func (d *driver) watchLease(ctx context.Context, token, leaseID string, cut func()) {
 	ticker := time.NewTicker(d.recheck)
 	defer ticker.Stop()
@@ -322,10 +341,10 @@ func (d *driver) watchLease(ctx context.Context, token, leaseID string, cut func
 				unconfirmed = now
 				continue
 			}
-			if now.Sub(unconfirmed) < d.recheck {
+			if now.Sub(unconfirmed) < d.grace {
 				continue
 			}
-			d.logf("lease=%s: the exchange could not confirm it for %s; cut the transfer", leaseID, d.recheck)
+			d.logf("lease=%s: the exchange could not confirm it for %s; cut the transfer", leaseID, d.grace)
 		default:
 			d.logf("lease=%s ended during a transfer; cut it", leaseID)
 		}
@@ -502,6 +521,11 @@ func (d *driver) forward(ctx context.Context, w http.ResponseWriter, r *http.Req
 	}
 	if finishErr := scrub.finish(); err == nil {
 		err = finishErr
+	}
+	if scrub.masked > 0 {
+		// The upstream echoed the credential (or an encoding of it): never
+		// expected of a forge, so worth a line (the count, never the value).
+		d.logf("lease=%s: masked %d occurrence(s) of the connector's credential in the upstream's answer", leaseID, scrub.masked)
 	}
 	if err != nil && r.Context().Err() == nil {
 		d.logf("lease=%s: the transfer ended early (%s)", leaseID, scrubText(err.Error(), credential))

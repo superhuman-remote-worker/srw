@@ -19,6 +19,8 @@ type scrubber struct {
 	needles [][]byte
 	longest int
 	held    []byte
+	// How many occurrences were masked (the caller logs the count).
+	masked int
 }
 
 // newScrubber scrubs the credential itself, its URL escape, its base64 and
@@ -98,6 +100,7 @@ func (s *scrubber) mask(buf []byte) {
 			for i := at; i < at+len(needle); i++ {
 				buf[i] = '*'
 			}
+			s.masked++
 			start = at + len(needle)
 		}
 	}

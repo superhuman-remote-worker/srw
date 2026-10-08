@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/url"
@@ -34,8 +36,9 @@ type requestFile struct {
 	Connector       struct {
 		ID     string `json:"id"`
 		Config struct {
-			Upstream string `json:"upstream"`
-			Host     string `json:"host"`
+			Upstream   string `json:"upstream"`
+			Host       string `json:"host"`
+			UpstreamCA string `json:"upstream_ca"`
 		} `json:"config"`
 	} `json:"connector"`
 	Service struct {
@@ -54,11 +57,15 @@ type config struct {
 	driver      string
 	connectorID string
 	upstream    upstream
-	exchangeURL string
-	identity    string
-	port        string
-	certFile    string
-	keyFile     string
+	// The only roots the upstream's certificate is checked against, when
+	// the connector names a CA (a forge behind a private CA); nil means the
+	// system's public roots.
+	upstreamRoots *x509.CertPool
+	exchangeURL   string
+	identity      string
+	port          string
+	certFile      string
+	keyFile       string
 }
 
 // loadConfig reads the pod's request file and identity, which the
@@ -135,14 +142,50 @@ func parseConfig(request requestFile, identity string) (*config, error) {
 		// Workspaces reach the driver over TLS only (SRW's driver CA).
 		return nil, errors.New("the request names no TLS certificate")
 	}
+	roots, err := upstreamRoots(request.Connector.Config.UpstreamCA)
+	if err != nil {
+		return nil, err
+	}
 	return &config{
-		driver:      request.Driver,
-		connectorID: connector,
-		upstream:    served,
-		exchangeURL: strings.TrimRight(request.Exchange.URL, "/"),
-		identity:    identity,
-		port:        strconv.Itoa(request.Service.Port),
-		certFile:    request.TLS.CertFile,
-		keyFile:     request.TLS.KeyFile,
+		driver:        request.Driver,
+		connectorID:   connector,
+		upstream:      served,
+		upstreamRoots: roots,
+		exchangeURL:   strings.TrimRight(request.Exchange.URL, "/"),
+		identity:      identity,
+		port:          strconv.Itoa(request.Service.Port),
+		certFile:      request.TLS.CertFile,
+		keyFile:       request.TLS.KeyFile,
 	}, nil
+}
+
+// upstreamRoots is the connector's upstream CA as a pool: PEM certificates
+// and nothing else, or nil (public roots) when it names none.
+func upstreamRoots(text string) (*x509.CertPool, error) {
+	if strings.TrimSpace(text) == "" {
+		return nil, nil
+	}
+	pool := x509.NewCertPool()
+	rest := []byte(text)
+	found := 0
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			return nil, fmt.Errorf("the connector's upstream CA holds a %s block", block.Type)
+		}
+		certificate, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("the connector's upstream CA: %w", err)
+		}
+		pool.AddCert(certificate)
+		found++
+	}
+	if found == 0 || strings.TrimSpace(string(rest)) != "" {
+		return nil, errors.New("the connector's upstream CA is not PEM certificates")
+	}
+	return pool, nil
 }
