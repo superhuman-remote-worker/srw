@@ -52,9 +52,9 @@
 // per binding. Every check above stays here; the front also names each
 // request's binding (its lease) and hands over the binding's credential in
 // headers only it sets, for the bridge to put in that process's
-// environment, and tells the bridge when a lease ended (on a stream, and
-// in a sweep of the bindings with a process every 30 s), so the process
-// stops with its binding. Each probe starts a process, so it runs in the
+// environment, and tells the bridge when a lease ended (when it refuses the
+// lease, on a stream, and in a sweep of the bindings with a process every
+// 30 s), so the process stops with its binding. Each probe starts a process, so it runs in the
 // background (every 5 s until the server answered, every 5 minutes after)
 // and /readyz answers from its last result and the bridge's liveness.
 package main

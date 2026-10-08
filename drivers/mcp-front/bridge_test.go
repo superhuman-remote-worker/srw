@@ -181,6 +181,36 @@ func TestTheSweepEndsTheProcessOfABindingWhoseLeaseEnded(t *testing.T) {
 	}
 }
 
+func TestARefusedLeaseEndsItsBindingsProcessAtOnce(t *testing.T) {
+	h := newBridgeHarness(t)
+	if code := h.do(t, http.MethodPost, tokenB, rpc(1, "initialize", map[string]any{}), nil).Code; code != http.StatusOK {
+		t.Fatalf("initialize: %d", code)
+	}
+	h.authority.mu.Lock()
+	delete(h.authority.leases, tokenB)
+	h.authority.mu.Unlock()
+	h.advance(31 * time.Second)
+	if code := h.do(t, http.MethodPost, tokenB, call("whoami"), nil).Code; code != http.StatusUnauthorized {
+		t.Fatalf("a dead lease: %d", code)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for len(h.server.at("/srw/bindings/lease-b")) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the bridge was not told the binding ended")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// A token that never had a process ends nothing.
+	h.do(t, http.MethodPost, tokenDead, call("whoami"), nil)
+	time.Sleep(50 * time.Millisecond)
+	if count := len(h.server.at("/srw/bindings/lease-b")); count != 1 {
+		t.Fatalf("%d binding ends", count)
+	}
+	if h.front.bindings.leaseOf(tokenB) != "" {
+		t.Fatal("the ended binding is still tracked")
+	}
+}
+
 func TestAStreamWhoseLeaseEndsStopsItsBindingsProcess(t *testing.T) {
 	previous := streamRecheck
 	streamRecheck = 20 * time.Millisecond

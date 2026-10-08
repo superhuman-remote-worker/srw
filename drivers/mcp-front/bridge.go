@@ -33,15 +33,17 @@ var bindingSweep = 30 * time.Second
 
 // bridgeBindings are the bindings whose process the bridge started (an
 // initialize answered for them), with the lease token the sweep re-checks.
-// The token stays in the front's memory, as on every request.
+// The token stays in the front's memory, as on every request; a refused
+// token is found by its digest.
 type bridgeBindings struct {
-	mu     sync.Mutex
-	tokens map[string]string
-	order  []string
+	mu      sync.Mutex
+	tokens  map[string]string
+	byToken map[[32]byte]string
+	order   []string
 }
 
 func newBridgeBindings() *bridgeBindings {
-	return &bridgeBindings{tokens: map[string]string{}}
+	return &bridgeBindings{tokens: map[string]string{}, byToken: map[[32]byte]string{}}
 }
 
 func (b *bridgeBindings) track(leaseID, token string) {
@@ -51,21 +53,35 @@ func (b *bridgeBindings) track(leaseID, token string) {
 		// Past the bound the oldest is no longer swept: its process still
 		// stops when idle.
 		for len(b.order) >= maxBridgeBindings {
-			delete(b.tokens, b.order[0])
-			b.order = b.order[1:]
+			b.forgetLocked(b.order[0])
 		}
 		b.order = append(b.order, leaseID)
 	}
 	b.tokens[leaseID] = token
+	b.byToken[tokenKey(token)] = leaseID
 }
 
 func (b *bridgeBindings) forget(leaseID string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if _, known := b.tokens[leaseID]; known {
-		delete(b.tokens, leaseID)
-		b.order = without(b.order, leaseID)
+	b.forgetLocked(leaseID)
+}
+
+func (b *bridgeBindings) forgetLocked(leaseID string) {
+	token, known := b.tokens[leaseID]
+	if !known {
+		return
 	}
+	delete(b.tokens, leaseID)
+	delete(b.byToken, tokenKey(token))
+	b.order = without(b.order, leaseID)
+}
+
+// leaseOf is the binding a token was tracked for, if any.
+func (b *bridgeBindings) leaseOf(token string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.byToken[tokenKey(token)]
 }
 
 func (b *bridgeBindings) snapshot() map[string]string {

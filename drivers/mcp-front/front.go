@@ -175,6 +175,13 @@ func (f *front) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case !found.active || !strings.EqualFold(found.connectorID, f.cfg.connectorID):
 		f.logf("refused a request without a live lease of this connector")
+		if f.cfg.bridge {
+			// A binding that had a process: it ended, and its process
+			// stops now, not at the next sweep.
+			if leaseID := f.bindings.leaseOf(token); leaseID != "" {
+				go f.endBinding(leaseID)
+			}
+		}
 		f.unauthorized(w, "lease_inactive", leaseRefused)
 		return
 	}
