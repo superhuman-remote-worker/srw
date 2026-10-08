@@ -236,6 +236,41 @@ def test_egress_settings_reach_the_orchestrator():
     assert env["CONNECTOR_SERVICE_PODS_ENABLED"] == "true"
 
 
+def test_the_shim_image_reaches_the_orchestrator_pinned_when_a_digest_is_set():
+    env = orchestrator_env(render())
+    assert env["CONNECTOR_DRIVER_SHIM_IMAGE"] == (
+        "ghcr.io/superhuman-remote-worker/srw-driver-shim:latest"
+    )
+    digest = "sha256:" + "a" * 64
+    env = orchestrator_env(render(f"connectors.drivers.shim.image.digest={digest}"))
+    assert env["CONNECTOR_DRIVER_SHIM_IMAGE"] == (
+        f"ghcr.io/superhuman-remote-worker/srw-driver-shim@{digest}"
+    )
+
+
+def test_tilt_builds_the_shim_and_pins_it_by_digest():
+    import ast
+
+    tiltfile = (ROOT / "Tiltfile").read_text()
+    tree = ast.parse(tiltfile)
+    build = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "docker_build"
+        and node.args
+        and getattr(node.args[0], "value", None) == "srw-driver-shim"
+    )
+    keywords = {item.arg: item.value for item in build.keywords}
+    assert ast.literal_eval(keywords["dockerfile"]) == "docker/Dockerfile.driver-shim"
+    assert "drivers/shim/" in ast.literal_eval(keywords["only"])
+    assert (
+        "('srw-driver-shim', 'connectors.drivers.shim.image.repository', "
+        "'connectors.drivers.shim.image.tag')" in tiltfile
+    )
+    assert "'srw-mcp', 'srw-vm-preparer', 'srw-driver-shim'" in tiltfile
+
+
 def test_the_k3d_profile_resolves_from_the_k3d_registry_over_http():
     example = ROOT / "deployment/values-local.yaml.example"
     registry = yaml.safe_load(example.read_text())["connectors"]["drivers"]["registry"]

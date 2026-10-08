@@ -215,6 +215,9 @@ class DeploymentSettings:
     connector_service_cluster_cidrs: tuple[str, ...] = DEFAULT_CLUSTER_CIDRS
     connector_service_private_tiers: frozenset[str] = DEFAULT_PRIVATE_TIERS
     connector_service_ipv6: bool = False
+    #: SRW's static driver shim image (``connectors.drivers.shim.image``):
+    #: the canary wait, the shim install and every driver's command.
+    connector_driver_shim_image: str = ""
 
     def session_subagent_fanout(self, lane: str | None) -> bool:
         """Whether a session on ``lane`` may fan out right now."""
@@ -299,6 +302,9 @@ class DeploymentSettings:
                 else DEFAULT_PRIVATE_TIERS
             ),
             connector_service_ipv6=_enabled("CONNECTOR_SERVICE_IPV6"),
+            connector_driver_shim_image=os.environ.get(
+                "CONNECTOR_DRIVER_SHIM_IMAGE", ""
+            ).strip(),
         )
 
 

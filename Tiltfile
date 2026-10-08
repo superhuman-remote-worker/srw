@@ -414,6 +414,18 @@ docker_build(
     ignore=['**/__pycache__', '**/*.pyc'],
 )
 
+# -----------------------------------------------------------------------------
+# Connector driver shim (connector drivers D5): the static Go helper every
+# service driver pod runs as its canary-wait and shim-install init containers
+# and as the driver container's command. The chart pins it by digest.
+# -----------------------------------------------------------------------------
+docker_build(
+    'srw-driver-shim',
+    context='.',
+    dockerfile='docker/Dockerfile.driver-shim',
+    only=['drivers/shim/', 'docker/Dockerfile.driver-shim'],
+)
+
 _srw_images = [
     ('srw-orchestrator', 'image.orchestrator.repository', 'image.orchestrator.tag'),
     ('srw-cockpit', 'image.cockpit.repository', 'image.cockpit.tag'),
@@ -423,6 +435,7 @@ _srw_images = [
     ('srw-workspace-minimal', 'image.workspaceMinimal.repository', 'image.workspaceMinimal.tag'),
     ('srw-vm-controller', 'vmController.image.repository', 'vmController.image.tag'),
     ('srw-vm-preparer', 'vmController.preparation.image.repository', 'vmController.preparation.image.tag'),
+    ('srw-driver-shim', 'connectors.drivers.shim.image.repository', 'connectors.drivers.shim.image.tag'),
 ]
 
 # Tilt fills in TILT_IMAGE_<i> (the freshly built+pushed ref) per image_deps
@@ -438,7 +451,7 @@ for i in range(len(_srw_images)):
     _srw_helm_env['TILT_IMAGE_KEY_TAG_%s' % i] = _srw_images[i][2]
     # These chart images also accept a digest, which outranks the tag. Tilt
     # owns the local image selection, including a pin saved by an earlier gate.
-    if _srw_images[i][0] in ['srw-mcp', 'srw-vm-preparer']:
+    if _srw_images[i][0] in ['srw-mcp', 'srw-vm-preparer', 'srw-driver-shim']:
         _srw_helm_env['TILT_IMAGE_KEY_DIGEST_%s' % i] = _srw_images[i][2][:-4] + '.digest'
 
 _srw_exposure_mode = os.getenv('SRW_EXPOSURE_MODE') or 'multi-host'

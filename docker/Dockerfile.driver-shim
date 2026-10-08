@@ -1,0 +1,26 @@
+# =============================================================================
+# srw-driver-shim — SRW's static helper inside connector driver pods
+# =============================================================================
+# Connector drivers D5: the canary-wait init container, the shim-install init
+# container, and the shim that becomes a driver container's command. One
+# static Go binary (standard library only) on scratch, run as an unprivileged
+# user; the pod's init containers also drop every capability and mount the
+# root filesystem read-only.
+#
+#   docker build -f docker/Dockerfile.driver-shim -t srw-driver-shim .
+# =============================================================================
+FROM golang:1.22-alpine AS build
+
+ARG SRW_SOURCE_REVISION="dev"
+
+WORKDIR /src
+COPY drivers/shim/ ./
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+        -ldflags "-s -w -X main.version=${SRW_SOURCE_REVISION}" \
+        -o /out/srw-driver-shim . \
+    && /out/srw-driver-shim version
+
+FROM scratch
+COPY --from=build /out/srw-driver-shim /srw-driver-shim
+USER 65532:65532
+ENTRYPOINT ["/srw-driver-shim"]

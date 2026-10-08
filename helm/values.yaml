@@ -209,6 +209,14 @@ connectors:
       secrets: 64
       services: 32
   drivers:
+    # -- SRW's static driver shim (docker/Dockerfile.driver-shim): the
+    # canary-wait and shim-install init containers of every driver pod, and
+    # the driver container's command. Pin a digest in production.
+    shim:
+      image:
+        repository: ghcr.io/superhuman-remote-worker/srw-driver-shim
+        tag: latest
+        digest: ""
     # -- How a bind resolves a driver image reference to a digest. Any
     # registry may serve a driver image; anonymous pulls only (private
     # registries need pull credentials SRW does not hold yet).

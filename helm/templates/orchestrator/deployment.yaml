@@ -1910,6 +1910,8 @@ spec:
             - name: CONNECTOR_SERVICE_IPV6
               value: {{ .ipv6 | quote }}
             {{- end }}
+            - name: CONNECTOR_DRIVER_SHIM_IMAGE
+              value: {{ include "srw.imageRef" (dict "image" .Values.connectors.drivers.shim.image) | quote }}
             - name: KB_EXTERNAL_REINDEX_CONCURRENCY
               value: {{ .Values.orchestrator.kbExternalReindexConcurrency | quote }}
             - name: KB_REINDEX_SWEEP_SECONDS
