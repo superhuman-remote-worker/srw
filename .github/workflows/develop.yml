@@ -906,7 +906,9 @@ jobs:
           DRIVER_SHIM=$(image_missing driver-shim "$DRIVER_SHIM_SHA")
 
           # The managed MCP front (D5a): one static Go binary, stdlib only.
-          DRIVER_MCP_FRONT_PATHS=(drivers/mcp-front/ .dockerignore docker/Dockerfile.driver-mcp-front)
+          # Its job also tests the development MCP server (drivers/mcp-test),
+          # so a change there runs it too.
+          DRIVER_MCP_FRONT_PATHS=(drivers/mcp-front/ drivers/mcp-test/ .dockerignore docker/Dockerfile.driver-mcp-front)
           DRIVER_MCP_FRONT_SHA=$(last_input_sha "${DRIVER_MCP_FRONT_PATHS[@]}")
           DRIVER_MCP_FRONT=$(image_missing driver-mcp-front "$DRIVER_MCP_FRONT_SHA")
 
@@ -2263,7 +2265,14 @@ jobs:
         working-directory: drivers/mcp-front
         run: |
           go vet ./...
-          go test -count=1 ./...
+          go test -count=1 -race ./...
+      # The development MCP server the front's integration tests and the
+      # k3d gate run behind it: tested here, never built or published.
+      - name: Vet and test the MCP test server
+        working-directory: drivers/mcp-test
+        run: |
+          go vet ./...
+          go test -count=1 -race ./...
       - uses: docker/setup-buildx-action@v3
         with:
           buildkitd-config-inline: |

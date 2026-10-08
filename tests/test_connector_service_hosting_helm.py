@@ -119,10 +119,37 @@ def test_quotas_split_service_and_bind_time_pods():
     } <= set(compute)
     assert compute["services.loadbalancers"] == "0"
     assert compute["services.nodeports"] == "0"
+    assert compute["count/services"] == "48"
     (limits,) = one(docs, "LimitRange")["spec"]["limits"]
     assert limits["type"] == "Container"
     assert set(limits) == {"type", "defaultRequest", "default", "max"}
     assert limits["max"]["memory"] == "2Gi"
+
+
+def test_the_service_quota_follows_the_installation_cap():
+    """Each pod has its own Service and each connector and digest an
+    endpoint Service: the quota never falls below two per pod."""
+
+    def services(*overrides: str) -> str:
+        docs = in_namespace(render(EXCHANGE, ON, *overrides))
+        compute = one(docs, "ResourceQuota", "srw-connector-compute")
+        return compute["spec"]["hard"]["count/services"]
+
+    assert services("connectors.servicePods.maxInstallation=40") == "80"
+    assert (
+        services(
+            "connectors.servicePods.maxInstallation=5",
+            "connectors.servicePods.quota.services=6",
+        )
+        == "10"
+    )
+    assert (
+        services(
+            "connectors.servicePods.maxInstallation=5",
+            "connectors.servicePods.quota.services=30",
+        )
+        == "30"
+    )
 
 
 def test_the_orchestrator_role_has_no_exec_attach_or_log():

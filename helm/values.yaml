@@ -253,7 +253,8 @@ connectors:
       ephemeralStorage: "40Gi"
       # -- One Secret per service pod, plus room for D6. Services: one per
       # service pod and one endpoint Service per connector and image digest
-      # with a live pod (D5a), so at least twice maxInstallation.
+      # with a live pod (D5a); the chart never sets the quota below twice
+      # maxInstallation, whatever this says.
       secrets: 64
       services: 48
   drivers:

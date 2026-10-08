@@ -303,6 +303,13 @@ def test_the_mcp_front_is_vetted_tested_built_and_pinned_by_digest(name, publica
     test = next(s for s in steps if s.get("name") == "Vet and test the front")
     assert test["working-directory"] == "drivers/mcp-front"
     assert "go vet ./..." in test["run"] and "go test" in test["run"]
+    assert "-race" in test["run"]
+    # The development MCP server it is tested against: vetted and tested.
+    server = next(
+        s for s in steps if s.get("name") == "Vet and test the MCP test server"
+    )
+    assert server["working-directory"] == "drivers/mcp-test"
+    assert "go vet ./..." in server["run"] and "go test" in server["run"]
     go = next(s for s in steps if s.get("uses", "").startswith("actions/setup-go@"))
     dockerfile = (SCRIPT.parents[1] / "docker/Dockerfile.driver-mcp-front").read_text()
     base = re.search(
@@ -327,10 +334,12 @@ def test_the_mcp_front_is_vetted_tested_built_and_pinned_by_digest(name, publica
 
 def test_develop_rebuilds_the_mcp_front_when_its_inputs_change():
     text, jobs = workflow("develop")
-    assert "DRIVER_MCP_FRONT_PATHS=(drivers/mcp-front/" in text
+    assert "DRIVER_MCP_FRONT_PATHS=(drivers/mcp-front/ drivers/mcp-test/" in text
     assert 'image_missing driver-mcp-front "$DRIVER_MCP_FRONT_SHA"' in text
     outputs = jobs["changes"]["outputs"]
     assert "driver-mcp-front" in outputs and "driver-mcp-front-sha" in outputs
-    # The development MCP test server is never published.
+    # The development MCP test server is tested, never built or published.
     for name in ("develop", "main"):
-        assert "mcp-test" not in workflow(name)[0]
+        text = workflow(name)[0]
+        assert "Dockerfile.driver-mcp-test" not in text
+        assert "driver-mcp-test" not in text

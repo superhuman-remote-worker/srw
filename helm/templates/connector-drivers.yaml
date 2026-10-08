@@ -93,7 +93,9 @@ spec:
     limits.memory: {{ $quota.limitsMemory | quote }}
     requests.ephemeral-storage: {{ $quota.ephemeralStorage | quote }}
     count/secrets: {{ $quota.secrets | quote }}
-    count/services: {{ $quota.services | quote }}
+    {{- /* A service pod's own Service plus one endpoint Service per
+       connector and digest (D5a): never fewer than two per pod. */}}
+    count/services: {{ max (int $quota.services) (mul 2 (int $pods.maxInstallation)) | quote }}
     services.loadbalancers: "0"
     services.nodeports: "0"
 ---
