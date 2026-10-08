@@ -15892,6 +15892,12 @@ class ContainerProvisioner:
             },
             "spec": {
                 "restartPolicy": "Never",
+                # The workspace shell is agent-controlled and talks to no
+                # Kubernetes API: without this the namespace's default
+                # ServiceAccount token is mounted, and kubectl (or any client)
+                # with no kubeconfig falls back to it. Retirement fence Pods
+                # and manifest workspace Pods already opt out.
+                "automountServiceAccountToken": False,
                 # Grace period for agent to checkpoint and push artifacts
                 # before the pod is killed on deletion.
                 "terminationGracePeriodSeconds": 120,

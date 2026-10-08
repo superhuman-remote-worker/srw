@@ -158,6 +158,50 @@ def test_build_sha_label_only_for_the_installation_image():
     assert "srw/build-sha" not in build(provisioner, custom)["metadata"]["labels"]
 
 
+@pytest.mark.parametrize(
+    "owner",
+    [WorkspaceOwner.job(JOB_ID), WorkspaceOwner.session(JOB_ID)],
+    ids=["job", "session"],
+)
+@pytest.mark.parametrize("image", [None, CUSTOM], ids=["default", "custom"])
+@pytest.mark.parametrize("pvc_name", [None, "pvc-workspace-111111112222"])
+def test_workspace_pod_never_mounts_a_service_account_token(owner, image, pvc_name):
+    # The agent drives the workspace shell; a mounted default-ServiceAccount
+    # token is what kubectl falls back to with no kubeconfig. Every shape of
+    # workspace Pod (job, session/IDE, custom image, PVC) opts out, and no
+    # volume or mount reintroduces a projected token.
+    provisioner = ContainerProvisioner()
+    profile = sandbox_pod_profile(
+        SandboxSettings(image=image), provisioner._image_policy()
+    )
+    manifest = provisioner._build_pod_manifest(
+        pod_name="workspace-111111112222",
+        owner=owner,
+        image=profile.image,
+        cpu=profile.cpu,
+        memory=profile.memory,
+        cpu_limit=profile.cpu_limit,
+        memory_limit=profile.memory_limit,
+        pvc_name=pvc_name,
+        seed_configmap="workspace-111111112222-seed",
+        profile=profile,
+    )
+    spec = manifest["spec"]
+    assert spec["automountServiceAccountToken"] is False
+    assert "serviceAccountName" not in spec
+    assert "serviceAccount" not in spec
+    assert not any(
+        "serviceAccountToken" in source
+        for volume in spec["volumes"]
+        for source in volume.get("projected", {}).get("sources", [])
+    )
+    assert not any(
+        mount["mountPath"].startswith("/var/run/secrets/kubernetes.io")
+        for container in spec["containers"] + spec.get("initContainers", [])
+        for mount in container.get("volumeMounts", [])
+    )
+
+
 @pytest.mark.asyncio
 async def test_reusing_a_smaller_pvc_is_logged_not_resized(caplog):
     provisioner = ContainerProvisioner()
