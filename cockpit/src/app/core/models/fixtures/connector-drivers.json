@@ -402,7 +402,7 @@
             "repo_pull",
             "repo_pr_status"
           ],
-          "enforced_by": "Only the repo tools are read-only; the workspace shell can still push with the checkout's credentials.",
+          "enforced_by": "Only the repo tools are read-only; the workspace shell can still push with the checkout's credentials. A GitHub App connector's token is minted with contents: read.",
           "advisory": true
         },
         {
@@ -416,7 +416,7 @@
             "repo_open_pr",
             "repo_pr_status"
           ],
-          "enforced_by": "The forge token or deploy key decides which pushes succeed.",
+          "enforced_by": "The forge token or deploy key decides which pushes succeed; a GitHub App connector's token is minted with contents: write for its one repository.",
           "advisory": false
         }
       ],
@@ -463,6 +463,27 @@
               }
             }
           }
+        },
+        {
+          "name": "private_key",
+          "kind": "secret_string",
+          "required": false,
+          "rotatable": false,
+          "access_levels": [],
+          "delivery": null,
+          "update": "replace",
+          "names_field": null,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "private_key": {
+                "type": "string",
+                "writeOnly": true,
+                "x-srw-multiline": true,
+                "x-srw-widget": "file"
+              }
+            }
+          }
         }
       ],
       "config_schema": {
@@ -482,6 +503,27 @@
           "upstream_ca": {
             "type": "string",
             "x-srw-multiline": true
+          },
+          "github_app": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "app_id",
+              "installation_id"
+            ],
+            "properties": {
+              "app_id": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]{0,19}$"
+              },
+              "installation_id": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]{0,19}$"
+              },
+              "api_base": {
+                "type": "string"
+              }
+            }
           },
           "endpoint": {
             "type": "string",
@@ -1605,7 +1647,7 @@
         "sandbox",
         "vm"
       ],
-      "workspace_requirements": "A shell workspace: each file is written under the home's private credential store over a secret channel, with its mode, and linked at its target path; kubeconfigs are merged for kubectl.",
+      "workspace_requirements": "A shell workspace: each file is written under the home's private credential store over a secret channel, with its mode, and linked at its target path; kubeconfigs are merged for kubectl. With TokenRequest minting the workspace's kubeconfig holds only a short-lived token SRW minted for the target ServiceAccount, bound to a Secret SRW deletes when the execution ends; the minting credential stays with SRW.",
       "tool_category": null,
       "operations": [],
       "access_levels": [
@@ -1613,14 +1655,14 @@
           "id": "ReadOnly",
           "rank": 0,
           "tools": [],
-          "enforced_by": "Told to the agent only; the same kubeconfig is delivered either way.",
+          "enforced_by": "Told to the agent only; the same kubeconfig is delivered either way. With TokenRequest minting, the cluster's RBAC for the target ServiceAccount decides: SRW cannot narrow a minted token.",
           "advisory": true
         },
         {
           "id": "ReadWrite",
           "rank": 1,
           "tools": [],
-          "enforced_by": "The upstream credential decides what is allowed.",
+          "enforced_by": "The upstream credential decides what is allowed; with TokenRequest minting, the cluster's RBAC for the target ServiceAccount.",
           "advisory": false
         }
       ],
@@ -1707,6 +1749,35 @@
                 "env_var": {
                   "type": "string"
                 }
+              }
+            }
+          },
+          "token_request": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "namespace",
+              "service_account"
+            ],
+            "properties": {
+              "namespace": {
+                "type": "string"
+              },
+              "service_account": {
+                "type": "string"
+              },
+              "expiration_seconds": {
+                "type": "integer",
+                "minimum": 600,
+                "maximum": 86400,
+                "default": 3600
+              },
+              "audiences": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 10
               }
             }
           }

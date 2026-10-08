@@ -283,6 +283,28 @@ CREDENTIALS_SPEC = DriverSpec(
     holds_upstream_credentials=True,
 )
 
+#: A repository connector that authenticates as a GitHub App installation
+#: (C5, ``shared.connectors.github_app``): the App and the installation, and
+#: the REST API base of a GitHub Enterprise Server; not secret.
+_GITHUB_APP: Mapping[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["app_id", "installation_id"],
+    "properties": {
+        "app_id": {"type": "string", "pattern": "^[1-9][0-9]{0,19}$"},
+        "installation_id": {"type": "string", "pattern": "^[1-9][0-9]{0,19}$"},
+        "api_base": {"type": "string"},
+    },
+}
+#: The App's private key: SRW signs App JWTs with it and mints installation
+#: tokens; it never leaves SRW.
+_GITHUB_APP_KEY = CredentialSlot(
+    "private_key",
+    "secret_string",
+    {"type": "object", "properties": {"private_key": _SECRET_FILE}},
+    update="replace",
+)
+
 REPOSITORY_SPEC = DriverSpec(
     name="srw.repository/v1",
     legacy_type="repository",
@@ -300,6 +322,7 @@ REPOSITORY_SPEC = DriverSpec(
             # PEM certificates the git swap driver alone trusts the upstream
             # with (a forge behind a private CA); not a secret.
             "upstream_ca": {"type": "string", "x-srw-multiline": True},
+            "github_app": _GITHUB_APP,
             "endpoint": _ENDPOINT,
             "default_branch": _MIRROR,
             "auth_method": _AUTH_METHOD,
@@ -326,6 +349,7 @@ REPOSITORY_SPEC = DriverSpec(
             delivery="ssh_agent",
             update="replace",
         ),
+        _GITHUB_APP_KEY,
     ),
     tool_category="repo",
     access_levels=_read_write(
@@ -340,11 +364,14 @@ REPOSITORY_SPEC = DriverSpec(
         ),
         read_only_enforced_by=(
             "Only the repo tools are read-only; the workspace shell can still "
-            "push with the checkout's credentials."
+            "push with the checkout's credentials. A GitHub App connector's "
+            "token is minted with contents: read."
         ),
         read_only_advisory=True,
         read_write_enforced_by=(
-            "The forge token or deploy key decides which pushes succeed."
+            "The forge token or deploy key decides which pushes succeed; a "
+            "GitHub App connector's token is minted with contents: write for "
+            "its one repository."
         ),
     ),
     supported_backends=SHELL_BACKENDS,
@@ -686,7 +713,15 @@ MCP_REMOTE_DRIVER = MCP_REMOTE_SPEC.name
 
 
 def _credential_file(
-    type_id: str, name: str, title: str, kind: CredentialKind, file_word: str
+    type_id: str,
+    name: str,
+    title: str,
+    kind: CredentialKind,
+    file_word: str,
+    *,
+    config: Mapping[str, Mapping[str, Any]] | None = None,
+    access_levels: tuple[AccessLevel, ...] | None = None,
+    requirements: str = "",
 ) -> DriverSpec:
     return DriverSpec(
         name=f"srw.{name}/v1",
@@ -695,7 +730,9 @@ def _credential_file(
         guide_topic="datasources",
         plane="bind_time",
         delivery_forms=("credential_file",),
-        config_schema=_config(endpoint=_ENDPOINT, files=_FILE_TARGETS),
+        config_schema=_config(
+            endpoint=_ENDPOINT, files=_FILE_TARGETS, **(config or {})
+        ),
         legacy_connection_url="optional",
         credential_slots=(
             CredentialSlot(
@@ -707,19 +744,68 @@ def _credential_file(
                 update="replace",
             ),
         ),
-        access_levels=_declared_only(file_word),
+        access_levels=access_levels or _declared_only(file_word),
         supported_backends=SHELL_BACKENDS,
         workspace_requirements=(
             "A shell workspace: each file is written under the home's private "
             "credential store over a secret channel, with its mode, and linked "
-            "at its target path; kubeconfigs are merged for kubectl."
+            "at its target path; kubeconfigs are merged for kubectl." + requirements
         ),
         holds_upstream_credentials=True,
     )
 
 
+#: A kubeconfig connector's optional TokenRequest minting (C5,
+#: ``shared.connectors.token_request``): its stored kubeconfig then mints a
+#: short-lived token for the target ServiceAccount at each bind and is never
+#: delivered; the workspace's kubeconfig holds the minted token only.
+_TOKEN_REQUEST: Mapping[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["namespace", "service_account"],
+    "properties": {
+        "namespace": {"type": "string"},
+        "service_account": {"type": "string"},
+        "expiration_seconds": {
+            "type": "integer",
+            "minimum": 600,
+            "maximum": 86400,
+            "default": 3600,
+        },
+        "audiences": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
+    },
+}
+
 KUBECONFIG_SPEC = _credential_file(
-    "kubeconfig", "kubeconfig", "Kubeconfig", "kubeconfig", "kubeconfig"
+    "kubeconfig",
+    "kubeconfig",
+    "Kubeconfig",
+    "kubeconfig",
+    "kubeconfig",
+    config={"token_request": _TOKEN_REQUEST},
+    access_levels=(
+        AccessLevel(
+            "ReadOnly",
+            0,
+            "Told to the agent only; the same kubeconfig is delivered either "
+            "way. With TokenRequest minting, the cluster's RBAC for the target "
+            "ServiceAccount decides: SRW cannot narrow a minted token.",
+            advisory=True,
+        ),
+        AccessLevel(
+            "ReadWrite",
+            1,
+            "The upstream credential decides what is allowed; with "
+            "TokenRequest minting, the cluster's RBAC for the target "
+            "ServiceAccount.",
+        ),
+    ),
+    requirements=(
+        " With TokenRequest minting the workspace's kubeconfig holds only a "
+        "short-lived token SRW minted for the target ServiceAccount, bound to "
+        "a Secret SRW deletes when the execution ends; the minting credential "
+        "stays with SRW."
+    ),
 )
 SSH_KEY_SPEC = DriverSpec(
     name="srw.ssh-key/v1",
@@ -1263,6 +1349,7 @@ GIT_SWAP_SPEC = DriverSpec(
             "default_branch": _MIRROR,
             "auth_method": _AUTH_METHOD,
             "upstream_ca": {"type": "string", "x-srw-multiline": True},
+            "github_app": _GITHUB_APP,
             "upstream": _MIRROR,
             "host": _MIRROR,
         },
@@ -1270,13 +1357,16 @@ GIT_SWAP_SPEC = DriverSpec(
     credential_slots=(
         # Never the workspace: the driver injects it upstream per request,
         # and the agent process keeps it for the forge API (pull requests).
+        # A GitHub App connector stores the App's key instead: the exchange
+        # hands the driver an installation token SRW mints at the binding's
+        # level and mints again before it expires (C5).
         CredentialSlot(
             "token",
             "secret_string",
             {"type": "object", "properties": {"token": _SECRET}},
-            required=True,
             update="replace",
         ),
+        _GITHUB_APP_KEY,
     ),
     tool_category="repo",
     access_levels=(
@@ -1286,7 +1376,8 @@ GIT_SWAP_SPEC = DriverSpec(
             "SRW's git swap driver refuses both git-receive-pack routes, by "
             "request path, and the lease exchange refuses it the write "
             "credential; the workspace holds a lease token, never the forge "
-            "token.",
+            "token. A GitHub App connector's token is minted with contents: "
+            "read as well.",
             tools=("repo_pull", "repo_pr_status"),
         ),
         AccessLevel(
