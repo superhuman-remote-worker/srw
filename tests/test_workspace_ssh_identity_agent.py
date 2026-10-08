@@ -24,7 +24,10 @@ from shared.runtime.core.managed_repository import (
     managed_repository_agent_zero_command,
 )
 from shared.runtime.core.workspace_ssh_identity import (
+    _CHECKOUT_IDENTITY_KINDS,
     IDENTITY_READY,
+    WorkspaceSshIdentityError,
+    _validated_identity,
     materialize_workspace_ssh_identities,
     prune_workspace_ssh_identities,
     retire_workspace_ssh_identities,
@@ -238,6 +241,21 @@ def test_one_broken_identity_degrades_only_its_connector(home: Path) -> None:
     slug = not_a_key["authority_id"].replace("-", "")
     assert not (home / ".ssh" / "srw-managed" / "agents" / f"{slug}.state").exists()
     assert not any("ProxyCommand" in command for command, _ in backend.commands)
+
+
+def test_a_checkout_identity_is_bound_to_its_clone_host() -> None:
+    """The repository driver checks out, so its identity names its host and
+    adds no other; an ssh_key identity may do either (C1 wire contract)."""
+    assert _CHECKOUT_IDENTITY_KINDS == {"repository"}
+    _validated_identity(_payload(kind="ssh_key", host=None, port=None, user=None))
+    _validated_identity(_payload(kind="ssh_key", extra_hosts=["bastion.example.com"]))
+    _validated_identity(_payload(kind="repository"))
+    for broken in (
+        _payload(kind="repository", host=None, port=None, user=None),
+        _payload(kind="repository", extra_hosts=["bastion.example.com"]),
+    ):
+        with pytest.raises(WorkspaceSshIdentityError):
+            _validated_identity(broken)
 
 
 def test_no_shell_backend_refuses_every_identity_and_drops_keys() -> None:

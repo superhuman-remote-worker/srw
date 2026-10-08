@@ -399,6 +399,11 @@ def select_known_hosts(
 WORKSPACE_SSH_IDENTITY_VERSION = 1
 #: The stored types whose driver delivers an ssh-agent identity.
 WORKSPACE_SSH_IDENTITY_KINDS = legacy_types_with_form("ssh_identity")
+#: Kinds whose driver also checks out (a repository): their identity is bound
+#: to the host they clone from, so it names that host and adds no others.
+_CHECKOUT_IDENTITY_KINDS = WORKSPACE_SSH_IDENTITY_KINDS & legacy_types_with_form(
+    "checkout"
+)
 #: Status of an identity the workspace agent holds and has proven.
 IDENTITY_READY = "ready"
 _FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
@@ -460,7 +465,7 @@ def _validated_identity(payload: Mapping[str, Any]) -> dict[str, Any]:
         or not isinstance(strict, bool)
         or (strict and not known_hosts)
         or len(extra_hosts) > _MAX_EXTRA_HOSTS
-        or (kind == "repository" and extra_hosts)
+        or (kind in _CHECKOUT_IDENTITY_KINDS and extra_hosts)
     ):
         raise invalid
     host = payload.get("ssh_host")
@@ -482,7 +487,9 @@ def _validated_identity(payload: Mapping[str, Any]) -> dict[str, Any]:
             raise invalid
     except SshEndpointError as exc:
         raise invalid from exc
-    if kind == "repository" and (host is None or port is None or user is None):
+    if kind in _CHECKOUT_IDENTITY_KINDS and (
+        host is None or port is None or user is None
+    ):
         raise invalid
     if host is None and (port is not None or user is not None or known_hosts):
         raise invalid
