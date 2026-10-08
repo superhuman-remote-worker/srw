@@ -1,0 +1,37 @@
+# =============================================================================
+# In-pod plane mount images — D7 SPIKE PROTOTYPE (connector drivers)
+# =============================================================================
+# Two targets, built by scripts/k3d-in-pod-plane-spike.py only; never published.
+#
+#   opener  the privileged native sidecar: srw-fuse-opener alone on scratch.
+#           It opens /dev/fuse, mounts it and passes the descriptor over a
+#           unix socket. No shell, no network code, no rclone.
+#   rclone  the unprivileged native sidecar: upstream rclone with the opener's
+#           fusermount3 client ahead of the real (setuid) one, which is
+#           removed. rclone mount2 asks it to mount, so rclone needs no
+#           capability and no /dev/fuse.
+#
+#   docker build -f docker/Dockerfile.in-pod-mount --target opener .
+#   docker build -f docker/Dockerfile.in-pod-mount --target rclone .
+# =============================================================================
+FROM --platform=$BUILDPLATFORM golang:1.26.8-alpine3.24@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c AS build
+
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /src
+COPY drivers/fuse-opener/ ./
+RUN CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" \
+        GOARCH="${TARGETARCH:-$(go env GOARCH)}" \
+        go build -trimpath -ldflags "-s -w" -o /out/srw-fuse-opener .
+
+FROM scratch AS opener
+COPY --from=build /out/srw-fuse-opener /srw-fuse-opener
+ENTRYPOINT ["/srw-fuse-opener"]
+
+FROM rclone/rclone:1.74.3@sha256:623378ad0ff3ebd5cebf77720843c0e02edfe46e2d5b5ac6bed54c6371780dfb AS rclone
+# go-fuse finds fusermount3 on PATH; /usr/local/bin comes first. The setuid
+# original goes, so nothing in this image can mount by itself.
+RUN rm -f /usr/bin/fusermount3 /usr/bin/fusermount
+COPY --from=build /out/srw-fuse-opener /usr/local/bin/srw-fuse-opener
+RUN ln -s srw-fuse-opener /usr/local/bin/fusermount3
