@@ -307,6 +307,17 @@ describe('JobCreateComponent project picker', () => {
 
   afterEach(() => TestBed.resetTestingModule());
 
+  it('lets a job make cloud storage read-only but never ask for write', () => {
+    // The server only lets cloud_storage_read_only tighten a project link.
+    const {component} = setup(null);
+    expect(component.buildRequest().context?.['cloud_storage_read_only']).toBeUndefined();
+    component.onCloudStorageChange('readwrite');
+    expect(component.cloudStorageOverride()).toBe('inherit');
+    expect(component.buildRequest().context?.['cloud_storage_read_only']).toBeUndefined();
+    component.onCloudStorageChange('readonly');
+    expect(component.buildRequest().context?.['cloud_storage_read_only']).toBe(true);
+  });
+
   it('offers active projects only', () => {
     const {component, api} = setup(null);
 

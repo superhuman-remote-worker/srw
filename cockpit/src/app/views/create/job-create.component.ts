@@ -292,9 +292,10 @@ import {AppFormFieldComponent} from '../../ui/form-field';
                   (changed)="onCloudStorageChange($event)"
                   [disabled]="isSubmitting()"
                 >
+                  <!-- No read-write choice: a job's override only tightens the
+                       project's link, it never lifts a read-only one. -->
                   <option value="inherit">{{ 'jobs.create.cloudStorageInherit' | transloco }}</option>
                   <option value="readonly">{{ 'jobs.create.cloudStorageReadonly' | transloco }}</option>
-                  <option value="readwrite">{{ 'jobs.create.cloudStorageReadwrite' | transloco }}</option>
                 </app-select>
               </app-form-field>
             }
@@ -1180,7 +1181,7 @@ export class JobCreateComponent implements OnInit {
   }
 
   onCloudStorageChange(value: string | null): void {
-    if (value === 'inherit' || value === 'readonly' || value === 'readwrite') {
+    if (value === 'inherit' || value === 'readonly') {
       this.cloudStorageOverride.set(value);
     }
   }
@@ -1188,7 +1189,9 @@ export class JobCreateComponent implements OnInit {
   readonly projects = signal<Project[]>([]);
   readonly selectedProjectId = signal<string | null>(null);
 
-  readonly cloudStorageOverride = signal<'inherit' | 'readonly' | 'readwrite'>('inherit');
+  /** A job can make the project's cloud storage read-only, never writable:
+   *  the server only lets `cloud_storage_read_only` tighten a link. */
+  readonly cloudStorageOverride = signal<'inherit' | 'readonly'>('inherit');
   /** A project reachable only through a `?project=` deep link can be archived;
    *  the form says so instead of pretending the job will be accepted. */
   readonly selectedProjectIsArchived = computed(() => {
@@ -1706,11 +1709,10 @@ export class JobCreateComponent implements OnInit {
     if (priority !== 5) request.priority = priority;
 
     // Cloud storage override
-    const csOverride = this.cloudStorageOverride();
-    if (csOverride !== 'inherit') {
+    if (this.cloudStorageOverride() === 'readonly') {
       request.context = {
         ...(request.context ?? {}),
-        cloud_storage_read_only: csOverride === 'readonly',
+        cloud_storage_read_only: true,
       };
     }
 
