@@ -138,31 +138,25 @@ def durable_project_ids(
     project. A NULL column means no project, except on a **legacy
     multi-project Session** created before that rule (the column was NULL for
     two or more projects). Its list lives only in the legacy places, read in
-    their historical order: ``metadata.project_ids`` (before Phase 1 of the
-    cloud collaboration model), else the ``project`` and ``project_default``
-    rows of ``thread_mounts`` (``legacy_mounts``). Those Sessions keep
-    working as legacy; nothing else reads the mount rows for scope.
+    their historical order: the ``project`` and ``project_default`` rows of
+    ``thread_mounts`` (``legacy_mounts``), else ``metadata.project_ids``
+    (before Phase 1 of the cloud collaboration model). Those Sessions keep
+    working exactly as before; nothing else reads the mount rows for scope.
     """
     if not thread:
         return []
     if thread.get("project_id"):
         return [str(thread["project_id"])]
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    legacy = [
-        str(value)
-        for value in (
-            metadata.get("project_ids") if isinstance(metadata, dict) else None
-        )
-        or []
-        if value
-    ]
+    legacy = project_ids_from_mounts(legacy_mounts or [])
     if not legacy:
-        legacy = project_ids_from_mounts(legacy_mounts or [])
+        metadata = thread.get("metadata") or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (json.JSONDecodeError, TypeError):
+                metadata = {}
+        values = metadata.get("project_ids") if isinstance(metadata, dict) else None
+        legacy = [str(value) for value in values or [] if value]
     return list(dict.fromkeys(legacy))
 
 

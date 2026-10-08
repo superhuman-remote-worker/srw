@@ -146,20 +146,19 @@ class TestDurableProjectIds:
         assert durable_project_ids(_thread(None), legacy_mounts=[]) == []
         assert durable_project_ids(None) == []
 
-    def test_a_legacy_multi_project_session_reads_its_metadata_list(self):
-        thread = _thread(None, project_ids=[DEFAULT, Q, DEFAULT])
-        assert durable_project_ids(thread, legacy_mounts=[_mount(P)]) == [DEFAULT, Q]
-
-    def test_a_legacy_multi_project_session_falls_back_to_its_mount_rows(self):
+    def test_a_legacy_multi_project_session_reads_its_mount_rows_first(self):
+        """The historical order: the rows, as the old reader returned them."""
         mounts = [
             _mount(DEFAULT, kind="project_default"),
             _mount(Q),
             {"mount_kind": "repo", "source_ref": P},
         ]
-        assert durable_project_ids(_thread(None), legacy_mounts=mounts) == [
-            DEFAULT,
-            Q,
-        ]
+        thread = _thread(None, project_ids=[DEFAULT, Q, P])
+        assert durable_project_ids(thread, legacy_mounts=mounts) == [DEFAULT, Q]
+
+    def test_a_legacy_session_without_rows_reads_its_metadata_list(self):
+        thread = _thread(None, project_ids=[DEFAULT, Q, DEFAULT])
+        assert durable_project_ids(thread, legacy_mounts=[]) == [DEFAULT, Q]
 
     def test_metadata_stored_as_text_is_decoded(self):
         thread = {**_thread(None), "metadata": '{"project_ids": ["%s"]}' % Q}
