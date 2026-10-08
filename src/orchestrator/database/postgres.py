@@ -50653,7 +50653,6 @@ class PostgresDB:
         config: Dict[str, Any] | None = None,
         is_global: bool | None = None,
         read_only: bool | None = None,
-        connection_url_set: bool = False,
         authority_project_scope_id: str | None = None,
     ) -> bool:
         """Update a datasource.
@@ -50669,8 +50668,6 @@ class PostgresDB:
             config: New non-secret type-specific configuration
             is_global: Publish (True) / unpublish (False); None = unchanged
             read_only: Declared read-only flag; None = unchanged
-            connection_url_set: Persist ``connection_url`` even when it is
-                explicitly ``None`` (used when an MCP switches to stdio).
 
         Returns:
             True if updated, False if not found
@@ -50704,7 +50701,7 @@ class PostgresDB:
             updates.append(f"description = ${param_count}")
             values.append(description)
 
-        if connection_url is not None or connection_url_set:
+        if connection_url is not None:
             param_count += 1
             updates.append(f"connection_url = ${param_count}")
             values.append(connection_url)
@@ -50756,21 +50753,16 @@ class PostgresDB:
         # reads: ``knowledge_projection.build_datasource_note_content``, which
         # asks the connector's driver (``DatasourceDriver.knowledge_note``).
         # Credential *values* never enter the note, but generic connectors
-        # expose their environment variable names. An explicit URL clear is
-        # content-changing too.
-        note_content_changed = (
-            connection_url is not None
-            or connection_url_set
-            or any(
-                value is not None
-                for value in (
-                    name,
-                    description,
-                    credentials,
-                    cli_hint,
-                    default_branch,
-                    config,
-                )
+        # expose their environment variable names.
+        note_content_changed = connection_url is not None or any(
+            value is not None
+            for value in (
+                name,
+                description,
+                credentials,
+                cli_hint,
+                default_branch,
+                config,
             )
         )
 
@@ -50890,7 +50882,6 @@ class PostgresDB:
         config: Dict[str, Any] | None = None,
         is_global: bool | None = None,
         read_only: bool | None = None,
-        connection_url_set: bool = False,
         authority_user_id: str | None = None,
         authority_is_admin: bool = False,
         authority_project_scope_id: str | None = None,
@@ -51036,7 +51027,7 @@ class PostgresDB:
                     add_update("name", name)
                 if description is not None:
                     add_update("description", description)
-                if connection_url is not None or connection_url_set:
+                if connection_url is not None:
                     add_update("connection_url", connection_url)
                 if credentials is not None:
                     add_update("credentials", _encrypt_credentials_dict(credentials))
@@ -51108,19 +51099,15 @@ class PostgresDB:
                 # driver (``DatasourceDriver.knowledge_note``). Credential
                 # values stay secret; generic note content only exposes ENV
                 # names.
-                note_content_changed = (
-                    connection_url is not None
-                    or connection_url_set
-                    or any(
-                        value is not None
-                        for value in (
-                            name,
-                            description,
-                            credentials,
-                            cli_hint,
-                            default_branch,
-                            config,
-                        )
+                note_content_changed = connection_url is not None or any(
+                    value is not None
+                    for value in (
+                        name,
+                        description,
+                        credentials,
+                        cli_hint,
+                        default_branch,
+                        config,
                     )
                 )
                 if note_content_changed:

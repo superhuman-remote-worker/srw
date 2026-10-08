@@ -683,7 +683,6 @@ async def update_datasource(
     connection_url = normalized.connection_url
     datasource_config = normalized.config
     credentials = normalized.credentials
-    connection_url_set = normalized.connection_url_set
     try:
         policy_result: dict[str, Any] | None = None
         content_fields = {
@@ -720,7 +719,6 @@ async def update_datasource(
                 config=datasource_config,
                 is_global=body.is_global,
                 read_only=read_only,
-                connection_url_set=connection_url_set,
                 authority_user_id=str(user["id"]),
                 authority_is_admin=bool(user.get("is_admin")),
                 authority_project_scope_id=(
@@ -745,8 +743,6 @@ async def update_datasource(
                 is_global=body.is_global,
                 read_only=read_only,
             )
-            if connection_url_set:
-                update_kwargs["connection_url_set"] = True
             if scope_project_id:
                 update_kwargs["authority_project_scope_id"] = str(scope_project_id)
             success = await dependencies.store.update_datasource(**update_kwargs)

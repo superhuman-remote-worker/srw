@@ -496,10 +496,6 @@ _NOTE_CONTENT_UPDATES = [
     pytest.param({"description": "Runbook"}, id="description"),
     pytest.param({"connection_url": "https://db.example.test"}, id="url"),
     pytest.param(
-        {"connection_url": None, "connection_url_set": True},
-        id="url-clear",
-    ),
-    pytest.param(
         {"credentials": {"env_vars": {"DATABASE_TOKEN": "secret"}}},
         id="credential-env-names",
     ),

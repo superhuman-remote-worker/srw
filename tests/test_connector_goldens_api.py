@@ -1069,10 +1069,25 @@ CASES.update(
             _stored("mcp_remote"),
             {"credentials": {"transport": "stdio", "command": "uvx", "args": ["x"]}},
         ),
-        # A stored stdio row is kept (read, delete), but an edit that leaves
-        # it stdio is refused; one that moves it to http or sse is not.
-        "update/mcp/stdio_row_edit_refused": _update(
+        # A stored stdio row is kept: it can be read, renamed, unpublished
+        # and deleted, and moved to http or sse; an edit that points it at a
+        # URL without a remote transport, or publishes it, is refused.
+        "update/mcp/stdio_row_renamed": _update(
             _stored("mcp_stdio"), {"description": "Edited"}
+        ),
+        "update/mcp/stdio_row_unpublished": _update(
+            _stored("mcp_stdio", is_global=True, read_only=True),
+            {
+                "name": "Local MCP",
+                "description": "Local tool server",
+                "is_global": False,
+            },
+        ),
+        "update/mcp/stdio_row_publish_refused": _update(
+            _stored("mcp_stdio"), {"is_global": True, "read_only": True}
+        ),
+        "update/mcp/stdio_row_url_without_transport_refused": _update(
+            _stored("mcp_stdio"), {"connection_url": "https://mcp.example.com/mcp"}
         ),
         "update/mcp/stdio_row_moved_to_remote": _update(
             _stored("mcp_stdio"),
@@ -1086,6 +1101,8 @@ CASES.update(
         ),
         # ---- delete ----------------------------------------------------------
         "delete/postgresql": ApiCase("delete", existing=_stored("postgresql")),
+        # A stored stdio server (retired, D5b) can always be deleted.
+        "delete/mcp/stdio_row": ApiCase("delete", existing=_stored("mcp_stdio")),
         "delete/kb/external_through_index_fence": ApiCase(
             "delete", existing=_stored("kb")
         ),
@@ -1108,7 +1125,7 @@ class GoldenStore:
     """In-memory datasource store that records every write and grant lookup.
 
     ``update_datasource`` applies the real SQL's rules: ``None`` leaves a
-    column alone unless ``connection_url_set`` clears the URL.
+    column alone.
     """
 
     _CONTENT = (
@@ -1183,9 +1200,7 @@ class GoldenStore:
     def _apply(self, kwargs: dict[str, Any]) -> None:
         for column in self._CONTENT:
             value = kwargs.get(column)
-            if value is not None or (
-                column == "connection_url" and kwargs.get("connection_url_set")
-            ):
+            if value is not None:
                 self.row[column] = copy.deepcopy(value)
 
     async def update_datasource(self, datasource_id, **kwargs):

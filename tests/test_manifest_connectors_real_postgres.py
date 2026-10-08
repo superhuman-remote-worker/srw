@@ -777,37 +777,38 @@ async def test_persisting_inside_a_transaction_is_idempotent(database):
 
 @pytest.mark.asyncio
 async def test_a_transport_edit_changes_the_connectors_driver(database):
+    """A stored stdio server (retired, D5b) moved to a remote transport: the
+    edit the API still takes for one."""
     owner = await _user(database, "Owner")
     created = await database.create_datasource(
         name="tools",
         ds_type="mcp",
+        connection_url=None,
+        credentials={"transport": "stdio", "command": "npx s3cret-cmd"},
+        created_by=owner,
+    )
+    datasource_id = str(created["id"])
+    stdio = await _resource(database, datasource_id)
+    assert stdio["document"]["spec"]["driver"] == "srw.mcp/v1"
+    assert stdio["document"]["spec"]["config"] == {"transport": "stdio"}
+
+    assert await database.update_datasource(
+        datasource_id,
         connection_url="https://mcp.example/api/mcp/s/s3cret-path/mcp",
         credentials={
             "transport": "http",
             "auth": {"type": "bearer", "token": "s3cret-header"},
         },
-        created_by=owner,
     )
-    datasource_id = str(created["id"])
     remote = await _resource(database, datasource_id)
+    assert (remote["id"], remote["name"]) == (stdio["id"], stdio["name"])
+    assert remote["resource_version"] == stdio["resource_version"] + 1
     assert remote["document"]["spec"]["driver"] == "srw.mcp-remote/v1"
     assert remote["document"]["spec"]["config"] == {
         "endpoint": "https://mcp.example",
         "transport": "http",
         "auth_type": "bearer",
     }
-
-    assert await database.update_datasource(
-        datasource_id,
-        connection_url=None,
-        connection_url_set=True,
-        credentials={"transport": "stdio", "command": "npx s3cret-cmd"},
-    )
-    stdio = await _resource(database, datasource_id)
-    assert (stdio["id"], stdio["name"]) == (remote["id"], remote["name"])
-    assert stdio["resource_version"] == remote["resource_version"] + 1
-    assert stdio["document"]["spec"]["driver"] == "srw.mcp/v1"
-    assert stdio["document"]["spec"]["config"] == {"transport": "stdio"}
     assert await _schema_problems(database) == []
     stored = await _stored_revisions(database)
     assert not [secret for secret in SECRETS if secret in stored]

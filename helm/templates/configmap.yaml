@@ -485,7 +485,8 @@ data:
   PRODUCT_CAPABILITIES_TOOL_ENABLED: {{ .Values.agent.productCapabilitiesToolEnabled | default "false" | quote }}
   # User-added MCP servers (http or sse). A stdio server no longer runs in
   # agent pods (connector drivers D5b): its image runs as a managed MCP server.
-  {{- if eq (toString (.Values.agent.mcpStdioEnabled | default "false")) "true" }}
+  {{- /* Any value that reads as on (true, "True", "yes", 1, "on"...). */}}
+  {{- if has (lower (trim (toString (.Values.agent.mcpStdioEnabled | default "false")))) (list "true" "1" "yes" "y" "on") }}
   {{- fail "agent.mcpStdioEnabled was removed (connector drivers D5b): stdio MCP servers no longer run in agent pods. Run a stdio server's image as a managed MCP server (connectors.drivers), or connect the server by URL" }}
   {{- end }}
   MCP_DATASOURCES_ENABLED: {{ .Values.agent.mcpDatasourcesEnabled | default "false" | quote }}

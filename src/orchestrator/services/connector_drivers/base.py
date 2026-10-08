@@ -134,15 +134,13 @@ class ValidationContext:
 class NormalizedConnector:
     """What a create or update stores.  ``None`` leaves a stored value alone.
 
-    ``connection_url_set`` clears a stored URL to ``None`` (an MCP stdio
-    server has none); ``reindex_required`` asks the KB driver's write effect
-    for a full rebuild.
+    ``reindex_required`` asks the KB driver's write effect for a full
+    rebuild.
     """
 
     connection_url: str | None
     config: dict[str, Any] | None
     credentials: dict[str, Any] | None
-    connection_url_set: bool = False
     reindex_required: bool = False
 
 

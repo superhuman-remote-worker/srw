@@ -447,6 +447,52 @@ describe('DatasourceListComponent MCP support', () => {
     component.onMcpTransportSelect('sse');
     expect(component.formData.mcpTransport).toBe('sse');
   });
+
+  const storedStdio = (): Datasource => ({
+    ...kbDatasource(),
+    id: 'mcp-stdio',
+    name: 'Local tools',
+    type: 'mcp',
+    connection_url: null,
+    config: {},
+    is_global: true,
+    read_only: true,
+  });
+
+  it('moves a stored stdio server to plain http with its transport', () => {
+    // REST hides the stored transport, so the form shows http: re-choosing
+    // it is no change of the form's own, and the URL alone must carry it.
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm(storedStdio());
+    component.onConnectionUrlChange('https://mcp.example.com/mcp');
+    component.formData.connection_url = 'https://mcp.example.com/mcp';
+    component.saveForm();
+    const update = api.updateDatasource.mock.calls[0][1];
+    expect(update.connection_url).toBe('https://mcp.example.com/mcp');
+    expect(update.credentials).toEqual({transport: 'http'});
+  });
+
+  it('unpublishes a stored stdio server without touching its server', () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm(storedStdio());
+    component.formData.is_global = false;
+    component.saveForm();
+    const update = api.updateDatasource.mock.calls[0][1];
+    expect(update.is_global).toBe(false);
+    expect(update.credentials).toBeUndefined();
+    expect(update.connection_url).toBeUndefined();
+  });
+
+  it('keeps a remote server\'s stored credentials when only its URL changes', () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm({...storedStdio(), connection_url: 'https://old.example.com/mcp'});
+    component.onConnectionUrlChange('https://new.example.com/mcp');
+    component.formData.connection_url = 'https://new.example.com/mcp';
+    component.saveForm();
+    const update = api.updateDatasource.mock.calls[0][1];
+    expect(update.connection_url).toBe('https://new.example.com/mcp');
+    expect(update.credentials).toBeUndefined();
+  });
 });
 
 describe('DatasourceListComponent publish confirmation tiers', () => {

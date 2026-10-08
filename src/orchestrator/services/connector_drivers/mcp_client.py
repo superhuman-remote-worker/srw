@@ -11,8 +11,9 @@ Two specs, one implementation: ``srw.mcp/v1`` (stdio) owns the stored
 A row's Connector resource names the one its transport needs, so an edit of
 the transport changes the resource's driver.  A stdio server no longer runs
 in the agent pod (connector drivers D5b): a stdio row is refused on create,
-never delivered and never tested here; it can be read, deleted, or edited to
-a remote transport. A stdio image runs as a managed MCP server instead.
+never delivered and never tested here; it can be read, renamed, unpublished
+(never published) and deleted, or moved to a remote transport with a URL.
+A stdio image runs as a managed MCP server instead.
 """
 
 from __future__ import annotations
@@ -86,6 +87,17 @@ class McpDriver(DatasourceDriver):
             if credentials is not None
             else (existing.get("credentials") or {})
         )
+        if (
+            credentials is None
+            and not draft.connection_url
+            and self._transport(effective_credentials) == "stdio"
+        ):
+            # An edit that leaves a stored stdio server's server alone: it
+            # may still be renamed and unpublished (and deleted), never
+            # published again.
+            if draft.is_global is True and not existing.get("is_global"):
+                raise HTTPException(status_code=400, detail=MCP_STDIO_RETIRED)
+            return NormalizedConnector(None, None, None)
         url_was_supplied = "connection_url" in draft.supplied
         effective_url = (
             draft.connection_url if url_was_supplied else existing.get("connection_url")

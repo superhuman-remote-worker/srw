@@ -642,8 +642,9 @@ MCP_STDIO_RETIRED = (
 # server (``srw.mcp-remote/v1``). One control-plane driver implementation
 # serves both; a row's Connector resource names the one its transport needs.
 # The stdio path is retired (D5b, MCP_STDIO_RETIRED): a stored stdio row is
-# kept (it can be read, deleted, or edited to a remote transport) but no new
-# one is created and none is delivered or tested.
+# kept (it can be read, renamed, unpublished and deleted, or moved to a
+# remote transport) but no new one is created or published and none is
+# delivered or tested.
 MCP_SPEC = DriverSpec(
     name="srw.mcp/v1",
     legacy_type="mcp",

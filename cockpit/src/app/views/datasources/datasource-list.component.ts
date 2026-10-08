@@ -4585,7 +4585,23 @@ export class DatasourceListComponent implements OnInit {
     return (
       this.mcpTransportDirty ||
       !!this.formData.mcpToken ||
-      this.formData.mcpHeaders.some((row) => !!row.key.trim())
+      this.formData.mcpHeaders.some((row) => !!row.key.trim()) ||
+      // A stored stdio server is retired (it no longer runs in the agent):
+      // given a URL, it moves to the transport chosen here. REST hides its
+      // transport, so the form's default http is no change of its own.
+      (this.isStoredStdioServer() && !!this.formData.connection_url.trim())
+    );
+  }
+
+  /** The MCP row being edited is a stored stdio server: a remote one
+   *  always has a URL (a redacted one too), a stdio one never had one. */
+  private isStoredStdioServer(): boolean {
+    const original = this.editingOriginal;
+    return (
+      this.editingId() !== null &&
+      original?.type === 'mcp' &&
+      !original.connection_url &&
+      !original.connection_url_redacted
     );
   }
 

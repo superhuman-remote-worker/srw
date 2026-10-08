@@ -778,3 +778,36 @@ def test_the_stdio_probe_server_runs_the_test_servers_image():
 def test_an_incomplete_stdio_setup_fails_to_render(settings):
     with pytest.raises(subprocess.CalledProcessError):
         render(*settings)
+
+
+# The agent-pod stdio path is retired (D5b): its old switch, set to anything
+# that reads as on, fails the render instead of being ignored.
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "agent.mcpStdioEnabled=true",
+        "agent.mcpStdioEnabled=1",
+        "agent.mcpStdioEnabled=yes",
+        "agent.mcpStdioEnabled=True",
+        "agent.mcpStdioEnabled=on",
+        "agent.mcpStdioEnabled=\\ YES",
+    ],
+)
+def test_the_retired_stdio_switch_fails_the_render(setting):
+    with pytest.raises(subprocess.CalledProcessError) as failed:
+        render(setting)
+    assert "agent.mcpStdioEnabled was removed" in failed.value.stderr
+
+
+@pytest.mark.parametrize(
+    "setting", ["agent.mcpStdioEnabled=false", "agent.mcpStdioEnabled=0"]
+)
+def test_the_retired_stdio_switch_off_still_renders(setting):
+    env = render(setting)
+    configmap = next(
+        doc
+        for doc in env
+        if doc["kind"] == "ConfigMap"
+        and "MCP_DATASOURCES_ENABLED" in (doc.get("data") or {})
+    )
+    assert "MCP_STDIO_ENABLED" not in configmap["data"]

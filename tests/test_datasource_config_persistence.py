@@ -149,20 +149,17 @@ async def test_update_datasource_visibility_advances_policy_revision():
 
 
 @pytest.mark.asyncio
-async def test_update_datasource_can_explicitly_clear_connection_url():
+async def test_update_datasource_leaves_an_omitted_connection_url_alone():
+    """No connector clears its URL any more: the MCP stdio servers that did
+    are retired (connector drivers D5b)."""
     conn = AsyncMock()
     conn.execute.return_value = "UPDATE 1"
     db = _make_db(conn)
 
-    assert await db.update_datasource(
-        DATASOURCE_ID,
-        connection_url=None,
-        connection_url_set=True,
-    )
+    assert await db.update_datasource(DATASOURCE_ID, name="Renamed")
 
-    sql, *params = conn.execute.await_args_list[0].args
-    assert "connection_url = $1" in sql
-    assert params[0] is None
+    sql = conn.execute.await_args_list[0].args[0]
+    assert "connection_url" not in sql
 
 
 @pytest.mark.asyncio
