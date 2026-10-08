@@ -300,6 +300,14 @@ def patched_main(monkeypatch):
         )
 
     db.thread_configuration_transaction = transaction_scope
+
+    @asynccontextmanager
+    async def acquire():
+        # A live detach revokes any lease of every removed connector (a git
+        # swap repository's included): none here.
+        yield SimpleNamespace(fetch=AsyncMock(return_value=[]))
+
+    db.acquire = acquire
     db.refresh_session_execution = AsyncMock(
         side_effect=lambda _thread_id, *, conn, config_override: {
             "delivery_override": config_override
@@ -1129,6 +1137,8 @@ class TestResetupDatasources:
             ssh_identity_status=session.workspace_ssh_identity_status,
             # A live add sees only the added repositories: no key sweep.
             legacy_key_files="own",
+            # Named over the full new list (C3 re-review S4).
+            clone_names=["new-repo"],
         )
         # Removal keeps the clone on disk (documented) but drops the
         # session-side registration.

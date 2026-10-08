@@ -317,6 +317,18 @@ def _wire_swap_repositories(
         else:
             wired[index] = binding
     if not wired:
+        if prune and any(
+            isinstance(ds.get("git_swap"), dict) for ds in repo_datasources
+        ):
+            # The owner's set has no binding now (every repository fell
+            # back, or was refused): an earlier attach's wiring goes, or its
+            # rewrite would keep sending a checkout to the driver.
+            try:
+                install_wiring(backend, (), prune=True)
+            except Exception as exc:
+                logger.warning(
+                    "Could not prune the git swap wiring: %s", type(exc).__name__
+                )
         return wired, reasons
     try:
         install_wiring(
@@ -367,6 +379,63 @@ def _secure_swap_checkout(
     return None
 
 
+def _falls_back(ds: Dict[str, Any]) -> bool:
+    block = ds.get("git_swap")
+    return isinstance(block, dict) and "fallback" in block
+
+
+def _fallback_checkout(git_mgr: Any, token_url: str) -> Optional[str]:
+    """Point a checkout the git swap driver served before at its token URL
+    (the installation's fallback now); ``None`` when done, else why not."""
+    git_mgr._run_git(["config", "--unset-all", "transfer.credentialsInUrl"])
+    if not git_mgr.add_remote("origin", token_url):
+        return "its existing checkout's origin could not be set for the fallback"
+    return None
+
+
+def _repository_identity(url: Any) -> Optional[Tuple[Optional[str], str]]:
+    """``(host, path)`` of a repository URL, credentials and ``.git``
+    dropped, for telling two repositories apart; the host is ``None`` for an
+    SSH alias SRW wrote (``srw-repo-*``), which names no real host."""
+    text = str(url or "").strip()
+    if not text:
+        return None
+    if "://" not in text:
+        # scp-like: [user@]host:path
+        head, sep, path = text.partition(":")
+        if not sep:
+            return None
+        host = head.rsplit("@", 1)[-1]
+    else:
+        parsed = urlparse(text)
+        host = parsed.hostname or ""
+        path = parsed.path
+    path = path.strip("/").removesuffix(".git").strip("/").lower()
+    host = host.lower()
+    if not path:
+        return None
+    return (None if host.startswith("srw-repo-") else host or None), path
+
+
+def _other_repository(git_mgr: Any, expected_url: str) -> Optional[str]:
+    """The repository a reused checkout's origin names when it is not the
+    one expected (credentials masked), else ``None``; an origin that cannot
+    be read decides nothing."""
+    found = git_mgr._run_git(["config", "--get", "remote.origin.url"])
+    current = getattr(found, "stdout", None)
+    if not isinstance(current, str) or getattr(found, "returncode", None) != 0:
+        return None
+    have = _repository_identity(current.strip())
+    want = _repository_identity(expected_url)
+    if have is None or want is None:
+        return None
+    same_path = have[1] == want[1]
+    same_host = have[0] is None or want[0] is None or have[0] == want[0]
+    if same_path and same_host:
+        return None
+    return f"{have[0] or 'an SSH alias'}/{have[1]}"
+
+
 def _note_skipped(workspace_manager: Any, clone_name: str, reason: str) -> None:
     """Record why a repository was not cloned, for the README."""
     skipped = getattr(workspace_manager, "source_repo_skipped", None)
@@ -385,6 +454,7 @@ def clone_repository_datasources(
     *,
     ssh_identity_status: Optional[Dict[str, str]] = None,
     legacy_key_files: str = "sweep",
+    clone_names: Optional[List[str]] = None,
 ) -> None:
     """Clone repository datasources onto the workspace backend.
 
@@ -468,7 +538,8 @@ def clone_repository_datasources(
             exc,
         )
 
-    clone_names = resolve_repo_clone_names(repo_datasources)
+    if clone_names is None or len(clone_names) != len(repo_datasources):
+        clone_names = resolve_repo_clone_names(repo_datasources)
     swap_wired, swap_reasons = _wire_swap_repositories(
         backend, repo_datasources, clone_names, prune=legacy_key_files == "sweep"
     )
@@ -540,6 +611,20 @@ def clone_repository_datasources(
                     backend=backend,
                     remote_cwd=remote_cwd,
                 )
+                other = _other_repository(git_mgr, ds.get("connection_url", ""))
+                if other is not None:
+                    # Another connector's checkout (a live add whose name
+                    # collides, an order that changed): re-pointing it would
+                    # send that checkout's commits to this repository.
+                    reason = (
+                        f"`./repos/{repo_name}/` is the checkout of another "
+                        f"repository ({other}); remove or rename it to clone this one"
+                    )
+                    logger.warning(
+                        "Skipping repository datasource %r: %s", ds_name, reason
+                    )
+                    _note_skipped(workspace_manager, repo_name, reason)
+                    continue
                 if ssh_clone_url is not None:
                     if git_mgr.add_remote("origin", ssh_clone_url):
                         # Proven lazily: ls-remote only if a key file is left.
@@ -561,6 +646,22 @@ def clone_repository_datasources(
                             "Skipping repository datasource %r: %s", ds_name, unsafe
                         )
                         _note_skipped(workspace_manager, repo_name, unsafe)
+                        continue
+                if (
+                    auth == "token_in_url"
+                    and _falls_back(ds)
+                    and legacy_key_files != "keep"
+                ):
+                    # The driver served this checkout in an earlier attach:
+                    # its remote is the clean URL and it refuses credentials
+                    # in URLs. On the fallback it clones as before C3 did,
+                    # with the token in its remote URL (as the README says).
+                    unusable = _fallback_checkout(git_mgr, repo_url)
+                    if unusable is not None:
+                        logger.warning(
+                            "Skipping repository datasource %r: %s", ds_name, unusable
+                        )
+                        _note_skipped(workspace_manager, repo_name, unusable)
                         continue
                 logger.info(
                     "Reusing repository datasource %r from repos/%s",
@@ -754,10 +855,13 @@ class CheckoutMaterializer:
 
         A removed repository keeps its clone on the workspace (cheap honesty:
         scrubbing is not a security boundary) but loses its ``source_repos``
-        registration and its forge metadata, which holds its token. An added
-        repository whose clone name collides with an existing clone fails
-        that one clone with a warning; a resume re-resolves suffixed names
-        over the full list.
+        registration and its forge metadata, which holds its token, and a
+        git swap binding loses its wiring (its lease was revoked with the
+        detach). An added repository's clone name is resolved over the full
+        new list: the name a resume resolves and the README lists. A
+        checkout already there whose origin is another repository (an order
+        that changed) is never re-pointed: that one repository is skipped
+        and the README says why.
         """
         old_keys = {_key(delivery) for delivery in old}
         new_keys = {_key(delivery) for delivery in new}
@@ -765,6 +869,10 @@ class CheckoutMaterializer:
         removed = old_keys - new_keys
         workspace_manager = rt.workspace_manager
         if added and workspace_manager:
+            names = resolve_repo_clone_names([delivery.entry for delivery in new])
+            named = {
+                id(delivery): name for delivery, name in zip(new, names, strict=True)
+            }
             try:
                 clone_repository_datasources(
                     [delivery.entry for delivery in added],
@@ -773,6 +881,7 @@ class CheckoutMaterializer:
                     # Only the added ones: another repository's key file is
                     # not this batch's to sweep.
                     legacy_key_files="own",
+                    clone_names=[named[id(delivery)] for delivery in added],
                 )
             except Exception as e:
                 logger.warning("Live repository clone failed: %s", e)

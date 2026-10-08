@@ -636,8 +636,21 @@ class TestClone:
                 [_entry(git_swap={"unavailable": "not HTTPS"}, credentials={})], ws
             )
         clone.assert_not_called()
-        ws.backend.install_git_swap_wiring.assert_not_called()
+        # Nothing is wired; the owner's sweep still prunes an earlier
+        # attach's wiring (no binding is left).
+        ws.backend.install_git_swap_wiring.assert_called_once_with(
+            [], remove=[], prune=True
+        )
         assert "not HTTPS" in caplog.text
+        # A partial set (a live add) prunes nothing.
+        ws = _workspace()
+        with patch("agent.managers.git_manager.GitManager.clone"):
+            clone_repository_datasources(
+                [_entry(git_swap={"unavailable": "x"}, credentials={})],
+                ws,
+                legacy_key_files="own",
+            )
+        ws.backend.install_git_swap_wiring.assert_not_called()
 
     def test_a_failed_wiring_skips_the_clone_rather_than_cloning_bare(self, caplog):
         ws = _workspace()
@@ -721,6 +734,178 @@ class TestWait:
             backend, self._binding(wait=12), sleep=sleep, clock=lambda: now[0]
         )
         assert reason is not None and backend.shell_run.call_count == 3
+
+
+class TestFallbackAfterSwap:
+    """C3 re-review S3: a re-attach that falls back after the driver served
+    the checkout (its pod dead, or alive but out of this workspace's reach:
+    the agent sees the same entry; the orchestrator revoked the old lease)."""
+
+    def _fallback(self):
+        return _entry(
+            git_swap={"fallback": "the driver could not reach the upstream"},
+            credentials={"token": TOKEN},
+        )
+
+    def test_a_reused_checkout_takes_the_token_url_and_the_wiring_goes(self):
+        ws = _workspace(exists=True)
+        reused = MagicMock()
+        reused.add_remote.return_value = True
+        reused._run_git.return_value = SimpleNamespace(
+            returncode=0, stdout="https://github.com/o/r.git\n"
+        )
+        with patch("agent.managers.git_manager.GitManager", return_value=reused):
+            clone_repository_datasources(
+                [self._fallback()], ws, legacy_key_files="sweep"
+            )
+        # The swap era's binding is pruned: nothing rewrites the checkout.
+        ws.backend.install_git_swap_wiring.assert_called_once_with(
+            [], remove=[], prune=True
+        )
+        # Its remote takes the token URL, which it refused before.
+        reused._run_git.assert_any_call(
+            ["config", "--unset-all", "transfer.credentialsInUrl"]
+        )
+        reused.add_remote.assert_called_once_with(
+            "origin", f"https://oauth2:{TOKEN}@github.com/o/r.git"
+        )
+        assert ws.source_repos == {"r": reused}
+        rt = RuntimeContext(execution="session", workspace_manager=ws)
+        [facts] = CheckoutMaterializer().facts(
+            deliveries_from_payload([self._fallback()]), rt
+        )
+        assert "cloned with the forge token in its remote URL" in facts.lines[0]
+        for call in ws.backend.shell_run.call_args_list:
+            assert TOKEN not in str(call)
+
+    def test_a_new_checkout_clones_with_the_token_url_unwired(self):
+        ws = _workspace()
+        with patch(
+            "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
+        ) as clone:
+            clone_repository_datasources(
+                [self._fallback()], ws, legacy_key_files="sweep"
+            )
+        assert clone.call_args.args[0] == f"https://oauth2:{TOKEN}@github.com/o/r.git"
+        assert "config" not in clone.call_args.kwargs
+        ws.backend.install_git_swap_wiring.assert_called_once_with(
+            [], remove=[], prune=True
+        )
+
+    def test_someone_elses_workspace_is_left_alone(self):
+        ws = _workspace(exists=True)
+        reused = MagicMock()
+        reused._run_git.return_value = SimpleNamespace(
+            returncode=0, stdout="https://github.com/o/r.git\n"
+        )
+        with patch("agent.managers.git_manager.GitManager", return_value=reused):
+            clone_repository_datasources(
+                [self._fallback()], ws, legacy_key_files="keep"
+            )
+        ws.backend.install_git_swap_wiring.assert_not_called()
+        reused.add_remote.assert_not_called()
+
+    def test_the_wiring_program_prunes_to_nothing_and_leaves_a_clean_home_alone(
+        self, home
+    ):
+        binding, _ = swap_binding(_entry())
+        repo = home / "repos" / "r"
+        _sync(home, [binding], checkouts={CONNECTOR: repo})
+        _checkout(home, repo, "https://github.com/o/r.git")
+        assert _url(home, repo) == f"{ORIGIN}/{CONNECTOR}/o/r.git"
+        report = _sync(home, [], prune=True)
+        assert report["bindings"] == [] and report["removed"] == [CONNECTOR]
+        assert _url(home, repo) == "https://github.com/o/r.git"
+        clean = home / "clean"
+        clean.mkdir()
+        report = _sync(clean, [], prune=True)
+        assert report["include"] == "absent"
+        assert not (clean / ".srw-credentials").exists()
+        assert not (clean / ".gitconfig").exists()
+
+
+class TestCheckoutNames:
+    """C3 re-review S4: a live add never takes another connector's
+    checkout."""
+
+    def _workspace_with(self, *checkouts: str):
+        ws = _workspace()
+        ws.backend.exists = MagicMock(
+            side_effect=lambda path: any(path == f"repos/{c}/.git" for c in checkouts)
+        )
+        return ws
+
+    def test_a_live_add_is_named_over_the_full_list(self):
+        ws = self._workspace_with("r")  # connector A's checkout
+        a = _entry()
+        b = _entry(
+            connector=OTHER, origin=OTHER_ORIGIN, url="https://github.com/x/r.git"
+        )
+        b["name"] = "Other"
+        rt = RuntimeContext(execution="session", workspace_manager=ws)
+        with (
+            patch(
+                "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
+            ) as clone,
+            patch("agent.managers.git_manager.GitManager") as manager,
+        ):
+            manager.clone = clone
+            CheckoutMaterializer().replace(
+                deliveries_from_payload([a]), deliveries_from_payload([a, b]), rt
+            )
+        # B clones into repos/r-2; A's checkout is never opened, let alone
+        # re-pointed.
+        assert clone.call_args.kwargs["remote_cwd"] == "repos/r-2"
+        manager.assert_not_called()
+        [items], _kwargs = ws.backend.install_git_swap_wiring.call_args
+        assert [item["gitdir"] for item in items] == [
+            "/home/agent-host/workspace/repos/r-2/"
+        ]
+        facts = CheckoutMaterializer().facts(deliveries_from_payload([a, b]), rt)
+        assert "./repos/r-2/" in facts[1].lines[0]
+
+    def test_a_checkout_of_another_repository_is_never_re_pointed(self):
+        ws = self._workspace_with("r")
+        b = _entry(
+            connector=OTHER, origin=OTHER_ORIGIN, url="https://github.com/x/r.git"
+        )
+        reused = MagicMock()
+        reused._run_git.return_value = SimpleNamespace(
+            returncode=0, stdout=f"https://oauth2:{TOKEN}@github.com/o/r.git\n"
+        )
+        with patch("agent.managers.git_manager.GitManager", return_value=reused):
+            clone_repository_datasources([b], ws, legacy_key_files="own")
+        reused.add_remote.assert_not_called()
+        assert ws.source_repos == {}
+        rt = RuntimeContext(execution="session", workspace_manager=ws)
+        [facts] = CheckoutMaterializer().facts(deliveries_from_payload([b]), rt)
+        assert "NOT cloned" in facts.lines[0]
+        assert "checkout of another repository (github.com/o/r)" in facts.lines[0]
+        assert TOKEN not in facts.lines[0]
+
+    @pytest.mark.parametrize(
+        ("origin", "expected", "other"),
+        [
+            ("https://github.com/o/r.git", "https://github.com/o/r", False),
+            (
+                "https://oauth2:t@GitHub.com/O/R.git",
+                "https://github.com/o/r.git",
+                False,
+            ),
+            ("ssh://srw-repo-abc/o/r.git", "git@github.com:o/r.git", False),
+            ("https://github.com/o/r.git", "https://github.com/x/r.git", True),
+            ("https://gitlab.com/o/r.git", "https://github.com/o/r.git", True),
+        ],
+    )
+    def test_what_counts_as_the_same_repository(self, origin, expected, other):
+        from agent.connectors.checkout import _other_repository
+
+        git_mgr = MagicMock()
+        git_mgr._run_git.return_value = SimpleNamespace(returncode=0, stdout=origin)
+        assert (_other_repository(git_mgr, expected) is not None) is other
+        # An origin that cannot be read decides nothing.
+        git_mgr._run_git.return_value = SimpleNamespace(returncode=1, stdout="")
+        assert _other_repository(git_mgr, expected) is None
 
 
 class TestLiveChanges:

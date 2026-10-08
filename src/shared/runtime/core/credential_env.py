@@ -453,6 +453,10 @@ def checkout(name):
 request = json.load(sys.stdin)
 wanted = request.get('bindings') or []
 ids = [item['id'] for item in wanted]
+if not wanted and not os.path.isdir(bindings):
+    # Nothing to write and nothing written before: leave the home alone.
+    print(json.dumps({'bindings': [], 'removed': [], 'unscoped': [], 'include': 'absent'}))
+    sys.exit(0)
 for name in ids + list(request.get('remove') or []):
     if not CONNECTOR.fullmatch(name):
         sys.exit(3)
