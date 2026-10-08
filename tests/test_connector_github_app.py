@@ -26,6 +26,7 @@ from orchestrator.services.connector_drivers.base import (
 from orchestrator.services.connector_drivers.git_swap import GitSwapDriver
 from orchestrator.services.connector_drivers.github_app import (
     app_jwt,
+    covers_only,
     granted_as_asked,
     mint_installation_token,
     normalize_private_key,
@@ -43,6 +44,7 @@ from shared.connectors.github_app import (
     GITHUB_COM_API,
     GitHubAppConfigError,
     access_token_request,
+    api_host_for,
     default_api_base,
     installation_permissions,
     jwt_claims,
@@ -51,6 +53,7 @@ from shared.connectors.github_app import (
     uses_github_app,
 )
 from tests._provider_fakes import (
+    FAKE_CA,
     FakeGitHubApi,
     ProviderRouter,
     install,
@@ -93,12 +96,42 @@ class TestRules:
         assert default_api_base(url) == base
 
     def test_an_enterprise_api_base_is_configurable(self):
-        options = _options(api_base="https://ghe.corp.example/api/v3/")
+        options = parse_github_app(
+            {"github_app": {**APP, "api_base": "https://ghe.corp.example/api/v3/"}},
+            "https://ghe.corp.example/acme/repo.git",
+        )
         assert options.api_base == "https://ghe.corp.example/api/v3"
         assert options.as_config(configured_api_base=options.api_base) == {
             **APP,
             "api_base": "https://ghe.corp.example/api/v3",
         }
+
+    @pytest.mark.parametrize(
+        ("url", "api_base"),
+        [
+            # The App key would sign for a host the repository is not on.
+            ("https://github.com/acme/repo.git", "https://ghe.corp.example/api/v3"),
+            ("https://github.com/acme/repo.git", "https://github.com/api/v3"),
+            ("https://ghe.corp.example/acme/repo.git", "https://api.github.com"),
+            ("https://ghe.corp.example/acme/repo.git", "https://other.corp/api/v3"),
+            ("https://acme.ghe.com/acme/repo.git", "https://api.github.com"),
+        ],
+    )
+    def test_the_api_base_is_on_the_repositorys_api_host(self, url, api_base):
+        with pytest.raises(GitHubAppConfigError, match="must be on"):
+            parse_github_app({"github_app": {**APP, "api_base": api_base}}, url)
+
+    @pytest.mark.parametrize(
+        ("url", "host"),
+        [
+            ("https://github.com/o/r", "api.github.com"),
+            ("https://GitHub.com/o/r", "api.github.com"),
+            ("https://acme.ghe.com/o/r", "api.acme.ghe.com"),
+            ("https://ghe.corp.example:8443/o/r", "ghe.corp.example"),
+        ],
+    )
+    def test_the_api_host_of_a_repository(self, url, host):
+        assert api_host_for(url) == host
 
     @pytest.mark.parametrize(
         "over",
@@ -155,6 +188,20 @@ class TestRules:
             {"contents": "read", "pull_requests": "write"}, wanted
         )
         assert not granted_as_asked(None, wanted)
+
+    def test_the_answer_must_cover_the_one_repository(self):
+        assert covers_only([{"full_name": "Acme/Repo"}], "acme", "repo")
+        assert covers_only(
+            [{"owner": {"login": "acme"}, "name": "repo"}], "acme", "repo"
+        )
+        assert not covers_only([], "acme", "repo")
+        assert not covers_only(None, "acme", "repo")
+        assert not covers_only([{"full_name": "acme/other"}], "acme", "repo")
+        assert not covers_only([{"full_name": "evil/repo"}], "acme", "repo")
+        assert not covers_only([{"name": "repo"}], "acme", "repo")
+        assert not covers_only(
+            [{"full_name": "acme/repo"}, {"full_name": "acme/other"}], "acme", "repo"
+        )
 
 
 class TestPrivateKey:
@@ -231,6 +278,57 @@ class TestCalls:
         assert caught.value.transient is False
         [token] = github.tokens
         assert github.live(token) is None
+
+    @pytest.mark.asyncio
+    async def test_other_repositories_in_the_answer_are_revoked_and_refused(
+        self, github
+    ):
+        github.extra_repositories = ["other"]
+        with pytest.raises(ProviderError, match="revoked") as caught:
+            await mint_installation_token(_options(), PRIVATE, "ReadOnly")
+        assert caught.value.reason == "overbroad"
+        [token] = github.tokens
+        assert github.live(token) is None
+
+    @pytest.mark.asyncio
+    async def test_the_call_dials_the_resolved_address(self, monkeypatch):
+        api = FakeGitHubApi(public_key_pem=PUBLIC)
+        router = install(monkeypatch, ProviderRouter(github=api))
+        await mint_installation_token(_options(), PRIVATE, "ReadOnly")
+        assert router.dialled == [("203.0.113.20", "api.github.com")]
+
+    @pytest.mark.asyncio
+    async def test_a_private_api_host_needs_a_tier_that_allows_it(self, monkeypatch):
+        api = FakeGitHubApi(public_key_pem=PUBLIC)
+        install(
+            monkeypatch,
+            ProviderRouter(github=api),
+            addresses={"api.github.com": ("192.168.10.10",)},
+        )
+        with pytest.raises(ProviderError) as caught:
+            await mint_installation_token(_options(), PRIVATE, "ReadOnly")
+        assert caught.value.reason == "address_refused"
+        assert api.requests == []
+        minted = await mint_installation_token(
+            _options(), PRIVATE, "ReadOnly", allow_private=True
+        )
+        assert api.live(minted.token)
+
+    @pytest.mark.asyncio
+    async def test_the_upstream_ca_verifies_the_calls(self, monkeypatch):
+        api = FakeGitHubApi(public_key_pem=PUBLIC)
+        router = install(monkeypatch, ProviderRouter(github=api))
+        await mint_installation_token(_options(), PRIVATE, "ReadOnly", ca_pem=FAKE_CA)
+        subjects = [
+            dict(field[0] for field in cert["subject"])
+            for cert in router.verified[-1].get_ca_certs()
+        ]
+        assert {"commonName": "fake-kube-ca"} in subjects
+        with pytest.raises(ProviderError) as caught:
+            await mint_installation_token(
+                _options(), PRIVATE, "ReadOnly", ca_pem="not a certificate"
+            )
+        assert caught.value.reason == "ca_unusable"
 
     @pytest.mark.asyncio
     async def test_github_trouble_is_transient(self, github):
@@ -354,6 +452,85 @@ class TestRepositoryDriver:
         body = {"credentials": _app_credentials(), **over}
         with pytest.raises(HTTPException, match=detail):
             await RepositoryDriver().validate(_draft(**body), existing=None, ctx=_ctx())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("edit", "stored_url"),
+        [
+            # Another API base on the same host is still another target.
+            (
+                {
+                    "connection_url": "https://ghe.corp.example/acme/repo.git",
+                    "config": {
+                        "forge": "github",
+                        "github_app": {
+                            **APP,
+                            "api_base": "https://ghe.corp.example/api/v4",
+                        },
+                    },
+                },
+                "https://ghe.corp.example/acme/repo.git",
+            ),
+            # Another repository host (and so another API host).
+            ({"connection_url": "https://acme.ghe.com/acme/repo.git"}, URL),
+            (
+                {"connection_url": "https://other.corp.example/acme/repo.git"},
+                "https://ghe.corp.example/acme/repo.git",
+            ),
+        ],
+        ids=["api-base", "github-to-ghe-cloud", "ghes-to-ghes"],
+    )
+    async def test_an_edit_may_not_move_the_stored_key(self, edit, stored_url):
+        existing = {
+            "id": CONNECTOR,
+            "name": "repo",
+            "type": "repository",
+            "connection_url": stored_url,
+            "config": {"forge": "github", "github_app": APP},
+            "credentials": _app_credentials(),
+        }
+        with pytest.raises(HTTPException, match="private key again") as caught:
+            await RepositoryDriver().validate(
+                _draft(**edit), existing=existing, ctx=_ctx()
+            )
+        assert caught.value.status_code == 400
+        # With the key sent again, the move is fine.
+        normalized = await RepositoryDriver().validate(
+            _draft(**edit, credentials=_app_credentials()),
+            existing=existing,
+            ctx=_ctx(),
+        )
+        assert normalized.credentials["private_key"] == PRIVATE
+
+    @pytest.mark.asyncio
+    async def test_dropping_the_app_needs_new_credentials(self):
+        existing = {
+            "id": CONNECTOR,
+            "name": "repo",
+            "type": "repository",
+            "connection_url": URL,
+            "config": {"forge": "github", "github_app": APP},
+            "credentials": _app_credentials(),
+        }
+        with pytest.raises(HTTPException, match="github_app"):
+            await RepositoryDriver().validate(
+                _draft(config={"forge": "github"}), existing=existing, ctx=_ctx()
+            )
+
+    @pytest.mark.asyncio
+    async def test_an_app_is_refused_where_the_deployment_turned_minting_off(
+        self, monkeypatch
+    ):
+        from orchestrator.services import connector_minted_credentials as minted
+
+        monkeypatch.setitem(minted._state, "enabled", False)
+        with pytest.raises(HTTPException, match="providerMinting") as caught:
+            await RepositoryDriver().validate(
+                _draft(credentials=_app_credentials(), config={"github_app": APP}),
+                existing=None,
+                ctx=_ctx(),
+            )
+        assert caught.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_an_update_keeps_the_key_and_checks_the_url(self):
@@ -484,11 +661,26 @@ class TestGitSwapDriver:
             owner="thread:x",
             access="ReadOnly",
         )
+        # An installation token authenticates as x-access-token (GitHub's
+        # documented user); static tokens keep the swap driver's default.
         assert answer == {
             "credential": "ghs_minted",
             "allowed_upstream": ["https://github.com/acme/repo.git"],
+            "username": "x-access-token",
         }
         assert seen == {"row": CONNECTOR, "owner": "thread:x", "access": "ReadOnly"}
+
+    def test_a_static_token_names_its_username_too(self):
+        answer = GitSwapDriver("img").lease_upstream(
+            {
+                "id": CONNECTOR,
+                "type": "repository",
+                "connection_url": "https://gitlab.example/acme/repo.git",
+                "config": {"forge": "gitlab"},
+                "credentials": {"auth_method": "token", "token": "glpat-" + "t" * 20},
+            }
+        )
+        assert answer["username"] == "oauth2"
 
     def test_uses_github_app(self):
         assert uses_github_app({"auth_method": " GitHub_App "})

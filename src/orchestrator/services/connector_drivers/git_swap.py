@@ -55,6 +55,11 @@ from shared.connectors.git_swap import (
 
 logger = logging.getLogger(__name__)
 
+#: The username a static forge token is presented with upstream (and in a
+#: token-in-URL clone): the exchange names it per credential, and the
+#: driver uses the name it is given.
+STATIC_TOKEN_USERNAME = "oauth2"
+
 
 def token_auth(entry: Mapping[str, Any], credentials: Mapping[str, Any]) -> bool:
     """Whether a repository entry clones with a token (the agent's
@@ -86,6 +91,9 @@ class GitSwapDriver(DatasourceDriver):
         return {
             "credential": str(credentials["token"]),
             "allowed_upstream": [upstream.url],
+            # The one SRW's clone URL always used with a forge token: GitLab
+            # expects it for some token kinds.
+            "username": STATIC_TOKEN_USERNAME,
         }
 
     def mints_upstream(self, row: Mapping[str, Any]) -> bool:
@@ -103,9 +111,16 @@ class GitSwapDriver(DatasourceDriver):
             minted_lease_upstream,
         )
 
+        from shared.connectors.github_app import TOKEN_USERNAME
+
         upstream = swap_upstream(row.get("connection_url"))
         minted = await minted_lease_upstream(store, row, owner=owner, access=access)
-        return {"credential": minted.token, "allowed_upstream": [upstream.url]}
+        return {
+            "credential": minted.token,
+            "allowed_upstream": [upstream.url],
+            # GitHub's documented username for an installation token.
+            "username": TOKEN_USERNAME,
+        }
 
     def service_connector(self, row: Mapping[str, Any]) -> Mapping[str, Any]:
         return swap_service_connector(row)

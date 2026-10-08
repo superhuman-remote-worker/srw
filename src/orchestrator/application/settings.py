@@ -339,6 +339,13 @@ class DeploymentSettings:
     connector_git_swap_image: str = ""
     connector_git_swap_fallback: str = FALLBACK_TOKEN_IN_URL
     connector_driver_ca_dir: str = ""
+    #: Provider-minted credentials (C5, ``connectors.providerMinting``):
+    #: whether kubeconfig TokenRequest minting and GitHub App repository
+    #: connectors are offered (and their revoke sweep runs), and the
+    #: provider hosts (``host[:port]``) the operator trusts at a private or
+    #: cluster address, e.g. ``kubernetes.default.svc``.
+    connector_provider_minting_enabled: bool = True
+    connector_provider_minting_private_hosts: frozenset[str] = frozenset()
     #: Where service pods run and how the leader reconciles them
     #: (``connectors.servicePods``): the driver and release namespaces, the
     #: installation cap, the idle and start timeouts, the pass interval, the
@@ -508,6 +515,15 @@ class DeploymentSettings:
             connector_driver_ca_dir=os.environ.get(
                 "CONNECTOR_DRIVER_CA_DIR", ""
             ).strip(),
+            connector_provider_minting_enabled=_enabled(
+                "CONNECTOR_PROVIDER_MINTING_ENABLED", "true"
+            ),
+            connector_provider_minting_private_hosts=frozenset(
+                host.lower()
+                for host in parse_name_list(
+                    os.environ.get("CONNECTOR_PROVIDER_MINTING_PRIVATE_HOSTS")
+                )
+            ),
             connector_service_namespace=os.environ.get(
                 "CONNECTOR_SERVICE_NAMESPACE", ""
             ).strip(),

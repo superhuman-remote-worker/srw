@@ -315,6 +315,11 @@ connectors:
       - 10.42.0.0/16
       - 10.43.0.0/16
       - 169.254.0.0/16
+  # Provider-minted credentials (C5): the cluster SRW runs in is a provider
+  # the operator trusts, so a kubeconfig connector's TokenRequest may reach
+  # its API server at its service address (scripts/k3d-provider-minted-gate.py).
+  providerMinting:
+    privateHosts: ["kubernetes.default.svc"]
   drivers:
     registry:
       # The k3d registry Tilt pushes driver images to; the orchestrator pod

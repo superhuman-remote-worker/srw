@@ -224,6 +224,37 @@ def git_swap_delivery_settings(
     )
 
 
+def configure_provider_minting(resources: ApplicationResources) -> None:
+    """Provider-minted credentials (C5): where the orchestrator's own
+    provider calls may go (the service pods' cluster and refused ranges and
+    private tiers, and ``connectors.providerMinting.privateHosts``), and
+    whether minting is offered at all, process-wide like the git swap
+    settings."""
+    from orchestrator.services import connector_minted_credentials
+    from orchestrator.services.connector_drivers.provider_http import (
+        ProviderNetwork,
+        configure_provider_network,
+    )
+
+    settings = resources.settings
+    configure_provider_network(
+        ProviderNetwork(
+            cluster_cidrs=tuple(settings.connector_service_cluster_cidrs),
+            refused_cidrs=tuple(settings.connector_service_refused_cidrs),
+            private_tiers=frozenset(settings.connector_service_private_tiers),
+            ipv6=settings.connector_service_ipv6,
+            private_hosts=frozenset(settings.connector_provider_minting_private_hosts),
+        )
+    )
+    enabled = settings.connector_provider_minting_enabled
+    connector_minted_credentials.configure_minted_credentials(
+        connector_minted_credentials.MintedRuntime(store=resources.postgres_db)
+        if enabled
+        else None,
+        enabled=enabled,
+    )
+
+
 def service_image_settings(resources: ApplicationResources) -> ServiceImageSettings:
     """How this application resolves service driver images (D5).
 

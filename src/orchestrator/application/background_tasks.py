@@ -471,18 +471,21 @@ async def start_background_tasks(
     # Provider-minted credentials (C5): revoke at the provider what ended
     # executions, expired credentials and connector changes left (a bound
     # Secret deleted, an installation token revoked). Leader-gated on the
-    # lease sweep's cadence, and woken by every revoke request's NOTIFY.
-    tasks.start_leader_gated(
-        "connector_minted_credential_sweeper",
-        functools.partial(
-            connector_minted_credentials.connector_minted_credential_sweeper,
-            store=resources.postgres_db,
-            interval_seconds=connector_credential_leases.sweep_interval(
-                resources.settings.connector_lease_ttl_seconds,
-                resources.settings.connector_lease_sweep_seconds,
+    # lease sweep's cadence; it LISTENs for revoke requests only while a
+    # credential may need a provider call. Off with
+    # connectors.providerMinting.enabled.
+    if resources.settings.connector_provider_minting_enabled:
+        tasks.start_leader_gated(
+            "connector_minted_credential_sweeper",
+            functools.partial(
+                connector_minted_credentials.connector_minted_credential_sweeper,
+                store=resources.postgres_db,
+                interval_seconds=connector_credential_leases.sweep_interval(
+                    resources.settings.connector_lease_ttl_seconds,
+                    resources.settings.connector_lease_sweep_seconds,
+                ),
             ),
-        ),
-    )
+        )
     # The lease exchange's own port, on every replica (drivers reach it
     # through the Service). Off unless the chart sets the port.
     exchange_port = resources.settings.connector_lease_exchange_port

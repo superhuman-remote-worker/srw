@@ -554,6 +554,36 @@ def _validation_context(
     )
 
 
+def minting_inputs_changed(
+    existing_ds: dict[str, Any], normalized: NormalizedConnector
+) -> bool:
+    """Whether an update of a connector that mints at a provider (C5)
+    changed what it mints with: its URL, config or credentials."""
+    if connector_minted_credentials.row_provider(existing_ds) is None:
+        return False
+    return (
+        normalized.config is not None
+        or normalized.credentials is not None
+        or normalized.connection_url_set
+        or normalized.connection_url is not None
+    )
+
+
+async def revoke_minted_after_update(
+    store: Any,
+    datasource_id: str,
+    existing_ds: dict[str, Any],
+    normalized: NormalizedConnector,
+) -> int:
+    """Right after the update committed: what SRW minted with the old
+    minting inputs is revoked, and each execution's next delivery mints
+    afresh (C5). Returns how many credentials were asked to go."""
+    if not minting_inputs_changed(existing_ds, normalized):
+        return 0
+    async with store.acquire() as conn:
+        return await connector_minted_credentials.connector_changed(conn, datasource_id)
+
+
 async def update_datasource(
     *,
     request: Request,
@@ -727,6 +757,11 @@ async def update_datasource(
                     status_code=404, detail=f"Connector '{datasource_id}' not found"
                 )
 
+        # Right after the update committed, before anything else that may
+        # fail: what SRW minted with the old minting inputs goes (C5).
+        await revoke_minted_after_update(
+            dependencies.store, datasource_id, existing_ds, normalized
+        )
         if isinstance(driver, SupportsWriteEffects):
             await driver.after_write(
                 datasource_id,
@@ -741,18 +776,6 @@ async def update_datasource(
             # each execution's next delivery binds afresh (D6).
             async with dependencies.store.acquire() as conn:
                 await connector_bind_time.connector_changed(conn, datasource_id)
-        if (
-            normalized.config is not None
-            or normalized.credentials is not None
-            or connection_url_set
-            or normalized.connection_url is not None
-        ) and connector_minted_credentials.row_provider(existing_ds) is not None:
-            # What SRW minted with the old minting inputs is revoked; each
-            # execution's next delivery mints afresh (C5).
-            async with dependencies.store.acquire() as conn:
-                await connector_minted_credentials.connector_changed(
-                    conn, datasource_id
-                )
 
         updated_ds = await dependencies.store.get_datasource(datasource_id)
         if not updated_ds:

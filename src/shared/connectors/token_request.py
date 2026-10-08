@@ -40,6 +40,60 @@ credential never needs ``get``, ``list`` or ``watch``: it cannot read a
 Secret, so a service-account token Secret it could create stays unreadable
 to it.
 
+**Recommended: narrow the Secret verbs with a ValidatingAdmissionPolicy**
+(Kubernetes 1.30+), so the minting credential may delete only SRW's
+labelled ``srw-mint-*`` Secrets and create only empty, immutable ones (no
+service-account token Secret, nothing with data)::
+
+    apiVersion: admissionregistration.k8s.io/v1
+    kind: ValidatingAdmissionPolicy
+    metadata:
+      name: srw-minted-secrets
+    spec:
+      failurePolicy: Fail
+      matchConstraints:
+        resourceRules:
+        - apiGroups: [""]
+          apiVersions: ["v1"]
+          operations: ["CREATE", "DELETE"]
+          resources: ["secrets"]
+      matchConditions:
+      - name: the-minting-account
+        expression: >-
+          request.userInfo.username ==
+          "system:serviceaccount:<namespace>:<minting account>"
+      variables:
+      - name: secret
+        expression: 'request.operation == "DELETE" ? oldObject : object'
+      validations:
+      - expression: >-
+          variables.secret.metadata.name.startsWith("srw-mint-")
+          && has(variables.secret.metadata.labels)
+          && "app.kubernetes.io/managed-by" in variables.secret.metadata.labels
+          && variables.secret.metadata.labels["app.kubernetes.io/managed-by"] == "srw"
+        message: SRW's minting account handles its own srw-mint- Secrets only
+      - expression: >-
+          request.operation == "DELETE"
+          || (object.type == "Opaque"
+              && has(object.immutable) && object.immutable == true
+              && !has(object.data) && !has(object.stringData))
+        message: SRW's minting account creates empty, immutable Secrets only
+    ---
+    apiVersion: admissionregistration.k8s.io/v1
+    kind: ValidatingAdmissionPolicyBinding
+    metadata:
+      name: srw-minted-secrets
+    spec:
+      policyName: srw-minted-secrets
+      validationActions: [Deny]
+      matchResources:
+        namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: <namespace>
+
+``scripts/k3d-provider-minted-gate.py`` installs exactly this and mints
+through it.
+
 **Access levels.** SRW cannot narrow a token TokenRequest mints: whatever
 the target ServiceAccount's RBAC allows, the workspace can do, at either
 access level. A read-only connector needs a read-only ServiceAccount.
@@ -296,6 +350,13 @@ def minting_kubeconfig(doc: Any) -> MintingKubeconfig:
         raise TokenRequestConfigError(
             "the minting kubeconfig's server must be an https URL"
         )
+    if parts.path not in ("", "/"):
+        # SRW calls the API's own paths: a path prefix (a proxy in front of
+        # the API server) would make it call wherever that prefix leads.
+        raise TokenRequestConfigError(
+            "the minting kubeconfig's server must be https://host[:port], "
+            "without a path"
+        )
     ca = cluster.get("certificate-authority-data")
     tls_name = cluster.get("tls-server-name")
     if tls_name is not None and (
@@ -310,7 +371,7 @@ def minting_kubeconfig(doc: Any) -> MintingKubeconfig:
     ):
         namespace = None
     return MintingKubeconfig(
-        server=str(server).rstrip("/"),
+        server=f"https://{parts.netloc.lower()}",
         ca_pem=_ca_pem(ca) if ca else None,
         tls_server_name=tls_name or None,
         token=token.strip(),
@@ -349,6 +410,86 @@ def delivered_kubeconfig(
         "contexts": [{"name": name, "context": context}],
         "current-context": name,
     }
+
+
+#: The policy the module docstring recommends (and the k3d gate installs).
+ADMISSION_POLICY_NAME = "srw-minted-secrets"
+
+
+def admission_policy(namespace: str, minting_account: str) -> list[dict[str, Any]]:
+    """The recommended ValidatingAdmissionPolicy and its binding (see the
+    module docstring), for one namespace and minting ServiceAccount."""
+    labelled = (
+        'variables.secret.metadata.name.startsWith("srw-mint-") '
+        "&& has(variables.secret.metadata.labels) "
+        f'&& "{MANAGED_BY_LABEL}" in variables.secret.metadata.labels '
+        f'&& variables.secret.metadata.labels["{MANAGED_BY_LABEL}"] == "{MANAGED_BY}"'
+    )
+    empty = (
+        'request.operation == "DELETE" '
+        '|| (object.type == "Opaque" '
+        "&& has(object.immutable) && object.immutable == true "
+        "&& !has(object.data) && !has(object.stringData))"
+    )
+    return [
+        {
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": ADMISSION_POLICY_NAME},
+            "spec": {
+                "failurePolicy": "Fail",
+                "matchConstraints": {
+                    "resourceRules": [
+                        {
+                            "apiGroups": [""],
+                            "apiVersions": ["v1"],
+                            "operations": ["CREATE", "DELETE"],
+                            "resources": ["secrets"],
+                        }
+                    ]
+                },
+                "matchConditions": [
+                    {
+                        "name": "the-minting-account",
+                        "expression": "request.userInfo.username == "
+                        f'"system:serviceaccount:{namespace}:{minting_account}"',
+                    }
+                ],
+                "variables": [
+                    {
+                        "name": "secret",
+                        "expression": 'request.operation == "DELETE" ? oldObject : object',
+                    }
+                ],
+                "validations": [
+                    {
+                        "expression": labelled,
+                        "message": "SRW's minting account handles its own "
+                        "srw-mint- Secrets only",
+                    },
+                    {
+                        "expression": empty,
+                        "message": "SRW's minting account creates empty, "
+                        "immutable Secrets only",
+                    },
+                ],
+            },
+        },
+        {
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": ADMISSION_POLICY_NAME},
+            "spec": {
+                "policyName": ADMISSION_POLICY_NAME,
+                "validationActions": ["Deny"],
+                "matchResources": {
+                    "namespaceSelector": {
+                        "matchLabels": {"kubernetes.io/metadata.name": namespace}
+                    }
+                },
+            },
+        },
+    ]
 
 
 def secret_name(credential_id: Any) -> str:
@@ -400,6 +541,7 @@ def token_request(
 
 
 __all__ = [
+    "ADMISSION_POLICY_NAME",
     "CONFIG_KEY",
     "DEFAULT_EXPIRATION_SECONDS",
     "MAX_EXPIRATION_SECONDS",
@@ -407,6 +549,7 @@ __all__ = [
     "MintingKubeconfig",
     "TokenRequestConfigError",
     "TokenRequestOptions",
+    "admission_policy",
     "bound_secret",
     "delivered_kubeconfig",
     "minting_kubeconfig",

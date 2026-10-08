@@ -18,7 +18,6 @@ import secrets
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
-from uuid import uuid4
 
 from fastapi import HTTPException
 
@@ -45,7 +44,7 @@ from shared.connectors.token_request import (
     CONFIG_KEY as TOKEN_REQUEST_KEY,
     TokenRequestConfigError,
     parse_token_request,
-    secret_name,
+    token_request_options,
 )
 from shared.connectors.envelope import (
     DriverError,
@@ -236,6 +235,27 @@ class KubeconfigDriver(CredentialFileDriver):
                 ),
             ) from None
 
+    @staticmethod
+    def _require_enabled(config: Any) -> None:
+        from orchestrator.services.connector_minted_credentials import (
+            DISABLED_DETAIL,
+            minting_enabled,
+        )
+
+        if (
+            isinstance(config, Mapping)
+            and config.get(TOKEN_REQUEST_KEY) is not None
+            and not minting_enabled()
+        ):
+            raise HTTPException(status_code=403, detail=DISABLED_DETAIL)
+
+    @staticmethod
+    def _stored_options(existing: Mapping[str, Any]) -> Any:
+        try:
+            return token_request_options(stored_json_object(existing.get("config")))
+        except TokenRequestConfigError:
+            return None
+
     async def validate(
         self,
         draft: ConnectorDraft,
@@ -245,6 +265,7 @@ class KubeconfigDriver(CredentialFileDriver):
     ) -> NormalizedConnector:
         if existing is None:
             config = self._config(draft, None)
+            self._require_enabled(config)
             credentials = self._normalize_files(
                 draft.name or "", self.stored_credentials(draft, existing), None
             )
@@ -257,15 +278,50 @@ class KubeconfigDriver(CredentialFileDriver):
             )
         config = self._config(draft, existing)
         if config is not None or credentials is not None:
-            self._check_minting(
+            effective = (
                 config
                 if config is not None
-                else stored_json_object(existing.get("config")),
+                else stored_json_object(existing.get("config"))
+            )
+            self._require_enabled(effective)
+            if credentials is None:
+                self._same_use(self._stored_options(existing), effective)
+            self._check_minting(
+                effective,
                 credentials
                 if credentials is not None
                 else stored_json_object(existing.get("credentials")),
             )
         return NormalizedConnector(draft.connection_url, config, credentials)
+
+    @staticmethod
+    def _same_use(stored: Any, effective: Mapping[str, Any]) -> None:
+        """An edit that keeps the stored kubeconfig may not change what it is
+        used for: minting turned on or off (a minting credential would be
+        delivered as it is, or a delivered one start minting), or another
+        target ServiceAccount. Those need the kubeconfig sent again."""
+        options = token_request_options(effective)
+        if stored is None and options is None:
+            return
+        if stored is None or options is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Turning TokenRequest minting on or off changes what the "
+                    "stored kubeconfig is used for: send the kubeconfig again"
+                ),
+            )
+        if (stored.namespace, stored.service_account) != (
+            options.namespace,
+            options.service_account,
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Changing the target ServiceAccount points the stored minting "
+                    "kubeconfig elsewhere: send the kubeconfig again"
+                ),
+            )
 
     def bind(
         self, row: Mapping[str, Any], credentials: Any, *, ctx: BindContext
@@ -298,12 +354,13 @@ async def probe_token_request(
     row: Mapping[str, Any], config: Mapping[str, Any], credentials: Mapping[str, Any]
 ) -> dict[str, Any]:
     """Test a minting kubeconfig connector: mint a token for the target
-    ServiceAccount, bound to a Secret, and delete the Secret again. Never
-    discloses the minting credential or the token."""
-    from orchestrator.services.connector_drivers.provider_http import ProviderError
-    from orchestrator.services.connector_drivers.token_request import (
-        delete_bound_secret,
-        mint_token,
+    ServiceAccount, bound to a Secret, and delete the Secret again. The mint
+    is recorded (``connector_minted_credentials``), so a delete that fails
+    is retried by the sweep. Never discloses the minting credential or the
+    token."""
+    from orchestrator.services.connector_minted_credentials import (
+        MintFailure,
+        mint_for_test,
     )
 
     try:
@@ -315,28 +372,18 @@ async def probe_token_request(
         )
     except TokenRequestConfigError as exc:
         return {"status": "error", "message": str(exc)}
-    probe = uuid4()
-    name = secret_name(probe)
     try:
-        minted = await mint_token(
-            minting,
-            options,
-            secret=name,
-            credential_id=probe,
-            annotations={
-                "srw.io/connector": str(row.get("id") or ""),
-                "srw.io/test": "1",
-            },
+        minted, revoke = await mint_for_test(
+            {
+                **row,
+                "type": KUBECONFIG_SPEC.legacy_type,
+                "config": config,
+                "credentials": credentials,
+            }
         )
-    except ProviderError as exc:
+    except MintFailure as exc:
         return {"status": "error", "message": str(exc)}
-    revoked = True
-    try:
-        await delete_bound_secret(
-            minting, namespace=options.namespace, name=name, uid=minted.handle
-        )
-    except ProviderError:
-        revoked = False
+    revoked = await revoke()
     lifetime = int((minted.expires_at - datetime.now(timezone.utc)).total_seconds())
     message = (
         f"Minted a token for ServiceAccount {options.namespace}/"
@@ -345,8 +392,8 @@ async def probe_token_request(
         + (
             " and revoked it by deleting its bound Secret"
             if revoked
-            else "; deleting its bound Secret FAILED: grant the minting "
-            "credential delete on secrets in that namespace"
+            else "; deleting its bound Secret FAILED (SRW keeps trying): grant "
+            "the minting credential delete on secrets in that namespace"
         )
         + ". The workspace receives a kubeconfig with such a token only; the "
         "target ServiceAccount's RBAC decides what it may do, at either access "

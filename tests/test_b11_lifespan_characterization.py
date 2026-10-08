@@ -342,6 +342,14 @@ def _lifespan_environment(
     monkeypatch.setenv("KUBECONFIG", "/dev/null")
     for key, value in (env or {}).items():
         monkeypatch.setenv(key, value)
+    # Building the application configures process-wide connector state
+    # (C5's minting runtime and provider network): restored with the rest.
+    from orchestrator.services import connector_minted_credentials
+    from orchestrator.services.connector_drivers import provider_http
+
+    for state in (connector_minted_credentials._state, provider_http._state):
+        for key, value in list(state.items()):
+            monkeypatch.setitem(state, key, value)
 
     app = app if app is not None else _application()
     resources: ApplicationResources = app.state.resources
@@ -693,6 +701,20 @@ async def test_optional_tasks_follow_their_gates(monkeypatch):
         "completion-finalizer-drain"
     )
     assert "CompletionSweepRouter.run" not in created
+    assert sorted(recorder.awaited) == sorted(created)
+
+
+@pytest.mark.asyncio
+async def test_provider_minting_off_starts_no_minted_credential_sweeper(monkeypatch):
+    recorder = _Recorder()
+    await _run_lifespan(
+        monkeypatch,
+        recorder,
+        settings={"connector_provider_minting_enabled": False},
+    )
+    created = {e["label"] for e in recorder.created}
+    assert "connector_minted_credential_sweeper" not in created
+    assert "connector_lease_sweeper" in created
     assert sorted(recorder.awaited) == sorted(created)
 
 

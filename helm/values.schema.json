@@ -1495,6 +1495,21 @@
             }
           }
         },
+        "providerMinting": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Credentials SRW mints at a provider (connector drivers C5).",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "privateHosts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]{1,5})?$"
+              }
+            }
+          }
+        },
         "drivers": {
           "type": "object",
           "properties": {

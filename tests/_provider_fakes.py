@@ -8,8 +8,10 @@ server's rule: unexpired, and its bound Secret exists with the same uid).
 installation tokens with the requested repositories and permissions
 checked against what the installation allows, and revokes them.
 
-``ProviderRouter`` routes an ``httpx.MockTransport`` to them by host;
-``install`` puts it behind ``provider_http.configure_provider_http``.
+``ProviderRouter`` routes an ``httpx.MockTransport`` to them by host (the
+``Host`` header: SRW dials the checked address, never the name); ``install``
+puts it behind ``provider_http.configure_provider_http`` and a fake resolver
+(:data:`ADDRESSES`) behind ``configure_provider_network``.
 """
 
 from __future__ import annotations
@@ -25,6 +27,13 @@ import httpx
 
 KUBE_SERVER = "https://kube.test:6443"
 GITHUB_API = "https://api.github.com"
+
+#: What the fake resolver answers: public (documentation) addresses, so the
+#: provider calls pass the egress check on any project tier.
+ADDRESSES: dict[str, tuple[str, ...]] = {
+    "kube.test": ("203.0.113.10",),
+    "api.github.com": ("203.0.113.20",),
+}
 
 
 def _self_signed_ca() -> str:
@@ -119,6 +128,8 @@ class FakeKubeApi:
         self.forbidden: set[str] = set()
         #: Status to answer the next N calls of a verb with.
         self.fail: dict[str, list[int]] = {}
+        #: The ``message`` of an injected refusal.
+        self.leak = ""
 
     def authenticates(self, token: str) -> bool:
         """The bound-token rule: unexpired, its Secret exists, same uid."""
@@ -132,7 +143,9 @@ class FakeKubeApi:
         queued = self.fail.get(verb) or []
         if queued:
             status = queued.pop(0)
-            return httpx.Response(status, json={"message": f"injected {status}"})
+            return httpx.Response(
+                status, json={"message": self.leak or f"injected {status}"}
+            )
         if verb in self.forbidden:
             return httpx.Response(
                 403, json={"kind": "Status", "message": f"forbidden: {verb}"}
@@ -239,6 +252,8 @@ class FakeGitHubApi:
         #: Extra permissions to grant beyond the request (a misbehaving
         #: answer SRW must refuse).
         self.grant_extra: dict[str, str] = {}
+        #: Repositories to name in an answer beyond the request (likewise).
+        self.extra_repositories: list[str] = []
         self.fail: list[int] = []
 
     def live(self, token: str) -> dict[str, Any] | None:
@@ -307,7 +322,14 @@ class FakeGitHubApi:
                     "expires_at": _iso(expires),
                     "permissions": granted,
                     "repository_selection": "selected",
-                    "repositories": [{"name": name} for name in repositories],
+                    "repositories": [
+                        {
+                            "name": name,
+                            "full_name": f"{self.owner}/{name}",
+                            "owner": {"login": self.owner},
+                        }
+                        for name in [*repositories, *self.extra_repositories]
+                    ],
                 },
             )
         if request.method == "DELETE" and path == "/installation/token":
@@ -337,7 +359,8 @@ class FakeGitHubApi:
 
 
 class ProviderRouter:
-    """One MockTransport for both fakes, by host."""
+    """One MockTransport for both fakes, by the name SRW asked for (the
+    ``Host`` header of a pinned request)."""
 
     def __init__(
         self, kube: FakeKubeApi | None = None, github: FakeGitHubApi | None = None
@@ -345,10 +368,15 @@ class ProviderRouter:
         self.kube = kube
         self.github = github
         self.hosts: list[str] = []
+        #: The address each request dialled, and the TLS name it asked for.
+        self.dialled: list[tuple[str, str | None]] = []
+        #: The TLS context each client was made with.
+        self.verified: list[Any] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
-        host = request.url.host
+        host = (request.headers.get("host") or request.url.host).split(":")[0]
         self.hosts.append(host)
+        self.dialled.append((request.url.host, request.extensions.get("sni_hostname")))
         if self.kube is not None and host == urlsplit(KUBE_SERVER).hostname:
             return self.kube.handle(request)
         if self.github is not None and host == urlsplit(GITHUB_API).hostname:
@@ -359,6 +387,7 @@ class ProviderRouter:
         transport = httpx.MockTransport(self)
 
         def make(*, verify: Any = True, timeout: float = 10.0) -> httpx.AsyncClient:
+            self.verified.append(verify)
             return httpx.AsyncClient(
                 transport=transport, timeout=timeout, follow_redirects=False
             )
@@ -366,11 +395,46 @@ class ProviderRouter:
         return make
 
 
-def install(monkeypatch: Any, router: ProviderRouter) -> ProviderRouter:
-    """Route every provider call of the C5 drivers to ``router``."""
+def fake_resolver(addresses: dict[str, tuple[str, ...]] | None = None):
+    """A resolver answering from ``addresses`` (default :data:`ADDRESSES`);
+    any other name does not resolve."""
+    table = dict(ADDRESSES if addresses is None else addresses)
+
+    async def resolve(host: str, ipv6: bool) -> tuple[str, ...]:
+        found = table.get(host.lower())
+        if not found:
+            raise OSError(f"{host} does not resolve")
+        return found
+
+    return resolve
+
+
+def install(
+    monkeypatch: Any,
+    router: ProviderRouter,
+    *,
+    addresses: dict[str, tuple[str, ...]] | None = None,
+    private_hosts: tuple[str, ...] = (),
+) -> ProviderRouter:
+    """Route every provider call of the C5 drivers to ``router``, resolving
+    names with :func:`fake_resolver`. Minting is on, with no runtime (no
+    store): whatever an application built earlier in this process left
+    configured is set aside for the test (a real-PostgreSQL test installs
+    its own store after this)."""
+    from orchestrator.services import connector_minted_credentials as minted
     from orchestrator.services.connector_drivers import provider_http
 
+    monkeypatch.setitem(minted._state, "runtime", None)
+    monkeypatch.setitem(minted._state, "enabled", True)
     monkeypatch.setitem(provider_http._state, "factory", router.factory())
+    monkeypatch.setitem(
+        provider_http._state,
+        "network",
+        provider_http.ProviderNetwork(
+            resolver=fake_resolver(addresses),
+            private_hosts=frozenset(h.lower() for h in private_hosts),
+        ),
+    )
     return router
 
 

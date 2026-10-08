@@ -175,6 +175,24 @@ class TestMintingKubeconfig:
         with pytest.raises(TokenRequestConfigError):
             parse_minting_kubeconfig(text)
 
+    @pytest.mark.parametrize(
+        "server",
+        ["https://kube.test:6443/prefix", "https://kube.test:6443/api/v1"],
+    )
+    def test_a_server_with_a_path_is_refused(self, server):
+        with pytest.raises(TokenRequestConfigError, match="without a path"):
+            parse_minting_kubeconfig(
+                minting_kubeconfig_yaml("tok-0123456789abcdef", server=server)
+            )
+
+    def test_the_server_is_normalized_to_scheme_host_and_port(self):
+        minting = parse_minting_kubeconfig(
+            minting_kubeconfig_yaml(
+                "tok-0123456789abcdef", server="https://KUBE.test:6443/"
+            )
+        )
+        assert minting.server == KUBE_SERVER
+
     def test_the_delivered_kubeconfig_holds_the_minted_token_only(self):
         text = delivered_kubeconfig_text(
             server=KUBE_SERVER,
@@ -309,6 +327,69 @@ class TestCalls:
         assert kube.minting_token not in str(caught.value)
 
     @pytest.mark.asyncio
+    async def test_the_api_servers_words_never_reach_the_error(self, kube):
+        kube.fail["create-secret"] = [403]
+        kube.leak = "secrets is forbidden: User internal-admin@10.0.0.7"
+        with pytest.raises(ProviderError) as caught:
+            await mint_token(
+                _minting(kube),
+                parse_token_request(OPTIONS),
+                secret="srw-mint-l",
+                credential_id="c-l",
+                annotations={},
+            )
+        assert "HTTP 403" in str(caught.value)
+        assert "internal-admin" not in str(caught.value)
+        assert "10.0.0.7" not in str(caught.value)
+
+    @pytest.mark.asyncio
+    async def test_the_call_dials_the_resolved_address(self, monkeypatch):
+        api = FakeKubeApi()
+        router = install(monkeypatch, ProviderRouter(kube=api))
+        await mint_token(
+            _minting(api),
+            parse_token_request(OPTIONS),
+            secret="srw-mint-p",
+            credential_id="c-p",
+            annotations={},
+        )
+        assert router.dialled == [("203.0.113.10", "kube.test")] * 2
+
+    @pytest.mark.asyncio
+    async def test_a_cluster_address_needs_the_operators_listing(self, monkeypatch):
+        api = FakeKubeApi()
+        install(
+            monkeypatch,
+            ProviderRouter(kube=api),
+            addresses={"kube.test": ("10.43.0.1",)},
+        )
+        with pytest.raises(ProviderError) as caught:
+            await mint_token(
+                _minting(api),
+                parse_token_request(OPTIONS),
+                secret="srw-mint-q",
+                credential_id="c-q",
+                annotations={},
+                allow_private=True,
+            )
+        assert caught.value.reason == "address_refused"
+        assert api.requests == []
+        install(
+            monkeypatch,
+            ProviderRouter(kube=api),
+            addresses={"kube.test": ("10.43.0.1",)},
+            private_hosts=("kube.test:6443",),
+        )
+        minted = await mint_token(
+            _minting(api),
+            parse_token_request(OPTIONS),
+            secret="srw-mint-q",
+            credential_id="c-q",
+            annotations={},
+        )
+        assert api.authenticates(minted.token)
+
+    @pytest.mark.asyncio
     async def test_a_wrong_minting_credential_is_a_401(self, kube):
         minting = parse_minting_kubeconfig(
             minting_kubeconfig_yaml("wrong-token-0123456")
@@ -419,36 +500,134 @@ class TestDriver:
             "id": CONNECTOR,
             "name": "cluster",
             "config": {},
-            "credentials": _files(
-                minting_kubeconfig_yaml("", user_extra={"exec": {"command": "aws"}})
-            ),
+            "credentials": _files(minting_kubeconfig_yaml("tok-0123456789abcdef")),
         }
-        # Turning minting on over an exec kubeconfig is refused.
+        # Turning minting on with an exec kubeconfig is refused.
         with pytest.raises(HTTPException, match="exec plugin"):
             await driver.validate(
-                _draft(config={"token_request": OPTIONS}),
+                _draft(
+                    config={"token_request": OPTIONS},
+                    credentials=_files(
+                        minting_kubeconfig_yaml(
+                            "", user_extra={"exec": {"command": "aws"}}
+                        )
+                    ),
+                ),
                 existing=existing,
                 ctx=_ctx(),
             )
-        # A bad CA is refused before any delivery.
+        # A bad CA in the stored kubeconfig is refused before any delivery
+        # (a lifetime change keeps the stored kubeconfig in use).
+        existing["config"] = {"token_request": OPTIONS}
         existing["credentials"] = _files(
             minting_kubeconfig_yaml("tok-0123456789abcdef").replace(
                 "certificate-authority-data: ",
                 "certificate-authority-data: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCg== #",
             )
         )
-        with pytest.raises(HTTPException):
+        with pytest.raises(HTTPException, match="certificate-authority-data"):
             await driver.validate(
-                _draft(config={"token_request": OPTIONS}),
+                _draft(
+                    config={"token_request": {**OPTIONS, "expiration_seconds": 900}}
+                ),
                 existing=existing,
                 ctx=_ctx(),
             )
         # A name-only edit of a minting connector is not checked again.
-        existing["config"] = {"token_request": OPTIONS}
         normalized = await driver.validate(
             _draft(name="renamed"), existing=existing, ctx=_ctx()
         )
         assert normalized.config is None and normalized.credentials is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("stored", "edited"),
+        [
+            # Minting turned on over a kubeconfig delivered as it is.
+            ({}, {"token_request": OPTIONS}),
+            # Minting turned off: the minting credential would be delivered.
+            ({"token_request": OPTIONS}, {}),
+            ({"token_request": OPTIONS}, {"token_request": None}),
+            # Another target ServiceAccount or namespace.
+            (
+                {"token_request": OPTIONS},
+                {"token_request": {**OPTIONS, "service_account": "admin"}},
+            ),
+            (
+                {"token_request": OPTIONS},
+                {"token_request": {**OPTIONS, "namespace": "kube-system"}},
+            ),
+        ],
+        ids=["on", "off-empty", "off-null", "other-account", "other-namespace"],
+    )
+    async def test_an_edit_may_not_retarget_the_stored_kubeconfig(self, stored, edited):
+        driver = KubeconfigDriver()
+        kubeconfig = _files(minting_kubeconfig_yaml("tok-0123456789abcdef"))
+        existing = {
+            "id": CONNECTOR,
+            "name": "cluster",
+            "config": stored,
+            "credentials": kubeconfig,
+        }
+        with pytest.raises(HTTPException, match="send the kubeconfig again") as caught:
+            await driver.validate(_draft(config=edited), existing=existing, ctx=_ctx())
+        assert caught.value.status_code == 400
+        # With the kubeconfig sent again, the same edit is fine.
+        normalized = await driver.validate(
+            _draft(config=edited, credentials=kubeconfig),
+            existing=existing,
+            ctx=_ctx(),
+        )
+        assert normalized.credentials is not None
+
+    @pytest.mark.asyncio
+    async def test_a_lifetime_or_audience_edit_keeps_the_stored_kubeconfig(self):
+        normalized = await KubeconfigDriver().validate(
+            _draft(
+                config={
+                    "token_request": {
+                        **OPTIONS,
+                        "expiration_seconds": 900,
+                        "audiences": ["api"],
+                    }
+                }
+            ),
+            existing={
+                "id": CONNECTOR,
+                "name": "cluster",
+                "config": {"token_request": OPTIONS},
+                "credentials": _files(minting_kubeconfig_yaml("tok-0123456789abcdef")),
+            },
+            ctx=_ctx(),
+        )
+        assert normalized.config["token_request"]["expiration_seconds"] == 900
+        assert normalized.credentials is None
+
+    @pytest.mark.asyncio
+    async def test_minting_is_refused_where_the_deployment_turned_it_off(
+        self, monkeypatch
+    ):
+        from orchestrator.services import connector_minted_credentials as minted
+
+        monkeypatch.setitem(minted._state, "enabled", False)
+        driver = KubeconfigDriver()
+        with pytest.raises(HTTPException, match="providerMinting") as caught:
+            await driver.validate(
+                _draft(
+                    credentials=_files(minting_kubeconfig_yaml("tok-0123456789abcdef")),
+                    config={"token_request": OPTIONS},
+                ),
+                existing=None,
+                ctx=_ctx(),
+            )
+        assert caught.value.status_code == 403
+        # A kubeconfig delivered as it is stays available.
+        normalized = await driver.validate(
+            _draft(credentials=_files(minting_kubeconfig_yaml("tok-0123456789abcdef"))),
+            existing=None,
+            ctx=_ctx(),
+        )
+        assert normalized.config == {}
 
     def test_a_minting_connector_binds_without_its_kubeconfig(self):
         driver = KubeconfigDriver()

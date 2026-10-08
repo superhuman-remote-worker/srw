@@ -320,6 +320,22 @@ connectors:
     # -- How many spec-operation pods (registering an image without a spec
     # label) one user may run at once.
     specPodsPerUser: 2
+  # -- Credentials SRW mints at a provider (connector drivers C5): a
+  # kubeconfig connector's token_request (a TokenRequest token for one
+  # ServiceAccount, bound to a Secret SRW deletes when the execution ends)
+  # and GitHub App repository connectors (one-hour installation tokens for
+  # one repository). The orchestrator calls the provider itself: its address
+  # must be public, or private on a project tier that allows private
+  # addresses, never loopback, link-local or cloud metadata.
+  providerMinting:
+    # -- Offer both options, and run the leader's revoke sweep. Off: neither
+    # can be saved or delivered; credentials minted before lapse at the
+    # provider on their own (bound Secrets stay behind).
+    enabled: true
+    # -- Provider hosts (host or host:port) the operator trusts at a private
+    # or cluster address, for every project, e.g. kubernetes.default.svc for
+    # the cluster SRW runs in. Link-local and metadata addresses never.
+    privateHosts: []
   drivers:
     # -- Repositories whose driver images are trusted (D6), matched on a
     # path boundary: ghcr.io/acme trusts ghcr.io/acme/driver but never

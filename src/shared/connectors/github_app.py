@@ -17,8 +17,12 @@ upstream credential, re-minted before it expires. Without the swap driver,
 the installation's C3 fallback applies, visibly: ``token-in-url`` delivers
 the one-hour, repository-scoped token in the clone URL (never the key),
 ``refuse`` delivers nothing. Either way git presents the token with the
-username every SRW forge token uses (``oauth2``): GitHub reads the token
-and ignores the username.
+username GitHub documents for installation tokens (:data:`TOKEN_USERNAME`);
+static forge tokens keep the one SRW always used (``oauth2``).
+
+The App's key signs requests to the repository's own API host only
+(:func:`api_host_for`), and the token GitHub answers must cover exactly the
+connector's repository.
 
 GitHub.com is served at ``https://api.github.com``; a GitHub Enterprise
 Server at ``https://<host>/api/v3`` unless ``api_base`` names another base;
@@ -43,6 +47,8 @@ from urllib.parse import urlsplit
 AUTH_METHOD = "github_app"
 CONFIG_KEY = "github_app"
 GITHUB_COM_API = "https://api.github.com"
+#: The username GitHub documents for an installation token over HTTPS git.
+TOKEN_USERNAME = "x-access-token"
 #: GitHub refuses an App JWT that lives longer than ten minutes; SRW backdates
 #: ``iat`` a minute for clock drift and keeps the total under that.
 JWT_BACKDATE_SECONDS = 60
@@ -150,6 +156,18 @@ def _api_base(value: Any) -> str:
     return f"https://{parts.netloc.lower()}{parts.path.rstrip('/')}"
 
 
+def api_host_for(url: Any) -> str:
+    """The one host a repository's App calls may go to: api.github.com for
+    github.com, api.<sub>.ghe.com for <sub>.ghe.com, else the repository's
+    own host (a GitHub Enterprise Server answers its API there)."""
+    host = (urlsplit(str(url or "")).hostname or "").lower()
+    if host in ("github.com", "www.github.com"):
+        return "api.github.com"
+    if host.endswith(".ghe.com"):
+        return f"api.{host}"
+    return host
+
+
 def _identifier(value: Any, field: str) -> str:
     text = str(value).strip() if isinstance(value, (str, int)) else ""
     if isinstance(value, bool) or not _ID.fullmatch(text):
@@ -173,10 +191,18 @@ def parse_github_app(config: Any, url: Any) -> GitHubAppOptions:
         )
     owner, name = repository_of(url)
     configured = value.get("api_base")
+    api_base = _api_base(configured) if configured else default_api_base(url)
+    if (urlsplit(api_base).hostname or "").lower() != api_host_for(url):
+        # The App's key signs requests to this host: it must be the
+        # repository's own API, never another host an edit points it at.
+        raise GitHubAppConfigError(
+            f"github_app.api_base must be on {api_host_for(url)}, the "
+            "repository's own API host"
+        )
     return GitHubAppOptions(
         app_id=_identifier(value.get("app_id"), "app_id"),
         installation_id=_identifier(value.get("installation_id"), "installation_id"),
-        api_base=_api_base(configured) if configured else default_api_base(url),
+        api_base=api_base,
         owner=owner,
         repository=name,
     )
@@ -214,7 +240,9 @@ __all__ = [
     "GitHubAppConfigError",
     "GitHubAppOptions",
     "PERMISSIONS",
+    "TOKEN_USERNAME",
     "access_token_request",
+    "api_host_for",
     "default_api_base",
     "installation_permissions",
     "jwt_claims",

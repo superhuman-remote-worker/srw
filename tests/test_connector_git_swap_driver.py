@@ -445,6 +445,10 @@ class TestDriver:
         assert driver.lease_upstream(row) == {
             "credential": TOKEN,
             "allowed_upstream": ["https://github.com/o/r.git"],
+            # A static token keeps the forge username SRW's clone URL always
+            # used (GitLab expects it for some token kinds); only a GitHub
+            # App's installation token is x-access-token (C5).
+            "username": "oauth2",
         }
         for broken in (
             {**row, "credentials": {"auth_method": "ssh", "ssh_key": "k"}},

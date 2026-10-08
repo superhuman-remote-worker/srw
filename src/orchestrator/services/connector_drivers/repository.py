@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import HTTPException
 
@@ -88,17 +89,27 @@ class RepositoryDriver(WorkspaceSshDriver):
         config: Mapping[str, Any] | None,
         credentials: Mapping[str, Any] | None,
         check_key: bool,
+        existing: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """A GitHub App connector's config and credentials, normalized (C5):
         a GitHub repository URL, ``github_app: {app_id, installation_id,
-        api_base?}`` and the App's unencrypted RSA private key, and nothing
-        else secret. HTTP 400 otherwise; a ``github_app`` config on a
-        connector that does not authenticate as an App is refused too."""
+        api_base?}`` on the repository's own API host and the App's
+        unencrypted RSA private key, and nothing else secret. HTTP 400
+        otherwise; a ``github_app`` config on a connector that does not
+        authenticate as an App is refused too. An edit that keeps the stored
+        key (``check_key`` off) may not move the API base or the
+        repository's host: the key would sign requests elsewhere."""
         from orchestrator.services.connector_drivers.github_app import (
             normalize_private_key,
         )
+        from orchestrator.services.connector_minted_credentials import (
+            DISABLED_DETAIL,
+            minting_enabled,
+        )
 
         out = dict(config or {})
+        if uses_github_app(credentials) and not minting_enabled():
+            raise HTTPException(status_code=403, detail=DISABLED_DETAIL)
         if not uses_github_app(credentials):
             if out.get(GITHUB_APP_CONFIG) is not None:
                 raise HTTPException(
@@ -123,6 +134,7 @@ class RepositoryDriver(WorkspaceSshDriver):
             configured_api_base=options.api_base if configured else None
         )
         if not check_key:
+            self._same_targets(existing, options, connection_url)
             return out, None
         extra = sorted(
             key
@@ -142,6 +154,32 @@ class RepositoryDriver(WorkspaceSshDriver):
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
         return out, {"auth_method": GITHUB_APP_AUTH, "private_key": key}
+
+    @staticmethod
+    def _same_targets(
+        existing: Mapping[str, Any] | None, options: Any, connection_url: Any
+    ) -> None:
+        """The stored key keeps signing for the API base and the repository
+        host it was saved for."""
+        if existing is None:
+            return
+        try:
+            stored = parse_github_app(
+                stored_json_object(existing.get("config")),
+                existing.get("connection_url"),
+            )
+        except GitHubAppConfigError:
+            return  # no stored App: check_key would be on
+        stored_host = urlsplit(str(existing.get("connection_url") or "")).hostname or ""
+        host = urlsplit(str(connection_url or "")).hostname or ""
+        if stored.api_base != options.api_base or stored_host.lower() != host.lower():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Moving a GitHub App connector to another API base or "
+                    "repository host needs the App's private key again"
+                ),
+            )
 
     def unread_pins_dropped(
         self, config: dict[str, Any], credentials: Mapping[str, Any]
@@ -213,6 +251,7 @@ class RepositoryDriver(WorkspaceSshDriver):
                     else stored_json_object(existing.get("credentials"))
                 ),
                 check_key=credentials is not None,
+                existing=existing,
             )
             if config is not None:
                 config = effective
@@ -406,36 +445,43 @@ async def probe_github_app(
     ds: dict[str, Any], credentials: Mapping[str, Any]
 ) -> dict[str, Any]:
     """Test a GitHub App connector (C5): mint a read token for its one
-    repository, read the repository with it, and revoke it again. Never
+    repository, read the repository with it, and revoke it again. The mint
+    is recorded, so a revoke that fails is retried by the sweep. Never
     discloses the key or the token."""
     from orchestrator.services.connector_drivers.github_app import (
-        mint_installation_token,
         normalize_private_key,
         repository_facts,
-        revoke_installation_token,
     )
     from orchestrator.services.connector_drivers.provider_http import ProviderError
+    from orchestrator.services.connector_git_swap_delivery import upstream_ca_of
+    from orchestrator.services.connector_minted_credentials import (
+        MintFailure,
+        mint_for_test,
+    )
 
+    config = stored_json_object(ds.get("config"))
     try:
-        options = parse_github_app(
-            stored_json_object(ds.get("config")), ds.get("connection_url")
-        )
-        key = normalize_private_key(credentials.get("private_key"))
+        options = parse_github_app(config, ds.get("connection_url"))
+        normalize_private_key(credentials.get("private_key"))
     except (GitHubAppConfigError, ValueError) as exc:
         return {"status": "error", "message": str(exc)}
     try:
-        minted = await mint_installation_token(options, key, "ReadOnly")
-    except ProviderError as exc:
+        minted, revoke = await mint_for_test(
+            {**ds, "type": "repository", "config": config, "credentials": credentials}
+        )
+    except MintFailure as exc:
         return {"status": "error", "message": str(exc)}
     try:
-        facts = await repository_facts(options, minted.token)
+        facts = await repository_facts(
+            options,
+            minted.token,
+            ca_pem=upstream_ca_of(config),
+            allow_private=bool(minted.material.get("allow_private")),
+        )
     except ProviderError as exc:
         return {"status": "error", "message": str(exc)}
     finally:
-        try:
-            await revoke_installation_token(options.api_base, minted.token)
-        except ProviderError:
-            pass  # it expires within the hour
+        await revoke()  # a failure is the sweep's
     branch = facts.get("default_branch")
     return {
         "status": "ok",

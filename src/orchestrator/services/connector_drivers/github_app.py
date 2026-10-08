@@ -1,15 +1,17 @@
 """GitHub App calls for repository connectors (connector drivers C5).
 
 The rules (the config, the API base, the permissions per access level) are
-``shared.connectors.github_app``. Here are SRW's calls, each over HTTPS,
-never through a proxy, never following a redirect:
+``shared.connectors.github_app``. Here are SRW's calls, each a
+``provider_http`` call (one deadline, a capped answer, a checked and pinned
+address, verified against the connector's ``upstream_ca`` when it names one,
+never a redirect or a proxy):
 
 * the App JWT: RS256 over ``{iat, exp, iss}`` with the App's private key,
   backdated a minute and under ten minutes long;
 * ``POST <api>/app/installations/<id>/access_tokens`` with the JWT: an
   installation token for the connector's one repository and the access
-  level's ``contents`` permission. An answer that grants more than was asked
-  is revoked at once and refused;
+  level's ``contents`` permission. An answer that grants more than was asked,
+  or covers another repository, is revoked at once and refused;
 * ``DELETE <api>/installation/token`` with the installation token itself:
   revokes it (a token GitHub no longer accepts, 401, counts as revoked);
 * for Test, ``GET <api>/repos/<owner>/<repository>`` with a read token.
@@ -17,19 +19,18 @@ never through a proxy, never following a redirect:
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any
 
-import httpx
-
 from orchestrator.services.connector_drivers.provider_http import (
     MintedToken,
+    ProviderAnswer,
     ProviderError,
-    message_of,
+    failure,
     parse_time,
-    provider_client,
+    provider_request,
     status_transient,
-    transport_error,
 )
 from shared.connectors.github_app import (
     API_VERSION,
@@ -38,6 +39,8 @@ from shared.connectors.github_app import (
     installation_permissions,
     jwt_claims,
 )
+
+logger = logging.getLogger(__name__)
 
 _WHO = "GitHub"
 #: A PEM private key's size cap (a 4096-bit RSA key is about 3.3 kB).
@@ -87,74 +90,51 @@ def _headers(bearer: str) -> dict[str, str]:
     }
 
 
-def _refusal(response: httpx.Response, action: str) -> ProviderError:
-    status = response.status_code
-    message = message_of(response)
-    suffix = f": {message}" if message else ""
+def _refusal(answer: ProviderAnswer, action: str) -> ProviderError:
+    """A fixed text per status class; GitHub's message is logged."""
+    status = answer.status
+    logger.info("GitHub answered HTTP %d to %s: %s", status, action, answer.message())
     if status == 401:
         text = (
             f"{_WHO} refused the App's JWT (HTTP 401); check the App id and its "
             "private key"
         )
+    elif status == 403:
+        text = f"{_WHO} refused to {action} (HTTP 403)"
     elif status == 404:
-        text = f"{_WHO} knows no such App installation (HTTP 404)"
+        text = f"{_WHO} knows no such App installation or repository (HTTP 404)"
     elif status == 422:
         text = (
             f"{_WHO} refused to {action} (HTTP 422); the installation must "
             "cover the repository and grant the contents permission"
         )
+    elif status == 429:
+        text = f"{_WHO} asked SRW to slow down (HTTP 429)"
+    elif status >= 500:
+        text = f"{_WHO} failed to {action} (a server error)"
     else:
-        text = f"{_WHO} refused to {action} (HTTP {status})"
-    return ProviderError(text + suffix, transient=status_transient(status))
+        text = f"{_WHO} refused to {action} (an HTTP 4xx answer)"
+    return ProviderError(text, transient=status_transient(status), reason="refused")
 
 
-async def mint_installation_token(
-    options: GitHubAppOptions,
-    private_key: str,
-    access: str,
+async def _call(
+    method: str,
+    url: str,
+    bearer: str,
     *,
-    now: int | None = None,
-) -> MintedToken:
-    """An installation token for the connector's repository at ``access``."""
-    try:
-        bearer = app_jwt(options.app_id, private_key, now=now)
-    except Exception:
-        raise ProviderError(
-            "the GitHub App private key cannot sign a JWT", transient=False
-        ) from None
-    url = (
-        f"{options.api_base}/app/installations/{options.installation_id}/access_tokens"
+    ca_pem: str | None,
+    allow_private: bool,
+    json_body: Any = None,
+) -> ProviderAnswer:
+    return await provider_request(
+        method,
+        url,
+        who=_WHO,
+        headers=_headers(bearer),
+        json_body=json_body,
+        ca_pem=ca_pem,
+        allow_private=allow_private,
     )
-    async with provider_client() as client:
-        try:
-            response = await client.post(
-                url,
-                json=access_token_request(options.repository, access),
-                headers=_headers(bearer),
-            )
-        except httpx.HTTPError as exc:
-            raise transport_error(exc, _WHO) from None
-        if response.status_code != 201:
-            raise _refusal(response, "mint an installation token")
-        try:
-            body = response.json()
-            token = str(body["token"])
-            expires_at = parse_time(body["expires_at"])
-        except (ValueError, KeyError, TypeError):
-            raise ProviderError(
-                f"{_WHO} answered an installation token SRW cannot read",
-                transient=True,
-            ) from None
-        wanted = installation_permissions(access)
-        if not token or not granted_as_asked(body.get("permissions"), wanted):
-            # More (or other) than the access level: never deliver it.
-            await _revoke(client, options.api_base, token)
-            raise ProviderError(
-                f"{_WHO} granted other permissions than SRW asked for "
-                f"({sorted(wanted.items())}); the token was revoked",
-                transient=False,
-            )
-    return MintedToken(token=token, expires_at=expires_at)
 
 
 def granted_as_asked(granted: Any, wanted: dict[str, str]) -> bool:
@@ -168,52 +148,142 @@ def granted_as_asked(granted: Any, wanted: dict[str, str]) -> bool:
     )
 
 
-async def _revoke(client: httpx.AsyncClient, api_base: str, token: str) -> None:
+def covers_only(repositories: Any, owner: str, name: str) -> bool:
+    """Whether GitHub's answer names exactly the connector's repository (by
+    ``full_name``, or ``owner.login`` and ``name``, case-insensitively)."""
+    if not isinstance(repositories, list) or len(repositories) != 1:
+        return False
+    found = repositories[0]
+    if not isinstance(found, dict):
+        return False
+    wanted = f"{owner}/{name}".lower()
+    full = found.get("full_name")
+    if isinstance(full, str):
+        return full.lower() == wanted
+    login = (
+        (found.get("owner") or {}).get("login")
+        if isinstance(found.get("owner"), dict)
+        else None
+    )
+    return (
+        isinstance(login, str)
+        and isinstance(found.get("name"), str)
+        and f"{login}/{found['name']}".lower() == wanted
+    )
+
+
+async def mint_installation_token(
+    options: GitHubAppOptions,
+    private_key: str,
+    access: str,
+    *,
+    ca_pem: str | None = None,
+    allow_private: bool = False,
+    now: int | None = None,
+) -> MintedToken:
+    """An installation token for the connector's repository at ``access``."""
+    try:
+        bearer = app_jwt(options.app_id, private_key, now=now)
+    except Exception:
+        raise ProviderError(
+            "the GitHub App private key cannot sign a JWT", transient=False
+        ) from None
+    answer = await _call(
+        "POST",
+        f"{options.api_base}/app/installations/{options.installation_id}/access_tokens",
+        bearer,
+        ca_pem=ca_pem,
+        allow_private=allow_private,
+        json_body=access_token_request(options.repository, access),
+    )
+    if answer.status != 201:
+        raise _refusal(answer, "mint an installation token")
+    try:
+        body = answer.json()
+        token = str(body["token"])
+        expires_at = parse_time(body["expires_at"])
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError, AttributeError):
+        raise failure("malformed", _WHO, transient=True) from None
+    wanted = installation_permissions(access)
+    if not token:
+        raise failure("malformed", _WHO, transient=True)
+    if not granted_as_asked(body.get("permissions"), wanted) or not covers_only(
+        body.get("repositories"), options.owner, options.repository
+    ):
+        # More, other permissions or other repositories than asked: never
+        # deliver it.
+        try:
+            await revoke_installation_token(
+                options.api_base, token, ca_pem=ca_pem, allow_private=allow_private
+            )
+        except ProviderError:
+            logger.warning("An over-broad installation token could not be revoked")
+        raise ProviderError(
+            f"{_WHO} granted other permissions or repositories than SRW asked "
+            f"for ({sorted(wanted.items())} on "
+            f"{options.owner}/{options.repository}); the token was revoked",
+            transient=False,
+            reason="overbroad",
+        )
+    return MintedToken(token=token, expires_at=expires_at)
+
+
+async def revoke_installation_token(
+    api_base: str,
+    token: str,
+    *,
+    ca_pem: str | None = None,
+    allow_private: bool = False,
+) -> None:
+    """``DELETE /installation/token`` with the token itself."""
     if not token:
         return
-    try:
-        response = await client.request(
-            "DELETE", f"{api_base}/installation/token", headers=_headers(token)
-        )
-    except httpx.HTTPError as exc:
-        raise transport_error(exc, _WHO) from None
+    answer = await _call(
+        "DELETE",
+        f"{api_base}/installation/token",
+        token,
+        ca_pem=ca_pem,
+        allow_private=allow_private,
+    )
     # 401: GitHub no longer accepts the token (revoked or expired).
-    if response.status_code in (204, 401):
+    if answer.status in (204, 401):
         return
-    raise _refusal(response, "revoke the installation token")
+    raise _refusal(answer, "revoke the installation token")
 
 
-async def revoke_installation_token(api_base: str, token: str) -> None:
-    """``DELETE /installation/token`` with the token itself."""
-    async with provider_client() as client:
-        await _revoke(client, api_base, token)
-
-
-async def repository_facts(options: GitHubAppOptions, token: str) -> dict[str, Any]:
+async def repository_facts(
+    options: GitHubAppOptions,
+    token: str,
+    *,
+    ca_pem: str | None = None,
+    allow_private: bool = False,
+) -> dict[str, Any]:
     """What a read token sees of the repository (Test)."""
-    url = f"{options.api_base}/repos/{options.owner}/{options.repository}"
-    async with provider_client() as client:
-        try:
-            response = await client.get(url, headers=_headers(token))
-        except httpx.HTTPError as exc:
-            raise transport_error(exc, _WHO) from None
-    if response.status_code != 200:
-        raise _refusal(response, "show the repository")
+    answer = await _call(
+        "GET",
+        f"{options.api_base}/repos/{options.owner}/{options.repository}",
+        token,
+        ca_pem=ca_pem,
+        allow_private=allow_private,
+    )
+    if answer.status != 200:
+        raise _refusal(answer, "show the repository")
     try:
-        body = response.json()
-    except ValueError:
+        body = answer.json()
+    except (ValueError, UnicodeDecodeError):
         body = {}
+    body = body if isinstance(body, dict) else {}
     return {
         "repository": f"{options.owner}/{options.repository}",
-        "default_branch": body.get("default_branch")
-        if isinstance(body, dict)
-        else None,
-        "private": body.get("private") if isinstance(body, dict) else None,
+        "default_branch": body.get("default_branch"),
+        "private": body.get("private"),
     }
 
 
 __all__ = [
     "app_jwt",
+    "covers_only",
+    "granted_as_asked",
     "mint_installation_token",
     "normalize_private_key",
     "repository_facts",

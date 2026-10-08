@@ -1914,6 +1914,13 @@ spec:
             - name: CONNECTOR_DRIVER_RESOLVE_TIMEOUT_SECONDS
               value: {{ .resolveTimeoutSeconds | quote }}
             {{- end }}
+            # Credentials SRW mints at a provider (connector drivers C5).
+            {{- with (.Values.connectors.providerMinting | default dict) }}
+            - name: CONNECTOR_PROVIDER_MINTING_ENABLED
+              value: {{ (hasKey . "enabled" | ternary .enabled true) | quote }}
+            - name: CONNECTOR_PROVIDER_MINTING_PRIVATE_HOSTS
+              value: {{ join "," (.privateHosts | default list) | quote }}
+            {{- end }}
             # Service-plane driver hosting (connector drivers D5).
             {{- with .Values.connectors.servicePods }}
             - name: CONNECTOR_SERVICE_PODS_ENABLED

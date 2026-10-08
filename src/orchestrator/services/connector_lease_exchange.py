@@ -395,18 +395,21 @@ class ConnectorLeaseExchange:
                 path=EXCHANGE_PATH,
                 request=request,
             )
-        return ExchangeOutcome(
-            200,
-            {
-                "credential": str(upstream.get("credential") or ""),
-                "expires_at": counted["expires_at"].isoformat(),
-                "access": str(counted["access"]),
-                "allowed_upstream": [
-                    str(item) for item in upstream.get("allowed_upstream") or ()
-                ],
-                "max_cache_seconds": MAX_CACHE_SECONDS,
-            },
-        )
+        answer: dict[str, Any] = {
+            "credential": str(upstream.get("credential") or ""),
+            "expires_at": counted["expires_at"].isoformat(),
+            "access": str(counted["access"]),
+            "allowed_upstream": [
+                str(item) for item in upstream.get("allowed_upstream") or ()
+            ],
+            "max_cache_seconds": MAX_CACHE_SECONDS,
+        }
+        if upstream.get("username"):
+            # The name the credential is presented upstream with, where the
+            # driver's protocol has one (git over HTTPS): GitHub's for an
+            # installation token, the forge default for a static one.
+            answer["username"] = str(upstream["username"])
+        return ExchangeOutcome(200, answer)
 
     async def introspect(
         self, *, identity_token: str, lease_token: str, request: Any = None
