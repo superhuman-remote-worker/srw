@@ -21,7 +21,10 @@ agents never see connectors you didn't attach.
 - **OKF Knowledge Base** — centrally indexed Markdown knowledge the agent can
   search and read.
 - **Credential files** — kubeconfig, SSH key, or a generic file the agent
-  needs to reach some other system.
+  needs to reach some other system, delivered to a sandbox or VM workspace.
+  A kubeconfig or generic file lands at its path under the workspace home
+  (kubeconfigs are merged into `~/.kube/config`, so `kubectl` works as is);
+  an SSH key is held by an ssh-agent and never written to disk.
 - **Credentials** — named environment variables for API keys or website
   logins, delivered to a sandbox or VM workspace. Scripts read them from the
   environment; browser forms use `browser_type(ref=..., env_var="NAME")`.

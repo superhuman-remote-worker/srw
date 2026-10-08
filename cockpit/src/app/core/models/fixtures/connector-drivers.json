@@ -1345,12 +1345,10 @@
         "credential_file"
       ],
       "supported_backends": [
-        "none",
         "sandbox",
-        "virtual",
         "vm"
       ],
-      "workspace_requirements": "None today: the files land on the agent pod, for worker jobs only.",
+      "workspace_requirements": "A shell workspace: each file is written under the home's private credential store over a secret channel, with its mode, and linked at its target path; kubeconfigs are merged for kubectl.",
       "tool_category": null,
       "operations": [],
       "access_levels": [
@@ -1444,7 +1442,7 @@
         }
       },
       "publishable": true,
-      "live_attach": false,
+      "live_attach": true,
       "live_detach": "immediate",
       "delete_while_attached": true,
       "max_per_execution": null,
@@ -1606,12 +1604,10 @@
         "credential_file"
       ],
       "supported_backends": [
-        "none",
         "sandbox",
-        "virtual",
         "vm"
       ],
-      "workspace_requirements": "None today: the files land on the agent pod, for worker jobs only.",
+      "workspace_requirements": "A shell workspace: each file is written under the home's private credential store over a secret channel, with its mode, and linked at its target path; kubeconfigs are merged for kubectl.",
       "tool_category": null,
       "operations": [],
       "access_levels": [
@@ -1705,7 +1701,7 @@
         }
       },
       "publishable": true,
-      "live_attach": false,
+      "live_attach": true,
       "live_detach": "immediate",
       "delete_while_attached": true,
       "max_per_execution": null,

@@ -585,11 +585,12 @@ def _credential_file(
             ),
         ),
         access_levels=_declared_only(file_word),
-        supported_backends=ALL_BACKENDS,
+        supported_backends=SHELL_BACKENDS,
         workspace_requirements=(
-            "None today: the files land on the agent pod, for worker jobs only."
+            "A shell workspace: each file is written under the home's private "
+            "credential store over a secret channel, with its mode, and linked "
+            "at its target path; kubeconfigs are merged for kubectl."
         ),
-        live_attach=False,
         holds_upstream_credentials=True,
     )
 

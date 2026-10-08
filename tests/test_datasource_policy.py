@@ -122,7 +122,9 @@ async def test_credentials_require_shell_workspace(backend):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ["none", "virtual"])
-@pytest.mark.parametrize("ds_type", ["generic", "ssh_key"])
+@pytest.mark.parametrize(
+    "ds_type", ["generic", "ssh_key", "kubeconfig", "generic_file"]
+)
 async def test_every_driver_needing_a_shell_is_refused_on_a_lite_tier(backend, ds_type):
     """The lite-tier rule is the drivers' supported_backends, not a type list:
     a generic environment used to pass admission and fail at setup."""
@@ -140,12 +142,14 @@ async def test_every_driver_needing_a_shell_is_refused_on_a_lite_tier(backend, d
         ("credentials", "none", True),
         ("generic", "virtual", True),
         ("ssh_key", "none", True),
+        # Credential files land in the workspace home (D1d).
+        ("kubeconfig", "virtual", True),
+        ("generic_file", "none", True),
         ("repository", "VIRTUAL", True),
         # Types match exactly, like the driver registry.
         ("Repository", "virtual", False),
         ("kb", "virtual", False),
         ("postgresql", "none", False),
-        ("kubeconfig", "virtual", False),
         ("email", "virtual", False),
         ("unknown-type", "virtual", False),
         ("repository", "sandbox", False),

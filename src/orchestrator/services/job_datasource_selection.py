@@ -87,8 +87,9 @@ class JobDatasourceSelectionDependencies:
 def shell_connector_names(datasources: Any, workspace_backend: str | None) -> list[str]:
     """Names of the connectors ``workspace_backend`` cannot serve.
 
-    Repositories need a clone target, and credential and generic environments
-    and SSH keys need a shell; the lite tiers provide neither (§4/§7). The rule
+    Repositories need a clone target, and credential and generic
+    environments, SSH keys and credential files need a shell; the lite tiers
+    provide neither (§4/§7). The rule
     is the drivers' ``supported_backends`` (``workspace_tier_refuses``).
     Returns a (possibly empty) list of human-readable names for the error.
     """

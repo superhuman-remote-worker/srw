@@ -1,9 +1,11 @@
 """Validation and normalization of credentials.files[] for credential-file datasource types.
 
 For ``kubeconfig``, ``ssh_key``, and ``generic_file`` datasources the credentials
-dict carries a list of file payloads that get materialized as files on the agent's
-filesystem at job start (see ``src/agent/connectors/files.py``). This module is the
-single source of truth for:
+dict carries a list of file payloads. A kubeconfig's or generic file's land in the
+workspace the shell runs in, at the same path under its home (see
+``src/agent/connectors/files.py``, which refuses a target outside ``/home/srw``);
+an ssh_key's private key is loaded into a workspace ssh-agent instead. This module
+is the single source of truth for:
 
 - per-file size cap (64 KB) and per-datasource count cap (5)
 - ``target_path`` resolution (``~`` expansion against ``/home/srw``) and safety

@@ -438,4 +438,13 @@ def test_the_cockpit_picker_refuses_what_the_server_refuses_on_lite_tiers():
             for backend in LITE_WORKSPACE_BACKENDS
         )
     }
-    assert cockpit == server == {"repository", "credentials", "generic", "ssh_key"}
+    # Credential files joined the shell drivers in D1d.
+    needs_shell = {
+        "repository",
+        "credentials",
+        "generic",
+        "ssh_key",
+        "kubeconfig",
+        "generic_file",
+    }
+    assert cockpit == server == needs_shell

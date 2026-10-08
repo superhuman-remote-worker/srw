@@ -143,10 +143,18 @@ describe('datasources-group selection logic', () => {
   });
 
   it('requiresShellWorkspace matches the drivers that need a shell', () => {
-    for (const type of ['repository', 'credentials', 'generic', 'ssh_key', 'Generic']) {
+    for (const type of [
+      'repository',
+      'credentials',
+      'generic',
+      'ssh_key',
+      'Generic',
+      'kubeconfig',
+      'generic_file',
+    ]) {
       expect(requiresShellWorkspace(type)).toBe(true);
     }
-    for (const type of ['kb', 'postgresql', 'email', 'mcp', 'kubeconfig', 'generic_file']) {
+    for (const type of ['kb', 'postgresql', 'email', 'mcp']) {
       expect(requiresShellWorkspace(type)).toBe(false);
     }
   });

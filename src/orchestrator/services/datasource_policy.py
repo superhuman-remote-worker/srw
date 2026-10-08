@@ -95,8 +95,8 @@ def workspace_tier_refuses(
 
     The connector's driver names the workspace backends it works with
     (``spec.supported_backends``): repositories, credential and generic
-    environments and SSH keys need a shell, which the lite tiers (virtual,
-    none) do not have. Only a lite tier is ever refused here; the attach-time
+    environments, SSH keys and credential files need a shell, which the lite
+    tiers (virtual, none) do not have. Only a lite tier is ever refused here; the attach-time
     revalidation passes no backend at all. The one rule behind create-time
     authorization, implicit-default filtering and dispatch.
     """

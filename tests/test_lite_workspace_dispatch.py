@@ -215,8 +215,9 @@ class TestShellConnectorNames:
 
     @pytest.mark.parametrize("backend", ["virtual", "none"])
     def test_every_driver_needing_a_shell_is_named(self, backend):
-        # The drivers' supported_backends: generic environments and SSH keys
-        # need a shell too, which a lite tier cannot give them.
+        # The drivers' supported_backends: generic environments, SSH keys and
+        # credential files (in the workspace home since D1d) need a shell
+        # too, which a lite tier cannot give them.
         ds = [
             {"type": "generic", "name": "env"},
             {"type": "ssh_key", "name": "key"},
@@ -227,6 +228,7 @@ class TestShellConnectorNames:
         assert job_datasource_selection_module.shell_connector_names(ds, backend) == [
             "env",
             "key",
+            "cluster",
         ]
 
     @pytest.mark.parametrize("backend", ["sandbox", "vm", "remote", None])

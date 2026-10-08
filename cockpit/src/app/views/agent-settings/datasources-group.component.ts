@@ -35,7 +35,14 @@ const LITE_BACKENDS: readonly string[] = ['virtual', 'none'];
 
 /** The built-in drivers that need a shell workspace: a copy of the server's
  *  `workspace_tier_refuses`, used only until the capability matrix loads. */
-const SHELL_WORKSPACE_TYPES = new Set(['repository', 'credentials', 'generic', 'ssh_key']);
+const SHELL_WORKSPACE_TYPES = new Set([
+  'repository',
+  'credentials',
+  'generic',
+  'ssh_key',
+  'kubeconfig',
+  'generic_file',
+]);
 
 /** Whether a connector type needs a shell workspace: its driver's
  *  `supported_backends` leaves a lite tier out. The picker knows only that the
