@@ -88,6 +88,34 @@ source_modules = ["shared.connectors"]
 forbidden_modules = ["fastapi", "httpx", "jsonschema", "pydantic", "starlette", "yaml"]
 
 [[tool.importlinter.contracts]]
+name = "Only the connector drivers use their internal rules"
+type = "forbidden"
+# These modules branch on the calling driver's own type
+# (policy/connector_type_branches.txt classifies them driver-internal), so
+# only the driver package may import them. Other code asks the drivers, or
+# imports the few names connector_drivers.workspace_ssh re-exports.
+# Import Linter skips a source that contains a forbidden module, so the
+# orchestrator is named by its children (and the two parents' children).
+source_modules = [
+  "agent",
+  "mcp_server",
+  "vm_controller",
+  "shared",
+  "orchestrator.*",
+  "orchestrator.services.*",
+  "orchestrator.security.*",
+]
+forbidden_modules = [
+  "orchestrator.services.workspace_ssh_connector",
+  "orchestrator.security.credential_files",
+]
+ignore_imports = [
+  "orchestrator.services.connector_drivers.** -> orchestrator.services.workspace_ssh_connector",
+  "orchestrator.services.connector_drivers.** -> orchestrator.security.credential_files",
+]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
 name = "Generic manifest operations do not load application startup or the legacy harness"
 type = "forbidden"
 source_modules = ["orchestrator.routers.manifests", "orchestrator.schemas.manifests", "orchestrator.services.manifests"]

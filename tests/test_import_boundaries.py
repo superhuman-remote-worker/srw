@@ -22,7 +22,9 @@ def boundary_tree(tmp_path):
         "orchestrator/operator_cli",
         "orchestrator/routers",
         "orchestrator/schemas",
+        "orchestrator/security",
         "orchestrator/services",
+        "orchestrator/services/connector_drivers",
         "mcp_server",
         "vm_controller",
         "shared",
@@ -74,6 +76,17 @@ def boundary_tree(tmp_path):
         ),
         "mcp_server/app.py": "from shared.contracts.item import VALUE\n",
         "vm_controller/app.py": "from shared.value import VALUE\n",
+        # D1c: the drivers' internal rules, imported only by the drivers.
+        "orchestrator/services/workspace_ssh_connector.py": (
+            "from shared.value import VALUE\n"
+        ),
+        "orchestrator/security/credential_files.py": "from shared.value import VALUE\n",
+        "orchestrator/services/connector_drivers/workspace_ssh.py": (
+            "from orchestrator.services.workspace_ssh_connector import VALUE\n"
+        ),
+        "orchestrator/services/connector_drivers/credential_files.py": (
+            "from orchestrator.security.credential_files import VALUE\n"
+        ),
     }.items():
         (tmp_path / "src" / module).write_text(body)
     # New extraction boundaries declare their source modules in the manifest.
@@ -127,8 +140,34 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     # 28 since R1.B12 closed the entrypoint and the composition boundary;
     # 29 since R3.2 fenced the session client transport off the runtime;
     # 30 since R3.3a fenced the session input owner off the runtime and loop;
-    # 32 since D1a kept the connector driver contract on the standard library.
-    assert "Contracts: 32 kept, 0 broken" in result.stdout
+    # 32 since D1a kept the connector driver contract on the standard library;
+    # 33 since D1c kept the drivers' internal rules to the drivers.
+    assert "Contracts: 33 kept, 0 broken" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        (
+            "orchestrator/services/datasources.py",
+            "orchestrator.services.workspace_ssh_connector",
+        ),
+        (
+            "orchestrator/application/settings.py",
+            "orchestrator.services.workspace_ssh_connector",
+        ),
+        ("orchestrator/services/projects.py", "orchestrator.security.credential_files"),
+        ("agent/core/setup.py", "orchestrator.security.credential_files"),
+    ],
+)
+def test_only_the_drivers_import_their_internal_rules(boundary_tree, source, target):
+    path = boundary_tree / "src" / source
+    path.parent.mkdir(parents=True, exist_ok=True)
+    (path.parent / "__init__.py").touch()
+    path.write_text(f"import {target}\n")
+    result = lint_boundaries(boundary_tree)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "Only the connector drivers use their internal rules BROKEN" in result.stdout
 
 
 def test_connector_contract_rejects_a_framework_import(boundary_tree):

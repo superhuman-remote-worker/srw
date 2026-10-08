@@ -39,7 +39,7 @@ from orchestrator.services.connector_drivers.base import (
     SupportsWorkspaceSshIdentity,
     payload_entry,
 )
-from orchestrator.services.workspace_ssh_connector import (
+from orchestrator.services.connector_drivers.workspace_ssh import (
     WorkspaceSshConnectorError,
 )
 from shared.datasource_policy import datasource_tool_categories

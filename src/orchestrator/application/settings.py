@@ -15,7 +15,7 @@ import logging
 import os
 from dataclasses import dataclass
 
-from orchestrator.services.workspace_ssh_connector import (
+from orchestrator.services.connector_drivers.workspace_ssh import (
     WORKSPACE_SSH_KNOWN_HOSTS_ENV,
 )
 from shared.run_queue import LANE_PINNED, LANE_STATELESS

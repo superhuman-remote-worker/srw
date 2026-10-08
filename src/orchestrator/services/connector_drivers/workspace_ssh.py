@@ -28,6 +28,7 @@ from orchestrator.services.connector_drivers.base import (
 )
 from orchestrator.services.datasource_config import stored_json_object
 from orchestrator.services.workspace_ssh_connector import (
+    WORKSPACE_SSH_KNOWN_HOSTS_ENV,
     WorkspaceSshConnectorError,
     WorkspaceSshIdentity,
     apply_ssh_test_overrides,
@@ -35,6 +36,15 @@ from orchestrator.services.workspace_ssh_connector import (
     workspace_ssh_descriptor,
     workspace_ssh_identity,
 )
+
+
+#: What code outside the drivers may use of the shared SSH rules: import-linter
+#: keeps everything but the driver package out of ``workspace_ssh_connector``.
+__all__ = [
+    "WORKSPACE_SSH_KNOWN_HOSTS_ENV",
+    "WorkspaceSshConnectorError",
+    "WorkspaceSshDriver",
+]
 
 
 class WorkspaceSshDriver(DatasourceDriver):
