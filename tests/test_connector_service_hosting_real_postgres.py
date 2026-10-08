@@ -433,7 +433,9 @@ async def test_a_refusal_audit_survives_the_callers_rollback(db, registry):
 
 
 @pytest.mark.asyncio
-async def test_a_slow_registry_costs_a_bind_its_cap_and_is_remembered(db, registry):
+async def test_a_slow_registry_costs_a_bind_its_cap_and_is_remembered_briefly(
+    db, registry, monkeypatch
+):
     calls: list[str] = []
 
     class Slow:
@@ -456,8 +458,45 @@ async def test_a_slow_registry_costs_a_bind_its_cap_and_is_remembered(db, regist
         with pytest.raises(images.ServiceImageUnavailable):
             await _bind(db, connector, await _thread(db))
         assert time.monotonic() - started < 5
-    # The failure is remembered for the window: the registry was asked once.
+    # The capped failure spares the next bind the wait: asked once.
     assert len(calls) == 1
+    # Only briefly, never for the whole window: a later bind asks again.
+    monkeypatch.setattr(images, "BRIEF_FAILURE_SECONDS", 0.05)
+    images.configure_service_images(images.service_image_settings())
+    with pytest.raises(images.ServiceImageUnavailable):
+        await _bind(db, connector, await _thread(db))
+    await asyncio.sleep(0.1)
+    with pytest.raises(images.ServiceImageUnavailable):
+        await _bind(db, connector, await _thread(db))
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_rr_hung_registry_bind_reuses_the_last_digest(db, registry):
+    """Registry unreachable (hangs): a bind with no prepared decision reuses
+    the digest it resolved before (the module docstring's promise). The
+    lookup gets less than the bind's cap, so the fallback read fits in it."""
+    connector = await _connector(db)
+    registry.push(D1, _label())
+    await images.resolve_driver_image(db, driver=DRIVER, reference=REFERENCE)
+
+    class Hung:
+        async def resolve_image(self, image):
+            await asyncio.sleep(30)
+
+    images.configure_service_images(
+        images.ServiceImageSettings(
+            references={DRIVER: REFERENCE},
+            resolver=Hung(),
+            cache_seconds=60,
+            bind_timeout_seconds=0.5,
+            store=db,
+        )
+    )
+    started = time.monotonic()
+    lease = await _bind(db, connector, await _thread(db))
+    assert time.monotonic() - started < 2
+    assert await _lease_digest(db, lease.id) == D1
 
 
 @pytest.mark.asyncio

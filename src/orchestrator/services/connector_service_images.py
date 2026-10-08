@@ -66,6 +66,14 @@ DEFAULT_TIMEOUT_SECONDS = 10.0
 #: The longest a bind waits on a registry it has no answer for: a bind may
 #: run inside its caller's transaction and under its locks.
 DEFAULT_BIND_TIMEOUT_SECONDS = 2.0
+#: Of a bind's cap, what the registry lookup leaves for the fallback to the
+#: last resolved digest (a read) and the moved-tag check: at most this much,
+#: at most half the cap.
+BIND_FALLBACK_SECONDS = 0.5
+#: How long a lookup that failed under a bind's short cap is remembered. A
+#: full-deadline failure is remembered for the cache window; a capped one
+#: only spares the next binds the same wait.
+BRIEF_FAILURE_SECONDS = 5.0
 #: The most schema errors a refusal lists.
 _MAX_CONFIG_ERRORS = 3
 
@@ -290,6 +298,8 @@ async def resolve_driver_image(
     parsed = ImageReference.parse(reference)
     key = (driver, reference)
     window = max(0.0, settings.cache_seconds)
+    deadline = timeout or settings.timeout_seconds
+    capped = deadline < settings.timeout_seconds
     cached = _cache.get(key)
     now = clock()
     if cached is not None and cached[0] > now:
@@ -303,7 +313,7 @@ async def resolve_driver_image(
         try:
             resolved = await asyncio.wait_for(
                 settings.resolver.resolve_image(parsed.lookup()),
-                timeout=timeout or settings.timeout_seconds,
+                timeout=deadline,
             )
         except (TimeoutError, asyncio.TimeoutError):
             problem = "the registry did not answer in time"
@@ -324,7 +334,10 @@ async def resolve_driver_image(
             else "",
         )
         if last is None:
-            _cache[key] = (now + window, _Failure())
+            # A lookup cut short by a bind's cap proves less than one that
+            # had its whole deadline: remember it only briefly.
+            failure_window = min(window, BRIEF_FAILURE_SECONDS) if capped else window
+            _cache[key] = (now + failure_window, _Failure())
             raise ServiceImageUnavailable(_unavailable(driver))
         return last
     try:
@@ -526,10 +539,12 @@ def _remember(
     key: tuple[str, str, str],
     decision: _Decision,
     *,
+    window: float | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> None:
-    window = max(0.0, service_image_settings().cache_seconds)
-    _decisions[key] = (clock() + window, decision)
+    full = max(0.0, service_image_settings().cache_seconds)
+    held = full if window is None else min(full, window)
+    _decisions[key] = (clock() + held, decision)
 
 
 def _recalled(
@@ -639,6 +654,9 @@ async def bind_service_image(
         if settings.store is None:
             raise ServiceImageUnavailable(_unavailable(spec.name))
         cap = settings.bind_timeout_seconds
+        # The lookup gets less than the cap, so a registry that hangs still
+        # leaves time to fall back to the last digest this reference resolved.
+        lookup = cap - min(BIND_FALLBACK_SECONDS, cap / 2)
         try:
             decision = await _apart(
                 lambda: _decide(
@@ -647,13 +665,18 @@ async def bind_service_image(
                     reference=reference,
                     connector_id=connector_id,
                     owner=owner,
-                    timeout=cap,
+                    timeout=lookup,
                 ),
                 timeout=cap,
             )
         except (TimeoutError, asyncio.TimeoutError):
             decision = _Decision(unavailable=_unavailable(spec.name))
-        _remember(key, decision)
+        if decision.unavailable is None:
+            _remember(key, decision)
+        else:
+            # Decided under the bind's short cap: spare the next binds the
+            # same wait, briefly; a prepared decision is remembered in full.
+            _remember(key, decision, window=BRIEF_FAILURE_SECONDS)
     if decision.refusal is not None:
         raise ServiceImageRefused(decision.refusal)
     if decision.digest is None:
