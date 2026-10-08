@@ -541,7 +541,7 @@ def test_knowledge_bindings_skip_a_connector_that_is_no_knowledge_base():
                 "datasource_id": "00000000-0000-0000-0000-0000000000d8",
             },
             {
-                "type": "KB",
+                "type": "kb",
                 "name": "Docs",
                 "datasource_id": "00000000-0000-0000-0000-0000000000d9",
             },

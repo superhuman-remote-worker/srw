@@ -7,7 +7,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable, Literal, Optional
 
-from shared.connectors.builtin import spec_for_type
+from shared.connectors.builtin import delivers_in
 from shared.native_kb import (
     NATIVE_PROJECT_CONFIG_KEY as NATIVE_PROJECT_CONFIG_KEY,
     native_kb_project_id as native_kb_project_id,
@@ -114,8 +114,7 @@ def build_knowledge_bindings(
         tuple[str, uuid.UUID, str, dict[str, Any], dict[str, Any]]
     ] = []
     for datasource in datasources:
-        spec = spec_for_type(str(datasource.get("type") or "").lower())
-        if spec is None or "knowledge_index" not in spec.delivery_forms:
+        if not delivers_in(datasource, "knowledge_index"):
             continue
         raw_id = datasource.get("datasource_id") or datasource.get("id")
         native_project = native_kb_project_id(datasource)
