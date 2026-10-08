@@ -26705,6 +26705,52 @@ COMMENT ON COLUMN public.config_overrides.kind IS 'Resolver subsection (MatrixRe
 
 
 --
+-- Name: connector_bind_time_bindings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.connector_bind_time_bindings (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    owner_kind text NOT NULL,
+    owner_id uuid NOT NULL,
+    connector_id uuid NOT NULL,
+    registration_id uuid,
+    driver text NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    image_reference text,
+    image_digest text,
+    resolved_at timestamp with time zone,
+    spec_hash text,
+    protocol_version text,
+    access text,
+    delivery_ciphertext text,
+    driver_state_ciphertext text,
+    error_class text,
+    error_message text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    bound_at timestamp with time zone,
+    failed_at timestamp with time zone,
+    revoke_requested_at timestamp with time zone,
+    revoke_reason text,
+    revoked_at timestamp with time zone,
+    revoke_error text,
+    CONSTRAINT connector_bind_time_bindings_bound_check CHECK (((status <> ALL (ARRAY['bound'::text, 'revoking'::text])) OR ((delivery_ciphertext IS NOT NULL) AND (image_digest IS NOT NULL) AND (bound_at IS NOT NULL)))),
+    CONSTRAINT connector_bind_time_bindings_digest_check CHECK (((image_digest IS NULL) OR (image_digest ~ '^sha256:[0-9a-f]{64}$'::text))),
+    CONSTRAINT connector_bind_time_bindings_driver_check CHECK ((driver <> ''::text)),
+    CONSTRAINT connector_bind_time_bindings_failed_check CHECK ((((status = 'failed'::text) = (failed_at IS NOT NULL)) AND ((status <> 'failed'::text) OR (error_message IS NOT NULL)))),
+    CONSTRAINT connector_bind_time_bindings_owner_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text]))),
+    CONSTRAINT connector_bind_time_bindings_revoke_check CHECK ((((status = ANY (ARRAY['revoking'::text, 'revoked'::text])) = (revoke_requested_at IS NOT NULL)) AND ((status = 'revoked'::text) = (revoked_at IS NOT NULL)))),
+    CONSTRAINT connector_bind_time_bindings_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'bound'::text, 'failed'::text, 'revoking'::text, 'revoked'::text])))
+);
+
+
+--
+-- Name: TABLE connector_bind_time_bindings; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.connector_bind_time_bindings IS 'Bind-time image driver bindings (D6): what one bind recorded and delivered (encrypted), and its revocation. Owner and connector are plain ids so a revoke can run after either is gone.';
+
+
+--
 -- Name: connector_credential_leases; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -26744,6 +26790,24 @@ CREATE TABLE public.connector_credential_leases (
 --
 
 COMMENT ON TABLE public.connector_credential_leases IS 'Connector credential leases (scl_ tokens). token_hash is the lookup key; token_ciphertext lets SRW deliver the same token again. Renewed only by the server-side sweeper while the owning execution is live.';
+
+
+--
+-- Name: connector_driver_assignments; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.connector_driver_assignments (
+    connector_id uuid NOT NULL,
+    registration_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE connector_driver_assignments; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.connector_driver_assignments IS 'The registration a connector of a registered image driver runs, pinned by id when the connector is created. The API refuses to delete a registration a connector uses; a user or project delete cascades, and the connector then refuses to bind.';
 
 
 --
@@ -26858,6 +26922,90 @@ CREATE TABLE public.connector_driver_images (
 --
 
 COMMENT ON TABLE public.connector_driver_images IS 'Connector driver image resolutions: one row per (driver, reference, digest) with the image entrypoint, command and spec label. Written at bind; read by the service-pod launch and the moved-tag check.';
+
+
+--
+-- Name: connector_driver_operations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.connector_driver_operations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    token_hash bytea NOT NULL,
+    token_last_four text NOT NULL,
+    operation text NOT NULL,
+    registration_id uuid,
+    connector_id uuid,
+    binding_id uuid,
+    image_reference text NOT NULL,
+    image_digest text NOT NULL,
+    pod_namespace text NOT NULL,
+    pod_name text NOT NULL,
+    status text DEFAULT 'running'::text NOT NULL,
+    deadline_at timestamp with time zone NOT NULL,
+    exit_code integer,
+    outcome_ciphertext text,
+    error text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    finished_at timestamp with time zone,
+    removed_at timestamp with time zone,
+    CONSTRAINT connector_driver_operations_digest_check CHECK ((image_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT connector_driver_operations_finished_check CHECK (((status = 'running'::text) = (finished_at IS NULL))),
+    CONSTRAINT connector_driver_operations_hash_check CHECK ((octet_length(token_hash) = 32)),
+    CONSTRAINT connector_driver_operations_last_four_check CHECK ((char_length(token_last_four) = 4)),
+    CONSTRAINT connector_driver_operations_operation_check CHECK ((operation = ANY (ARRAY['spec'::text, 'check'::text, 'bind'::text, 'revoke'::text, 'gc'::text]))),
+    CONSTRAINT connector_driver_operations_status_check CHECK ((status = ANY (ARRAY['running'::text, 'finished'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: TABLE connector_driver_operations; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.connector_driver_operations IS 'Short-lived connector driver pods (D6), one per operation: the pod''s sdi_ identity (SHA-256 only), the outcome its shim posted (encrypted) and its lifecycle.';
+
+
+--
+-- Name: connector_driver_registrations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.connector_driver_registrations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    name text NOT NULL,
+    scope_kind text NOT NULL,
+    owner_id uuid,
+    project_id uuid,
+    title text NOT NULL,
+    description text,
+    image_reference text NOT NULL,
+    image_digest text NOT NULL,
+    spec jsonb NOT NULL,
+    spec_hash text NOT NULL,
+    spec_source text NOT NULL,
+    protocol_version text NOT NULL,
+    plane text NOT NULL,
+    source_document jsonb,
+    created_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT connector_driver_registrations_digest_check CHECK ((image_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT connector_driver_registrations_name_check CHECK (((name ~ '^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)+/v[1-9][0-9]*$'::text) AND (name !~~ 'srw.%'::text))),
+    CONSTRAINT connector_driver_registrations_plane_check CHECK ((plane = ANY (ARRAY['bind_time'::text, 'service'::text, 'in_pod'::text]))),
+    CONSTRAINT connector_driver_registrations_protocol_check CHECK ((protocol_version ~ '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'::text)),
+    CONSTRAINT connector_driver_registrations_reference_check CHECK (((image_reference <> ''::text) AND (char_length(image_reference) <= 512))),
+    CONSTRAINT connector_driver_registrations_scope_check CHECK ((((scope_kind = 'Account'::text) AND (owner_id IS NOT NULL) AND (project_id IS NULL)) OR ((scope_kind = 'Project'::text) AND (project_id IS NOT NULL) AND (owner_id IS NULL)) OR ((scope_kind = 'Catalog'::text) AND (owner_id IS NULL) AND (project_id IS NULL)))),
+    CONSTRAINT connector_driver_registrations_source_check CHECK (((source_document IS NULL) OR (jsonb_typeof(source_document) = 'object'::text))),
+    CONSTRAINT connector_driver_registrations_spec_check CHECK ((jsonb_typeof(spec) = 'object'::text)),
+    CONSTRAINT connector_driver_registrations_spec_hash_check CHECK ((spec_hash ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT connector_driver_registrations_spec_source_check CHECK ((spec_source = ANY (ARRAY['label'::text, 'spec_operation'::text, 'server_json'::text]))),
+    CONSTRAINT connector_driver_registrations_title_check CHECK (((title <> ''::text) AND (char_length(title) <= 200)))
+);
+
+
+--
+-- Name: TABLE connector_driver_registrations; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.connector_driver_registrations IS 'Registered connector driver images (D6): one name per Account, Project or the shared Catalog, the spec the image declared and the digest its reference resolved to at registration. srw.* names are SRW''s own.';
 
 
 --
@@ -33722,6 +33870,14 @@ ALTER TABLE ONLY public.compute_shadow_observations
 
 
 --
+-- Name: connector_bind_time_bindings connector_bind_time_bindings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_bind_time_bindings
+    ADD CONSTRAINT connector_bind_time_bindings_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: connector_credential_leases connector_credential_leases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -33735,6 +33891,14 @@ ALTER TABLE ONLY public.connector_credential_leases
 
 ALTER TABLE ONLY public.connector_credential_leases
     ADD CONSTRAINT connector_credential_leases_token_hash_key UNIQUE (token_hash);
+
+
+--
+-- Name: connector_driver_assignments connector_driver_assignments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_assignments
+    ADD CONSTRAINT connector_driver_assignments_pkey PRIMARY KEY (connector_id);
 
 
 --
@@ -33767,6 +33931,30 @@ ALTER TABLE ONLY public.connector_driver_images
 
 ALTER TABLE ONLY public.connector_driver_images
     ADD CONSTRAINT connector_driver_images_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: connector_driver_operations connector_driver_operations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_operations
+    ADD CONSTRAINT connector_driver_operations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: connector_driver_operations connector_driver_operations_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_operations
+    ADD CONSTRAINT connector_driver_operations_token_hash_key UNIQUE (token_hash);
+
+
+--
+-- Name: connector_driver_registrations connector_driver_registrations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_registrations
+    ADD CONSTRAINT connector_driver_registrations_pkey PRIMARY KEY (id);
 
 
 --
@@ -36886,6 +37074,20 @@ CREATE INDEX idx_config_override_lookup ON public.config_overrides USING btree (
 
 
 --
+-- Name: idx_connector_bind_time_bindings_connector; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_bind_time_bindings_connector ON public.connector_bind_time_bindings USING btree (connector_id, created_at DESC);
+
+
+--
+-- Name: idx_connector_bind_time_bindings_open; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_bind_time_bindings_open ON public.connector_bind_time_bindings USING btree (status) WHERE (status = ANY (ARRAY['pending'::text, 'bound'::text, 'revoking'::text]));
+
+
+--
 -- Name: idx_connector_credential_leases_connector; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -36914,6 +37116,13 @@ CREATE INDEX idx_connector_credential_leases_thread ON public.connector_credenti
 
 
 --
+-- Name: idx_connector_driver_assignments_registration; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_driver_assignments_registration ON public.connector_driver_assignments USING btree (registration_id);
+
+
+--
 -- Name: idx_connector_driver_identities_connector; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -36939,6 +37148,20 @@ CREATE INDEX idx_connector_driver_images_digest ON public.connector_driver_image
 --
 
 CREATE INDEX idx_connector_driver_images_latest ON public.connector_driver_images USING btree (driver, reference, resolved_at DESC);
+
+
+--
+-- Name: idx_connector_driver_operations_binding; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_driver_operations_binding ON public.connector_driver_operations USING btree (binding_id) WHERE (binding_id IS NOT NULL);
+
+
+--
+-- Name: idx_connector_driver_operations_live; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_driver_operations_live ON public.connector_driver_operations USING btree (created_at) WHERE (removed_at IS NULL);
 
 
 --
@@ -38454,6 +38677,13 @@ CREATE UNIQUE INDEX uq_config_override ON public.config_overrides USING btree (C
 
 
 --
+-- Name: uq_connector_bind_time_bindings_live; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_connector_bind_time_bindings_live ON public.connector_bind_time_bindings USING btree (owner_kind, owner_id, connector_id) WHERE (status = ANY (ARRAY['pending'::text, 'bound'::text]));
+
+
+--
 -- Name: uq_connector_credential_leases_live_job; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -38472,6 +38702,27 @@ CREATE UNIQUE INDEX uq_connector_credential_leases_live_thread ON public.connect
 --
 
 CREATE UNIQUE INDEX uq_connector_driver_identities_serving_key ON public.connector_driver_identities USING btree (connector_id, image_digest, credential_generation) WHERE ((revoked_at IS NULL) AND (credential_generation IS NOT NULL) AND (replaced_at IS NULL));
+
+
+--
+-- Name: uq_connector_driver_registrations_account; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_connector_driver_registrations_account ON public.connector_driver_registrations USING btree (owner_id, name) WHERE (scope_kind = 'Account'::text);
+
+
+--
+-- Name: uq_connector_driver_registrations_catalog; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_connector_driver_registrations_catalog ON public.connector_driver_registrations USING btree (name) WHERE (scope_kind = 'Catalog'::text);
+
+
+--
+-- Name: uq_connector_driver_registrations_project; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_connector_driver_registrations_project ON public.connector_driver_registrations USING btree (project_id, name) WHERE (scope_kind = 'Project'::text);
 
 
 --
@@ -41479,6 +41730,14 @@ ALTER TABLE ONLY public.compute_shadow_observations
 
 
 --
+-- Name: connector_bind_time_bindings connector_bind_time_bindings_registration_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_bind_time_bindings
+    ADD CONSTRAINT connector_bind_time_bindings_registration_id_fkey FOREIGN KEY (registration_id) REFERENCES public.connector_driver_registrations(id) ON DELETE SET NULL;
+
+
+--
 -- Name: connector_credential_leases connector_credential_leases_connector_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -41503,11 +41762,67 @@ ALTER TABLE ONLY public.connector_credential_leases
 
 
 --
+-- Name: connector_driver_assignments connector_driver_assignments_connector_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_assignments
+    ADD CONSTRAINT connector_driver_assignments_connector_id_fkey FOREIGN KEY (connector_id) REFERENCES public.datasources(id) ON DELETE CASCADE;
+
+
+--
+-- Name: connector_driver_assignments connector_driver_assignments_registration_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_assignments
+    ADD CONSTRAINT connector_driver_assignments_registration_id_fkey FOREIGN KEY (registration_id) REFERENCES public.connector_driver_registrations(id) ON DELETE CASCADE;
+
+
+--
 -- Name: connector_driver_identities connector_driver_identities_connector_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.connector_driver_identities
     ADD CONSTRAINT connector_driver_identities_connector_id_fkey FOREIGN KEY (connector_id) REFERENCES public.datasources(id) ON DELETE CASCADE;
+
+
+--
+-- Name: connector_driver_operations connector_driver_operations_binding_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_operations
+    ADD CONSTRAINT connector_driver_operations_binding_id_fkey FOREIGN KEY (binding_id) REFERENCES public.connector_bind_time_bindings(id) ON DELETE SET NULL;
+
+
+--
+-- Name: connector_driver_operations connector_driver_operations_registration_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_operations
+    ADD CONSTRAINT connector_driver_operations_registration_id_fkey FOREIGN KEY (registration_id) REFERENCES public.connector_driver_registrations(id) ON DELETE SET NULL;
+
+
+--
+-- Name: connector_driver_registrations connector_driver_registrations_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_registrations
+    ADD CONSTRAINT connector_driver_registrations_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: connector_driver_registrations connector_driver_registrations_owner_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_registrations
+    ADD CONSTRAINT connector_driver_registrations_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: connector_driver_registrations connector_driver_registrations_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_registrations
+    ADD CONSTRAINT connector_driver_registrations_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
 
 
 --

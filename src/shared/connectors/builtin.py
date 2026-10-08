@@ -1335,6 +1335,36 @@ GIT_SWAP_SPEC = DriverSpec(
 #: names its image).
 OFFICIAL_SERVICE_SPECS: tuple[DriverSpec, ...] = (GIT_SWAP_SPEC,)
 
+# ---------------------------------------------------------------------------
+# Registered image drivers (connector drivers D6)
+#
+# A connector of a driver someone registered (an image with its own spec) is
+# stored with this one type. The registration's spec governs its config, its
+# credentials and its bind; what SRW and the agent key on the stored type
+# (the wire entry, the workspace backends, live attach and detach) follows
+# this spec: a bind-time image returns data in the env_file and
+# credential_file forms only (``shared.connectors.registration``), and SRW
+# delivers it to the workspace as an environment or credential-file
+# connector's. No catalogue lists it: the registrations are the catalogue.
+# ---------------------------------------------------------------------------
+
+IMAGE_DRIVER_SPEC = DriverSpec(
+    name="srw.image-driver/v1",
+    legacy_type="image_driver",
+    title="Registered driver",
+    plane="bind_time",
+    delivery_forms=("env_file", "credential_file"),
+    config_schema={"type": "object"},
+    access_levels=_declared_only("binding"),
+    supported_backends=SHELL_BACKENDS,
+    workspace_requirements=(
+        "A shell workspace: what the driver's bind returns is written under "
+        "~/.srw-credentials/ (variables) and linked at the allowed credential "
+        "file locations (files)."
+    ),
+    holds_upstream_credentials=True,
+)
+
 #: Datasource drivers in catalogue order.
 DATASOURCE_SPECS: tuple[DriverSpec, ...] = (
     GENERIC_SPEC,
@@ -1373,9 +1403,13 @@ DEVELOPMENT_SPECS: tuple[DriverSpec, ...] = (
     MCP_STDIO_PROBE_SPEC,
 )
 
+#: Stored types that carry connectors of registered image drivers (D6).
+#: Their type resolves; no catalogue lists them.
+HOSTED_SPECS: tuple[DriverSpec, ...] = (IMAGE_DRIVER_SPEC,)
+
 _BY_TYPE: dict[str, DriverSpec] = {
     spec.legacy_type: spec
-    for spec in DATASOURCE_SPECS + MANAGED_MCP_SPECS + DEVELOPMENT_SPECS
+    for spec in DATASOURCE_SPECS + MANAGED_MCP_SPECS + DEVELOPMENT_SPECS + HOSTED_SPECS
     if spec.legacy_type
 }
 LEGACY_TYPE_IDS: tuple[str, ...] = tuple(
