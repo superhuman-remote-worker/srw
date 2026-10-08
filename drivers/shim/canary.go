@@ -17,10 +17,12 @@ import (
 // without endpoints (a node restart, k3d stopping and starting) every
 // connect fails, policy or not. So each round probes every --allow target
 // first, and a --deny refusal counts only in a round where every allow
-// target answered. The deny and allow targets are the same Service (the
-// orchestrator's API port and its lease exchange port), so "the exchange
-// answers and the API port is refused" in one round can only mean the pod's
-// policy is in force. Any other round resets every count. The driver's code
+// target answered. The deny and allow targets are two listeners of one
+// server behind one Service (the lease exchange and its canary port), which
+// start and stop listening together, so "the exchange answers and the canary
+// is refused" in one round can only mean the pod's policy is in force. (The
+// API port is no such target: it stops listening while the exchange still
+// drains.) Any other round resets every count. The driver's code
 // starts after --consecutive such rounds in a row.
 //
 // Then every --expect target is waited for at most --expect-timeout, never

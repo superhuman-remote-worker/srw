@@ -123,6 +123,44 @@ def test_a_set_port_always_gets_the_policy():
         render(ON, "orchestrator.connectorLeases.networkPolicy.enabled=false")
 
 
+HOSTING = (
+    ON,
+    "connectors.servicePods.enabled=true",
+    "connectors.drivers.shim.image.digest=sha256:" + "5" * 64,
+)
+
+
+def test_hosting_adds_the_exchange_servers_canary_port():
+    """Container port, Service port and env; the driver namespace is
+    admitted on it like the exchange, so only a driver pod's own egress
+    policy can refuse it."""
+    docs = render(*HOSTING)
+    _deployment, container, service = _orchestrator(docs)
+    assert {"name": "lease-canary", "containerPort": 8089} in container["ports"]
+    ports = {port["name"]: port for port in service["spec"]["ports"]}
+    assert ports["lease-canary"] == {
+        "name": "lease-canary",
+        "port": 8089,
+        "targetPort": "lease-canary",
+    }
+    assert _env(container)["CONNECTOR_LEASE_CANARY_PORT"] == "8089"
+    _api, drivers = _policy(docs)["spec"]["ingress"]
+    assert drivers["ports"] == [
+        {"protocol": "TCP", "port": 8088},
+        {"protocol": "TCP", "port": 8089},
+    ]
+    # Without hosting there is no canary.
+    _deployment, container, service = _orchestrator(render(ON))
+    assert all(port.get("name") != "lease-canary" for port in container["ports"])
+    assert "CONNECTOR_LEASE_CANARY_PORT" not in _env(container)
+
+
+@pytest.mark.parametrize("port", ["8085", "8088"])
+def test_the_canary_port_is_a_port_of_its_own(port):
+    with pytest.raises(subprocess.CalledProcessError):
+        render(*HOSTING, f"connectors.servicePods.canaryPort={port}")
+
+
 def test_no_ingress_routes_the_exchange_port():
     for doc in render(ON):
         if doc["kind"] != "Ingress":

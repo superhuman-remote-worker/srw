@@ -439,6 +439,8 @@ class ServiceHostingSettings:
     exchange_host: str
     exchange_port: int
     orchestrator_labels: Mapping[str, str]
+    #: The exchange server's canary listener: the start-up wait's deny target.
+    canary_port: int = 8089
     max_installation: int = 10
     idle_seconds: float = 600.0
     start_timeout_seconds: float = 180.0
@@ -515,6 +517,7 @@ class ServiceHostingSettings:
             exchange_address=exchange_address,
             exchange_port=self.exchange_port,
             orchestrator_labels=dict(self.orchestrator_labels),
+            canary_port=self.canary_port,
             **overrides,
         )
 

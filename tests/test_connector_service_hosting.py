@@ -352,6 +352,7 @@ def _settings(**over: Any) -> DeploymentSettings:
         + "a" * 64,
         connector_service_exchange_host="srw-orchestrator.srw.svc",
         connector_lease_exchange_port=8088,
+        connector_lease_canary_port=8089,
         connector_service_orchestrator_labels={
             "app.kubernetes.io/component": "orchestrator"
         },
@@ -443,6 +444,7 @@ def test_hosting_settings_come_from_the_deployment():
     assert policy.exchange_address == "10.43.0.20"
     assert policy.memory_limit == "128Mi"
     assert policy.cpu_limit == "500m"
+    assert settings.canary_port == 8089 and policy.canary_port == 8089
     assert settings.refused_cidrs == ("10.0.50.0/24",)
     assert settings.pod_ip == "10.42.0.9"
     assert settings.cluster_problem("10.43.0.20") is None
@@ -456,6 +458,8 @@ def test_hosting_settings_come_from_the_deployment():
         {"connector_service_pods_enabled": False},
         {"connector_driver_shim_image": ""},
         {"connector_lease_exchange_port": None},
+        # No canary listener: a start-up wait could prove nothing.
+        {"connector_lease_canary_port": None},
         {"connector_service_orchestrator_labels": {}},
     ],
 )

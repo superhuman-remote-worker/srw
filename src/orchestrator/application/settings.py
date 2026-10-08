@@ -36,6 +36,9 @@ _SESSION_SUBAGENT_FANOUT_LANE_NAMES = frozenset({LANE_STATELESS, LANE_PINNED})
 
 #: The credential lease exchange's dedicated port (slice C2).
 CONNECTOR_LEASE_EXCHANGE_PORT_ENV = "CONNECTOR_LEASE_EXCHANGE_PORT"
+#: The exchange server's second listener: the deny target of a driver pod's
+#: start-up wait (connectors.servicePods.canaryPort, D5).
+CONNECTOR_LEASE_CANARY_PORT_ENV = "CONNECTOR_LEASE_CANARY_PORT"
 _MAIN_PORT = 8085
 
 
@@ -43,8 +46,11 @@ def _enabled(name: str, default: str = "false") -> bool:
     return os.environ.get(name, default).lower() in ("true", "1", "yes")
 
 
-def parse_exchange_port(raw: str | None) -> int | None:
-    """The exchange port from ``CONNECTOR_LEASE_EXCHANGE_PORT``.
+def parse_exchange_port(
+    raw: str | None, *, name: str = CONNECTOR_LEASE_EXCHANGE_PORT_ENV
+) -> int | None:
+    """The exchange port from ``CONNECTOR_LEASE_EXCHANGE_PORT`` (or the
+    exchange server's canary port from ``name``).
 
     Unset, empty or ``0`` is off. A value that is not a port, or is the main
     API port, is off with a warning: the exchange must never share a port
@@ -59,9 +65,22 @@ def parse_exchange_port(raw: str | None) -> int | None:
         port = -1
     if not 1 <= port <= 65535 or port == _MAIN_PORT:
         logger.warning(
-            "%s=%r is not a dedicated port; the lease exchange is off",
-            CONNECTOR_LEASE_EXCHANGE_PORT_ENV,
+            "%s=%r is not a dedicated port; it is off",
+            name,
             raw,
+        )
+        return None
+    return port
+
+
+def parse_canary_port(raw: str | None, *, exchange_port: int | None) -> int | None:
+    """The exchange server's canary port (``CONNECTOR_LEASE_CANARY_PORT``):
+    a port of its own, never the exchange's or the API's."""
+    port = parse_exchange_port(raw, name=CONNECTOR_LEASE_CANARY_PORT_ENV)
+    if port is not None and port == exchange_port:
+        logger.warning(
+            "%s is the exchange port; the canary is off",
+            CONNECTOR_LEASE_CANARY_PORT_ENV,
         )
         return None
     return port
@@ -208,6 +227,9 @@ class DeploymentSettings:
     #: (``orchestrator.connectorLeases.exchangePort``, slice C2); ``None``
     #: serves no exchange. Never the main port.
     connector_lease_exchange_port: int | None = None
+    #: The exchange server's canary listener (``connectors.servicePods.
+    #: canaryPort``); ``None`` serves the exchange alone.
+    connector_lease_canary_port: int | None = None
     #: Install the development lease probe driver (``srw.lease-probe/v1``,
     #: ``orchestrator.connectorLeases.probeDriver``). Off by default.
     connector_lease_probe_enabled: bool = False
@@ -300,6 +322,12 @@ class DeploymentSettings:
             workspace_ssh_known_hosts=os.environ.get(WORKSPACE_SSH_KNOWN_HOSTS_ENV, ""),
             connector_lease_exchange_port=parse_exchange_port(
                 os.environ.get(CONNECTOR_LEASE_EXCHANGE_PORT_ENV)
+            ),
+            connector_lease_canary_port=parse_canary_port(
+                os.environ.get(CONNECTOR_LEASE_CANARY_PORT_ENV),
+                exchange_port=parse_exchange_port(
+                    os.environ.get(CONNECTOR_LEASE_EXCHANGE_PORT_ENV)
+                ),
             ),
             connector_lease_probe_enabled=_enabled("CONNECTOR_LEASE_PROBE_ENABLED"),
             connector_lease_ttl_seconds=int(
@@ -412,9 +440,11 @@ class DeploymentSettings:
 
 
 __all__ = [
+    "CONNECTOR_LEASE_CANARY_PORT_ENV",
     "CONNECTOR_LEASE_EXCHANGE_PORT_ENV",
     "SESSION_SUBAGENT_FANOUT_LANES_ENV",
     "DeploymentSettings",
+    "parse_canary_port",
     "parse_cidr_list",
     "parse_exchange_port",
     "parse_json_object",

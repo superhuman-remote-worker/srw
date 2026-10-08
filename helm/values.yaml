@@ -179,6 +179,12 @@ connectors:
     startTimeoutSeconds: 180
     # -- Seconds between the leader's reconcile passes.
     reconcileIntervalSeconds: 15
+    # -- The lease exchange server's second listener: every driver pod's
+    # start-up wait must find it refused while the exchange answers. The same
+    # server serves both, so they open and close together; the orchestrator
+    # admits the driver namespace on it and no driver policy ever allows it.
+    # A port of its own: never the exchange port or 8085.
+    canaryPort: 8089
     # -- Driver pod egress is pinned per pod: each declared host is resolved
     # once and written into the pod's NetworkPolicy ipBlocks and hostAliases.
     # These are the cluster's REAL pod and service ranges (k3s defaults

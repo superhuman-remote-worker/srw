@@ -119,6 +119,12 @@ spec:
             - name: lease-exchange
               containerPort: {{ . }}
             {{- end }}
+            {{- if and .Values.connectors.servicePods.enabled .Values.orchestrator.connectorLeases.exchangePort }}
+            # The exchange server's canary (connector drivers D5): a driver
+            # pod's start-up deny target, admitted from the driver namespace.
+            - name: lease-canary
+              containerPort: {{ .Values.connectors.servicePods.canaryPort }}
+            {{- end }}
           env:
             # Migration 0185 is intentionally not rolling-compatible.  An
             # existing database accepts it only after the operator drains old
@@ -1903,6 +1909,13 @@ spec:
             {{- with .Values.connectors.servicePods }}
             - name: CONNECTOR_SERVICE_PODS_ENABLED
               value: {{ .enabled | quote }}
+            {{- if .enabled }}
+            {{- if has (int .canaryPort) (list 8085 (int $.Values.orchestrator.connectorLeases.exchangePort)) }}
+            {{- fail "connectors.servicePods.canaryPort must be a port of its own: not 8085 and not orchestrator.connectorLeases.exchangePort" }}
+            {{- end }}
+            - name: CONNECTOR_LEASE_CANARY_PORT
+              value: {{ .canaryPort | quote }}
+            {{- end }}
             - name: CONNECTOR_SERVICE_ENFORCEMENT_VERIFIED
               value: {{ .networkEnforcementVerified | quote }}
             - name: CONNECTOR_SERVICE_CLUSTER_CIDRS

@@ -18,5 +18,12 @@ spec:
       port: {{ . }}
       targetPort: lease-exchange
     {{- end }}
+    {{- if and .Values.connectors.servicePods.enabled .Values.orchestrator.connectorLeases.exchangePort }}
+    # The exchange server's canary (connector drivers D5): driver pods must
+    # find it refused by their own policy while the exchange answers.
+    - name: lease-canary
+      port: {{ .Values.connectors.servicePods.canaryPort }}
+      targetPort: lease-canary
+    {{- end }}
   selector:
     {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}

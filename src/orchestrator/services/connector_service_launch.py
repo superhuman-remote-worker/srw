@@ -57,8 +57,11 @@ REQUEST_PATH = "/run/srw/request.json"
 IDENTITY_PATH = "/run/srw/identity"
 SHIM_DIR = "/srw/bin"
 SHIM_PATH = f"{SHIM_DIR}/srw-driver-shim"
-#: The orchestrator's API port: the canary a driver pod must never reach.
-CANARY_PORT = 8085
+#: The canary a driver pod must never reach: a listener of the exchange's
+#: own server (``connectors.servicePods.canaryPort``), so it opens and closes
+#: with the exchange. Never the API port, which stops listening before the
+#: exchange does while the orchestrator shuts down.
+CANARY_PORT = 8089
 #: Agent pods, by the ``app`` label their provisioners set.
 AGENT_APPS: tuple[str, ...] = (
     "srw-agent",
@@ -158,6 +161,11 @@ class ServiceLaunchPolicy:
             raise ValueError("driver pods never run in the release namespace")
         if not self.orchestrator_labels:
             raise ValueError("the orchestrator's pod labels are required")
+        if not 1 <= self.canary_port <= 65535 or self.canary_port in (
+            self.exchange_port,
+            8085,
+        ):
+            raise ValueError("the canary port is its own port of the exchange's server")
 
 
 @dataclass(frozen=True)

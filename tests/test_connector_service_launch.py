@@ -6,6 +6,7 @@ after its ``sdi_`` identity. The whole manifests are pinned here.
 
 from __future__ import annotations
 
+import dataclasses
 import base64
 import json
 from dataclasses import replace
@@ -197,7 +198,7 @@ def test_the_pod_manifest():
                     "args": [
                         "canary-wait",
                         "--deny",
-                        "10.43.0.20:8085",
+                        "10.43.0.20:8089",
                         "--allow",
                         "10.43.0.20:8088",
                         "--expect",
@@ -440,6 +441,25 @@ def test_a_dollar_in_the_image_command_is_never_expanded():
     driver = plan.pod["spec"]["containers"][0]
     assert driver["args"] == ["/bin/echo", "$$(SRW_DRIVER_PORT)", "cost: $$5"]
     assert "runtimeClassName" not in plan.pod["spec"]
+
+
+def test_the_canary_is_the_exchange_servers_own_port_and_never_allowed():
+    """The deny target is the exchange server's canary listener (one
+    lifecycle with the exchange), never the API port; no driver egress rule
+    names it."""
+    plan = _plan()
+    args = plan.pod["spec"]["initContainers"][0]["args"]
+    assert args[args.index("--deny") + 1] == f"10.43.0.20:{POLICY.canary_port}"
+    assert POLICY.canary_port not in (8085, POLICY.exchange_port)
+    allowed = {
+        port["port"]
+        for rule in plan.network_policy["spec"]["egress"]
+        for port in rule.get("ports") or ()
+    }
+    assert POLICY.canary_port not in allowed and 8085 not in allowed
+    for port in (8085, POLICY.exchange_port, 0):
+        with pytest.raises(ValueError, match="canary port"):
+            dataclasses.replace(POLICY, canary_port=port)
 
 
 def test_the_vm_peer_matches_the_launcher_labels_the_chart_stamps():

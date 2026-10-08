@@ -26,7 +26,7 @@ from agent.connectors import RuntimeContext, deliveries_from_payload
 from agent.connectors.lease import LeaseTokenMaterializer
 from orchestrator.application import background_tasks
 from orchestrator.application import connectors as connectors_composition
-from orchestrator.application.settings import parse_exchange_port
+from orchestrator.application.settings import parse_canary_port, parse_exchange_port
 from orchestrator.services import connector_credential_leases as leases
 from orchestrator.services.connector_drivers import builtin_connector_drivers
 from orchestrator.services.connector_drivers.base import (
@@ -502,6 +502,12 @@ class TestExchangePortSetting:
     def test_parse(self, raw, port):
         assert parse_exchange_port(raw) == port
 
+    def test_the_canary_is_a_port_of_its_own(self):
+        assert parse_canary_port("8089", exchange_port=8088) == 8089
+        assert parse_canary_port("8088", exchange_port=8088) is None
+        assert parse_canary_port("8085", exchange_port=8088) is None
+        assert parse_canary_port(None, exchange_port=8088) is None
+
 
 class TestServer:
     @pytest.mark.asyncio
@@ -521,6 +527,92 @@ class TestServer:
             )
         finally:
             holder.close()
+
+    @pytest.mark.asyncio
+    async def test_a_busy_canary_port_leaves_the_exchange_off_too(self):
+        """Both listen or neither: an exchange without its canary would let
+        a refused canary (nothing listening) pass a start-up wait."""
+        import socket
+
+        holder = socket.socket()
+        holder.bind(("0.0.0.0", 0))
+        holder.listen()
+        busy = holder.getsockname()[1]
+        free = socket.socket()
+        free.bind(("127.0.0.1", 0))
+        port = free.getsockname()[1]
+        free.close()
+        try:
+            await asyncio.wait_for(
+                connectors_composition.serve_connector_lease_exchange(
+                    SimpleNamespace(),
+                    port=port,
+                    canary_port=busy,
+                    shutdown_event=asyncio.Event(),
+                ),
+                timeout=5,
+            )
+            with pytest.raises(OSError):
+                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+        finally:
+            holder.close()
+
+    @pytest.mark.asyncio
+    async def test_the_canary_listens_and_stops_with_the_exchange(self, monkeypatch):
+        """One server, two sockets: they open together and one shutdown
+        closes both, so no shutdown window has the exchange answering while
+        the canary is refused."""
+        import socket
+
+        ports = []
+        for _ in range(2):
+            probe = socket.socket()
+            probe.bind(("127.0.0.1", 0))
+            ports.append(probe.getsockname()[1])
+            probe.close()
+        port, canary = ports
+        monkeypatch.setattr(
+            connectors_composition,
+            "connector_lease_exchange",
+            lambda *_args: _FakeExchange(),
+        )
+
+        def reachable(number: int) -> bool:
+            try:
+                socket.create_connection(("127.0.0.1", number), timeout=1).close()
+                return True
+            except OSError:
+                return False
+
+        shutdown = asyncio.Event()
+        task = asyncio.create_task(
+            connectors_composition.serve_connector_lease_exchange(
+                SimpleNamespace(),
+                port=port,
+                canary_port=canary,
+                shutdown_event=shutdown,
+            )
+        )
+        for _ in range(100):
+            if await asyncio.to_thread(reachable, port):
+                break
+            await asyncio.sleep(0.02)
+        assert await asyncio.to_thread(reachable, port)
+        assert await asyncio.to_thread(reachable, canary)
+        # A connection open across the shutdown, as a driver's would be.
+        held = socket.create_connection(("127.0.0.1", port), timeout=1)
+        try:
+            shutdown.set()
+            for _ in range(100):
+                if not await asyncio.to_thread(reachable, canary):
+                    break
+                await asyncio.sleep(0.02)
+            # Once shutdown begins, neither listener accepts.
+            assert not await asyncio.to_thread(reachable, canary)
+            assert not await asyncio.to_thread(reachable, port)
+        finally:
+            held.close()
+        await asyncio.wait_for(task, timeout=15)
 
     @pytest.mark.asyncio
     async def test_it_serves_until_shutdown(self, monkeypatch):

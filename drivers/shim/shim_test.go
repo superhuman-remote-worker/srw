@@ -76,7 +76,7 @@ func (s scripted) probe(calls *[]string) probe {
 
 func config() canaryConfig {
 	return canaryConfig{
-		deny:          []string{"10.43.0.20:8085"},
+		deny:          []string{"10.43.0.20:8089"},
 		allow:         []string{"10.43.0.20:8088"},
 		expect:        []string{"1.1.1.1:443"},
 		consecutive:   3,
@@ -98,7 +98,7 @@ func TestCanaryCountsARefusalOnlyWhileTheExchangeAnswers(t *testing.T) {
 	// the canary would be refused. Rounds 5 to 7: enforced (1, 2, 3).
 	targets := scripted{
 		"10.43.0.20:8088": {false, true, true, false, true, true, true},
-		"10.43.0.20:8085": {true, false, false, false, false},
+		"10.43.0.20:8089": {true, false, false, false, false},
 		"1.1.1.1:443":     {true},
 	}
 	clock := &fakeClock{now: time.Unix(0, 0)}
@@ -110,7 +110,7 @@ func TestCanaryCountsARefusalOnlyWhileTheExchangeAnswers(t *testing.T) {
 		switch call {
 		case "10.43.0.20:8088":
 			allowProbes++
-		case "10.43.0.20:8085":
+		case "10.43.0.20:8089":
 			denyProbes++
 		}
 	}
@@ -145,14 +145,14 @@ func TestCanaryRefusesWhenTheOrchestratorHasNoEndpoints(t *testing.T) {
 	// Both ports of the Service refuse for the whole wait: not one refusal
 	// may count, and the wait fails naming the exchange.
 	var calls []string
-	targets := scripted{"10.43.0.20:8085": {false}, "10.43.0.20:8088": {false}}
+	targets := scripted{"10.43.0.20:8089": {false}, "10.43.0.20:8088": {false}}
 	clock := &fakeClock{now: time.Unix(0, 0)}
 	err := canaryWait(config(), targets.probe(&calls), clock, silent)
 	if err == nil || !strings.Contains(err.Error(), "10.43.0.20:8088 stayed unreachable") {
 		t.Fatalf("err = %v", err)
 	}
 	for _, call := range calls {
-		if call == "10.43.0.20:8085" {
+		if call == "10.43.0.20:8089" {
 			t.Fatal("the canary was probed while the exchange did not answer")
 		}
 	}
@@ -160,7 +160,7 @@ func TestCanaryRefusesWhenTheOrchestratorHasNoEndpoints(t *testing.T) {
 
 func TestCanaryFailsWhenTheDenyNeverHolds(t *testing.T) {
 	var calls []string
-	targets := scripted{"10.43.0.20:8085": {true}, "10.43.0.20:8088": {true}}
+	targets := scripted{"10.43.0.20:8089": {true}, "10.43.0.20:8088": {true}}
 	clock := &fakeClock{now: time.Unix(0, 0)}
 	err := canaryWait(config(), targets.probe(&calls), clock, silent)
 	if err == nil || !strings.Contains(err.Error(), "default deny is not enforced") {
@@ -171,7 +171,7 @@ func TestCanaryFailsWhenTheDenyNeverHolds(t *testing.T) {
 func TestAnUnreachableUpstreamIsLoggedNotFatal(t *testing.T) {
 	var calls []string
 	var logged []string
-	targets := scripted{"10.43.0.20:8085": {false}, "10.43.0.20:8088": {true}, "1.1.1.1:443": {false}}
+	targets := scripted{"10.43.0.20:8089": {false}, "10.43.0.20:8088": {true}, "1.1.1.1:443": {false}}
 	clock := &fakeClock{now: time.Unix(0, 0)}
 	logf := func(format string, a ...any) { logged = append(logged, fmt.Sprintf(format, a...)) }
 	if err := canaryWait(config(), targets.probe(&calls), clock, logf); err != nil {
@@ -209,7 +209,7 @@ func TestTheSystemProbeConnectsAndIsRefused(t *testing.T) {
 
 func TestCanaryFlags(t *testing.T) {
 	cfg, err := parseCanaryFlags([]string{
-		"--deny", "10.43.0.20:8085", "--allow", "10.43.0.20:8088",
+		"--deny", "10.43.0.20:8089", "--allow", "10.43.0.20:8088",
 		"--expect", "1.1.1.1:443", "--consecutive", "5", "--timeout", "90s",
 	})
 	if err != nil {

@@ -473,6 +473,9 @@ async def start_background_tasks(
                 resources,
                 port=exchange_port,
                 shutdown_event=resources.shutdown_event,
+                # Service-pod hosting's start-up deny target, on the same
+                # server so it never outlives or predates the exchange.
+                canary_port=resources.settings.connector_lease_canary_port,
             ),
         )
     # Service-plane driver pods (connector drivers D5): start the shared pods

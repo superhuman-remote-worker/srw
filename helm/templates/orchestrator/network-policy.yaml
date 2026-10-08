@@ -9,6 +9,9 @@
 # MCP, collectors, kubelet probes). The credential lease exchange port admits
 # only pods in the connector driver namespace, so a driver reaches the
 # exchange and nothing else of the API, and no other pod reaches the exchange.
+# With service pods on, the exchange server's canary port is admitted from the
+# driver namespace too: only a driver pod's own egress policy may refuse it,
+# which is what its start-up wait proves.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -32,4 +35,8 @@ spec:
       ports:
         - protocol: TCP
           port: {{ $leases.exchangePort }}
+        {{- if .Values.connectors.servicePods.enabled }}
+        - protocol: TCP
+          port: {{ .Values.connectors.servicePods.canaryPort }}
+        {{- end }}
 {{- end }}

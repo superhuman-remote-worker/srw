@@ -187,6 +187,7 @@ def service_hosting_settings(
             ("shim image", settings.connector_driver_shim_image),
             ("exchange host", settings.connector_service_exchange_host),
             ("exchange port", settings.connector_lease_exchange_port),
+            ("canary port", settings.connector_lease_canary_port),
             ("orchestrator labels", settings.connector_service_orchestrator_labels),
         )
         if not value
@@ -203,6 +204,7 @@ def service_hosting_settings(
         shim_image=settings.connector_driver_shim_image,
         exchange_host=settings.connector_service_exchange_host,
         exchange_port=int(settings.connector_lease_exchange_port or 0),
+        canary_port=int(settings.connector_lease_canary_port or 0),
         orchestrator_labels=dict(settings.connector_service_orchestrator_labels),
         max_installation=settings.connector_service_max_installation,
         idle_seconds=settings.connector_service_idle_seconds,
@@ -324,33 +326,62 @@ def exchange_server_config(app: Any) -> uvicorn.Config:
 
 
 async def serve_connector_lease_exchange(
-    resources: ApplicationResources, *, port: int, shutdown_event: asyncio.Event
+    resources: ApplicationResources,
+    *,
+    port: int,
+    shutdown_event: asyncio.Event,
+    canary_port: int | None = None,
 ) -> None:
-    """Serve the exchange on ``port`` until shutdown.
+    """Serve the exchange on ``port`` (and its canary on ``canary_port``)
+    until shutdown.
 
-    The socket is bound here, not by uvicorn, whose bind failure exits the
+    The sockets are bound here, not by uvicorn, whose bind failure exits the
     process: a busy port is logged and leaves the exchange off, never the
     orchestrator down. Shutdown waits for open requests at most
     ``GRACEFUL_SHUTDOWN_SECONDS`` (and the server task a little longer
     before it is cancelled), so a slow client never holds the orchestrator's
     shutdown.
+
+    The canary is a driver pod's start-up deny target: its policy admits the
+    exchange and refuses the canary, and "exchange answers, canary refused"
+    proves the policy is in force only if nothing else can make that so. One
+    server serves both sockets: they start listening together, and its one
+    shutdown stops both at once (the API port, by contrast, stops listening
+    while the exchange still drains). Both bind or neither does.
     """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        # Pod network; the chart's NetworkPolicy bounds who reaches it.
-        sock.bind(("0.0.0.0", port))  # nosec B104
-    except OSError as exc:
-        sock.close()
-        logger.error("Connector lease exchange cannot bind port %d: %s", port, exc)
-        return
+    sockets: list[socket.socket] = []
+    for label, number in (("exchange", port), ("canary", canary_port)):
+        if number is None:
+            continue
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            # Pod network; the chart's NetworkPolicy bounds who reaches it.
+            sock.bind(("0.0.0.0", number))  # nosec B104
+        except OSError as exc:
+            sock.close()
+            for bound in sockets:
+                bound.close()
+            logger.error(
+                "Connector lease exchange cannot bind its %s port %d: %s; the "
+                "exchange is off",
+                label,
+                number,
+                exc,
+            )
+            return
+        sockets.append(sock)
     server = _EmbeddedServer(
         exchange_server_config(connector_lease_exchange_app(resources))
     )
     task = asyncio.create_task(
-        server.serve(sockets=[sock]), name="connector-lease-exchange"
+        server.serve(sockets=sockets), name="connector-lease-exchange"
     )
-    logger.info("Connector lease exchange listening on port %d", port)
+    logger.info(
+        "Connector lease exchange listening on port %d%s",
+        port,
+        f" (canary {canary_port})" if canary_port is not None else "",
+    )
     try:
         stop = asyncio.create_task(shutdown_event.wait())
         done, _ = await asyncio.wait({task, stop}, return_when=asyncio.FIRST_COMPLETED)
@@ -367,7 +398,8 @@ async def serve_connector_lease_exchange(
                 await asyncio.wait_for(task, timeout=GRACEFUL_SHUTDOWN_SECONDS + 5)
             except asyncio.TimeoutError:
                 logger.warning("Connector lease exchange did not stop in time")
-        sock.close()
+        for sock in sockets:
+            sock.close()
 
 
 __all__ = [

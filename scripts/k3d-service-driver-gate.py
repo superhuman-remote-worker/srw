@@ -42,9 +42,9 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
   reach       the agent pod and session 1's workspace reach A's Service on
               srw-driver; neither reaches A's pod on its other port; a plain
               release-namespace pod reaches neither
-  egress      from inside A's pod: the pinned host answers; a canary address
-              and the orchestrator's API port are refused; the exchange port
-              answers; no name resolves through DNS while the pinned name
+  egress      from inside A's pod: the pinned host answers; a canary address,
+              the orchestrator's API port and the exchange server's canary
+              port are refused; the exchange port answers; no name resolves through DNS while the pinned name
               resolves (hostAliases) to the recorded addresses; the
               connector's egress view and the matrix show what is enforced
   exchange    A's pod calls the exchange with its sdi_ identity: A's lease
@@ -763,6 +763,7 @@ class ServiceDriverGate:
         self.user_id = ""
         self.namespace = ""
         self.exchange_port = 0
+        self.canary_port = 0
         self.idle_seconds = 0
         self.reconcile_seconds = 0
         self.orchestrator_ip = ""
@@ -1017,6 +1018,7 @@ class ServiceDriverGate:
                 "CONNECTOR_SERVICE_RECONCILE_SECONDS",
                 "CONNECTOR_DRIVER_REGISTRY_INSECURE_HOSTS",
                 "CONNECTOR_DRIVER_RESOLVE_CACHE_SECONDS",
+                "CONNECTOR_LEASE_CANARY_PORT",
             )
         }
         idle = float(env["CONNECTOR_SERVICE_IDLE_SECONDS"] or 0)
@@ -1025,6 +1027,9 @@ class ServiceDriverGate:
             and env["CONNECTOR_SERVICE_NAMESPACE"] != ""
             and env["CONNECTOR_LEASE_EXCHANGE_PORT"].isdigit()
             and int(env["CONNECTOR_LEASE_EXCHANGE_PORT"]) not in (0, 8085)
+            and env["CONNECTOR_LEASE_CANARY_PORT"].isdigit()
+            and int(env["CONNECTOR_LEASE_CANARY_PORT"])
+            not in (0, 8085, int(env["CONNECTOR_LEASE_EXCHANGE_PORT"]))
             and "@sha256:" in env["CONNECTOR_DRIVER_SHIM_IMAGE"]
             and env["CONNECTOR_ECHO_DRIVER_IMAGE"] != ""
             and 0 < idle <= self.args.max_idle
@@ -1047,6 +1052,7 @@ class ServiceDriverGate:
             )
         self.namespace = env["CONNECTOR_SERVICE_NAMESPACE"]
         self.exchange_port = int(env["CONNECTOR_LEASE_EXCHANGE_PORT"])
+        self.canary_port = int(env["CONNECTOR_LEASE_CANARY_PORT"])
         self.idle_seconds = int(idle)
         self.reconcile_seconds = int(
             float(env["CONNECTOR_SERVICE_RECONCILE_SECONDS"] or 15)
@@ -1167,10 +1173,14 @@ class ServiceDriverGate:
         _rc, canary_log, _err = run(
             self.kc + ["logs", row["pod_name"], "-c", "canary-wait"], timeout=60
         )
+        canary_target = f"{self.orchestrator_ip}:{self.canary_port}"
         self.report.check(
             "pod: the canary-wait init container ran first and exited 0 after the "
-            "default deny was enforced",
-            canary_passed(pod) and "default deny enforced" in canary_log,
+            "default deny was enforced, its deny target the exchange server's "
+            "canary port",
+            canary_passed(pod)
+            and "default deny enforced" in canary_log
+            and canary_target in (pod["spec"]["initContainers"][0].get("args") or []),
             canary_log.splitlines()[-1][:200] if canary_log else "no log",
         )
         caps = capabilities_dropped(pod)
@@ -1314,6 +1324,13 @@ class ServiceDriverGate:
                 {
                     "kind": "http",
                     "url": self.service_url(
+                        "a",
+                        f"/probe?addr={self.orchestrator_ip}:{self.canary_port}",
+                    ),
+                },
+                {
+                    "kind": "http",
+                    "url": self.service_url(
                         "a", "/resolve?name=kubernetes.default.svc.cluster.local"
                     ),
                 },
@@ -1325,15 +1342,16 @@ class ServiceDriverGate:
                 },
             ]
         )
-        reach = [(p.get("body") or {}).get("reachable") for p in probes[:4]]
+        reach = [(p.get("body") or {}).get("reachable") for p in probes[:5]]
         self.report.check(
             "egress: from A's pod the pinned host answers, a canary address and "
-            "the orchestrator API port are refused, the exchange port answers",
-            reach == [True, False, False, True],
+            "the orchestrator API port are refused, the exchange port answers "
+            "and the exchange server's canary port is refused",
+            reach == [True, False, False, True, False],
             str(reach),
         )
-        no_dns = probes[4].get("body") or {}
-        pinned_name = probes[5].get("body") or {}
+        no_dns = probes[5].get("body") or {}
+        pinned_name = probes[6].get("body") or {}
         self.report.check(
             "egress: no DNS from A's pod; the pinned name resolves only to its "
             "recorded addresses",
