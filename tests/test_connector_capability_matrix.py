@@ -5,14 +5,17 @@ registry alone.  Pinned here:
 
 * every installed driver is listed, with its access levels and their
   ``enforced_by`` lines, trust, credential slots and egress columns;
-* built-in drivers are "built-in, trusted"; anything else is marked as its
-  author's word;
+* built-in drivers are "built-in, trusted"; a managed MCP server is
+  "managed", its claims SRW's but its image never trusted; anything else is
+  marked as its author's word;
 * no credential value can appear: the route reads no connector, and a
   ``writeOnly`` schema loses any value its author put there;
 * any approved user may read it, and the literal segment wins over
   ``/{datasource_id}``;
 * the response is the cockpit's fixture byte for byte, so the cockpit specs
-  render what the API returns.  Regenerate the fixture with
+  render what the API returns (the managed MCP servers' rows, installed only
+  where the chart names their images, in a fixture of their own).
+  Regenerate the fixtures with
   ``UPDATE_CONNECTOR_GOLDENS=1 python -m pytest tests/test_connector_capability_matrix.py``.
 """
 
@@ -41,6 +44,7 @@ from shared.connectors.builtin import (
     BUILTIN_SPECS,
     DATASOURCE_SPECS,
     IMAGE_DRIVER_SPEC,
+    MANAGED_MCP_SPECS,
 )
 from shared.connectors.contract import (
     AccessLevel,
@@ -52,6 +56,7 @@ from tests._mounted_router import mount_router
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "cockpit/src/app/core/models/fixtures/connector-drivers.json"
+MANAGED_FIXTURE = FIXTURE.with_name("connector-drivers-managed.json")
 UPDATE = os.environ.get("UPDATE_CONNECTOR_GOLDENS") == "1"
 
 USER = {"id": "00000000-0000-0000-0000-0000000000c1", "is_admin": False}
@@ -283,6 +288,75 @@ class TestDevelopmentDrivers:
 
     def test_without_the_switch_it_is_not_installed(self, matrix):
         assert "srw.lease-probe/v1" not in {d["name"] for d in matrix["drivers"]}
+
+
+_BUILTIN_NAMES = frozenset(spec.name for spec in BUILTIN_SPECS)
+
+
+def _managed_rows() -> dict:
+    """What a deployment installing every managed MCP server of SRW's
+    catalogue (D5a) adds to the matrix, with the service-pod hosting the
+    chart requires for one: the cockpit renders these rows from
+    ``fixtures/connector-drivers-managed.json``."""
+    registry = builtin_connector_drivers(
+        managed_mcp_images={
+            spec.name: f"registry.example/{spec.name.split('/')[0]}:1"
+            for spec in MANAGED_MCP_SPECS
+        }
+    )
+    matrix = capability_matrix(registry, hosting=HostingStatus(enabled=True))
+    return {
+        **matrix,
+        "drivers": [d for d in matrix["drivers"] if d["name"] not in _BUILTIN_NAMES],
+    }
+
+
+class TestManagedMcpServers:
+    """SRW curates them and its front enforces their levels; their image is
+    a third party's."""
+
+    def test_each_is_managed_never_trusted_and_its_claims_are_srws(self):
+        rows = _managed_rows()["drivers"]
+        assert [d["name"] for d in rows] == [s.name for s in MANAGED_MCP_SPECS]
+        for row in rows:
+            assert row["trust"] == {
+                "tier": "managed",
+                "trusted": False,
+                "image": f"registry.example/{row['name'].split('/')[0]}:1",
+                "claims_declared_by_author": False,
+            }
+
+    def test_each_offers_its_specs_levels_and_owns_its_type(self):
+        for spec, row in zip(MANAGED_MCP_SPECS, _managed_rows()["drivers"]):
+            assert row["legacy_type"] == spec.legacy_type
+            assert row["serves_stored_type"] is True
+            assert [level["id"] for level in row["access_levels"]] == list(
+                spec.ranked_access_ids()
+            )
+            # The connector picks its level in its config, from those levels.
+            assert row["config_schema"]["properties"]["access"]["enum"] == list(
+                spec.ranked_access_ids()
+            )
+
+    def test_the_built_ins_stay_built_in_beside_them(self):
+        registry = builtin_connector_drivers(
+            managed_mcp_images={s.name: "r/x:1" for s in MANAGED_MCP_SPECS}
+        )
+        tiers = {
+            d["name"]: d["trust"]["tier"]
+            for d in capability_matrix(registry)["drivers"]
+        }
+        assert {tiers[name] for name in _BUILTIN_NAMES} == {"builtin"}
+
+    def test_the_cockpit_fixture_is_the_response(self):
+        rendered = json.dumps(_managed_rows(), indent=2) + "\n"
+        if UPDATE:
+            MANAGED_FIXTURE.write_text(rendered)
+        assert MANAGED_FIXTURE.read_text() == rendered, (
+            "the cockpit's managed fixture is stale; regenerate it with "
+            "UPDATE_CONNECTOR_GOLDENS=1 python -m pytest "
+            "tests/test_connector_capability_matrix.py"
+        )
 
 
 class TestDriversOutsideTheTrustedList:

@@ -18,7 +18,11 @@ what it is.  A driver's author could still write a value into a schema, so
   becomes ``{}``.
 
 Trust: the built-in drivers are SRW's own code, so their claims are SRW's.
-A development driver (the lease probe or the echo service, on only where a
+SRW's own service driver image (the git swap driver) is ``trusted``. A
+managed MCP server from SRW's catalogue (D5a) is tier ``managed``: SRW wrote
+its spec and SRW's front enforces its access levels, so its claims are SRW's,
+but its pods run a third-party image (Gitea's), so it is never trusted. A
+development driver (the lease probe or the echo service, on only where a
 deployment switch installs it) is SRW's too but tier ``development``, never
 trusted; a service-plane one shows the image its pods run. A registered
 image driver (D6) is ``trusted`` when its repository is in the operator's
@@ -59,6 +63,7 @@ from orchestrator.services.connector_drivers.registry import (
 from shared.connectors.builtin import (
     BUILTIN_SPECS,
     DEVELOPMENT_SPECS,
+    MANAGED_MCP_SPECS,
     OFFICIAL_SERVICE_SPECS,
 )
 from shared.connectors.contract import (
@@ -74,6 +79,9 @@ _BUILTIN_NAMES = frozenset(spec.name for spec in BUILTIN_SPECS)
 #: Service drivers SRW ships as its own images (the git swap driver),
 #: installed when the chart names their image.
 _OFFICIAL_NAMES = frozenset(spec.name for spec in OFFICIAL_SERVICE_SPECS)
+#: Managed MCP servers from SRW's catalogue (the Gitea MCP server): a
+#: third-party image behind SRW's front, installed when the chart names it.
+_MANAGED_NAMES = frozenset(spec.name for spec in MANAGED_MCP_SPECS)
 #: Drivers SRW ships for development only, installed when a deployment
 #: switch turns them on (the lease probe).
 _DEVELOPMENT_NAMES = frozenset(spec.name for spec in DEVELOPMENT_SPECS)
@@ -440,6 +448,16 @@ def _trust(
         return {
             "tier": "trusted",
             "trusted": True,
+            "image": image,
+            "claims_declared_by_author": False,
+        }
+    if in_process and spec.name in _MANAGED_NAMES:
+        # A third-party image the chart pins, which SRW did not build, so
+        # never trusted; but SRW wrote its spec and SRW's front hides and
+        # refuses the tools a level does not allow, so its claims are SRW's.
+        return {
+            "tier": "managed",
+            "trusted": False,
             "image": image,
             "claims_declared_by_author": False,
         }

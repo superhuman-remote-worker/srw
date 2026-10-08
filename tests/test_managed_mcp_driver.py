@@ -250,6 +250,27 @@ def test_the_matrix_lists_an_installed_server_with_its_service():
     assert entry["plane"] == "service"
     assert entry["service"]["callers"] == ["harness"]
     assert entry["holds_upstream_credentials"] is True
+    # SRW curates it and its front enforces the levels, but the image is
+    # Gitea's: managed, never trusted, its claims SRW's.
+    assert entry["trust"] == {
+        "tier": "managed",
+        "trusted": False,
+        "image": GITEA_IMAGE,
+        "claims_declared_by_author": False,
+    }
+
+
+def test_a_development_server_stays_development():
+    registry = builtin_connector_drivers(
+        managed_mcp_images={"srw.mcp-test/v1": TEST_IMAGE}
+    )
+    (entry,) = (
+        item
+        for item in capability_matrix(registry)["drivers"]
+        if item["name"] == "srw.mcp-test/v1"
+    )
+    assert entry["trust"]["tier"] == "development"
+    assert entry["trust"]["trusted"] is False
 
 
 # =============================================================================

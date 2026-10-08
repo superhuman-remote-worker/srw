@@ -442,6 +442,24 @@ levels, credential slots, egress and the variables it sets. Unless your
 operator trusts its repository, every claim there is marked as declared by its
 author.
 
+Every driver on that page carries one of these trust labels (`trust.tier` in
+`GET /api/datasources/drivers`):
+
+- **Built-in, trusted** (`builtin`): SRW's own code, running in SRW.
+- **Trusted image** (`trusted`): an image SRW publishes for its own service
+  drivers (the git swap driver), or a registered image whose repository your
+  operator trusts (`connectors.drivers.trustedRepositories`).
+- **Managed by SRW, third-party image** (`managed`): a managed MCP server
+  from SRW's catalogue, such as the Gitea MCP server
+  (`connectors.drivers.managedMcp`). Its image is a third party's, pinned by
+  the chart, so it is not trusted. SRW wrote its spec, and SRW's front hides
+  and refuses the tools an access level does not allow, so its claims are
+  SRW's, not the image author's.
+- **Custom, not verified** (`custom`): any other registered image. Its claims
+  are its author's.
+- **Development only** (`development`): a driver a deployment turns on for
+  SRW's own tests, never for real connectors.
+
 ## 6. Create a connector and use it
 
 Create a connector of type `image_driver` that names the registration (or the

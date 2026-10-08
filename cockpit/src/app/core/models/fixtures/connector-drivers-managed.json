@@ -1,0 +1,218 @@
+{
+  "protocol_version": "1.0",
+  "drivers": [
+    {
+      "name": "srw.gitea-mcp/v1",
+      "title": "Gitea (managed MCP server)",
+      "legacy_type": "gitea_mcp",
+      "serves_stored_type": true,
+      "protocol_version": "1.0",
+      "plane": "service",
+      "delivery_forms": [
+        "mcp_client"
+      ],
+      "supported_backends": [
+        "none",
+        "sandbox",
+        "virtual",
+        "vm"
+      ],
+      "workspace_requirements": "None: the agent process is the MCP client; the server runs in its own pod and the token never reaches the agent or the workspace.",
+      "tool_category": "mcp",
+      "operations": [],
+      "access_levels": [
+        {
+          "id": "ReadOnly",
+          "rank": 0,
+          "tools": "*",
+          "enforced_by": "SRW's front hides and refuses every tool the driver's spec does not class as read; a tool the server adds later stays hidden until it does.",
+          "advisory": false
+        },
+        {
+          "id": "ReadWrite",
+          "rank": 1,
+          "tools": "*",
+          "enforced_by": "The Gitea token decides what the server may do.",
+          "advisory": false
+        }
+      ],
+      "default_access": "ReadWrite",
+      "forced_read_only": false,
+      "holds_upstream_credentials": true,
+      "credential_slots": [
+        {
+          "name": "token",
+          "kind": "secret_string",
+          "required": true,
+          "rotatable": false,
+          "access_levels": [],
+          "delivery": null,
+          "update": "replace",
+          "names_field": null,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "token": {
+                "type": "string",
+                "writeOnly": true
+              }
+            }
+          }
+        }
+      ],
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "url": {
+            "type": "string",
+            "title": "Gitea URL",
+            "maxLength": 512,
+            "pattern": "^https?://[^/?#@\\s]+/?$"
+          },
+          "host": {
+            "type": "string",
+            "readOnly": true
+          },
+          "port": {
+            "type": "integer",
+            "readOnly": true
+          },
+          "access": {
+            "enum": [
+              "ReadOnly",
+              "ReadWrite"
+            ],
+            "title": "Access"
+          }
+        }
+      },
+      "legacy_connection_url": "forbidden",
+      "egress": {
+        "declared": {
+          "rules": [
+            {
+              "host": "${config.host}",
+              "ports": [
+                "${config.port}"
+              ],
+              "protocol": "tcp"
+            }
+          ],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "enforced",
+          "reason": "pinned_per_pod",
+          "mechanism": "networkpolicy_ipblock",
+          "dns": "none"
+        },
+        "installation": {
+          "status": "unverified",
+          "reason": "start_up_wait_unverified",
+          "namespace_default_deny": true,
+          "start_up_wait": true
+        }
+      },
+      "publishable": true,
+      "live_attach": true,
+      "live_detach": "immediate",
+      "delete_while_attached": true,
+      "max_per_execution": null,
+      "needs_knowledge_profile": false,
+      "deployment_gate": null,
+      "service": {
+        "instancing": "shared",
+        "resources": {
+          "limits": {
+            "cpu": "500m",
+            "memory": "128Mi"
+          }
+        },
+        "start_seconds": 20,
+        "mcp": {
+          "transport": "http",
+          "port": 8091,
+          "path": "/mcp",
+          "protocol": "legacy",
+          "tools": {
+            "read": [
+              "get_gitea_mcp_server_version",
+              "get_me",
+              "get_user_orgs",
+              "search_users",
+              "search_org_teams",
+              "search_repos",
+              "search_issues",
+              "notification_read",
+              "label_read",
+              "milestone_read",
+              "wiki_read",
+              "timetracking_read",
+              "package_read",
+              "project_read",
+              "list_issues",
+              "issue_read",
+              "list_pull_requests",
+              "pull_request_read",
+              "actions_config_read",
+              "list_my_repos",
+              "list_org_repos",
+              "get_repository_tree",
+              "get_file_contents",
+              "get_dir_contents",
+              "list_branches",
+              "get_tag",
+              "list_tags",
+              "list_commits",
+              "get_commit",
+              "get_release",
+              "get_latest_release",
+              "list_releases"
+            ]
+          },
+          "access": {
+            "ReadOnly": [
+              "read"
+            ],
+            "ReadWrite": [
+              "read",
+              "write"
+            ]
+          },
+          "credential": {
+            "header": "Authorization",
+            "scheme": "Bearer"
+          },
+          "env": {
+            "MCP_MODE": "http",
+            "GITEA_HOST": "${config.url}"
+          },
+          "args": [
+            "-b",
+            "127.0.0.1",
+            "-p",
+            "8091"
+          ],
+          "max_in_flight_per_binding": 4,
+          "tool_pinning": "warn"
+        },
+        "port": 8080,
+        "callers": [
+          "harness"
+        ],
+        "tls": false,
+        "idle_seconds": null
+      },
+      "trust": {
+        "tier": "managed",
+        "trusted": false,
+        "image": "registry.example/srw.gitea-mcp:1",
+        "claims_declared_by_author": false
+      }
+    }
+  ]
+}
