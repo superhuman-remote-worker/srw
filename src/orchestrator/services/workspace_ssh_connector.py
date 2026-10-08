@@ -31,13 +31,13 @@ is the API's 400 detail; it never echoes key material.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Mapping
 from uuid import UUID, uuid5
 
+from orchestrator.services.datasource_config import stored_json_object
 from shared.runtime.core.workspace_ssh_identity import (
     WORKSPACE_SSH_IDENTITY_VERSION,
     SshEndpointError,
@@ -269,15 +269,6 @@ def validate_workspace_ssh_connector(
 # ---------------------------------------------------------------------------
 
 
-def _json_object(value: Any) -> dict[str, Any]:
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except ValueError:
-            return {}
-    return dict(value) if isinstance(value, Mapping) else {}
-
-
 def is_workspace_ssh_connector(ds: Mapping[str, Any]) -> bool:
     """An ``ssh_key`` connector, or a repository that authenticates by key."""
 
@@ -285,7 +276,7 @@ def is_workspace_ssh_connector(ds: Mapping[str, Any]) -> bool:
     if ds_type == "ssh_key":
         return True
     return ds_type == "repository" and repository_uses_ssh_key(
-        _json_object(ds.get("credentials"))
+        stored_json_object(ds.get("credentials"))
     )
 
 
@@ -408,8 +399,8 @@ def workspace_ssh_identity(
         raise WorkspaceSshConnectorError(
             "connector has no stable identity", code="ssh_identity_unresolvable"
         ) from exc
-    credentials = _json_object(ds.get("credentials"))
-    config = _json_object(ds.get("config"))
+    credentials = stored_json_object(ds.get("credentials"))
+    config = stored_json_object(ds.get("config"))
     if ds.get("type") == "ssh_key":
         settings = _validate_ssh_key_config(config)
         private_key = ssh_key_connector_private_key(credentials)
@@ -536,8 +527,8 @@ def apply_ssh_test_overrides(
     row["config"] = validate_workspace_ssh_connector(
         str(row.get("type")),
         connection_url=row.get("connection_url"),
-        config=_json_object(row.get("config")),
-        credentials=_json_object(row.get("credentials")),
+        config=stored_json_object(row.get("config")),
+        credentials=stored_json_object(row.get("credentials")),
         check_key=False,
     )
     return row
@@ -559,7 +550,7 @@ async def probe_workspace_ssh_connector(ds: Mapping[str, Any]) -> dict[str, Any]
 
     if (
         ds.get("type") == "ssh_key"
-        and not str(_json_object(ds.get("config")).get("host") or "").strip()
+        and not str(stored_json_object(ds.get("config")).get("host") or "").strip()
     ):
         return None
     try:

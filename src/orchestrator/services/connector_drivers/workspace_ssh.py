@@ -17,7 +17,6 @@ them at the points each driver operation needs:
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from typing import Any
 
@@ -27,6 +26,7 @@ from orchestrator.services.connector_drivers.base import (
     ConnectorDraft,
     DatasourceDriver,
 )
+from orchestrator.services.datasource_config import stored_json_object
 from orchestrator.services.workspace_ssh_connector import (
     WorkspaceSshConnectorError,
     WorkspaceSshIdentity,
@@ -35,16 +35,6 @@ from orchestrator.services.workspace_ssh_connector import (
     workspace_ssh_descriptor,
     workspace_ssh_identity,
 )
-
-
-def json_object(value: Any) -> dict[str, Any]:
-    """A stored JSONB value as a dict (a string is parsed, junk is empty)."""
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except ValueError:
-            return {}
-    return dict(value) if isinstance(value, Mapping) else {}
 
 
 class WorkspaceSshDriver(DatasourceDriver):
@@ -109,7 +99,8 @@ class WorkspaceSshDriver(DatasourceDriver):
         effective_config = config
         if effective_config is None:
             effective_config = self.unread_pins_dropped(
-                json_object(existing.get("config")), effective_credentials
+                stored_json_object(existing.get("config")),
+                effective_credentials,
             )
         checked = self.validate_endpoint(
             connection_url=draft.connection_url or existing.get("connection_url"),

@@ -15,6 +15,8 @@ detail strings move with the code rather than being re-derived by a caller.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlparse
 
@@ -25,6 +27,21 @@ from shared.runtime.utils.ssh_key import (
     InvalidSSHKeyError,
     validate_private_key as _validate_ssh_private_key,
 )
+
+
+def stored_json_object(value: Any) -> dict[str, Any]:
+    """A stored JSONB value as a dict.
+
+    asyncpg hands JSONB back as text unless a codec is registered, and a test
+    double hands back a dict: a JSON string is parsed, and anything that is
+    not an object (junk, null, a list) is an empty dict.
+    """
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {}
+    return dict(value) if isinstance(value, Mapping) else {}
 
 
 def normalize_datasource_credentials(

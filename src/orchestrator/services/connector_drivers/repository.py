@@ -27,11 +27,11 @@ from orchestrator.services.connector_drivers.base import (
     ValidationContext,
     payload_entry,
 )
-from orchestrator.services.connector_drivers.workspace_ssh import (
-    WorkspaceSshDriver,
-    json_object,
+from orchestrator.services.connector_drivers.workspace_ssh import WorkspaceSshDriver
+from orchestrator.services.datasource_config import (
+    normalize_repository_config,
+    stored_json_object,
 )
-from orchestrator.services.datasource_config import normalize_repository_config
 from orchestrator.services.workspace_ssh_connector import (
     probe_workspace_ssh_connector,
     repository_uses_ssh_key,
@@ -47,7 +47,7 @@ class RepositoryDriver(WorkspaceSshDriver):
         super().__init__(REPOSITORY_SPEC)
 
     def holds_ssh_key(self, row: Mapping[str, Any]) -> bool:
-        return repository_uses_ssh_key(json_object(row.get("credentials")))
+        return repository_uses_ssh_key(stored_json_object(row.get("credentials")))
 
     def unread_pins_dropped(
         self, config: dict[str, Any], credentials: Mapping[str, Any]
@@ -178,7 +178,7 @@ async def probe_repository(
             ),
         }
 
-    config = json_object(ds.get("config"))
+    config = stored_json_object(ds.get("config"))
     try:
         forge = normalize_repository_config(config, url)["forge"]
         owner, repo = parse_owner_repo(url or "")

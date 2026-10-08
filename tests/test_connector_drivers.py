@@ -507,3 +507,25 @@ def test_workspace_ssh_identities_are_the_drivers_answer():
     assert identity["kind"] == "ssh_key"
     assert identity["private_key"] == row["credentials"]["files"][0]["contents"]
     assert deliver() is None
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        ({"host": "h"}, {"host": "h"}),
+        ('{"host": "h"}', {"host": "h"}),
+        ("not json", {}),
+        ("[1, 2]", {}),
+        (None, {}),
+        (["host"], {}),
+    ],
+)
+def test_one_stored_json_helper_reads_the_ssh_connector_columns(stored, expected):
+    from orchestrator.services import workspace_ssh_connector
+    from orchestrator.services.connector_drivers import repository, workspace_ssh
+    from orchestrator.services.datasource_config import stored_json_object
+
+    assert stored_json_object(stored) == expected
+    # The SSH rules, the SSH driver base and the token probe share it.
+    for module in (workspace_ssh_connector, workspace_ssh, repository):
+        assert module.stored_json_object is stored_json_object
