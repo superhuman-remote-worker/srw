@@ -123,6 +123,87 @@ def test_the_privileged_workspace_variant_is_todays_profile():
     assert pod["spec"]["containers"][0]["securityContext"] == {"privileged": True}
 
 
+def test_pod_mounts_match_the_mountpoint_field_only():
+    uid = "11111111-2222-4333-8444-555555555555"
+    pod_dir = f"/var/lib/kubelet/pods/{uid}/volumes/kubernetes.io~empty-dir"
+    mountinfo = "\n".join(
+        [
+            f"1 2 0:1 / {pod_dir}/srw-cloud rw - tmpfs tmpfs rw",
+            f"3 1 0:2 / {pod_dir}/srw-cloud/root ro - fuse.rclone srw-cloud ro",
+            # The uid in another field (a bind's root, an option) is not this Pod's.
+            f"4 2 0:3 /pods/{uid} /var/lib/other rw - fuse.rclone x rw,{uid}",
+            f"5 2 0:4 / /var/lib/kubelet/pods/{uid}x/volumes/v rw - fuse.x y rw",
+        ]
+    )
+    assert spike.pod_mounts(mountinfo, uid) == [
+        (f"{pod_dir}/srw-cloud", "tmpfs"),
+        (f"{pod_dir}/srw-cloud/root", "fuse.rclone"),
+    ]
+
+
+def _recording_cluster(monkeypatch, answers):
+    """Fake subprocess.run: record every command, answer by its first words."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        joined = " ".join(argv)
+        for needle, (code, out) in answers.items():
+            if needle in joined:
+                return subprocess.CompletedProcess(argv, code, out, "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return calls
+
+
+def test_preflight_aborts_before_any_docker_exec_without_the_node(monkeypatch):
+    calls = _recording_cluster(
+        monkeypatch,
+        {
+            "get-contexts": (0, "k3d-srw\n"),
+            "get node k3d-srw-server-0": (1, ""),
+        },
+    )
+    run = spike.Spike(run_id="d7-0123456789")
+    assert run.run() == 1
+    assert not any(c[:2] == ["docker", "exec"] for c in calls)
+    assert not any("create" in c or "delete" in c or "rm" in c for c in calls)
+    assert [name for name, ok, _ in run.results if not ok] == ["spike"]
+
+
+def test_cleanup_deletes_only_what_the_run_created(monkeypatch):
+    calls = _recording_cluster(monkeypatch, {"get namespace": (1, "")})
+    run = spike.Spike(run_id="d7-0123456789")
+    run.cleanup()
+    assert not any("delete" in c for c in calls)
+    assert not any("rm" in c or "rmi" in c for c in calls)
+
+
+def test_cleanup_is_best_effort(monkeypatch):
+    def failing_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, 1)
+
+    monkeypatch.setattr(subprocess, "run", failing_run)
+    run = spike.Spike(run_id="d7-0123456789", created_namespace=True)
+    run.pod_uids = {"11111111-2222-4333-8444-555555555555"}
+    run.owned_repositories = {"srw-spike-d7-opener"}
+    run.images = {"opener": "localhost:5005/srw-spike-d7-opener:d7-0123456789"}
+    run.pushed_keys = ["opener"]
+    run.built_refs = ["localhost:5005/srw-spike-d7-opener:d7-0123456789"]
+    run.cleanup()  # every step fails, none raises
+    [(name, ok, detail)] = run.results
+    assert name == "cleanup" and not ok
+    for step in (
+        "detach",
+        "delete the namespace",
+        "registry",
+        "node image",
+        "local tag",
+    ):
+        assert step in detail
+
+
 def test_fixture_secret_carries_the_password_and_an_rclone_config():
     secret, pod, service = spike.fixture_manifests("pw", spike.rclone_config("OBSC"))
     assert set(secret["data"]) == {"password", "rclone.conf"}

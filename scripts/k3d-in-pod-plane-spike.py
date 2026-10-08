@@ -26,9 +26,10 @@ nothing outside its namespace.
 
 Checks (each PASS/FAIL; exit 0 only if all pass):
 
-  preflight  the k3d-srw context and its node container, /var/lib/kubelet a
-             shared mount on the node, docker pushes to localhost:5005, the
-             namespace absent
+  preflight  the k3d-srw context, k3d-srw-server-0 one of its nodes (before
+             any docker exec into it), k3s, /var/lib/kubelet a shared mount on
+             the node, the namespace and the spike's registry repositories
+             absent; any failure aborts the run before it creates anything
   start      (a, b) the workspace's first command sees the fuse.rclone mount
              and lists the fixture: the sidecar's startup probe held it back
   readonly   (a, b) reads work; create, overwrite, mkdir and rm fail with
@@ -45,6 +46,10 @@ Checks (each PASS/FAIL; exit 0 only if all pass):
              workspace reads the new mount without restarting
   opener     (b) SIGKILL the opener: the live mount is untouched; after a
              second rclone kill the restarted opener detaches and remounts
+  dead       (b) SIGKILL rclone twice (the second restart waits out a 10 s
+             back-off), then SIGKILL the opener over the dead mount: it
+             detaches it on start and serves again, rclone remounts, and the
+             Pod still goes without sticking Terminating
   delete     (a, b) Pod deletion unmounts within the grace period and leaves
              no mount or pod directory on the node
   hang       (a, b) SIGSTOP rclone, then delete the Pod: rclone never answers
@@ -62,13 +67,15 @@ Checks (each PASS/FAIL; exit 0 only if all pass):
   privws     (b) a privileged workspace as root (today's FUSE profile)
              remounts the mount read-write; the write reaches rclone and only
              rclone's --read-only refuses it
-  cleanup    the namespace is deleted (no privileged Pod left), no node mount
-             names a spike Pod, the spike's registry repositories and node
-             images are gone
+  cleanup    best-effort, and only what this run created: the namespace is
+             deleted (no privileged Pod left), no node mount names a spike
+             Pod, the run's registry repositories, node images and local tags
+             are gone
 
 Run with the repository venv, on k3d-srw only. It creates and deletes the
-namespace srw-spike-d7 (Pod Security privileged) and never touches another.
-At most two small Pods run at a time.
+namespace srw-spike-d7 (Pod Security privileged) and never touches another;
+it refuses to start if that namespace or its registry repositories already
+exist. At most two small Pods run at a time.
 
   .venv/bin/python scripts/k3d-in-pod-plane-spike.py            # plan
   .venv/bin/python scripts/k3d-in-pod-plane-spike.py \\
@@ -87,6 +94,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -118,8 +127,8 @@ TERM_DELAY_SECONDS = 8
 _RUN_ID_RE = re.compile(r"d7-[0-9a-f]{10}\Z")
 
 PLAN = [
-    "preflight: k3d-srw context, node container, shared /var/lib/kubelet, "
-    "registry push, namespace absent",
+    "preflight: k3d-srw context, its node k3d-srw-server-0, k3s, shared "
+    "/var/lib/kubelet, namespace and registry repositories absent (any failure aborts)",
     "images: docker/Dockerfile.in-pod-mount (opener, rclone) and upstream "
     "rclone, pushed as localhost:5005/srw-spike-d7-*:<run id>",
     f"namespace: {NAMESPACE}, Pod Security privileged, srw.io/spike=d7",
@@ -130,11 +139,15 @@ PLAN = [
     "b: opener + unprivileged rclone (in_pod_mount.py): start, readonly, "
     "isolation, privilege, restart, opener restart, delete",
     "b-crash / b-hang: the same failures (expected: the opener detaches, the Pod goes)",
+    "b-dead: the opener restarts over a dead mount during rclone's back-off",
     "b1: rclone on /dev/fd/3 with and without --allow-non-empty",
     "privws: today's privileged workspace profile against b's mount",
-    "cleanup: delete the namespace, node mounts, registry repositories, node images",
+    "cleanup: delete what this run created (namespace, node mounts, registry "
+    "repositories, node images, local tags), best-effort",
 ]
-PHASES = frozenset({"a", "a-crash", "a-hang", "b", "b-crash", "b-hang", "b1", "privws"})
+PHASES = frozenset(
+    {"a", "a-crash", "a-hang", "b", "b-crash", "b-hang", "b-dead", "b1", "privws"}
+)
 
 
 class SafetyError(RuntimeError):
@@ -430,9 +443,6 @@ def pod_b(
     workspace = workspace_container(
         plane.WORKSPACE_CLOUD_ROOT, "root", term_delay=term_delay
     )
-    if privileged_workspace:
-        # Today's FUSE profile, with a root process inside it.
-        workspace["securityContext"] = {"privileged": True}
     pod = base_pod(name, "b1" if devfd else "b", workspace)
     mount = plane.CloudMountSidecar(
         name="root", secret_name="cloud-credential", remote="cloud:"
@@ -440,6 +450,10 @@ def pod_b(
     plane.add_cloud_mount_sidecars(
         pod, mount, plane.InPodPlaneImages(opener=opener_image, rclone=rclone_image)
     )
+    if privileged_workspace:
+        # Today's FUSE profile, with a root process inside it: what the
+        # builder refuses, set afterwards to measure why.
+        workspace["securityContext"] = {"privileged": True}
     rclone = next(
         c for c in pod["spec"]["initContainers"] if c["name"] == plane.RCLONE_CONTAINER
     )
@@ -589,6 +603,36 @@ echo started
 # ---------------------------------------------------------------------------
 
 
+def registry_repositories() -> set[str]:
+    """Which of the spike's repositories the k3d registry already holds."""
+    present = set()
+    for repository in REPOSITORIES.values():
+        try:
+            with urllib.request.urlopen(
+                f"http://{PUSH_REGISTRY}/v2/{repository}/tags/list", timeout=30
+            ):
+                present.add(repository)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                raise SpikeError(f"the k3d registry answered {exc.code}") from None
+        except OSError as exc:
+            raise SpikeError(f"the k3d registry is unreachable: {exc}") from None
+    return present
+
+
+def pod_mounts(mountinfo: str, uid: str) -> list[tuple[str, str]]:
+    """(mountpoint, type) of every mount under a Pod's kubelet directory,
+    matched on mountinfo's mountpoint field, never on the whole line."""
+    prefix = f"/var/lib/kubelet/pods/{uid}/"
+    found = []
+    for line in mountinfo.splitlines():
+        fields = line.split()
+        if len(fields) < 7 or " - " not in line or not fields[4].startswith(prefix):
+            continue
+        found.append((fields[4], line.split(" - ", 1)[1].split()[0]))
+    return found
+
+
 @dataclass
 class Spike:
     run_id: str
@@ -596,7 +640,11 @@ class Spike:
     results: list[tuple[str, bool, str]] = field(default_factory=list)
     pod_uids: set[str] = field(default_factory=set)
     images: dict[str, str] = field(default_factory=dict)
-    pushed: bool = False
+    # What this run created, and so may delete: nothing else, ever.
+    created_namespace: bool = False
+    built_refs: list[str] = field(default_factory=list)
+    pushed_keys: list[str] = field(default_factory=list)
+    owned_repositories: set[str] = field(default_factory=set)
 
     def check(self, name: str, ok: bool, detail: str = "") -> bool:
         self.results.append((name, ok, detail))
@@ -763,11 +811,10 @@ class Spike:
         return False
 
     def node_mounts(self, uid: str) -> list[str]:
-        out = node("grep", uid, "/proc/self/mountinfo").stdout
+        mountinfo = node("cat", "/proc/self/mountinfo", check=True).stdout
         return [
-            f"{line.split()[4]} ({line.split(' - ')[1].split()[0]})"
-            for line in out.splitlines()
-            if " - " in line
+            f"{mountpoint} ({fstype})"
+            for mountpoint, fstype in pod_mounts(mountinfo, uid)
         ]
 
     def pod_gone(self, name: str) -> bool:
@@ -779,25 +826,38 @@ class Spike:
 
     # -- phases -----------------------------------------------------------------
     def preflight(self) -> None:
+        """Every failure here aborts the run before it creates anything."""
         contexts = run(
             ["kubectl", "config", "get-contexts", "-o", "name"], check=True
         ).stdout
         if LOCAL_CONTEXT not in contexts.split():
             raise SpikeError(f"no {LOCAL_CONTEXT} context")
+        # docker exec reaches the node container by name: it must be this
+        # cluster's node, never some other container of that name.
+        if kubectl("get", "node", NODE_CONTAINER, namespaced=False).returncode != 0:
+            raise SpikeError(f"{LOCAL_CONTEXT} has no node {NODE_CONTAINER}")
         version = kubectl("version", "-o", "json", namespaced=False, check=True).stdout
         server = json.loads(version)["serverVersion"]["gitVersion"]
-        self.check("preflight cluster", "k3s" in server, server)
+        if "k3s" not in server:
+            raise SpikeError(f"{LOCAL_CONTEXT} is not k3s: {server}")
+        self.check("preflight cluster", True, server)
         shared = node("grep", " /var/lib/kubelet ", "/proc/self/mountinfo").stdout
         tags = [f for f in shared.split() if f.startswith(("shared:", "master:"))]
+        if not any(tag.startswith("shared:") for tag in tags):
+            raise SpikeError(f"the node's /var/lib/kubelet is not shared: {tags}")
         self.check(
             "preflight shared kubelet dir",
-            any(tag.startswith("shared:") for tag in tags),
+            True,
             "node /var/lib/kubelet " + " ".join(tags),
         )
-        exists = kubectl("get", "namespace", NAMESPACE, namespaced=False)
-        if exists.returncode == 0:
+        if kubectl("get", "namespace", NAMESPACE, namespaced=False).returncode == 0:
             raise SpikeError(
-                f"{NAMESPACE} exists: delete it or wait for a previous run's cleanup"
+                f"{NAMESPACE} exists: this run would not own it; delete it first"
+            )
+        existing = registry_repositories() & set(REPOSITORIES.values())
+        if existing:
+            raise SpikeError(
+                f"registry repositories {sorted(existing)} exist: this run would not own them"
             )
 
     def build_images(self) -> None:
@@ -820,34 +880,47 @@ class Spike:
                 timeout=900,
                 check=True,
             )
+            self.built_refs.append(ref)
             self.images[target] = ref
         upstream = f"{PUSH_REGISTRY}/{REPOSITORIES['upstream']}:{tag}"
         run(["docker", "pull", "-q", UPSTREAM_RCLONE], timeout=600, check=True)
         run(["docker", "tag", UPSTREAM_RCLONE, upstream], check=True)
+        self.built_refs.append(upstream)
         self.images["upstream"] = upstream
-        self.pushed = True
-        for ref in self.images.values():
+        for key, ref in self.images.items():
+            # Preflight saw the repository absent, so the first push creates it.
+            self.owned_repositories.add(REPOSITORIES[key])
             run(["docker", "push", "-q", ref], timeout=600, check=True)
+            self.pushed_keys.append(key)
         self.check("images", True, ", ".join(sorted(self.images.values())))
 
     def node_image(self, key: str) -> str:
         return self.images[key].replace(PUSH_REGISTRY, NODE_REGISTRY, 1)
 
     def namespace(self) -> None:
-        self.apply(
-            {
-                "apiVersion": "v1",
-                "kind": "Namespace",
-                "metadata": {
-                    "name": NAMESPACE,
-                    "labels": {
-                        "srw.io/spike": "d7",
-                        "pod-security.kubernetes.io/enforce": "privileged",
-                        "pod-security.kubernetes.io/enforce-version": "v1.31",
+        # create, not apply: it fails if the namespace appeared meanwhile.
+        kubectl(
+            "create",
+            "-f",
+            "-",
+            namespaced=False,
+            check=True,
+            input=json.dumps(
+                {
+                    "apiVersion": "v1",
+                    "kind": "Namespace",
+                    "metadata": {
+                        "name": NAMESPACE,
+                        "labels": {
+                            "srw.io/spike": "d7",
+                            "pod-security.kubernetes.io/enforce": "privileged",
+                            "pod-security.kubernetes.io/enforce-version": "v1.31",
+                        },
                     },
-                },
-            }
+                }
+            ),
         )
+        self.created_namespace = True
 
     def fixture(self) -> None:
         password = secrets.token_urlsafe(24)
@@ -1093,12 +1166,63 @@ class Spike:
             f"mount and mounted anew ({stacked} mount at the target)",
         )
 
+    def opener_over_dead_mount(self) -> None:
+        """The opener restarts while rclone is down: its predecessor's mount
+        is dead, and every stat of it fails. The opener must detach it, serve
+        again, and still be there to clean up when the Pod goes."""
+        name = "b-dead"
+        self.start(pod_b(name, self.node_image("opener"), self.node_image("rclone")))
+        self.kill_container(name, "srw-cloud-mount")
+        self.wait_for(
+            "rclone's first restart",
+            lambda: self.restarts(name, "srw-cloud-mount") == (1, True),
+            60,
+        )
+        # A second crash waits out the kubelet's back-off (10 s): the mount
+        # stays dead meanwhile.
+        self.kill_container(name, "srw-cloud-mount")
+        dead = self.wait_for(
+            "the mount to be dead",
+            lambda: "Transport endpoint is not connected"
+            in self.sh(name, "workspace", "ls /cloud/root 2>&1"),
+            10,
+        )
+        self.kill_container(name, "srw-fuse-opener")
+        back = self.wait_for(
+            "the opener to serve again",
+            lambda: self.restarts(name, "srw-fuse-opener") == (1, True),
+            30,
+        )
+        opener_log = self.logs(name, "srw-fuse-opener")
+        recovered = self.wait_for(
+            "rclone to remount after its back-off",
+            lambda: self.restarts(name, "srw-cloud-mount") == (2, True),
+            90,
+        )
+        read = self.sh(name, "workspace", "cat /cloud/root/docs/readme.txt 2>&1")
+        detached = "detached 1 dead mount(s)" in opener_log
+        self.check(
+            "b opener over a dead mount",
+            dead
+            and back
+            and detached
+            and recovered
+            and "hello from the fixture" in read,
+            f"dead={dead}, opener ready again={back}, detached on start={detached}, "
+            f"rclone remounted={recovered}; opener: "
+            + " | ".join(x for x in opener_log.splitlines() if "detached" in x)[:200],
+        )
+        self.delete_and_check("b-dead delete (no stuck Terminating)", name)
+
     def detach_on_node(self, uid: str) -> int:
         """Lazily unmount a spike Pod's FUSE mounts on the node (its own)."""
+        if uid not in self.pod_uids:
+            raise SpikeError(f"Pod {uid} is not this run's")
+        mountinfo = node("cat", "/proc/self/mountinfo", check=True).stdout
         count = 0
-        for line in node("grep", uid, "/proc/self/mountinfo").stdout.splitlines():
-            if " - fuse." in line and f"/var/lib/kubelet/pods/{uid}/volumes/" in line:
-                node("umount", "-l", line.split()[4], check=True)
+        for mountpoint, fstype in pod_mounts(mountinfo, uid):
+            if fstype.startswith("fuse."):
+                node("umount", "-l", mountpoint, check=True)
                 count += 1
         return count
 
@@ -1199,26 +1323,39 @@ class Spike:
         self.delete_and_check("privws delete", name)
 
     def cleanup(self) -> None:
+        """Remove what this run created, and only that. Every step is
+        best-effort: one failing never skips the next."""
         if self.keep:
             print("--keep: leaving the namespace", flush=True)
             return
-        for uid in sorted(self.pod_uids):
-            self.detach_on_node(uid)
-        if kubectl("get", "namespace", NAMESPACE, namespaced=False).returncode == 0:
-            kubectl(
-                "delete",
-                "namespace",
-                NAMESPACE,
-                "--wait=true",
-                "--timeout=180s",
-                namespaced=False,
-                timeout=200,
+        problems: list[str] = []
+
+        def attempt(what: str, step: Callable[[], Any]) -> None:
+            try:
+                step()
+            except (SpikeError, OSError, subprocess.SubprocessError) as exc:
+                problems.append(f"{what}: {exc}")
+
+        if self.created_namespace:
+            for uid in sorted(self.pod_uids):
+                attempt(f"detach {uid}", lambda uid=uid: self.detach_on_node(uid))
+            attempt(
+                "delete the namespace",
+                lambda: kubectl(
+                    "delete",
+                    "namespace",
+                    NAMESPACE,
+                    "--wait=true",
+                    "--timeout=180s",
+                    namespaced=False,
+                    timeout=200,
+                    check=True,
+                ),
             )
-        gone = kubectl("get", "namespace", NAMESPACE, namespaced=False).returncode != 0
-        left = [m for uid in self.pod_uids for m in self.node_mounts(uid)]
-        if self.pushed:
-            for repository in REPOSITORIES.values():
-                run(
+        for repository in sorted(self.owned_repositories):
+            attempt(
+                f"registry {repository}",
+                lambda repository=repository: run(
                     [
                         "docker",
                         "exec",
@@ -1226,15 +1363,39 @@ class Spike:
                         "rm",
                         "-rf",
                         f"{REGISTRY_REPOSITORIES}/{repository}",
-                    ]
-                )
-            for key, ref in self.images.items():
-                node("crictl", "rmi", self.node_image(key))
-                run(["docker", "rmi", ref])
+                    ],
+                    check=True,
+                ),
+            )
+        for key in self.pushed_keys:
+            attempt(
+                f"node image {key}",
+                lambda key=key: node("crictl", "rmi", self.node_image(key)),
+            )
+        for ref in self.built_refs:
+            attempt(f"local tag {ref}", lambda ref=ref: run(["docker", "rmi", ref]))
+        absent: list[bool] = [not self.created_namespace]
+        if self.created_namespace:
+            attempt(
+                "read the namespace",
+                lambda: absent.append(
+                    kubectl("get", "namespace", NAMESPACE, namespaced=False).returncode
+                    != 0
+                ),
+            )
+        gone = absent[-1]
+        left: list[str] = []
+        attempt(
+            "read node mounts",
+            lambda: left.extend(
+                m for uid in self.pod_uids for m in self.node_mounts(uid)
+            ),
+        )
         self.check(
             "cleanup",
-            gone and not left,
-            f"namespace deleted={gone}, node mounts left {left}",
+            gone and not left and not problems,
+            f"namespace deleted={gone} (created by this run: {self.created_namespace}), "
+            f"node mounts left {left}, problems {problems}",
         )
 
     def run(self, phases: frozenset[str] = PHASES) -> int:
@@ -1267,6 +1428,8 @@ class Spike:
                 for mode in ("crash", "hang"):
                     if f"{approach}-{mode}" in phases:
                         self.termination(approach, mode)
+            if "b-dead" in phases:
+                self.opener_over_dead_mount()
             if "b1" in phases:
                 self.devfd()
             if "privws" in phases:
