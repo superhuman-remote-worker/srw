@@ -379,6 +379,32 @@ class TestMaterializer:
         )
         assert len(backend.files) == 1 and backend.env
 
+    def test_the_readme_names_home_paths_and_what_is_not_delivered(self):
+        """The workspace home is not /home/srw: the README says ``~``."""
+        row = _file_row(
+            "Mixed",
+            {
+                "contents": "a",
+                "target_path": "/home/srw/.netrc",
+                "mode": "0600",
+                "env_var": "NETRC",
+            },
+            {"contents": "b", "target_path": "/tmp/outside", "mode": "0600"},
+            {
+                "contents": "c",
+                "target_path": "/home/srw/x",
+                "mode": "0600",
+                "env_var": "PATH",
+            },
+        )
+        (fact,) = CredentialFileMaterializer().facts(
+            deliveries_from_payload([row]), _rt(None)
+        )
+        assert fact.lines == [
+            "- **Mixed** (file) — `~/.netrc` (`$NETRC`), "
+            "`/tmp/outside` (not delivered: outside the home), `~/x`"
+        ]
+
 
 # =============================================================================
 # End to end: the real workspace programs behind a RemoteBackend

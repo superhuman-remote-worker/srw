@@ -28,7 +28,7 @@
       "- **Local MCP** (mcp, stdio) — not connected yet",
       "",
       "### Credential Files",
-      "- **Service account** (file) — `/home/srw/.config/gcloud/sa.json`, `/home/srw/.config/gcloud/ca.pem`",
+      "- **Service account** (file) — `~/.config/gcloud/sa.json` (`$GOOGLE_APPLICATION_CREDENTIALS`), `~/.config/gcloud/ca.pem`",
       "- **Staging Cluster** (kubeconfig) — merged into `~/.kube/config`; contexts prefixed `staging-cluster-*`. Try `kubectl config get-contexts`.",
       "- **Deploy Key** (ssh_key) — use it with `ssh -o IdentityAgent=~/.ssh/srw-managed/sockets/86349e2c62065ae297413689e29f78ee.sock <user>@<host>`. The key is held by an ssh-agent and never written to disk. Key `SHA256:lbmsoA0yIEcEiVDRnMWuzm+nV+3ZEEpVIURqFoeSspg`.",
       "",
@@ -42,8 +42,7 @@
       "- **Team files** (webdav, read-write tools)",
       "- **Support inbox** (email, support@example.test, tier `draft`) — folders: `INBOX`, `Support`",
       ""
-    ],
-    "pinned_defect": "D1d fixes (L1 §6 #3): a session never materializes credential files, yet the README advertises them; a worker writes them to the agent pod, not the workspace the shell runs in"
+    ]
   },
   "readme/all_kinds_read_only": {
     "lines": [
@@ -66,7 +65,7 @@
       "- **Local MCP** (mcp, stdio) — not connected yet",
       "",
       "### Credential Files",
-      "- **Service account** (file) — `/home/srw/.config/gcloud/sa.json`, `/home/srw/.config/gcloud/ca.pem`",
+      "- **Service account** (file) — `~/.config/gcloud/sa.json` (`$GOOGLE_APPLICATION_CREDENTIALS`), `~/.config/gcloud/ca.pem`",
       "- **Staging Cluster** (kubeconfig) — merged into `~/.kube/config`; contexts prefixed `staging-cluster-*`. Try `kubectl config get-contexts`.",
       "- **Deploy Key** (ssh_key) — use it with `ssh -o IdentityAgent=~/.ssh/srw-managed/sockets/86349e2c62065ae297413689e29f78ee.sock <user>@<host>`. The key is held by an ssh-agent and never written to disk. Key `SHA256:lbmsoA0yIEcEiVDRnMWuzm+nV+3ZEEpVIURqFoeSspg`.",
       "",
@@ -80,8 +79,7 @@
       "- **Team files** (webdav, read-only tools)",
       "- **Support inbox** (email, support@example.test, tier `read`) — folders: `INBOX`, `Support`",
       ""
-    ],
-    "pinned_defect": "D1d fixes (L1 §6 #3): a session never materializes credential files, yet the README advertises them; a worker writes them to the agent pod, not the workspace the shell runs in"
+    ]
   },
   "readme/mcp_connected_with_tools": {
     "lines": [
@@ -181,11 +179,10 @@
       "### Credential Files",
       "- **Staging Cluster** (kubeconfig) — merged into `~/.kube/config`; contexts prefixed `staging-cluster-*`. Try `kubectl config get-contexts`.",
       "- **Deploy Key** (ssh_key) — use it with `ssh -o IdentityAgent=~/.ssh/srw-managed/sockets/86349e2c62065ae297413689e29f78ee.sock <user>@<host>`. The key is held by an ssh-agent and never written to disk. Key `SHA256:lbmsoA0yIEcEiVDRnMWuzm+nV+3ZEEpVIURqFoeSspg`.",
-      "- **Service account** (file) — `/home/srw/.config/gcloud/sa.json`, `/home/srw/.config/gcloud/ca.pem`",
+      "- **Service account** (file) — `~/.config/gcloud/sa.json` (`$GOOGLE_APPLICATION_CREDENTIALS`), `~/.config/gcloud/ca.pem`",
       "- **Service account** (file) — <none>",
       ""
-    ],
-    "pinned_defect": "D1d fixes (L1 §6 #3): a session never materializes credential files, yet the README advertises them; a worker writes them to the agent pod, not the workspace the shell runs in"
+    ]
   },
   "readme/declared_read_only_via_payload": {
     "lines": [

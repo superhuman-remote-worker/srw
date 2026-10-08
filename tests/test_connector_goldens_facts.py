@@ -38,11 +38,6 @@ from orchestrator.services.deployment_gates import (
 )
 from tests._connector_goldens import KINDS, PROJECT_ID, Golden, all_rows, resolved_row
 
-_SESSION_FILES_NEVER_MATERIALIZED = (
-    "D1d fixes (L1 §6 #3): a session never materializes credential files, yet "
-    "the README advertises them; a worker writes them to the agent pod, not "
-    "the workspace the shell runs in"
-)
 _DECLARED_READ_ONLY_DROPPED = (
     "the payload never forwards the publisher's declared read_only flag, so "
     "the README's 'declared read-only' advisory cannot render"
@@ -67,13 +62,8 @@ def _mcp_tools(count: int) -> list[str]:
 
 README_CASES: dict[str, ReadmeCase] = {
     "no_connectors": ReadmeCase([]),
-    "all_kinds_read_write": ReadmeCase(
-        all_rows(), pinned_defect=_SESSION_FILES_NEVER_MATERIALIZED
-    ),
-    "all_kinds_read_only": ReadmeCase(
-        all_rows(project_read_only=True),
-        pinned_defect=_SESSION_FILES_NEVER_MATERIALIZED,
-    ),
+    "all_kinds_read_write": ReadmeCase(all_rows()),
+    "all_kinds_read_only": ReadmeCase(all_rows(project_read_only=True)),
     "mcp_connected_with_tools": ReadmeCase(
         [resolved_row("mcp_remote")],
         annotate={"mcp": {"_mcp_status": "connected", "_mcp_tools": _mcp_tools(3)}},
@@ -132,7 +122,6 @@ README_CASES: dict[str, ReadmeCase] = {
             resolved_row("generic_file"),
             resolved_row("generic_file", credentials={"files": []}),
         ],
-        pinned_defect=_SESSION_FILES_NEVER_MATERIALIZED,
     ),
     "declared_read_only_via_payload": ReadmeCase(
         [

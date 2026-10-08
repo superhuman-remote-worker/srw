@@ -374,8 +374,8 @@ class CredentialFileMaterializer:
     ) -> list[FactsLines]:
         out: list[FactsLines] = []
         for delivery in deliveries:
-            ds = delivery.entry
             name = delivery.name
+            values = delivery.values("credential_file")
             if _files_slot_kind(delivery) == "kubeconfig":
                 slug = _ds_slug_hyphen(name)
                 line = (
@@ -383,10 +383,7 @@ class CredentialFileMaterializer:
                     f"contexts prefixed `{slug}-*`. Try `kubectl config get-contexts`."
                 )
             else:
-                files = (ds.get("credentials") or {}).get("files") or []
-                paths = (
-                    ", ".join(f"`{f.get('target_path')}`" for f in files) or "<none>"
-                )
+                paths = ", ".join(_fact_path(value) for value in values) or "<none>"
                 line = f"- **{name}** (file) — {paths}"
             out.append(FactsLines("Credential Files", delivery.index, [line]))
         return out
@@ -399,3 +396,13 @@ def _files_slot_kind(delivery: Delivery) -> str | None:
         (slot.kind for slot in delivery.spec.credential_slots if slot.name == "files"),
         None,
     )
+
+
+def _fact_path(value: Any) -> str:
+    path = str(value.get("path") or "")
+    relative, refused = home_target(path)
+    if relative is None:
+        return f"`{path}` (not delivered: {refused})"
+    env_var = value.get("env_var")
+    named = bool(env_var) and _usable_env_name(env_var)
+    return f"`~/{relative}`" + (f" (`${env_var}`)" if named else "")
