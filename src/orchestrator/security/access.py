@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections.abc import Mapping
 from typing import Any, Awaitable, Callable, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
@@ -1029,12 +1030,19 @@ def redact_datasource(ds: dict[str, Any]) -> dict[str, Any]:
         return ds
     out = dict(ds)
     # A slot whose key names the spec makes visible (the credentials
-    # connector's environment) shows them, never their values.
+    # connector's environment) shows them, never their values: only an
+    # object's keys are names; any other stored shape shows none.
     spec = spec_for_row(ds)
+    credentials = ds.get("credentials")
     for slot in spec.credential_slots if spec is not None else ():
         if slot.names_field:
-            out[slot.names_field] = sorted(
-                (ds.get("credentials") or {}).get(slot.name, {})
+            value = (
+                credentials.get(slot.name) if isinstance(credentials, Mapping) else None
+            )
+            out[slot.names_field] = (
+                sorted(str(name) for name in value)
+                if isinstance(value, Mapping)
+                else []
             )
     out.pop("credentials", None)
     out.pop("connection_url_redacted", None)

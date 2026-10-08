@@ -229,6 +229,42 @@ class TestRedactDatasource:
         assert out["connection_url"] == value
         assert "connection_url_redacted" not in out
 
+    def test_a_credentials_connector_shows_its_variable_names_only(self):
+        out = access.redact_datasource(
+            {
+                "type": "credentials",
+                "credentials": {"env_vars": {"B_TOKEN": "b-secret", "A_KEY": "a"}},
+            }
+        )
+        assert out["env_var_names"] == ["A_KEY", "B_TOKEN"]
+        assert "credentials" not in out
+        assert "b-secret" not in repr(out)
+
+    def test_a_generic_connector_shows_no_names(self):
+        out = access.redact_datasource(
+            {"type": "generic", "credentials": {"env_vars": {"TOKEN": "secret"}}}
+        )
+        assert "env_var_names" not in out
+
+    @pytest.mark.parametrize(
+        "stored",
+        [
+            # A string or a list where the object should be: no names, and
+            # none of its characters or items.
+            {"env_vars": "API_KEY=s3cret-value"},
+            {"env_vars": ["API_KEY=s3cret-value", "OTHER=x"]},
+            {"env_vars": None},
+            {},
+            "an-encrypted-blob-that-did-not-decrypt",
+            ["s3cret-value"],
+            None,
+        ],
+    )
+    def test_a_malformed_slot_leaks_nothing(self, stored):
+        out = access.redact_datasource({"type": "credentials", "credentials": stored})
+        assert out["env_var_names"] == []
+        assert "s3cret" not in repr(out)
+
 
 # =============================================================================
 # user_can_access_datasource — admin / creator / project member

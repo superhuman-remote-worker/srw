@@ -68,6 +68,37 @@ _DRIVER_NAME = re.compile(DRIVER_NAME_PATTERN)
 _PROTOCOL = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 _EGRESS_PROTOCOLS = frozenset({"tcp", "udp"})
 _FIELD_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
+#: Fields a connector read already carries: the datasource row's columns and
+#: what the API adds to it. A slot's ``names_field`` may not shadow one.
+RESERVED_READ_FIELDS: frozenset[str] = frozenset(
+    {
+        "id",
+        "name",
+        "description",
+        "type",
+        "connection_url",
+        "connection_url_redacted",
+        "credentials",
+        "cli_hint",
+        "default_branch",
+        "config",
+        "job_id",
+        "project_id",
+        "created_by",
+        "created_at",
+        "updated_at",
+        "is_global",
+        "read_only",
+        "scope_mode",
+        "auto_attach",
+        "policy_revision",
+        "project_ids",
+        "project_count",
+        "project_read_only",
+        "default_selected",
+        "unavailable",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +131,8 @@ class CredentialSlot:
     how an edit treats the stored value: a blank edit keeps it, a merge adds
     keys, a replace swaps the whole object.  ``names_field``, when set, is the
     field a connector read shows the slot's key names under (never their
-    values), so an editor can tell what a merge adds to.
+    values), so an editor can tell what a merge adds to.  It needs the slot's
+    value to be an object, and may not shadow a field the read already has.
     """
 
     name: str
@@ -314,9 +346,37 @@ def _slot_problems(spec: DriverSpec) -> list[str]:
             problems.append(f"slot {slot.name!r} update {slot.update!r} is invalid")
         if not isinstance(slot.schema, Mapping):
             problems.append(f"slot {slot.name!r} schema must be an object")
-        if slot.names_field is not None and not _FIELD_NAME.fullmatch(slot.names_field):
-            problems.append(f"slot {slot.name!r} names_field is not a field name")
+        if slot.names_field is not None:
+            problems += _names_field_problems(slot)
         unknown = sorted(set(slot.access_levels) - level_ids)
         if unknown:
             problems.append(f"slot {slot.name!r} names unknown access levels {unknown}")
+    fields = [slot.names_field for slot in spec.credential_slots if slot.names_field]
+    if len(fields) != len(set(fields)):
+        problems.append("credential slot names_field values are not unique")
+    return problems
+
+
+def _names_field_problems(slot: CredentialSlot) -> list[str]:
+    """A names field shows the keys of an object-valued slot, nowhere else."""
+    problems: list[str] = []
+    field_name = slot.names_field or ""
+    if not _FIELD_NAME.fullmatch(field_name):
+        problems.append(f"slot {slot.name!r} names_field is not a field name")
+    elif field_name in RESERVED_READ_FIELDS:
+        problems.append(
+            f"slot {slot.name!r} names_field {field_name!r} is a connector read field"
+        )
+    schema = slot.schema if isinstance(slot.schema, Mapping) else {}
+    properties = schema.get("properties")
+    value = properties.get(slot.name) if isinstance(properties, Mapping) else None
+    if (
+        schema.get("type") != "object"
+        or not isinstance(value, Mapping)
+        or value.get("type") != "object"
+    ):
+        problems.append(
+            f"slot {slot.name!r} names_field needs an object-typed "
+            f"{slot.name!r} in the slot schema"
+        )
     return problems

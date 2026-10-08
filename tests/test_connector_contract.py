@@ -183,6 +183,52 @@ class TestValidateSpec:
         )
         assert "names_field is not a field name" in "\n".join(validate_spec(spec))
 
+    @pytest.mark.parametrize("field", ["name", "created_by", "id", "type", "config"])
+    def test_a_names_field_cannot_shadow_a_read_field(self, field):
+        slot = replace(GENERIC_SPEC.credential_slots[0], names_field=field)
+        problems = "\n".join(
+            validate_spec(replace(GENERIC_SPEC, credential_slots=(slot,)))
+        )
+        assert f"names_field {field!r} is a connector read field" in problems
+
+    @pytest.mark.parametrize(
+        "schema",
+        [
+            {"type": "object", "properties": {"env_vars": {"type": "string"}}},
+            {"type": "object", "properties": {"env_vars": {"type": "array"}}},
+            {"type": "object", "properties": {}},
+            {"type": "object"},
+            {"type": "string"},
+        ],
+    )
+    def test_a_names_field_needs_an_object_valued_slot(self, schema):
+        slot = replace(
+            GENERIC_SPEC.credential_slots[0], schema=schema, names_field="env_names"
+        )
+        problems = "\n".join(
+            validate_spec(replace(GENERIC_SPEC, credential_slots=(slot,)))
+        )
+        assert "names_field needs an object-typed 'env_vars'" in problems
+
+    def test_names_fields_are_unique_across_slots(self):
+        first = replace(GENERIC_SPEC.credential_slots[0], names_field="env_names")
+        second = replace(
+            first,
+            name="other_vars",
+            schema={
+                "type": "object",
+                "properties": {"other_vars": {"type": "object"}},
+            },
+        )
+        problems = validate_spec(
+            replace(GENERIC_SPEC, credential_slots=(first, second))
+        )
+        assert "credential slot names_field values are not unique" in problems
+        unique = replace(second, names_field="other_names")
+        assert (
+            validate_spec(replace(GENERIC_SPEC, credential_slots=(first, unique))) == []
+        )
+
 
 # =============================================================================
 # What other code asks the specs (slice D1c)
