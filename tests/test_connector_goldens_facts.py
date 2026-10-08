@@ -173,16 +173,11 @@ class NoteCase:
     pinned_defect: str | None = None
 
 
-_DEAD_CLI_NOTE = (
-    "D1 deletes (L1 §6 #7): the read-write managed note describes the retired "
-    "CLI mode (psql/cypher-shell/mongosh and env vars the workspace never gets)"
-)
 _UNTYPED_NOTE = (
     "falls through to the bare connector note and the database retrieval phrases"
 )
 
 _READ_WRITE_NOTE_DEFECTS = {
-    **dict.fromkeys(("postgresql", "neo4j", "mongodb"), _DEAD_CLI_NOTE),
     **dict.fromkeys(
         ("generic_file", "kubeconfig", "ssh_key", "email", "mcp_remote", "mcp_stdio"),
         _UNTYPED_NOTE,
