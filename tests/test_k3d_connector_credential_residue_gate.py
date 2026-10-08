@@ -243,6 +243,18 @@ def test_secrets_and_bearer_never_appear_in_an_argument() -> None:
         ({"status": "failed", "llm_failure": True}, "LLM unavailable"),
         ({"status": "paused", "llm_failure": True}, "LLM unavailable"),
         ({"status": "failed", "llm_failure": False}, "job stopped"),
+        (
+            {
+                "status": "paused",
+                "llm_failure": False,
+                "parked": "worker_execution_outcome_unknown",
+            },
+            r"job stopped \(its unit parked: worker_execution_outcome_unknown\)",
+        ),
+        (
+            {"status": "paused", "llm_failure": False, "parked": "Bad Reason!"},
+            r"job stopped \(its unit parked: \?\)",
+        ),
     ],
 )
 def test_early_stop_fails_clearly(row, message) -> None:
@@ -252,6 +264,24 @@ def test_early_stop_fails_clearly(row, message) -> None:
         runner.workspace()
     assert "before the scans could run" in str(raised.value)
     assert "muse-spark-1.3-contributor" in str(raised.value)
+
+
+def test_a_paused_job_whose_unit_is_not_parked_is_still_waited_for() -> None:
+    """A pinned job paused for re-dispatch runs again on its own."""
+    row = {"status": "paused", "llm_failure": False, "parked": None}
+    runner = gate.Gate(gate.validate_config(_args()), _FakeKube([row]), "pw")
+    runner.job_id = str(uuid4())
+    assert runner.alive(row) is row
+
+
+def test_the_job_row_reads_only_a_parked_unit_reason() -> None:
+    kube = _FakeKube([{"status": "processing"}])
+    runner = gate.Gate(gate.validate_config(_args()), kube, "pw")
+    runner.job_id = str(uuid4())
+    runner.job_row()
+    query = kube.calls[-1][1]
+    assert "'parked', (SELECT coalesce(q.park_reason, 'parked')" in query
+    assert "q.state = 'parked'" in query
 
 
 def test_paused_on_llm_outage_after_the_scans_still_fails() -> None:

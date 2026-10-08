@@ -87,6 +87,7 @@ _MARKER_RE = re.compile(r"[A-Za-z0-9+/=]{20,}\Z")
 _POD_RE = re.compile(r"[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?\Z")
 _HOST_RE = re.compile(r"[A-Za-z0-9.:-]{1,253}\Z")
 _MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,199}\Z")
+_PARK_REASON_RE = re.compile(r"[a-z0-9_]{1,64}\Z")
 
 
 class SafetyError(RuntimeError):
@@ -938,7 +939,9 @@ class Gate:
             "context->'workspace_container', 'agent', (SELECT a.hostname FROM "
             "agents a WHERE a.id = j.assigned_agent_id), 'leased_by', (SELECT "
             "coalesce(q.leased_by, q.last_leased_by) FROM run_queue q WHERE "
-            "q.unit_id = j.id), 'llm_failure', lower(concat_ws(' ', "
+            "q.unit_id = j.id), 'parked', (SELECT coalesce(q.park_reason, "
+            "'parked') FROM run_queue q WHERE q.unit_id = j.id AND q.state = "
+            "'parked'), 'llm_failure', lower(concat_ws(' ', "
             "j.error_message, j.freeze_data::text, j.context->>'llm_outage')) "
             f"~ '{'|'.join(_LLM_FAILURE_WORDS)}') FROM jobs j "
             f"WHERE j.id = '{self.job_id}';",
@@ -947,14 +950,26 @@ class Gate:
         return json.loads(raw) if raw else {}
 
     def alive(self, row: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Fail clearly when the job stops before the scans could run."""
+        """Fail clearly when the job stops before the scans could run.
+
+        A paused job whose run-queue unit is parked (a stateless worker's
+        lost lease, say) never runs again without an operator, so it stops
+        the gate too, naming the park reason, instead of a scan timing out.
+        """
         row = row if row is not None else self.job_row()
         status = row.get("status")
+        parked = row.get("parked")
         stopped = status in {"failed", "cancelled"} or (
-            status == "paused" and row.get("llm_failure")
+            status == "paused" and (row.get("llm_failure") or parked)
         )
         if stopped and not self.scans_started:
-            cause = "LLM unavailable" if row.get("llm_failure") else "job stopped"
+            if row.get("llm_failure"):
+                cause = "LLM unavailable"
+            elif status == "paused" and parked:
+                reason = parked if _PARK_REASON_RE.fullmatch(str(parked)) else "?"
+                cause = f"job stopped (its unit parked: {reason})"
+            else:
+                cause = "job stopped"
             raise GateFailure(
                 f"{cause}: job {status} before the scans could run "
                 f"(model {self.config.model})"
