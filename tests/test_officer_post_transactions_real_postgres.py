@@ -4419,6 +4419,108 @@ async def test_no_force_officer_refusal_keeps_preflight_hidden_and_abortable(db)
     )
 
 
+async def _officer_lease(db: PostgresDB, thread_id: str):
+    """A lease probe connector and the Officer session's credential lease."""
+    from orchestrator.security.crypto import encrypt
+    from orchestrator.services import connector_credential_leases as leases
+
+    connector_id = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO datasources (id, name, type, scope_mode, policy_revision, "
+            "credentials, config) VALUES ($1, $2, 'lease_probe', 'all', 1, "
+            "$3::jsonb, '{}'::jsonb)",
+            connector_id,
+            f"officer-probe-{str(connector_id)[:8]}",
+            json.dumps(encrypt(json.dumps({"secret": "officer-secret"}))),
+        )
+        lease = await leases.issue_or_redeliver(
+            conn,
+            owner=leases.LeaseOwner.thread(thread_id),
+            connector_id=str(connector_id),
+            driver="srw.lease-probe/v1",
+            access="ReadWrite",
+        )
+    return lease
+
+
+async def _lease_row(db: PostgresDB, lease_id: str):
+    async with db.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT revoked_at, revoke_reason FROM connector_credential_leases "
+            "WHERE id = $1",
+            UUID(lease_id),
+        )
+
+
+@pytest.mark.asyncio
+async def test_an_authorized_officer_decommission_revokes_the_session_leases(db):
+    """The decommission is the Officer's retirement authorization edge
+    (connector drivers C2): its transaction revokes the session's leases.
+    The Begin before it is a hidden preflight and revokes nothing."""
+    seed = await _seed_post(db)
+    lease = await _officer_lease(db, seed["thread_id"])
+    retirement = await db.begin_pinned_thread_retirement(
+        seed["thread_id"], permanent=False, settle_status="ended"
+    )
+    assert (await _lease_row(db, lease.id))["revoked_at"] is None
+
+    result = await db.decommission_project_officer(
+        seed["project_id"],
+        seed["thread_id"],
+        reason="retired with a lease",
+        retirement_token=retirement["token"],
+        retirement_generation=retirement["generation"],
+        retirement_settle_status="ended",
+    )
+
+    assert result["transitioned"] is True
+    row = await _lease_row(db, lease.id)
+    assert row["revoked_at"] is not None
+    assert row["revoke_reason"] == "session_end"
+    async with db.acquire() as conn:
+        audited = await conn.fetchval(
+            "SELECT count(*) FROM security_events "
+            "WHERE event_type = 'connector_lease_revoked' AND resource_id = $1",
+            lease.id,
+        )
+    assert audited == 1
+
+
+@pytest.mark.asyncio
+async def test_a_refused_officer_decommission_leaves_the_session_lease_live(db):
+    seed = await _seed_post(db)
+    await _seed_officer_job(
+        db,
+        seed,
+        thread_id=seed["thread_id"],
+        status="processing",
+        label="in-flight lease proof",
+    )
+    lease = await _officer_lease(db, seed["thread_id"])
+    retirement = await db.begin_pinned_thread_retirement(
+        seed["thread_id"], permanent=False, settle_status="ended"
+    )
+
+    result = await db.decommission_project_officer(
+        seed["project_id"],
+        seed["thread_id"],
+        reason="no-force refusal with a lease",
+        force=False,
+        retirement_token=retirement["token"],
+        retirement_generation=retirement["generation"],
+        retirement_settle_status="ended",
+    )
+
+    assert result["blocked_by_in_flight"] is True
+    assert (await _lease_row(db, lease.id))["revoked_at"] is None
+    assert await db.abort_pinned_thread_retirement(
+        seed["thread_id"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+    )
+
+
 @pytest.mark.asyncio
 async def test_repeated_decommission_is_idempotent_and_stages_one_fallback(db):
     seed = await _seed_post(
