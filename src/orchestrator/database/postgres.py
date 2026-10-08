@@ -5146,6 +5146,16 @@ class PostgresDB:
                     """,
                     uuid_val,
                 )
+                # Revoke before the row goes (connector drivers C2): the
+                # lease rows cascade with the Job below, so the audited
+                # revocation is written first, in this same transaction.
+                from orchestrator.services.connector_credential_leases import (
+                    revoke_execution_leases,
+                )
+
+                await revoke_execution_leases(
+                    conn, job_id=uuid_val, reason="job_deleted"
+                )
                 if prepared_stateless:
                     queue_result = await conn.execute(
                         "DELETE FROM run_queue "
@@ -5270,6 +5280,14 @@ class PostgresDB:
                     "AND status NOT IN ('completed','cancelled')",
                     uuid_val,
                 )
+                if result == "UPDATE 1":
+                    from orchestrator.services.connector_credential_leases import (
+                        revoke_execution_leases,
+                    )
+
+                    await revoke_execution_leases(
+                        conn, job_id=uuid_val, reason="job_cancelled"
+                    )
 
         cancelled = result == "UPDATE 1"
         if cancelled:
@@ -5367,6 +5385,13 @@ class PostgresDB:
                     expected_status,
                 )
                 if result == "UPDATE 1":
+                    from orchestrator.services.connector_credential_leases import (
+                        revoke_execution_leases,
+                    )
+
+                    await revoke_execution_leases(
+                        conn, job_id=uuid_val, reason="job_cancelled"
+                    )
                     recovery_cancellation = (
                         await self._resolve_workspace_recovery_cancel_participant(
                             conn, uuid_val
@@ -5580,6 +5605,13 @@ class PostgresDB:
                         "|| '{\"_stateless_cancel_cleanup_pending\": true}'::jsonb "
                         "WHERE id=$1",
                         job_uuid,
+                    )
+                    from orchestrator.services.connector_credential_leases import (
+                        revoke_execution_leases,
+                    )
+
+                    await revoke_execution_leases(
+                        conn, job_id=job_uuid, reason="job_cancelled"
                     )
                     recovery_cancellation = (
                         await self._resolve_workspace_recovery_cancel_participant(
@@ -43033,6 +43065,16 @@ class PostgresDB:
                 )
                 if admitted is None:
                     return {"state": "conflict", "reason": "authority_changed"}
+                # End, cancel, drain and a lost runtime all Begin here: the
+                # earliest durable terminal decision revokes the session's
+                # credential leases (connector drivers C2) in its transaction.
+                from orchestrator.services.connector_credential_leases import (
+                    revoke_execution_leases,
+                )
+
+                await revoke_execution_leases(
+                    conn, thread_id=parsed_thread_id, reason="session_end"
+                )
                 # A hidden owner preflight is still abortable. It fences
                 # grants through the thread token, but cancellation becomes
                 # durable only at the irrevocable authorization edge.
@@ -46198,6 +46240,15 @@ class PostgresDB:
                     raise RuntimeError(
                         "stateless session retirement lost thread authority"
                     )
+                # The End decision revokes the session's credential leases
+                # (connector drivers C2) in the same transaction.
+                from orchestrator.services.connector_credential_leases import (
+                    revoke_execution_leases,
+                )
+
+                await revoke_execution_leases(
+                    conn, thread_id=thread_id, reason="session_end"
+                )
                 return {
                     "state": "closed",
                     "terminal_token": terminal_token,

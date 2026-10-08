@@ -192,7 +192,9 @@ def build_application_resources(
         catalogue_resources=CatalogueResources(
             config_dir=lambda: catalogue_config_dir()
         ),
-        connector_drivers=builtin_connector_drivers(),
+        connector_drivers=builtin_connector_drivers(
+            lease_probe=settings.connector_lease_probe_enabled
+        ),
     )
     # Every infrastructure-metering gate defaults off until startup decides
     # which paths this process runs (``lifecycle.open_stores``).

@@ -60,8 +60,19 @@ class ConnectorDriverRegistry:
         return tuple(self._by_type)
 
 
-def builtin_connector_drivers() -> ConnectorDriverRegistry:
-    """The drivers SRW ships, in catalogue order."""
+def builtin_connector_drivers(*, lease_probe: bool = False) -> ConnectorDriverRegistry:
+    """The drivers SRW ships, in catalogue order.
+
+    ``lease_probe`` adds the development lease probe driver after them
+    (``orchestrator.connectorLeases.probeDriver``, slice C2).
+    """
     from orchestrator.services.connector_drivers import builtin
 
-    return ConnectorDriverRegistry(builtin.drivers())
+    drivers: tuple[ConnectorDriver, ...] = builtin.drivers()
+    if lease_probe:
+        from orchestrator.services.connector_drivers.lease_probe import (
+            LeaseProbeDriver,
+        )
+
+        drivers += (LeaseProbeDriver(),)
+    return ConnectorDriverRegistry(drivers)

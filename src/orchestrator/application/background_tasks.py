@@ -16,6 +16,7 @@ from typing import Any
 
 from orchestrator.application import (
     completion as completion_composition,
+    connectors as connectors_composition,
     controls as controls_composition,
     jobs as jobs_composition,
     projects as projects_composition,
@@ -31,6 +32,7 @@ from orchestrator.services import (
     audit_usage,
     cloud_pricing,
     completion_recovery as completion_recovery_operations,
+    connector_credential_leases,
     container_provisioner as container_provisioner_module,
     cron_dispatcher,
     ide_session,
@@ -107,6 +109,8 @@ BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
     "completion_monitor",
     "security_events_prune",
     "ssh_attachments_prune",
+    "connector_lease_sweeper",
+    "connector_lease_exchange",
     "checkpoint_retention",
     "headless_notify",
     "attention_sleep",
@@ -444,6 +448,29 @@ async def start_background_tasks(
             resources.shutdown_event, store=resources.postgres_db
         ),
     )
+    # Credential leases (connector drivers C2): renew the leases of live
+    # executions and retire expired ones. Leader-gated: one renewer is
+    # enough, and a renewal is re-derived from durable state, so a pass a
+    # leadership change cancels is simply run again by the next leader.
+    tasks.start_leader_gated(
+        "connector_lease_sweeper",
+        functools.partial(
+            connector_credential_leases.connector_lease_sweeper,
+            store=resources.postgres_db,
+        ),
+    )
+    # The lease exchange's own port, on every replica (drivers reach it
+    # through the Service). Off unless the chart sets the port.
+    exchange_port = resources.settings.connector_lease_exchange_port
+    if exchange_port:
+        tasks.start(
+            "connector_lease_exchange",
+            connectors_composition.serve_connector_lease_exchange(
+                resources,
+                port=exchange_port,
+                shutdown_event=resources.shutdown_event,
+            ),
+        )
     # In-flight checkpoint retention: bound every live thread's LangGraph
     # checkpoints to the newest N while it runs (leader-gated), so a long job
     # can't fill the checkpointer PVC before it terminates.

@@ -1006,6 +1006,13 @@ class TestEndThread:
             reason="force_end",
             epoch_already_bumped=False,
         )
+        # End revokes the session's credential leases in this transaction (C2).
+        (revoke,) = [
+            call
+            for call in conn.fetch.await_args_list
+            if "UPDATE connector_credential_leases" in call.args[0]
+        ]
+        assert revoke.args[1:] == ("tid-1", "session_end")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("permanent", [False, True])

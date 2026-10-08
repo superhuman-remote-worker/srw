@@ -46,6 +46,7 @@ from shared.workspace_recovery import (
 
 from orchestrator.security.access import vm_workspaces_on_pod_network
 from orchestrator.services import (
+    connector_credential_leases,
     dispatch_credentials,
     job_start_bundle,
     job_workspace_authority,
@@ -129,6 +130,35 @@ class _WorkspaceRecoveryRefusal(HTTPException):
     ):
         super().__init__(409, detail)
         self.code = code
+
+
+async def _deliver_claim_leases(
+    conn: Any,
+    entries: Any,
+    *,
+    owner: connector_credential_leases.LeaseOwner,
+    refusal: str,
+) -> None:
+    """Put lease tokens into a claim's datasources, in its transaction.
+
+    A lease that cannot be delivered refuses the claim with the lane's
+    generic detail (the reason stays in the server log), so the transaction
+    rolls back and no bundle crosses the credential boundary.
+    """
+    if not connector_credential_leases.needs_leases(entries):
+        return
+    try:
+        await connector_credential_leases.deliver_connector_leases(
+            conn, entries, owner=owner
+        )
+    except connector_credential_leases.LeaseDeliveryError as exc:
+        logger.warning(
+            "Claim refused: connector leases unavailable for %s %s (%s)",
+            owner.kind,
+            owner.id,
+            exc,
+        )
+        raise HTTPException(status_code=409, detail=refusal) from exc
 
 
 def _digest(value: Any) -> str:
@@ -666,6 +696,7 @@ async def _assemble_claim_bundle(
         job_start = await job_start_bundle.build_job_start_request(
             attested_job,
             persist_dispatch_state=False,
+            deliver_connector_leases=False,
             dependencies=dependencies.job_start_bundle_dependencies(),
         )
         if job_start is None:
@@ -861,6 +892,15 @@ async def _assemble_claim_bundle(
                 )
                 if not authorized:
                     raise HTTPException(403, "Lease validation failed")
+                # Credential leases (connector drivers C2), in the claim
+                # transaction: only the claimant whose run_queue lease was
+                # just re-checked receives a lease token.
+                await _deliver_claim_leases(
+                    conn,
+                    job_start.datasources,
+                    owner=connector_credential_leases.job_lease_owner(job),
+                    refusal="Job bundle assembly refused",
+                )
         return {
             "unit_id": unit_id,
             "job_id": unit_id,
@@ -1061,6 +1101,15 @@ async def _assemble_claim_bundle(
                     # set the previous turn saved (only a lease holder
                     # writes it, and this claim now holds the lease).
                     pending_memory = pending_memory_from_metadata(final_metadata)
+                if lease_still_current:
+                    # Credential leases (C2), under the same thread row lock
+                    # and claim stamp: the same token on every turn.
+                    await _deliver_claim_leases(
+                        conn,
+                        attach.get("datasources"),
+                        owner=connector_credential_leases.LeaseOwner.thread(unit_id),
+                        refusal="Attach assembly refused",
+                    )
     if not lease_still_current:
         raise HTTPException(status_code=403, detail="Lease validation failed")
     _t_end = time.perf_counter()

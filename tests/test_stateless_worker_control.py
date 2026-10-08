@@ -474,10 +474,15 @@ async def test_leased_cancel_publishes_status_without_pruning_checkpoint():
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
     conn.fetchval = AsyncMock(return_value=False)
+    conn.fetch = AsyncMock(return_value=[])
     db = _db_with_conn(conn)
 
     assert await db.cancel_stateless_job(JOB_ID) == (True, False)
     db.delete_checkpoint_thread.assert_not_awaited()
+    # The cancel transaction revokes the Job's credential leases (C2).
+    revoke = conn.fetch.await_args
+    assert "UPDATE connector_credential_leases" in revoke.args[0]
+    assert revoke.args[1:] == (str(UUID(JOB_ID)), "job_cancelled")
     job_update = next(
         call
         for call in conn.fetchrow.await_args_list
@@ -758,10 +763,15 @@ async def test_final_prepared_delete_removes_queue_and_job_atomically():
         raise AssertionError(normalized)
 
     conn.execute = AsyncMock(side_effect=execute)
+    conn.fetch = AsyncMock(return_value=[])
     db = _db_with_conn(conn)
 
     assert await db.delete_job(JOB_ID, prepared_stateless=True)
     assert lock_order == ["queue", "docker_advisory", "job"]
+    # Revoked before the row goes: the lease rows cascade with the Job (C2).
+    revoke = conn.fetch.await_args
+    assert "UPDATE connector_credential_leases" in revoke.args[0]
+    assert revoke.args[1:] == (str(UUID(JOB_ID)), "job_deleted")
     assert (
         conn.fetchrow.await_args_list[0]
         .args[0]

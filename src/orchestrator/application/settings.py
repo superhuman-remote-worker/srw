@@ -27,8 +27,37 @@ SESSION_SUBAGENT_FANOUT_LANES_ENV = "SESSION_SUBAGENT_FANOUT_LANES"
 _SESSION_SUBAGENT_FANOUT_LANE_NAMES = frozenset({LANE_STATELESS, LANE_PINNED})
 
 
+#: The credential lease exchange's dedicated port (slice C2).
+CONNECTOR_LEASE_EXCHANGE_PORT_ENV = "CONNECTOR_LEASE_EXCHANGE_PORT"
+_MAIN_PORT = 8085
+
+
 def _enabled(name: str, default: str = "false") -> bool:
     return os.environ.get(name, default).lower() in ("true", "1", "yes")
+
+
+def parse_exchange_port(raw: str | None) -> int | None:
+    """The exchange port from ``CONNECTOR_LEASE_EXCHANGE_PORT``.
+
+    Unset, empty or ``0`` is off. A value that is not a port, or is the main
+    API port, is off with a warning: the exchange must never share a port
+    with the rest of the API.
+    """
+    value = (raw or "").strip()
+    if not value or value == "0":
+        return None
+    try:
+        port = int(value)
+    except ValueError:
+        port = -1
+    if not 1 <= port <= 65535 or port == _MAIN_PORT:
+        logger.warning(
+            "%s=%r is not a dedicated port; the lease exchange is off",
+            CONNECTOR_LEASE_EXCHANGE_PORT_ENV,
+            raw,
+        )
+        return None
+    return port
 
 
 def parse_session_subagent_fanout_lanes(raw: str | None) -> frozenset[str]:
@@ -109,6 +138,13 @@ class DeploymentSettings:
     #: an SSH connector without a pin of its own is checked against.
     #: Empty means such connectors trust a host on first use.
     workspace_ssh_known_hosts: str = ""
+    #: The credential lease exchange's own port
+    #: (``orchestrator.connectorLeases.exchangePort``, slice C2); ``None``
+    #: serves no exchange. Never the main port.
+    connector_lease_exchange_port: int | None = None
+    #: Install the development lease probe driver (``srw.lease-probe/v1``,
+    #: ``orchestrator.connectorLeases.probeDriver``). Off by default.
+    connector_lease_probe_enabled: bool = False
 
     def session_subagent_fanout(self, lane: str | None) -> bool:
         """Whether a session on ``lane`` may fan out right now."""
@@ -144,11 +180,17 @@ class DeploymentSettings:
                 os.environ.get(SESSION_SUBAGENT_FANOUT_LANES_ENV)
             ),
             workspace_ssh_known_hosts=os.environ.get(WORKSPACE_SSH_KNOWN_HOSTS_ENV, ""),
+            connector_lease_exchange_port=parse_exchange_port(
+                os.environ.get(CONNECTOR_LEASE_EXCHANGE_PORT_ENV)
+            ),
+            connector_lease_probe_enabled=_enabled("CONNECTOR_LEASE_PROBE_ENABLED"),
         )
 
 
 __all__ = [
+    "CONNECTOR_LEASE_EXCHANGE_PORT_ENV",
     "SESSION_SUBAGENT_FANOUT_LANES_ENV",
     "DeploymentSettings",
+    "parse_exchange_port",
     "parse_session_subagent_fanout_lanes",
 ]

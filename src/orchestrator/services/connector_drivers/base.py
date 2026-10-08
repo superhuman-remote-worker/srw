@@ -390,6 +390,21 @@ class SupportsWorkspaceSshIdentity(Protocol):
 
 
 @runtime_checkable
+class SupportsCredentialLease(Protocol):
+    """A driver whose upstream credential SRW hands out through a lease.
+
+    The lease exchange (slice C2) calls this after it has authorized a
+    driver identity and a live lease of the connector; the agent never sees
+    what it returns.
+    """
+
+    def lease_upstream(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        """``{"credential": str, "allowed_upstream": [str, ...]}`` for a
+        decrypted connector row; ``ValueError`` when it holds none."""
+        ...
+
+
+@runtime_checkable
 class SupportsIndexOperations(Protocol):
     """A connector SRW indexes: delete through the index fence, status, reindex."""
 

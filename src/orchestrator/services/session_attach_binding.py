@@ -76,6 +76,7 @@ from uuid import UUID, uuid4
 
 import httpx
 
+from orchestrator.services import connector_credential_leases
 from orchestrator.services.container_provisioner import (
     WORKSPACE_RUNTIME_INCARNATION_KEY,
 )
@@ -929,6 +930,23 @@ async def send_session_attach_locked(
         config_name=config_name,
         runtime_agent_id=agent_id,
     )
+    if payload is not None:
+        # Credential leases (connector drivers C2), under the datasource lock
+        # the caller holds: a warm re-attach or a recycled pod receives the
+        # thread's same token; a failed attach revokes nothing.
+        try:
+            await connector_credential_leases.deliver_connector_leases_with(
+                store,
+                payload.get("datasources"),
+                owner=connector_credential_leases.LeaseOwner.thread(thread_id),
+            )
+        except connector_credential_leases.LeaseDeliveryError:
+            logger.warning(
+                "Session attach: connector leases unavailable for thread %s",
+                thread_id,
+                exc_info=True,
+            )
+            payload = None
     if payload is None:
         try:
             release = await dependencies.release_session_attach_binding(

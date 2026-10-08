@@ -23,6 +23,7 @@ from uuid import UUID
 from fastapi import HTTPException, Request
 
 from orchestrator.schemas.job_runtime import JobCompleteRequest
+from orchestrator.services import connector_credential_leases
 from orchestrator.services.container_provisioner import (
     WORKSPACE_RUNTIME_INCARNATION_KEY,
     WorkspaceCleanupOutcome,
@@ -36,6 +37,12 @@ from orchestrator.services.vm_workspace_recovery_store import (
 
 
 CompletionCallback = Callable[..., Any]
+#: Terminal statuses whose status write revokes the Job's credential leases.
+_LEASE_REVOKING_STATUSES = {
+    "completed": "job_completed",
+    "failed": "job_failed",
+    "cancelled": "job_cancelled",
+}
 
 
 def _string_or_none(value: Any) -> str | None:
@@ -2036,6 +2043,17 @@ async def complete_job_legacy(
                         current_status,
                     )
                     await _raise_completion_control_race(current_status)
+                if new_status in _LEASE_REVOKING_STATUSES:
+                    # The terminal status write revokes the Job's credential
+                    # leases (connector drivers C2), in this effect's
+                    # transaction. ``pending_review`` and ``paused`` keep the
+                    # workspace and let the leases lapse instead.
+                    async with postgres_db.acquire() as conn:
+                        await connector_credential_leases.revoke_execution_leases(
+                            conn,
+                            job_id=job_id,
+                            reason=_LEASE_REVOKING_STATUSES[new_status],
+                        )
                 if (
                     _effect_runner is not None
                     and new_status == "pending_review"

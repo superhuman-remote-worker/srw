@@ -65,6 +65,7 @@ from orchestrator.schemas.thread_config import (
     ThreadWorkspaceUpgradeRequest,
 )
 from orchestrator.security.access import redact_config_override
+from orchestrator.services import connector_credential_leases
 from orchestrator.services.config_overrides import deep_merge_dicts
 from orchestrator.services.manifest_runtime_ownership import require_srw_runtime
 from orchestrator.services.session_class_policy import (
@@ -440,6 +441,7 @@ async def apply_thread_config_update_locked(
     selected_ds_ids: list[str] | None = None
     selected_ds_revisions: dict[str, int] | None = None
     datasource_selection_provenance: dict[str, Any] | None = None
+    detached_lease_ids: list[str] = []
     grant_fragment = config_override
     if datasource_ids is not None:
         if thread_row is None:
@@ -465,6 +467,11 @@ async def apply_thread_config_update_locked(
                     status_code=409,
                     detail="Credential connectors stay attached for the lifetime of the session",
                 )
+            detached_lease_ids = [
+                str(row["id"])
+                for row in removed_rows
+                if connector_credential_leases.lease_spec(row) is not None
+            ]
         target_project_ids = await dependencies.thread_project_ids(thread_id)
         if thread_row.get("user_id"):
             owner = await dependencies.store.get_user(str(thread_row["user_id"]))
@@ -643,6 +650,16 @@ async def apply_thread_config_update_locked(
             ) from exc
         if not updated:
             raise HTTPException(status_code=404, detail="Thread not found")
+        # A live detach revokes that connector's lease (connector drivers C2)
+        # in this configuration transaction. Only lease drivers hold leases.
+        detached = [cid for cid in detached_lease_ids if cid not in selected_ds_ids]
+        if detached:
+            async with dependencies.store.acquire() as conn:
+                await connector_credential_leases.revoke_connector_leases(
+                    conn,
+                    owner=connector_credential_leases.LeaseOwner.thread(thread_id),
+                    connector_ids=detached,
+                )
 
     # Config-change audit (live_session_settings.md Slice C): key paths only,
     # fired after every persist step succeeded. log_security_event never

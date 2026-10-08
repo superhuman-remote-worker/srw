@@ -415,6 +415,12 @@ class _EndpointDB(PostgresDB):
             async def fetchval(self, _sql: str, *_args):
                 return db.job.get("execution_lane", "pinned")
 
+            async def fetch(self, sql: str, *args):
+                # The terminal status write revokes credential leases (C2);
+                # this Job holds none.
+                db.statements.append((sql, args))
+                return []
+
         yield _Connection()
 
     async def get_job(self, job_id: str) -> dict:
@@ -753,6 +759,36 @@ class TestCompleteJobClassA:
             "status -> completed",
         ]
         assert job["completed_at"] == "set"
+
+    @pytest.mark.asyncio
+    async def test_the_terminal_status_write_revokes_the_jobs_leases(self):
+        """Connector drivers C2: completion revokes the Job's credential
+        leases right after its status write, in the same effect."""
+        job = _job()
+        db = _EndpointDB(job)
+        body = job_runtime_module.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=True,
+            freeze_data={"status": "job_completed", "summary": "done"},
+        )
+
+        with ExitStack() as stack:
+            _patch_completion(stack, db)
+            await b08_helpers.complete_job(MagicMock(), JOB_ID, body)
+
+        statements = [_normalized(sql) for sql, _ in db.statements]
+        revokes = [
+            (index, args)
+            for index, (sql, args) in enumerate(db.statements)
+            if "UPDATE connector_credential_leases" in sql
+        ]
+        assert [args for _, args in revokes] == [(JOB_ID, "job_completed")]
+        status_write = next(
+            index
+            for index, sql in enumerate(statements)
+            if sql.startswith("UPDATE jobs SET status = $1")
+        )
+        assert revokes[0][0] > status_write
 
     @pytest.mark.asyncio
     async def test_strict_delivery_cap_terminalizes_blocked_in_one_class_a_write(

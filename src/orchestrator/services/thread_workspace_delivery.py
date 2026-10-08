@@ -49,6 +49,7 @@ from orchestrator.services.session_workspace_policy import preparation_wait_budg
 
 from orchestrator.security.access import externalize_gitea_url
 from orchestrator.security.access import require_internal as _require_internal
+from orchestrator.services import connector_credential_leases
 from orchestrator.services.container_provisioner import (
     WORKSPACE_RUNTIME_INCARNATION_KEY,
     WorkspaceRuntimeAttestation,
@@ -1332,6 +1333,20 @@ async def agent_get_thread_workspace_locked(
             status_code=409,
             detail={"code": "pinned_runtime_generation_unavailable"},
         )
+    # Credential leases (connector drivers C2), after the last authority
+    # check and still under the datasource lock: the thread's lease token
+    # replaces each lease connector's credentials. A pod recycle or a warm
+    # re-attach receives the same token again; only End revokes.
+    try:
+        await connector_credential_leases.deliver_connector_leases_with(
+            postgres_db,
+            datasources_payload,
+            owner=connector_credential_leases.LeaseOwner.thread(thread_id),
+        )
+    except connector_credential_leases.LeaseDeliveryError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": "connector_lease_unavailable"}
+        ) from exc
 
     return {
         "status": ws.get("status", "none"),

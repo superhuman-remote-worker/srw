@@ -56,7 +56,11 @@ from orchestrator.services.container_startup_config import (
 from orchestrator.services.session_creation_observation import (
     SessionCreationObservationBudget,
 )
-from orchestrator.services import resolve_ssh_key_path, workspace_metering
+from orchestrator.services import (
+    connector_credential_leases,
+    resolve_ssh_key_path,
+    workspace_metering,
+)
 from orchestrator.services.blocking_effect import joined_blocking_call
 from orchestrator.services.ssh_helpers import (
     SSHPrivateKeyError,
@@ -9834,6 +9838,13 @@ class ContainerProvisioner:
 
         if not self._db:
             return False
+        # Credential leases (connector drivers C2): an idempotent backstop
+        # only. A pod delete is not an execution event (an idle session's
+        # workspace may go while the session lives), so this revokes only
+        # leases whose execution durable state already shows as terminal.
+        await connector_credential_leases.revoke_terminal_execution_leases_with(
+            self._db, owner=connector_credential_leases.LeaseOwner.of_workspace(owner)
+        )
         owner_kind = "thread" if owner.kind == "session" else "job"
         if await self._db.managed_repository_workspace_process_zero_is_current(
             owner.id,

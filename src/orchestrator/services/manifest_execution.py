@@ -755,6 +755,21 @@ class ManifestExecutionService:
             snapshot["id"],
             identity.attempt,
         )
+        if final:
+            # The generic execution ended: revoke its credential leases
+            # (connector drivers C2). Idempotent; a retried attempt is not
+            # final and keeps them.
+            from orchestrator.services.connector_credential_leases import (
+                revoke_execution_leases,
+            )
+
+            owner = (
+                {"thread_id": snapshot["work_id"]}
+                if snapshot.get("work_kind") == "Session"
+                else {"job_id": snapshot["work_id"]}
+            )
+            async with self.db.acquire() as conn:
+                await revoke_execution_leases(conn, reason="execution_ended", **owner)
         return True
 
     async def report_outcome(

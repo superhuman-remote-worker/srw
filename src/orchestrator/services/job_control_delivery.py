@@ -17,6 +17,7 @@ from orchestrator.security.access import (
     externalize_gitea_url,
     vm_workspaces_on_pod_network,
 )
+from orchestrator.services import connector_credential_leases
 from orchestrator.services.config_resolver import (
     inject_blob_credentials,
     resolve_config,
@@ -874,6 +875,23 @@ async def resume_job_on_agent(
             # from before C1 hashes the projection it parsed, so an always-
             # present key would fail every resume as pinned_projection_mismatch.
             resume_payload["workspace_ssh_identities"] = workspace_ssh_identities
+
+        # The second credential path (connector drivers C2): a paused Job's
+        # leases lapsed while it waited, so resume issues new ones; a lease
+        # still live is delivered again. In place, in ``datasources``.
+        try:
+            await connector_credential_leases.deliver_connector_leases_with(
+                dependencies.store,
+                datasources_payload,
+                owner=connector_credential_leases.job_lease_owner(job),
+            )
+        except connector_credential_leases.LeaseDeliveryError as exc:
+            dependencies.logger.warning(
+                "Resume dispatch: connector leases unavailable for job %s (%s)",
+                job_id,
+                exc,
+            )
+            return False
 
         if not await dependencies.pinned_k8s_job_workspace_authority_is_current(
             durable_job, workspace_authority

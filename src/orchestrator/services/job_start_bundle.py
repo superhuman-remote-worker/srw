@@ -36,6 +36,7 @@ from fastapi import HTTPException
 from orchestrator.logging_config import bind_log_context, reset_log_context
 from orchestrator.schemas.job_runtime import JobStartRequest
 from orchestrator.security.access import externalize_gitea_url, redact_config_override
+from orchestrator.services import connector_credential_leases
 from orchestrator.services.config_resolver import unrouted_model_slots
 from orchestrator.services.datasource_policy import SHELL_WORKSPACE_DETAIL
 from orchestrator.services.job_datasource_selection import shell_connector_names
@@ -265,6 +266,7 @@ async def build_job_start_request(
     job: dict,
     *,
     persist_dispatch_state: bool = True,
+    deliver_connector_leases: bool = True,
     dependencies: JobStartBundleDependencies,
 ) -> "JobStartRequest | None":
     """Build the canonical credential-complete worker start bundle.
@@ -275,7 +277,9 @@ async def build_job_start_request(
     the historical status/cache writes on a refused bundle. Stateless claim
     assembly disables those writes because credential resolution can outlive
     its queue lease; the final exact-token recheck then makes the whole build
-    read-only from a stale claimant's point of view.
+    read-only from a stale claimant's point of view. It also turns off
+    ``deliver_connector_leases`` and puts the lease tokens into the bundle
+    inside its claim transaction instead.
     """
     postgres_db = dependencies.store
     gitea_client = dependencies.forge
@@ -727,6 +731,18 @@ async def build_job_start_request(
                         job_id, status="failed", error_message=msg
                     )
                 return None
+
+        # Credential leases (connector drivers C2): a lease connector's entry
+        # carries a lease token, never its upstream credential. Issued or
+        # delivered again only after every refusal above, so a refused
+        # bundle mints nothing. The stateless claim defers this to its claim
+        # transaction, where the run_queue lease is re-checked.
+        if deliver_connector_leases:
+            await connector_credential_leases.deliver_connector_leases_with(
+                postgres_db,
+                datasources_payload,
+                owner=connector_credential_leases.job_lease_owner(job),
+            )
 
         # Build job start request. resolved_config and config_override are
         # mutually exclusive on the wire: a delivered blob is complete, so we
