@@ -49,6 +49,8 @@ from shared.runtime.utils.ssh_key import (
 )
 
 _OWNER_ID = "11111111-1111-1111-1111-111111111111"
+#: A host named exactly like a workspace identity alias.
+_ALIAS_HOST = "srw-repo-" + "0123456789abcdef" * 2
 
 
 # Deterministic, so parametrized test ids agree across xdist workers.
@@ -612,6 +614,30 @@ class TestCreateEndpoint:
                 },
                 "SSH host",
             ),
+            # A host named like an identity alias would take over that
+            # alias's agent and pins in every workspace's shared config.
+            (
+                {
+                    "type": "ssh_key",
+                    "config": {"host": _ALIAS_HOST},
+                    "credentials": {
+                        "files": [{"contents": generate_ed25519_keypair().private_key}]
+                    },
+                },
+                "srw-repo-",
+            ),
+            (
+                {
+                    "type": "repository",
+                    "connection_url": f"git@{_ALIAS_HOST}:o/r.git",
+                    "config": {"forge": "gitea"},
+                    "credentials": {
+                        "auth_method": "ssh",
+                        "ssh_key": generate_ed25519_keypair().private_key,
+                    },
+                },
+                "srw-repo-",
+            ),
         ],
     )
     def test_unsafe_ssh_connectors_are_400_and_never_persisted(
@@ -707,6 +733,28 @@ class TestUpdateEndpoint:
             json={"config": {"host": "bastion", "user": "x y"}},
         )
         assert response.status_code == 400, response.text
+        update.assert_not_awaited()
+
+    def test_host_edit_to_an_identity_alias_is_refused(self, monkeypatch):
+        existing = {
+            "id": "44444444-4444-4444-4444-444444444445",
+            "name": "bastion",
+            "type": "ssh_key",
+            "connection_url": None,
+            "credentials": {
+                "files": [{"contents": generate_ed25519_keypair().private_key}]
+            },
+            "config": {"host": "bastion.example.com"},
+            "is_global": False,
+            "read_only": None,
+        }
+        client, update = self._patch_update(monkeypatch, existing)
+        response = client.put(
+            f"/api/datasources/{existing['id']}",
+            json={"config": {"host": _ALIAS_HOST.upper()}},
+        )
+        assert response.status_code == 400, response.text
+        assert "srw-repo-" in response.json()["detail"]
         update.assert_not_awaited()
 
     def test_rename_does_not_revalidate_a_legacy_ssh_repository(self, monkeypatch):
