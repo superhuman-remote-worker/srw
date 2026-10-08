@@ -304,8 +304,11 @@ REPOSITORY_SPEC = DriverSpec(
     },
     legacy_connection_url="required",
     credential_slots=(
-        # The token lands in the clone URL, and so in .git/config, until the
-        # git swap driver (C3); the key is loaded into an ssh-agent (C1).
+        # Where the git swap driver (C3, srw.git-swap/v1) is installed, a
+        # token repository on HTTPS is served through it and its workspace
+        # holds a lease only; otherwise the token lands in the clone URL
+        # (connectors.drivers.gitSwap.fallback). The key is loaded into an
+        # ssh-agent (C1).
         CredentialSlot(
             "token",
             "secret_string",
@@ -1071,6 +1074,105 @@ MCP_TEST_SPEC = DriverSpec(
 #: the chart before it is installed).
 MANAGED_MCP_SPECS: tuple[DriverSpec, ...] = (GITEA_MCP_SPEC,)
 
+# ---------------------------------------------------------------------------
+# The git swap driver (connector drivers C3)
+#
+# A git smart-HTTP reverse proxy in a shared service pod per connector, not a
+# second Git server. It serves the token repositories of the ``repository``
+# type (a variant of srw.repository/v1, found by name): the workspace keeps
+# the clean upstream URL as its remote, and its git reaches the driver
+# through a per-binding ``insteadOf`` with the lease token from a credential
+# helper; the driver exchanges the lease for the forge token per request and
+# never takes a host from the request. SRW's own image
+# (docker/Dockerfile.driver-git-swap); installed only when the chart turns
+# it on (``connectors.drivers.gitSwap``) with service-pod hosting.
+# ---------------------------------------------------------------------------
+
+GIT_SWAP_SPEC = DriverSpec(
+    name="srw.git-swap/v1",
+    legacy_type="repository",
+    title="Repository (git swap driver)",
+    guide_topic="datasources",
+    plane="service",
+    delivery_forms=("checkout", "lease_token"),
+    # A repository row's config, plus what its pod is built from: the clean
+    # upstream URL and the host its egress pins (derived from the row's URL).
+    config_schema={
+        "type": "object",
+        "properties": {
+            "forge": {"enum": list(FORGES)},
+            "endpoint": _ENDPOINT,
+            "default_branch": _MIRROR,
+            "auth_method": _AUTH_METHOD,
+            "upstream": _MIRROR,
+            "host": _MIRROR,
+        },
+    },
+    credential_slots=(
+        # Never the workspace: the driver injects it upstream per request,
+        # and the agent process keeps it for the forge API (pull requests).
+        CredentialSlot(
+            "token",
+            "secret_string",
+            {"type": "object", "properties": {"token": _SECRET}},
+            required=True,
+            update="replace",
+        ),
+    ),
+    tool_category="repo",
+    access_levels=(
+        AccessLevel(
+            "ReadOnly",
+            0,
+            "SRW's git swap driver refuses both git-receive-pack routes, by "
+            "request path, and the lease exchange refuses it the write "
+            "credential; the workspace holds a lease token, never the forge "
+            "token.",
+            tools=("repo_pull", "repo_pr_status"),
+        ),
+        AccessLevel(
+            "ReadWrite",
+            1,
+            "Branch pushes only: the driver refuses ref deletes and any ref "
+            "outside refs/heads/ with the reason; fast-forward and protected "
+            "branches stay with the upstream's branch protection and the "
+            "forge token's own permissions.",
+            tools=(
+                "repo_checkout",
+                "repo_commit",
+                "repo_push",
+                "repo_pull",
+                "repo_open_pr",
+                "repo_pr_status",
+            ),
+        ),
+    ),
+    supported_backends=SHELL_BACKENDS,
+    workspace_requirements=(
+        "git and a POSIX shell, on a container or same-cluster VM workspace "
+        "that reaches the driver namespace. The remote stays the "
+        "clean HTTPS upstream URL; ~/.gitconfig includes SRW's wiring under "
+        "~/.srw-credentials/git/, which every git in the workspace (the "
+        "agent's, IDE terminals, ssh-gateway sessions) reads. HTTPS upstreams "
+        "on port 443 only; Git LFS is unsupported; submodules only as "
+        "relative URLs within the same repository path."
+    ),
+    egress=(EgressRule("${config.host}", (443,)),),
+    holds_upstream_credentials=True,
+    credential_delivery="lease",
+    harness_credentials=("token",),
+    service=ServiceSpec(
+        port=8443,
+        callers=("workspace",),
+        tls=True,
+        resources={"limits": {"cpu": "1", "memory": "128Mi"}},
+        start_seconds=20,
+    ),
+)
+#: Service drivers SRW ships as its own images (each off until the chart
+#: names its image).
+OFFICIAL_SERVICE_SPECS: tuple[DriverSpec, ...] = (GIT_SWAP_SPEC,)
+
 #: Datasource drivers in catalogue order.
 DATASOURCE_SPECS: tuple[DriverSpec, ...] = (
     GENERIC_SPEC,
@@ -1161,16 +1263,31 @@ def mcp_spec_for(credentials: Any) -> DriverSpec:
     return MCP_REMOTE_SPEC
 
 
+def git_swap_entry(row: Any) -> bool:
+    """Whether a payload entry is a token repository bound through the git
+    swap driver (C3): its ``git_swap`` block, empty until the lease step
+    fills in the driver's endpoint, and without an ``unavailable`` reason
+    (a token repository the installation refuses instead)."""
+    get = getattr(row, "get", None)
+    if not callable(get) or get("type") != REPOSITORY_SPEC.legacy_type:
+        return False
+    block = get("git_swap")
+    return isinstance(block, Mapping) and "unavailable" not in block
+
+
 def driver_spec_for_row(row: Any) -> DriverSpec | None:
     """The driver serving one stored row or payload entry.
 
     The type's driver (:func:`spec_for_row`), except where the row's own
     fields pick a variant of it: an ``mcp`` row names its driver by
-    transport.
+    transport, and a repository entry its bind routed through the git swap
+    driver names that.
     """
     spec = spec_for_row(row)
     if spec is MCP_SPEC:
         return mcp_spec_for(row.get("credentials"))
+    if spec is REPOSITORY_SPEC and git_swap_entry(row):
+        return GIT_SWAP_SPEC
     return spec
 
 

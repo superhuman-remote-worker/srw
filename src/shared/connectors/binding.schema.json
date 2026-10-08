@@ -207,7 +207,8 @@
                   "enum": [
                     "none",
                     "token_in_url",
-                    "ssh_agent"
+                    "ssh_agent",
+                    "swap"
                   ]
                 },
                 "secret": {

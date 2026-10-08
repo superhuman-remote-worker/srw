@@ -187,6 +187,9 @@ class ServiceSpec:
     ``resources`` are Kubernetes ``requests``/``limits``, capped by the
     installation.  ``mcp`` carries the managed-MCP block (transport, port,
     path, protocol, stdio mode, limits, tool pinning) for MCP server images.
+    ``tls``: the pod serves its port over TLS with a certificate SRW's
+    driver certificate authority signs for its Service names (the git swap
+    driver, C3); its callers trust that authority for the driver's URL only.
     """
 
     instancing: Literal["shared", "per_execution"] = "shared"
@@ -195,6 +198,7 @@ class ServiceSpec:
     mcp: Mapping[str, Any] | None = None
     port: int = 8080
     callers: tuple[ServiceCaller, ...] = ("workspace",)
+    tls: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,9 +225,14 @@ class DriverSpec:
     drivers only.
 
     ``credential_delivery`` is ``lease`` for a driver whose upstream
-    credential never reaches the agent: SRW issues one lease per
+    credential never reaches the workspace: SRW issues one lease per
     workspace-owning execution and delivers its token in the
     ``lease_token`` form (which such a driver must list, and no other may).
+    ``harness_credentials`` names the credential slots such a binding still
+    carries to the agent process, never the workspace: the git swap
+    driver's forge token, which the pull-request tools call the forge API
+    with (owner, 2026-10-07: what the harness holds is not a target). Empty
+    for every other lease driver, whose binding carries the lease only.
     """
 
     name: str
@@ -255,6 +264,7 @@ class DriverSpec:
     holds_upstream_credentials: bool = False
     service: ServiceSpec | None = None
     credential_delivery: CredentialDeliveryMode = "inline"
+    harness_credentials: tuple[str, ...] = ()
 
     def access_level(self, level_id: str) -> AccessLevel | None:
         return next(
@@ -360,6 +370,15 @@ def validate_spec(spec: DriverSpec) -> list[str]:
             "credential_delivery is 'lease' (a managed MCP driver's lease is "
             "its client's bearer token instead)"
         )
+    if spec.harness_credentials:
+        slots = {slot.name for slot in spec.credential_slots}
+        if spec.credential_delivery != "lease":
+            problems.append("only a lease driver names harness_credentials")
+        problems += [
+            f"harness credential {name!r} is not a credential slot"
+            for name in spec.harness_credentials
+            if name not in slots
+        ]
     problems += _access_problems(spec)
     problems += _slot_problems(spec)
     if (spec.service is not None) != (spec.plane == "service"):
@@ -379,6 +398,8 @@ def validate_spec(spec: DriverSpec) -> list[str]:
                 f"service callers {service.callers!r} must be a non-empty subset "
                 f"of {SERVICE_CALLERS}"
             )
+        if not isinstance(service.tls, bool):
+            problems.append("service tls is a boolean")
         if service.mcp is not None:
             problems += _managed_mcp_problems(spec)
     for rule in spec.egress:

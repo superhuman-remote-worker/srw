@@ -122,10 +122,11 @@ VALUE_FIELDS: dict[str, dict[str, tuple[ValueType, bool, bool]]] = {
 }
 #: Closed value enums inside a form (``null`` stays allowed where the type
 #: allows it).  A checkout's ``auth`` names how the credential reaches git:
-#: a token in the clone URL, or a key loaded into the workspace's ssh-agent
-#: (slice C1).  The git swap driver (C3) will add its own value.
+#: a token in the clone URL, a key loaded into the workspace's ssh-agent
+#: (slice C1), or the git swap driver (C3), which the workspace's git
+#: reaches with a lease token while the remote stays the clean upstream URL.
 VALUE_ENUMS: dict[tuple[str, str], tuple[str, ...]] = {
-    ("checkout", "auth"): ("none", "token_in_url", "ssh_agent"),
+    ("checkout", "auth"): ("none", "token_in_url", "ssh_agent", "swap"),
     ("credential_file", "transform"): ("kubeconfig_prefix",),
     ("mcp_client", "transport"): ("http", "sse", "stdio"),
 }
