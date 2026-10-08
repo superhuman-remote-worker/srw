@@ -290,6 +290,13 @@ def test_secrets_reach_the_cluster_only_on_stdin(monkeypatch):
         assert gate._scrub(value) == "<redacted>"
 
 
+def test_the_node_must_lie_in_the_refused_ranges():
+    assert gate.node_refused("172.18.0.2", "172.16.0.0/12,10.42.0.0/16")
+    assert not gate.node_refused("172.18.0.2", "10.0.50.0/24,10.42.0.0/16")
+    assert not gate.node_refused("", "172.16.0.0/12")
+    assert not gate.node_refused("172.18.0.2", "")
+
+
 def test_the_default_deny_probe_verdict_is_its_last_rounds():
     raced = "\n".join(["canary=open"] * 3 + ["canary=closed"] * 9)
     assert gate.parse_denyprobe(raced) is True

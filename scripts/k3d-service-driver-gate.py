@@ -32,7 +32,8 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               namespace has Pod Security baseline and its static default deny,
               and the cluster enforces it: a busybox pod under that deny never
               reaches the orchestrator's API port (without enforcement every
-              driver pod's canary wait refuses to start the driver)
+              driver pod's canary wait refuses to start the driver); the
+              canary port is set and refusedCidrs covers the node
   pod         session 1 binds A and B; A gets exactly one service pod in the
               driver namespace, ready, its canary wait passed (exit 0, "default
               deny enforced"), no ServiceAccount token (spec and in the pod),
@@ -78,6 +79,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import ipaddress
 import json
 import re
 import secrets
@@ -522,6 +524,22 @@ def parse_denyprobe(log: str) -> bool:
     if len(verdicts) < DENYPROBE_SETTLED:
         raise GateError("the default-deny probe printed too few verdicts")
     return all(verdict == "closed" for verdict in verdicts[-DENYPROBE_SETTLED:])
+
+
+def node_refused(node: str, refused: str) -> bool:
+    """Whether the node address lies in one of the refused ranges."""
+    try:
+        address = ipaddress.ip_address(node)
+    except ValueError:
+        return False
+    for cidr in refused.split(","):
+        try:
+            network = ipaddress.ip_network(cidr.strip(), strict=False)
+        except ValueError:
+            continue
+        if network.version == address.version and address in network:
+            return True
+    return False
 
 
 def pod_diagnosis(pod: dict | None, canary_log: str = "") -> str:
@@ -1019,6 +1037,8 @@ class ServiceDriverGate:
                 "CONNECTOR_DRIVER_REGISTRY_INSECURE_HOSTS",
                 "CONNECTOR_DRIVER_RESOLVE_CACHE_SECONDS",
                 "CONNECTOR_LEASE_CANARY_PORT",
+                "CONNECTOR_SERVICE_REFUSED_CIDRS",
+                "CONNECTOR_SERVICE_NODE_IP",
             )
         }
         idle = float(env["CONNECTOR_SERVICE_IDLE_SECONDS"] or 0)
@@ -1053,6 +1073,19 @@ class ServiceDriverGate:
         self.namespace = env["CONNECTOR_SERVICE_NAMESPACE"]
         self.exchange_port = int(env["CONNECTOR_LEASE_EXCHANGE_PORT"])
         self.canary_port = int(env["CONNECTOR_LEASE_CANARY_PORT"])
+        node = env["CONNECTOR_SERVICE_NODE_IP"]
+        covered = node_refused(node, env["CONNECTOR_SERVICE_REFUSED_CIDRS"])
+        self.report.check(
+            "preflight: driver pods are refused the orchestrator's node "
+            "(refusedCidrs covers it; the orchestrator does not host otherwise)",
+            covered,
+            f"node={node} refused={env['CONNECTOR_SERVICE_REFUSED_CIDRS']}",
+        )
+        if not covered:
+            raise GateError(
+                "set connectors.servicePods.refusedCidrs to cover the k3d node "
+                "(the profile lists 172.16.0.0/12)"
+            )
         self.idle_seconds = int(idle)
         self.reconcile_seconds = int(
             float(env["CONNECTOR_SERVICE_RECONCILE_SECONDS"] or 15)
