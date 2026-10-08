@@ -51,6 +51,17 @@ def test_dry_run_prints_the_plan_and_touches_nothing(monkeypatch, capsys):
         assert phase in out
 
 
+def test_preflight_compares_the_modules_c1_runs_in():
+    """D1b moved the agent half of C1 into the connector materializers."""
+    root = Path(__file__).resolve().parents[1]
+    for path in gate.AGENT_FILES + gate.ORCHESTRATOR_FILES:
+        assert (root / path).is_file(), path
+    assert {
+        "src/agent/connectors/checkout.py",
+        "src/agent/connectors/ssh_identity.py",
+    } <= set(gate.AGENT_FILES)
+
+
 def test_embedded_programs_compile():
     for program in (
         gate._API_PROGRAM,

@@ -120,7 +120,13 @@ ORCHESTRATOR_FILES = [
 AGENT_FILES = [
     "src/agent/core/datasource_setup.py",
     "src/agent/api/persistent_session.py",
+    "src/agent/api/session_attach.py",
     "src/agent/agent.py",
+    # D1b moved C1's clone, key retirement and identity loading here.
+    "src/agent/connectors/checkout.py",
+    "src/agent/connectors/ssh_identity.py",
+    "src/agent/connectors/legacy.py",
+    "src/agent/connectors/registry.py",
     "src/shared/runtime/core/workspace_ssh_identity.py",
     "src/shared/runtime/core/managed_repository.py",
 ]

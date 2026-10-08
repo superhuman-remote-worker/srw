@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Local k3d gate for connector drivers D1a: the contract and the control plane.
+"""Local k3d gate for connector drivers D1a and D1b: the contract, the control
+plane and the agent's materializers.
 
-Design: knowledge-base/knowledge/features/connector_drivers.md, Track D, D1a.
+Design: knowledge-base/knowledge/features/connector_drivers.md, Track D, D1a
+and D1b.
 Templates: scripts/k3d-connector-credential-residue-gate.py (C0) and
 scripts/k3d-ssh-agent-connectors-gate.py (C1) -- the same safety envelope:
 dry-run by default, the exact k3d-srw/srw context, secrets only on
@@ -23,8 +25,9 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
   preflight  Tilt reports the srw resource ``ok``; every orchestrator,
              stateless agent and MCP pod serves this checkout's bytes for the
              whole connector module set (every file under
-             src/shared/connectors/ and the drivers package, none extra) and
-             the agent's Neo4j wrapper opens READ_ACCESS sessions
+             src/shared/connectors/, the drivers package and, on agents, the
+             materializers in src/agent/connectors/, none extra) and the
+             agent's Neo4j wrapper opens READ_ACCESS sessions
   lifecycle  per type -- postgresql, webdav, repository (token), repository
              (SSH), kb, generic, credentials, kubeconfig, generic_file and a
              host-less ssh_key -- create (nothing secret echoed), Test,
@@ -48,6 +51,22 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
              deployed builder binds read tools only (a session's audit rows
              carry no tool list), a webdav_list call returns the marker, and
              asking for a webdav_write creates no file in Nextcloud
+  live       (D1b) a PINNED session (an Officer conference in the project,
+             sandbox workspace) whose own agent pod serves this checkout's
+             connector modules. A live ``config.update`` attaches the generic
+             env connector, Postgres (linked read-only) and an SSH repository
+             (a read deploy key on the private repository): the ack lists
+             all three; the pod logs the read-only Postgres connection and
+             "3 attached (3 added, 0 removed)"; the variable lands in
+             ~/.srw-credentials/; the key is held by a workspace ssh-agent; the
+             repository is cloned and fetches through its alias; README.md
+             lists the three. A second update detaches all three: the ack
+             lists them removed; the pod logs "0 attached (0 added, 3
+             removed)" and closes the replaced Postgres connection after the
+             turn; the key's ssh-agent is retired and the clone no longer
+             fetches; README.md says no connectors are attached. A detached
+             env value staying in the workspace is a NOTE (v1 keeps values).
+             ``--skip-live`` runs the D1a gate alone
   cockpit    Playwright logs in as the test account, presses Test on a
              kubeconfig row and finds the neutral ``unsupported`` result
   cleanup    nothing this run created is left (rows, pods, Gitea
@@ -94,6 +113,9 @@ AUDIT_POD = "srw-auditdb-0"
 NEXTCLOUD = "deploy/srw-nextcloud"
 NEXTCLOUD_CONTAINER = "nextcloud"
 WORKSPACE_CONTAINER = "workspace"
+AGENT_CONTAINER = "agent"
+PINNED_THREAD_LABEL = "srw.io/thread-id"
+AGENT_PORT = 8001
 HOME = "/home/agent-host"
 KEYCLOAK_TOKEN_URL = "http://srw-keycloak:8080/realms/srw/protocol/openid-connect/token"
 POD_ROOT = "/app"
@@ -112,6 +134,7 @@ _MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,199}\Z")
 # file the checkout lacks (a stale ``legacy.py`` from an older image).
 SHARED_CONNECTORS = "src/shared/connectors"
 DRIVERS = "src/orchestrator/services/connector_drivers"
+AGENT_CONNECTORS = "src/agent/connectors"
 NEO4J_DB = "src/shared/runtime/database/neo4j_db.py"
 _SHARED_FILES = (
     "src/shared/credential_connectors.py",
@@ -128,6 +151,19 @@ class ServedSet:
     files: tuple[str, ...]
     contains: tuple[tuple[str, str], ...] = ()
 
+
+# The agent side: the materializers and every entry point that runs them.
+_AGENT_FILES = (
+    *_SHARED_FILES,
+    NEO4J_DB,
+    "src/shared/runtime/core/datasource_catalog.py",
+    "src/agent/core/datasource_setup.py",
+    "src/agent/tools/graph/neo4j.py",
+    "src/agent/agent.py",
+    "src/agent/api/session_attach.py",
+    "src/agent/api/persistent_session.py",
+    "src/agent/api/persistent_app.py",
+)
 
 SERVED_SETS = (
     ServedSet(
@@ -162,15 +198,9 @@ SERVED_SETS = (
     ServedSet(
         "stateless agent",
         "agent-stateless",
-        "agent",
-        (SHARED_CONNECTORS,),
-        (
-            *_SHARED_FILES,
-            NEO4J_DB,
-            "src/shared/runtime/core/datasource_catalog.py",
-            "src/agent/core/datasource_setup.py",
-            "src/agent/tools/graph/neo4j.py",
-        ),
+        AGENT_CONTAINER,
+        (SHARED_CONNECTORS, AGENT_CONNECTORS),
+        _AGENT_FILES,
         ((NEO4J_DB, "READ_ACCESS"),),
     ),
     ServedSet(
@@ -184,6 +214,16 @@ SERVED_SETS = (
             "src/mcp_server/server.py",
         ),
     ),
+)
+
+# A pinned session's own agent pod (no component label; checked in ``live``).
+PINNED_AGENT = ServedSet(
+    "pinned agent",
+    "",
+    AGENT_CONTAINER,
+    (SHARED_CONNECTORS, AGENT_CONNECTORS),
+    _AGENT_FILES,
+    ((NEO4J_DB, "READ_ACCESS"),),
 )
 
 _SECRETS: list[str] = []
@@ -339,6 +379,14 @@ async def main():
             if response.status_code != 201:
                 raise SystemExit(f"token creation failed ({response.status_code})")
             out["token"] = response.json()["sha1"]
+        elif request["action"] == "deploy_key":
+            key_id = await client.ensure_repo_deploy_key(
+                request["repo"], title=request["title"],
+                public_key=request["public_key"], access_mode=request["access_mode"],
+            )
+            if key_id is None:
+                raise SystemExit("deploy key registration failed")
+            out["key_id"] = key_id
         elif request["action"] == "cleanup":
             out["deleted"] = [
                 repo for repo, marker in request["repos"].items()
@@ -361,6 +409,66 @@ async def main():
     finally:
         await client.close()
     print(json.dumps(out))
+asyncio.run(main())
+"""
+
+# A cockpit-like WebSocket on a pinned session's agent pod sends one live
+# ``config.update`` (the settings pane's frame) and prints the answer with the
+# same request id: ``config.changed`` or ``error``. Names only come back.
+_LIVE_UPDATE_PROGRAM = r"""
+import asyncio, json, sys, urllib.parse, urllib.request
+import websockets
+r = json.loads(sys.stdin.readline())
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+def session_token():
+    form = urllib.parse.urlencode({
+        "grant_type": "password", "client_id": "admin-cli", "scope": "openid",
+        "username": r["username"], "password": r["password"],
+    }).encode()
+    with opener.open(r["token_url"], data=form, timeout=30) as response:
+        bearer = json.load(response)["id_token"]
+    request = urllib.request.Request(
+        "http://localhost:8085/api/sessions/%s/connection" % r["thread"],
+        headers={"Authorization": "Bearer " + bearer},
+    )
+    with opener.open(request, timeout=60) as response:
+        return json.load(response)["token"]
+async def main():
+    token = await asyncio.to_thread(session_token)
+    url = "ws://%s:%d/p/%s/ws?t=%s" % (r["ip"], r["port"], r["thread"], token)
+    loop = asyncio.get_running_loop()
+    async with websockets.connect(url, max_size=None, open_timeout=30) as ws:
+        await ws.send(json.dumps({
+            "method": "config.update", "config": {},
+            "datasource_ids": r["datasource_ids"], "request_id": r["request_id"],
+        }))
+        deadline = loop.time() + r["timeout"]
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                print(json.dumps({"outcome": "timeout"}))
+                return
+            try:
+                raw = await asyncio.wait_for(ws.recv(), remaining)
+            except asyncio.TimeoutError:
+                continue
+            try:
+                frame = json.loads(raw)
+            except ValueError:
+                continue
+            params = frame.get("params") if isinstance(frame, dict) else None
+            if not isinstance(params, dict):
+                continue
+            if params.get("request_id") != r["request_id"]:
+                continue
+            if frame.get("method") in ("config.changed", "error"):
+                print(json.dumps({
+                    "outcome": frame["method"],
+                    "datasources": params.get("datasources"),
+                    "message": params.get("message"),
+                    "detail": params.get("detail"),
+                }))
+                return
 asyncio.run(main())
 """
 
@@ -527,6 +635,30 @@ def make_key() -> str:
     return text
 
 
+def make_key_pair() -> tuple[str, str, str]:
+    """``(private key, public key line, SHA256 fingerprint)``; private scrubbed."""
+    import base64
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding,
+        NoEncryption,
+        PrivateFormat,
+        PublicFormat,
+    )
+
+    key = Ed25519PrivateKey.generate()
+    private = key.private_bytes(
+        Encoding.PEM, PrivateFormat.OpenSSH, NoEncryption()
+    ).decode()
+    secret(private)
+    _SECRETS.extend(line for line in private.splitlines()[1:-1] if len(line) > 20)
+    public = key.public_key().public_bytes(Encoding.OpenSSH, PublicFormat.OpenSSH)
+    digest = hashlib.sha256(base64.b64decode(public.split()[1])).digest()
+    fingerprint = "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
+    return private, public.decode() + " srw-d1b-gate", fingerprint
+
+
 def expected_bytes(served: ServedSet) -> dict[str, str]:
     """``{path: sha256}`` for every file of ``served`` in this checkout."""
     paths = set(served.files)
@@ -589,12 +721,21 @@ PLAN = [
     "session: stateless, WebDAV read-only via the project; read-only "
     "connection logged; read tools only; webdav_list returns the marker; "
     "a requested write creates nothing",
+    "live (D1b): a pinned Officer-conference session; its pod serves this "
+    "checkout's materializers; a live config.update attaches the generic env "
+    "connector, Postgres (read-only link) and an SSH repository (read deploy "
+    "key), then a second one detaches all three: acks, pod logs, "
+    "~/.srw-credentials/, the ssh-agent, the clone and README.md each way "
+    "(--skip-live skips it)",
     "cockpit: Playwright presses Test on a kubeconfig row; result is unsupported",
     "notes: Neo4j not deployed on k3d (covered by the real-container test)",
     "cleanup: end + delete session, cancel + delete job, delete connectors, "
     "project, Gitea repos + token, Nextcloud user, database + role; residue "
     "check",
 ]
+
+# Attached live to the pinned session, then detached: env, managed, SSH.
+LIVE_LABELS = ("attach-generic", "attach-pg", "live-ssh")
 
 JOB_TERMINAL = frozenset({"completed", "failed", "cancelled"})
 JOB_RESTING = JOB_TERMINAL | {"pending_review", "paused", "waiting"}
@@ -638,6 +779,8 @@ class ConnectorDriversGate:
         self.project: str | None = None
         self.job: str | None = None
         self.thread: str | None = None
+        self.live_thread: str | None = None
+        self.live_fingerprint = ""
         self.user_id = ""
         self.gitea: dict[str, Any] = {}
         self.pg_password = secret(secrets.token_hex(16))
@@ -800,6 +943,41 @@ class ConnectorDriversGate:
 
         wait_for(f"turn {step} answered", answered, timeout=self.args.turn_timeout)
 
+    def served_problems(self, pod: str, served: ServedSet) -> list[str]:
+        """How ``pod`` differs from this checkout for ``served`` (empty: same)."""
+        found = json.loads(
+            command(
+                K
+                + ["exec", "-i", pod, "-c", served.container, "--"]
+                + ["python", "-c", _HASH_PROGRAM, POD_ROOT],
+                data=json.dumps(
+                    {
+                        "files": expected_bytes(served),
+                        "dirs": list(served.dirs),
+                        "contains": [list(pair) for pair in served.contains],
+                    }
+                ),
+            ).splitlines()[-1]
+        )
+        return [
+            f"{pod} {kind}: {found[kind][:6]}"
+            for kind in ("stale", "extra", "missing_text")
+            if found.get(kind)
+        ]
+
+    def ws(self, pod: str, script: str, *, check: bool = True) -> tuple[int, str]:
+        """Run ``script`` as agent-host in the workspace (stdin, never argv)."""
+        rc, out, err = run(
+            K
+            + ["exec", "-i", pod, "-c", WORKSPACE_CONTAINER, "--"]
+            + ["su", "-s", "/bin/bash", "agent-host", "-c", "bash -s"],
+            data="set -u\ncd ~\n" + script,
+            timeout=120,
+        )
+        if check and rc:
+            raise GateError(f"workspace command failed (exit {rc}): {err[-300:]}")
+        return rc, out
+
     def create_connector(self, label: str, body: dict[str, Any]) -> tuple[int, Any]:
         """POST a connector; its id is recorded before the status is read."""
         status, parsed = self.api.call(
@@ -825,7 +1003,6 @@ class ConnectorDriversGate:
             self.report.note("tilt not on PATH; rollout state not read")
         problems: list[str] = []
         for served in SERVED_SETS:
-            expected = expected_bytes(served)
             pods = self.pods(served.component)
             if not pods:
                 problems.append(f"no {served.label} pod")
@@ -837,23 +1014,7 @@ class ConnectorDriversGate:
                 ):
                     problems.append(f"{name} is not running and ready")
                     continue
-                found = json.loads(
-                    command(
-                        K
-                        + ["exec", "-i", name, "-c", served.container, "--"]
-                        + ["python", "-c", _HASH_PROGRAM, POD_ROOT],
-                        data=json.dumps(
-                            {
-                                "files": expected,
-                                "dirs": list(served.dirs),
-                                "contains": [list(pair) for pair in served.contains],
-                            }
-                        ),
-                    ).splitlines()[-1]
-                )
-                for kind in ("stale", "extra", "missing_text"):
-                    if found.get(kind):
-                        problems.append(f"{name} {kind}: {found[kind][:6]}")
+                problems += self.served_problems(name, served)
         self.report.check(
             "preflight: every orchestrator, stateless agent and MCP pod serves "
             "this checkout's connector modules",
@@ -1516,24 +1677,297 @@ class ConnectorDriversGate:
 
     def end_session(self) -> bool:
         """End and permanently delete the session; True once its row is gone."""
+        return self.delete_thread(self.thread)
 
+    def delete_thread(self, thread: str | None) -> bool:
         def gone() -> bool:
             status, _body = self.api.call(
                 "DELETE",
-                f"/api/persistent/threads/{self.thread}?force=true&permanent=true",
+                f"/api/persistent/threads/{thread}?force=true&permanent=true",
             )
             if status == 404:
                 return True
-            return (
-                sql(f"SELECT count(*) FROM threads WHERE id = {lit(self.thread)}")
-                == "0"
-            )
+            return sql(f"SELECT count(*) FROM threads WHERE id = {lit(thread)}") == "0"
 
         try:
             wait_for("session deleted", gone, timeout=300, interval=5)
         except GateError:
             return False
         return True
+
+    # -- live attach and detach on a pinned session (D1b) -----------------
+    def live(self) -> None:
+        self.live_setup()
+        self.live_session()
+        self.live_attached(
+            self.live_update(
+                [self.connectors[label] for label in LIVE_LABELS], "attach"
+            )
+        )
+        self.live_detached(self.live_update([], "detach"))
+        self.report.check(
+            "live: session ended and deleted",
+            self.delete_thread(self.live_thread),
+            "thread row",
+        )
+
+    def live_setup(self) -> None:
+        private, public, self.live_fingerprint = make_key_pair()
+        in_orchestrator(
+            _GITEA_PROGRAM,
+            {
+                "action": "deploy_key",
+                "repo": self.repo,
+                "title": self.name("live deploy key"),
+                "public_key": public,
+                "access_mode": "read",
+            },
+        )
+        owner, host = self.gitea["owner"], self.gitea["ssh_host"]
+        status, created = self.create_connector(
+            "live-ssh",
+            {
+                "type": "repository",
+                "connection_url": (
+                    f"ssh://git@{host}:{self.gitea['ssh_port']}/{owner}/{self.repo}.git"
+                ),
+                "config": {"forge": "gitea"},
+                "credentials": {"auth_method": "ssh", "ssh_key": private},
+            },
+        )
+        if status not in (200, 201) or "live-ssh" not in self.connectors:
+            raise GateError(f"live-ssh create answered HTTP {status}: {created}")
+
+    def live_session(self) -> None:
+        body: dict[str, Any] = {
+            "title": f"D1b live connectors gate {self.gate_id}",
+            "permission_mode": "autonomous",
+            "project_id": self.project,
+            # Explicitly none: the project's linked connectors would otherwise
+            # be selected by default.
+            "datasource_ids": [],
+            # An Officer conference is pinned by rule: its own agent pod.
+            "config_override": {
+                "workspace": {"backend": "sandbox"},
+                "officer": {"conference": True},
+            },
+            "model": self.args.model,
+        }
+        created = self.api.ok("POST", "/api/persistent/threads", body)
+        self.live_thread = str(created.get("thread_id") or created["id"])
+        print(f"live session {self.live_thread}", flush=True)
+        lane = sql(
+            f"SELECT execution_lane FROM threads WHERE id = {lit(self.live_thread)}"
+        )
+        if lane != "pinned":
+            raise GateError(f"live session lane is {lane!r}, not pinned")
+        pod = self.pinned_pod()["metadata"]["name"]
+        problems = self.served_problems(pod, PINNED_AGENT)
+        self.report.check(
+            "live: the pinned agent pod serves this checkout's connector modules",
+            not problems,
+            "; ".join(problems)[:600],
+        )
+        if problems:
+            raise GateError("the pinned agent pod does not serve this checkout")
+        wait_for(
+            "pinned session attached (workspace facts written)",
+            lambda: self.pinned_log_lines(["Wrote workspace facts"]),
+            timeout=self.args.turn_timeout,
+            interval=5,
+        )
+
+    def pinned_pod(self) -> dict:
+        selector = f"{PINNED_THREAD_LABEL}={self.live_thread}"
+
+        def probe() -> dict | None:
+            pods = json.loads(
+                command(K + ["get", "pods", "-l", selector, "-o", "json"])
+            )["items"]
+            ready = [
+                pod
+                for pod in pods
+                if not pod["metadata"].get("deletionTimestamp")
+                and pod.get("status", {}).get("phase") == "Running"
+                and pod["status"].get("podIP")
+                and all(
+                    status.get("ready")
+                    for status in pod["status"].get("containerStatuses") or [{}]
+                )
+            ]
+            return ready[0] if len(ready) == 1 else None
+
+        return wait_for(f"pinned agent pod {selector}", probe, timeout=600, interval=5)
+
+    def pinned_log_lines(self, needles: list[str]) -> list[str]:
+        """The pinned agent pod's log lines since the gate started."""
+        pod = self.pinned_pod()["metadata"]["name"]
+        rc, out, _err = run(
+            K + ["logs", pod, "-c", AGENT_CONTAINER] + [f"--since-time={self.started}"],
+            timeout=120,
+        )
+        if rc:
+            return []
+        return [line for line in out.splitlines() if any(n in line for n in needles)]
+
+    def live_update(self, datasource_ids: list[str], label: str) -> dict:
+        """One live ``config.update``; retried while the session still attaches."""
+        request_id = f"{self.gate_id}-{label}"
+
+        def attempt() -> dict | None:
+            result = in_orchestrator(
+                _LIVE_UPDATE_PROGRAM,
+                {
+                    "username": self.api.username,
+                    "password": self.api.password,
+                    "token_url": KEYCLOAK_TOKEN_URL,
+                    "thread": self.live_thread,
+                    "ip": self.pinned_pod()["status"]["podIP"],
+                    "port": AGENT_PORT,
+                    "datasource_ids": datasource_ids,
+                    "request_id": request_id,
+                    "timeout": self.args.turn_timeout,
+                },
+                timeout=self.args.turn_timeout + 90,
+            )
+            if result.get("outcome") == "error" and "No active session" in str(
+                result.get("message")
+            ):
+                return None
+            return result
+
+        result = wait_for(
+            f"live {label} answered",
+            attempt,
+            timeout=self.args.turn_timeout,
+            interval=10,
+        )
+        print(f"live {label}: {json.dumps(result)[:300]}", flush=True)
+        return result
+
+    def live_workspace(self) -> str:
+        return self.workspace_pod(f"app=srw-workspace,srw/thread-id={self.live_thread}")
+
+    def held_fingerprints(self, pod: str) -> set[str]:
+        """Fingerprints every connector ssh-agent socket in the workspace holds."""
+        _rc, listing = self.ws(
+            pod,
+            'for socket in ~/.ssh/srw-managed/sockets/*.sock; do test -S "$socket" '
+            '|| continue; SSH_AUTH_SOCK="$socket" ssh-add -l 2>/dev/null | '
+            "awk 'NF { print $2 }'; done\n",
+            check=False,
+        )
+        return set(listing.split())
+
+    def live_fetches(self, pod: str) -> bool:
+        rc, _out = self.ws(
+            pod,
+            f"cd ~/workspace/repos/{self.repo} && "
+            "GIT_TERMINAL_PROMPT=0 git fetch -q origin 2>/dev/null\n",
+            check=False,
+        )
+        return rc == 0
+
+    def live_readme(self, pod: str) -> str:
+        _rc, text = self.ws(pod, "cat ~/workspace/README.md 2>/dev/null\n", check=False)
+        return text
+
+    def live_attached(self, result: dict) -> None:
+        names = {self.name(label) for label in LIVE_LABELS}
+        added = set((result.get("datasources") or {}).get("added") or [])
+        self.report.check(
+            "live attach: config.changed lists the three connectors added",
+            result.get("outcome") == "config.changed" and added == names,
+            f"{result.get('outcome')}: added {sorted(added)} "
+            f"{result.get('message') or ''} {result.get('detail') or ''}".strip(),
+        )
+        pg = self.name("attach-pg")
+        lines = self.pinned_log_lines([pg, "Datasources re-set up live"])
+        connected = f"Connected to postgresql datasource: {pg} (read-only)"
+        self.report.check(
+            "live attach: the pinned agent opens the read-only Postgres connection",
+            any(connected in line for line in lines),
+            f"{sum(pg in line for line in lines)} matching lines",
+        )
+        self.report.check(
+            "live attach: the registry re-set up the three connectors",
+            any("3 attached (3 added, 0 removed)" in line for line in lines),
+            next((line[-120:] for line in lines if "re-set up" in line), "no line"),
+        )
+        pod = self.live_workspace()
+        _name, value = self.env["generic"]
+        paths = self.workspace_grep(pod, value, f"{HOME}/.srw-credentials")
+        self.report.check(
+            "live attach: the generic connector's variable lands in "
+            "~/.srw-credentials/",
+            bool(paths),
+            ", ".join(sorted({p.replace(HOME, "~") for p in paths})),
+        )
+        self.report.check(
+            "live attach: a workspace ssh-agent holds the SSH repository's key",
+            self.live_fingerprint in self.held_fingerprints(pod),
+        )
+        self.report.check(
+            "live attach: the SSH repository is cloned and fetches through its alias",
+            self.live_fetches(pod),
+        )
+        readme = self.live_readme(pod)
+        self.report.check(
+            "live attach: README.md lists the three connectors",
+            all(name in readme for name in names),
+            f"{sum(name in readme for name in names)} of 3 named",
+        )
+
+    def live_detached(self, result: dict) -> None:
+        names = {self.name(label) for label in LIVE_LABELS}
+        removed = set((result.get("datasources") or {}).get("removed") or [])
+        self.report.check(
+            "live detach: config.changed lists the three connectors removed",
+            result.get("outcome") == "config.changed" and removed == names,
+            f"{result.get('outcome')}: removed {sorted(removed)} "
+            f"{result.get('message') or ''} {result.get('detail') or ''}".strip(),
+        )
+        lines = self.pinned_log_lines(["Datasources re-set up live"])
+        self.report.check(
+            "live detach: the registry re-set up no connectors",
+            any("0 attached (0 added, 3 removed)" in line for line in lines),
+            (lines[-1][-120:] if lines else "no line"),
+        )
+        try:
+            closed = wait_for(
+                "replaced connection closed after the turn",
+                lambda: self.pinned_log_lines(
+                    ["Closed 1 replaced datasource connection(s) after turn end"]
+                ),
+                timeout=120,
+                interval=5,
+            )
+        except GateError:
+            closed = []
+        self.report.check(
+            "live detach: the replaced Postgres connection closes after the turn",
+            bool(closed),
+        )
+        pod = self.live_workspace()
+        self.report.check(
+            "live detach: the SSH repository's ssh-agent is retired",
+            self.live_fingerprint not in self.held_fingerprints(pod),
+        )
+        self.report.check(
+            "live detach: the clone stays but no longer fetches",
+            not self.live_fetches(pod),
+        )
+        self.report.check(
+            "live detach: README.md says no connectors are attached",
+            "_No connectors attached._" in self.live_readme(pod),
+        )
+        _name, value = self.env["generic"]
+        kept = bool(self.workspace_grep(pod, value, f"{HOME}/.srw-credentials"))
+        self.report.note(
+            "live detach: the detached generic variable "
+            + ("stays in" if kept else "left")
+            + " ~/.srw-credentials/ (v1 keeps installed values for the session)"
+        )
 
     def cockpit(self) -> None:
         """Press Test on a kubeconfig row in the real cockpit (Playwright)."""
@@ -1635,6 +2069,8 @@ class ConnectorDriversGate:
 
         if self.thread:
             step("delete session", self.end_session)
+        if self.live_thread:
+            step("delete live session", lambda: self.delete_thread(self.live_thread))
         if self.job:
             step(
                 "cancel job",
@@ -1721,6 +2157,7 @@ class ConnectorDriversGate:
         for table, value in (
             ("jobs", self.job),
             ("threads", self.thread),
+            ("threads", self.live_thread),
             ("projects", self.project),
         ):
             if (
@@ -1731,6 +2168,8 @@ class ConnectorDriversGate:
         selectors = [
             f"srw/job-id={self.job}" if self.job else "",
             f"srw/thread-id={self.thread}" if self.thread else "",
+            f"srw/thread-id={self.live_thread}" if self.live_thread else "",
+            f"{PINNED_THREAD_LABEL}={self.live_thread}" if self.live_thread else "",
         ]
         for selector in filter(None, selectors):
             try:
@@ -1784,6 +2223,8 @@ class ConnectorDriversGate:
             self.report.check(
                 "session: ended and deleted", self.end_session(), "thread row"
             )
+            if not self.args.skip_live:
+                self.live()
             self.job_settle()
             self.job_agent_checks()
             self.cockpit()
@@ -1800,6 +2241,7 @@ class ConnectorDriversGate:
                             "project": self.project,
                             "job": self.job,
                             "thread": self.thread,
+                            "live_thread": self.live_thread,
                             "repos": sorted(self.repos),
                             "database": self.pg_name if self.pg_started else None,
                             "nextcloud_user": self.nc_user if self.nc_started else None,
@@ -1842,6 +2284,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--job-timeout", type=int, default=900)
     parser.add_argument("--kb-timeout", type=int, default=240)
     parser.add_argument("--skip-cockpit", action="store_true")
+    parser.add_argument(
+        "--skip-live",
+        action="store_true",
+        help="skip the D1b live attach/detach on a pinned session",
+    )
     parser.add_argument("--keep", action="store_true", help="skip cleanup")
     return parser
 

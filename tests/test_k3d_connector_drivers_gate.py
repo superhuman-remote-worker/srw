@@ -63,6 +63,8 @@ def test_dry_run_prints_the_plan_and_touches_nothing(no_cluster, capsys):
         "cockpit",
         "Neo4j",
         "cleanup",
+        "live (D1b)",
+        "pinned",
     ):
         assert phase in out
 
@@ -74,6 +76,7 @@ def test_embedded_programs_compile():
         gate._DAV_PROGRAM,
         gate._PAYLOAD_PROGRAM,
         gate._HASH_PROGRAM,
+        gate._LIVE_UPDATE_PROGRAM,
     ):
         compile(program, "<gate program>", "exec")
 
@@ -106,6 +109,21 @@ def test_every_served_set_compares_the_whole_connector_package():
     assert drivers <= set(gate.expected_bytes(by_label["orchestrator"]))
     for label in ("orchestrator", "stateless agent"):
         assert (gate.NEO4J_DB, "READ_ACCESS") in by_label[label].contains
+    # D1b: both agent lanes serve the materializers and their entry points.
+    materializers = {
+        str(path.relative_to(root))
+        for path in (root / gate.AGENT_CONNECTORS).rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    }
+    assert "src/agent/connectors/registry.py" in materializers
+    for served in (by_label["stateless agent"], gate.PINNED_AGENT):
+        expected = set(gate.expected_bytes(served))
+        assert materializers <= expected
+        assert {
+            "src/agent/agent.py",
+            "src/agent/api/session_attach.py",
+            "src/agent/api/persistent_session.py",
+        } <= expected
 
 
 def _hash(root: Path, request: dict) -> dict:
@@ -427,3 +445,157 @@ def test_session_checks_read_the_session_selection_and_probe_the_write(
 def test_write_tools_or_a_written_probe_fail_the_session(monkeypatch, tools, probe):
     runner, _requests, _turns = _session(monkeypatch, tools, probe)
     assert not runner.report.passed
+
+
+# -- the D1b live attach and detach on a pinned session ----------------------------
+
+
+def _live(monkeypatch, **fault):
+    runner = _runner()
+    observed = {**_good_live(runner.name), **fault}
+    readme_attached, readme_detached = (
+        observed["readme_attached"],
+        observed["readme_detached"],
+    )
+    held, fetches, logs = observed["held"], observed["fetches"], observed["logs"]
+    runner.live_thread = "00000000-0000-4000-8000-0000000000cc"
+    runner.live_fingerprint = "SHA256:" + "k" * 43
+    phase = {"now": "attach"}
+
+    def once(label, probe, *, timeout, interval=3.0):
+        value = probe()
+        if not value:
+            raise gate.GateError(f"timed out: {label}")
+        return value
+
+    monkeypatch.setattr(gate, "wait_for", once)
+    monkeypatch.setattr(runner, "live_workspace", lambda: "ws-pod")
+    monkeypatch.setattr(
+        runner,
+        "workspace_grep",
+        lambda pod, needle, path: [f"{gate.HOME}/.srw-credentials/env.sh"],
+    )
+    monkeypatch.setattr(runner, "held_fingerprints", lambda pod: held[phase["now"]])
+    monkeypatch.setattr(runner, "live_fetches", lambda pod: fetches[phase["now"]])
+    monkeypatch.setattr(
+        runner,
+        "live_readme",
+        lambda pod: readme_attached if phase["now"] == "attach" else readme_detached,
+    )
+    monkeypatch.setattr(
+        runner,
+        "pinned_log_lines",
+        lambda needles: [
+            line for line in logs if any(needle in line for needle in needles)
+        ],
+    )
+    names = sorted(runner.name(label) for label in gate.LIVE_LABELS)
+    runner.live_attached({"outcome": "config.changed", "datasources": {"added": names}})
+    phase["now"] = "detach"
+    runner.live_detached(
+        {"outcome": "config.changed", "datasources": {"removed": names}}
+    )
+    return runner
+
+
+def _good_live(runner_name):
+    pg = runner_name("attach-pg")
+    return {
+        "readme_attached": "\n".join(
+            f"- **{runner_name(label)}**" for label in gate.LIVE_LABELS
+        ),
+        "readme_detached": "_No connectors attached._",
+        "held": {"attach": {"SHA256:" + "k" * 43}, "detach": set()},
+        "fetches": {"attach": True, "detach": False},
+        "logs": [
+            f"INFO Connected to postgresql datasource: {pg} (read-only)",
+            "INFO Datasources re-set up live: 3 attached (3 added, 0 removed), "
+            "1 connections",
+            "INFO Datasources re-set up live: 0 attached (0 added, 3 removed), "
+            "0 connections",
+            "INFO Closed 1 replaced datasource connection(s) after turn end",
+        ],
+    }
+
+
+def test_live_checks_pass_when_attach_and_detach_both_land(monkeypatch):
+    runner = _live(monkeypatch)
+    assert runner.report.passed, runner.report.results
+    names = [name for name, _ok, _detail in runner.report.results]
+    assert sum(name.startswith("live attach") for name in names) == 7
+    assert sum(name.startswith("live detach") for name in names) == 6
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        {"held": {"attach": set(), "detach": set()}},
+        {"held": {"attach": {"SHA256:" + "k" * 43}, "detach": {"SHA256:" + "k" * 43}}},
+        {"fetches": {"attach": False, "detach": False}},
+        {"fetches": {"attach": True, "detach": True}},
+        {"readme_detached": "- **still listed**"},
+        {"logs": []},
+    ],
+)
+def test_a_live_step_that_did_not_land_fails(monkeypatch, fault):
+    runner = _live(monkeypatch, **fault)
+    assert not runner.report.passed
+
+
+def test_a_live_update_error_fails_the_ack_check(monkeypatch):
+    runner = _runner()
+    runner.live_thread = "00000000-0000-4000-8000-0000000000cc"
+    monkeypatch.setattr(runner, "pinned_log_lines", lambda needles: [])
+    monkeypatch.setattr(runner, "live_workspace", lambda: "ws-pod")
+    monkeypatch.setattr(runner, "workspace_grep", lambda *a: [])
+    monkeypatch.setattr(runner, "held_fingerprints", lambda pod: set())
+    monkeypatch.setattr(runner, "live_fetches", lambda pod: False)
+    monkeypatch.setattr(runner, "live_readme", lambda pod: "")
+    runner.live_attached({"outcome": "error", "message": "rejected"})
+    failed = [name for name, ok, _ in runner.report.results if not ok]
+    assert "live attach: config.changed lists the three connectors added" in failed
+
+
+def test_skip_live_runs_the_d1a_gate_alone(monkeypatch):
+    for argv, expected in (([], True), (["--skip-live"], False)):
+        runner = _runner(*argv)
+        ran: list[str] = []
+        for phase in (
+            "preflight",
+            "fixture",
+            "lifecycle",
+            "refusals",
+            "attach_setup",
+            "job_run",
+            "session",
+            "session_checks",
+            "job_settle",
+            "job_agent_checks",
+            "cockpit",
+            "notes",
+        ):
+            monkeypatch.setattr(runner, phase, lambda: None)
+        monkeypatch.setattr(runner, "end_session", lambda: True)
+        monkeypatch.setattr(runner, "live", lambda: ran.append("live"))
+        monkeypatch.setattr(runner, "cleanup", lambda: [])
+        monkeypatch.setattr(runner, "residue", lambda: [])
+        runner.run()
+        assert (ran == ["live"]) is expected
+
+
+def test_cleanup_deletes_the_live_session_after_the_first(monkeypatch):
+    runner = _runner()
+    runner.thread = "00000000-0000-4000-8000-000000000001"
+    runner.live_thread = "00000000-0000-4000-8000-0000000000cc"
+    order: list[str] = []
+
+    def call(method, path, body=None):
+        order.append(f"{method} {path.split('?')[0]}")
+        return 404, {}
+
+    monkeypatch.setattr(runner.api, "call", call)
+    assert runner.cleanup() == []
+    assert order == [
+        f"DELETE /api/persistent/threads/{runner.thread}",
+        f"DELETE /api/persistent/threads/{runner.live_thread}",
+    ]
