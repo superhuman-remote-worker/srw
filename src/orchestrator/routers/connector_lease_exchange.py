@@ -1,4 +1,5 @@
-"""The credential lease exchange routes (slice C2).
+"""The credential lease exchange routes (slice C2), and the result route
+bind-time driver pods post their outcome to (D6).
 
 These routes are mounted ONLY on the orchestrator's dedicated exchange port
 (``application.connectors.connector_lease_exchange_app``), never on the main
@@ -13,12 +14,14 @@ included, carries ``Cache-Control: no-store``.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from orchestrator.services.connector_bind_time import record_operation_result
+from orchestrator.services.connector_bind_time_launch import RESULT_PATH
 from orchestrator.services.connector_lease_exchange import (
     EXCHANGE_PATH,
     INTROSPECT_PATH,
@@ -78,3 +81,27 @@ async def introspect_connector_lease(
         request=request,
     )
     return _respond(outcome)
+
+
+class DriverResultBody(BaseModel):
+    """What a bind-time driver pod's shim posts (drivers/shim/run.go)."""
+
+    protocol_version: str = Field("", max_length=16)
+    operation: Literal["spec", "check", "bind", "revoke", "gc"]
+    exit_code: int
+    lines: list[dict[str, Any]] = Field(..., max_length=20000)
+    protocol_error: str | None = Field(None, max_length=2000)
+
+
+@router.post(RESULT_PATH)
+async def record_driver_result(
+    request: Request, body: DriverResultBody
+) -> JSONResponse:
+    """A bind-time driver pod's outcome (D6). Its identity names the
+    operation; each identity posts once, while its operation runs."""
+    status, answer = await record_operation_result(
+        request.app.state.driver_operations_store_factory(),
+        identity_token=_identity(request),
+        posted=body.model_dump(),
+    )
+    return JSONResponse(answer, status_code=status, headers=NO_STORE)

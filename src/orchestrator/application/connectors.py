@@ -31,6 +31,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from orchestrator.application.resources import ApplicationResources
+from orchestrator.routers import connector_drivers as connector_drivers_routes
 from orchestrator.routers import connector_lease_exchange as exchange_routes
 from orchestrator.services.connector_driver_ca import driver_ca
 from orchestrator.services.connector_git_swap_delivery import GitSwapDeliverySettings
@@ -44,6 +45,15 @@ from orchestrator.services.connector_service_hosting import (
     ServiceHostingSettings,
     ServicePodRuntime,
 )
+from orchestrator.services.connector_bind_time import (
+    MAX_RESULT_BYTES,
+    BindTimePodRuntime,
+    BindTimeRuntime,
+    BindTimeSettings,
+    DriverOperations,
+)
+from orchestrator.services.connector_bind_time_launch import RESULT_PATH
+from orchestrator.services.connector_driver_registrations import DriverTrustPolicy
 from orchestrator.services.connector_service_images import ServiceImageSettings
 from shared.oci_registry import DEFAULT_TOKEN_HOSTS, RegistryResolver
 
@@ -70,11 +80,23 @@ class BodyLimit:
     the client disconnect, so it never holds more than ``limit`` bytes, and
     whatever it answers to that is dropped. The 413 (no-store) is this
     wrapper's own, not the framework's 400 for an unreadable body.
+
+    ``path_limits`` gives one path its own limit: a bind-time driver pod
+    posts its whole output to the result route (D6).
     """
 
-    def __init__(self, app: ASGIApp, *, limit: int = MAX_BODY_BYTES) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        limit: int = MAX_BODY_BYTES,
+        path_limits: dict[str, int] | None = None,
+    ) -> None:
         self.app = app
         self.limit = int(limit)
+        self.path_limits = {
+            path: int(value) for path, value in (path_limits or {}).items()
+        }
 
     async def _refuse(self, send: Send) -> None:
         await send(
@@ -95,13 +117,14 @@ class BodyLimit:
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
+        limit = self.path_limits.get(scope.get("path") or "", self.limit)
         for name, value in scope.get("headers") or ():
             if name.lower() == b"content-length":
                 try:
                     declared = int(value)
                 except ValueError:
-                    declared = self.limit + 1
-                if declared > self.limit:
+                    declared = limit + 1
+                if declared > limit:
                     await self._refuse(send)
                     return
         received = 0
@@ -115,7 +138,7 @@ class BodyLimit:
             message = await receive()
             if message.get("type") == "http.request":
                 received += len(message.get("body") or b"")
-                if received > self.limit:
+                if received > limit:
                     overflow = True
                     return {"type": "http.disconnect"}
             return message
@@ -342,6 +365,108 @@ def connector_service_reconciler_builder(
     return build
 
 
+def driver_trust_policy(resources: ApplicationResources) -> DriverTrustPolicy:
+    """The operator's trust in registered driver images (D6)."""
+    settings = resources.settings
+    return DriverTrustPolicy(
+        trusted_repositories=tuple(settings.connector_driver_trusted_repositories),
+        custom_drivers_privileged=settings.connector_custom_drivers_privileged,
+    )
+
+
+def bind_time_pod_runtime_builder(
+    hosting: ServiceHostingSettings,
+) -> Callable[[], BindTimePodRuntime | None]:
+    """The driver namespace's API for bind-time pods (D6), or ``None`` while
+    the Kubernetes API is unavailable; the networking client is created once
+    over the core API's own client, as the service reconciler's is."""
+    cached: dict[str, Any] = {}
+
+    def build() -> BindTimePodRuntime | None:
+        from kubernetes.client import NetworkingV1Api
+
+        from orchestrator.services import (
+            agent_provisioner as agent_provisioner_module,
+            container_provisioner as container_provisioner_module,
+        )
+
+        if not agent_provisioner_module.agent_provisioner._k8s_available:
+            return None
+        core_api = container_provisioner_module.container_provisioner._core_api
+        if core_api is None:
+            return None
+        if cached.get("core") is not core_api:
+            cached["core"] = core_api
+            cached["networking"] = NetworkingV1Api(
+                getattr(core_api, "api_client", None)
+            )
+        return BindTimePodRuntime(
+            core_api, cached["networking"], namespace=hosting.namespace
+        )
+
+    return build
+
+
+def bind_time_runtime(resources: ApplicationResources) -> BindTimeRuntime | None:
+    """This application's bind-time driver hosting (D6), or ``None`` when the
+    installation runs no driver pods (``connectors.servicePods``)."""
+    hosting = service_hosting_settings(resources)
+    if hosting is None:
+        return None
+    settings = resources.settings
+    return BindTimeRuntime(
+        store=resources.postgres_db,
+        operations=DriverOperations(
+            store=resources.postgres_db,
+            settings=BindTimeSettings(
+                hosting=hosting,
+                max_pods=settings.connector_bind_time_max_pods,
+                deadline_seconds=settings.connector_bind_time_deadline_seconds,
+                wait_seconds=settings.connector_bind_time_wait_seconds,
+            ),
+            runtime=bind_time_pod_runtime_builder(hosting),
+        ),
+        privileged=driver_trust_policy(resources).privileged,
+    )
+
+
+async def resolve_registration_image(lookup: str) -> Any:
+    """Resolve an image a caller registers, with the bind's resolver and
+    deadline (``service_image_settings``): any registry, the same SSRF
+    guard."""
+    from orchestrator.services import connector_service_images
+
+    settings = connector_service_images.service_image_settings()
+    if settings.resolver is None:
+        raise RuntimeError("no image resolver is configured")
+    return await asyncio.wait_for(
+        settings.resolver.resolve_image(lookup), timeout=settings.timeout_seconds
+    )
+
+
+def connector_drivers_dependencies(
+    resources: ApplicationResources,
+) -> connector_drivers_routes.ConnectorDriversDependencies:
+    """Compose the driver registration routes (D6). An unlabelled image's
+    spec is asked in a driver pod; without hosting, that answers why not."""
+    from orchestrator.security import auth
+    from orchestrator.services.connector_bind_time import run_spec_operation
+    from orchestrator.services.connector_drivers.matrix import HostingStatus
+
+    settings = resources.settings
+    return connector_drivers_routes.ConnectorDriversDependencies(
+        store=resources.postgres_db,
+        resolve_image=resolve_registration_image,
+        run_spec=run_spec_operation,
+        trust=driver_trust_policy(resources),
+        hosting=HostingStatus(
+            enabled=settings.connector_service_pods_enabled,
+            enforcement_verified=settings.connector_service_enforcement_verified,
+        ),
+        require_approved_user=auth.require_approved_user,
+    )
+
+
 def connector_lease_exchange(
     resources: ApplicationResources,
     limiter: DenialLimiter | None = None,
@@ -378,6 +503,8 @@ def connector_lease_exchange_app(resources: ApplicationResources) -> FastAPI:
     app.state.connector_lease_exchange_factory = lambda: connector_lease_exchange(
         resources, limiter, service_hosting=hosting
     )
+    # Bind-time driver pods post their outcome here (D6).
+    app.state.driver_operations_store_factory = lambda: resources.postgres_db
 
     @app.exception_handler(RequestValidationError)
     async def _invalid(_request: Request, _exc: RequestValidationError) -> JSONResponse:
@@ -409,7 +536,7 @@ def exchange_server_config(app: Any) -> uvicorn.Config:
     address is always the socket peer, never an ``X-Forwarded-For`` value.
     """
     return uvicorn.Config(
-        BodyLimit(app),
+        BodyLimit(app, path_limits={RESULT_PATH: MAX_RESULT_BYTES}),
         ws="none",
         lifespan="off",
         proxy_headers=False,
@@ -504,7 +631,10 @@ __all__ = [
     "MAX_BODY_BYTES",
     "MAX_CONCURRENT_CONNECTIONS",
     "BodyLimit",
+    "bind_time_pod_runtime_builder",
+    "bind_time_runtime",
     "connector_lease_exchange",
+    "driver_trust_policy",
     "connector_lease_exchange_app",
     "connector_service_reconciler_builder",
     "git_swap_delivery_settings",

@@ -42,6 +42,7 @@ from orchestrator.database import (
 )
 from orchestrator.security.auth import set_provisioning_backends
 from orchestrator.services import (
+    connector_bind_time,
     connector_credential_leases,
     connector_driver_ca,
     connector_git_swap_delivery,
@@ -227,6 +228,11 @@ def build_application_resources(
     # token repository now, else the installation's fallback.
     connector_git_swap_delivery.configure_git_swap_delivery(
         connectors_composition.git_swap_delivery_settings(resources)
+    )
+    # Bind-time image drivers (D6): one pod per operation, where this
+    # installation runs driver pods; process-wide like the image settings.
+    connector_bind_time.configure_bind_time(
+        connectors_composition.bind_time_runtime(resources)
     )
     if settings.connector_lease_probe_enabled:
         logger.warning(

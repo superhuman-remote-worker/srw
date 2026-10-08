@@ -59,6 +59,20 @@ class DatasourceCreate(BaseModel):
             "are the enforcement boundary."
         ),
     )
+    driver_registration_id: str | None = Field(
+        None,
+        description=(
+            "A registered driver's connector (type image_driver): the "
+            "registration it runs, pinned for the connector's life"
+        ),
+    )
+    driver: str | None = Field(
+        None,
+        description=(
+            "A registered driver's connector: its driver name, resolved in the "
+            "shared Catalog, then the one selected project, then your Account"
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_availability_policy(self) -> "DatasourceCreate":

@@ -1986,6 +1986,22 @@ spec:
             {{- end }}
             - name: CONNECTOR_DRIVER_SHIM_IMAGE
               value: {{ include "srw.imageRef" (dict "image" .Values.connectors.drivers.shim.image) | quote }}
+            # Registered driver images (connector drivers D6): the trusted
+            # repositories (a path-boundary match), whether custom images may
+            # have privilege anyway, and the bind-time pod limits (the
+            # namespace's Terminating pod quota is the cap's backstop).
+            - name: CONNECTOR_DRIVER_TRUSTED_REPOSITORIES
+              value: {{ .Values.connectors.drivers.trustedRepositories | default list | toJson | quote }}
+            {{- with .Values.connectors.customDrivers }}
+            - name: CONNECTOR_CUSTOM_DRIVERS_PRIVILEGED
+              value: {{ .privileged | quote }}
+            - name: CONNECTOR_BIND_TIME_DEADLINE_SECONDS
+              value: {{ .bindDeadlineSeconds | quote }}
+            - name: CONNECTOR_BIND_TIME_WAIT_SECONDS
+              value: {{ .bindWaitSeconds | quote }}
+            {{- end }}
+            - name: CONNECTOR_BIND_TIME_MAX_PODS
+              value: {{ .Values.connectors.servicePods.quota.bindTimePods | quote }}
             {{- with .Values.connectors.drivers.echo }}
             {{- if .enabled }}
             {{- if not $.Values.connectors.servicePods.enabled }}

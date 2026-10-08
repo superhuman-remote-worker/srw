@@ -51,7 +51,7 @@ from orchestrator.security.access import (
     redact_datasources,
     user_visible_project_ids,
 )
-from orchestrator.services import knowledge_index
+from orchestrator.services import connector_driver_registrations, knowledge_index
 from orchestrator.services.connector_drivers import ConnectorDriverRegistry
 from orchestrator.services.connector_drivers.base import (
     CheckContext,
@@ -64,6 +64,10 @@ from orchestrator.services.connector_drivers.base import (
     SupportsTestOverrides,
     SupportsWriteEffects,
     ValidationContext,
+)
+from orchestrator.services.connector_drivers.registered import (
+    CheckRunner,
+    SupportsDriverRegistration,
 )
 from shared.credential_connectors import CredentialConnectorAttachedError
 from shared.connectors.platform import platform_owned
@@ -104,6 +108,19 @@ class DatasourceDependencies:
     #: in place (``connector_secrets.read_connector_credentials``); ``None``
     #: tests with the row's own.
     connector_credentials: Callable[..., Awaitable[None]] | None = None
+    #: Runs a registered driver's ``check`` in a driver pod (D6); ``None``
+    #: where this installation runs no driver pods.
+    driver_check_runner: CheckRunner | None = None
+
+    async def driver_for(self, row: dict[str, Any]) -> DatasourceDriver | None:
+        """The driver of a stored row: its type's, or for a registered
+        driver's connector, its registration's."""
+        return await connector_driver_registrations.driver_for_row(
+            self.store,
+            self.connector_drivers,
+            row,
+            check_runner=self.driver_check_runner,
+        )
 
     def driver_environment(self) -> DriverEnvironment:
         return DriverEnvironment(
@@ -311,6 +328,18 @@ async def get_datasource(
             and str(scope_project_id) in {str(value) for value in project_ids}
             else ([] if scope_project_id else project_ids)
         )
+    driver = dependencies.connector_drivers.for_type(ds.get("type"))
+    if isinstance(driver, SupportsDriverRegistration):
+        # A registered driver's connector shows which image it runs and how
+        # its last bind went (a refused moved tag included).
+        ds[
+            "driver_status"
+        ] = await connector_driver_registrations.connector_driver_status(
+            dependencies.store,
+            datasource_id,
+            with_bindings=bool(user.get("is_admin"))
+            or str(ds.get("created_by") or "") == str(user["id"]),
+        )
     return redact_datasource(ds)
 
 
@@ -383,6 +412,27 @@ async def create_datasource(
     # membership is insufficient to add a link. Creation needs management
     # authority for every selected target before the datasource transaction.
     project_ids = list(dict.fromkeys(str(value) for value in body.project_ids or []))
+    registration = None
+    if isinstance(driver, SupportsDriverRegistration):
+        # A registered driver's connector runs the registration it names, one
+        # the caller may read (D6), pinned for the connector's life.
+        registration = (
+            await connector_driver_registrations.resolve_registration_for_use(
+                dependencies.store,
+                user,
+                registration_id=body.driver_registration_id,
+                name=body.driver,
+                project_id=project_ids[0] if len(project_ids) == 1 else None,
+            )
+        )
+        driver = driver.for_registration(
+            registration, check_runner=dependencies.driver_check_runner
+        )
+    elif body.driver_registration_id is not None or body.driver is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Only a registered driver's connector names a driver",
+        )
     scope_project_id = mcp_scope_project_id(user)
     if scope_project_id and (
         body.scope_mode != "projects" or set(project_ids) != {str(scope_project_id)}
@@ -435,6 +485,11 @@ async def create_datasource(
             project_ids=project_ids,
             authority_user_id=user_id,
             authority_is_admin=bool(user.get("is_admin")),
+            **(
+                {"driver_registration_id": registration.id}
+                if registration is not None
+                else {}
+            ),
         )
     except DatasourceProjectAuthorizationError as exc:
         raise HTTPException(
@@ -499,7 +554,7 @@ async def update_datasource(
         user, existing_ds, datasource_id, dependencies=dependencies
     )
     environment = dependencies.driver_environment()
-    driver = dependencies.connector_drivers.for_type(existing_ds.get("type"))
+    driver = await dependencies.driver_for(existing_ds)
     if driver is not None:
         driver.require_enabled(environment.gates)
     # Publish gate (spec: knowledge-base/knowledge/features/public_datasources.md). Only the
@@ -865,7 +920,7 @@ async def test_datasource(
         _, ds = await resolve_datasource()
         if dependencies.connector_credentials is not None:
             await dependencies.connector_credentials([ds], authorized=[str(ds["id"])])
-        driver = dependencies.connector_drivers.for_type(ds.get("type"))
+        driver = await dependencies.driver_for(ds)
         if overrides and isinstance(driver, SupportsTestOverrides):
             ds = driver.apply_test_overrides(ds, overrides)
         ds_type = ds["type"]

@@ -22,6 +22,7 @@ from orchestrator.application import (
     administration as administration_composition,
     catalogue as catalogue_composition,
     completion as completion_composition,
+    connectors as connectors_composition,
     controls as controls_composition,
     jobs as jobs_composition,
     preparation as preparation_composition,
@@ -48,6 +49,7 @@ from orchestrator.routers import (
     capacity as capacity_routes,
     citations as citations_routes,
     config_catalog as config_catalog_routes,
+    connector_drivers as connector_drivers_routes,
     datasources as datasources_routes,
     diagnostics as diagnostics_routes,
     expert_catalog as expert_catalog_routes,
@@ -204,6 +206,9 @@ def bind_router_dependencies(app: FastAPI, resources: ApplicationResources) -> N
     )
     app.state.datasources_dependencies_factory = (
         lambda: projects_composition.datasources_dependencies(resources)
+    )
+    app.state.connector_drivers_dependencies_factory = (
+        lambda: connectors_composition.connector_drivers_dependencies(resources)
     )
     app.state.projects_dependencies_factory = (
         lambda: projects_composition.projects_dependencies(resources)
@@ -442,6 +447,7 @@ def include_routers(app: FastAPI) -> None:
     app.include_router(job_diagnostics_routes.router)
     app.include_router(expert_catalog_routes.router)
     app.include_router(datasources_routes.router)
+    app.include_router(connector_drivers_routes.router)
     app.include_router(projects_routes.router)
     app.include_router(knowledge_routes.router)
     app.include_router(citations_routes.router)

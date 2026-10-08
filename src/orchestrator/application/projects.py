@@ -13,6 +13,7 @@ import logging
 
 from orchestrator.application import (
     access as access_composition,
+    connectors as connectors_composition,
     preparation as preparation_composition,
 )
 from orchestrator.application.resources import ApplicationResources, bound
@@ -26,6 +27,7 @@ from orchestrator.routers import (
 from orchestrator.security import access, auth
 from orchestrator.services import (
     citations as citations_operations,
+    connector_bind_time,
     connector_secrets,
     datasource_config,
     datasources as datasources_operations,
@@ -87,6 +89,8 @@ def datasources_dependencies(
                 datasources_dependencies,
                 resources,
             ),
+            # A registered driver's Test runs its check in a driver pod (D6).
+            driver_check_runner=connector_bind_time.run_check,
         ),
         require_approved_user=auth.require_approved_user,
         require_project_member=access.require_project_member,
@@ -100,6 +104,7 @@ def datasources_dependencies(
                 resources.settings.connector_service_enforcement_verified
             ),
         ),
+        driver_trust=connectors_composition.driver_trust_policy(resources),
     )
 
 

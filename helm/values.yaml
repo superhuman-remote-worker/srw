@@ -274,7 +274,29 @@ connectors:
       # maxInstallation, whatever this says.
       secrets: 64
       services: 48
+  # -- Driver images users register themselves (connector drivers D6): in
+  # their Account, as Project editors in a Project, as administrators in the
+  # shared Catalog. Any image may be registered; the control is privilege,
+  # never admission (the workspace-image policy). A custom image runs
+  # unprivileged in bind-time pods under the namespace baseline; its bind
+  # returns data (environment variables, credential files) that SRW delivers.
+  # Needs servicePods.enabled for its pods.
+  customDrivers:
+    # -- Let images outside drivers.trustedRepositories have privilege too
+    # (the in-pod plane, when it arrives). Off: only trusted repositories.
+    privileged: false
+    # -- A bind-time pod's activeDeadlineSeconds: the longest one driver
+    # operation (bind, revoke, check, spec) may run, canary wait included.
+    bindDeadlineSeconds: 120
+    # -- How long a delivery (a claim, an attach) waits for a new bind
+    # before it is refused and retried; the bind goes on meanwhile.
+    bindWaitSeconds: 60
   drivers:
+    # -- Repositories whose driver images are trusted (D6), matched on a
+    # path boundary: ghcr.io/acme trusts ghcr.io/acme/driver but never
+    # ghcr.io/acme-evil. A trusted image may have privilege; every other
+    # registered image is custom and its claims are its author's.
+    trustedRepositories: []
     # -- SRW's static driver shim (docker/Dockerfile.driver-shim): the
     # canary-wait and shim-install init containers of every driver pod, and
     # the driver container's command. servicePods.enabled needs a digest

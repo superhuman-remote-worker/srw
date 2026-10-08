@@ -37,7 +37,11 @@ from orchestrator.services.connector_drivers.matrix import (
     capability_matrix,
     public_schema,
 )
-from shared.connectors.builtin import BUILTIN_SPECS, DATASOURCE_SPECS
+from shared.connectors.builtin import (
+    BUILTIN_SPECS,
+    DATASOURCE_SPECS,
+    IMAGE_DRIVER_SPEC,
+)
 from shared.connectors.contract import (
     AccessLevel,
     CredentialSlot,
@@ -111,6 +115,9 @@ def _store() -> SimpleNamespace:
         list_datasource_catalog=AsyncMock(return_value={"items": [row]}),
         list_eligible_datasources=AsyncMock(return_value=[row]),
         get_datasource=AsyncMock(return_value=row),
+        # Registered drivers the caller can see (D6): none here.
+        get_projects_for_user=AsyncMock(return_value=[]),
+        fetch=AsyncMock(return_value=[]),
     )
 
 
@@ -158,8 +165,10 @@ def matrix():
 class TestBuiltinMatrix:
     def test_every_installed_driver_is_listed_in_registry_order(self, matrix):
         registry = builtin_connector_drivers()
+        # The stored type of registered drivers' connectors is no driver
+        # anyone picks: each registration is its own row (D6).
         assert [d["name"] for d in matrix["drivers"]] == [
-            spec.name for spec in registry.specs()
+            spec.name for spec in registry.specs() if spec is not IMAGE_DRIVER_SPEC
         ]
         assert {d["name"] for d in matrix["drivers"]} == {
             spec.name for spec in BUILTIN_SPECS
@@ -266,7 +275,9 @@ class TestDevelopmentDrivers:
             "claims_declared_by_author": False,
         }
         assert [d["name"] for d in builtins] == [
-            spec.name for spec in builtin_connector_drivers().specs()
+            spec.name
+            for spec in builtin_connector_drivers().specs()
+            if spec is not IMAGE_DRIVER_SPEC
         ]
         assert all(d["trust"]["tier"] == "builtin" for d in builtins)
 
@@ -495,8 +506,12 @@ class TestNoCredentialValue:
         response = wire.client.get("/api/datasources/drivers")
         assert response.status_code == 200
         assert STORED_SECRET not in response.text
-        for name in vars(wire.store):
+        # Only the registered drivers the caller sees are read (D6): never a
+        # connector.
+        registration_reads = {"get_projects_for_user", "fetch"}
+        for name in set(vars(wire.store)) - registration_reads:
             getattr(wire.store, name).assert_not_awaited()
+        assert "connector_driver_registrations" in wire.store.fetch.await_args.args[0]
 
 
 class TestRoute:
@@ -527,3 +542,89 @@ class TestRoute:
             "UPDATE_CONNECTOR_GOLDENS=1 python -m pytest "
             "tests/test_connector_capability_matrix.py"
         )
+
+
+class TestRegisteredDrivers:
+    """Registered image drivers (D6): a row each, where the caller sees them."""
+
+    def _registration(self, **over):
+        from orchestrator.services.connector_driver_registrations import (
+            registration_from_row,
+        )
+        from shared.connectors.registration import spec_to_json
+
+        spec = spec_to_json(_image_spec())
+        spec.update(
+            name="acme.env/v1",
+            plane="bind_time",
+            delivery_forms=["env_file"],
+            credential_delivery="inline",
+            supported_backends=["sandbox"],
+        )
+        row = {
+            "id": "00000000-0000-0000-0000-00000000d6d6",
+            "name": "acme.env/v1",
+            "scope_kind": "Account",
+            "owner_id": USER["id"],
+            "project_id": None,
+            "title": "Acme",
+            "description": None,
+            "image_reference": "ghcr.io/acme/env:1",
+            "image_digest": "sha256:" + "1" * 64,
+            "spec": json.dumps(spec),
+            "spec_hash": "sha256:" + "2" * 64,
+            "spec_source": "label",
+            "protocol_version": "1.0",
+            "plane": "bind_time",
+            "source_document": None,
+            "created_by": USER["id"],
+            "created_at": None,
+            "updated_at": None,
+            **over,
+        }
+        return row, registration_from_row(row)
+
+    def test_a_registration_row_carries_its_trust_and_where_it_lives(self):
+        from orchestrator.services.connector_driver_registrations import (
+            DriverTrustPolicy,
+        )
+        from orchestrator.services.connector_drivers.matrix import (
+            registered_driver_entry,
+        )
+
+        _row, registration = self._registration()
+        entry = registered_driver_entry(
+            registration,
+            trust=DriverTrustPolicy().trust(registration.image_reference),
+            hosting=HostingStatus(enabled=True),
+        )
+        assert entry["name"] == "acme.env/v1"
+        assert entry["legacy_type"] == "image_driver"
+        assert entry["serves_stored_type"] is False
+        assert entry["trust"] == {
+            "tier": "custom",
+            "trusted": False,
+            "privileged": False,
+            "image": "ghcr.io/acme/env:1",
+            "claims_declared_by_author": True,
+        }
+        assert entry["registration"]["scope"] == {
+            "kind": "Account",
+            "name": USER["id"],
+        }
+        # Its pods pin their egress like service pods.
+        assert entry["egress"]["enforced"]["status"] == "enforced"
+        trusted = DriverTrustPolicy(trusted_repositories=("ghcr.io/acme",))
+        assert trusted.trust(registration.image_reference)["tier"] == "trusted"
+
+    def test_the_route_lists_the_registrations_the_caller_sees(self):
+        row, _registration = self._registration()
+        wire = _client()
+        wire.store.fetch = AsyncMock(return_value=[row])
+        body = wire.client.get("/api/datasources/drivers").json()
+        names = [driver["name"] for driver in body["drivers"]]
+        assert names[-1] == "acme.env/v1"
+        query, account, projects = wire.store.fetch.await_args.args
+        assert "connector_driver_registrations" in query
+        assert str(account) == USER["id"]
+        assert projects == []

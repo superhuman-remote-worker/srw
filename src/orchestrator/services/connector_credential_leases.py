@@ -271,8 +271,14 @@ def harness_credentials(entry: Mapping[str, Any], spec: DriverSpec) -> dict[str,
 
 
 def needs_leases(entries: Sequence[Any] | None) -> bool:
-    """Whether any entry of a datasources payload is delivered by lease."""
-    return any(isinstance(e, Mapping) and lease_spec(e) for e in entries or ())
+    """Whether any entry of a datasources payload is delivered by lease, or
+    by a registered image driver's bind (D6), which the same delivery fills."""
+    from orchestrator.services.connector_bind_time import registered_entry
+
+    return any(
+        isinstance(e, Mapping) and (lease_spec(e) or registered_entry(e))
+        for e in entries or ()
+    )
 
 
 def _encrypt(token: str) -> str:
@@ -649,6 +655,11 @@ async def deliver_connector_leases(
             # ask for that pass when this transaction commits (S1).
             await _ask_for_reconcile(conn)
         delivered += 1
+    # A registered image driver's connector receives what its bind-time pod
+    # returned for this execution (D6), in the same transaction.
+    from orchestrator.services.connector_bind_time import deliver_bind_time_entries
+
+    delivered += await deliver_bind_time_entries(conn, entries, owner=owner)
     return delivered
 
 
@@ -777,9 +788,13 @@ async def prepare_lease_delivery(
     happen here, on ``db``'s own connections, so the delivery inside the
     caller's transaction does no network and no write of its own. A git
     swap candidate's upstream is checked here too (its egress and its TLS,
-    C3). No-op without such an entry; never raises (the delivery applies
+    C3), and a registered image driver's connector is bound, in its own pod
+    (D6). No-op without such an entry; never raises (the delivery applies
     the outcome).
     """
+    from orchestrator.services.connector_bind_time import prepare_bind_time_bindings
+
+    await prepare_bind_time_bindings(entries, owner=owner)
     if not any(
         isinstance(entry, Mapping)
         and (spec := lease_spec(entry)) is not None

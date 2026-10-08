@@ -43,11 +43,16 @@ from orchestrator.security.access import (
     require_project_owner,
 )
 from orchestrator.security.auth import require_approved_user
-from orchestrator.services import datasources
+from orchestrator.services import connector_driver_registrations, datasources
+from orchestrator.services.connector_driver_registrations import DriverTrustPolicy
 from orchestrator.services.connector_drivers.matrix import (
     HostingStatus,
     capability_matrix,
     egress_columns,
+    registered_driver_entry,
+)
+from orchestrator.services.connector_drivers.registered import (
+    SupportsDriverRegistration,
 )
 from orchestrator.services.connector_service_hosting import connector_egress_view
 
@@ -67,6 +72,9 @@ class DatasourcesDependencies:
     #: Service-plane driver hosting on this installation (D5), for the
     #: matrix's egress columns.
     service_hosting: HostingStatus = HostingStatus()
+    #: The operator's trust in registered driver images (D6), for the
+    #: matrix's trust column.
+    driver_trust: DriverTrustPolicy = DriverTrustPolicy()
 
 
 def get_datasources_dependencies(request: Request) -> DatasourcesDependencies:
@@ -214,20 +222,29 @@ async def list_connector_drivers(
     *,
     dependencies: DatasourcesDependencies = Depends(get_datasources_dependencies),
 ) -> dict[str, Any]:
-    """The capability matrix of every installed connector driver.
+    """The capability matrix of every driver the caller can use.
 
-    It describes installed software and reads no connector, so any approved
-    user may read it, as the catalog without a project filter.
-
-    TODO(D6): once drivers can be registered at Account and Project scope,
-    with image references, the matrix must list only the drivers the caller
-    can see (the shared Catalog, their Account, their Projects).
+    The installed drivers describe installed software and read no connector,
+    so any approved user may read them, as the catalog without a project
+    filter. Registered image drivers (D6) are listed only where the caller
+    can see them: the shared Catalog, their Account, their Projects.
     """
-    await dependencies.require_approved_user(request, dependencies.store)
-    return capability_matrix(
+    user = await dependencies.require_approved_user(request, dependencies.store)
+    matrix = capability_matrix(
         dependencies.operations.connector_drivers,
         hosting=dependencies.service_hosting,
     )
+    for registration in await connector_driver_registrations.list_visible_registrations(
+        dependencies.store, user
+    ):
+        matrix["drivers"].append(
+            registered_driver_entry(
+                registration,
+                trust=dependencies.driver_trust.trust(registration.image_reference),
+                hosting=dependencies.service_hosting,
+            )
+        )
+    return matrix
 
 
 @router.get("/api/datasources/{datasource_id}/egress")
@@ -247,12 +264,16 @@ async def get_connector_egress(
     _user, ds = await dependencies.require_datasource_access(
         request, dependencies.store, datasource_id
     )
-    driver = dependencies.operations.connector_drivers.for_type(ds.get("type"))
+    driver = await dependencies.operations.driver_for(ds)
     spec = driver.spec if driver is not None else None
     view = await connector_egress_view(dependencies.store, datasource_id, spec=spec)
     if spec is not None:
         _enforced, installation = egress_columns(
-            spec, in_process=False, hosting=dependencies.service_hosting
+            spec,
+            in_process=False,
+            hosting=dependencies.service_hosting,
+            # A registered image driver runs in driver pods on any plane.
+            pod_hosted=isinstance(driver, SupportsDriverRegistration),
         )
         view["installation"] = installation
     return view

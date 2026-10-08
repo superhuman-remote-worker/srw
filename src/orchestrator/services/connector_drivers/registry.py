@@ -1,9 +1,11 @@
 """The installed connector drivers, by driver name and by stored type.
 
 One registry per application lives on ``ApplicationResources`` and reaches
-services through their dependency dataclasses.  It is immutable: a future
-image driver is registered by building the registry with it, never by
-mutating a shared one.
+services through their dependency dataclasses.  It is immutable: it holds
+the drivers SRW ships. Image drivers someone registers (D6) live in the
+database (``connector_driver_registrations``); their connectors share one
+stored type, whose driver here hands out each registration's
+(``connector_drivers.registered``).
 """
 
 from __future__ import annotations
@@ -70,8 +72,18 @@ class ConnectorDriverRegistry:
         return tuple(self._by_name.values())
 
     def type_ids(self) -> tuple[str, ...]:
-        """Stored types with a driver, in registration order."""
-        return tuple(self._by_type)
+        """Stored types a connector is created with by its type alone, in
+        registration order. The type of registered image drivers'
+        connectors is not one: such a connector names its registration."""
+        from orchestrator.services.connector_drivers.registered import (
+            SupportsDriverRegistration,
+        )
+
+        return tuple(
+            type_id
+            for type_id, driver in self._by_type.items()
+            if not isinstance(driver, SupportsDriverRegistration)
+        )
 
 
 def builtin_connector_drivers(
@@ -97,8 +109,13 @@ def builtin_connector_drivers(
     SRW ships is refused.
     """
     from orchestrator.services.connector_drivers import builtin
+    from orchestrator.services.connector_drivers.registered import (
+        RegisteredDriverHost,
+    )
 
-    drivers: tuple[ConnectorDriver, ...] = builtin.drivers()
+    # The stored type of every registered image driver's connector (D6):
+    # the registrations themselves live in the database.
+    drivers: tuple[ConnectorDriver, ...] = builtin.drivers() + (RegisteredDriverHost(),)
     if git_swap_image:
         from orchestrator.services.connector_drivers.git_swap import GitSwapDriver
         from shared.connectors.builtin import REPOSITORY_SPEC

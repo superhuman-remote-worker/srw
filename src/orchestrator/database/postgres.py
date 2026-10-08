@@ -50499,6 +50499,7 @@ class PostgresDB:
         project_ids: list[str] | None = None,
         authority_user_id: str | None = None,
         authority_is_admin: bool = False,
+        driver_registration_id: str | None = None,
     ) -> Dict[str, Any]:
         """Create a new datasource.
 
@@ -50525,6 +50526,9 @@ class PostgresDB:
             authority_user_id: Optional request actor whose target-project
                 owner role is rechecked inside the link transaction
             authority_is_admin: Whether that request actor is an administrator
+            driver_registration_id: The registered image driver the connector
+                runs (connector drivers D6), pinned in the same transaction
+                before its Connector resource is written
 
         Returns:
             Created datasource dict
@@ -50583,6 +50587,13 @@ class PostgresDB:
                     auto_attach,
                 )
                 datasource_uuid = row["id"]
+                if driver_registration_id is not None:
+                    await conn.execute(
+                        "INSERT INTO connector_driver_assignments "
+                        "(connector_id, registration_id) VALUES ($1, $2)",
+                        datasource_uuid,
+                        UUID(str(driver_registration_id)),
+                    )
                 if project_uuids:
                     # Knowledge connectors keep the existing link-level RO
                     # invariant. Retained overrides are relevant only on

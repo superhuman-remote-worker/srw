@@ -360,7 +360,11 @@ async def persist_connector_resource(db, datasource_id: Any, *, registry=None) -
         await _retire(db, current)
         return "deleted"
     drivers = _registry(db, registry)
-    driver = drivers.for_type(row.get("type"))
+    # A registered image driver's connector names its registration's driver
+    # and keeps the config its spec declares (D6).
+    from orchestrator.services.connector_driver_registrations import driver_for_row
+
+    driver = await driver_for_row(db, drivers, row)
     if row.get("job_id") or driver is None:
         # A legacy clone-to-job row (frozen since 0083) or a type no driver
         # serves: never a Connector.

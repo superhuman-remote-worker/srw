@@ -32,6 +32,7 @@ from orchestrator.services import (
     audit_usage,
     cloud_pricing,
     completion_recovery as completion_recovery_operations,
+    connector_bind_time,
     connector_credential_leases,
     connector_service_hosting,
     container_provisioner as container_provisioner_module,
@@ -114,6 +115,7 @@ BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
     "connector_lease_exchange",
     "connector_service_reconciler",
     "connector_service_identity_revoker",
+    "connector_bind_time_reconciler",
     "checkpoint_retention",
     "headless_notify",
     "attention_sleep",
@@ -505,6 +507,21 @@ async def start_background_tasks(
             "connector_service_identity_revoker",
             connector_service_hosting.connector_service_identity_revoker(
                 resources.shutdown_event, store=resources.postgres_db
+            ),
+        )
+    # Bind-time image drivers (D6): revoke the bindings of ended executions
+    # and deleted connectors in a driver pod, fail binds a restart orphaned,
+    # and remove what operation pods left behind. Leader-gated, like the
+    # service reconciler; off where no driver pod runs.
+    if service_hosting is not None:
+        tasks.start_leader_gated(
+            "connector_bind_time_reconciler",
+            functools.partial(
+                connector_bind_time.bind_time_reconciler,
+                pod_runtime=connectors_composition.bind_time_pod_runtime_builder(
+                    service_hosting
+                ),
+                interval_seconds=resources.settings.connector_service_reconcile_seconds,
             ),
         )
     # In-flight checkpoint retention: bound every live thread's LangGraph

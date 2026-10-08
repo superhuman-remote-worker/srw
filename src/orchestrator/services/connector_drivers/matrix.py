@@ -20,8 +20,9 @@ what it is.  A driver's author could still write a value into a schema, so
 Trust: the built-in drivers are SRW's own code, so their claims are SRW's.
 A development driver (the lease probe or the echo service, on only where a
 deployment switch installs it) is SRW's too but tier ``development``, never
-trusted; a service-plane one shows the image its pods run. A driver
-outside the trusted list (registration arrives in D6) is marked
+trusted; a service-plane one shows the image its pods run. A registered
+image driver (D6) is ``trusted`` when its repository is in the operator's
+trusted list and ``custom`` otherwise; a custom one is marked
 ``claims_declared_by_author``: SRW does not verify foreign images, the same
 as for workspace images.
 
@@ -46,6 +47,10 @@ from typing import Any
 from orchestrator.services.connector_drivers.base import (
     DatasourceDriver,
     ManifestDeliveryDriver,
+)
+from orchestrator.services.connector_drivers.registered import (
+    RegisteredImageDriver,
+    SupportsDriverRegistration,
 )
 from orchestrator.services.connector_drivers.registry import (
     ConnectorDriver,
@@ -119,20 +124,66 @@ class HostingStatus:
 def capability_matrix(
     registry: ConnectorDriverRegistry, *, hosting: HostingStatus | None = None
 ) -> dict[str, Any]:
-    """The matrix of every installed driver, in registration order."""
+    """The matrix of every installed driver, in registration order.
+
+    The stored type of registered image drivers' connectors is no driver
+    anyone picks: each registration the caller may see is its own row
+    (:func:`registered_driver_entry`), added by the route.
+    """
     return {
         "protocol_version": PROTOCOL_VERSION,
         "drivers": [
-            driver_entry(driver, hosting=hosting) for driver in registry.drivers()
+            driver_entry(driver, hosting=hosting)
+            for driver in registry.drivers()
+            if not isinstance(driver, SupportsDriverRegistration)
         ],
     }
 
 
+def registered_driver_entry(
+    registration: Any,
+    *,
+    trust: Mapping[str, Any],
+    hosting: HostingStatus | None = None,
+) -> dict[str, Any]:
+    """One registered image driver's row (D6): its spec's columns, its pods'
+    egress, the trust its repository earns and where it is registered.
+
+    ``legacy_type`` is the type its connectors are created with; it owns no
+    catalogue form (the generic form renders its schema).
+    """
+    driver = RegisteredImageDriver(registration)
+    entry = driver_entry(driver, hosting=hosting)
+    enforced, installation = egress_columns(
+        driver.spec, in_process=False, hosting=hosting, pod_hosted=True
+    )
+    entry["egress"]["enforced"] = enforced
+    entry["egress"]["installation"] = installation
+    entry["serves_stored_type"] = False
+    entry["trust"] = dict(trust)
+    entry["registration"] = {
+        "id": registration.id,
+        "scope": registration.scope,
+        "image_reference": registration.image_reference,
+        "image_digest": registration.image_digest,
+        "spec_source": registration.spec_source,
+    }
+    return entry
+
+
 def egress_columns(
-    spec: DriverSpec, *, in_process: bool, hosting: HostingStatus | None
+    spec: DriverSpec,
+    *,
+    in_process: bool,
+    hosting: HostingStatus | None,
+    pod_hosted: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """The ``enforced`` and ``installation`` columns of one driver."""
-    if spec.plane == "service":
+    """The ``enforced`` and ``installation`` columns of one driver.
+
+    ``pod_hosted``: the driver runs in SRW's driver pods whatever its plane
+    (a registered bind-time image), so its egress is pinned per pod too.
+    """
+    if spec.plane == "service" or pod_hosted:
         if hosting is None or not hosting.enabled:
             reason = {"status": "not_enforced", "reason": "service_hosting_disabled"}
             return dict(reason), dict(reason)
@@ -399,8 +450,8 @@ def _trust(
             "image": image,
             "claims_declared_by_author": False,
         }
-    # D6 registers image drivers with their image reference and checks it
-    # against the operator's trusted repositories; nothing else exists yet.
+    # A registered image driver's trust comes from its registration
+    # (registered_driver_entry); nothing else reaches here.
     return {
         "tier": "custom",
         "trusted": False,

@@ -242,6 +242,7 @@ _RULES: tuple[_Rule, ...] = (
     _prefix(f"{_PROJECT}/contacts", _ADMIN),
     _prefix("/api/projects", _CATALOG),
     _prefix("/api/datasources", _CATALOG),
+    _prefix("/api/connector-drivers", _CATALOG),
     _prefix("/api/experts", _CATALOG),
     _prefix("/api/expert-defaults", _CATALOG),
     _prefix("/api/skills", _CATALOG),

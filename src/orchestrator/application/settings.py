@@ -131,6 +131,28 @@ def parse_name_list(raw: str | None) -> frozenset[str]:
     return frozenset(item.strip() for item in (raw or "").split(",") if item.strip())
 
 
+def parse_repository_list(raw: str | None) -> tuple[str, ...]:
+    """Image repositories from a JSON list (``connectors.drivers.
+    trustedRepositories``). Anything that is not a list of non-empty strings
+    trusts nothing, with a warning: a typo never widens trust."""
+    value = (raw or "").strip()
+    if not value:
+        return ()
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        parsed = None
+    if not isinstance(parsed, list) or not all(
+        isinstance(item, str) and item.strip() for item in parsed
+    ):
+        logger.warning(
+            "CONNECTOR_DRIVER_TRUSTED_REPOSITORIES is not a JSON list of "
+            "repositories; no driver repository is trusted"
+        )
+        return ()
+    return tuple(item.strip() for item in parsed)
+
+
 def parse_cidr_list(
     raw: str | None, *, default: tuple[str, ...] = DEFAULT_CLUSTER_CIDRS
 ) -> tuple[str, ...]:
@@ -336,6 +358,19 @@ class DeploymentSettings:
     #: replaced after a re-pin runs on once its replacement serves.
     connector_service_reresolve_seconds: float = 300.0
     connector_service_repin_drain_seconds: float = 30.0
+    #: Registered driver images (D6): the operator's trusted repositories
+    #: (``connectors.drivers.trustedRepositories``, a path-boundary match)
+    #: and whether custom images may have privilege anyway
+    #: (``connectors.customDrivers.privileged``, off by default).
+    connector_driver_trusted_repositories: tuple[str, ...] = ()
+    connector_custom_drivers_privileged: bool = False
+    #: Bind-time driver pods (D6): the installation cap (the namespace's
+    #: Terminating pod quota is the backstop), each pod's
+    #: activeDeadlineSeconds, and how long a delivery waits for a bind before
+    #: it is refused and retried (the bind goes on).
+    connector_bind_time_max_pods: int = 10
+    connector_bind_time_deadline_seconds: float = 120.0
+    connector_bind_time_wait_seconds: float = 60.0
 
     def session_subagent_fanout(self, lane: str | None) -> bool:
         """Whether a session on ``lane`` may fan out right now."""
@@ -527,6 +562,36 @@ class DeploymentSettings:
                 default=30.0,
                 minimum=0.0,
             ),
+            connector_driver_trusted_repositories=parse_repository_list(
+                os.environ.get("CONNECTOR_DRIVER_TRUSTED_REPOSITORIES")
+            ),
+            # Opt-in only: a garbage value never grants privilege.
+            connector_custom_drivers_privileged=(
+                os.environ.get("CONNECTOR_CUSTOM_DRIVERS_PRIVILEGED", "")
+                .strip()
+                .lower()
+                in ("1", "true", "yes", "on")
+            ),
+            connector_bind_time_max_pods=int(
+                parse_positive_number(
+                    "CONNECTOR_BIND_TIME_MAX_PODS",
+                    os.environ.get("CONNECTOR_BIND_TIME_MAX_PODS"),
+                    default=10,
+                    minimum=0,
+                )
+            ),
+            connector_bind_time_deadline_seconds=parse_positive_number(
+                "CONNECTOR_BIND_TIME_DEADLINE_SECONDS",
+                os.environ.get("CONNECTOR_BIND_TIME_DEADLINE_SECONDS"),
+                default=120.0,
+                minimum=30.0,
+            ),
+            connector_bind_time_wait_seconds=parse_positive_number(
+                "CONNECTOR_BIND_TIME_WAIT_SECONDS",
+                os.environ.get("CONNECTOR_BIND_TIME_WAIT_SECONDS"),
+                default=60.0,
+                minimum=1.0,
+            ),
         )
 
 
@@ -541,5 +606,6 @@ __all__ = [
     "parse_json_object",
     "parse_name_list",
     "parse_positive_number",
+    "parse_repository_list",
     "parse_session_subagent_fanout_lanes",
 ]

@@ -36,6 +36,7 @@ from orchestrator.services.connector_drivers.base import (
     SupportsCredentialLease,
 )
 from orchestrator.services.connector_drivers.lease_probe import LeaseProbeDriver
+from orchestrator.services.connector_bind_time_launch import RESULT_PATH
 from orchestrator.services.connector_lease_exchange import (
     EXCHANGE_PATH,
     INTROSPECT_PATH,
@@ -491,7 +492,9 @@ class TestExchangePort:
         client, _ = exchange_client
         app = client.app
         paths = {getattr(route, "path", None) for route in app.routes}
-        assert paths == {EXCHANGE_PATH, INTROSPECT_PATH}
+        # The exchange, introspection, and the result route bind-time driver
+        # pods post to (D6).
+        assert paths == {EXCHANGE_PATH, INTROSPECT_PATH, RESULT_PATH}
         for path in ("/docs", "/openapi.json", "/api/health"):
             assert client.get(path).status_code == 404
 
@@ -501,6 +504,7 @@ class TestExchangePort:
         app = create_app()
         paths = {getattr(route, "path", "") for route in app.routes}
         assert EXCHANGE_PATH not in paths and INTROSPECT_PATH not in paths
+        assert RESULT_PATH not in paths
         assert not any("connector-lease" in path for path in paths)
 
     def test_max_cache_seconds_is_thirty(self):
@@ -1026,7 +1030,7 @@ class TestDenialLimiter:
         assert limiter.admit(("e", "r")) == (True, 0)
 
 
-async def _asgi_call(app, *, body_chunks, headers=()):
+async def _asgi_call(app, *, body_chunks, headers=(), path=EXCHANGE_PATH):
     sent: list[dict] = []
     chunks = list(body_chunks)
 
@@ -1045,8 +1049,8 @@ async def _asgi_call(app, *, body_chunks, headers=()):
         "http_version": "1.1",
         "method": "POST",
         "scheme": "http",
-        "path": EXCHANGE_PATH,
-        "raw_path": EXCHANGE_PATH.encode(),
+        "path": path,
+        "raw_path": path.encode(),
         "root_path": "",
         "query_string": b"",
         "headers": [(k.encode(), v.encode()) for k, v in headers],
@@ -1153,10 +1157,39 @@ class TestBoundedPort:
         )
         assert response.status_code == 413 and fake.calls == []
 
+    @pytest.mark.asyncio
+    async def test_the_result_route_has_its_own_limit_and_no_other_path_does(self):
+        """A bind-time driver pod posts its whole output (D6): only that
+        path takes more than an exchange body."""
+        limited = connectors_composition.BodyLimit(
+            _echo, limit=16, path_limits={RESULT_PATH: 64}
+        )
+        sent = await _asgi_call(
+            limited,
+            body_chunks=[b"x" * 40],
+            headers=[("content-length", "40")],
+            path=RESULT_PATH,
+        )
+        assert sent[0]["status"] == 200
+        sent = await _asgi_call(
+            limited,
+            body_chunks=[b"x" * 40],
+            headers=[("content-length", "40")],
+            path=EXCHANGE_PATH,
+        )
+        assert sent[0]["status"] == 413
+        sent = await _asgi_call(
+            limited, body_chunks=[b"x" * 40, b"x" * 40], path=RESULT_PATH
+        )
+        assert sent[0]["status"] == 413
+
     def test_the_server_is_bounded(self):
         config = connectors_composition.exchange_server_config(object())
         assert isinstance(config.app, connectors_composition.BodyLimit)
         assert config.app.limit == connectors_composition.MAX_BODY_BYTES == 4096
+        assert config.app.path_limits == {
+            RESULT_PATH: connectors_composition.MAX_RESULT_BYTES
+        }
         assert (
             config.limit_concurrency
             == connectors_composition.MAX_CONCURRENT_CONNECTIONS

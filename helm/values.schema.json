@@ -1446,9 +1446,23 @@
             }
           }
         },
+        "customDrivers": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Driver images users register (connector drivers D6).",
+          "properties": {
+            "privileged": {"type": "boolean"},
+            "bindDeadlineSeconds": {"type": "integer", "minimum": 30},
+            "bindWaitSeconds": {"type": "integer", "minimum": 1}
+          }
+        },
         "drivers": {
           "type": "object",
           "properties": {
+            "trustedRepositories": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1}
+            },
             "echo": {
               "type": "object",
               "additionalProperties": false,
