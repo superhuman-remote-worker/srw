@@ -1000,3 +1000,21 @@ def test_the_generic_needle_finds_a_real_key_split_across_reads(chunk_size):
             chunk_size=chunk_size,
         )
         assert found == {0}, key.splitlines()[0]
+
+
+def test_cleanup_deletes_the_session_thread_permanently(monkeypatch):
+    runner = _runner()
+    runner.thread = "00000000-0000-4000-8000-000000000001"
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        runner.api, "call", lambda method, path, body=None: calls.append((method, path))
+    )
+
+    runner.cleanup()
+
+    assert calls == [
+        (
+            "DELETE",
+            f"/api/persistent/threads/{runner.thread}?force=true&permanent=true",
+        )
+    ]

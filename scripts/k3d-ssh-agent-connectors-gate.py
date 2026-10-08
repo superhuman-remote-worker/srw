@@ -64,9 +64,9 @@ full test run): this is a mutating gate.
       --run --confirm LOCAL-K3D-DISPOSABLE
 
 Private keys travel only on ``kubectl exec -i`` stdin and are scrubbed from
-every message this script prints. Cleanup (end the session, cancel and delete
-the job, delete the connectors and the Gitea repositories) runs in ``finally``
-unless ``--keep``.
+every message this script prints. Cleanup (delete the session permanently,
+cancel and delete the job, delete the connectors and the Gitea repositories)
+runs in ``finally`` unless ``--keep``: nothing named with the gate id stays.
 """
 
 from __future__ import annotations
@@ -744,7 +744,7 @@ PLAN = [
     "job-snap: cancel the still-running job; wait for jobs/<id>/ objects; scan them",
     "end: End the session; no ssh-agent left",
     "snapshot: scan threads/<id>/ objects if any (a sandbox End writes none)",
-    "cleanup: end session, cancel+delete job, delete connectors and repos",
+    "cleanup: delete session, cancel+delete job, delete connectors and repos",
 ]
 
 
@@ -1537,9 +1537,13 @@ class SshAgentConnectorsGate:
         if self.thread:
             steps.append(
                 (
-                    "end session",
+                    "delete session",
+                    # permanent: an ended thread row (titled with the gate
+                    # id) would otherwise stay behind after every run.
                     lambda: self.api.call(
-                        "DELETE", f"/api/persistent/threads/{self.thread}?force=true"
+                        "DELETE",
+                        f"/api/persistent/threads/{self.thread}"
+                        "?force=true&permanent=true",
                     ),
                 )
             )
