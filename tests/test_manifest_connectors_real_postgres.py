@@ -1,11 +1,15 @@
 """Datasources become Connectors, slice D3a, on a real PostgreSQL.
 
-* the migrations (0350-0354) add the identity and marker columns to rows a
-  pre-D3a database already holds, and validate their constraints;
+* the migrations (0350-0352) add the identity and marker columns to rows a
+  pre-D3a database already holds and validate their constraints; they retry
+  past application transactions that lock the two tables in either order,
+  leaving no dirty ledger row, and applying any of them again is a no-op;
 * ``migrate_stored_connectors`` writes one Connector per eligible row with
   the right uid, name, scope, driver and access, touches no
   ``policy_revision``, link or reconcile entry, is idempotent, works in
-  batches and skips rows already in step (timed at 1,500 and 6,000 rows);
+  batches and skips rows already in step (timed at 1,500 and 6,000 rows),
+  including a row an older replica renamed in a transaction that began before
+  the last sync, and never looks at legacy job clones;
 * the datasource store writes the row and its resource in one transaction
   (create, update, policy update, link, unlink, delete, default seeding), and
   a failure in either half rolls both back; nothing secret-looking reaches a
@@ -1070,3 +1074,192 @@ async def test_control_the_old_lock_order_deadlocks(database, order, monkeypatch
         database, "delete", order, fixed=False, monkeypatch=monkeypatch
     )
     assert any(isinstance(o, asyncpg.DeadlockDetectedError) for o in outcomes), outcomes
+
+
+# =============================================================================
+# The migrations against live application transactions, and applied again
+# =============================================================================
+
+D3A_FILES = (
+    "0350_datasource_manifest_identity.sql",
+    "0351_validate_datasource_manifest_identity.sql",
+    "0352_datasources_managed_key_idx.notx.sql",
+)
+
+
+async def _ledger(db) -> list[tuple[str, bool]]:
+    return [
+        (row["filename"], row["success"])
+        for row in await db.fetch(
+            "SELECT filename, success FROM schema_migrations "
+            "WHERE filename >= '0350' ORDER BY filename"
+        )
+    ]
+
+
+async def _waiting_on(db, table: str, *, timeout: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if await db.fetchval(
+            "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation "
+            "WHERE c.relname = $1 AND NOT l.granted",
+            table,
+        ):
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"nothing waited for {table}")
+
+
+@pytest.mark.asyncio
+async def test_the_migration_waits_out_a_manifest_apply_without_deadlock(
+    legacy_database,
+):
+    """The review's scenario: an application transaction has written
+    srw_resources (a manifest apply's store.save) and then reads datasources
+    (admission's policy snapshot) while 0350 runs."""
+    db = legacy_database
+    owner = await _user(db, "Owner")
+    await _raw_row(db, "orders", "postgresql", owner=owner)
+    app = await asyncpg.connect(db._connection_string)
+    transaction = app.transaction()
+    await transaction.start()
+    await app.execute("LOCK TABLE srw_resources IN ROW EXCLUSIVE MODE")
+    runner = asyncio.create_task(db.apply_migrations())
+    await _waiting_on(db, "srw_resources")
+    # 0350 holds nothing while it waits for srw_resources, so the read runs.
+    assert await app.fetchval("SELECT count(*) FROM datasources") == 1
+    await transaction.rollback()
+    await app.close()
+    await asyncio.wait_for(runner, 120)
+    assert await _ledger(db) == [(name, True) for name in D3A_FILES]
+    assert await db.apply_migrations()
+    assert await _ledger(db) == [(name, True) for name in D3A_FILES]
+
+
+@pytest.mark.asyncio
+async def test_a_deadlock_with_the_reverse_order_is_retried_not_recorded(
+    legacy_database,
+):
+    """The write-through's order: an application transaction reads
+    datasources, then writes srw_resources, while 0350 holds srw_resources and
+    waits for datasources. Whichever side PostgreSQL ends, the migration
+    retries and completes with a clean ledger."""
+    db = legacy_database
+    app = await asyncpg.connect(db._connection_string)
+    transaction = app.transaction()
+    await transaction.start()
+    await app.fetchval("SELECT count(*) FROM datasources")
+    runner = asyncio.create_task(db.apply_migrations())
+    await _waiting_on(db, "datasources")
+    try:
+        await app.execute("LOCK TABLE srw_resources IN ROW EXCLUSIVE MODE")
+    except asyncpg.DeadlockDetectedError:
+        pass  # the application was the victim; it would retry
+    await transaction.rollback()
+    await app.close()
+    await asyncio.wait_for(runner, 120)
+    assert await _ledger(db) == [(name, True) for name in D3A_FILES]
+    assert not await db.fetchval(
+        "SELECT count(*) FROM schema_migrations WHERE NOT success"
+    )
+
+
+@pytest.mark.asyncio
+async def test_each_d3a_migration_applied_again_is_a_no_op(database):
+    """As if someone deleted the ledger rows by hand: the schema already has
+    every object (it is schema_current), and each file runs twice."""
+
+    async def shape() -> tuple:
+        return (
+            await database.fetchval(
+                "SELECT count(*) FROM pg_constraint WHERE conrelid = "
+                "'public.datasources'::regclass AND conname IN "
+                "('datasources_managed_key_shape', "
+                "'datasources_manifest_resource_id_fkey') AND convalidated"
+            ),
+            await database.fetchval(
+                "SELECT count(*) FROM information_schema.columns WHERE "
+                "(table_name, column_name) IN (('datasources', 'managed_key'), "
+                "('datasources', 'manifest_resource_id'), "
+                "('srw_resources', 'platform_managed'), "
+                "('srw_resources', 'linked_updated_at'))"
+            ),
+            await database.fetchval(
+                "SELECT count(*) FROM pg_index WHERE indisvalid AND "
+                "indexrelid = 'uq_datasources_managed_key'::regclass"
+            ),
+        )
+
+    assert await shape() == (2, 4, 1)
+    connection = await asyncpg.connect(database._connection_string)
+    try:
+        for name in D3A_FILES:
+            for _ in range(2):
+                await connection.execute((MIGRATIONS / name).read_text())
+    finally:
+        await connection.close()
+    assert await shape() == (2, 4, 1)
+
+
+# =============================================================================
+# What the backfill looks at
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_a_rename_an_older_replica_began_before_the_sync_is_found(database):
+    """The review's interleaving: an older replica's transaction starts, a
+    write-through for the same row commits, then the older transaction renames
+    the row. Its updated_at is its start time, earlier than the sync's."""
+    owner = await _user(database, "Owner")
+    created = await database.create_datasource(
+        name="orig", ds_type="postgresql", created_by=owner
+    )
+    datasource_id = str(created["id"])
+    older = await asyncpg.connect(database._connection_string)
+    transaction = older.transaction()
+    await transaction.start()
+    await older.fetchval("SELECT now()")
+    await asyncio.sleep(0.05)
+    assert await database.update_datasource(datasource_id, description="touch")
+    synced = await database.fetchval(
+        "SELECT linked_updated_at FROM srw_resources WHERE id=$1", UUID(datasource_id)
+    )
+    await older.execute(
+        "UPDATE datasources SET name='renamed by the older replica' WHERE id=$1",
+        UUID(datasource_id),
+    )
+    await transaction.commit()
+    await older.close()
+    stamp = await database.fetchval(
+        "SELECT updated_at FROM datasources WHERE id=$1", UUID(datasource_id)
+    )
+    assert stamp < synced  # the case a newer-than test misses
+    assert datasource_id in await _needing_work(database)
+    assert (await migrate_stored_connectors(database))["updated"] == 1
+    resource = await _resource(database, datasource_id)
+    assert resource["document"]["metadata"]["annotations"][DISPLAY_NAME] == (
+        "renamed by the older replica"
+    )
+    assert datasource_id not in await _needing_work(database)
+
+
+@pytest.mark.asyncio
+async def test_legacy_job_clones_are_never_looked_at(database):
+    owner = await _user(database, "Owner")
+    job = await database.fetchval(
+        "INSERT INTO jobs (description) VALUES ('clone owner') RETURNING id"
+    )
+    clone = await database.fetchval(
+        "INSERT INTO datasources (name, type, created_by, job_id) "
+        "VALUES ('clone', 'postgresql', $1, $2) RETURNING id",
+        UUID(owner),
+        job,
+    )
+    assert str(clone) not in await _needing_work(database)
+    assert await migrate_stored_connectors(database) == dict.fromkeys(
+        ("created", "updated", "unchanged", "legacy", "deleted", "deferred"), 0
+    )
+    # A write to it never makes it a Connector either.
+    assert await database.update_datasource(str(clone), description="still a clone")
+    assert await _resource(database, str(clone)) is None

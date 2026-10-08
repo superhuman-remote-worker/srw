@@ -74,16 +74,22 @@ DESCRIPTION = "srw.io/description"
 #: identity lock each, so a batch stays under PostgreSQL's 64 cached
 #: subtransactions and holds few advisory locks.
 BACKFILL_BATCH = 50
-#: Rows whose resource is missing, retired or older than the row. Every
-#: write-through ends with the resource no older than its row (the same
-#: transaction timestamp), so an in-sync row is skipped; a write that bypassed
-#: the write-through (an older orchestrator, a project delete's link cascade,
-#: a user deletion detaching a knowledge base) left the row newer.
+#: Rows whose resource is missing or retired, or was written from another
+#: version of the row. Every write-through ends by copying the row's exact
+#: ``updated_at`` into the resource's ``linked_updated_at``, so a row in step
+#: is skipped. A write that bypassed the write-through (an older orchestrator
+#: during a rollout, a project delete's link cascade, a user deletion
+#: detaching a knowledge base) gave the row another ``updated_at``. That value
+#: is its transaction's start time, which can be *earlier* than the last sync
+#: (an older replica's transaction began first, waited for the row lock, and
+#: committed after the write-through), so the test is inequality, never
+#: "newer". Legacy job clones are never Connectors and are not looked at.
 _NEEDS_WORK = """
 SELECT d.id FROM datasources d LEFT JOIN srw_resources r ON r.id = d.id
-WHERE d.id > $1
+WHERE d.id > $1 AND d.job_id IS NULL
   AND (d.manifest_resource_id IS NULL OR r.id IS NULL
-       OR r.deleted_at IS NOT NULL OR d.updated_at > r.updated_at)
+       OR r.deleted_at IS NOT NULL
+       OR r.linked_updated_at IS DISTINCT FROM d.updated_at)
 ORDER BY d.id
 LIMIT $2
 """
@@ -396,11 +402,14 @@ async def persist_connector_resource(db, datasource_id: Any, *, registry=None) -
         resource["id"],
         key,
     )
-    # The resource is now in step with the row: say so in its timestamp, so
-    # the startup backfill can skip it (an unchanged save writes nothing).
+    # The resource is now in step with this version of the row (read after
+    # the write above, which may itself have bumped it): record it, so the
+    # startup backfill skips the row until its updated_at changes again.
     await db.execute(
-        """UPDATE srw_resources SET updated_at=now() WHERE id=$1
-           AND updated_at < (SELECT updated_at FROM datasources WHERE id=$1)""",
+        """UPDATE srw_resources r SET linked_updated_at = d.updated_at
+           FROM datasources d
+           WHERE r.id=$1 AND d.id=$1
+             AND r.linked_updated_at IS DISTINCT FROM d.updated_at""",
         uid,
     )
     if current is None:
@@ -445,7 +454,8 @@ async def migrate_stored_connectors(
 
     Runs at startup between ``migrate_stored_experts`` and
     ``migrate_projects``, on every replica.  It only touches rows whose
-    resource is missing, retired or older than the row (``_NEEDS_WORK``), in
+    resource is missing, retired or written from another version of the row
+    (``_NEEDS_WORK``), in
     batches of ``batch_size``, each its own transaction under the catalog
     lock with one savepoint per row.  That also reconciles what an older
     orchestrator wrote without the write-through during a rollout.  Then one
