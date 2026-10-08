@@ -116,7 +116,7 @@ const HELM_TONE: Record<MainCloudHelmState, BadgeTone> = {
       <h3 class="matrix-title">{{ 'settings.cloud.matrixTitle' | transloco }}</h3>
       <p class="matrix-desc">{{ 'settings.cloud.matrixDesc' | transloco }}</p>
       <div class="matrix-scroll">
-        <table class="matrix">
+        <table class="app-table matrix">
           <thead>
             <tr>
               <th scope="col">{{ 'settings.cloud.connector' | transloco }}</th>
@@ -288,30 +288,23 @@ const HELM_TONE: Record<MainCloudHelmState, BadgeTone> = {
       }
 
       .matrix {
-        width: 100%;
         min-width: 560px;
-        border-collapse: collapse;
-        font-size: 0.82rem;
       }
 
-      .matrix th,
-      .matrix td {
-        padding: 8px 10px;
+      .matrix tbody th {
+        padding: 10px 12px;
         text-align: left;
-        vertical-align: top;
         border-bottom: 1px solid var(--border-hairline);
+      }
+
+      .matrix tbody th,
+      .matrix tbody td {
+        vertical-align: top;
       }
 
       .matrix tbody tr:last-child th,
       .matrix tbody tr:last-child td {
         border-bottom: none;
-      }
-
-      .matrix thead th {
-        font-weight: 600;
-        color: var(--text-secondary);
-        background: var(--surface-0);
-        white-space: nowrap;
       }
 
       .matrix thead th.active {
