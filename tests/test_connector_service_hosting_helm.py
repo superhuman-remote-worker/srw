@@ -236,6 +236,73 @@ def test_egress_settings_reach_the_orchestrator():
     assert env["CONNECTOR_SERVICE_PODS_ENABLED"] == "true"
 
 
+DRIVER_RULE = {
+    "to": [
+        {
+            "namespaceSelector": {
+                "matchLabels": {"kubernetes.io/metadata.name": NAMESPACE}
+            },
+            "podSelector": {"matchLabels": {"srw.io/plane": "service"}},
+        }
+    ],
+    "ports": [{"protocol": "TCP", "port": "srw-driver"}],
+}
+
+
+def _workspace_tiers(docs: list[dict]) -> list[dict]:
+    return [
+        doc
+        for doc in docs
+        if doc["kind"] == "NetworkPolicy"
+        and "-workspace-policy-" in doc["metadata"]["name"]
+    ]
+
+
+def _agent_egress(docs: list[dict]) -> dict:
+    return one(docs, "NetworkPolicy", "srw-superhuman-remote-worker-agent-egress")
+
+
+def test_workspaces_and_agents_reach_only_the_driver_port_in_the_driver_namespace():
+    docs = render(EXCHANGE, ON, "agent.networkPolicy.enabled=true")
+    tiers = _workspace_tiers(docs)
+    assert tiers
+    for policy in tiers:
+        rules = [r for r in policy["spec"]["egress"] if r.get("to")]
+        assert DRIVER_RULE in rules
+        # The only rule naming the driver namespace, and only the named port.
+        into = [
+            r
+            for r in rules
+            if any(
+                peer.get("namespaceSelector", {})
+                .get("matchLabels", {})
+                .get("kubernetes.io/metadata.name")
+                == NAMESPACE
+                for peer in r["to"]
+            )
+        ]
+        assert into == [DRIVER_RULE]
+    assert DRIVER_RULE in _agent_egress(docs)["spec"]["egress"]
+
+
+def test_no_rule_into_the_driver_namespace_without_hosting():
+    docs = render("agent.networkPolicy.enabled=true")
+    for policy in [*_workspace_tiers(docs), _agent_egress(docs)]:
+        assert DRIVER_RULE not in policy["spec"]["egress"]
+        assert NAMESPACE not in yaml.safe_dump(policy)
+
+
+def test_the_driver_rule_follows_the_driver_namespace():
+    docs = render(EXCHANGE, ON, "connectors.servicePods.namespace=hosted")
+    (rule,) = [
+        r
+        for r in _workspace_tiers(docs)[0]["spec"]["egress"]
+        if r.get("ports") == [{"protocol": "TCP", "port": "srw-driver"}]
+    ]
+    selector = rule["to"][0]["namespaceSelector"]["matchLabels"]
+    assert selector == {"kubernetes.io/metadata.name": "hosted"}
+
+
 def test_the_reconciler_settings_reach_the_orchestrator():
     import json
 

@@ -231,6 +231,22 @@ spec:
       ports:
         - protocol: TCP
           port: 7688
+    {{- if $.Values.connectors.servicePods.enabled }}
+    # Connector driver service pods (connector drivers D5): only their one
+    # named port, srw-driver, in the driver namespace. Each driver pod's own
+    # policy then admits only the workspaces bound to it (a workspace-facing
+    # driver such as the git swap); everything else there stays closed.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ include "srw.connectorsNamespace" $ | quote }}
+          podSelector:
+            matchLabels:
+              srw.io/plane: service
+      ports:
+        - protocol: TCP
+          port: srw-driver
+    {{- end }}
     {{- with $.Values.workspace.networkPolicy.extraEgress }}
     # Deployment-specific extra egress from the values overlay — e.g. local
     # k3d's in-cluster Traefik hairpin for the OpenCloud tus data gateway.

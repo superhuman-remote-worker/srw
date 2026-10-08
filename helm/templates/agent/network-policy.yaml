@@ -172,6 +172,22 @@ spec:
         - protocol: TCP
           port: {{ .Values.crawl4ai.service.port }}
     {{- end }}
+    {{- if .Values.connectors.servicePods.enabled }}
+    # Connector driver service pods (connector drivers D5): only their one
+    # named port, srw-driver, in the driver namespace. A harness-facing
+    # driver's pod (managed MCP) admits agent pods; each call's lease token
+    # authorizes it, since agent pods are pooled.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ include "srw.connectorsNamespace" . | quote }}
+          podSelector:
+            matchLabels:
+              srw.io/plane: service
+      ports:
+        - protocol: TCP
+          port: srw-driver
+    {{- end }}
     # Public internet (TCP 80/443 for external LLM providers, Tavily web
     # research, external Keycloak token-exchange; 22 for completeness). The
     # `except` list subtracts cluster CIDRs, the home LAN, and link-local /
