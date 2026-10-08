@@ -3716,18 +3716,35 @@ def test_worker_environment_is_restored_between_claims(monkeypatch):
     agent = UniversalAgent.__new__(UniversalAgent)
     agent._worker_env_restore = {}
     monkeypatch.setenv("TENANT_ONLY_KEY", "pod-baseline")
-    monkeypatch.delenv("PGPASSWORD", raising=False)
+    monkeypatch.delenv("TENANT_NEW_KEY", raising=False)
 
     agent._capture_worker_environment(
         {
-            "resolved_config": {"agent": {"env_keys": {"TENANT_ONLY_KEY": "secret"}}},
+            "resolved_config": {
+                "agent": {
+                    "env_keys": {"TENANT_ONLY_KEY": "secret", "TENANT_NEW_KEY": "x"}
+                }
+            },
             "datasources": [{"type": "postgresql"}],
         }
     )
     os.environ["TENANT_ONLY_KEY"] = "secret"
-    os.environ["PGPASSWORD"] = "database-secret"
+    os.environ["TENANT_NEW_KEY"] = "tenant-secret"
 
     agent._restore_worker_environment()
 
     assert os.environ["TENANT_ONLY_KEY"] == "pod-baseline"
-    assert "PGPASSWORD" not in os.environ
+    assert "TENANT_NEW_KEY" not in os.environ
+
+
+def test_managed_connectors_leave_the_worker_environment_alone():
+    """The CLI mode that wrote PG*/NEO4J_*/MONGOSH_URI into the agent process
+    is gone, so a managed connector no longer adds keys to the snapshot."""
+    agent = UniversalAgent.__new__(UniversalAgent)
+    agent._worker_env_restore = {}
+
+    agent._capture_worker_environment(
+        {"datasources": [{"type": "postgresql"}, {"type": "neo4j"}]}
+    )
+
+    assert agent._worker_env_restore == {}

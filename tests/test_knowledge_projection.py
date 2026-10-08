@@ -129,21 +129,24 @@ def test_kb_note_states_the_release_read_only_rule_and_the_root():
 
 
 @pytest.mark.parametrize(
-    "ds_type,tool,env",
+    "ds_type,write_tool,cli",
     [
-        ("postgresql", "psql", "PGHOST"),
-        ("neo4j", "cypher-shell", "NEO4J_URI"),
-        ("mongodb", "mongosh", "MONGOSH_URI"),
+        ("postgresql", "sql_execute", "psql"),
+        ("neo4j", "cypher_execute", "cypher-shell"),
+        ("mongodb", "mongo_insert", "mongosh"),
     ],
 )
-def test_a_read_write_managed_connector_names_its_cli_and_env(ds_type, tool, env):
+def test_a_read_write_managed_connector_names_its_write_tools_not_a_cli(
+    ds_type, write_tool, cli
+):
     ds = {"type": ds_type, "name": "Analytics", "project_read_only": False}
 
     content = subject.build_datasource_note_content(ds)
 
-    assert "**Access:** full (CLI)" in content
-    assert f"`{tool}`" in content
-    assert env in content
+    assert "**Access:** read-write (tools)" in content
+    assert f"`{write_tool}`" in content
+    assert cli not in content
+    assert "CLI" not in content
 
 
 @pytest.mark.parametrize(

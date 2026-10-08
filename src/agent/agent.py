@@ -2161,11 +2161,12 @@ class UniversalAgent:
     def _capture_worker_environment(self, metadata: Dict[str, Any]) -> None:
         """Snapshot every per-job env key before this worker can overwrite it.
 
-        A stateless process serves unrelated jobs sequentially.  Config
-        ``env_keys`` are intentionally open-ended, while managed datasource
-        CLIs populate a small fixed set.  Recording the pre-claim values lets
-        teardown restore the pod baseline instead of leaking one tenant's
-        credentials into the next claim.
+        A stateless process serves unrelated jobs sequentially, and config
+        ``env_keys`` are intentionally open-ended.  Recording the pre-claim
+        values lets teardown restore the pod baseline instead of leaking one
+        tenant's credentials into the next claim.  Managed connectors hold a
+        connection rather than environment variables, and credential files
+        unset their own variables when they are cleaned up.
         """
 
         self._restore_worker_environment()
@@ -2175,14 +2176,6 @@ class UniversalAgent:
                 "env_keys"
             )
         keys = set(env_keys) if isinstance(env_keys, dict) else set()
-        datasource_env = {
-            "postgresql": {"PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"},
-            "neo4j": {"NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD"},
-            "mongodb": {"MONGOSH_URI"},
-        }
-        for datasource in metadata.get("datasources") or []:
-            if isinstance(datasource, dict):
-                keys.update(datasource_env.get(str(datasource.get("type")), set()))
         self._worker_env_restore = {key: os.environ.get(key) for key in keys}
 
     def _restore_worker_environment(self) -> None:
@@ -4311,9 +4304,7 @@ class UniversalAgent:
             ds for ds in ds_configs if ds.get("type") not in ("repository", "kb")
         ]
 
-        datasources_dict, client_registry, cli_ds_types = process_datasources(
-            non_repo_datasources
-        )
+        datasources_dict, client_registry = process_datasources(non_repo_datasources)
         # Track connections for cleanup
         self._datasource_connections.update(datasources_dict)
         self._datasource_clients.update(client_registry)
@@ -4392,9 +4383,6 @@ class UniversalAgent:
             )
             if readme:
                 self._agent_seed_files["README.md"] = readme
-
-        if cli_ds_types:
-            self.config.extra["_cli_datasources"] = cli_ds_types
 
         # Create tool context with dependencies
         # Merge agent_id and LLM settings into config for tools
@@ -5347,37 +5335,6 @@ class UniversalAgent:
             logger.warning(
                 f"Auto-registration of input documents failed (non-fatal): {e}"
             )
-
-    def _inject_typed_env_vars(self, ds_type: str, ds: Dict[str, Any]) -> None:
-        """Inject well-known environment variables for managed connector CLI access."""
-        url = ds.get("connection_url", "")
-        creds = ds.get("credentials") or {}
-
-        if ds_type == "postgresql":
-            # Parse connection URL into PG* env vars
-            from urllib.parse import urlparse
-
-            parsed = urlparse(url)
-            if parsed.hostname:
-                os.environ["PGHOST"] = parsed.hostname
-            if parsed.port:
-                os.environ["PGPORT"] = str(parsed.port)
-            if parsed.username:
-                os.environ["PGUSER"] = parsed.username
-            password = parsed.password or creds.get("password", "")
-            if password:
-                os.environ["PGPASSWORD"] = password
-            db_name = parsed.path.lstrip("/").split("?")[0]
-            if db_name:
-                os.environ["PGDATABASE"] = db_name
-
-        elif ds_type == "neo4j":
-            os.environ["NEO4J_URI"] = url
-            os.environ["NEO4J_USERNAME"] = creds.get("username", "neo4j")
-            os.environ["NEO4J_PASSWORD"] = creds.get("password", "")
-
-        elif ds_type == "mongodb":
-            os.environ["MONGOSH_URI"] = url
 
     def _close_datasource_connections(self) -> None:
         """Close all datasource connections opened for the current job."""

@@ -74,7 +74,7 @@ async def test_full_job_path_slice(tmp_path):
         },
     }
 
-    connections, _, _ = process_datasources([datasource])
+    connections, _ = process_datasources([datasource])
     manager = connections["mcp"]
     await manager.connect_all()
     try:

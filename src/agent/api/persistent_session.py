@@ -3205,7 +3205,7 @@ class PersistentSession:
         non_repo = [
             ds for ds in new_configs if ds.get("type") not in ("repository", "kb")
         ]
-        new_conns, new_clients, cli_ds_types = process_datasources(non_repo)
+        new_conns, new_clients = process_datasources(non_repo)
 
         from agent.tools.registry import register_mcp_tools
 
@@ -3231,7 +3231,6 @@ class PersistentSession:
 
         for category, names in datasource_tool_categories(new_configs).items():
             setattr(self.config.tools, category, list(names))
-        self.config.extra["_cli_datasources"] = cli_ds_types
 
         added_repos = [ds for ds in added if ds.get("type") == "repository"]
         removed_repos = {_key(ds) for ds in removed if ds.get("type") == "repository"}

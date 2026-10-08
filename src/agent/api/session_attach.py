@@ -183,18 +183,13 @@ def session_backend_is_vm(config: Optional[Dict[str, Any]]) -> bool:
 def apply_datasource_enrichment_to_resolved(
     resolved_config: Optional[Dict[str, Any]],
     ds_tool_categories: Dict[str, List[str]],
-    cli_ds_types: List[str],
 ) -> None:
     """Fold datasource-derived config into an orchestrator-resolved blob.
 
     Hydration (``load_config_from_resolved``) deliberately skips the
-    config_override merge, so the datasource tool categories and
-    ``_cli_datasources`` applied to config_override during attach never reach
-    a hydrated session. Mutate the blob's ``agent`` dict in place instead:
-    tool categories merge into ``agent["tools"]``; ``_cli_datasources`` goes
-    at the TOP level, because ``serialize_resolved_config`` flattens
-    ``extra`` keys there and ``load_agent_config_from_dict`` folds unknown
-    top-level keys back into ``config.extra``.
+    config_override merge, so the datasource tool categories applied to
+    config_override during attach never reach a hydrated session. Merge them
+    into the blob's ``agent["tools"]`` in place instead.
 
     No-op when ``resolved_config`` is absent or malformed.
     """
@@ -208,8 +203,6 @@ def apply_datasource_enrichment_to_resolved(
         agent_tools = dict(agent_tools) if isinstance(agent_tools, dict) else {}
         agent_tools.update(ds_tool_categories)
         agent_dict["tools"] = agent_tools
-    if cli_ds_types:
-        agent_dict["_cli_datasources"] = cli_ds_types
 
 
 MEMORY_EMBEDDING_ENV_KEYS = (
@@ -1251,8 +1244,7 @@ class SessionAttachCoordinator:
 
         # config_override is final here (request > workspace_override > ws_info)
         # and caller-authored on every one of those routes. Strip loader-owned
-        # keys ONCE, before the runtime decorates it (``extra._cli_datasources``
-        # below) and before the deep-merge onto config.extra further down: a
+        # keys ONCE, before the deep-merge onto config.extra further down: a
         # thread override carrying ``_db_prompt_keys: []`` must not unfence the
         # expert's DB prompts (security audit 2026-08-27, finding #2).
         if isinstance(config_override, dict):
@@ -1291,7 +1283,7 @@ class SessionAttachCoordinator:
             non_repo_datasources = [
                 ds for ds in datasources if ds.get("type") not in ("repository", "kb")
             ]
-            datasources_dict, datasource_clients, cli_ds_types = process_datasources(
+            datasources_dict, datasource_clients = process_datasources(
                 non_repo_datasources
             )
             if self._cleanup_context is not None:
@@ -1315,7 +1307,7 @@ class SessionAttachCoordinator:
             # Inject datasource tool categories so the correct tools are loaded
             # when config is resolved below. Shared map with the orchestrator's
             # _build_datasource_tool_override — the two previously disagreed on
-            # read-write managed connectors (write-tools vs CLI-only).
+            # read-write managed connectors.
             ds_tool_categories = datasource_tool_categories(datasources)
             config_override = dict(config_override or {})
             tools_override = dict(config_override.get("tools", {}))
@@ -1323,26 +1315,18 @@ class SessionAttachCoordinator:
             if tools_override:
                 config_override["tools"] = tools_override
 
-            if cli_ds_types:
-                config_override.setdefault("extra", {})["_cli_datasources"] = (
-                    cli_ds_types
-                )
-
             # Hydrated attaches load the orchestrator-resolved blob below and
             # never touch config_override — fold the same enrichment into the
             # blob's agent dict, or a hydrated attach silently drops read-only
-            # connector tools and the CLI prompt block. The warm-pool path
-            # compensated orchestrator-side; the dedicated-pod path did not
+            # connector tools. The warm-pool path compensated
+            # orchestrator-side; the dedicated-pod path did not
             # (live_session_settings.md P0.2).
-            apply_datasource_enrichment_to_resolved(
-                resolved_config, ds_tool_categories, cli_ds_types
-            )
+            apply_datasource_enrichment_to_resolved(resolved_config, ds_tool_categories)
 
             self._logger.info(
-                "Processed %d datasource(s) for session: %d connections, %d CLI",
+                "Processed %d datasource(s) for session: %d connections",
                 len(datasources),
                 len(datasources_dict),
-                len(cli_ds_types),
             )
 
         # Pool-mode agents serve sequential sessions. Replace (or clear) the
@@ -1439,10 +1423,9 @@ class SessionAttachCoordinator:
                     f"temperature={effective_config.llm.temperature}"
                 )
 
-        # Task 15: thread protected_cloud into config.extra via the same channel
-        # _cli_datasources uses (loader.py reads config.extra["_protected_cloud"]
-        # at render time — loader.py:3913-3915), so the interactive prompt's
-        # honesty block renders for this session. Applied once, after
+        # Task 15: thread protected_cloud into config.extra (loader.py reads
+        # config.extra["_protected_cloud"] at render time), so the interactive
+        # prompt's honesty block renders for this session. Applied once, after
         # effective_config is fully resolved (hydrated / config_override-merged /
         # config_name-loaded / plain boot config) rather than folded into the
         # config_override merge above — pushing it through config_override would

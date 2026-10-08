@@ -1,9 +1,9 @@
 """Shared datasource setup logic for both job agents and persistent sessions.
 
 Processes datasource configs received from the orchestrator: connects managed
-connectors, injects env vars for CLI access, clones repositories onto the
-workspace backend, materializes credential files (kubeconfig, ssh_key,
-generic_file), and renders the workspace-facts block in README.md.
+connectors, delivers environment connectors to the workspace, clones
+repositories onto the workspace backend, materializes credential files
+(kubeconfig, generic_file), and renders the workspace-facts block in README.md.
 
 Repository datasources are cloned exclusively on the workspace via
 ``clone_repository_datasources()`` (GitManager + shell-capable backend).
@@ -40,11 +40,6 @@ AGENT_HOME = "/home/srw"
 CREDENTIAL_FILE_TYPES = frozenset({"kubeconfig", "ssh_key", "generic_file"})
 
 
-def _slugify(name: str) -> str:
-    """Convert a datasource name to a lowercase slug for env vars / filenames."""
-    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
-
-
 def _ds_slug_hyphen(name: str) -> str:
     """Hyphenated slug for filenames and kubeconfig context prefixes.
 
@@ -57,18 +52,14 @@ def _ds_slug_hyphen(name: str) -> str:
 
 def process_datasources(
     ds_configs: List[Dict[str, Any]],
-) -> Tuple[Dict[str, Any], Dict[str, Any], List[str]]:
-    """Process datasource configs and create connections/env vars.
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Process datasource configs and create connections.
 
     ALL managed connectors (postgresql, neo4j, mongodb, webdav) get a real
-    tool connection now — read-write ones included. The former CLI-mode
-    routing for read-write managed connectors (env vars / pg_service.conf,
-    no connection) was a dead path on remote workspace backends: the env
-    landed in the agent process while the shell runs on the workspace host,
-    leaving read-write datasources with no access at all. See
-    knowledge-base/knowledge/issues/datasource_cli_mode_dead_on_remote.md (fix direction 1);
-    the inject_* helpers below are kept for a future real CLI-forwarding
-    feature but are no longer called from here.
+    tool connection, read-write ones included. The former CLI mode (env vars
+    and pg_service.conf in the agent process, no connection) never reached
+    the remote workspace the shell runs on and was deleted
+    (knowledge-history/done/datasource_cli_mode_dead_on_remote.md).
 
     Repository datasources are NOT handled here — callers filter them out
     and clone via clone_repository_datasources() once the workspace backend
@@ -79,16 +70,12 @@ def process_datasources(
         ds_configs: List of datasource config dicts from the orchestrator.
 
     Returns:
-        Tuple of (datasources_dict, client_registry, cli_ds_types):
+        Tuple of (datasources_dict, client_registry):
         - datasources_dict: Connection objects keyed by type for ToolContext
         - client_registry: Parent clients (e.g. MongoClient) for cleanup
-        - cli_ds_types: Always empty since the CLI-mode retirement; kept in
-          the signature so callers' prompt-block plumbing (the future CLI
-          feature's seam) stays in place.
     """
     datasources_dict: Dict[str, Any] = {}
     client_registry: Dict[str, Any] = {}
-    cli_ds_types: List[str] = []
 
     mcp_list: List[Dict[str, Any]] = []
     connector_list: List[Dict[str, Any]] = []
@@ -165,7 +152,7 @@ def process_datasources(
 
         datasources_dict["mcp"] = MCPManager(mcp_list)
 
-    return datasources_dict, client_registry, cli_ds_types
+    return datasources_dict, client_registry
 
 
 def install_workspace_credentials(
@@ -499,104 +486,7 @@ def cleanup_credential_files(manifest: Optional[Dict[str, Any]]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Named connection generators (Phase 2: multi-source)
-# ---------------------------------------------------------------------------
-
-
-def inject_postgresql_services(datasources: List[Dict[str, Any]]) -> None:
-    """Generate ~/.pg_service.conf entries for all PostgreSQL datasources.
-
-    Uses PostgreSQL's native service file for named connection profiles.
-    All libpq-based tools (psql, pg_dump, etc.) support PGSERVICE.
-    """
-    service_file = os.path.expanduser("~/.pg_service.conf")
-    os.environ["PGSERVICEFILE"] = service_file
-
-    entries: List[str] = []
-    for ds in datasources:
-        slug = _slugify(ds["name"])
-        url = ds.get("connection_url", "")
-        creds = ds.get("credentials") or {}
-        parsed = urlparse(url)
-
-        entries.append(f"[{slug}]")
-        if parsed.hostname:
-            entries.append(f"host={parsed.hostname}")
-        if parsed.port:
-            entries.append(f"port={parsed.port}")
-        if parsed.username:
-            entries.append(f"user={parsed.username}")
-        password = parsed.password or creds.get("password", "")
-        if password:
-            entries.append(f"password={password}")
-        db_name = parsed.path.lstrip("/").split("?")[0]
-        if db_name:
-            entries.append(f"dbname={db_name}")
-        entries.append("")  # blank line between services
-
-        logger.info("Configured pg_service entry '%s' for: %s", slug, ds.get("name"))
-
-    with open(service_file, "a") as f:
-        f.write("\n".join(entries))
-
-    # Backward compat: also set legacy env vars when only one PG datasource
-    if len(datasources) == 1:
-        _inject_legacy_pg_env(datasources[0])
-
-
-def inject_mongodb_env_vars(datasources: List[Dict[str, Any]]) -> None:
-    """Set per-datasource MONGO_{SLUG}_URI environment variables."""
-    for ds in datasources:
-        slug = _slugify(ds["name"]).upper()
-        url = ds.get("connection_url", "")
-        os.environ[f"MONGO_{slug}_URI"] = url
-        logger.info("Set MONGO_%s_URI for: %s", slug, ds.get("name"))
-
-    # Backward compat: also set MONGOSH_URI when only one
-    if len(datasources) == 1:
-        os.environ["MONGOSH_URI"] = datasources[0].get("connection_url", "")
-
-
-def inject_neo4j_env_vars(datasources: List[Dict[str, Any]]) -> None:
-    """Set per-datasource NEO4J_{SLUG}_* environment variables."""
-    for ds in datasources:
-        slug = _slugify(ds["name"]).upper()
-        url = ds.get("connection_url", "")
-        creds = ds.get("credentials") or {}
-        os.environ[f"NEO4J_{slug}_URI"] = url
-        os.environ[f"NEO4J_{slug}_USERNAME"] = creds.get("username", "neo4j")
-        os.environ[f"NEO4J_{slug}_PASSWORD"] = creds.get("password", "")
-        logger.info("Set NEO4J_%s_* for: %s", slug, ds.get("name"))
-
-    # Backward compat: also set legacy env vars when only one
-    if len(datasources) == 1:
-        creds = datasources[0].get("credentials") or {}
-        os.environ["NEO4J_URI"] = datasources[0].get("connection_url", "")
-        os.environ["NEO4J_USERNAME"] = creds.get("username", "neo4j")
-        os.environ["NEO4J_PASSWORD"] = creds.get("password", "")
-
-
-def _inject_legacy_pg_env(ds: Dict[str, Any]) -> None:
-    """Set legacy PGHOST/PGPORT/etc. env vars for a single PostgreSQL datasource."""
-    url = ds.get("connection_url", "")
-    creds = ds.get("credentials") or {}
-    parsed = urlparse(url)
-    if parsed.hostname:
-        os.environ["PGHOST"] = parsed.hostname
-    if parsed.port:
-        os.environ["PGPORT"] = str(parsed.port)
-    if parsed.username:
-        os.environ["PGUSER"] = parsed.username
-    password = parsed.password or creds.get("password", "")
-    if password:
-        os.environ["PGPASSWORD"] = password
-    db_name = parsed.path.lstrip("/").split("?")[0]
-    if db_name:
-        os.environ["PGDATABASE"] = db_name
-
-
-# ---------------------------------------------------------------------------
-# Typed connections (read-only tool mode)
+# Typed connections
 # ---------------------------------------------------------------------------
 
 
@@ -1757,10 +1647,3 @@ def inject_workspace_facts(
     except Exception as e:
         logger.warning("Failed to write workspace facts into README.md: %s", e)
         return None
-
-
-# NOTE: the former _format_rw_cli_entry (PGSERVICE/cypher-shell/mongosh usage
-# lines for read-write connectors) was removed with the CLI-mode retirement —
-# it advertised commands that cannot work on remote workspace backends. A
-# future real CLI-forwarding feature reintroduces it properly
-# (knowledge-base/knowledge/issues/datasource_cli_mode_dead_on_remote.md, direction 2).

@@ -923,7 +923,7 @@ class TestResetupDatasources:
 
         with patch(
             "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}, []),
+            return_value=({}, {}),
         ):
             await session.resetup_datasources([])
 
@@ -952,7 +952,7 @@ class TestResetupDatasources:
 
         with patch(
             "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}, []),
+            return_value=({}, {}),
         ):
             await session.resetup_datasources([email])
         failed = session.tool_context.session_runtime_facts
@@ -963,7 +963,7 @@ class TestResetupDatasources:
         connection = SimpleNamespace(access="send", unattended_send=True)
         with patch(
             "agent.core.datasource_setup.process_datasources",
-            return_value=({"email": connection}, {}, []),
+            return_value=({"email": connection}, {}),
         ):
             await session.resetup_datasources([email])
         ready = session.tool_context.session_runtime_facts
@@ -982,7 +982,7 @@ class TestResetupDatasources:
 
         with patch(
             "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}, []),
+            return_value=({}, {}),
         ):
             await session.resetup_datasources([])
         removed = session.tool_context.session_runtime_facts
@@ -1011,7 +1011,7 @@ class TestResetupDatasources:
         new_conn = MagicMock()
         with patch(
             "agent.core.datasource_setup.process_datasources",
-            return_value=({"webdav": new_conn}, {}, []),
+            return_value=({"webdav": new_conn}, {}),
         ):
             summary = await session.resetup_datasources([_ds("webdav", "Cloud")])
 
@@ -1030,14 +1030,14 @@ class TestResetupDatasources:
         session = _make_session(datasource_configs=[_ds("postgresql", "PG")])
         with patch(
             "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}, []),
+            return_value=({}, {}),
         ):
             await session.resetup_datasources([_ds("webdav", "Cloud")])
 
         assert "webdav_write" in session.config.tools.webdav
         # Removed type stripped — stale sql tools must not survive.
         assert session.config.tools.sql == []
-        assert session.config.extra["_cli_datasources"] == []
+        assert "_cli_datasources" not in session.config.extra
         session.resetup_tools_for_backend.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1049,7 +1049,7 @@ class TestResetupDatasources:
         session.config.tools.canvas = []  # user disabled Canvas live
         with patch(
             "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}, []),
+            return_value=({}, {}),
         ):
             await session.resetup_datasources([_ds("postgresql", "PG")])
 
@@ -1062,7 +1062,7 @@ class TestResetupDatasources:
         )
         with patch(
             "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}, []),
+            return_value=({}, {}),
         ):
             summary = await session.resetup_datasources(
                 [_ds("postgresql", "Keep"), _ds("mongodb", "Add")]
@@ -1076,7 +1076,7 @@ class TestResetupDatasources:
         session = _make_session()
         with patch(
             "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}, []),
+            return_value=({}, {}),
         ) as process:
             summary = await session.resetup_datasources(
                 [{"type": "kb", "name": "Docs KB", "datasource_id": "kb-1"}]
@@ -1092,7 +1092,7 @@ class TestResetupDatasources:
         with (
             patch(
                 "agent.core.datasource_setup.process_datasources",
-                return_value=({}, {}, []),
+                return_value=({}, {}),
             ),
             patch("agent.core.datasource_setup.inject_workspace_facts") as inject,
         ):
@@ -1119,7 +1119,7 @@ class TestResetupDatasources:
         with (
             patch(
                 "agent.core.datasource_setup.process_datasources",
-                return_value=({}, {}, []),
+                return_value=({}, {}),
             ),
             patch("agent.core.datasource_setup.clone_repository_datasources") as clone,
             patch("agent.core.datasource_setup.inject_workspace_facts"),
@@ -1158,7 +1158,7 @@ class TestResetupDatasources:
         with (
             patch(
                 "agent.core.datasource_setup.process_datasources",
-                return_value=({}, {}, []),
+                return_value=({}, {}),
             ),
             patch("agent.core.datasource_setup.clone_repository_datasources"),
             patch("agent.core.datasource_setup.inject_workspace_facts"),
@@ -1179,7 +1179,7 @@ class TestResetupDatasources:
         with (
             patch(
                 "agent.core.datasource_setup.process_datasources",
-                return_value=({"mcp": manager}, {}, []),
+                return_value=({"mcp": manager}, {}),
             ),
             patch("agent.core.datasource_setup.inject_workspace_facts"),
             patch("agent.tools.registry.register_mcp_tools") as register,
@@ -1203,7 +1203,7 @@ class TestResetupDatasources:
         with (
             patch(
                 "agent.core.datasource_setup.process_datasources",
-                return_value=({}, {}, []),
+                return_value=({}, {}),
             ),
             patch("agent.core.datasource_setup.inject_workspace_facts"),
             patch("agent.tools.registry.register_mcp_tools") as register,
@@ -1250,7 +1250,7 @@ class TestResetupDatasources:
         with (
             patch(
                 "agent.core.datasource_setup.process_datasources",
-                return_value=({}, {}, []),
+                return_value=({}, {}),
             ),
             patch("agent.core.datasource_setup.inject_workspace_facts"),
             patch(
@@ -1288,7 +1288,7 @@ class TestResetupDatasources:
         with (
             patch(
                 "agent.core.datasource_setup.process_datasources",
-                return_value=({}, {}, []),
+                return_value=({}, {}),
             ),
             patch("agent.core.datasource_setup.inject_workspace_facts"),
             patch(

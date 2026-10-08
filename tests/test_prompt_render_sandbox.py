@@ -140,14 +140,11 @@ def _reference_render(content, tools, **kw):
     """What the pre-fix plain ``jinja2.Environment`` produced, same context."""
     env = jinja2.Environment(keep_trailing_newline=True)
     tool_set = set(tools)
-    ds_set = set(kw.get("cli_datasources") or [])
     context = dict(kw.get("extra_context") or {})
     context.update(
         tools=tools,
         has_tool=lambda name: name in tool_set,
         has_shell=_has_shell_tools(tool_set),
-        cli_datasources=list(ds_set),
-        has_cli_datasource=lambda ds_type: ds_type in ds_set,
         protected_cloud=kw.get("protected_cloud", False),
     )
     return env.from_string(content).render(**context)
@@ -166,7 +163,7 @@ def test_bundled_prompt_renders_byte_identically_in_the_sandbox(rel, tools_on):
     )
     for kw in (
         {},
-        {"cli_datasources": ["postgresql"], "protected_cloud": True},
+        {"protected_cloud": True},
         {"extra_context": {"caller_flag": True}},
         {"extra_context": {"caller_flag": False}},
     ):

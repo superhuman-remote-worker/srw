@@ -1,186 +1,29 @@
-"""Tests for the datasource redesign: KB templates, payload building, env var injection.
+"""Tests for the datasource redesign: KB templates and payload building.
 
-Covers the three datasource categories (generic, repository, managed connectors)
-and the dual-mode behavior (CLI vs tools) for managed connectors.
+Covers the three datasource categories (generic, repository, managed
+connectors). Managed connectors are tool-backed in both access modes; the
+former CLI mode (env vars in the agent process) is gone.
 
-Functions under test are replicated here to avoid importing orchestrator.main
-(which has heavy dependencies). Originals live in orchestrator/main.py.
+The KB note builders are the real ones from
+``orchestrator.services.knowledge_projection``. The payload builder is
+replicated here (the original lives in the connector drivers now).
 """
 
 import json
-import os
-import re
 
-import pytest
+from orchestrator.services.knowledge_projection import (
+    build_datasource_note_content as _build_datasource_note_content,
+    build_generic_note as _build_generic_note,
+    build_managed_readonly_note as _build_managed_readonly_note,
+    build_managed_readwrite_note as _build_managed_readwrite_note,
+    build_repository_note as _build_repository_note,
+    build_webdav_note as _build_webdav_note,
+)
 
 
 # =============================================================================
-# Replicated functions from orchestrator/main.py
-# Keep in sync with the originals.
+# Replicated payload builder. Keep in sync with the original.
 # =============================================================================
-
-
-def _build_generic_note(name: str, desc: str, ds: dict) -> str:
-    lines = [f"## Connector: {name}"]
-    if desc:
-        lines.append(desc)
-    url = ds.get("connection_url")
-    cli_hint = ds.get("cli_hint")
-    if url or cli_hint:
-        lines.append("\n### Connection")
-        if url:
-            lines.append(f"- **URL:** {url} (credentials via env vars)")
-        if cli_hint:
-            lines.append(f"- **CLI:** `{cli_hint}`")
-    creds = ds.get("credentials") or {}
-    if isinstance(creds, str):
-        try:
-            creds = json.loads(creds)
-        except (json.JSONDecodeError, ValueError):
-            creds = {}
-    env_vars = creds.get("env_vars", {})
-    if env_vars:
-        lines.append("\n### Environment Variables")
-        for key in env_vars:
-            lines.append(f"- `{key}` — available in workspace")
-    return "\n".join(lines)
-
-
-def _build_repository_note(name: str, desc: str, ds: dict) -> str:
-    slug = re.sub(r"[^a-z0-9]+", name.lower(), "").strip(
-        "-"
-    )  # intentional bug check below
-    # Fix: use correct re.sub argument order
-    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-    lines = [f"## Repository: {name}"]
-    if desc:
-        lines.append(desc)
-    lines.append("\n### Location")
-    lines.append(f"Cloned to `./repos/{slug}/` — git is pre-authenticated.")
-    lines.append("\n### Usage")
-    lines.append("Use standard git commands:")
-    lines.append(f"- `cd repos/{slug} && git status`")
-    lines.append("- `git pull`, `git commit`, `git push`")
-    lines.append("- No login or credential setup required.")
-    branch = ds.get("default_branch")
-    if branch:
-        lines.append(f"- Default branch: `{branch}`")
-    return "\n".join(lines)
-
-
-def _build_managed_readwrite_note(name: str, desc: str, ds_type: str) -> str:
-    cli_info = {
-        "postgresql": {
-            "tool": "psql",
-            "env_vars": "`PGHOST`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`",
-            "examples": [
-                '`psql -c "SELECT * FROM users LIMIT 10"`',
-                '`psql -c "CREATE TABLE ..."`',
-            ],
-        },
-        "neo4j": {
-            "tool": "cypher-shell",
-            "env_vars": "`NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`",
-            "examples": [
-                '`cypher-shell "MATCH (n) RETURN n LIMIT 10"`',
-            ],
-        },
-        "mongodb": {
-            "tool": "mongosh",
-            "env_vars": "`MONGOSH_URI`",
-            "examples": [
-                '`mongosh --eval "db.users.find().limit(10)"`',
-            ],
-        },
-    }
-    info = cli_info.get(ds_type, {})
-    lines = [
-        f"## Connector: {name}",
-        f"**Type:** {ds_type} | **Access:** full (CLI)",
-    ]
-    if desc:
-        lines.append(f"\n{desc}")
-    lines.append("\n### Connection")
-    lines.append(
-        f"Use `{info.get('tool', ds_type)}` to connect — credentials are pre-configured via environment variables."
-    )
-    lines.append("\n### Environment Variables")
-    lines.append(
-        f"- {info.get('env_vars', 'Check environment for connection details')} — pre-configured"
-    )
-    if info.get("examples"):
-        lines.append("\n### Examples")
-        for ex in info["examples"]:
-            lines.append(f"- {ex}")
-    return "\n".join(lines)
-
-
-def _build_managed_readonly_note(name: str, desc: str, ds_type: str) -> str:
-    tool_info = {
-        "postgresql": [
-            "- `sql_query` — execute SELECT queries",
-            "- `sql_schema` — inspect tables, columns, types, constraints",
-        ],
-        "neo4j": [
-            "- `cypher_query` — execute read-only Cypher queries",
-            "- `cypher_execute` — execute write Cypher statements (CREATE, MERGE, DELETE, SET)",
-            "- `get_database_schema` — inspect labels, relationships, properties",
-        ],
-        "mongodb": [
-            "- `mongo_query` — document queries with filters",
-            "- `mongo_aggregate` — aggregation pipelines",
-            "- `mongo_schema` — collections, fields, indexes",
-        ],
-    }
-    tools = tool_info.get(ds_type, ["- Check available tools for this connector type"])
-    lines = [
-        f"## Connector: {name}",
-        f"**Type:** {ds_type} | **Access:** read-only (tools)",
-    ]
-    if desc:
-        lines.append(f"\n{desc}")
-    lines.append("\n### Available Tools")
-    lines.extend(tools)
-    lines.append("\nNo CLI access or write operations available.")
-    return "\n".join(lines)
-
-
-def _build_webdav_note(name: str, desc: str, is_read_only: bool) -> str:
-    access = "read-only" if is_read_only else "read-write"
-    lines = [
-        f"## Connector: {name}",
-        f"**Type:** webdav | **Access:** {access}",
-    ]
-    if desc:
-        lines.append(f"\n{desc}")
-    lines.append("\n### Available Tools")
-    lines.append("- `webdav_list` — list files and directories")
-    lines.append("- `webdav_read` — read file contents")
-    lines.append("- `webdav_info` — get file metadata")
-    if not is_read_only:
-        lines.append("- `webdav_write` — write/upload files")
-        lines.append("- `webdav_delete` — delete files")
-    return "\n".join(lines)
-
-
-def _build_datasource_note_content(ds: dict) -> str:
-    ds_type = ds.get("type", "unknown")
-    ds_name = ds.get("name", "Unnamed")
-    desc = ds.get("description") or ""
-    is_read_only = ds.get("project_read_only", False)
-    if ds_type == "generic":
-        return _build_generic_note(ds_name, desc, ds)
-    elif ds_type == "repository":
-        return _build_repository_note(ds_name, desc, ds)
-    elif ds_type == "webdav":
-        return _build_webdav_note(ds_name, desc, is_read_only)
-    elif ds_type in ("postgresql", "neo4j", "mongodb"):
-        if is_read_only:
-            return _build_managed_readonly_note(ds_name, desc, ds_type)
-        else:
-            return _build_managed_readwrite_note(ds_name, desc, ds_type)
-    else:
-        return f"## Connector: {ds_name}\n{desc}"
 
 
 def _build_datasources_payload(resolved_ds):
@@ -308,23 +151,26 @@ class TestRepositoryNote:
 
 
 class TestManagedReadWriteNote:
-    """KB note for managed connectors in read-write (CLI) mode."""
+    """KB note for managed connectors in read-write mode: read and write tools."""
 
     def test_postgresql(self):
         content = _build_managed_readwrite_note("Analytics", "Big data", "postgresql")
-        assert "**Access:** full (CLI)" in content
-        assert "`psql`" in content
-        assert "PGHOST" in content
+        assert "**Access:** read-write (tools)" in content
+        assert "`sql_query`" in content
+        assert "`sql_execute`" in content
+        assert "psql" not in content
+        assert "PGHOST" not in content
 
     def test_neo4j(self):
         content = _build_managed_readwrite_note("Graph DB", "", "neo4j")
-        assert "`cypher-shell`" in content
-        assert "NEO4J_URI" in content
+        assert "`cypher_execute`" in content
+        assert "cypher-shell" not in content
 
     def test_mongodb(self):
         content = _build_managed_readwrite_note("Docs DB", "", "mongodb")
-        assert "`mongosh`" in content
-        assert "MONGOSH_URI" in content
+        assert "`mongo_insert`" in content
+        assert "`mongo_update`" in content
+        assert "mongosh" not in content
 
 
 class TestManagedReadOnlyNote:
@@ -378,7 +224,7 @@ class TestBuildDatasourceNoteContent:
 
     def test_dispatches_managed_readwrite(self):
         ds = {"type": "postgresql", "name": "DB", "project_read_only": False}
-        assert "full (CLI)" in _build_datasource_note_content(ds)
+        assert "read-write (tools)" in _build_datasource_note_content(ds)
 
     def test_dispatches_managed_readonly(self):
         ds = {"type": "postgresql", "name": "DB", "project_read_only": True}
@@ -396,7 +242,7 @@ class TestBuildDatasourceNoteContent:
     def test_default_readwrite_when_no_flag(self):
         """Missing project_read_only defaults to False (read-write)."""
         ds = {"type": "neo4j", "name": "Graph"}
-        assert "full (CLI)" in _build_datasource_note_content(ds)
+        assert "read-write (tools)" in _build_datasource_note_content(ds)
 
 
 # =============================================================================
@@ -557,133 +403,27 @@ class TestBuildDatasourcesPayload:
         assert [r["type"] for r in result] == ["generic", "repository", "postgresql"]
 
 
-# =============================================================================
-# Agent-side: Typed Env Var Injection
-# =============================================================================
+class TestRenderInstructionContentNoCliMode:
+    """The CLI-mode template variables are gone; a stored template that still
+    guards a block with them renders it as it always did at runtime, where
+    the list was always empty."""
 
+    def test_a_cli_datasources_block_never_renders(self):
+        from shared.runtime.core.loader import render_instruction_content
 
-class TestInjectTypedEnvVars:
-    """Tests for Agent._inject_typed_env_vars (env var mapping for CLI access)."""
+        template = "A{% if cli_datasources and has_shell %}HAS_CLI{% endif %}B"
+        assert render_instruction_content(template, ["run_command"]) == "AB"
 
-    @pytest.fixture(autouse=True)
-    def _clean_env(self):
-        """Remove PG/NEO4J/MONGO env vars before and after each test."""
-        keys = [
-            "PGHOST",
-            "PGPORT",
-            "PGUSER",
-            "PGPASSWORD",
-            "PGDATABASE",
-            "NEO4J_URI",
-            "NEO4J_USERNAME",
-            "NEO4J_PASSWORD",
-            "MONGOSH_URI",
+    def test_bundled_prompts_no_longer_mention_it(self):
+        from pathlib import Path
+
+        config = Path(__file__).parents[1] / "config"
+        offenders = [
+            str(path.relative_to(config))
+            for path in config.rglob("*.txt")
+            if "cli_datasource" in path.read_text()
         ]
-        saved = {k: os.environ.pop(k, None) for k in keys}
-        yield
-        for k in keys:
-            os.environ.pop(k, None)
-            if saved[k] is not None:
-                os.environ[k] = saved[k]
-
-    def _get_inject_fn(self):
-        from agent.agent import UniversalAgent
-
-        agent = UniversalAgent.__new__(UniversalAgent)
-        return agent._inject_typed_env_vars
-
-    def test_postgresql_full_url(self):
-        inject = self._get_inject_fn()
-        inject(
-            "postgresql",
-            {
-                "connection_url": "postgresql://myuser:mypass@db.example.com:5433/analytics",
-                "credentials": {},
-            },
-        )
-        assert os.environ["PGHOST"] == "db.example.com"
-        assert os.environ["PGPORT"] == "5433"
-        assert os.environ["PGUSER"] == "myuser"
-        assert os.environ["PGPASSWORD"] == "mypass"
-        assert os.environ["PGDATABASE"] == "analytics"
-
-    def test_postgresql_password_from_credentials(self):
-        inject = self._get_inject_fn()
-        inject(
-            "postgresql",
-            {
-                "connection_url": "postgresql://user@host:5432/db",
-                "credentials": {"password": "from-creds"},
-            },
-        )
-        assert os.environ["PGPASSWORD"] == "from-creds"
-
-    def test_neo4j_env_vars(self):
-        inject = self._get_inject_fn()
-        inject(
-            "neo4j",
-            {
-                "connection_url": "bolt://neo4j.example.com:7687",
-                "credentials": {"username": "neo4j", "password": "secret"},
-            },
-        )
-        assert os.environ["NEO4J_URI"] == "bolt://neo4j.example.com:7687"
-        assert os.environ["NEO4J_USERNAME"] == "neo4j"
-        assert os.environ["NEO4J_PASSWORD"] == "secret"
-
-    def test_mongodb_env_vars(self):
-        inject = self._get_inject_fn()
-        inject(
-            "mongodb",
-            {
-                "connection_url": "mongodb+srv://user:pass@cluster.mongodb.net/mydb",
-                "credentials": {},
-            },
-        )
-        assert (
-            os.environ["MONGOSH_URI"]
-            == "mongodb+srv://user:pass@cluster.mongodb.net/mydb"
-        )
-
-
-class TestRenderInstructionContentCLI:
-    """Tests for cli_datasources support in render_instruction_content."""
-
-    def test_cli_datasources_conditional(self):
-        from shared.runtime.core.loader import render_instruction_content
-
-        template = "{% if cli_datasources %}HAS_CLI{% endif %}"
-        result = render_instruction_content(
-            template, [], cli_datasources=["postgresql"]
-        )
-        assert "HAS_CLI" in result
-
-    def test_no_cli_datasources_omits_block(self):
-        from shared.runtime.core.loader import render_instruction_content
-
-        template = "{% if cli_datasources %}HAS_CLI{% endif %}"
-        result = render_instruction_content(template, [], cli_datasources=[])
-        assert "HAS_CLI" not in result
-
-    def test_has_cli_datasource_check(self):
-        from shared.runtime.core.loader import render_instruction_content
-
-        template = (
-            '{% if has_cli_datasource("postgresql") %}PG{% endif %}'
-            '{% if has_cli_datasource("neo4j") %}NEO{% endif %}'
-        )
-        result = render_instruction_content(
-            template, [], cli_datasources=["postgresql"]
-        )
-        assert "PG" in result
-        assert "NEO" not in result
-
-    def test_default_none_cli_datasources(self):
-        from shared.runtime.core.loader import render_instruction_content
-
-        template = "{% if cli_datasources %}HAS_CLI{% endif %}"
-        result = render_instruction_content(template, [])
-        assert "HAS_CLI" not in result
+        assert offenders == []
 
 
 class TestRenderInstructionContentProtectedCloud:

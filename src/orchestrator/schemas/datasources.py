@@ -164,6 +164,6 @@ class ProjectDatasourceSettings(BaseModel):
 
     read_only: bool | None = Field(
         None,
-        description="Managed connectors: true = read-only tools, false/null = CLI mode",
+        description="Managed connectors: true = read-only tools, false/null = read-write tools",
     )
     description: str | None = Field(None, description="Project-specific usage context")

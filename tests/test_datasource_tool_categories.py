@@ -322,7 +322,7 @@ class TestApplyDatasourceEnrichmentToResolved:
     config_override merge — the enrichment must be folded into the blob
     (dedicated-pod parity with warm-pool, live_session_settings.md P0.2)."""
 
-    def test_folds_categories_and_cli_types_into_agent_dict(self):
+    def test_folds_categories_into_agent_dict(self):
         from agent.api.session_attach import apply_datasource_enrichment_to_resolved
 
         resolved = {
@@ -333,25 +333,19 @@ class TestApplyDatasourceEnrichmentToResolved:
             "prompts": {},
         }
         cats = {"sql": ["sql_query", "sql_schema"], "graph": []}
-        apply_datasource_enrichment_to_resolved(resolved, cats, ["postgresql"])
+        apply_datasource_enrichment_to_resolved(resolved, cats)
 
         agent = resolved["agent"]
         # Categories merged; unrelated categories preserved; stale replaced.
         assert agent["tools"]["sql"] == ["sql_query", "sql_schema"]
         assert agent["tools"]["graph"] == []
         assert agent["tools"]["core"] == ["read_file"]
-        # _cli_datasources goes at the TOP level of the agent dict —
-        # serialize_resolved_config flattens extra there, and
-        # load_agent_config_from_dict folds unknown top-level keys back
-        # into config.extra (which loader.py reads at prompt render).
-        assert agent["_cli_datasources"] == ["postgresql"]
         assert "extra" not in agent
 
-    def test_top_level_cli_key_reaches_config_extra_via_loader(self):
+    def test_categories_reach_config_tools_via_loader(self):
         """End-to-end through the real loader: the enrichment written by
         _apply_datasource_enrichment_to_resolved must surface as
-        config.extra['_cli_datasources'] and config.tools.sql after
-        load_config_from_resolved."""
+        config.tools.sql after load_config_from_resolved."""
         from agent.api.session_attach import apply_datasource_enrichment_to_resolved
         from shared.runtime.core.loader import load_config_from_resolved
 
@@ -361,39 +355,39 @@ class TestApplyDatasourceEnrichmentToResolved:
             "instructions": {},
         }
         apply_datasource_enrichment_to_resolved(
-            resolved, {"sql": ["sql_query", "sql_schema"]}, ["postgresql"]
+            resolved, {"sql": ["sql_query", "sql_schema"]}
         )
         config = load_config_from_resolved(resolved)
-        assert config.extra["_cli_datasources"] == ["postgresql"]
+        assert "_cli_datasources" not in config.extra
         assert config.tools.sql == ["sql_query", "sql_schema"]
 
     def test_noop_on_missing_or_malformed_blob(self):
         from agent.api.session_attach import apply_datasource_enrichment_to_resolved
 
         # None blob: nothing to do, must not raise.
-        apply_datasource_enrichment_to_resolved(None, {"sql": []}, ["postgresql"])
+        apply_datasource_enrichment_to_resolved(None, {"sql": []})
 
         # Malformed agent key: left untouched.
         resolved = {"agent": "not-a-dict"}
-        apply_datasource_enrichment_to_resolved(resolved, {"sql": []}, ["x"])
+        apply_datasource_enrichment_to_resolved(resolved, {"sql": []})
         assert resolved == {"agent": "not-a-dict"}
 
-    def test_no_cli_types_leaves_top_level_unset(self):
+    def test_no_cli_key_is_written(self):
         from agent.api.session_attach import apply_datasource_enrichment_to_resolved
 
         resolved = {"agent": {"agent_id": "a", "tools": {}}}
-        apply_datasource_enrichment_to_resolved(resolved, {"sql": []}, [])
+        apply_datasource_enrichment_to_resolved(resolved, {"sql": []})
         assert "_cli_datasources" not in resolved["agent"]
 
 
 class TestProcessDatasourcesConnectionRouting:
-    """Read-write managed connectors get real connections now — the CLI-mode
-    routing (env injection, no connection) is retired
-    (knowledge-base/knowledge/issues/datasource_cli_mode_dead_on_remote.md, direction 1)."""
+    """Read-write managed connectors get real connections; the CLI mode
+    (env injection, no connection) is deleted
+    (knowledge-history/done/datasource_cli_mode_dead_on_remote.md)."""
 
     @pytest.fixture
     def spies(self, monkeypatch):
-        """Spy on connection creation + the retired CLI injectors."""
+        """Spy on connection creation."""
         import agent.core.datasource_setup as mod
         from unittest.mock import MagicMock
 
@@ -406,40 +400,26 @@ class TestProcessDatasourcesConnectionRouting:
             return conn, None
 
         monkeypatch.setattr(mod, "create_datasource_connection", _fake_create)
-        cli_spies = {}
-        for fn in (
-            "inject_postgresql_services",
-            "inject_mongodb_env_vars",
-            "inject_neo4j_env_vars",
-        ):
-            spy = MagicMock(name=fn)
-            monkeypatch.setattr(mod, fn, spy)
-            cli_spies[fn] = spy
-        return created, cli_spies
+        return created
 
-    def test_read_write_connector_gets_connection_not_cli(self, spies):
+    def test_read_write_connector_gets_connection(self, spies):
         from agent.core.datasource_setup import process_datasources
 
-        created, cli_spies = spies
-        connections, clients, cli_types = process_datasources(
+        created = spies
+        connections, clients = process_datasources(
             [_ds("postgresql", read_only=False, name="rw-db")]
         )
 
         assert "postgresql" in connections
         assert [ds["name"] for ds in created] == ["rw-db"]
-        assert cli_types == []
-        for fn, spy in cli_spies.items():
-            spy.assert_not_called()
 
     def test_read_only_connector_unchanged(self, spies):
         from agent.core.datasource_setup import process_datasources
 
-        created, _ = spies
-        connections, clients, cli_types = process_datasources(
+        connections, clients = process_datasources(
             [_ds("neo4j", read_only=True, name="ro-graph")]
         )
         assert "neo4j" in connections
-        assert cli_types == []
 
     def test_mixed_same_type_read_write_connection_wins_registry(self, spies):
         """The registry is TYPE-keyed last-one-wins, and the category map
@@ -449,7 +429,7 @@ class TestProcessDatasourcesConnectionRouting:
         from agent.core.datasource_setup import process_datasources
 
         for order in (["rw", "ro"], ["ro", "rw"]):
-            connections, _, _ = process_datasources(
+            connections, _ = process_datasources(
                 [
                     _ds("postgresql", read_only=(label == "ro"), name=label)
                     for label in order
@@ -473,7 +453,7 @@ class TestProcessDatasourcesConnectionRouting:
             return conn, client
 
         monkeypatch.setattr(mod, "create_datasource_connection", _fake_create)
-        connections, clients, _ = mod.process_datasources(
+        connections, clients = mod.process_datasources(
             [
                 _ds(ds_type, read_only=False, name="rw"),
                 _ds(ds_type, read_only=True, name="ro"),
@@ -500,7 +480,7 @@ class TestProcessDatasourcesConnectionRouting:
             return ro_conn, None
 
         monkeypatch.setattr(mod, "create_datasource_connection", _fake_create)
-        connections, _, _ = mod.process_datasources(
+        connections, _ = mod.process_datasources(
             [
                 _ds("neo4j", read_only=False, name="rw"),
                 _ds("neo4j", read_only=True, name="ro"),

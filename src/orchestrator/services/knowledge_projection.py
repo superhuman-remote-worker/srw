@@ -73,8 +73,8 @@ def build_datasource_note_content(ds: dict[str, Any]) -> str:
     Content varies by type and access mode:
     - generic: lists env var names + CLI hint
     - repository: cloned path + git usage
-    - managed connectors (read-write): CLI tool + env vars
-    - managed connectors (read-only): available tools list
+    - managed connectors (read-write): read and write tools list
+    - managed connectors (read-only): read tools list
     - webdav: always tools
     """
     ds_type = ds.get("type", "unknown")
@@ -159,52 +159,36 @@ def build_repository_note(name: str, desc: str, ds: dict) -> str:
 
 
 def build_managed_readwrite_note(name: str, desc: str, ds_type: str) -> str:
-    """KB entry for managed connectors in read-write (CLI) mode."""
-    cli_info = {
-        "postgresql": {
-            "tool": "psql",
-            "env_vars": "`PGHOST`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`",
-            "examples": [
-                '`psql -c "SELECT * FROM users LIMIT 10"`',
-                '`psql -c "CREATE TABLE ..."`',
-            ],
-        },
-        "neo4j": {
-            "tool": "cypher-shell",
-            "env_vars": "`NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`",
-            "examples": [
-                '`cypher-shell "MATCH (n) RETURN n LIMIT 10"`',
-                "`cypher-shell \"CREATE (n:Label {name: 'test'})\"`",
-            ],
-        },
-        "mongodb": {
-            "tool": "mongosh",
-            "env_vars": "`MONGOSH_URI`",
-            "examples": [
-                '`mongosh --eval "db.users.find().limit(10)"`',
-                '`mongosh --eval "db.users.insertOne({...})"`',
-            ],
-        },
+    """KB entry for managed connectors in read-write mode: the read and write
+    tools the agent's connection serves (there is no CLI access)."""
+    tool_info = {
+        "postgresql": [
+            "- `sql_query` — execute SELECT queries",
+            "- `sql_schema` — inspect tables, columns, types, constraints",
+            "- `sql_execute` — execute write statements (INSERT, UPDATE, DELETE, DDL)",
+        ],
+        "neo4j": [
+            "- `cypher_query` — execute read-only Cypher queries",
+            "- `cypher_execute` — execute write Cypher statements (CREATE, MERGE, DELETE, SET)",
+            "- `get_database_schema` — inspect labels, relationships, properties",
+        ],
+        "mongodb": [
+            "- `mongo_query` — document queries with filters",
+            "- `mongo_aggregate` — aggregation pipelines",
+            "- `mongo_schema` — collections, fields, indexes",
+            "- `mongo_insert` — insert documents",
+            "- `mongo_update` — update documents",
+        ],
     }
-    info = cli_info.get(ds_type, {})
+    tools = tool_info.get(ds_type, ["- Check available tools for this connector type"])
     lines = [
         f"## Connector: {name}",
-        f"**Type:** {ds_type} | **Access:** full (CLI)",
+        f"**Type:** {ds_type} | **Access:** read-write (tools)",
     ]
     if desc:
         lines.append(f"\n{desc}")
-    lines.append("\n### Connection")
-    lines.append(
-        f"Use `{info.get('tool', ds_type)}` to connect — credentials are pre-configured via environment variables."
-    )
-    lines.append("\n### Environment Variables")
-    lines.append(
-        f"- {info.get('env_vars', 'Check environment for connection details')} — pre-configured"
-    )
-    if info.get("examples"):
-        lines.append("\n### Examples")
-        for ex in info["examples"]:
-            lines.append(f"- {ex}")
+    lines.append("\n### Available Tools")
+    lines.extend(tools)
     return "\n".join(lines)
 
 

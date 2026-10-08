@@ -1331,11 +1331,10 @@ class TestProcessDatasourcesRepoGuard:
 
     def test_repository_ds_ignored_with_warning(self, caplog):
         with patch("agent.core.datasource_setup.subprocess.run") as mock_run:
-            connections, clients, cli_types = process_datasources([token_ds()])
+            connections, clients = process_datasources([token_ds()])
         mock_run.assert_not_called()
         assert connections == {}
         assert clients == {}
-        assert cli_types == []
         assert any(
             "ignored by process_datasources" in r.message for r in caplog.records
         )

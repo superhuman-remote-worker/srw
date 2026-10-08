@@ -263,8 +263,8 @@ def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]
 # added later is covered without touching this seam: every ``_`` key at the
 # top level and inside ``extra`` (the loader's own namespace, which
 # ``dataclasses.asdict`` round-trips as a nested mapping) is dropped before the
-# merge. Runtime-derived ``_`` keys (``_cli_datasources``, ``_protected_cloud``,
-# the session tool-group markers, the roster's ``_ref*`` meta) are written by
+# merge. Runtime-derived ``_`` keys (``_protected_cloud``, the session
+# tool-group markers, the roster's ``_ref*`` meta) are written by
 # the runtime AFTER this strip, straight onto the merged config or the
 # delivered blob, so they are unaffected.
 LOADER_OWNED_KEY_PREFIX = "_"
@@ -1536,7 +1536,6 @@ def _prompt_template_environment():
 def render_instruction_content(
     content: str,
     tool_names: List[str],
-    cli_datasources: Optional[List[str]] = None,
     protected_cloud: bool = False,
     extra_context: Optional[Dict[str, Any]] = None,
     origin: str = "",
@@ -1545,7 +1544,6 @@ def render_instruction_content(
 
     Supports ``{% if has_tool("kb_write") %}`` conditionals,
     ``{% if has_shell %}`` for blocks that only make sense with a shell,
-    ``{% if cli_datasources %}`` for read-write datasource access,
     ``{% if protected_cloud %}`` for the protected-cloud honesty block, and
     ``{{ tools }}`` variable access.  Non-templated content (no ``{%``
     or ``{{`` markers) passes through unchanged with zero overhead.
@@ -1570,10 +1568,6 @@ def render_instruction_content(
     Args:
         content: Raw instruction file content (may contain Jinja2 markers).
         tool_names: List of actually-loaded tool names for this job.
-        cli_datasources: List of datasource types with read-write CLI access
-            (e.g. ``["postgresql", "neo4j"]``).  Enables
-            ``{% if cli_datasources %}`` and ``has_cli_datasource("postgresql")``
-            conditionals in templates.
         protected_cloud: Whether the session's cloud folder is in F-C1
             protected mode (writes staged for review, never live-saved).
             Enables the ``{% if protected_cloud %}`` honesty block that
@@ -1616,14 +1610,11 @@ def render_instruction_content(
         return _BudgetedRange(safe_range(*args), _check_deadline)
 
     tool_set = set(tool_names)
-    ds_set = set(cli_datasources or [])
     context: Dict[str, Any] = dict(extra_context or {})
     context.update(
         tools=tool_names,
         has_tool=lambda name: name in tool_set,
         has_shell=_has_shell_tools(tool_set),
-        cli_datasources=list(ds_set),
-        has_cli_datasource=lambda ds_type: ds_type in ds_set,
         protected_cloud=protected_cloud,
         # Shadows the environment global for THIS render only, so the deadline
         # closure is per-call and the shared cached environment stays stateless.
@@ -5836,13 +5827,11 @@ def get_phase_system_prompt(
             expert_identity = fence_persona(expert_identity)
 
         # Render Jinja2 conditionals
-        cli_ds_interactive = config.extra.get("_cli_datasources", [])
         protected_cloud_interactive = bool(config.extra.get("_protected_cloud"))
         if tool_names is not None:
             template = render_instruction_content(
                 template,
                 tool_names,
-                cli_datasources=cli_ds_interactive,
                 protected_cloud=protected_cloud_interactive,
                 origin=_prompt_origin(config, "systemprompt_interactive"),
             )
@@ -5989,19 +5978,16 @@ def _render_worker_prompt(
     legacy = phase_component is not None
     # Render Jinja2 conditionals BEFORE placeholder substitution — Jinja2 owns
     # {%..%} blocks and leaves single-brace placeholders untouched.
-    cli_ds = config.extra.get("_cli_datasources", [])
     if tool_names is not None:
         if legacy:
             phase_component = render_instruction_content(
                 phase_component,
                 tool_names,
-                cli_datasources=cli_ds,
                 origin=_prompt_origin(config, phase_key or "phase component"),
             )
         base_template = render_instruction_content(
             base_template,
             tool_names,
-            cli_datasources=cli_ds,
             origin=_prompt_origin(config, "systemprompt"),
         )
 
@@ -6120,12 +6106,10 @@ def get_subagent_system_prompt(
 
         expert_identity = fence_persona(expert_identity)
 
-    cli_ds = config.extra.get("_cli_datasources", [])
     if tool_names is not None:
         template = render_instruction_content(
             template,
             tool_names,
-            cli_datasources=cli_ds,
             origin=_prompt_origin(config, "systemprompt_subagent"),
         )
 

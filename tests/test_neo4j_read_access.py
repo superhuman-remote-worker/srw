@@ -162,7 +162,7 @@ def _tools_for(server, *, read_only: bool):
         "project_read_only": read_only,
     }
     (entry,) = build_datasources_payload([row], dependencies=deps)
-    connections, _, _ = process_datasources([entry])
+    connections, _ = process_datasources([entry])
     db = connections["neo4j"]
     tools = create_neo4j_tools(ToolContext(datasources={"neo4j": db}))
     return db, {t.name: t for t in tools}

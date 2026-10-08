@@ -29,13 +29,13 @@ class FakeWorkspace:
 
 
 def test_process_datasources_creates_manager_without_io():
-    connections, clients, _ = process_datasources([_mcp_ds()])
+    connections, clients = process_datasources([_mcp_ds()])
     assert isinstance(connections["mcp"], MCPManager)
     assert "mcp" not in clients
 
 
 def test_process_datasources_groups_all_mcp_into_one_manager():
-    connections, _, _ = process_datasources([_mcp_ds("A"), _mcp_ds("B")])
+    connections, _ = process_datasources([_mcp_ds("A"), _mcp_ds("B")])
     assert len(connections["mcp"]._handles) == 2
 
 
