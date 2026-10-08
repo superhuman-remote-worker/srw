@@ -1306,6 +1306,44 @@ class SshAgentConnectorsGate:
                 )
         return self._store
 
+    def wait_for_job_sleep(self) -> None:
+        """Wait (bounded) until the job's agent runs the brief's sleep.
+
+        A cancel that lands while a stateless job is still starting deletes
+        its workspace without the archive snapshot (k3d, 2026-10-08: a job
+        cancelled 16 s after dispatch left no jobs/<id>/ object; one
+        cancelled minutes in, with its agent working, left a 99.9 MB
+        snapshot). The sleep running is the sign the agent has started.
+        """
+
+        try:
+            pod = self.workspace_pod(f"app=srw-workspace,srw/job-id={self.job}")
+        except GateError:
+            return
+
+        def sleeping() -> bool:
+            if self.job_status() not in JOB_RUNNING:
+                return True
+            rc, out = self.ws(
+                pod,
+                "pgrep -u agent-host -x sleep >/dev/null && echo sleeping\n",
+                check=False,
+            )
+            return rc == 0 and out.strip() == "sleeping"
+
+        try:
+            wait_for(
+                "job agent in its sleep",
+                sleeping,
+                timeout=self.args.turn_timeout,
+                interval=5,
+            )
+        except GateError:
+            print(
+                "note: the job's agent never started its sleep; cancelling anyway",
+                flush=True,
+            )
+
     def job_snapshot(self) -> None:
         """Cancel the running job, then scan the snapshot the cancel uploads.
 
@@ -1319,6 +1357,7 @@ class SshAgentConnectorsGate:
         if not self.job or not self.store_configured():
             return
         prefix = f"jobs/{self.job}/"
+        self.wait_for_job_sleep()
         status = self.job_status()
         if status not in JOB_RUNNING:
             if self.snapshot_objects(prefix).get("objects"):

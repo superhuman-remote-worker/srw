@@ -275,7 +275,62 @@ def _gate_runner(*extra):
     runner.keys = {label: gate.make_key(label) for label in "abcd"}
     runner.thread = "00000000-0000-4000-8000-000000000001"
     runner.job = "00000000-0000-4000-8000-0000000000aa"
+    # Never the cluster: tests of the wait itself restore the real one.
+    runner.wait_for_job_sleep = lambda: None
     return runner
+
+
+def _sleep_probe(monkeypatch, runner, *answers):
+    """The real wait_for_job_sleep, against a fake workspace."""
+    runner.wait_for_job_sleep = gate.SshAgentConnectorsGate.wait_for_job_sleep.__get__(
+        runner
+    )
+    monkeypatch.setattr(runner, "workspace_pod", lambda selector: "pod")
+    remaining = list(answers)
+    scripts = []
+
+    def ws(pod, script, check=True):
+        scripts.append(script)
+        answer = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+        return (0, "sleeping") if answer else (1, "")
+
+    monkeypatch.setattr(runner, "ws", ws)
+    return scripts
+
+
+def test_the_cancel_waits_until_the_job_agent_runs_its_sleep(monkeypatch, clocked):
+    runner = _gate_runner()
+    _statuses(monkeypatch, runner, "processing")
+    scripts = _sleep_probe(monkeypatch, runner, False, False, True)
+
+    runner.wait_for_job_sleep()
+
+    assert len(scripts) == 3
+    assert "pgrep -u agent-host -x sleep" in scripts[0]
+    assert clocked.now == 10
+
+
+def test_the_sleep_wait_ends_when_the_job_settles(monkeypatch, clocked):
+    runner = _gate_runner()
+    _statuses(monkeypatch, runner, "completed")
+    scripts = _sleep_probe(monkeypatch, runner, False)
+
+    runner.wait_for_job_sleep()
+
+    assert scripts == [] and clocked.now == 0
+
+
+def test_a_sleep_that_never_starts_does_not_block_the_cancel(
+    monkeypatch, clocked, capsys
+):
+    runner = _gate_runner("--turn-timeout", "60")
+    _statuses(monkeypatch, runner, "processing")
+    _sleep_probe(monkeypatch, runner, False)
+
+    runner.wait_for_job_sleep()
+
+    assert "never started its sleep" in capsys.readouterr().out
+    assert 60 <= clocked.now <= 70
 
 
 def _statuses(monkeypatch, runner, *sequence):
