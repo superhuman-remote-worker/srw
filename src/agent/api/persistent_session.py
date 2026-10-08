@@ -897,37 +897,21 @@ class PersistentSession:
             managed_repository_credentials, workspace_backend
         )
         del managed_repository_credentials
-        from shared.runtime.core.workspace_ssh_identity import (
-            materialize_workspace_ssh_identities,
-            prune_workspace_ssh_identities,
-        )
+        from agent.connectors import RuntimeContext, connector_registry
 
         # Per-identity and never fatal: a broken connector key degrades only
         # its own connector (the clone at attach skips it). Off the event
-        # loop: each identity is a blocking round trip to the workspace.
-        self.workspace_ssh_identity_status = await asyncio.to_thread(
-            materialize_workspace_ssh_identities,
-            workspace_ssh_identities,
-            workspace_backend,
+        # loop: each identity is a blocking round trip to the workspace. A
+        # session owns its workspace, so identities it no longer delivers
+        # are retired here (agent.connectors.ssh_identity).
+        identities = RuntimeContext(
+            execution="session",
+            backend=workspace_backend,
+            ssh_identities=workspace_ssh_identities,
         )
         del workspace_ssh_identities
-        # A session owns its workspace. A connector no longer delivered was
-        # detached (a stateless session applies connector edits here, at its
-        # next attach, never through the live detach), so its agent goes.
-        # Every DELIVERED identity is kept, loaded or not: one whose load
-        # failed this time must not cost a healthy resident agent, or its
-        # learned host key, that an earlier attach left.
-        if getattr(
-            workspace_backend, "supports_shell", False
-        ) and not await asyncio.to_thread(
-            prune_workspace_ssh_identities,
-            list(self.workspace_ssh_identity_status),
-            workspace_backend,
-        ):
-            logger.warning(
-                "Could not retire detached connector SSH identities; "
-                "terminal teardown retires them"
-            )
+        await connector_registry().initialize_workspace(identities, offload=True)
+        self.workspace_ssh_identity_status = identities.ssh_identity_status or {}
         if repository_url_has_credentials(git_remote_url):
             raise ManagedRepositoryMaterializationError(
                 "credentialed_managed_repository_url_refused"
@@ -3056,49 +3040,6 @@ class PersistentSession:
             f"Re-derived {len(self.tools)} tools after backend swap ({backend_name})"
         )
 
-    async def _resetup_workspace_ssh_identities(
-        self,
-        old_configs: List[Dict[str, Any]],
-        new_configs: List[Dict[str, Any]],
-        workspace_ssh_identities: Optional[List[Dict[str, Any]]],
-    ) -> None:
-        """Retire detached connector identities, then (re)load the rest."""
-        from shared.runtime.core.workspace_ssh_identity import (
-            materialize_workspace_ssh_identities,
-            retire_workspace_ssh_identities,
-        )
-
-        def _authorities(configs: List[Dict[str, Any]]) -> set[str]:
-            return {
-                str(ds["ssh_identity"]["authority_id"])
-                for ds in configs
-                if isinstance(ds.get("ssh_identity"), dict)
-                and ds["ssh_identity"].get("authority_id")
-            }
-
-        backend = getattr(self.workspace_manager, "backend", None)
-        detached = sorted(_authorities(old_configs) - _authorities(new_configs))
-        if detached:
-            if backend is not None and await asyncio.to_thread(
-                retire_workspace_ssh_identities, detached, backend
-            ):
-                for authority in detached:
-                    self.workspace_ssh_identity_status.pop(authority, None)
-            else:
-                logger.warning(
-                    "Could not retire %d detached connector SSH identities; "
-                    "terminal teardown retires them",
-                    len(detached),
-                )
-        if workspace_ssh_identities:
-            self.workspace_ssh_identity_status.update(
-                await asyncio.to_thread(
-                    materialize_workspace_ssh_identities,
-                    workspace_ssh_identities,
-                    backend,
-                )
-            )
-
     async def resetup_datasources(
         self,
         new_datasources: List[Dict[str, Any]],
@@ -3107,15 +3048,21 @@ class PersistentSession:
         """Apply a live datasource selection change (live_session_settings.md
         Slice B).
 
-        Rebuilds the type-keyed connection registry from the NEW full payload
-        through the same path attach takes (``process_datasources`` sorts
-        read-only first, so a read-write entry wins a mixed same-type slot and
-        multi-same-type stays correct by construction), applies the derived
-        tool categories directly to ``config.tools`` (the validated session
-        tools override's closed vocabulary silently drops sql/graph/mongodb/
-        webdav, so they must never ride ``config.update``), clones added
-        repositories, rewrites the README.md workspace-facts block, and re-derives +
-        rebinds the toolset — which also rebuilds the system prompt for the
+        Runs the connector registry's live update (``agent.connectors``): the
+        environment file is rewritten, detached SSH connectors (repository or
+        ``ssh_key``) have exactly their own workspace ssh-agent retired (the
+        session owns its workspace, so nothing else can still be using that
+        identity) and the rest are re-proven or loaded from
+        ``workspace_ssh_identities`` before any clone, and the type-keyed
+        connection registry is rebuilt from the NEW full payload through the
+        same path attach takes (read-only first, so a read-write entry wins
+        a mixed same-type slot). The new registry is swapped in place and the
+        derived tool categories are applied directly to ``config.tools`` (the
+        validated session tools override's closed vocabulary silently drops
+        sql/graph/mongodb/webdav, so they must never ride ``config.update``).
+        Then added repositories are cloned and removed ones unregistered, the
+        README.md workspace-facts block is rewritten, and the toolset is
+        re-derived + rebound — which also rebuilds the system prompt for the
         per-turn ``messages[0]`` refresh (P0.1).
 
         The REPLACED connections are NOT closed here because a tool call may
@@ -3126,21 +3073,9 @@ class PersistentSession:
         ``stale_connections`` / ``stale_clients`` and the caller closes them
         once no turn is executing.
 
-        kb-type datasources are out of scope for live changes (v1): their
+        A changed KB selection takes effect on the next attach (v1): its
         knowledge bindings wire into memory/KB machinery that ToolContext
-        holds a copy of. Existing kb entries pass through untouched; a changed
-        kb selection takes effect on the next attach.
-
-        Repository removals keep their clone on the workspace (cheap honesty
-        — scrubbing is not a security boundary) but drop the ``source_repos``
-        registration. A removed SSH connector (repository or ``ssh_key``) has
-        exactly its own workspace ssh-agent retired: the session owns its
-        workspace, so nothing else can still be using that identity. The
-        identities that stay are re-proven, and added ones loaded, from
-        ``workspace_ssh_identities`` before any clone. A live repository ADD whose clone name
-        collides with an existing clone fails that one clone with a warning
-        (the existing clone is never touched); a resume re-resolves suffixed
-        names over the full list.
+        holds a copy of. Existing kb entries pass through untouched.
 
         Args:
             new_datasources: Full datasource payload for the thread, as
@@ -3153,13 +3088,14 @@ class PersistentSession:
             stamp), ``stale_connections``/``stale_clients`` (caller's
             deferred close), ``kb_deferred`` when a kb change was skipped.
         """
+        from agent.connectors import (
+            RuntimeContext,
+            connector_registry,
+            deliveries_from_payload,
+        )
         from agent.core.datasource_setup import (
-            clone_repository_datasources,
             datasource_tool_categories,
             inject_workspace_facts,
-            install_workspace_credentials,
-            process_datasources,
-            resolve_repo_clone_names,
         )
 
         if not self.tool_context:
@@ -3176,13 +3112,6 @@ class PersistentSession:
 
         new_configs = list(new_datasources or [])
         old_configs = list(self.datasource_configs or [])
-        await asyncio.to_thread(
-            install_workspace_credentials, new_configs, self.workspace_manager
-        )
-        await self._resetup_workspace_ssh_identities(
-            old_configs, new_configs, workspace_ssh_identities
-        )
-        del workspace_ssh_identities
 
         # The internal payload strips datasource ids, so identity for the
         # add/remove summary is (type, name) — unique enough for display and
@@ -3195,68 +3124,41 @@ class PersistentSession:
         added = [ds for ds in new_configs if _key(ds) not in old_keys]
         removed = [ds for ds in old_configs if _key(ds) not in new_keys]
 
-        kb_changed = any(ds.get("type") == "kb" for ds in added + removed)
-        if kb_changed:
-            logger.warning(
-                "kb-type datasource selection changed live — knowledge "
-                "bindings apply on the next attach, not mid-session"
-            )
-
-        non_repo = [
-            ds for ds in new_configs if ds.get("type") not in ("repository", "kb")
-        ]
-        new_conns, new_clients = process_datasources(non_repo)
-
         from agent.tools.registry import register_mcp_tools
 
-        mcp_manager = new_conns.get("mcp")
-        if mcp_manager is not None:
-            try:
-                await mcp_manager.connect_all()
-            except Exception as e:
-                logger.warning(
-                    "Unexpected live MCP discovery failure (%s); continuing",
-                    type(e).__name__,
-                )
-            mcp_manager.annotate_configs()
-        register_mcp_tools(mcp_manager)
+        stale: Dict[str, Dict[str, Any]] = {}
+        new_connection_count = 0
 
-        stale_connections = dict(self.datasources)
-        stale_clients = dict(self._datasource_clients)
-        # ToolContext shares this dict by REFERENCE — mutate in place, never
-        # rebind, or live tools keep reading the orphaned old registry.
-        self.datasources.clear()
-        self.datasources.update(new_conns)
-        self._datasource_clients = new_clients
+        def _swap_harness(connections: Dict[str, Any], clients: Dict[str, Any]) -> None:
+            nonlocal new_connection_count
+            register_mcp_tools(connections.get("mcp"))
+            stale["connections"] = dict(self.datasources)
+            stale["clients"] = dict(self._datasource_clients)
+            # ToolContext shares this dict by REFERENCE — mutate in place,
+            # never rebind, or live tools keep reading the orphaned old
+            # registry.
+            self.datasources.clear()
+            self.datasources.update(connections)
+            self._datasource_clients = clients
+            new_connection_count = len(connections)
+            for category, names in datasource_tool_categories(new_configs).items():
+                setattr(self.config.tools, category, list(names))
 
-        for category, names in datasource_tool_categories(new_configs).items():
-            setattr(self.config.tools, category, list(names))
-
-        added_repos = [ds for ds in added if ds.get("type") == "repository"]
-        removed_repos = {_key(ds) for ds in removed if ds.get("type") == "repository"}
-        if added_repos and self.workspace_manager:
-            try:
-                clone_repository_datasources(
-                    added_repos,
-                    self.workspace_manager,
-                    ssh_identity_status=self.workspace_ssh_identity_status,
-                    # Only the added ones: another repository's key file is
-                    # not this batch's to sweep.
-                    legacy_key_files="own",
-                )
-            except Exception as e:
-                logger.warning("Live repository clone failed: %s", e)
-        if removed_repos and self.workspace_manager:
-            # Resolve clone names over the OLD full repo list (payload order)
-            # so collision suffixes match what attach actually registered.
-            old_repos = [ds for ds in old_configs if ds.get("type") == "repository"]
-            for ds, clone_name in zip(old_repos, resolve_repo_clone_names(old_repos)):
-                if _key(ds) in removed_repos:
-                    self.workspace_manager.source_repos.pop(clone_name, None)
-                    # source_repo_meta holds the repository's plaintext token;
-                    # leaving it behind keeps a detached credential live on the
-                    # workspace manager for the rest of the session.
-                    self.workspace_manager.source_repo_meta.pop(clone_name, None)
+        connector_runtime = RuntimeContext(
+            execution="session",
+            workspace_manager=self.workspace_manager,
+            ssh_identities=workspace_ssh_identities,
+            ssh_identity_status=self.workspace_ssh_identity_status,
+        )
+        del workspace_ssh_identities
+        await connector_registry().replace_live(
+            deliveries_from_payload(old_configs),
+            deliveries_from_payload(new_configs),
+            connector_runtime,
+            on_harness_replaced=_swap_harness,
+        )
+        if connector_runtime.ssh_identity_status is not None:
+            self.workspace_ssh_identity_status = connector_runtime.ssh_identity_status
 
         self.datasource_configs = new_configs
         self._refresh_runtime_facts()
@@ -3280,10 +3182,10 @@ class PersistentSession:
         summary: Dict[str, Any] = {
             "added": [ds.get("name", "unnamed") for ds in added],
             "removed": [ds.get("name", "unnamed") for ds in removed],
-            "stale_connections": stale_connections,
-            "stale_clients": stale_clients,
+            "stale_connections": stale.get("connections", {}),
+            "stale_clients": stale.get("clients", {}),
         }
-        if kb_changed:
+        if "knowledge_index" in connector_runtime.deferred:
             summary["kb_deferred"] = True
         logger.info(
             "Datasources re-set up live: %d attached (%d added, %d removed), "
@@ -3291,7 +3193,7 @@ class PersistentSession:
             len(new_configs),
             len(added),
             len(removed),
-            len(new_conns),
+            new_connection_count,
         )
         return summary
 
@@ -3775,11 +3677,11 @@ class PersistentSession:
 
         # ENV files belong to the physical workspace. Restore the bindings on
         # the new host before retiring the old one or exposing its tools.
-        from shared.credential_connectors import collect_credential_env
+        from agent.connectors import connector_registry, deliveries_from_payload
 
-        credential_env = collect_credential_env(self.datasource_configs or [])
-        if credential_env:
-            new_backend.install_credential_environment(credential_env)
+        connector_registry().on_backend_swap(
+            deliveries_from_payload(self.datasource_configs), new_backend
+        )
 
         # This is a genuine backend retirement, not a queue-claim detach. The
         # deterministic tmux session belongs to the old workspace and must not
@@ -4142,9 +4044,15 @@ class PersistentSession:
 
         # Close datasource connections
         if self.datasources or self._datasource_clients:
-            from agent.core.datasource_setup import close_datasource_connections
+            from agent.connectors import RuntimeContext, connector_registry
 
-            close_datasource_connections(self.datasources, self._datasource_clients)
+            connector_registry().release(
+                RuntimeContext(
+                    execution="session",
+                    connections=self.datasources,
+                    clients=self._datasource_clients,
+                )
+            )
             self.datasources = {}
             self._datasource_clients = {}
 

@@ -7916,7 +7916,7 @@ class TestHandleConfigUpdateDatasources:
 
         src = getsource(_close_datasources_after_turn)
         assert "_turn_in_flight()" in src
-        assert "close_datasource_connections(connections, clients)" in src
+        assert "close_connections(connections, clients)" in src
 
     @pytest.mark.asyncio
     async def test_close_after_turn_polls_until_turn_ends(self, monkeypatch):

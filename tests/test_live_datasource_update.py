@@ -23,7 +23,7 @@ core (redacted response, connected-session 409 gate), and the
 
 import json
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -872,6 +872,32 @@ class TestConfigChangeSummary:
 # ---------------------------------------------------------------------------
 
 
+@contextmanager
+def _harness(connections=None, clients=None):
+    """Stand in for the live harness rebuild: the managed-connection step
+    fills the fresh slots with these, and the MCP step constructs nothing
+    (an ``mcp`` slot here still gets discovered). Yields the entries each
+    managed-connection step received."""
+    seen = []
+
+    def _materialize(self, deliveries, rt):
+        seen.append([delivery.entry for delivery in deliveries])
+        rt.connections.update(connections or {})
+        rt.clients.update(clients or {})
+
+    with (
+        patch(
+            "agent.connectors.connections.ManagedConnectionMaterializer.materialize",
+            _materialize,
+        ),
+        patch(
+            "agent.connectors.mcp.McpClientMaterializer.materialize",
+            lambda self, deliveries, rt: None,
+        ),
+    ):
+        yield seen
+
+
 def _make_session(datasource_configs=None, datasources=None, clients=None):
     from agent.api.persistent_session import PersistentSession
     from shared.runtime.core.loader import ToolsConfig
@@ -921,10 +947,7 @@ class TestResetupDatasources:
             if tool.name == "email_send"
         )
 
-        with patch(
-            "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}),
-        ):
+        with _harness():
             await session.resetup_datasources([])
 
         result = bound_send.invoke(
@@ -950,10 +973,7 @@ class TestResetupDatasources:
             },
         }
 
-        with patch(
-            "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}),
-        ):
+        with _harness():
             await session.resetup_datasources([email])
         failed = session.tool_context.session_runtime_facts
         assert failed.attached_datasource_types == ("email",)
@@ -961,10 +981,7 @@ class TestResetupDatasources:
         assert failed.email_connection_failed is True
 
         connection = SimpleNamespace(access="send", unattended_send=True)
-        with patch(
-            "agent.core.datasource_setup.process_datasources",
-            return_value=({"email": connection}, {}),
-        ):
+        with _harness({"email": connection}):
             await session.resetup_datasources([email])
         ready = session.tool_context.session_runtime_facts
         assert ready.attached_datasource_types == ("email",)
@@ -980,10 +997,7 @@ class TestResetupDatasources:
         clamped = session.tool_context.session_runtime_facts
         assert clamped.email_access_tier == "read"
 
-        with patch(
-            "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}),
-        ):
+        with _harness():
             await session.resetup_datasources([])
         removed = session.tool_context.session_runtime_facts
         assert removed.attached_datasource_types == ()
@@ -1009,10 +1023,7 @@ class TestResetupDatasources:
         )
         registry_ref = session.datasources
         new_conn = MagicMock()
-        with patch(
-            "agent.core.datasource_setup.process_datasources",
-            return_value=({"webdav": new_conn}, {}),
-        ):
+        with _harness({"webdav": new_conn}):
             summary = await session.resetup_datasources([_ds("webdav", "Cloud")])
 
         assert session.datasources is registry_ref
@@ -1028,10 +1039,7 @@ class TestResetupDatasources:
         """sql/graph/mongodb/webdav ride config.tools directly — the validated
         session tools override's closed vocabulary would drop them."""
         session = _make_session(datasource_configs=[_ds("postgresql", "PG")])
-        with patch(
-            "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}),
-        ):
+        with _harness():
             await session.resetup_datasources([_ds("webdav", "Cloud")])
 
         assert "webdav_write" in session.config.tools.webdav
@@ -1047,10 +1055,7 @@ class TestResetupDatasources:
         written)."""
         session = _make_session()
         session.config.tools.canvas = []  # user disabled Canvas live
-        with patch(
-            "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}),
-        ):
+        with _harness():
             await session.resetup_datasources([_ds("postgresql", "PG")])
 
         assert session.config.tools.canvas == []
@@ -1060,10 +1065,7 @@ class TestResetupDatasources:
         session = _make_session(
             datasource_configs=[_ds("postgresql", "Keep"), _ds("webdav", "Drop")]
         )
-        with patch(
-            "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}),
-        ):
+        with _harness():
             summary = await session.resetup_datasources(
                 [_ds("postgresql", "Keep"), _ds("mongodb", "Add")]
             )
@@ -1074,15 +1076,12 @@ class TestResetupDatasources:
     @pytest.mark.asyncio
     async def test_kb_entries_skip_processing_and_flag_deferred(self):
         session = _make_session()
-        with patch(
-            "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}),
-        ) as process:
+        with _harness() as process:
             summary = await session.resetup_datasources(
                 [{"type": "kb", "name": "Docs KB", "datasource_id": "kb-1"}]
             )
 
-        assert process.call_args.args[0] == []  # kb never opens a connector
+        assert process == [[]]  # kb never opens a connector
         assert summary["kb_deferred"] is True
 
     @pytest.mark.asyncio
@@ -1090,10 +1089,7 @@ class TestResetupDatasources:
         session = _make_session(datasource_configs=[_ds("postgresql", "PG")])
         new_list = [_ds("postgresql", "PG"), {"type": "kb", "name": "KB"}]
         with (
-            patch(
-                "agent.core.datasource_setup.process_datasources",
-                return_value=({}, {}),
-            ),
+            _harness(),
             patch("agent.core.datasource_setup.inject_workspace_facts") as inject,
         ):
             await session.resetup_datasources(new_list)
@@ -1117,11 +1113,8 @@ class TestResetupDatasources:
         session = _make_session(datasource_configs=[repo_old])
         session.workspace_manager.source_repos = {"old-repo": MagicMock()}
         with (
-            patch(
-                "agent.core.datasource_setup.process_datasources",
-                return_value=({}, {}),
-            ),
-            patch("agent.core.datasource_setup.clone_repository_datasources") as clone,
+            _harness(),
+            patch("agent.connectors.checkout.clone_repository_datasources") as clone,
             patch("agent.core.datasource_setup.inject_workspace_facts"),
         ):
             await session.resetup_datasources([repo_new])
@@ -1156,11 +1149,8 @@ class TestResetupDatasources:
             "old-repo": {"forge": "gitea", "token": "sekrit"}
         }
         with (
-            patch(
-                "agent.core.datasource_setup.process_datasources",
-                return_value=({}, {}),
-            ),
-            patch("agent.core.datasource_setup.clone_repository_datasources"),
+            _harness(),
+            patch("agent.connectors.checkout.clone_repository_datasources"),
             patch("agent.core.datasource_setup.inject_workspace_facts"),
         ):
             await session.resetup_datasources([])
@@ -1177,10 +1167,7 @@ class TestResetupDatasources:
         manager.statuses = {"MCP": "connected"}
 
         with (
-            patch(
-                "agent.core.datasource_setup.process_datasources",
-                return_value=({"mcp": manager}, {}),
-            ),
+            _harness({"mcp": manager}),
             patch("agent.core.datasource_setup.inject_workspace_facts"),
             patch("agent.tools.registry.register_mcp_tools") as register,
         ):
@@ -1201,10 +1188,7 @@ class TestResetupDatasources:
         )
 
         with (
-            patch(
-                "agent.core.datasource_setup.process_datasources",
-                return_value=({}, {}),
-            ),
+            _harness(),
             patch("agent.core.datasource_setup.inject_workspace_facts"),
             patch("agent.tools.registry.register_mcp_tools") as register,
         ):
@@ -1248,10 +1232,7 @@ class TestResetupDatasources:
         }
         delivered = [{"authority_id": "kept-id", "private_key": "secret"}]
         with (
-            patch(
-                "agent.core.datasource_setup.process_datasources",
-                return_value=({}, {}),
-            ),
+            _harness(),
             patch("agent.core.datasource_setup.inject_workspace_facts"),
             patch(
                 "shared.runtime.core.workspace_ssh_identity."
@@ -1286,10 +1267,7 @@ class TestResetupDatasources:
         after = {**before, "name": "New name"}
         session = _make_session(datasource_configs=[before])
         with (
-            patch(
-                "agent.core.datasource_setup.process_datasources",
-                return_value=({}, {}),
-            ),
+            _harness(),
             patch("agent.core.datasource_setup.inject_workspace_facts"),
             patch(
                 "shared.runtime.core.workspace_ssh_identity."

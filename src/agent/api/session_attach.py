@@ -1260,49 +1260,35 @@ class SessionAttachCoordinator:
         if self._cleanup_context is not None:
             self._cleanup_context["setup_started"] = True
 
-        # Process datasources: create connections, inject env vars, apply tool overrides
-        # Note: repository cloning is deferred until AFTER the workspace is
-        # initialized, then runs on the workspace backend (repos/<name> on the
-        # workspace container) — never on the agent pod.
-        datasources_dict: Dict[str, Any] = {}
-        datasource_clients: Dict[str, Any] = {}
-        repo_datasources: List[Dict[str, Any]] = []
-        kb_datasources: List[Dict[str, Any]] = []
+        # Connectors, harness phase: managed connections and MCP discovery,
+        # before the tool set is resolved below. The workspace phase
+        # (environment, repository checkouts onto the workspace backend,
+        # never the agent pod) runs once the workspace is initialized.
+        from agent.connectors import (
+            RuntimeContext,
+            connector_registry,
+            deliveries_from_payload,
+        )
+
+        connector_deliveries = deliveries_from_payload(datasources)
+        connector_runtime = RuntimeContext(execution="session")
+        datasources_dict = connector_runtime.connections
+        datasource_clients = connector_runtime.clients
         mcp_manager = None
         if datasources:
-            from agent.core.datasource_setup import (
-                datasource_tool_categories,
-                process_datasources,
-            )
+            from agent.core.datasource_setup import datasource_tool_categories
 
-            # Separate repos (cloned later) from other datasources
-            repo_datasources = [
-                ds for ds in datasources if ds.get("type") == "repository"
-            ]
-            kb_datasources = [ds for ds in datasources if ds.get("type") == "kb"]
-            non_repo_datasources = [
-                ds for ds in datasources if ds.get("type") not in ("repository", "kb")
-            ]
-            datasources_dict, datasource_clients = process_datasources(
-                non_repo_datasources
-            )
             if self._cleanup_context is not None:
                 self._cleanup_context["datasources"] = datasources_dict
                 self._cleanup_context["datasource_clients"] = datasource_clients
+            _t_step = time.perf_counter()
+            await connector_registry().attach_harness(
+                connector_deliveries, connector_runtime
+            )
+            self._logger.info(
+                "attach step: connector harness %.2fs", time.perf_counter() - _t_step
+            )
             mcp_manager = datasources_dict.get("mcp")
-            if mcp_manager is not None:
-                _t_step = time.perf_counter()
-                try:
-                    await mcp_manager.connect_all()
-                except Exception as e:
-                    self._logger.warning(
-                        "Unexpected session MCP discovery failure (%s); continuing",
-                        type(e).__name__,
-                    )
-                mcp_manager.annotate_configs()
-                self._logger.info(
-                    "attach step: mcp connect_all %.2fs", time.perf_counter() - _t_step
-                )
 
             # Inject datasource tool categories so the correct tools are loaded
             # when config is resolved below. Shared map with the orchestrator's
@@ -1521,11 +1507,9 @@ class SessionAttachCoordinator:
         )
         apply_session_embedding_env(_env_keys_src)
 
-        from agent.services.knowledge.bindings import build_knowledge_bindings
-
-        knowledge_bindings = build_knowledge_bindings(
+        knowledge_bindings = connector_registry().knowledge_bindings(
+            connector_deliveries,
             project_ids=project_ids or [],
-            datasources=kb_datasources,
             runtime_actor=runtime_actor_context,
         )
 
@@ -1721,25 +1705,17 @@ class SessionAttachCoordinator:
             and self._session.cloud_mount_manager.active
         )
 
-        from agent.core.datasource_setup import install_workspace_credentials
-
-        await asyncio.to_thread(
-            install_workspace_credentials,
-            datasources or [],
-            self._session.workspace_manager,
+        # Connectors, workspace phase: the environment file, then repository
+        # checkouts (all clone/auth operations run on the workspace backend;
+        # there is no agent-local clone path,
+        # knowledge-base/knowledge/features/no_workspace_agent_mode.md §9.4).
+        connector_runtime.workspace_manager = self._session.workspace_manager
+        connector_runtime.ssh_identity_status = getattr(
+            self._session, "workspace_ssh_identity_status", None
         )
-
-        # Clone repository datasources into the workspace (deferred from above).
-        # All clone/auth operations run on the workspace backend — there is no
-        # agent-local clone path (knowledge-base/knowledge/features/no_workspace_agent_mode.md §9.4).
-        if repo_datasources and self._session.workspace_manager:
-            from agent.core.datasource_setup import clone_repository_datasources
-
-            clone_repository_datasources(
-                repo_datasources,
-                self._session.workspace_manager,
-                ssh_identity_status=self._session.workspace_ssh_identity_status,
-            )
+        await connector_registry().attach_workspace(
+            connector_deliveries, connector_runtime
+        )
 
         # README.md workspace-facts block (connectors, materials, layout) — after
         # the workspace is initialized and repositories are cloned. Written even

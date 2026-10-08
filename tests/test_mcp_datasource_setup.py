@@ -1,6 +1,7 @@
 """MCP routing through datasource setup and README.md facts rendering."""
 
-from agent.core.datasource_setup import inject_workspace_facts, process_datasources
+from agent.core.datasource_setup import inject_workspace_facts
+from tests._connector_runtime import open_harness
 from agent.tools.mcp.manager import MCPManager
 
 
@@ -28,14 +29,14 @@ class FakeWorkspace:
         self.files[path] = content
 
 
-def test_process_datasources_creates_manager_without_io():
-    connections, clients = process_datasources([_mcp_ds()])
+def test_the_harness_creates_the_manager_without_io():
+    connections, clients = open_harness([_mcp_ds()])
     assert isinstance(connections["mcp"], MCPManager)
     assert "mcp" not in clients
 
 
-def test_process_datasources_groups_all_mcp_into_one_manager():
-    connections, _ = process_datasources([_mcp_ds("A"), _mcp_ds("B")])
+def test_the_harness_groups_all_mcp_into_one_manager():
+    connections, _ = open_harness([_mcp_ds("A"), _mcp_ds("B")])
     assert len(connections["mcp"]._handles) == 2
 
 

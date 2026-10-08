@@ -184,8 +184,12 @@ def test_tool_categories_match_golden(case_id, golden, gates):
 
 
 def test_type_inventory_matches_golden(golden):
-    """Every hardcoded copy of the type list, as it stands."""
-    from agent.core import datasource_setup
+    """Every hardcoded copy of the type list, as it stands.
+
+    The agent's credential-file set is no longer a copy: it is the types the
+    README lists as credential files, routed by the specs' forms (D1b).
+    """
+    from agent.connectors import deliveries_from_payload
     from mcp_server.server import DatasourceType
     from orchestrator.security.credential_files import CREDENTIAL_FILE_TYPES
     from shared.credential_connectors import ENV_CONNECTOR_TYPES
@@ -220,7 +224,11 @@ def test_type_inventory_matches_golden(golden):
             "env_connector_types": sorted(ENV_CONNECTOR_TYPES),
             "credential_file_types_orchestrator": sorted(CREDENTIAL_FILE_TYPES),
             "credential_file_types_agent": sorted(
-                datasource_setup.CREDENTIAL_FILE_TYPES
+                delivery.entry["type"]
+                for delivery in deliveries_from_payload(
+                    [{"type": item.type_id} for item in DATASOURCE_TYPE_CATALOG]
+                )
+                if delivery.primary_form in {"credential_file", "ssh_identity"}
             ),
             "mcp_server_datasource_type": list(typing.get_args(DatasourceType)),
         },

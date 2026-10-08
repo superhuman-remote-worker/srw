@@ -445,8 +445,8 @@ class UniversalAgent:
             str, Any
         ] = {}  # Parent clients for cleanup (e.g. MongoClient)
         # Manifest of materialized credential files (kubeconfig /
-        # generic_file). Populated by process_credential_files() at job start;
-        # consumed by cleanup_credential_files() at job end.
+        # generic_file). Written by the credential-file materializer at job
+        # start; released with the connections at job end.
         self._datasource_files_manifest: Optional[Dict[str, Any]] = None
         # ``{authority_id: status}`` of the connector SSH identities loaded
         # into workspace ssh-agents for this job (C1); credential-free.
@@ -3672,16 +3672,18 @@ class UniversalAgent:
             managed_repository_credentials, workspace_backend
         )
         del managed_repository_credentials
-        from shared.runtime.core.workspace_ssh_identity import (
-            materialize_workspace_ssh_identities,
-        )
+        from agent.connectors import RuntimeContext, connector_registry
 
         # Per-identity and never fatal: a broken connector key degrades only
         # its own connector (the clone that follows skips it).
-        self._workspace_ssh_identity_status = materialize_workspace_ssh_identities(
-            workspace_ssh_identities, workspace_backend
+        identities = RuntimeContext(
+            execution="worker",
+            backend=workspace_backend,
+            ssh_identities=workspace_ssh_identities,
         )
         del workspace_ssh_identities
+        await connector_registry().initialize_workspace(identities)
+        self._workspace_ssh_identity_status = identities.ssh_identity_status or {}
         primary_url = metadata.get("git_remote_url")
         if repository_url_has_credentials(primary_url):
             raise ManagedRepositoryMaterializationError(
@@ -4280,87 +4282,63 @@ class UniversalAgent:
         Also creates datasource connections from job metadata (sent by orchestrator)
         and injects them into the ToolContext.
         """
-        # Process datasources from job metadata (sent by orchestrator)
-        from agent.core.datasource_setup import (
-            clone_repository_datasources,
-            inject_workspace_facts,
-            install_workspace_credentials,
-            process_credential_files,
-            process_datasources,
+        # Deliver the connectors in the job's payload (sent by the
+        # orchestrator), in the worker order: environment, managed
+        # connections, MCP discovery, repository checkouts (onto the
+        # workspace backend, never the agent pod), credential files.
+        from agent.connectors import (
+            RuntimeContext,
+            connector_registry,
+            deliveries_from_payload,
         )
+        from agent.core.datasource_setup import inject_workspace_facts
 
         ds_configs = (
             self._job_metadata.get("datasources", []) if self._job_metadata else []
         )
         ws = self._workspace_manager
-        install_workspace_credentials(ds_configs, ws)
-
-        # Repository datasources clone onto the workspace backend — never
-        # locally in the agent pod (the subprocess git-clone branch was
-        # removed; see knowledge-base/knowledge/features/no_workspace_agent_mode.md §9.4).
-        repo_datasources = [ds for ds in ds_configs if ds.get("type") == "repository"]
-        kb_datasources = [ds for ds in ds_configs if ds.get("type") == "kb"]
-        non_repo_datasources = [
-            ds for ds in ds_configs if ds.get("type") not in ("repository", "kb")
-        ]
-
-        datasources_dict, client_registry = process_datasources(non_repo_datasources)
-        # Track connections for cleanup
-        self._datasource_connections.update(datasources_dict)
-        self._datasource_clients.update(client_registry)
+        deliveries = deliveries_from_payload(ds_configs)
+        connectors = RuntimeContext(
+            execution="worker",
+            workspace_manager=ws,
+            ssh_identity_status=getattr(self, "_workspace_ssh_identity_status", None),
+            # A child job sees only its own repositories, on a home its
+            # parent (perhaps still on a pre-agent image) owns.
+            legacy_key_files=(
+                "sweep"
+                if _job_owns_its_workspace(
+                    self._job_metadata or {}, self._current_job_id
+                )
+                else "keep"
+            ),
+        )
+        try:
+            await connector_registry().setup_worker(deliveries, connectors)
+        finally:
+            # Tracked for cleanup, including what a failed step left open;
+            # _close_datasource_connections() closes them and removes the
+            # credential files.
+            self._datasource_connections.update(connectors.connections)
+            self._datasource_clients.update(connectors.clients)
+            self._datasource_files_manifest = connectors.files_manifest
+        datasources_dict = connectors.connections
 
         from agent.tools.registry import register_mcp_tools
 
-        # Discovery must finish before rendering the README.md facts block and loading
-        # tools. MCPManager degrades individual server failures internally.
+        # Discovery finished above; its tools load with the rest. Loop-mode
+        # workers are process-reused, so a job without MCP clears the prior
+        # job's dynamic registry entries.
         mcp_manager = datasources_dict.get("mcp")
         if mcp_manager is not None:
             try:
-                await mcp_manager.connect_all()
-            except Exception as e:
-                logger.warning(
-                    "Unexpected MCP discovery failure (%s); continuing without MCP",
-                    type(e).__name__,
-                )
-            try:
                 register_mcp_tools(mcp_manager)
-                mcp_manager.annotate_configs()
             except Exception as e:
                 logger.warning(
                     "Could not register MCP tools (%s); continuing without MCP",
                     type(e).__name__,
                 )
         else:
-            # Loop-mode workers are process-reused; do not retain the prior
-            # job's dynamic registry entries.
             register_mcp_tools(None)
-
-        if repo_datasources:
-            clone_repository_datasources(
-                repo_datasources,
-                ws,
-                ssh_identity_status=getattr(
-                    self, "_workspace_ssh_identity_status", None
-                ),
-                # A child job sees only its own repositories, on a home its
-                # parent (perhaps still on a pre-agent image) owns.
-                legacy_key_files=(
-                    "sweep"
-                    if _job_owns_its_workspace(
-                        self._job_metadata or {}, self._current_job_id
-                    )
-                    else "keep"
-                ),
-            )
-
-        # Materialize credential files (kubeconfig, generic_file; an ssh_key
-        # connector lives in a workspace ssh-agent instead).
-        # Tracked in a manifest so _close_datasource_connections() can undo it.
-        try:
-            self._datasource_files_manifest = process_credential_files(ds_configs)
-        except Exception as e:
-            logger.warning("Failed to materialize credential files: %s", e)
-            self._datasource_files_manifest = None
 
         # README.md workspace-facts block (connectors, materials, layout).
         # Regenerated on every init — resume included — so it reflects the
@@ -4418,7 +4396,6 @@ class UniversalAgent:
             "repo_name": (self._job_metadata or {}).get("repo_name"),
         }
 
-        from agent.services.knowledge.bindings import build_knowledge_bindings
         from shared.runtime_actor import RuntimeActorContext
 
         raw_project_id = (
@@ -4428,9 +4405,9 @@ class UniversalAgent:
         runtime_actor = RuntimeActorContext.from_payload(
             self._job_metadata.get("runtime_actor") if self._job_metadata else None
         )
-        knowledge_bindings = build_knowledge_bindings(
+        knowledge_bindings = connector_registry().knowledge_bindings(
+            deliveries,
             project_ids=native_project_ids,
-            datasources=kb_datasources,
             runtime_actor=runtime_actor,
         )
 
@@ -5347,33 +5324,21 @@ class UniversalAgent:
                 logger.warning(f"Error closing knowledge graph: {e}")
             self._knowledge_graph = None
 
-        for ds_type, conn in self._datasource_connections.items():
-            try:
-                if hasattr(conn, "close"):
-                    conn.close()
-                    logger.debug(f"Closed {ds_type} datasource connection")
-            except Exception as e:
-                logger.warning(f"Error closing {ds_type} datasource: {e}")
+        # The connections and parent clients (e.g. MongoClient), then the
+        # credential files materialized for this job (best-effort).
+        from agent.connectors import RuntimeContext, connector_registry
+
+        connector_registry().release(
+            RuntimeContext(
+                execution="worker",
+                connections=self._datasource_connections,
+                clients=self._datasource_clients,
+                files_manifest=self._datasource_files_manifest,
+            )
+        )
         self._datasource_connections = {}
-        # Close parent clients (e.g. MongoClient) that aren't in _datasource_connections
-        for ds_type, client in self._datasource_clients.items():
-            try:
-                if hasattr(client, "close"):
-                    client.close()
-                    logger.debug(f"Closed {ds_type} datasource client")
-            except Exception as e:
-                logger.warning(f"Error closing {ds_type} datasource client: {e}")
         self._datasource_clients = {}
-
-        # Remove credential files materialized for this job (best-effort).
-        if self._datasource_files_manifest:
-            try:
-                from agent.core.datasource_setup import cleanup_credential_files
-
-                cleanup_credential_files(self._datasource_files_manifest)
-            except Exception as e:
-                logger.warning(f"Error cleaning up credential files: {e}")
-            self._datasource_files_manifest = None
+        self._datasource_files_manifest = None
 
     async def _resume_from_checkpoint(
         self,

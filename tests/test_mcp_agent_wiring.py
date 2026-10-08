@@ -5,7 +5,7 @@ import textwrap
 
 import pytest
 
-from agent.core.datasource_setup import process_datasources
+from tests._connector_runtime import open_harness
 from shared.runtime.core.loader import get_all_tool_names, load_config_from_resolved
 from agent.tools.context import ToolContext
 from agent.tools.registry import (
@@ -74,7 +74,7 @@ async def test_full_job_path_slice(tmp_path):
         },
     }
 
-    connections, _ = process_datasources([datasource])
+    connections, _ = open_harness([datasource])
     manager = connections["mcp"]
     await manager.connect_all()
     try:

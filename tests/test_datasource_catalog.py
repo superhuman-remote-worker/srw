@@ -16,7 +16,7 @@ from shared.runtime.core.datasource_catalog import (
     DATASOURCE_TYPE_IDS,
     DATASOURCE_TYPES,
 )
-from agent.core.datasource_setup import CREDENTIAL_FILE_TYPES, DATASOURCE_TOOL_MAP
+from agent.core.datasource_setup import DATASOURCE_TOOL_MAP
 
 _ROOT = Path(__file__).resolve().parents[1]
 _GUIDE = _ROOT / "config" / "skills" / "app-guide"
@@ -37,8 +37,8 @@ def test_datasource_catalog_matches_agent_consumers():
 
     # Files delivered to the agent pod. An ssh_key's key goes into the
     # workspace's ssh-agent instead (C1), so it is catalogued as an SSH
-    # identity; both the agent and the orchestrator still treat its stored
-    # credentials as a files[] list.
+    # identity; the orchestrator still treats its stored credentials as a
+    # files[] list, and the agent's README lists it with the credential files.
     credential_types = {
         definition.type_id
         for definition in DATASOURCE_TYPE_CATALOG
@@ -63,8 +63,18 @@ def test_datasource_catalog_matches_agent_consumers():
     assert ssh_identity_types == {"ssh_key"}
     files_types = legacy_types_with_slot("files")
     assert files_types == credential_types | ssh_identity_types
-    assert CREDENTIAL_FILE_TYPES == files_types
     assert ORCHESTRATOR_CREDENTIAL_FILE_TYPES == files_types
+    # The agent keeps no copy: it routes deliveries by the spec's forms.
+    from agent.connectors import deliveries_from_payload
+
+    routed = {
+        delivery.entry["type"]
+        for delivery in deliveries_from_payload(
+            [{"type": type_id} for type_id in DATASOURCE_TYPE_IDS]
+        )
+        if delivery.primary_form in {"credential_file", "ssh_identity"}
+    }
+    assert routed == files_types
     assert tool_types == set(DATASOURCE_TOOL_MAP)
 
 

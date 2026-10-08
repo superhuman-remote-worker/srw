@@ -8,7 +8,7 @@ read always use one, and a connection made for a read-only connector link
 opens nothing else.
 
 The unit tests record the session arguments; the container test runs the
-real bind -> process_datasources -> create_neo4j_tools path against
+real bind -> managed-connection materializer -> create_neo4j_tools path against
 ``neo4j:5-community`` with auth on, and skips without a container runtime.
 """
 
@@ -20,6 +20,7 @@ import pytest
 
 from shared.runtime.database import neo4j_db
 from shared.runtime.database.neo4j_db import READ_ACCESS, Neo4jDB
+from tests._connector_runtime import open_harness
 
 # Statements that got past the keyword filter in review.
 WRITES_PAST_THE_FILTER = [
@@ -84,17 +85,19 @@ class TestSessionAccessMode:
 
 @pytest.mark.parametrize("read_only", [False, True])
 def test_the_agent_opens_read_only_links_read_only(read_only, monkeypatch):
-    from agent.core.datasource_setup import create_datasource_connection
+    from agent.connectors import binding_from_legacy_entry
+    from agent.connectors.connections import open_connection
 
     monkeypatch.setattr(Neo4jDB, "connect", lambda self: True)
-    db, _ = create_datasource_connection(
+    (entry,) = binding_from_legacy_entry(
         {
             "type": "neo4j",
             "connection_url": "bolt://graph:7687",
             "credentials": {"username": "graph", "password": "pw"},
             "project_read_only": read_only,
         }
-    )
+    ).entries
+    db, _ = open_connection(entry.value)
     assert db.read_only is read_only
 
 
@@ -136,7 +139,6 @@ def neo4j_server():
 
 def _tools_for(server, *, read_only: bool):
     """The real path: the orchestrator's bind, then the agent's setup."""
-    from agent.core.datasource_setup import process_datasources
     from agent.tools.context import ToolContext
     from agent.tools.graph.neo4j import create_neo4j_tools
     from orchestrator.services.agent_datasource_payload import (
@@ -162,7 +164,7 @@ def _tools_for(server, *, read_only: bool):
         "project_read_only": read_only,
     }
     (entry,) = build_datasources_payload([row], dependencies=deps)
-    connections, _ = process_datasources([entry])
+    connections, _ = open_harness([entry])
     db = connections["neo4j"]
     tools = create_neo4j_tools(ToolContext(datasources={"neo4j": db}))
     return db, {t.name: t for t in tools}

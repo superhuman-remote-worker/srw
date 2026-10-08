@@ -2,8 +2,8 @@
 
 ``EmailConnection`` bundles the mailbox credentials with the resolved,
 non-secret scoping config (access tier, folder allowlist, drafts folder,
-recipient allowlist, unattended-send flag). It is created by
-``datasource_setup.create_datasource_connection()`` and reached by the tools
+recipient allowlist, unattended-send flag). It is created by the email
+connection factory (``agent.connectors.connections``) and reached by the tools
 via ``ToolContext.get_datasource("email")``.
 
 Connections are strictly per-operation: every tool call opens a fresh IMAP

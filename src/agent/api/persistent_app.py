@@ -10090,19 +10090,19 @@ async def _close_datasources_after_turn(
     release its resource cleanly. Polls the turn flag and closes as soon as
     the loop parks (or the session ends).
     """
-    from agent.core.datasource_setup import close_datasource_connections
+    from agent.connectors.connections import close_connections
 
     try:
         while _turn_in_flight():
             await asyncio.sleep(0.5)
-        close_datasource_connections(connections, clients)
+        close_connections(connections, clients)
         logger.info(
             "Closed %d replaced datasource connection(s) after turn end",
             len(connections),
         )
     except asyncio.CancelledError:
         # Shutdown teardown — close immediately; nothing left in flight.
-        close_datasource_connections(connections, clients)
+        close_connections(connections, clients)
         raise
     except Exception as e:
         logger.warning("Deferred datasource close failed: %s", e)

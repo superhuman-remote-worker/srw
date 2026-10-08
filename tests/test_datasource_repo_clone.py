@@ -12,12 +12,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agent.connectors.checkout import clone_repository_datasources
 from agent.core.datasource_setup import (
-    clone_repository_datasources,
     inject_workspace_facts,
-    process_datasources,
     resolve_repo_clone_names,
 )
+from tests._connector_runtime import open_harness
 from orchestrator.application import preparation as preparation_composition
 from orchestrator.services import (
     agent_datasource_payload as agent_datasource_payload_module,
@@ -95,9 +95,11 @@ class TestCapabilityGate:
         clone_repository_datasources([], ws)  # must not raise or log errors
 
     def test_local_clone_function_removed(self):
+        from agent.connectors import checkout
         from agent.core import datasource_setup
 
         assert not hasattr(datasource_setup, "setup_repository_datasource")
+        assert not hasattr(checkout, "setup_repository_datasource")
 
 
 class TestBackendClone:
@@ -191,7 +193,7 @@ class TestBackendClone:
         )
         with (
             patch("agent.managers.git_manager.GitManager.clone") as mock_clone,
-            patch("agent.core.datasource_setup.logger") as log,
+            patch("agent.connectors.checkout.logger") as log,
         ):
             clone_repository_datasources([ds], ws, ssh_identity_status=status)
         if not materialized:
@@ -216,7 +218,7 @@ class TestBackendClone:
         }
         with (
             patch("agent.managers.git_manager.GitManager.clone") as mock_clone,
-            patch("agent.core.datasource_setup.logger") as log,
+            patch("agent.connectors.checkout.logger") as log,
         ):
             clone_repository_datasources(
                 [unavailable, legacy], ws, ssh_identity_status={}
@@ -347,7 +349,7 @@ class TestBackendClone:
 
         with patch("agent.managers.git_manager.GitManager") as git_manager:
             git_manager.return_value = existing
-            with caplog.at_level(logging.DEBUG, logger="agent.core.datasource_setup"):
+            with caplog.at_level(logging.DEBUG, logger="agent.connectors.checkout"):
                 clone_repository_datasources([token_ds(default_branch="dev")], ws)
 
         existing.checkout_branch.assert_not_called()
@@ -817,7 +819,7 @@ class TestLegacyKeyFiles:
     def test_listing_names_only_old_block_named_slug_named_private_key_files(
         self, home
     ):
-        from agent.core.datasource_setup import _legacy_ssh_key_files
+        from agent.connectors.checkout import _legacy_ssh_key_files
 
         ws = self._workspace(home)
         assert _legacy_ssh_key_files(ws.backend, f"{home}/.ssh") == {
@@ -953,7 +955,7 @@ class TestLegacyKeyFiles:
         """A name no exact old block names survives even a direct request."""
         import subprocess
 
-        from agent.core.datasource_setup import _RETIRE_LEGACY_KEYS_PROGRAM
+        from agent.connectors.checkout import _RETIRE_LEGACY_KEYS_PROGRAM
 
         ssh = home / ".ssh"
         (ssh / "repo_deploy").write_text(self._KEY)
@@ -1113,8 +1115,7 @@ class TestJobWorkspaceOwnership:
         agent._datasource_clients = {}
         clone = MagicMock(side_effect=Stop)
         with (
-            patch("agent.core.datasource_setup.install_workspace_credentials"),
-            patch("agent.core.datasource_setup.clone_repository_datasources", clone),
+            patch("agent.connectors.checkout.clone_repository_datasources", clone),
             pytest.raises(Stop),
         ):
             await UniversalAgent._setup_job_tools(agent)
@@ -1326,18 +1327,16 @@ class TestWorkspaceFactsRepositoryLine:
         assert "`ssh build.example.com` uses it" in content
 
 
-class TestProcessDatasourcesRepoGuard:
-    """process_datasources never clones — repository entries are skipped."""
+class TestHarnessRepoGuard:
+    """The harness phase never clones: a repository routes to the checkout
+    materializer only, which runs once the workspace exists."""
 
-    def test_repository_ds_ignored_with_warning(self, caplog):
-        with patch("agent.core.datasource_setup.subprocess.run") as mock_run:
-            connections, clients = process_datasources([token_ds()])
-        mock_run.assert_not_called()
+    def test_repository_ds_opens_nothing_in_the_harness(self):
+        with patch("agent.managers.git_manager.GitManager.clone") as mock_clone:
+            connections, clients = open_harness([token_ds()])
+        mock_clone.assert_not_called()
         assert connections == {}
         assert clients == {}
-        assert any(
-            "ignored by process_datasources" in r.message for r in caplog.records
-        )
 
 
 class TestDeclaredReadOnlyIndexNote:

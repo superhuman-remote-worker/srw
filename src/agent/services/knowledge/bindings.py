@@ -64,7 +64,9 @@ def build_knowledge_bindings(
 
     The first native project remains the sole write target, matching the
     existing primary-project behavior. External KB datasource payloads are
-    always read-only in Slice 4 v1.
+    always read-only in Slice 4 v1. ``datasources`` holds KB payload entries
+    only: the connector registry routes the knowledge-index form here
+    (``agent.connectors.knowledge``).
 
     A project's own KB datasource (auto-attached at project creation) is keyed
     by its *project* id, not its datasource id — its notes are indexed under
@@ -110,8 +112,6 @@ def build_knowledge_bindings(
         tuple[str, uuid.UUID, str, dict[str, Any], dict[str, Any]]
     ] = []
     for datasource in datasources:
-        if str(datasource.get("type") or "").lower() != "kb":
-            continue
         raw_id = datasource.get("datasource_id") or datasource.get("id")
         native_project = native_kb_project_id(datasource)
         try:

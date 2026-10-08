@@ -5,7 +5,7 @@ attached as a datasource. Read tools (list, read, info) are always available.
 Write tools (write, delete) are only injected when the datasource is not
 marked read-only.
 
-Connection is established by datasource_setup.create_datasource_connection()
+Connection is established by the WebDAV connection factory (agent.connectors.connections)
 and injected via ToolContext.get_datasource("webdav").
 """
 

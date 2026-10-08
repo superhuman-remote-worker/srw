@@ -2,7 +2,7 @@
 
 For ``kubeconfig``, ``ssh_key``, and ``generic_file`` datasources the credentials
 dict carries a list of file payloads that get materialized as files on the agent's
-filesystem at job start (see ``src/agent/core/datasource_setup.py``). This module is the
+filesystem at job start (see ``src/agent/connectors/files.py``). This module is the
 single source of truth for:
 
 - per-file size cap (64 KB) and per-datasource count cap (5)

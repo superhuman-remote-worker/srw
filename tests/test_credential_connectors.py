@@ -150,10 +150,10 @@ def test_remote_delivery_uses_private_transport_and_work_identity(
 
 
 def test_generic_credentials_do_not_enter_agent_environment(monkeypatch):
-    from agent.core.datasource_setup import process_datasources
+    from tests._connector_runtime import open_harness
 
     monkeypatch.delenv("SYNTHETIC_CONNECTOR_KEY", raising=False)
-    process_datasources(
+    connections, _ = open_harness(
         [
             {
                 "type": "generic",
@@ -161,15 +161,24 @@ def test_generic_credentials_do_not_enter_agent_environment(monkeypatch):
             }
         ]
     )
+    assert connections == {}
     assert "SYNTHETIC_CONNECTOR_KEY" not in os.environ
 
 
-def test_credentials_require_shell_workspace():
-    from agent.core.datasource_setup import install_workspace_credentials
+def _deliver_env(entries, workspace):
+    from agent.connectors import RuntimeContext, deliveries_from_payload
+    from agent.connectors.env import EnvFileMaterializer
 
+    EnvFileMaterializer().materialize(
+        deliveries_from_payload(entries),
+        RuntimeContext(execution="session", workspace_manager=workspace),
+    )
+
+
+def test_credentials_require_shell_workspace():
     workspace = SimpleNamespace(backend=SimpleNamespace(supports_shell=False))
     with pytest.raises(ValueError, match="sandbox or VM"):
-        install_workspace_credentials(
+        _deliver_env(
             [
                 {
                     "type": "credentials",
@@ -178,6 +187,53 @@ def test_credentials_require_shell_workspace():
             ],
             workspace,
         )
+
+
+def test_the_environment_materializer_installs_every_env_connector():
+    installed = []
+    workspace = SimpleNamespace(
+        backend=SimpleNamespace(
+            supports_shell=True, install_credential_environment=installed.append
+        )
+    )
+    _deliver_env(
+        [
+            {"type": "generic", "credentials": {"env_vars": {"A": "1"}}},
+            {"type": "postgresql", "credentials": {"env_vars": {"IGNORED": "x"}}},
+            {"type": "credentials", "credentials": {"env_vars": {"B": "2"}}},
+        ],
+        workspace,
+    )
+    assert installed == [{"A": "1", "B": "2"}]
+
+
+@pytest.mark.parametrize(
+    ("entries", "message"),
+    [
+        (
+            [
+                {"type": "credentials", "credentials": {"env_vars": {"K": "one"}}},
+                {"type": "generic", "credentials": {"env_vars": {"K": "two"}}},
+            ],
+            "Multiple attached connectors define K",
+        ),
+        (
+            [{"type": "credentials", "credentials": {"env_vars": {}}}],
+            "Add at least one credential environment variable",
+        ),
+        (
+            [{"type": "generic", "credentials": {"env_vars": {"PATH": "/x"}}}],
+            "reserved by the workspace",
+        ),
+    ],
+)
+def test_the_environment_materializer_keeps_the_delivery_errors(entries, message):
+    """The same refusals collect_credential_env gave, at delivery time."""
+    from agent.connectors import deliveries_from_payload
+    from agent.connectors.env import credential_environment
+
+    with pytest.raises(ValueError, match=message):
+        credential_environment(deliveries_from_payload(entries))
 
 
 def _browser_executor():

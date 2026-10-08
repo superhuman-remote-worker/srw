@@ -1,4 +1,4 @@
-"""Tests for credential-file materialization in ``src/core/datasource_setup.py``.
+"""Tests for credential-file materialization in ``src/agent/connectors/files.py``.
 
 The validator (``orchestrator/security/credential_files.py``, separately tested)
 resolves and stores ``target_path`` against the production agent home ``/home/srw``.
@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.core.datasource_setup import (
+from agent.connectors.files import (
     AGENT_HOME,
     cleanup_credential_files,
     process_credential_files,
