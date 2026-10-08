@@ -113,6 +113,7 @@ BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
     "connector_lease_sweeper",
     "connector_lease_exchange",
     "connector_service_reconciler",
+    "connector_service_identity_revoker",
     "checkpoint_retention",
     "headless_notify",
     "attention_sleep",
@@ -492,6 +493,16 @@ async def start_background_tasks(
                     resources, service_hosting
                 ),
                 interval_seconds=resources.settings.connector_service_reconcile_seconds,
+            ),
+        )
+    else:
+        # Hosting off (or not configured): no reconciler here keeps service
+        # pods, so their identities are revoked now and while it stays off,
+        # on every replica (connector drivers D5).
+        tasks.start(
+            "connector_service_identity_revoker",
+            connector_service_hosting.connector_service_identity_revoker(
+                resources.shutdown_event, store=resources.postgres_db
             ),
         )
     # In-flight checkpoint retention: bound every live thread's LangGraph

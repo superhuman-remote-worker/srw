@@ -24,7 +24,6 @@ from orchestrator import graph_routes
 from orchestrator.application import (
     background_tasks as background_tasks_composition,
     catalogue as catalogue_composition,
-    connectors as connectors_composition,
     jobs as jobs_composition,
     workflows as workflows_composition,
 )
@@ -198,21 +197,6 @@ async def open_stores(resources: ApplicationResources) -> tuple[bool, Any]:
             "Project connector entries were not healed; it retries at the next start"
         )
     resources.postgres_db.manifests_ready = True
-    # Service-pod hosting off (or not configured): no reconciler will stop
-    # the driver pods a previous configuration started, so the exchange must
-    # refuse their identities now (connector drivers D5).
-    if connectors_composition.service_hosting_settings(resources) is None:
-        from orchestrator.services.connector_service_hosting import (
-            revoke_unhosted_identities,
-        )
-
-        try:
-            await revoke_unhosted_identities(resources.postgres_db)
-        except Exception:
-            logger.exception(
-                "Revoking unhosted driver pod identities failed; it retries at "
-                "the next start"
-            )
     logger.info(
         "Managed expert defaults ready: worker=%s session=%s",
         managed_defaults.get("worker"),

@@ -468,28 +468,46 @@ def test_hosting_is_off_when_disabled_or_incomplete(over):
     assert connectors_composition.service_hosting_settings(resources) is None
 
 
-def test_startup_revokes_unhosted_identities_whenever_hosting_is_off():
-    """lifecycle.open_stores: hosting off (or not configured) revokes the
-    identities of pods no reconciler will stop, and never blocks startup."""
-    import ast
+def test_hosting_off_runs_the_revoke_loop_on_every_replica():
+    """Hosting off (or not configured): a loop on every replica (not
+    leader-gated) revokes live service-pod identities, shut down in order."""
     import inspect
 
-    from orchestrator.application import lifecycle
-
-    source = inspect.getsource(lifecycle.open_stores)
-    tree = ast.parse(source.lstrip())
-    text = ast.unparse(tree)
-    assert "connectors_composition.service_hosting_settings(resources) is None" in (
-        text
+    order = background_tasks.BACKGROUND_TASK_SHUTDOWN_ORDER
+    assert "connector_service_identity_revoker" in order
+    source = inspect.getsource(background_tasks.start_background_tasks)
+    assert 'tasks.start(\n            "connector_service_identity_revoker"' in source
+    assert (
+        'start_leader_gated(\n            "connector_service_identity_revoker"'
+        not in (source)
     )
-    assert "await revoke_unhosted_identities(resources.postgres_db)" in text
-    guarded = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Try)
-        and "revoke_unhosted_identities" in ast.unparse(node.body)
-    ]
-    assert guarded and guarded[0].handlers
+
+
+@pytest.mark.asyncio
+async def test_the_revoke_loop_revokes_at_once_then_on_its_interval(monkeypatch):
+    calls: list[object] = []
+
+    async def revoke(store):
+        calls.append(store)
+        if len(calls) == 2:
+            raise RuntimeError("database away")  # logged; the loop goes on
+        return []
+
+    monkeypatch.setattr(hosting, "revoke_unhosted_identities", revoke)
+    shutdown = asyncio.Event()
+    store = object()
+    task = asyncio.create_task(
+        hosting.connector_service_identity_revoker(
+            shutdown, store=store, interval_seconds=0.02
+        )
+    )
+    for _ in range(100):
+        if len(calls) >= 3:
+            break
+        await asyncio.sleep(0.01)
+    shutdown.set()
+    await asyncio.wait_for(task, timeout=2)
+    assert len(calls) >= 3 and all(item is store for item in calls)
 
 
 def test_the_reconciler_builder_creates_the_networking_api_once(monkeypatch):

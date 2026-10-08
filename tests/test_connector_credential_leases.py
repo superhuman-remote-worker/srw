@@ -394,6 +394,26 @@ class TestCheckDenial:
     def test_no_row_is_an_unknown_identity(self):
         assert check_denial(None, operation="read") == "unknown_driver_identity"
 
+    @pytest.mark.parametrize("operation", ["read", None])
+    def test_a_service_pod_is_refused_where_hosting_is_off(self, operation):
+        """Per request, on a replica without hosting: a pod an older replica
+        still hosts during a rollout is refused here."""
+        pod = _row(identity_service_pod=True)
+        assert check_denial(pod, operation=operation) is None
+        assert (
+            check_denial(pod, operation=operation, service_hosting=False)
+            == "service_hosting_off"
+        )
+        # A bind-time or lease-probe identity is no service pod.
+        other = _row(identity_service_pod=False)
+        assert check_denial(other, operation=operation, service_hosting=False) is None
+        # A revoked identity says so first.
+        revoked = _row(identity_service_pod=True, identity_revoked=True)
+        assert (
+            check_denial(revoked, operation=operation, service_hosting=False)
+            == "driver_identity_revoked"
+        )
+
 
 class _FakeExchange:
     def __init__(self) -> None:
@@ -414,7 +434,9 @@ class _FakeExchange:
 def exchange_client(monkeypatch):
     fake = _FakeExchange()
     monkeypatch.setattr(
-        connectors_composition, "connector_lease_exchange", lambda *_args: fake
+        connectors_composition,
+        "connector_lease_exchange",
+        lambda *_args, **_kwargs: fake,
     )
     app = connectors_composition.connector_lease_exchange_app(SimpleNamespace())
     return TestClient(app), fake
@@ -574,7 +596,7 @@ class TestServer:
         monkeypatch.setattr(
             connectors_composition,
             "connector_lease_exchange",
-            lambda *_args: _FakeExchange(),
+            lambda *_args, **_kwargs: _FakeExchange(),
         )
 
         def reachable(number: int) -> bool:
@@ -624,7 +646,9 @@ class TestServer:
         probe.close()
         fake = _FakeExchange()
         monkeypatch.setattr(
-            connectors_composition, "connector_lease_exchange", lambda *_args: fake
+            connectors_composition,
+            "connector_lease_exchange",
+            lambda *_args, **_kwargs: fake,
         )
         shutdown = asyncio.Event()
         task = asyncio.create_task(

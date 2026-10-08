@@ -260,13 +260,21 @@ def connector_service_reconciler_builder(
 
 
 def connector_lease_exchange(
-    resources: ApplicationResources, limiter: DenialLimiter | None = None
+    resources: ApplicationResources,
+    limiter: DenialLimiter | None = None,
+    *,
+    service_hosting: bool = True,
 ) -> ConnectorLeaseExchange:
-    """The exchange operations, bound to this application's store and drivers."""
+    """The exchange operations, bound to this application's store and drivers.
+
+    ``service_hosting`` is whether this process hosts service pods; without,
+    a service pod's identity is refused.
+    """
     return ConnectorLeaseExchange(
         store=resources.postgres_db,
         drivers=resources.connector_drivers,
         limiter=limiter,
+        service_hosting=service_hosting,
     )
 
 
@@ -278,8 +286,14 @@ def connector_lease_exchange_app(resources: ApplicationResources) -> FastAPI:
     """
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     limiter = DenialLimiter()
+    # Read once: the deployment's setting for this process's life. Without
+    # settings (a bare composition) no service pod is hosted here.
+    hosting = (
+        getattr(resources, "settings", None) is not None
+        and service_hosting_settings(resources) is not None
+    )
     app.state.connector_lease_exchange_factory = lambda: connector_lease_exchange(
-        resources, limiter
+        resources, limiter, service_hosting=hosting
     )
 
     @app.exception_handler(RequestValidationError)

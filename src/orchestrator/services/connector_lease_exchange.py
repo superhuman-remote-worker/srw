@@ -51,13 +51,16 @@ INTROSPECT_PATH = "/v1/leases/introspect"
 NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
 
 #: Denials of the caller's identity (401) rather than of its request (403).
-_IDENTITY_DENIALS = frozenset({"unknown_driver_identity", "driver_identity_revoked"})
+_IDENTITY_DENIALS = frozenset(
+    {"unknown_driver_identity", "driver_identity_revoked", "service_hosting_off"}
+)
 
 _CHECK = """
 SELECT ident.id AS identity_id,
        ident.connector_id AS identity_connector_id,
        ident.driver AS identity_driver,
        ident.revoked_at IS NOT NULL AS identity_revoked,
+       ident.credential_generation IS NOT NULL AS identity_service_pod,
        lease.id AS lease_id,
        lease.connector_id,
        lease.driver,
@@ -80,17 +83,24 @@ class ExchangeOutcome:
     body: dict[str, Any] = field(repr=False)
 
 
-def check_denial(row: Any, *, operation: str | None) -> str | None:
+def check_denial(
+    row: Any, *, operation: str | None, service_hosting: bool = True
+) -> str | None:
     """Why the checked rows refuse the request, or ``None``.
 
     ``operation`` is ``None`` for introspection, which never refuses on the
     lease's state (it reports it) but does refuse an identity of another
-    connector.
+    connector. Without ``service_hosting`` in this process, a service pod's
+    identity is refused: no reconciler here keeps such pods, so a pod an
+    older replica still hosts during a rollout that turns hosting off is
+    refused on every replica that has it off.
     """
     if row is None or row["identity_id"] is None:
         return "unknown_driver_identity"
     if row["identity_revoked"]:
         return "driver_identity_revoked"
+    if not service_hosting and row["identity_service_pod"]:
+        return "service_hosting_off"
     if row["lease_id"] is None:
         return "unknown_lease"
     if (
@@ -158,11 +168,19 @@ class ConnectorLeaseExchange:
     """The exchange port's operations, bound to one application's store."""
 
     def __init__(
-        self, *, store: Any, drivers: Any, limiter: DenialLimiter | None = None
+        self,
+        *,
+        store: Any,
+        drivers: Any,
+        limiter: DenialLimiter | None = None,
+        service_hosting: bool = True,
     ) -> None:
         self._store = store
         self._drivers = drivers
         self._limiter = limiter or DenialLimiter()
+        #: Whether this process hosts service pods; without, their
+        #: identities are refused per request.
+        self._service_hosting = service_hosting
 
     async def _audit(
         self,
@@ -272,7 +290,9 @@ class ConnectorLeaseExchange:
         if operation not in OPERATION_ACCESS:
             return ExchangeOutcome(400, {"error": "unknown_operation"})
         row = await self._checked_row(identity_token, lease_token)
-        reason = check_denial(row, operation=operation)
+        reason = check_denial(
+            row, operation=operation, service_hosting=self._service_hosting
+        )
         if reason is None:
             driver = self._drivers.get(str(row["driver"]))
             if not isinstance(driver, SupportsCredentialLease):
@@ -355,7 +375,9 @@ class ConnectorLeaseExchange:
         ``{"active": false}``; only the caller's identity can be refused.
         """
         row = await self._checked_row(identity_token, lease_token)
-        reason = check_denial(row, operation=None)
+        reason = check_denial(
+            row, operation=None, service_hosting=self._service_hosting
+        )
         if reason == "unknown_lease":
             return ExchangeOutcome(200, {"active": False})
         if reason is not None:

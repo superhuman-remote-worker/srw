@@ -1424,6 +1424,62 @@ async def test_the_exchange_answers_the_pods_identity_until_it_is_revoked(
 
 
 @pytest.mark.asyncio
+async def test_an_exchange_without_hosting_refuses_a_live_service_pod(db, reconciler):
+    """A rollout turning hosting off: an older replica still hosts and
+    starts a pod with a fresh, live identity; a replica with hosting off
+    refuses it on every request, and its revoke loop revokes it."""
+    from orchestrator.services.connector_service_hosting import (
+        connector_service_identity_revoker,
+    )
+
+    connector, thread = await _echo_connector(db), await _thread(db)
+    await _echo_image(db)
+    lease = await _bind_echo(db, connector, thread)
+    await reconciler.reconcile_once()
+    (pod,) = await _pods(db)
+    plan = reconciler.fake.plans[str(pod["id"])]
+    token = base64.b64decode(plan.secret["data"]["identity"]).decode()
+    drivers = builtin_connector_drivers(echo_service_image=ECHO_REFERENCE)
+    hosting_on = ConnectorLeaseExchange(store=db, drivers=drivers)
+    hosting_off = ConnectorLeaseExchange(
+        store=db, drivers=drivers, service_hosting=False
+    )
+    assert (
+        await hosting_on.exchange(
+            identity_token=token, lease_token=lease.token, operation="read"
+        )
+    ).status == 200
+    refused = await hosting_off.exchange(
+        identity_token=token, lease_token=lease.token, operation="read"
+    )
+    assert refused.status == 401
+    assert refused.body == {"error": "service_hosting_off"}
+
+    shutdown = asyncio.Event()
+    loop = asyncio.create_task(
+        connector_service_identity_revoker(shutdown, store=db, interval_seconds=0.05)
+    )
+    try:
+        for _ in range(100):
+            (pod,) = await _pods(db)
+            if pod["revoked_at"] is not None:
+                break
+            await asyncio.sleep(0.02)
+        assert pod["revoke_reason"] == "hosting_disabled"
+        # An older hosting replica starts a replacement: revoked again.
+        await reconciler.reconcile_once()
+        for _ in range(100):
+            live = [p for p in await _pods(db) if p["revoked_at"] is None]
+            if not live:
+                break
+            await asyncio.sleep(0.02)
+        assert live == []
+    finally:
+        shutdown.set()
+        await asyncio.wait_for(loop, timeout=5)
+
+
+@pytest.mark.asyncio
 async def test_the_connector_egress_view_shows_what_its_pods_enforce(db, reconciler):
     connector = await _echo_connector(db)
     await _echo_image(db)

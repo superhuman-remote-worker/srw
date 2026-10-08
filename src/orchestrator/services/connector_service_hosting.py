@@ -1266,6 +1266,32 @@ async def revoke_unhosted_identities(store: Any) -> list[str]:
     return revoked
 
 
+async def connector_service_identity_revoker(
+    shutdown_event: asyncio.Event,
+    *,
+    store: Any,
+    interval_seconds: float = 60.0,
+) -> None:
+    """Hosting is off in this process: revoke live service-pod identities
+    now and every ``interval_seconds``.
+
+    On every replica, not leader-gated (idempotent). During a rollout that
+    turns hosting off, an older replica that still hosts may start pods with
+    fresh identities; this keeps revoking them, and the exchange of a replica
+    with hosting off refuses them meanwhile.
+    """
+    while not shutdown_event.is_set():
+        try:
+            await revoke_unhosted_identities(store)
+        except Exception as exc:
+            logger.warning("Revoking unhosted driver pod identities failed: %s", exc)
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=interval_seconds)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+
 async def connector_egress_view(
     store: Any, connector_id: str, *, spec: DriverSpec | None
 ) -> dict[str, Any]:
@@ -1342,6 +1368,7 @@ __all__ = [
     "ServicePodRuntime",
     "ServiceRuntimeError",
     "connector_egress_view",
+    "connector_service_identity_revoker",
     "connector_service_reconciler",
     "credential_generation",
     "egress_withdrawn",
