@@ -95,6 +95,9 @@ RevokeReason = Literal[
 EXPIRED = "expired"
 _OWNER_COLUMNS = {"job": "job_id", "thread": "thread_id"}
 _TERMINAL_JOB_STATUSES = ("completed", "failed", "cancelled")
+#: The thread statuses whose leases the sweep renews (the live set the
+#: thread file and upload routes use); ``suspended`` and ``ended`` lapse.
+_LIVE_THREAD_STATUSES = ("created", "active", "idle", "awaiting_user")
 
 
 def sweep_interval(ttl_seconds: int, sweep_seconds: float) -> float:
@@ -463,11 +466,20 @@ async def deliver_connector_leases(
     agent binds the entry at (``effective_access``). Returns how many entries
     carry a lease. The caller holds the connection (and the transaction the
     delivery belongs to).
+
+    Entries are issued in connector-id order (the payload keeps its own
+    order), so every transaction that takes several connectors' rows takes
+    them in one order.
     """
     delivered = 0
-    for entry in entries or ():
-        if not isinstance(entry, dict):
-            continue
+    lease_entries = [
+        entry
+        for entry in entries or ()
+        if isinstance(entry, dict) and lease_spec(entry) is not None
+    ]
+    # Lowercase hex sorts as PostgreSQL sorts the uuid.
+    lease_entries.sort(key=lambda entry: str(entry.get("datasource_id") or "").lower())
+    for entry in lease_entries:
         spec = lease_spec(entry)
         if spec is None:
             continue
@@ -535,20 +547,47 @@ async def _revoke(
     where: str,
     args: Sequence[Any],
     reason: str,
+    skip_locked: bool = False,
 ) -> list[str]:
     """Revoke the live leases matching ``where``; audit the revoked ones.
 
     A lease already past its expiry is retired as ``expired`` instead: it was
     unusable before this decision, so it is not counted as revoked.
+
+    ``skip_locked`` is for the sweeper, which spans many executions: it
+    takes only the lease rows no transaction holds (an issue holding one
+    lease row and waiting for another would otherwise deadlock with a
+    single UPDATE locking them in scan order). What it skips, the next pass
+    revokes.
     """
-    rows = await conn.fetch(
-        f"""
+    reason_arg = f"${len(args) + 1}::text"
+    if skip_locked:
+        target = f"""
+        WITH picked AS (
+            SELECT lease.id FROM connector_credential_leases AS lease
+             WHERE lease.revoked_at IS NULL AND ({where})
+             ORDER BY lease.id
+             FOR UPDATE OF lease SKIP LOCKED
+        )
         UPDATE connector_credential_leases AS lease
            SET revoked_at = LEAST(now(), lease.expires_at),
                revoke_reason = CASE WHEN lease.expires_at <= now()
                                     THEN '{EXPIRED}'
-                                    ELSE ${len(args) + 1}::text END
+                                    ELSE {reason_arg} END
+          FROM picked
+         WHERE lease.id = picked.id
+        """
+    else:
+        target = f"""
+        UPDATE connector_credential_leases AS lease
+           SET revoked_at = LEAST(now(), lease.expires_at),
+               revoke_reason = CASE WHEN lease.expires_at <= now()
+                                    THEN '{EXPIRED}'
+                                    ELSE {reason_arg} END
          WHERE lease.revoked_at IS NULL AND ({where})
+        """
+    rows = await conn.fetch(
+        f"""{target}
         RETURNING lease.id, lease.job_id, lease.thread_id, lease.connector_id,
                   lease.driver, lease.token_last_four, lease.revoke_reason
         """,
@@ -710,9 +749,14 @@ async def revoke_terminal_execution_leases_with(db: Any, *, owner: LeaseOwner) -
 
 async def revoke_leases_of_terminal_executions(conn: Any) -> list[str]:
     """The sweeper's backstop: revoke every live lease whose execution durable
-    state already shows as terminal (a terminal write no revoke point saw)."""
+    state already shows as terminal (a terminal write no revoke point saw).
+    Rows another transaction holds are skipped until the next pass."""
     return await _revoke(
-        conn, where=_TERMINAL_OWNER, args=(), reason="execution_terminal"
+        conn,
+        where=_TERMINAL_OWNER,
+        args=(),
+        reason="execution_terminal",
+        skip_locked=True,
     )
 
 
@@ -729,15 +773,21 @@ async def renew_live_leases(conn: Any, *, ttl_seconds: int | None = None) -> int
     A Job is live while it is ``processing``, or while a ``processing``
     child runs on its workspace and the Job itself is not terminal;
     ``paused`` and ``pending_review`` Jobs are not, so their leases lapse. A
-    thread is live until it has ``ended`` or its retirement is authorized,
-    idle or not.
+    thread is live in a live status (created, active, idle, awaiting_user),
+    idle or not, unless its retirement is authorized; a ``suspended``
+    thread's lease lapses (every resume leaves ``suspended`` before its
+    runtime attaches, and that attach issues anew).
+
+    The due rows are taken ``FOR UPDATE SKIP LOCKED``: a transaction issuing
+    several leases holds some of them while it waits for the next, and one
+    UPDATE locking rows in scan order would deadlock with it. A skipped row
+    is still in the second half of its window, so the next pass renews it.
     """
     ttl = int(ttl_seconds or lease_ttl_seconds())
     rows = await conn.fetch(
         f"""
-        UPDATE connector_credential_leases AS lease
-           SET expires_at = now() + make_interval(secs => $1::int),
-               last_renewed_at = now()
+        WITH due AS (
+        SELECT lease.id FROM connector_credential_leases AS lease
          WHERE lease.revoked_at IS NULL
            AND lease.expires_at > now()
            AND lease.expires_at < now() + make_interval(secs => $2::int)
@@ -762,13 +812,21 @@ async def renew_live_leases(conn: Any, *, ttl_seconds: int | None = None) -> int
                 OR EXISTS (
                     SELECT 1 FROM threads AS thread
                      WHERE thread.id = lease.thread_id
-                       AND thread.status::text <> 'ended'
+                       AND thread.status::text IN {_LIVE_THREAD_STATUSES!r}
                        AND NOT (
                             thread.runtime_retirement_token IS NOT NULL
                             AND thread.runtime_retirement_authorized_at IS NOT NULL
                        )
                 )
            )
+         ORDER BY lease.id
+         FOR UPDATE OF lease SKIP LOCKED
+        )
+        UPDATE connector_credential_leases AS lease
+           SET expires_at = now() + make_interval(secs => $1::int),
+               last_renewed_at = now()
+          FROM due
+         WHERE lease.id = due.id
         RETURNING lease.id
         """,
         ttl,
@@ -778,13 +836,24 @@ async def renew_live_leases(conn: Any, *, ttl_seconds: int | None = None) -> int
 
 
 async def retire_expired_leases(conn: Any) -> int:
-    """Mark live leases past their expiry as ``expired`` (housekeeping)."""
+    """Mark live leases past their expiry as ``expired`` (housekeeping).
+
+    Like the renewal, it skips rows another transaction holds (an issue
+    retires its own expired copy): the next pass takes them.
+    """
     rows = await conn.fetch(
         f"""
-        UPDATE connector_credential_leases
-           SET revoked_at = expires_at, revoke_reason = '{EXPIRED}'
-         WHERE revoked_at IS NULL AND expires_at <= now()
-        RETURNING id
+        WITH lapsed AS (
+            SELECT id FROM connector_credential_leases
+             WHERE revoked_at IS NULL AND expires_at <= now()
+             ORDER BY id
+             FOR UPDATE SKIP LOCKED
+        )
+        UPDATE connector_credential_leases AS lease
+           SET revoked_at = lease.expires_at, revoke_reason = '{EXPIRED}'
+          FROM lapsed
+         WHERE lease.id = lapsed.id
+        RETURNING lease.id
         """
     )
     return len(rows)

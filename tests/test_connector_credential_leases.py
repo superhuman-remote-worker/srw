@@ -834,6 +834,31 @@ class TestLeaseOwner:
         )
 
     @pytest.mark.asyncio
+    async def test_leases_are_issued_in_connector_id_order(self, monkeypatch):
+        """One lock order for every transaction holding several connectors'
+        lease rows; the payload keeps its own order."""
+        low = "0000000a-0000-4000-8000-00000000000a"
+        high = "fffffffb-0000-4000-8000-00000000000b"
+        entries = [
+            {"type": "lease_probe", "name": "B", "datasource_id": high.upper()},
+            {"type": "generic", "name": "G", "credentials": {"k": "v"}},
+            {"type": "lease_probe", "name": "A", "datasource_id": low},
+        ]
+        issued: list[str] = []
+
+        async def issue(_conn, *, owner, connector_id, driver, access, ttl_seconds):
+            issued.append(connector_id.lower())
+            return SimpleNamespace(id="l", connector_id=connector_id, token="scl_x")
+
+        monkeypatch.setattr(leases, "issue_or_redeliver", issue)
+        delivered = await leases.deliver_connector_leases(
+            object(), entries, owner=leases.LeaseOwner.thread("t")
+        )
+        assert delivered == 2 and issued == [low, high]
+        assert [entry["name"] for entry in entries] == ["B", "G", "A"]
+        assert entries[1]["credentials"] == {"k": "v"}
+
+    @pytest.mark.asyncio
     async def test_the_backstop_never_raises(self):
         @contextlib.asynccontextmanager
         async def acquire():

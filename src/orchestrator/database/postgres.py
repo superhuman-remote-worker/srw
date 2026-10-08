@@ -1673,6 +1673,22 @@ async def _revoke_retiring_thread_leases(
     )
 
 
+async def _lock_threads_naming_connector(conn: Any, connector_id: UUID) -> None:
+    """Lock every thread that names a connector, before the connector's row.
+
+    A connector delete later scrubs these threads' ``datasource_ids``; a
+    credential lease issue locks its thread and then the connector. Taking
+    the threads first (in id order) keeps one order, thread -> connector,
+    for both, so they serialize instead of deadlocking (connector drivers
+    C2; D3a's catalog -> thread -> connector order).
+    """
+    await conn.fetch(
+        "SELECT id FROM threads WHERE metadata->'datasource_ids' ? $1::text "
+        "ORDER BY id FOR NO KEY UPDATE",
+        str(connector_id),
+    )
+
+
 def _decrypt_credentials_field(
     raw: Any, *, field: str = "datasources.credentials"
 ) -> Dict[str, Any]:
@@ -51064,6 +51080,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             async with _transaction_if(conn, authority_scope_uuid is not None):
                 if authority_scope_uuid is not None:
+                    await _lock_threads_naming_connector(conn, uuid_val)
                     scoped_row = await conn.fetchrow(
                         """
                         SELECT scope_mode
@@ -51097,6 +51114,8 @@ class PostgresDB:
                 # the scrub below could delete the connector while leaving
                 # dangling thread references behind.
                 async with _transaction_if(conn, authority_scope_uuid is None):
+                    if authority_scope_uuid is None:
+                        await _lock_threads_naming_connector(conn, uuid_val)
                     doomed = await conn.fetchrow(
                         "SELECT name, type FROM datasources WHERE id = $1 FOR UPDATE",
                         uuid_val,

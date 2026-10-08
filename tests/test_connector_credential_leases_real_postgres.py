@@ -426,6 +426,34 @@ async def test_an_idle_thread_is_renewed_until_it_ends(db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "renewed"),
+    [
+        ("created", 1),
+        ("active", 1),
+        ("idle", 1),
+        ("awaiting_user", 1),
+        ("suspended", 0),
+        ("ended", 0),
+    ],
+)
+async def test_only_a_live_thread_status_is_renewed(db, status, renewed):
+    """A suspended thread has no runtime: an Officer's agent-side 'ended'
+    parks it 'suspended' without a retirement, and a resume's attach that
+    failed after its lease committed leaves it there. Its lease lapses;
+    every resume leaves 'suspended' before its runtime attaches."""
+    connector = await _connector(db)
+    thread = await _thread(db, "active")
+    lease = await _issue(db, leases.LeaseOwner.thread(thread), connector)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET status = $2 WHERE id = $1", UUID(thread), status
+        )
+    await _set_expiry(db, lease.id, 100)
+    assert await _renew(db) == renewed
+
+
+@pytest.mark.asyncio
 async def test_an_expired_lease_is_never_renewed_and_is_retired(db):
     connector = await _connector(db)
     job = await _job(db, "processing")

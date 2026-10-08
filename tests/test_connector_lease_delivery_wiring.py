@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import asyncpg
 import httpx
 import pytest
 from fastapi import HTTPException
@@ -471,6 +472,29 @@ async def test_a_warm_attach_without_a_lease_releases_its_reservation():
         )
     release.assert_awaited_once()
     assert release.await_args.kwargs["pre_delivery"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        asyncpg.exceptions.DeadlockDetectedError("deadlock detected"),
+        ConnectionResetError("connection lost"),
+    ],
+    ids=["deadlock", "connection_lost"],
+)
+async def test_any_lease_failure_releases_the_warm_reservation(failure):
+    """The attach token is reserved before the lease step: whatever the lease
+    step raises, the reservation is released, never leaked."""
+    deps, (_payload, release, _issue) = _attach_dependencies(deliver_raises=False)
+    with patch.object(leases, "issue_or_redeliver", AsyncMock(side_effect=failure)):
+        await session_attach_binding.send_session_attach_locked(
+            {"id": AGENT_ID}, THREAD_ID, dependencies=deps
+        )
+    release.assert_awaited_once()
+    assert release.await_args.kwargs["pre_delivery"] is True
+    assert release.await_args.kwargs["expected_attach_token"] == "attach-token"
+    deps.schedule_attach_abort_successor.assert_called_once()
 
 
 # =============================================================================

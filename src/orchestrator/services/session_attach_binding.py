@@ -933,14 +933,17 @@ async def send_session_attach_locked(
     if payload is not None:
         # Credential leases (connector drivers C2), under the datasource lock
         # the caller holds: a warm re-attach or a recycled pod receives the
-        # thread's same token; a failed attach revokes nothing.
+        # thread's same token; a failed attach revokes nothing. The attach
+        # token is reserved by now, so ANY failure here (a refused lease, a
+        # lost connection, a lock conflict) takes the no-payload path below
+        # and releases the reservation; nothing may escape past it.
         try:
             await connector_credential_leases.deliver_connector_leases_with(
                 store,
                 payload.get("datasources"),
                 owner=connector_credential_leases.LeaseOwner.thread(thread_id),
             )
-        except connector_credential_leases.LeaseDeliveryError:
+        except Exception:
             logger.warning(
                 "Session attach: connector leases unavailable for thread %s",
                 thread_id,
