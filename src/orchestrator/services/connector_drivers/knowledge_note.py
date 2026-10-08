@@ -174,7 +174,17 @@ def _level_tools(spec: DriverSpec, level_id: str) -> list[str]:
 
 
 def database_note(row: Mapping[str, Any], spec: DriverSpec) -> str:
-    """A managed database connection: its access and the tools it binds."""
+    """A managed database connection: its access and the tools it binds.
+
+    The tools come from the spec's access level. A read-only Neo4j link's
+    note projected before slice D1c still lists ``cypher_execute`` (the
+    tool itself was never bound read-only) until that link is projected
+    again: an edit of the connector's name, description, URL, credentials or
+    config, or a re-link, enqueues it in
+    ``datasource_project_reconcile_queue`` and the reconciler rewrites the
+    note. No startup sweep does it: it would add a type-keyed write to every
+    orchestrator start for a note the agent cannot act on.
+    """
     read_only = _read_only(row)
     access = "read-only" if read_only else "read-write"
     lines = [

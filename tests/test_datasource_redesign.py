@@ -14,9 +14,14 @@ import json
 
 import pytest
 
-from orchestrator.services.knowledge_projection import (
-    build_datasource_note_content as _build_datasource_note_content,
-)
+from orchestrator.services.connector_drivers import builtin_connector_drivers
+from orchestrator.services.knowledge_projection import build_datasource_note_content
+
+_DRIVERS = builtin_connector_drivers()
+
+
+def _build_datasource_note_content(ds: dict) -> str:
+    return build_datasource_note_content(ds, drivers=_DRIVERS)
 
 
 def _note(ds_type: str, name: str, desc: str, row: dict | None = None) -> str:

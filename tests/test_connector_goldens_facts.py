@@ -303,6 +303,7 @@ async def test_kb_projection_note_matches_golden(case_id, golden):
         store=SimpleNamespace(acquire=lambda: _Acquire(conn)),
         logger=SimpleNamespace(warning=lambda *_args, **_kwargs: None),
         graph=SimpleNamespace(get=lambda: None),
+        connector_drivers=builtin_connector_drivers(),
     )
 
     await knowledge_projection.sync_datasource_knowledge(

@@ -15,12 +15,10 @@ of asking for the failure to be raised instead of swallowed.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any
 
 from orchestrator.services.connector_drivers import (
     ConnectorDriverRegistry,
-    builtin_connector_drivers,
 )
 from orchestrator.services.connector_drivers.knowledge_note import (
     bare_note,
@@ -69,9 +67,9 @@ class KnowledgeProjectionDependencies:
     store: Any
     logger: Any
     graph: KnowledgeGraphHandle
-    #: The drivers that write each connector's note (the built-in set when
-    #: none is given).
-    connector_drivers: ConnectorDriverRegistry | None = None
+    #: The drivers that write each connector's note: the application's
+    #: registry, never a module-level fallback.
+    connector_drivers: ConnectorDriverRegistry
 
 
 def get_knowledge_graph(*, dependencies: KnowledgeProjectionDependencies) -> Any | None:
@@ -79,13 +77,8 @@ def get_knowledge_graph(*, dependencies: KnowledgeProjectionDependencies) -> Any
     return dependencies.graph.get()
 
 
-@lru_cache(maxsize=1)
-def _builtin_drivers() -> ConnectorDriverRegistry:
-    return builtin_connector_drivers()
-
-
 def build_datasource_note_content(
-    ds: dict[str, Any], *, drivers: ConnectorDriverRegistry | None = None
+    ds: dict[str, Any], *, drivers: ConnectorDriverRegistry
 ) -> str:
     """Build markdown content for a connector knowledge entry.
 
@@ -95,15 +88,15 @@ def build_datasource_note_content(
     the tools its access level binds, from the driver's spec. A type no
     driver serves gets the bare note.
     """
-    driver = (drivers or _builtin_drivers()).for_type(ds.get("type"))
+    driver = drivers.for_type(ds.get("type"))
     return driver.knowledge_note(ds) if driver is not None else bare_note(ds)
 
 
 def datasource_retrieval_messages(
-    ds: dict[str, Any], *, drivers: ConnectorDriverRegistry | None = None
+    ds: dict[str, Any], *, drivers: ConnectorDriverRegistry
 ) -> list[str]:
     """The phrases a connector's knowledge entry is retrieved by."""
-    driver = (drivers or _builtin_drivers()).for_type(ds.get("type"))
+    driver = drivers.for_type(ds.get("type"))
     return (
         driver.retrieval_messages(ds) if driver is not None else connection_phrases(ds)
     )

@@ -50506,10 +50506,12 @@ class PostgresDB:
         values.append(uuid_val)
 
         query = f"UPDATE datasources SET {', '.join(updates)} WHERE id = ${param_count}"
-        # Keep this dependency set aligned with
-        # ``main._build_datasource_note_content``. Credential *values* never
-        # enter the note, but generic connectors expose their environment
-        # variable names. An explicit URL clear is content-changing too.
+        # Keep this dependency set aligned with what the connector's KB note
+        # reads: ``knowledge_projection.build_datasource_note_content``, which
+        # asks the connector's driver (``DatasourceDriver.knowledge_note``).
+        # Credential *values* never enter the note, but generic connectors
+        # expose their environment variable names. An explicit URL clear is
+        # content-changing too.
         note_content_changed = (
             connection_url is not None
             or connection_url_set
@@ -50853,9 +50855,12 @@ class PostgresDB:
                             list(removals),
                         )
 
-                # Keep this dependency set aligned with
-                # ``main._build_datasource_note_content``. Credential values
-                # stay secret; generic note content only exposes ENV names.
+                # Keep this dependency set aligned with what the connector's
+                # KB note reads: ``knowledge_projection.
+                # build_datasource_note_content``, which asks the connector's
+                # driver (``DatasourceDriver.knowledge_note``). Credential
+                # values stay secret; generic note content only exposes ENV
+                # names.
                 note_content_changed = (
                     connection_url is not None
                     or connection_url_set
