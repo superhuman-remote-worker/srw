@@ -1,6 +1,7 @@
--- migration:     0352_validate_datasource_manifest_identity.sql
--- description:   Validate the two constraints 0350 added NOT VALID.
--- depends-on:    0351_resource_platform_managed.sql
+-- migration:     0353_validate_datasource_manifest_identity.sql
+-- description:   Validate the CHECK 0350 and the foreign key 0351 added NOT
+--                VALID.
+-- depends-on:    0352_resource_platform_managed.sql
 -- expected:      < 30s. One scan of datasources per constraint under SHARE
 --                UPDATE EXCLUSIVE; reads and writes continue. Both columns
 --                arrive all-NULL from 0350, and the write-through stores only

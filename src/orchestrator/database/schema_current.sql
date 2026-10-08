@@ -26945,7 +26945,7 @@ COMMENT ON COLUMN public.datasources.policy_revision IS 'Optimistic concurrency 
 -- Name: COLUMN datasources.manifest_resource_id; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.datasources.manifest_resource_id IS 'The manifest Connector resource this row is written through to; its uid is the datasource id. NULL until the row is written through or backfilled, and for rows left on the legacy path.';
+COMMENT ON COLUMN public.datasources.manifest_resource_id IS 'The manifest Connector resource this row is written through to; its uid is the datasource id. NULL while the row stays on the legacy path (an ownerless row not linked to exactly one project, a legacy job clone, a type no driver serves); after its project was deleted it can name a retired resource.';
 
 
 --

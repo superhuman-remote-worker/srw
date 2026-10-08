@@ -1,9 +1,9 @@
--- migration:     0353_datasources_managed_key_idx.notx.sql
+-- migration:     0354_datasources_managed_key_idx.notx.sql
 -- description:   One row per platform identity: a managed key names at most
 --                one connector (the precedent is uq_experts_managed_key,
 --                0065). The write-through and the startup backfill stamp a
 --                key only when no other row holds it.
--- depends-on:    0352_validate_datasource_manifest_identity.sql
+-- depends-on:    0353_validate_datasource_manifest_identity.sql
 -- expected:      < 1s. datasources holds one row per configured connector and
 --                the partial predicate indexes only the platform-owned ones.
 -- locks:         SHARE UPDATE EXCLUSIVE on datasources; writes continue.

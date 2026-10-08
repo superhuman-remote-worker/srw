@@ -144,7 +144,7 @@ async def database(pg_url, monkeypatch):
         migration.with_name("0347_connector_credential_leases.sql").read_text()
     )
     await db.execute(
-        migration.with_name("0351_resource_platform_managed.sql").read_text()
+        migration.with_name("0352_resource_platform_managed.sql").read_text()
     )
     yield db
     await db.disconnect()
