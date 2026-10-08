@@ -6,7 +6,7 @@
 --                defaults.connectors writes and owns a 'manifest' row. The
 --                project's own knowledge base is never stored: it is the
 --                implied, platform-owned first entry.
--- depends-on:    0352_datasources_managed_key_idx.notx.sql
+-- depends-on:    0363_connector_service_pod_key_idx.notx.sql
 -- expected:      < 1s. Creates one empty table.
 -- locks:         SHARE ROW EXCLUSIVE on projects and users for the foreign keys (brief).
 -- transactional: yes
