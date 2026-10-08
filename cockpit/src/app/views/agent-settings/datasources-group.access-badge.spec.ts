@@ -32,7 +32,7 @@ function ds(id: string, type: string, readOnly: boolean, isGlobal = true): Datas
   };
 }
 
-function mount(rows: Datasource[], drivers: ConnectorDriver[] | null) {
+function mount(rows: Datasource[], drivers: ConnectorDriver[] | null, lite = false) {
   const service = {
     drivers: signal(drivers),
     load: vi.fn(),
@@ -52,6 +52,7 @@ function mount(rows: Datasource[], drivers: ConnectorDriver[] | null) {
   // Signal inputs cannot be set through setInput() in this pipeline; see
   // datasources-group.search.spec.ts.
   Object.defineProperty(fixture.componentInstance, 'datasources', {value: () => rows});
+  Object.defineProperty(fixture.componentInstance, 'isLiteBackend', {value: () => lite});
   fixture.detectChanges();
   return {fixture, service};
 }
@@ -89,5 +90,30 @@ describe('DatasourcesGroupComponent public access badge', () => {
     TestBed.resetTestingModule();
     const {service} = mount([ds('pg', 'postgresql', true, false)], null);
     expect(service.load).not.toHaveBeenCalled();
+  });
+});
+
+describe('DatasourcesGroupComponent lite tier from the matrix', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  it("holds back what the driver's backends leave out, and loads the matrix to know", () => {
+    const rows = [ds('env', 'generic', true, false), ds('pg', 'postgresql', true, false)];
+    const drivers = DRIVERS.map((driver) =>
+      driver.legacy_type === 'generic'
+        ? {...driver, supported_backends: ['none', 'sandbox', 'virtual', 'vm']}
+        : driver,
+    );
+    const {fixture, service} = mount(rows, drivers, true);
+    expect(service.load).toHaveBeenCalled();
+    const c = fixture.componentInstance;
+    expect(rows.map((row) => c.isLiteExcluded(row))).toEqual([false, false]);
+  });
+
+  it('keeps the built-in rule before the matrix loads', () => {
+    const rows = [ds('env', 'generic', true, false)];
+    const {fixture} = mount(rows, null, true);
+    expect(fixture.componentInstance.isLiteExcluded(rows[0])).toBe(true);
   });
 });

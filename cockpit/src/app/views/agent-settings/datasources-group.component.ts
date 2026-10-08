@@ -4,7 +4,11 @@ import {AppIconComponent} from '../../ui/icon';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {ApiService} from '../../core/services/api.service';
 import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
-import {publicReadWrite} from '../../core/models/connector-driver.model';
+import {
+  ConnectorDriver,
+  driverForType,
+  publicReadWrite,
+} from '../../core/models/connector-driver.model';
 import {
   Datasource,
   DatasourceIndexStatus,
@@ -25,12 +29,25 @@ export function isRepositoryDatasource(type: DatasourceType | string): boolean {
   return (type || '').toString().toLowerCase() === 'repository';
 }
 
-/** Connector types whose driver needs a shell workspace (its spec leaves the
- *  lite tiers out of `supported_backends`). A copy of the server's
- *  `workspace_tier_refuses` until the picker reads the driver specs (D2). */
+/** The workspace tiers without a shell, as the server's
+ *  `LITE_WORKSPACE_BACKENDS` names them. */
+const LITE_BACKENDS: readonly string[] = ['virtual', 'none'];
+
+/** The built-in drivers that need a shell workspace: a copy of the server's
+ *  `workspace_tier_refuses`, used only until the capability matrix loads. */
 const SHELL_WORKSPACE_TYPES = new Set(['repository', 'credentials', 'generic', 'ssh_key']);
 
-export function requiresShellWorkspace(type: DatasourceType | string): boolean {
+/** Whether a connector type needs a shell workspace: its driver's
+ *  `supported_backends` leaves a lite tier out. The picker knows only that the
+ *  backend is lite, not which tier, so a driver missing either one is held
+ *  back (the server refuses per tier). Before the matrix loads, or for a type
+ *  it does not list, the built-in copy decides. */
+export function requiresShellWorkspace(
+  type: DatasourceType | string,
+  drivers?: readonly ConnectorDriver[] | null,
+): boolean {
+  const driver = driverForType(drivers, (type || '').toString());
+  if (driver) return LITE_BACKENDS.some((tier) => !driver.supported_backends.includes(tier));
   return SHELL_WORKSPACE_TYPES.has((type || '').toString().toLowerCase());
 }
 
@@ -105,12 +122,13 @@ export function selectedDatasourceIds(
   isLiteBackend: boolean,
   defaultIds?: Set<string> | null,
   serverDefaultsEnabled = false,
+  drivers?: readonly ConnectorDriver[] | null,
 ): string[] {
   const active = activeDatasourceIds(
     datasources, selection, defaultIds, serverDefaultsEnabled,
   );
   return datasources
-    .filter(d => active.has(d.id) && !(isLiteBackend && requiresShellWorkspace(d.type)))
+    .filter(d => active.has(d.id) && !(isLiteBackend && requiresShellWorkspace(d.type, drivers)))
     .map(d => d.id);
 }
 
@@ -123,10 +141,11 @@ export function allDatasourcesSelected(
   defaultIds?: Set<string> | null,
   lockedIds?: string[],
   serverDefaultsEnabled = false,
+  drivers?: readonly ConnectorDriver[] | null,
 ): boolean {
   const locked = new Set(lockedIds ?? []);
   const selectable = datasources.filter(
-    d => !(isLiteBackend && requiresShellWorkspace(d.type)) && !locked.has(d.id),
+    d => !(isLiteBackend && requiresShellWorkspace(d.type, drivers)) && !locked.has(d.id),
   );
   if (selectable.length === 0) return false;
   const active = activeDatasourceIds(
@@ -572,10 +591,19 @@ export class DatasourcesGroupComponent {
         if (ds.type === 'kb') this.loadIndexStatus(ds.id);
       }
     });
-    // Only a public row's badge needs the matrix; read it once, when one shows.
+    // The matrix decides a public row's badge and, on a lite backend, which
+    // rows need a shell; read it once, when either shows.
     effect(() => {
-      if (this.datasources().some((ds) => ds.is_global)) this.connectorDrivers?.load();
+      const rows = this.datasources();
+      if (rows.some((ds) => ds.is_global) || (this.isLiteBackend() && rows.length > 0)) {
+        this.connectorDrivers?.load();
+      }
     });
+  }
+
+  /** The installed drivers, or null until the matrix loads. */
+  private drivers(): readonly ConnectorDriver[] | null {
+    return this.connectorDrivers?.drivers() ?? null;
   }
 
   /** A public row's badge: its declared flag, unless its driver offers one
@@ -601,7 +629,7 @@ export class DatasourcesGroupComponent {
   readonly selectedList = computed<Datasource[]>(() => {
     const ids = new Set(selectedDatasourceIds(
       this.datasources(), this.selection(), this.isLiteBackend(), this.defaultIds(),
-      this.datasourceDefaultsEnabled(),
+      this.datasourceDefaultsEnabled(), this.drivers(),
     ));
     return this.datasources().filter(d => ids.has(d.id));
   });
@@ -632,12 +660,13 @@ export class DatasourcesGroupComponent {
       this.defaultIds(),
       this.datasources().filter(ds => this.isLocked(ds)).map(ds => ds.id),
       this.datasourceDefaultsEnabled(),
+      this.drivers(),
     )
   );
 
-  /** Repositories and credentials require a shell-capable workspace. */
+  /** A driver that needs a shell is held back on a lite workspace. */
   isLiteExcluded(ds: Datasource): boolean {
-    return this.isLiteBackend() && requiresShellWorkspace(ds.type);
+    return this.isLiteBackend() && requiresShellWorkspace(ds.type, this.drivers());
   }
 
   /** Frozen at its current state — rendered, never toggleable. */
@@ -725,6 +754,7 @@ export class DatasourcesGroupComponent {
       this.isLiteBackend(),
       this.defaultIds(),
       this.datasourceDefaultsEnabled(),
+      this.drivers(),
     );
   }
 

@@ -10,6 +10,11 @@ import {
   DatasourcesGroupComponent,
 } from './datasources-group.component';
 import {DatasourceType, EligibleDatasource} from '../../core/models/api.model';
+import {ConnectorDriverMatrix} from '../../core/models/connector-driver.model';
+// The API's own capability matrix for the built-in drivers.
+import driversFixture from '../../core/models/fixtures/connector-drivers.json';
+
+const BUILTIN_DRIVERS = (driversFixture as unknown as ConnectorDriverMatrix).drivers;
 
 /**
  * Selection logic for the explicit-only datasource picker: server-computed
@@ -153,6 +158,34 @@ describe('datasources-group selection logic', () => {
       makeDs('pg', 'postgresql', true),
     ];
     expect(selectedDatasourceIds(ds, null, true, undefined, true)).toEqual(['pg']);
+  });
+
+  it('reads the matrix: a driver needs a shell when its backends leave a lite tier out', () => {
+    // The built-ins agree with the fallback copy, type by type.
+    for (const driver of BUILTIN_DRIVERS) {
+      if (!driver.legacy_type) continue;
+      expect(requiresShellWorkspace(driver.legacy_type, BUILTIN_DRIVERS)).toBe(
+        requiresShellWorkspace(driver.legacy_type),
+      );
+    }
+    // A driver that changes its backends is followed, both ways.
+    const shellGeneric = BUILTIN_DRIVERS.map((driver) =>
+      driver.legacy_type === 'generic'
+        ? {...driver, supported_backends: ['none', 'sandbox', 'virtual', 'vm']}
+        : driver.legacy_type === 'postgresql'
+          ? {...driver, supported_backends: ['sandbox', 'virtual', 'vm']}
+          : driver,
+    );
+    expect(requiresShellWorkspace('generic', shellGeneric)).toBe(false);
+    expect(requiresShellWorkspace('postgresql', shellGeneric)).toBe(true);
+    const ds = [makeDs('env', 'generic', true), makeDs('pg', 'postgresql', true)];
+    expect(selectedDatasourceIds(ds, null, true, undefined, true, shellGeneric)).toEqual(['env']);
+    expect(allDatasourcesSelected(ds, null, true, undefined, undefined, true, shellGeneric)).toBe(true);
+  });
+
+  it('keeps the fallback copy for a type the matrix does not list', () => {
+    expect(requiresShellWorkspace('repository', [])).toBe(true);
+    expect(requiresShellWorkspace('kb', null)).toBe(false);
   });
 });
 
