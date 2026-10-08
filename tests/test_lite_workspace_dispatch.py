@@ -234,9 +234,17 @@ class TestShellConnectorNames:
         ds = [{"type": "repository", "name": "r"}, {"type": "generic", "name": "g"}]
         assert job_datasource_selection_module.shell_connector_names(ds, backend) == []
 
-    def test_case_insensitive(self):
+    def test_types_match_exactly_backends_do_not(self):
+        # Stored types are the drivers' own lowercase ids, matched exactly
+        # like the driver registry does; a backend name is normalized.
+        assert (
+            job_datasource_selection_module.shell_connector_names(
+                [{"type": "Repository", "name": "r"}], "virtual"
+            )
+            == []
+        )
         assert job_datasource_selection_module.shell_connector_names(
-            [{"type": "Repository", "name": "r"}], "virtual"
+            [{"type": "repository", "name": "r"}], "VIRTUAL"
         ) == ["r"]
 
     def test_id_fallback_when_no_name(self):

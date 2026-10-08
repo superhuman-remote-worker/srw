@@ -256,9 +256,18 @@ class TestKnowledgeScope:
         get_datasource.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_kb_connector_opts_in_case_insensitively(self):
-        deps = _deps(get_datasource=AsyncMock(return_value={"type": "KB"}))
+    async def test_kb_connector_opts_in(self):
+        deps = _deps(get_datasource=AsyncMock(return_value={"type": "kb"}))
         assert await thread_has_knowledge_scope(
+            project_ids=[], datasource_ids=["d"], dependencies=deps
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_type_matches_exactly_like_the_driver_registry(self):
+        # Every write path stores the driver's own lowercase type; a type the
+        # registry would not serve gets no system key either.
+        deps = _deps(get_datasource=AsyncMock(return_value={"type": "KB"}))
+        assert not await thread_has_knowledge_scope(
             project_ids=[], datasource_ids=["d"], dependencies=deps
         )
 

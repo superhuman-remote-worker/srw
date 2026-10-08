@@ -678,13 +678,15 @@ def spec_for_row(row: Any) -> DriverSpec | None:
     """The built-in spec serving a stored connector row or payload entry.
 
     A row is anything with ``get`` (a dict, a database record).  Its
-    ``type`` is matched case-insensitively, as the type checks this replaces
-    did.  ``None`` for an unknown type or a value that is no row.
+    ``type`` is matched exactly, as ``ConnectorDriverRegistry.for_type``
+    matches it: every write path stores a driver's own lowercase type.
+    ``None`` for an unknown type or a value that is no row.
     """
     get = getattr(row, "get", None)
     if not callable(get):
         return None
-    return spec_for_type(str(get("type") or "").lower())
+    ds_type = get("type")
+    return spec_for_type(ds_type) if isinstance(ds_type, str) else None
 
 
 def delivers_in(row: Any, form: str) -> bool:

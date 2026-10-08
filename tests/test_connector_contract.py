@@ -250,7 +250,10 @@ class TestSpecQueries:
         ("row", "name"),
         [
             ({"type": "kb"}, "srw.kb/v1"),
-            ({"type": "Repository"}, "srw.repository/v1"),
+            ({"type": "repository"}, "srw.repository/v1"),
+            # Exact, like the driver registry.
+            ({"type": "Repository"}, None),
+            ({"type": 7}, None),
             (_Record(type="ssh_key"), "srw.ssh-key/v1"),
             ({"type": "ftp"}, None),
             ({}, None),
@@ -276,7 +279,7 @@ class TestSpecQueries:
             for spec in DATASOURCE_SPECS
             if needs_knowledge_profile({"type": spec.legacy_type})
         } == {"kb"}
-        assert needs_knowledge_profile({"type": "KB"})
+        assert not needs_knowledge_profile({"type": "KB"})
         assert not needs_knowledge_profile({"type": "ftp"})
 
     def test_the_behaviour_flags_name_the_types_they_replaced(self):

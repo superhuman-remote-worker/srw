@@ -140,7 +140,9 @@ async def test_every_driver_needing_a_shell_is_refused_on_a_lite_tier(backend, d
         ("credentials", "none", True),
         ("generic", "virtual", True),
         ("ssh_key", "none", True),
-        ("Repository", "VIRTUAL", True),
+        ("repository", "VIRTUAL", True),
+        # Types match exactly, like the driver registry.
+        ("Repository", "virtual", False),
         ("kb", "virtual", False),
         ("postgresql", "none", False),
         ("kubeconfig", "virtual", False),
