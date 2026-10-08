@@ -57,6 +57,7 @@ from orchestrator.services import (
 )
 from orchestrator.services.application_tasks import ApplicationTaskSet
 from orchestrator.services.cloud import instance_registry
+from orchestrator.services.cloud.reload import fire_reload
 from orchestrator.services.cloud_pricing import CloudCostEstimator
 from orchestrator.services.infrastructure_metering import bootstrap
 from orchestrator.services.persistent_recycler import PersistentThreadRecycler
@@ -324,33 +325,25 @@ async def bind_services(resources: ApplicationResources) -> None:
     await resources.keycloak_groups.ensure_initialized()
 
     # Adopt the exact durable backend installation before any main-cloud
-    # effect. The legacy system_settings row is read only as one-time input
-    # when 0186 has no active instance yet; afterward the immutable instance
-    # snapshot + singleton CAS pointer are the sole routing authority.
-    try:
-        _persisted_overlay = await resources.postgres_db.get_system_setting(
-            "main_cloud"
-        )
-    except Exception as _e:
-        logger.warning("Legacy main cloud overlay read failed at startup: %s", _e)
-        _persisted_overlay = None
+    # effect. The configuration is Helm's alone (main_cloud_as_connectors.md,
+    # "Configuration: Helm only"): the first boot adopts what Helm describes,
+    # later boots reconcile the active instance with it (instance_registry),
+    # and the immutable instance snapshot + singleton CAS pointer stay the
+    # sole routing authority. A legacy ``system_settings.main_cloud`` overlay
+    # row is ignored and removed: it was one-time input before 0186 and has
+    # been inert since.
     try:
         await instance_registry.initialize_main_cloud_instance_authority(
             resources.postgres_db,
             resources.main_cloud_router,
-            legacy_overlay=_persisted_overlay,
+            replace_installation=(
+                resources.settings.main_cloud_replace_installation or None
+            ),
+            notify=lambda instance_id: fire_reload(resources.postgres_db, instance_id),
         )
         await instance_registry.preload_retained_main_cloud_instances(
             resources.postgres_db, resources.main_cloud_router
         )
-        if _persisted_overlay is not None:
-            try:
-                await resources.postgres_db.delete_system_setting("main_cloud")
-            except Exception:
-                logger.warning(
-                    "Failed to remove inert legacy main_cloud setting",
-                    exc_info=True,
-                )
     except Exception as _e:
         # Main cloud is optional for the rest of the orchestrator, but an
         # unbound env adapter must never become a fallback routing authority.
@@ -361,12 +354,23 @@ async def bind_services(resources: ApplicationResources) -> None:
             _e,
         )
 
+    try:
+        if await resources.postgres_db.delete_system_setting("main_cloud"):
+            logger.warning(
+                "Removed an ignored legacy main_cloud settings row; the main "
+                "cloud is configured by Helm only"
+            )
+    except Exception:
+        logger.warning(
+            "Failed to remove inert legacy main_cloud setting", exc_info=True
+        )
+
     # Issue 5: warn loudly if the *active* backend's required secrets are not
     # present in the env — it is silently running on built-in DEV credentials
     # and will fail at the first cloud call. Non-fatal (graceful-degradation
     # convention + local/dev stacks legitimately set their own secrets), but no
-    # longer silent. The PUT/test endpoints refuse this at swap time; this
-    # catches a Helm-misconfigured deployment that booted straight into it.
+    # longer silent: this catches a Helm-misconfigured deployment that booted
+    # straight into it.
     try:
         from orchestrator.services.cloud.config import (
             missing_secret_envs,
@@ -374,7 +378,7 @@ async def bind_services(resources: ApplicationResources) -> None:
         )
 
         _active_id = resources.main_cloud_router.active.backend_id
-        _missing_secrets = missing_secret_envs(_active_id, _persisted_overlay)
+        _missing_secrets = missing_secret_envs(_active_id)
         warn_main_cloud_missing_secret_config(_missing_secrets, logger=logger)
     except Exception as _e:
         logger.debug("Main cloud secret presence check skipped at startup: %s", _e)

@@ -286,6 +286,11 @@ class DeploymentSettings:
     connector_service_exchange_host: str = ""
     connector_service_orchestrator_labels: dict[str, str] = field(default_factory=dict)
     connector_service_resources: dict[str, Any] = field(default_factory=dict)
+    #: The active main-cloud instance id an operator confirms Helm may
+    #: replace with a *different* installation (``cloud.replaceInstallation``).
+    #: Empty: Helm's description replaces only the same installation; see
+    #: ``services.cloud.instance_registry``.
+    main_cloud_replace_installation: str = ""
 
     def session_subagent_fanout(self, lane: str | None) -> bool:
         """Whether a session on ``lane`` may fan out right now."""
@@ -442,6 +447,9 @@ class DeploymentSettings:
                 "CONNECTOR_SERVICE_RESOURCES",
                 os.environ.get("CONNECTOR_SERVICE_RESOURCES"),
             ),
+            main_cloud_replace_installation=os.environ.get(
+                "MAIN_CLOUD_REPLACE_INSTALLATION", ""
+            ).strip(),
         )
 
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional, Protocol, runtime_checkable
 
+from orchestrator.services.cloud.capabilities import ProviderCapabilities
 from orchestrator.services.cloud.handles import (
     GroupId,
     ProjectFolderEntry,
@@ -121,6 +122,9 @@ class MainCloudBackend(Protocol):
     """
 
     backend_id: str
+    #: The provider support matrix this adapter declares (``capabilities.py``):
+    #: what code outside the adapters asks instead of naming a provider.
+    capabilities: ProviderCapabilities
 
     @property
     def backend_instance_id(self) -> Optional[str]:
@@ -360,6 +364,20 @@ class MainCloudBackend(Protocol):
         """Credentials the agent uses for WebDAV access, or ``{}`` if the
         backend does not speak WebDAV (e.g. Microsoft Graph).
         """
+        ...
+
+    def cloud_sync_config(
+        self, webdav_url: str, *, target_user_sub: Optional[str] = None
+    ) -> Optional[dict[str, Any]]:
+        """The agent's ``cloud_sync`` entry ``{backend, webdav_url, auth}`` for
+        one folder, or ``None`` when no credential resolves. ``target_user_sub``
+        names the owner of a user-home folder for providers that act as them.
+        """
+        ...
+
+    def legacy_folder_id(self, handle: ProjectFolderHandle) -> Optional[int]:
+        """The pre-abstraction ``projects.nextcloud_folder_id`` for ``handle``,
+        or ``None`` for a provider that never had one."""
         ...
 
 

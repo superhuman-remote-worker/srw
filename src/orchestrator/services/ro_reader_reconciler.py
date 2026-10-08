@@ -15,6 +15,7 @@ import logging
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from orchestrator.services.cloud import protected_provider
 from orchestrator.services.cloud.protected_effect_contract import (
     NextcloudEffectFenceIntent,
     NextcloudEffectHorizon,
@@ -34,18 +35,25 @@ logger = logging.getLogger(__name__)
 _LIVE_THREAD_STATUSES = {"created", "active", "awaiting_user", "suspended"}
 
 
-async def _resolve_backend_instance(*, postgres_db, router, instance_id: str):
-    """Resolve one retained installation without provider/active fallback."""
+async def _resolve_backend_instance(
+    *, postgres_db, router, instance_id: str, backend_id: object
+):
+    """Resolve one retained installation without provider/active fallback.
 
+    ``backend_id`` is the provider the protected record names; it must be one
+    that offers the protected level (fail closed otherwise).
+    """
+
+    expected_backend_id = protected_provider(backend_id)
     try:
         return router.for_backend_instance(
             instance_id,
-            expected_backend_id="nextcloud",
+            expected_backend_id=expected_backend_id,
         )
     except Exception:
         authority = await postgres_db.get_main_cloud_backend_instance(
             instance_id,
-            expected_backend_id="nextcloud",
+            expected_backend_id=expected_backend_id,
         )
         if authority is None:
             raise RuntimeError("protected reader backend installation is unavailable")
@@ -109,6 +117,7 @@ async def _close_abandoned_effect_intents(*, postgres_db, router) -> int:
                 postgres_db=postgres_db,
                 router=router,
                 instance_id=instance_id,
+                backend_id=row.get("backend_id"),
             )
             key = backend.protected_effect_hmac_key
             config_sha256 = str(row.get("config_sha256") or "")
@@ -194,6 +203,7 @@ async def reconcile_orphaned_ro_mounts(*, postgres_db, router) -> int:
                     postgres_db=postgres_db,
                     router=router,
                     instance_id=plan.backend_instance_id,
+                    backend_id=plan.backend,
                 )
                 if await revoke_ro_mount_attempt(
                     backend=backend,

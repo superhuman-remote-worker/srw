@@ -55,6 +55,7 @@ from shared.runtime.services.memory_prompts import (
     resolve_citation_verification_prompt,
     resolve_memory_extraction_prompt,
 )
+from agent.services.cloud_sync.protected_lower import is_protected_reader_transport
 from agent.tools import ToolContext, load_tools, apply_instruction_enforcement
 from agent.tools.context import SessionRuntimeFacts
 from agent.tools.description_manager import apply_description_overrides
@@ -1286,29 +1287,14 @@ class PersistentSession:
         lower = mounts[0]
         if not isinstance(lower, dict):
             return False
-        source = lower.get("source")
-        source_config = source.get("config") if isinstance(source, dict) else None
-        auth = lower.get("auth")
         return bool(
             isinstance(lower.get("mount_id"), str)
             and lower.get("mount_id")
             and lower.get("mount_kind") == "protected_lower"
-            and lower.get("backend") == "nextcloud"
             and lower.get("target_path") == "/cloud/lower"
             and lower.get("workspace_name") == "lower"
             and lower.get("access") == "read_only"
-            and isinstance(source, dict)
-            and source.get("type") == "webdav"
-            and isinstance(source_config, dict)
-            and source_config.get("vendor") == "nextcloud"
-            and isinstance(source_config.get("url"), str)
-            and source_config.get("url")
-            and isinstance(source_config.get("user"), str)
-            and source_config.get("user")
-            and isinstance(auth, dict)
-            and auth.get("type") == "basic"
-            and isinstance(auth.get("password"), str)
-            and auth.get("password")
+            and is_protected_reader_transport(lower)
         )
 
     def protected_cloud_ready(self) -> bool:
@@ -3894,7 +3880,9 @@ class PersistentSession:
             or self.shell_manager is None
             or not callable(getattr(backend_for_cleanup, "retire", None))
         ):
-            raise WorkspaceUnavailableError("VM local drain lacks a strict shell/backend")
+            raise WorkspaceUnavailableError(
+                "VM local drain lacks a strict shell/backend"
+            )
 
         # Belt for partial-attach and non-standard cleanup call sites. The
         # ordinary app teardown invokes this before its journal closes; this
@@ -4000,7 +3988,8 @@ class PersistentSession:
                         self.cloud_mount_manager = None
 
         if (
-            self.shell_manager and not preserve_shell
+            self.shell_manager
+            and not preserve_shell
             and not (vm_actuator_handoff and self.terminal_vm_shell_drained)
         ):
             try:

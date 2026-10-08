@@ -38,6 +38,7 @@ GET    /api/admin/grants                                                        
 DELETE /api/admin/grants/{scope_kind}/{scope_id}/{key}                                  pat=admin           admin:_require_admin
 PUT    /api/admin/grants/{scope_kind}/{scope_id}/{key}                                  pat=admin           admin:_require_admin
 GET    /api/admin/helm-managed                                                          pat=admin           admin:_require_admin
+GET    /api/admin/main-cloud                                                            pat=admin           admin:_require_admin
 GET    /api/admin/projects/{project_id}/officer/runtime-verification                    pat=admin           admin:_require_admin
 POST   /api/admin/projects/{project_id}/officer/runtime-verification                    pat=admin           admin:_require_admin
 POST   /api/admin/projects/{project_id}/officer/runtime-verification/{plan_id}/{action} pat=admin           admin:_require_admin

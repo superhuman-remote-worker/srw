@@ -1,0 +1,214 @@
+{
+  "provider": {
+    "backend_id": "nextcloud",
+    "title": "Nextcloud",
+    "public_url": "https://cloud.localhost",
+    "backend_instance_id": "4e72e665-1f70-4b69-9804-d981b51416e6",
+    "activation_revision": 1,
+    "activated_at": "2026-10-08T00:00:00+00:00",
+    "initialized": true
+  },
+  "health": {
+    "ok": true,
+    "latency_ms": 12.3,
+    "detail": "status=200"
+  },
+  "configuration": {
+    "source": "helm",
+    "helm": {
+      "state": "matches",
+      "backend_id": "nextcloud",
+      "detail": ""
+    },
+    "replace_installation": null
+  },
+  "matrix": {
+    "providers": [
+      {
+        "backend_id": "nextcloud",
+        "title": "Nextcloud",
+        "active": true
+      },
+      {
+        "backend_id": "opencloud",
+        "title": "OpenCloud",
+        "active": false
+      }
+    ],
+    "rows": [
+      {
+        "connector_type": "cloud_folder",
+        "folder_kind": "project",
+        "access": "read_only",
+        "cells": {
+          "nextcloud": {
+            "status": "planned",
+            "note": "a reader account granted read-only access to this one folder (the reader grant protected mode mints)",
+            "workspace_backends": [
+              "sandbox",
+              "vm"
+            ],
+            "slice": 5
+          },
+          "opencloud": {
+            "status": "unsupported",
+            "note": "the read-only reader code exists, but nothing calls it yet",
+            "workspace_backends": [],
+            "slice": null
+          }
+        }
+      },
+      {
+        "connector_type": "cloud_folder",
+        "folder_kind": "project",
+        "access": "read_write",
+        "cells": {
+          "nextcloud": {
+            "status": "offered",
+            "note": "the agent-service account, a member of the project's Group Folder (it can write every project folder until slice 7)",
+            "workspace_backends": [
+              "sandbox"
+            ],
+            "slice": null
+          },
+          "opencloud": {
+            "status": "offered",
+            "note": "the orchestrator's Keycloak service account, a member of the project Space; the workspace only holds short-lived tokens",
+            "workspace_backends": [
+              "sandbox"
+            ],
+            "slice": null
+          }
+        }
+      },
+      {
+        "connector_type": "cloud_folder",
+        "folder_kind": "project",
+        "access": "protected",
+        "cells": {
+          "nextcloud": {
+            "status": "offered",
+            "note": "the reader grant as a read-only lower layer; writes stay in an overlay until the owner approves them in review",
+            "workspace_backends": [
+              "sandbox"
+            ],
+            "slice": null
+          },
+          "opencloud": {
+            "status": "unsupported",
+            "note": "the protected review lane is built for Nextcloud only",
+            "workspace_backends": [],
+            "slice": null
+          }
+        }
+      },
+      {
+        "connector_type": "cloud_folder",
+        "folder_kind": "user_root",
+        "access": "read_write",
+        "cells": {
+          "nextcloud": {
+            "status": "planned",
+            "note": "a per-user app token for the user's own files",
+            "workspace_backends": [
+              "sandbox"
+            ],
+            "slice": 4
+          },
+          "opencloud": {
+            "status": "unsupported",
+            "note": "works today only through deprecated Keycloak impersonation, so it is not offered",
+            "workspace_backends": [],
+            "slice": null
+          }
+        }
+      },
+      {
+        "connector_type": "cloud_folder",
+        "folder_kind": "user_root",
+        "access": "read_only",
+        "cells": {
+          "nextcloud": {
+            "status": "unsupported",
+            "note": "an app token cannot be restricted to read-only or to one path",
+            "workspace_backends": [],
+            "slice": null
+          },
+          "opencloud": {
+            "status": "unsupported",
+            "note": "no per-user read-only credential exists",
+            "workspace_backends": [],
+            "slice": null
+          }
+        }
+      },
+      {
+        "connector_type": "cloud_folder",
+        "folder_kind": "user_root",
+        "access": "protected",
+        "cells": {
+          "nextcloud": {
+            "status": "unsupported",
+            "note": "an app token cannot be restricted to read-only or to one path",
+            "workspace_backends": [],
+            "slice": null
+          },
+          "opencloud": {
+            "status": "unsupported",
+            "note": "no per-user read-only credential exists",
+            "workspace_backends": [],
+            "slice": null
+          }
+        }
+      },
+      {
+        "connector_type": "cloud_folder_checkout",
+        "folder_kind": "project",
+        "access": "reviewed_write_back",
+        "cells": {
+          "nextcloud": {
+            "status": "offered",
+            "note": "the folder is copied into the job's repository; changes are written back only when the reviewer accepts the diff",
+            "workspace_backends": [
+              "sandbox",
+              "vm"
+            ],
+            "slice": null
+          },
+          "opencloud": {
+            "status": "offered",
+            "note": "the folder is copied into the job's repository; changes are written back only when the reviewer accepts the diff",
+            "workspace_backends": [
+              "sandbox",
+              "vm"
+            ],
+            "slice": null
+          }
+        }
+      },
+      {
+        "connector_type": "cloud_outbox",
+        "folder_kind": null,
+        "access": "read_write",
+        "cells": {
+          "nextcloud": {
+            "status": "offered",
+            "note": "a folder created for the execution and shared with its owner",
+            "workspace_backends": [
+              "sandbox"
+            ],
+            "slice": null
+          },
+          "opencloud": {
+            "status": "offered",
+            "note": "a folder created for the execution and shared with its owner",
+            "workspace_backends": [
+              "sandbox"
+            ],
+            "slice": null
+          }
+        }
+      }
+    ]
+  }
+}

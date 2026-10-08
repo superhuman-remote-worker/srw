@@ -266,12 +266,7 @@ async def ensure_project_cloud_resources(
                         project_name=project_name,
                         group_id=group_name,
                     )
-                    legacy_id: int | None = None
-                    if backend.backend_id == "nextcloud":
-                        try:
-                            legacy_id = int(folder_handle.native_id)
-                        except ValueError:
-                            legacy_id = None
+                    legacy_id = backend.legacy_folder_id(folder_handle)
                     await store.update_project(
                         project_id_str,
                         main_cloud_backend=backend.backend_id,

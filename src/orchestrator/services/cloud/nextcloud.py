@@ -51,6 +51,10 @@ from orchestrator.services.cloud.base import (
 from orchestrator.services.cloud.backend_instance_authority import (
     main_cloud_installation_proof_sha256,
 )
+from orchestrator.services.cloud.capabilities import (
+    CloudCapability,
+    ProviderCapabilities,
+)
 from orchestrator.services.cloud.config import NextcloudSettings
 from orchestrator.services.cloud.etag_baseline import (
     PropfindError,
@@ -96,6 +100,89 @@ _PROTECTED_EFFECT_AUTHORITY_HEADER = "X-SRW-Protected-Effect-Authority"
 _PROTECTED_EFFECT_SIGNATURE_HEADER = "X-SRW-Protected-Effect-Signature"
 _PROTECTED_EFFECT_INSTANCE_HEADER = "X-SRW-Backend-Instance"
 
+_UNRESTRICTABLE_APP_TOKEN = (
+    "an app token cannot be restricted to read-only or to one path"
+)
+
+#: What Nextcloud delivers (main_cloud_as_connectors.md, "Provider support
+#: matrix"). The workspace tier narrows it: rclone mounts the VM tier only
+#: with a read-only flag on a write-capable credential, which enforces
+#: nothing, so no VM row is offered until the reader grant reaches it.
+NEXTCLOUD_CAPABILITIES = ProviderCapabilities(
+    backend_id=BACKEND_ID,
+    title="Nextcloud",
+    capabilities=(
+        CloudCapability(
+            "cloud_folder",
+            "project",
+            "read_only",
+            "planned",
+            "a reader account granted read-only access to this one folder "
+            "(the reader grant protected mode mints)",
+            frozenset({"sandbox", "vm"}),
+            slice=5,
+        ),
+        CloudCapability(
+            "cloud_folder",
+            "project",
+            "read_write",
+            "offered",
+            "the agent-service account, a member of the project's Group "
+            "Folder (it can write every project folder until slice 7)",
+            frozenset({"sandbox"}),
+        ),
+        CloudCapability(
+            "cloud_folder",
+            "project",
+            "protected",
+            "offered",
+            "the reader grant as a read-only lower layer; writes stay in an "
+            "overlay until the owner approves them in review",
+            frozenset({"sandbox"}),
+        ),
+        CloudCapability(
+            "cloud_folder",
+            "user_root",
+            "read_write",
+            "planned",
+            "a per-user app token for the user's own files",
+            frozenset({"sandbox"}),
+            slice=4,
+        ),
+        CloudCapability(
+            "cloud_folder",
+            "user_root",
+            "read_only",
+            "unsupported",
+            _UNRESTRICTABLE_APP_TOKEN,
+        ),
+        CloudCapability(
+            "cloud_folder",
+            "user_root",
+            "protected",
+            "unsupported",
+            _UNRESTRICTABLE_APP_TOKEN,
+        ),
+        CloudCapability(
+            "cloud_folder_checkout",
+            "project",
+            "reviewed_write_back",
+            "offered",
+            "the folder is copied into the job's repository; changes are "
+            "written back only when the reviewer accepts the diff",
+            frozenset({"sandbox", "vm"}),
+        ),
+        CloudCapability(
+            "cloud_outbox",
+            None,
+            "read_write",
+            "offered",
+            "a folder created for the execution and shared with its owner",
+            frozenset({"sandbox"}),
+        ),
+    ),
+)
+
 
 class NextcloudBackend:
     """Main-cloud backend for Nextcloud.
@@ -110,6 +197,7 @@ class NextcloudBackend:
     """
 
     backend_id = BACKEND_ID
+    capabilities = NEXTCLOUD_CAPABILITIES
 
     def __init__(self, settings: NextcloudSettings) -> None:
         # Phase 1.5 parity with OpenCloudBackend (Issue 12): consume a
@@ -337,6 +425,58 @@ class NextcloudBackend:
     def webdav_credentials(self) -> dict[str, str]:
         """Agent credentials for WebDAV access to Nextcloud folders."""
         return {"username": self._agent_user, "password": self._agent_password}
+
+    def cloud_sync_config(
+        self, webdav_url: str, *, target_user_sub: Optional[str] = None
+    ) -> Optional[dict[str, Any]]:
+        """The agent's ``cloud_sync`` entry for one folder: basic auth as the
+        agent-service account, or ``None`` without its credentials.
+
+        Nextcloud has no token exchange, so ``target_user_sub`` changes
+        nothing. Never logs the auth payload.
+        """
+        creds = self.webdav_credentials or {}
+        if not creds.get("username") or not creds.get("password"):
+            return None
+        return {
+            "backend": self.backend_id,
+            "webdav_url": webdav_url,
+            "auth": {
+                "type": "basic",
+                "username": creds["username"],
+                "password": creds["password"],
+            },
+        }
+
+    @staticmethod
+    def legacy_folder_id(handle: ProjectFolderHandle) -> Optional[int]:
+        """The pre-abstraction ``projects.nextcloud_folder_id``: the Group
+        Folder id, while that column is still written."""
+        try:
+            return int(handle.native_id)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def protected_lower_transport(row: dict[str, Any]) -> dict[str, Any]:
+        """The provider half of a protected mount's read-only lower layer.
+
+        Built from an active ``cloud_ro_mounts`` reader grant: rclone WebDAV
+        as the per-mount reader account, never the agent-service account.
+        The caller adds the overlay layout and the cache settings.
+        """
+        return {
+            "backend": BACKEND_ID,
+            "source": {
+                "type": "webdav",
+                "config": {
+                    "url": row["webdav_url"],
+                    "vendor": BACKEND_ID,
+                    "user": row["reader_id"],
+                },
+            },
+            "auth": {"type": "basic", "password": row["credentials"]},
+        }
 
     def _explicit_user_home_credentials(
         self, handle: ProjectFolderHandle, subject: CloudMountSubject | None

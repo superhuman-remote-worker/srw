@@ -389,7 +389,7 @@ class PinnedRetirementOperations:
         if not (
             str(captured_ro.get("runtime_generation") or "")
             == str(retirement.get("generation") or "")
-            and captured_ro.get("backend") == "nextcloud"
+            and captured_ro.get("backend") == captured_plan.backend
             and str(captured_ro.get("user_id") or "")
             == str(context.get("user_id") or "")
             and str(captured_ro.get("thread_id") or "")

@@ -466,11 +466,20 @@ def test_cloud_sync_is_none_when_nothing_resolves():
 
 
 def test_cloud_sync_emits_v2_with_basic_auth_for_nextcloud():
-    backend = SimpleNamespace(
-        is_initialized=True,
-        backend_id="nextcloud",
-        webdav_credentials={"username": "agent", "password": "pw"},
+    """The adapter builds the entry (``cloud_sync_config``), not this module."""
+    from orchestrator.services.cloud import NextcloudBackend, NextcloudSettings
+
+    backend = NextcloudBackend(
+        NextcloudSettings(
+            base_url="http://nc.internal",
+            public_url="https://nc",
+            admin_user="admin",
+            admin_password="admin-pw",
+            agent_user="agent",
+            agent_password="pw",
+        )
     )
+    backend._initialized = True
     router = SimpleNamespace(
         for_thread_optional=lambda _t: None,
         for_backend_instance=lambda _id, *, expected_backend_id: backend,

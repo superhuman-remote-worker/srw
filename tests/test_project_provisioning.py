@@ -406,6 +406,7 @@ def _folder_backend() -> SimpleNamespace:
         backend_instance_id=str(uuid4()),
         ensure_group=AsyncMock(),
         ensure_project_folder=AsyncMock(side_effect=ensure_project_folder),
+        legacy_folder_id=lambda _handle: None,
     )
 
 

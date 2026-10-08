@@ -1,18 +1,18 @@
-"""HTTP adapters for the admin "Cloud Storage" panel.
+"""HTTP adapters for the admin "Main cloud" page and its operator operations.
 
-Seven routes on ``/api/admin/system-settings/main_cloud``. Every one of them
-awaits the admin gate first — before the body is inspected, before any
-validation refusal — so a non-admin can never learn which backend ids the
-deployment accepts or whether a secret env var is wired.
+The main cloud is configured by Helm only (main_cloud_as_connectors.md,
+slice 2). ``GET /api/admin/main-cloud`` reports the provider, its installation,
+its health, where the configuration comes from and the provider support
+matrix; nothing here changes the configuration.
 
-Only two routes need the admin's identity beyond the gate (PUT and DELETE
-record an actor on the activation), so those two pass it down; the rest
-discard it exactly as ``main`` did.
+The removed connection-form API answers **410 Gone** rather than 404: a
+cached cockpit or a script still calling it learns that the endpoint was
+retired on purpose and where the configuration lives now. The one-shot
+instance-authority backfill and thread-mount transport repair stay as
+operator operations until their work is done.
 
-Route order is part of the contract: the literal ``/test``, ``/reload``,
-``/backfill-instance-authority`` and ``/repair-thread-mounts`` sub-paths are
-POSTs on a base path whose only other verbs are GET/PUT/DELETE, so nothing
-here shadows anything.
+Every route awaits the admin gate first — before any body is inspected — so a
+non-admin learns nothing, not even that an endpoint was retired.
 """
 
 from __future__ import annotations
@@ -21,11 +21,17 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from orchestrator.services import main_cloud_settings
 
 router = APIRouter()
+
+#: The 410 body of the retired connection-form API.
+RETIRED_DETAIL = (
+    "The main cloud is configured by Helm only; this endpoint was removed. "
+    "GET /api/admin/main-cloud shows the active configuration."
+)
 
 
 @dataclass(frozen=True)
@@ -48,20 +54,28 @@ def get_main_cloud_settings_dependencies(
     return request.app.state.main_cloud_settings_dependencies_factory()
 
 
-# =============================================================================
-# System Settings — Main Cloud (Phase 4, Admin-only)
-# =============================================================================
-# These endpoints drive the cockpit admin "Cloud Storage" panel. GETs
-# return the current immutable instance snapshot with secrets stripped, PUT
-# remotely attests and CAS-activates a new instance, and POST /test does a
-# dry-run connection check without persisting.
-#
-# Secret handling: non-secret fields (URLs, usernames, quota) are stored
-# in the `value` JSONB column. Secret fields (passwords, client secrets)
-# are referenced via `credentials_ref` — a pointer like
-# `env:OPENCLOUD_KEYCLOAK_CLIENT_SECRET` that the loader resolves against
-# the orchestrator's own environment. This keeps secrets in Vault/ESO/.env
-# and lets the UI manage only the non-secret knobs.
+@router.get("/api/admin/main-cloud")
+async def get_main_cloud_page(
+    request: Request,
+    *,
+    dependencies: MainCloudSettingsRouteDependencies = Depends(
+        get_main_cloud_settings_dependencies
+    ),
+) -> dict[str, Any]:
+    """The read-only Main cloud page: provider, installation, health, the
+    configuration's source and the provider support matrix. Admin-only; holds
+    no secret."""
+    await dependencies.require_admin(request)
+    return await main_cloud_settings.get_main_cloud_page(
+        dependencies=dependencies.operations
+    )
+
+
+async def _retired(
+    request: Request, dependencies: MainCloudSettingsRouteDependencies
+) -> None:
+    await dependencies.require_admin(request)
+    raise HTTPException(status_code=410, detail=RETIRED_DETAIL)
 
 
 @router.get("/api/admin/system-settings/main_cloud")
@@ -71,67 +85,45 @@ async def get_main_cloud_settings(
     dependencies: MainCloudSettingsRouteDependencies = Depends(
         get_main_cloud_settings_dependencies
     ),
-) -> dict[str, Any]:
-    """Return the current effective main-cloud config + persisted overlay.
-
-    Admin-only. The response is safe to log: every secret field is
-    replaced with its env-var provenance (name + set/unset flag + length).
-    """
-    await dependencies.require_admin(request)
-    return await main_cloud_settings.get_main_cloud_settings(
-        dependencies=dependencies.operations
-    )
+) -> None:
+    """Retired: the connection form's read (410)."""
+    await _retired(request, dependencies)
 
 
 @router.put("/api/admin/system-settings/main_cloud")
 async def put_main_cloud_settings(
-    body: dict[str, Any],
     request: Request,
     *,
     dependencies: MainCloudSettingsRouteDependencies = Depends(
         get_main_cloud_settings_dependencies
     ),
-) -> dict[str, Any]:
-    """Attest and CAS-activate a new main-cloud backend instance.
+) -> None:
+    """Retired: the connection form's save (410)."""
+    await _retired(request, dependencies)
 
-    Admin-only. The request body is ``{"value": {...}, "credentials_ref": "env:..."}``:
 
-    * ``value.backend_id`` must be one of ``allowed_backends``.
-    * Secret fields in ``value`` are silently dropped by the sanitizer —
-      never persist secrets in the DB. Rotate via the secret store.
-    * ``credentials_ref`` is an optional pointer (e.g. ``env:NEW_VAR``)
-      that the loader resolves for secret fields at read time.
-    * ``expected_activation_revision`` must match the GET snapshot.
-    * Routing edits create a new immutable instance UUID. Secret-reference
-      edits rotate only the exact same proven installation.
-    * Other replicas resolve the durable pointer via the pg_notify LISTEN task.
-    """
-    admin = await dependencies.require_admin(request)
-    return await main_cloud_settings.put_main_cloud_settings(
-        body=body, admin=admin, dependencies=dependencies.operations
-    )
+@router.delete("/api/admin/system-settings/main_cloud")
+async def delete_main_cloud_settings(
+    request: Request,
+    *,
+    dependencies: MainCloudSettingsRouteDependencies = Depends(
+        get_main_cloud_settings_dependencies
+    ),
+) -> None:
+    """Retired: the connection form's reset to env (410). Startup applies Helm."""
+    await _retired(request, dependencies)
 
 
 @router.post("/api/admin/system-settings/main_cloud/test")
 async def test_main_cloud_settings(
-    body: dict[str, Any],
     request: Request,
     *,
     dependencies: MainCloudSettingsRouteDependencies = Depends(
         get_main_cloud_settings_dependencies
     ),
-) -> dict[str, Any]:
-    """Dry-run a proposed main-cloud config without persisting.
-
-    Builds a backend from the proposed overlay, calls
-    ``ensure_initialized()``, and tears it down. Returns whether the
-    probe succeeded plus a short detail string. Useful for "Test"
-    buttons in the admin UI before the operator commits to saving.
-    """
-    await dependencies.require_admin(request)
-    return await main_cloud_settings.test_main_cloud_settings(
-        body=body, dependencies=dependencies.operations
-    )
+) -> None:
+    """Retired: the connection form's dry run (410)."""
+    await _retired(request, dependencies)
 
 
 @router.post("/api/admin/system-settings/main_cloud/reload")
@@ -141,18 +133,10 @@ async def reload_main_cloud_settings(
     dependencies: MainCloudSettingsRouteDependencies = Depends(
         get_main_cloud_settings_dependencies
     ),
-) -> dict[str, Any]:
-    """Force a local re-attestation of the durable active instance.
-
-    Admin-only. Useful when an operator has rotated a secret out-of-band
-    (new Keycloak client secret in .env) and wants this orchestrator
-    replica to rebuild its client after an out-of-band secret-value update.
-    The immutable secret reference and installation proof remain unchanged.
-    """
-    await dependencies.require_admin(request)
-    return await main_cloud_settings.reload_main_cloud_settings(
-        dependencies=dependencies.operations
-    )
+) -> None:
+    """Retired: the forced local re-attestation (410). A secret rotation
+    reaches the orchestrator with its restart."""
+    await _retired(request, dependencies)
 
 
 @router.post("/api/admin/system-settings/main_cloud/backfill-instance-authority")
@@ -226,23 +210,4 @@ async def repair_thread_mount_transport(
     await dependencies.require_admin(request)
     return await main_cloud_settings.repair_thread_mount_transport(
         apply=apply, dependencies=dependencies.operations
-    )
-
-
-@router.delete("/api/admin/system-settings/main_cloud")
-async def delete_main_cloud_settings(
-    request: Request,
-    *,
-    dependencies: MainCloudSettingsRouteDependencies = Depends(
-        get_main_cloud_settings_dependencies
-    ),
-) -> dict[str, Any]:
-    """Attest and activate the current env-described installation.
-
-    History is retained; reset never deletes an instance referenced by an
-    existing project, session, grant, or staged review.
-    """
-    admin = await dependencies.require_admin(request)
-    return await main_cloud_settings.delete_main_cloud_settings(
-        admin=admin, dependencies=dependencies.operations
     )

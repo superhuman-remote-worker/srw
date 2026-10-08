@@ -25,6 +25,7 @@ from agent.api.session_identity import (
     canonical_runtime_generation,
     pinned_runtime_generation_advertised,
 )
+from agent.services.cloud_sync.protected_lower import is_protected_reader_transport
 from shared.session_subagent_batch import (
     SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
     SESSION_SUBAGENT_FANOUT_KEY,
@@ -98,28 +99,13 @@ def validate_protected_cloud_mount(payload: Any) -> Dict[str, Any]:
             "protected-cloud payload must contain exactly one protected lower"
         )
     lower = lowers[0]
-    source = lower.get("source")
-    source_config = source.get("config") if isinstance(source, dict) else None
-    auth = lower.get("auth")
     if (
         not isinstance(lower.get("mount_id"), str)
         or not lower.get("mount_id")
-        or lower.get("backend") != "nextcloud"
         or lower.get("target_path") != "/cloud/lower"
         or lower.get("workspace_name") != "lower"
         or lower.get("access") != "read_only"
-        or not isinstance(source, dict)
-        or source.get("type") != "webdav"
-        or not isinstance(source_config, dict)
-        or source_config.get("vendor") != "nextcloud"
-        or not isinstance(source_config.get("url"), str)
-        or not source_config.get("url")
-        or not isinstance(source_config.get("user"), str)
-        or not source_config.get("user")
-        or not isinstance(auth, dict)
-        or auth.get("type") != "basic"
-        or not isinstance(auth.get("password"), str)
-        or not auth.get("password")
+        or not is_protected_reader_transport(lower)
     ):
         raise ProtectedCloudUnavailable("protected-cloud lower mount is malformed")
     return payload

@@ -225,35 +225,27 @@ def test_a_crashing_probe_gate_is_a_500_without_the_exception_text():
 
 
 # =============================================================================
-# POST /api/admin/system-settings/main_cloud/test — two probe failures, 200
+# GET /api/admin/main-cloud — a failing health probe, 200
 # =============================================================================
 
-MAIN_CLOUD = "/api/admin/system-settings/main_cloud"
+MAIN_CLOUD_PAGE = "/api/admin/main-cloud"
 
 
-def _main_cloud_client(monkeypatch, *, build=None, ensure=None):
+def _main_cloud_client(health_check):
     from orchestrator.routers import main_cloud_settings as route_module
     from orchestrator.services import main_cloud_settings as ops
-    from orchestrator.services.cloud import config as cloud_config
-
-    monkeypatch.setattr(cloud_config, "missing_secret_envs", lambda *_a, **_k: [])
-    if build is not None:
-        monkeypatch.setattr(ops, "build_backend", build)
-    else:
-        probe = SimpleNamespace(
-            ensure_initialized=ensure,
-            health_check=AsyncMock(),
-            close=AsyncMock(),
-        )
-        monkeypatch.setattr(ops, "build_backend", lambda **_k: probe)
 
     async def require_admin(_request):
         return {"id": "admin-1"}
 
+    active = SimpleNamespace(
+        backend_id="nextcloud", is_initialized=True, health_check=health_check
+    )
     operations = ops.MainCloudSettingsDependencies(
-        store=SimpleNamespace(delete_system_setting=AsyncMock(return_value=None)),
-        cloud_router=SimpleNamespace(active=None, active_instance_id=None),
-        rebind_cloud_router=lambda _backend: None,
+        store=SimpleNamespace(
+            get_active_main_cloud_backend_instance=AsyncMock(return_value=None)
+        ),
+        cloud_router=SimpleNamespace(active=active),
         thread_mount_dependencies=lambda: None,
     )
     dependencies = route_module.MainCloudSettingsRouteDependencies(
@@ -267,47 +259,30 @@ def _main_cloud_client(monkeypatch, *, build=None, ensure=None):
     return TestClient(app, raise_server_exceptions=False)
 
 
-def _main_cloud_body() -> dict:
-    return {
-        "value": {"backend_id": "opencloud", "base_url": "https://cloud.example"},
-        "credentials_ref": "env:OC_CLIENT_SECRET",
-        "expected_activation_revision": 0,
-    }
+def test_a_raising_health_probe_is_reported_without_the_exception_text():
+    client = _main_cloud_client(AsyncMock(side_effect=RuntimeError(BOOM)))
 
-
-def test_a_failing_backend_build_keeps_its_reason_without_the_exception_text(
-    monkeypatch,
-):
-    def build(**_kwargs):
-        raise RuntimeError(BOOM)
-
-    client = _main_cloud_client(monkeypatch, build=build)
-
-    response = client.post(f"{MAIN_CLOUD}/test", json=_main_cloud_body())
+    response = client.get(MAIN_CLOUD_PAGE)
 
     assert response.status_code == 200
     body = response.json()
-    assert body["ok"] is False
-    assert body["detail"] == "build_backend failed"
+    assert body["health"] == {"ok": False, "latency_ms": None, "detail": "unreachable"}
     assert_no_leak(body)
-    error_ref_of(body)
 
 
-def test_a_failing_backend_init_keeps_its_reason_without_the_exception_text(
-    monkeypatch,
-):
+def test_an_upstream_error_text_in_the_health_detail_is_not_echoed():
+    from orchestrator.services.cloud import HealthStatus
+
     client = _main_cloud_client(
-        monkeypatch, ensure=AsyncMock(side_effect=RuntimeError(BOOM))
+        AsyncMock(return_value=HealthStatus(ok=False, latency_ms=0.0, detail=BOOM))
     )
 
-    response = client.post(f"{MAIN_CLOUD}/test", json=_main_cloud_body())
+    response = client.get(MAIN_CLOUD_PAGE)
 
     assert response.status_code == 200
     body = response.json()
-    assert body["ok"] is False
-    assert body["detail"] == "ensure_initialized raised"
+    assert body["health"]["detail"] == "unreachable"
     assert_no_leak(body)
-    error_ref_of(body)
 
 
 # =============================================================================

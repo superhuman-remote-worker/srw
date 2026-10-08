@@ -9212,7 +9212,7 @@ class PostgresDB:
                         == str(parsed_attempt)
                         and str(existing.get("backend_instance_id") or "")
                         == str(parsed_instance)
-                        and existing.get("backend") == "nextcloud"
+                        and existing.get("backend") == plan.backend
                         and existing.get("reader_id") == plan.reader_id
                         and existing.get("grant_group_id") == plan.group_id
                         and existing.get("grant_handle") == plan.grant_handle
@@ -9591,7 +9591,7 @@ class PostgresDB:
         )
         return bool(
             source == plan.source
-            and row.get("backend") == "nextcloud"
+            and row.get("backend") == plan.backend
             and str(row.get("backend_instance_id") or "") == plan.backend_instance_id
             and str(row.get("engage_attempt") or "") == plan.engage_attempt
             and row.get("reader_id") == plan.reader_id
@@ -10950,7 +10950,7 @@ class PostgresDB:
                         captured_mount
                         and captured_attempt
                         and captured_generation == str(parsed_generation)
-                        and captured_ro.get("backend") == "nextcloud"
+                        and captured_ro.get("backend") == captured_plan.backend
                         and str(captured_ro.get("thread_id") or "")
                         == str(parsed_thread)
                         and str(captured_ro.get("user_id") or "")

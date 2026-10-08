@@ -31,11 +31,14 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from orchestrator.services.cloud import (
+    PROTECTED_PROJECT_FOLDER,
     CloudBackendError,
     CloudMountSubject,
     ProjectFolderHandle,
     SessionFolderHandle,
     SupportsRcloneMount,
+    provider_adapter,
+    provider_offers,
 )
 from orchestrator.services.sandbox_workspace_settings import container_denies_fuse
 from orchestrator.services.session_runtime_admission import (
@@ -138,52 +141,12 @@ def _backend_cloud_cfg(
     expected payload. Returns ``None`` when credentials aren't resolvable.
     Never logs the auth payload.
 
-    When ``target_user_sub`` is set (Phase 2 user-home mount, only on
-    OpenCloud), the auth shape becomes ``keycloak_user_impersonation``: the
-    agent first fetches its service-account token via client_credentials,
-    then exchanges it for a user-scoped token impersonating the target
-    user (their Keycloak ``sub``) via RFC 8693 token-exchange. The exchanged
-    token is what authenticates WebDAV calls — required because OpenCloud
-    Personal Spaces are owned by exactly one user and the service account
-    has no WebDAV access of its own to them.
+    The provider's adapter builds it (``cloud_sync_config``): which credential
+    authenticates WebDAV is the adapter's business. ``target_user_sub`` names
+    the owner of a user-home folder (Phase 2), for a provider that acts as
+    that user.
     """
-    if backend.backend_id == "nextcloud":
-        creds = backend.webdav_credentials or {}
-        if not creds.get("username") or not creds.get("password"):
-            return None
-        return {
-            "backend": "nextcloud",
-            "webdav_url": webdav_url,
-            "auth": {
-                "type": "basic",
-                "username": creds["username"],
-                "password": creds["password"],
-            },
-        }
-    if backend.backend_id == "opencloud":
-        settings = getattr(backend, "_settings", None)
-        if settings is None:
-            return None
-        try:
-            client_secret = settings.keycloak_client_secret.get_secret_value()
-        except Exception:
-            return None
-        auth: dict[str, Any] = {
-            "issuer": str(settings.keycloak_issuer).rstrip("/"),
-            "client_id": settings.keycloak_client_id,
-            "client_secret": client_secret,
-        }
-        if target_user_sub:
-            auth["type"] = "keycloak_user_impersonation"
-            auth["target_user_sub"] = target_user_sub
-        else:
-            auth["type"] = "keycloak_client_credentials"
-        return {
-            "backend": "opencloud",
-            "webdav_url": webdav_url,
-            "auth": auth,
-        }
-    return None
+    return backend.cloud_sync_config(webdav_url, target_user_sub=target_user_sub)
 
 
 def _build_agent_cloud_sync(
@@ -503,11 +466,17 @@ def _build_protected_cloud_mount(
     row: dict[str, Any], *, thread_id: str
 ) -> Optional[dict[str, Any]]:
     """Build the RO-lower + capture-overlay cloud_mount payload from an active
-    ``cloud_ro_mounts`` row (design §3.1). Nextcloud-only, read-only lower using
-    the per-mount READER credential — never agent-service. Returns None when the
-    row is not an active Nextcloud grant."""
-    if not row or row.get("status") != "active" or row.get("backend") != "nextcloud":
+    ``cloud_ro_mounts`` row (design §3.1). The read-only lower uses the
+    per-mount READER credential — never agent-service — and its transport is
+    the provider adapter's. Returns None unless the row is an active grant of
+    a provider that offers the protected level."""
+    if (
+        not row
+        or row.get("status") != "active"
+        or not provider_offers(row.get("backend"), PROTECTED_PROJECT_FOLDER)
+    ):
         return None
+    lower_transport = provider_adapter(row["backend"]).protected_lower_transport(row)
     return {
         "version": 1,
         "driver": "rclone",
@@ -530,19 +499,10 @@ def _build_protected_cloud_mount(
             {
                 "mount_id": f"protected-{thread_id}",
                 "mount_kind": "protected_lower",
-                "backend": "nextcloud",
                 "target_path": _PROTECTED_LOWER_TARGET,
                 "workspace_name": "lower",
                 "access": "read_only",
-                "source": {
-                    "type": "webdav",
-                    "config": {
-                        "url": row["webdav_url"],
-                        "vendor": "nextcloud",
-                        "user": row["reader_id"],
-                    },
-                },
-                "auth": {"type": "basic", "password": row["credentials"]},
+                **lower_transport,
                 "cache": {
                     "vfs_cache_mode": "full",
                     "vfs_cache_max_size": "10G",

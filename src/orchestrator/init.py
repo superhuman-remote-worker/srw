@@ -1199,12 +1199,7 @@ async def _backfill_cloud_folders(db) -> None:
                 group_id=group_name,
             )
             if folder_handle is not None:
-                legacy_folder_id: int | None = None
-                if backend.backend_id == "nextcloud":
-                    try:
-                        legacy_folder_id = int(folder_handle.native_id)
-                    except ValueError:
-                        legacy_folder_id = None
+                legacy_folder_id = backend.legacy_folder_id(folder_handle)
                 await db.update_project(
                     project_id,
                     main_cloud_backend=backend.backend_id,

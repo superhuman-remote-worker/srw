@@ -784,6 +784,11 @@ data:
   DEFAULT_DS_WEBDAV_READ_ONLY: {{ "false" | quote }}
   {{- end }}
   {{- end }}
+  {{- with .Values.cloud.replaceInstallation }}
+  # The operator's confirmation that the installation Helm describes may
+  # replace this active main-cloud instance (main cloud: Helm only).
+  MAIN_CLOUD_REPLACE_INSTALLATION: {{ . | quote }}
+  {{- end }}
 
   # NATS — when nats.internal=true, points at the in-cluster Service;
   # otherwise the user-supplied .Values.nats.url (empty disables VM lifecycle).

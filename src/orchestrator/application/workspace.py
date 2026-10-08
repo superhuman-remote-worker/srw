@@ -1,9 +1,8 @@
 """Composition for workspace access, files, IDE proxy and cloud (R1.B04).
 
 IDE, workspace access, thread files, job repository/diff/review, cloud stage,
-cloud mounts, protected-cloud engage, cloud diff and main-cloud settings. The
-cloud task registry is the application's; ``rebind_main_cloud_router`` is the
-seam that replaces the application's cloud router.
+cloud mounts, protected-cloud engage, cloud diff and the main-cloud page. The
+cloud task registry is the application's.
 """
 
 from __future__ import annotations
@@ -333,29 +332,18 @@ def thread_cloud_diff_dependencies(
     )
 
 
-def rebind_main_cloud_router(resources: ApplicationResources, router: Any) -> None:
-    """Rebind the application's cloud router.
-
-    Nothing calls this today — ``MainCloudRouter`` is mutated in place by
-    ``replace_active`` and ``main_cloud_router`` is assigned exactly once. The
-    seam exists so a service that *does* swap the object replaces the
-    application's resource rather than holding its own copy.
-    """
-    resources.main_cloud_router = router
-
-
 def main_cloud_settings_dependencies(
     resources: ApplicationResources,
 ) -> main_cloud_settings_routes.MainCloudSettingsRouteDependencies:
-    """Admin-only main-cloud configuration; installation authority preserved."""
+    """The admin-only main-cloud page and operator operations (Helm configures)."""
     return main_cloud_settings_routes.MainCloudSettingsRouteDependencies(
         operations=main_cloud_settings_operations.MainCloudSettingsDependencies(
             store=resources.postgres_db,
             cloud_router=resources.main_cloud_router,
-            rebind_cloud_router=functools.partial(rebind_main_cloud_router, resources),
             thread_mount_dependencies=functools.partial(
                 preparation_composition.thread_mount_dependencies, resources
             ),
+            replace_installation=resources.settings.main_cloud_replace_installation,
         ),
         require_admin=functools.partial(access_composition.require_admin, resources),
     )

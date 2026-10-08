@@ -1,26 +1,25 @@
-"""Wire contracts for the extracted admin main-cloud settings routes.
+"""Wire contracts for the admin main-cloud routes.
 
-R1.B04 lane M. Two things live here that a careless move would break, so both
-are pinned end to end:
+R1.B04 lane M; main_cloud_as_connectors.md slice 2. The main cloud is
+configured by Helm only, so what is pinned here:
 
-* **What leaves the process.** GET reports a secret only as
-  ``{"env_var": ..., "set": ...}``; PUT and POST /test drop every secret-field
-  key from the body before it can reach JSONB or a probe overlay; and no
-  response, on any path, echoes a secret value.
+* **The page only reports.** ``GET /api/admin/main-cloud`` shows the provider,
+  its installation, health, where the configuration comes from and the
+  provider support matrix, and no response echoes a secret value.
+* **The connection form's API is gone, on purpose.** Each retired route
+  answers 410 with the same detail, after the admin gate.
 * **Installation authority.** The backfill refuses — 409/503, never a guess —
   unless the live installation has just been re-attested and every named
-  provider resolves to exactly one proof, and the reload path answers 409
-  rather than reporting success when the active instance moved.
+  provider resolves to exactly one proof.
 
-The admin gate is awaited before any body inspection on every route, so a
-non-admin cannot learn which backends the deployment accepts or whether a
-secret env var is wired.
+The admin gate is awaited before anything else on every route.
 """
 
 from __future__ import annotations
 
 import json
-import re
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -34,9 +33,10 @@ from tests._mounted_router import mount_router
 
 from orchestrator.routers import main_cloud_settings as route_module
 from orchestrator.services import main_cloud_settings as ops
-from orchestrator.services.cloud import config as cloud_config
+from orchestrator.services.cloud import instance_registry
 
 BASE = "/api/admin/system-settings/main_cloud"
+PAGE = "/api/admin/main-cloud"
 ADMIN = {"id": "admin-1", "email": "admin@example.test"}
 SECRET = "super-secret-client-value"
 PROOF = "0" * 64
@@ -136,8 +136,8 @@ def _store(**over: Any) -> SimpleNamespace:
     return store
 
 
-def _wire(*, store=None, cloud_router=None, admin_gate=None, rebind=None):
-    calls = SimpleNamespace(admin=0, rebound=[])
+def _wire(*, store=None, cloud_router=None, admin_gate=None, replace_installation=""):
+    calls = SimpleNamespace(admin=0)
     backing = store if store is not None else _store()
 
     async def require_admin(_request):
@@ -149,8 +149,8 @@ def _wire(*, store=None, cloud_router=None, admin_gate=None, rebind=None):
     operations = ops.MainCloudSettingsDependencies(
         store=backing,
         cloud_router=cloud_router if cloud_router is not None else _router(),
-        rebind_cloud_router=rebind or calls.rebound.append,
         thread_mount_dependencies=lambda: None,
+        replace_installation=replace_installation,
     )
     dependencies = route_module.MainCloudSettingsRouteDependencies(
         operations=operations,
@@ -180,15 +180,17 @@ def _contains_secret(payload: Any) -> bool:
 @pytest.mark.parametrize(
     "method,path,body",
     [
+        ("get", PAGE, None),
         ("get", BASE, None),
         ("put", BASE, {"value": "not-an-object"}),
         ("post", f"{BASE}/test", {"value": {"backend_id": "bogus"}}),
         ("post", f"{BASE}/reload", None),
         ("post", f"{BASE}/backfill-instance-authority", None),
+        ("post", f"{BASE}/repair-thread-mounts", None),
         ("delete", BASE, None),
     ],
 )
-def test_a_non_admin_is_refused_before_the_body_is_inspected(method, path, body):
+def test_a_non_admin_is_refused_before_anything_else(method, path, body):
     async def deny():
         raise HTTPException(status_code=403, detail="Admin access required")
 
@@ -198,494 +200,185 @@ def test_a_non_admin_is_refused_before_the_body_is_inspected(method, path, body)
     response = getattr(wired.client, method)(path, **kwargs)
 
     assert response.status_code == 403
-    assert response.json()["detail"] == "Admin access required"
     assert wired.calls.admin == 1
-    wired.store.get_active_main_cloud_backend_instance.assert_not_awaited()
 
 
 # --------------------------------------------------------------------------- #
-# GET — secrets are provenance only
+# The connection form's API is retired: 410, not 404
 # --------------------------------------------------------------------------- #
 
 
-def test_get_reports_secret_provenance_and_never_a_secret_value(monkeypatch):
-    monkeypatch.setenv("OC_CLIENT_SECRET", SECRET)
-    authority = _authority()
-    store = _store(
-        get_active_main_cloud_backend_instance=AsyncMock(
-            return_value={
-                "authority": authority,
-                "activated_at": None,
-                "activation_revision": 7,
-            }
-        )
-    )
-    wired = _wire(store=store)
-
-    body = wired.client.get(BASE).json()
-
-    assert body["secrets"] == {
-        "keycloak_client_secret": {"env_var": "OC_CLIENT_SECRET", "set": True}
-    }
-    assert body["activation_revision"] == 7
-    assert body["overlay"]["present"] is True
-    assert body["overlay"]["credentials_ref"] == "env:OC_CLIENT_SECRET"
-    assert body["overlay"]["value"]["__secret_fields__"] == ["keycloak_client_secret"]
-    # The synthetic marker belongs to the overlay copy alone; the recorded
-    # routing authority mirrored into ``effective`` must stay untouched.
-    assert "__secret_fields__" not in body["effective"]
-    assert body["allowed_backends"] == ["nextcloud", "opencloud"]
-    assert body["backend_instance"]["installation_proof_sha256"] == PROOF
-    assert not _contains_secret(body)
-
-
-def test_get_reports_an_unset_secret_without_inventing_one(monkeypatch):
-    monkeypatch.delenv("OC_CLIENT_SECRET", raising=False)
-    store = _store(
-        get_active_main_cloud_backend_instance=AsyncMock(
-            return_value={
-                "authority": _authority(),
-                "activated_at": None,
-                "activation_revision": 1,
-            }
-        )
-    )
-    wired = _wire(store=store)
-
-    body = wired.client.get(BASE).json()
-
-    assert body["secrets"]["keycloak_client_secret"]["set"] is False
-    assert "value" not in body["secrets"]["keycloak_client_secret"]
-
-
-def test_get_degrades_to_an_absent_overlay_when_the_registry_read_fails():
-    store = _store(
-        get_active_main_cloud_backend_instance=AsyncMock(side_effect=RuntimeError("db"))
-    )
-    wired = _wire(store=store)
-
-    body = wired.client.get(BASE).json()
-
-    assert body["overlay"]["present"] is False
-    assert body["backend_instance"] is None
-    assert body["activation_revision"] == 0
-    assert body["secrets"] == {}
-    # The live effective config still describes the active adapter.
-    assert body["effective"]["backend_id"] == "opencloud"
-    assert not _contains_secret(body)
-
-
-def test_get_effective_config_never_reads_the_settings_secret():
-    wired = _wire()
-
-    body = wired.client.get(BASE).json()
-
-    assert body["effective"]["keycloak_client_id"] == "srw"
-    assert "keycloak_client_secret" not in body["effective"]
-    assert not _contains_secret(body)
-
-
-# --------------------------------------------------------------------------- #
-# The sanitizer
-# --------------------------------------------------------------------------- #
-
-
-def test_sanitizer_keeps_only_known_non_secret_fields():
-    clean = ops._sanitize_main_cloud_value(
-        "opencloud",
-        {
-            "backend_id": "opencloud",
-            "base_url": "https://cloud.example",
-            "keycloak_client_secret": SECRET,
-            "unknown_knob": "x",
-            "public_url": "",
-            "default_quota_bytes": 5,
-        },
-    )
-
-    assert clean == {
-        "backend_id": "opencloud",
-        "base_url": "https://cloud.example",
-        "default_quota_bytes": 5,
-        "__secret_fields__": ["keycloak_client_secret"],
-    }
-
-
-def test_sanitizer_records_every_nextcloud_secret_field():
-    clean = ops._sanitize_main_cloud_value(
-        "nextcloud",
-        {"admin_password": SECRET, "agent_password": SECRET, "admin_user": "admin"},
-    )
-
-    assert clean["__secret_fields__"] == [
-        "admin_password",
-        "agent_password",
-        "oidc_client_secret",
-    ]
-    assert not _contains_secret(clean)
-
-
-def test_env_var_provenance_reports_presence_only(monkeypatch):
-    monkeypatch.setenv("SOME_SECRET", SECRET)
-    assert ops._env_var_provenance("SOME_SECRET") == {
-        "env_var": "SOME_SECRET",
-        "set": True,
-    }
-
-
-# --------------------------------------------------------------------------- #
-# PUT — refusal ordering, then the write
-# --------------------------------------------------------------------------- #
-
-
-def test_put_rejects_a_non_object_value_first():
-    wired = _wire()
-
-    response = wired.client.put(BASE, json={"value": "nope"})
-
-    assert response.status_code == 400
-    assert response.json()["detail"] == "`value` must be an object"
-
-
-def test_put_rejects_an_unknown_backend_naming_the_allowed_set():
-    wired = _wire()
-
-    response = wired.client.put(BASE, json={"value": {"backend_id": "dropbox"}})
-
-    assert response.status_code == 400
-    detail = response.json()["detail"]
-    assert "unknown backend_id 'dropbox'" in detail
-    assert "['nextcloud', 'opencloud']" in detail
-
-
-def test_put_rejects_a_non_string_credentials_ref_before_the_revision():
-    wired = _wire()
-
-    response = wired.client.put(
-        BASE,
-        json={"value": {"backend_id": "opencloud"}, "credentials_ref": 7},
-    )
-
-    assert response.status_code == 400
-    assert response.json()["detail"] == "`credentials_ref` must be a string or null"
-
-
-@pytest.mark.parametrize("revision", [None, -1, "3", True])
-def test_put_requires_a_non_negative_integer_revision(revision):
-    """``True`` is deliberately refused: the check is ``type(...) is not int``."""
-    wired = _wire()
-
-    response = wired.client.put(
-        BASE,
-        json={
-            "value": {"backend_id": "opencloud"},
-            "expected_activation_revision": revision,
-        },
-    )
-
-    assert response.status_code == 400
-    assert (
-        response.json()["detail"]
-        == "`expected_activation_revision` must be a non-negative integer"
-    )
-
-
-def _valid_put_body(**over: Any) -> dict[str, Any]:
-    body = {
-        "value": {
-            "backend_id": "opencloud",
-            "base_url": "https://cloud.example",
-            "keycloak_client_secret": SECRET,
-        },
-        "credentials_ref": "env:OC_CLIENT_SECRET",
-        "expected_activation_revision": 0,
-    }
-    body.update(over)
-    return body
-
-
-def _accept_config(monkeypatch, *, missing=None):
-    monkeypatch.setattr(cloud_config, "load_main_cloud_config", lambda **_k: object())
-    monkeypatch.setattr(
-        cloud_config, "missing_secret_envs", lambda *_a, **_k: missing or []
-    )
-
-
-def test_put_never_lets_a_secret_field_reach_the_probe_overlay(monkeypatch):
-    seen: dict[str, Any] = {}
-
-    def load(*, db_overlay):
-        seen["probe"] = db_overlay
-        return object()
-
-    monkeypatch.setattr(cloud_config, "load_main_cloud_config", load)
-    monkeypatch.setattr(cloud_config, "missing_secret_envs", lambda *_a, **_k: [])
-    activated = {"authority": _authority(), "activation_revision": 1}
-    monkeypatch.setattr(
-        ops, "activate_main_cloud_config", AsyncMock(return_value=activated)
-    )
-    monkeypatch.setattr(ops, "fire_reload", AsyncMock())
-    wired = _wire()
-
-    response = wired.client.put(BASE, json=_valid_put_body())
-
-    assert response.status_code == 200
-    assert "keycloak_client_secret" not in seen["probe"]["value"]
-    assert not _contains_secret(seen["probe"])
-    assert not _contains_secret(response.json())
-
-
-def test_put_refuses_when_the_backend_secret_env_is_not_wired(monkeypatch):
-    _accept_config(monkeypatch, missing=[{"env_var": "OC_CLIENT_SECRET"}])
+@pytest.mark.parametrize(
+    "method,path,body",
+    [
+        ("get", BASE, None),
+        ("put", BASE, {"value": {"backend_id": "nextcloud"}}),
+        ("delete", BASE, None),
+        ("post", f"{BASE}/test", {"value": {"backend_id": "opencloud"}}),
+        ("post", f"{BASE}/reload", None),
+    ],
+)
+def test_the_retired_connection_api_answers_410(method, path, body):
     activate = AsyncMock()
-    monkeypatch.setattr(ops, "activate_main_cloud_config", activate)
-    wired = _wire()
+    wired = _wire(store=_store(delete_system_setting=activate))
+    kwargs = {"json": body} if body is not None else {}
 
-    response = wired.client.put(BASE, json=_valid_put_body())
+    response = getattr(wired.client, method)(path, **kwargs)
 
-    assert response.status_code == 400
-    detail = response.json()["detail"]
-    assert "secret env not set for backend 'opencloud': OC_CLIENT_SECRET" in detail
-    assert "built-in dev" in detail
+    assert response.status_code == 410
+    assert response.json()["detail"] == route_module.RETIRED_DETAIL
+    assert "GET /api/admin/main-cloud" in route_module.RETIRED_DETAIL
     activate.assert_not_awaited()
 
 
-def test_put_maps_an_invalid_config_to_400(monkeypatch):
-    def load(**_kwargs):
-        raise ValueError("base_url is required")
-
-    monkeypatch.setattr(cloud_config, "load_main_cloud_config", load)
-    monkeypatch.setattr(cloud_config, "missing_secret_envs", lambda *_a, **_k: [])
-    wired = _wire()
-
-    response = wired.client.put(BASE, json=_valid_put_body())
-
-    assert response.status_code == 400
-    assert "invalid main cloud config" in response.json()["detail"]
+def test_the_service_has_no_configuration_operation_left():
+    for name in (
+        "put_main_cloud_settings",
+        "test_main_cloud_settings",
+        "reload_main_cloud_settings",
+        "delete_main_cloud_settings",
+        "get_main_cloud_settings",
+    ):
+        assert not hasattr(ops, name), name
 
 
-def test_put_maps_a_failed_attestation_to_500_without_activating(monkeypatch):
-    _accept_config(monkeypatch)
+# --------------------------------------------------------------------------- #
+# GET /api/admin/main-cloud — the read-only page
+# --------------------------------------------------------------------------- #
+
+
+def _page_backend(**over: Any) -> SimpleNamespace:
+    backend = _active_backend()
+    backend.health_check = AsyncMock(
+        return_value=SimpleNamespace(ok=True, latency_ms=12.345, detail="status=200")
+    )
+    for key, value in over.items():
+        setattr(backend, key, value)
+    return backend
+
+
+def _page_store(*, authority=None, revision=4):
+    from datetime import datetime, timezone
+
+    active = {
+        "authority": authority
+        or _authority(
+            routing={
+                "base_url": "http://oc.internal",
+                "public_url": "https://cloud.example",
+            }
+        ),
+        "activation_revision": revision,
+        "activated_at": datetime(2026, 10, 8, tzinfo=timezone.utc),
+    }
+    return _store(get_active_main_cloud_backend_instance=AsyncMock(return_value=active))
+
+
+def _helm(monkeypatch, state="matches", detail=""):
     monkeypatch.setattr(
         ops,
-        "activate_main_cloud_config",
-        AsyncMock(side_effect=RuntimeError("remote proof mismatch")),
+        "helm_configuration_status",
+        lambda _authority: instance_registry.HelmConfigurationStatus(
+            state, "opencloud", detail
+        ),
     )
-    wired = _wire()
-
-    response = wired.client.put(BASE, json=_valid_put_body())
-
-    assert response.status_code == 500
-    assert "no unverified adapter" in response.json()["detail"]
 
 
-def test_put_maps_a_lost_cas_to_409(monkeypatch):
-    _accept_config(monkeypatch)
-    monkeypatch.setattr(ops, "activate_main_cloud_config", AsyncMock(return_value=None))
-    wired = _wire()
+def test_the_page_reports_provider_installation_health_and_matrix(monkeypatch):
+    _helm(monkeypatch)
+    wired = _wire(store=_page_store(), cloud_router=_router(active=_page_backend()))
 
-    response = wired.client.put(BASE, json=_valid_put_body())
+    body = wired.client.get(PAGE).json()
 
-    assert response.status_code == 409
-    assert "activation authority changed" in response.json()["detail"]
-
-
-def test_put_fans_out_and_drops_the_legacy_setting_on_success(monkeypatch):
-    _accept_config(monkeypatch)
-    authority = _authority()
-    monkeypatch.setattr(
-        ops,
-        "activate_main_cloud_config",
-        AsyncMock(return_value={"authority": authority, "activation_revision": 4}),
-    )
-    fire = AsyncMock()
-    monkeypatch.setattr(ops, "fire_reload", fire)
-    wired = _wire()
-
-    body = wired.client.put(BASE, json=_valid_put_body()).json()
-
-    assert body == {
-        "status": "ok",
+    assert body["provider"] == {
         "backend_id": "opencloud",
+        "title": "OpenCloud",
+        "public_url": "https://cloud.example",
         "backend_instance_id": ACTIVE_INSTANCE,
         "activation_revision": 4,
-        "reloaded": True,
+        "activated_at": "2026-10-08T00:00:00+00:00",
+        "initialized": True,
     }
-    wired.store.delete_system_setting.assert_awaited_once_with("main_cloud")
-    fire.assert_awaited_once_with(wired.store, ACTIVE_INSTANCE)
-
-
-def test_put_survives_a_failed_legacy_cleanup(monkeypatch):
-    _accept_config(monkeypatch)
-    monkeypatch.setattr(
-        ops,
-        "activate_main_cloud_config",
-        AsyncMock(return_value={"authority": _authority(), "activation_revision": 4}),
-    )
-    monkeypatch.setattr(ops, "fire_reload", AsyncMock())
-    store = _store(delete_system_setting=AsyncMock(side_effect=RuntimeError("gone")))
-    wired = _wire(store=store)
-
-    assert wired.client.put(BASE, json=_valid_put_body()).status_code == 200
-
-
-# --------------------------------------------------------------------------- #
-# POST /test — a dry run that persists nothing
-# --------------------------------------------------------------------------- #
-
-
-def test_dry_run_rejects_an_unknown_backend():
-    wired = _wire()
-
-    response = wired.client.post(f"{BASE}/test", json={"value": {"backend_id": "x"}})
-
-    assert response.status_code == 400
-    assert response.json()["detail"] == "unknown backend_id 'x'"
-
-
-def test_dry_run_names_the_unwired_env_var_but_no_value(monkeypatch):
-    monkeypatch.setattr(
-        cloud_config,
-        "missing_secret_envs",
-        lambda *_a, **_k: [{"env_var": "OC_CLIENT_SECRET"}],
-    )
-    wired = _wire()
-
-    body = wired.client.post(f"{BASE}/test", json=_valid_put_body()).json()
-
-    assert body["ok"] is False
-    assert "OC_CLIENT_SECRET" in body["detail"]
+    assert body["health"] == {"ok": True, "latency_ms": 12.3, "detail": "status=200"}
+    assert body["configuration"] == {
+        "source": "helm",
+        "helm": {"state": "matches", "backend_id": "opencloud", "detail": ""},
+        "replace_installation": None,
+    }
+    providers = body["matrix"]["providers"]
+    assert {p["backend_id"]: p["active"] for p in providers} == {
+        "nextcloud": False,
+        "opencloud": True,
+    }
+    assert len(body["matrix"]["rows"]) == 8
     assert not _contains_secret(body)
 
 
-def test_dry_run_reports_a_build_failure_without_persisting(monkeypatch):
-    monkeypatch.setattr(cloud_config, "missing_secret_envs", lambda *_a, **_k: [])
-
-    def build(**_kwargs):
-        raise RuntimeError("bad url")
-
-    monkeypatch.setattr(ops, "build_backend", build)
-    wired = _wire()
-
-    body = wired.client.post(f"{BASE}/test", json=_valid_put_body()).json()
-
-    # The builder's exception text can name internal hosts and credentials, so
-    # the client gets the route's own wording plus the correlation id that
-    # finds the logged exception.
-    assert body["ok"] is False
-    assert body["detail"] == "build_backend failed"
-    assert "bad url" not in json.dumps(body)
-    assert re.fullmatch(r"[0-9a-f]{12}", body["error_ref"])
-    wired.store.delete_system_setting.assert_not_awaited()
-
-
-def test_dry_run_always_closes_the_probe_backend(monkeypatch):
-    monkeypatch.setattr(cloud_config, "missing_secret_envs", lambda *_a, **_k: [])
-    closed: list[bool] = []
-    probe = SimpleNamespace(
-        ensure_initialized=AsyncMock(return_value=True),
-        health_check=AsyncMock(
-            return_value=SimpleNamespace(ok=True, detail="fine", latency_ms=12)
-        ),
-        close=AsyncMock(side_effect=lambda: closed.append(True)),
+def test_the_page_reports_helm_drift_and_a_pending_replacement(monkeypatch):
+    _helm(monkeypatch, state="differs", detail="provider")
+    wired = _wire(
+        store=_page_store(),
+        cloud_router=_router(active=_page_backend()),
+        replace_installation=ACTIVE_INSTANCE,
     )
-    monkeypatch.setattr(ops, "build_backend", lambda **_k: probe)
-    wired = _wire()
 
-    body = wired.client.post(f"{BASE}/test", json=_valid_put_body()).json()
+    configuration = wired.client.get(PAGE).json()["configuration"]
 
-    assert body == {"ok": True, "detail": "fine", "latency_ms": 12}
-    assert closed == [True]
-
-
-def test_dry_run_reports_an_uninitialized_backend(monkeypatch):
-    monkeypatch.setattr(cloud_config, "missing_secret_envs", lambda *_a, **_k: [])
-    probe = SimpleNamespace(
-        ensure_initialized=AsyncMock(return_value=False),
-        health_check=AsyncMock(),
-        close=AsyncMock(),
-    )
-    monkeypatch.setattr(ops, "build_backend", lambda **_k: probe)
-    wired = _wire()
-
-    body = wired.client.post(f"{BASE}/test", json=_valid_put_body()).json()
-
-    assert body["ok"] is False
-    assert "not initialized" in body["detail"]
-    probe.health_check.assert_not_awaited()
-
-
-def test_dry_run_sanitizes_the_probe_overlay(monkeypatch):
-    seen: dict[str, Any] = {}
-    monkeypatch.setattr(cloud_config, "missing_secret_envs", lambda *_a, **_k: [])
-
-    def build(*, db_overlay):
-        seen["probe"] = db_overlay
-        raise RuntimeError("stop here")
-
-    monkeypatch.setattr(ops, "build_backend", build)
-    wired = _wire()
-
-    wired.client.post(f"{BASE}/test", json=_valid_put_body())
-
-    assert "keycloak_client_secret" not in seen["probe"]["value"]
-    assert not _contains_secret(seen["probe"])
-
-
-# --------------------------------------------------------------------------- #
-# POST /reload
-# --------------------------------------------------------------------------- #
-
-
-def test_reload_reports_the_active_instance_on_success(monkeypatch):
-    monkeypatch.setattr(
-        ops, "reload_active_main_cloud_instance", AsyncMock(return_value=True)
-    )
-    wired = _wire()
-
-    body = wired.client.post(f"{BASE}/reload").json()
-
-    assert body == {
-        "status": "ok",
+    assert configuration["helm"] == {
+        "state": "differs",
         "backend_id": "opencloud",
-        "backend_instance_id": ACTIVE_INSTANCE,
+        "detail": "provider",
     }
-    # The router object is mutated in place by ``replace_active``; nothing in
-    # this path rebinds the application's handle.
-    assert wired.calls.rebound == []
+    assert configuration["replace_installation"] == ACTIVE_INSTANCE
 
 
-@pytest.mark.parametrize("outcome", [False, None])
-def test_reload_409s_when_the_active_instance_moved(monkeypatch, outcome):
-    monkeypatch.setattr(
-        ops, "reload_active_main_cloud_instance", AsyncMock(return_value=outcome)
-    )
-    wired = _wire()
+def test_a_hanging_health_probe_does_not_hold_the_page(monkeypatch):
+    import asyncio
 
-    response = wired.client.post(f"{BASE}/reload")
+    async def _hang():
+        await asyncio.sleep(60)
 
-    assert response.status_code == 409
-    assert response.json()["detail"] == (
-        "active instance changed during re-attestation; retry"
+    _helm(monkeypatch)
+    monkeypatch.setattr(ops, "_HEALTH_TIMEOUT_SECONDS", 0.01)
+    wired = _wire(
+        store=_page_store(),
+        cloud_router=_router(active=_page_backend(health_check=_hang)),
     )
 
+    body = wired.client.get(PAGE).json()
 
-def test_reload_maps_a_failed_attestation_to_500(monkeypatch):
-    monkeypatch.setattr(
-        ops,
-        "reload_active_main_cloud_instance",
-        AsyncMock(side_effect=RuntimeError("keycloak down")),
+    assert body["health"] == {"ok": False, "latency_ms": None, "detail": "unreachable"}
+
+
+def test_the_page_degrades_when_the_registry_read_fails(monkeypatch):
+    _helm(monkeypatch, state="differs", detail="no_active")
+    store = _store(
+        get_active_main_cloud_backend_instance=AsyncMock(side_effect=RuntimeError("db"))
     )
-    wired = _wire()
+    wired = _wire(store=store, cloud_router=_router(active=_page_backend()))
 
-    response = wired.client.post(f"{BASE}/reload")
+    response = wired.client.get(PAGE)
 
-    assert response.status_code == 500
-    assert "re-attestation failed" in response.json()["detail"]
+    assert response.status_code == 200
+    provider = response.json()["provider"]
+    assert provider["backend_id"] == "opencloud"
+    assert provider["backend_instance_id"] is None
+    assert provider["public_url"] is None
+
+
+def test_the_page_never_reads_the_settings_secret(monkeypatch):
+    _helm(monkeypatch)
+    backend = _page_backend()
+    backend._settings.keycloak_client_secret = SimpleNamespace(
+        get_secret_value=lambda: pytest.fail("the page read a secret")
+    )
+    wired = _wire(store=_page_store(), cloud_router=_router(active=backend))
+
+    assert wired.client.get(PAGE).status_code == 200
 
 
 # --------------------------------------------------------------------------- #
-# POST /backfill-instance-authority
+# POST .../backfill-instance-authority — an operator operation that stays
 # --------------------------------------------------------------------------- #
 
 
@@ -862,70 +555,17 @@ def test_backfill_refuses_without_an_active_instance(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# DELETE
-# --------------------------------------------------------------------------- #
-
-
-def test_delete_activates_the_env_described_installation(monkeypatch):
-    authority = _authority()
-    activate = AsyncMock(
-        return_value={"authority": authority, "activation_revision": 9}
-    )
-    monkeypatch.setattr(ops, "activate_main_cloud_config", activate)
-    fire = AsyncMock()
-    monkeypatch.setattr(ops, "fire_reload", fire)
-    store = _store(
-        get_active_main_cloud_backend_instance=AsyncMock(
-            return_value={"authority": authority, "activation_revision": 8}
-        )
-    )
-    wired = _wire(store=store)
-
-    body = wired.client.delete(BASE).json()
-
-    assert body == {
-        "status": "ok",
-        "existed": True,
-        "backend_id": "opencloud",
-        "backend_instance_id": ACTIVE_INSTANCE,
-        "activation_revision": 9,
-    }
-    assert activate.await_args.kwargs["db_overlay"] is None
-    assert activate.await_args.kwargs["expected_activation_revision"] == 8
-    fire.assert_awaited_once_with(store, ACTIVE_INSTANCE)
-
-
-def test_delete_maps_a_lost_cas_to_409(monkeypatch):
-    monkeypatch.setattr(ops, "activate_main_cloud_config", AsyncMock(return_value=None))
-    wired = _wire()
-
-    response = wired.client.delete(BASE)
-
-    assert response.status_code == 409
-    assert "reload and retry" in response.json()["detail"]
-
-
-def test_delete_maps_a_failed_attestation_to_500(monkeypatch):
-    monkeypatch.setattr(
-        ops,
-        "activate_main_cloud_config",
-        AsyncMock(side_effect=RuntimeError("no proof")),
-    )
-    wired = _wire()
-
-    response = wired.client.delete(BASE)
-
-    assert response.status_code == 500
-    assert "env-described main cloud attestation failed" in response.json()["detail"]
-
-
-# --------------------------------------------------------------------------- #
 # Per-invocation dependency resolution
 # --------------------------------------------------------------------------- #
 
 
-def test_a_rebound_router_singleton_is_observed_by_the_next_request():
-    state = {"router": _router()}
+def test_a_rebound_router_singleton_is_observed_by_the_next_request(monkeypatch):
+    monkeypatch.setattr(
+        ops,
+        "helm_configuration_status",
+        lambda _a: instance_registry.HelmConfigurationStatus("matches"),
+    )
+    state = {"router": _router(active=_page_backend())}
 
     def _dependencies():
         async def require_admin(_request):
@@ -935,7 +575,6 @@ def test_a_rebound_router_singleton_is_observed_by_the_next_request():
             operations=ops.MainCloudSettingsDependencies(
                 store=_store(),
                 cloud_router=state["router"],
-                rebind_cloud_router=lambda _new: None,
                 thread_mount_dependencies=lambda: None,
             ),
             require_admin=require_admin,
@@ -947,13 +586,52 @@ def test_a_rebound_router_singleton_is_observed_by_the_next_request():
     )
     client = TestClient(app, raise_server_exceptions=False)
 
-    assert client.get(BASE).json()["effective"]["backend_id"] == "opencloud"
+    assert client.get(PAGE).json()["provider"]["backend_id"] == "opencloud"
 
-    swapped = _active_backend()
-    swapped.backend_id = "nextcloud"
-    swapped._base_url = "https://nc.example"
+    swapped = _page_backend(backend_id="nextcloud")
     state["router"] = _router(active=swapped, active_instance_id="other")
 
-    body = client.get(BASE).json()
-    assert body["effective"]["backend_id"] == "nextcloud"
-    assert body["effective"]["base_url"] == "https://nc.example"
+    body = client.get(PAGE).json()
+    assert body["provider"]["backend_id"] == "nextcloud"
+    assert body["provider"]["title"] == "Nextcloud"
+
+
+# --------------------------------------------------------------------------- #
+# The cockpit's fixture is this response
+# --------------------------------------------------------------------------- #
+
+FIXTURE = (
+    Path(__file__).resolve().parents[1]
+    / "cockpit/src/app/core/models/fixtures/main-cloud.json"
+)
+UPDATE = os.environ.get("UPDATE_CONNECTOR_GOLDENS") == "1"
+
+
+def test_the_cockpit_fixture_is_the_page_response(monkeypatch):
+    """The Main cloud page spec renders exactly what the API returns."""
+    monkeypatch.setattr(
+        ops,
+        "helm_configuration_status",
+        lambda _authority: instance_registry.HelmConfigurationStatus(
+            "matches", "nextcloud"
+        ),
+    )
+    authority = _authority(
+        backend_id="nextcloud",
+        routing={
+            "base_url": "http://srw-nextcloud",
+            "public_url": "https://cloud.localhost",
+        },
+    )
+    wired = _wire(
+        store=_page_store(authority=authority, revision=1),
+        cloud_router=_router(active=_page_backend(backend_id="nextcloud")),
+    )
+    rendered = json.dumps(wired.client.get(PAGE).json(), indent=2) + "\n"
+    if UPDATE:
+        FIXTURE.write_text(rendered)
+    assert FIXTURE.read_text() == rendered, (
+        "the cockpit fixture is stale; regenerate it with "
+        "UPDATE_CONNECTOR_GOLDENS=1 python -m pytest "
+        "tests/test_b04_lane_m_main_cloud_settings_routes.py"
+    )

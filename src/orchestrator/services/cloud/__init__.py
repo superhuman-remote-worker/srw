@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Optional
+from typing import Any
 
 from orchestrator.services.cloud.base import (
     CloudMountSubject,
@@ -25,6 +25,11 @@ from orchestrator.services.cloud.base import (
 )
 from orchestrator.services.cloud.backend_instance_authority import (
     MainCloudBackendInstanceAuthority,
+)
+from orchestrator.services.cloud.capabilities import (
+    PROTECTED_PROJECT_FOLDER,
+    ProviderCapabilities,
+    capability_matrix,
 )
 from orchestrator.services.cloud.config import (
     MainCloudConfig,
@@ -63,6 +68,56 @@ REGISTRY: dict[str, type] = {
 }
 
 
+def provider_adapter(backend_id: object) -> type | None:
+    """The adapter class registered for ``backend_id``, or ``None``."""
+    return REGISTRY.get(backend_id) if isinstance(backend_id, str) else None
+
+
+def provider_capabilities(backend_id: object) -> ProviderCapabilities | None:
+    """The support matrix ``backend_id``'s adapter declares, or ``None``.
+
+    Fails closed: an unknown, empty or non-string provider declares nothing.
+    """
+    adapter = provider_adapter(backend_id)
+    return getattr(adapter, "capabilities", None) if adapter is not None else None
+
+
+def provider_offers(
+    backend_id: object,
+    capability: tuple[str, str | None, str],
+    *,
+    workspace_backend: str | None = None,
+) -> bool:
+    """Whether ``backend_id`` offers ``(connector type, folder kind, access)``.
+
+    The question code outside the adapters asks instead of naming a
+    provider, e.g. ``provider_offers(row["backend"], PROTECTED_PROJECT_FOLDER)``.
+    """
+    declared = provider_capabilities(backend_id)
+    return declared is not None and declared.offers(
+        *capability, workspace_backend=workspace_backend
+    )
+
+
+def protected_provider(backend_id: object) -> str:
+    """``backend_id`` when its adapter offers the protected level, else raise.
+
+    The protected lane resolves a recorded installation only as a provider
+    that implements protected mode, so a record naming any other provider
+    fails closed with ``FeatureNotAvailable``.
+    """
+    if not provider_offers(backend_id, PROTECTED_PROJECT_FOLDER):
+        raise FeatureNotAvailable("protected cloud", backend=str(backend_id))
+    return str(backend_id)
+
+
+def provider_matrix(*, active: str | None = None) -> dict[str, Any]:
+    """Every registered adapter's declaration as one matrix (the page's table)."""
+    return capability_matrix(
+        [adapter.capabilities for adapter in REGISTRY.values()], active=active
+    )
+
+
 def build_backend_from_config(settings: MainCloudConfig) -> MainCloudBackend:
     """Construct one adapter from an already validated settings snapshot."""
 
@@ -76,12 +131,8 @@ def build_backend_from_config(settings: MainCloudConfig) -> MainCloudBackend:
     )
 
 
-def build_backend(
-    backend_id: str | None = None,
-    *,
-    db_overlay: Optional[dict] = None,
-) -> MainCloudBackend:
-    """Construct a main-cloud backend instance.
+def build_backend(backend_id: str | None = None) -> MainCloudBackend:
+    """Construct a main-cloud backend instance from the deployment's config.
 
     Phase 3: when called with no argument, this routes through
     ``load_main_cloud_config`` which picks the backend via
@@ -90,34 +141,17 @@ def build_backend(
     to force a specific backend (used by ``MainCloudRouter._legacy``
     when reviving a cached adapter for a pre-flip row).
 
-    Phase 4: ``db_overlay`` layers persisted ``system_settings.main_cloud``
-    values over the env-var defaults. This is what lets the cockpit
-    admin panel change the active backend without a pod restart.
-
-    Both backends now consume a validated Pydantic settings object
-    (``NextcloudSettings`` / ``OpenCloudSettings``) built by
-    ``load_main_cloud_config`` — so the ``MAIN_CLOUD_*`` aliases, the
-    ``db_overlay``, and ``credentials_ref`` apply uniformly to both
-    (Issue 12). Earlier, ``NextcloudBackend`` read ``NEXTCLOUD_*`` env vars
-    directly in its constructor and ignored the overlay.
+    The configuration is Helm's alone (main_cloud_as_connectors.md,
+    "Configuration: Helm only"): both backends consume a validated settings
+    object (``NextcloudSettings`` / ``OpenCloudSettings``) built from the
+    environment, ``MAIN_CLOUD_*`` aliases included (Issue 12).
     """
-    if backend_id is None:
-        settings = load_main_cloud_config(db_overlay=db_overlay)
-        return build_backend_from_config(settings)
-
-    if backend_id == "nextcloud":
-        settings = load_main_cloud_config(
-            backend_override="nextcloud", db_overlay=db_overlay
+    if backend_id is not None and backend_id not in REGISTRY:
+        raise ValueError(
+            f"unknown main cloud backend: {backend_id!r} (known: {sorted(REGISTRY)})"
         )
-        return build_backend_from_config(settings)
-    if backend_id == "opencloud":
-        settings = load_main_cloud_config(
-            backend_override="opencloud", db_overlay=db_overlay
-        )
-        return build_backend_from_config(settings)
-    raise ValueError(
-        f"unknown main cloud backend: {backend_id!r} (known: {sorted(REGISTRY)})"
-    )
+    settings = load_main_cloud_config(backend_override=backend_id)
+    return build_backend_from_config(settings)
 
 
 def build_backend_from_instance(
@@ -496,52 +530,6 @@ class MainCloudRouter:
                         authority.secret_revision
                     )
 
-    async def reload_from_db(self, db_overlay: Optional[dict]) -> bool:
-        """Rebuild the active backend from the current DB overlay.
-
-        Returns ``True`` if the new backend initialized successfully and
-        was installed as the active backend. Returns ``False`` if
-        initialization failed — in that case the current active backend
-        is left in place and callers should surface a 5xx to the caller
-        so the operator knows the config change did not take effect.
-        """
-        try:
-            new_backend = build_backend(db_overlay=db_overlay)
-        except Exception as e:
-            logger.error("Main cloud router: build_backend failed during reload: %s", e)
-            return False
-
-        try:
-            ok = await new_backend.ensure_initialized()
-        except Exception as e:
-            logger.error(
-                "Main cloud router: ensure_initialized raised during reload: %s",
-                e,
-            )
-            try:
-                await new_backend.close()
-            except Exception:  # best-effort cleanup
-                pass
-            return False
-
-        if not ok:
-            logger.error(
-                "Main cloud router: new backend reported init failure; "
-                "keeping previous active backend"
-            )
-            try:
-                await new_backend.close()
-            except Exception:  # best-effort cleanup
-                pass
-            return False
-
-        await self.replace_active(new_backend)
-        logger.info(
-            "Main cloud router: reloaded active backend to %s",
-            new_backend.backend_id,
-        )
-        return True
-
     async def close(self) -> None:
         """Close the active backend and any cached legacy backends."""
         await self._active.close()
@@ -593,8 +581,10 @@ __all__ = [
     "NextcloudSettings",
     "OpenCloudBackend",
     "OpenCloudSettings",
+    "PROTECTED_PROJECT_FOLDER",
     "ProjectFolderEntry",
     "ProjectFolderHandle",
+    "ProviderCapabilities",
     "RcloneMountSpec",
     "SessionFolderHandle",
     "ShareHandle",
@@ -605,5 +595,10 @@ __all__ = [
     "build_backend_from_config",
     "build_backend_from_instance",
     "load_main_cloud_config",
+    "provider_adapter",
+    "provider_capabilities",
+    "provider_matrix",
+    "provider_offers",
+    "protected_provider",
     "retryable_policy",
 ]

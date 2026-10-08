@@ -119,7 +119,6 @@ async def test_candidate_prepares_provisional_instance_before_remote_attestation
     )
 
     candidate_backend, candidate = await build_attested_main_cloud_candidate(
-        db_overlay=None,
         backend_instance_id=_A,
     )
 
@@ -204,11 +203,7 @@ async def test_first_boot_adopts_candidate_before_installing_router(
         AsyncMock(return_value=(candidate, authority)),
     )
 
-    result = await initialize_main_cloud_instance_authority(
-        db,
-        router,
-        legacy_overlay=None,
-    )
+    result = await initialize_main_cloud_instance_authority(db, router)
 
     assert result == _active(authority, 1)
     assert router.active is candidate
@@ -251,7 +246,6 @@ async def test_activation_creates_new_instance_under_pointer_cas(
     result = await activate_main_cloud_config(
         db,
         router,
-        db_overlay={"value": {"backend_id": "nextcloud"}},
         expected_activation_revision=4,
         activated_by="admin",
     )
@@ -307,7 +301,6 @@ async def test_same_installation_rotates_only_secret_reference_revision(
     result = await activate_main_cloud_config(
         db,
         router,
-        db_overlay={"value": {"backend_id": "nextcloud"}},
         expected_activation_revision=7,
         activated_by="admin",
     )
@@ -337,10 +330,260 @@ async def test_stale_activation_revision_performs_no_probe_or_write(
     result = await activate_main_cloud_config(
         db,
         MainCloudRouter(_backend(authority)),
-        db_overlay=None,
         expected_activation_revision=8,
         activated_by="admin",
     )
 
     assert result is None
     builder.assert_not_awaited()
+
+
+# =============================================================================
+# Helm only: startup reconciles the active instance with Helm's description
+# (main_cloud_as_connectors.md, "Configuration: Helm only")
+# =============================================================================
+
+
+def _describe(
+    monkeypatch: pytest.MonkeyPatch,
+    authority: MainCloudBackendInstanceAuthority,
+) -> None:
+    """Make Helm describe exactly ``authority``'s routing and references."""
+    import orchestrator.services.cloud.instance_registry as registry
+
+    settings = type("Settings", (), {"backend_id": authority.backend_id})()
+    monkeypatch.setattr(registry, "load_main_cloud_config", lambda **_kw: settings)
+    monkeypatch.setattr(
+        registry, "main_cloud_routing_snapshot", lambda _s: authority.routing
+    )
+    monkeypatch.setattr(
+        registry, "main_cloud_secret_references", lambda *_a: authority.secret_refs
+    )
+
+
+class _Startup:
+    """A DB whose active pointer is ``active`` until something activates.
+
+    Startup reads the pointer once, the activation's CAS once more, then the
+    post-activation check. ``raced`` moves the pointer before the CAS read,
+    as a replica that activated first does.
+    """
+
+    def __init__(self, active, after=None, *, raced=False):
+        reads = [active] if raced else [active, active]
+        self.get_active_main_cloud_backend_instance = AsyncMock(
+            side_effect=[*reads, *([after] * 4)] if after else None,
+            return_value=None if after else active,
+        )
+        self.register_main_cloud_backend_instance = AsyncMock()
+        self.activate_main_cloud_backend_instance = AsyncMock()
+        self.rotate_main_cloud_backend_secret_refs = AsyncMock()
+
+
+def test_helm_status_compares_without_the_network(monkeypatch):
+    from orchestrator.services.cloud.instance_registry import (
+        helm_configuration_status,
+    )
+
+    active = _authority()
+    _describe(monkeypatch, active)
+    assert helm_configuration_status(active).state == "matches"
+    moved = _authority(base_url="https://moved.internal.example")
+    _describe(monkeypatch, moved)
+    status = helm_configuration_status(active)
+    assert (status.state, status.detail) == ("differs", "routing")
+    rotated = _authority(refs={"admin_password": "env:A", "agent_password": "env:B"})
+    _describe(monkeypatch, rotated)
+    assert helm_configuration_status(active).detail == "secret_references"
+
+
+def test_helm_status_reports_a_description_it_cannot_adopt(monkeypatch):
+    import orchestrator.services.cloud.instance_registry as registry
+
+    def _unset(*_a):
+        raise ValueError("required secret env is unset for nextcloud.admin_password")
+
+    _describe(monkeypatch, _authority())
+    monkeypatch.setattr(registry, "main_cloud_secret_references", _unset)
+    status = registry.helm_configuration_status(_authority())
+    assert (status.state, status.detail) == ("invalid", "ValueError")
+
+
+@pytest.mark.asyncio
+async def test_a_matching_description_just_loads_the_active_instance(monkeypatch):
+    import orchestrator.services.cloud.instance_registry as registry
+
+    authority = _authority()
+    _describe(monkeypatch, authority)
+    db = _Startup(_active(authority, 3))
+    builder = AsyncMock()
+    reload = AsyncMock(return_value=True)
+    monkeypatch.setattr(registry, "build_attested_main_cloud_candidate", builder)
+    monkeypatch.setattr(registry, "reload_active_main_cloud_instance", reload)
+    notify = AsyncMock()
+
+    result = await initialize_main_cloud_instance_authority(
+        db, MainCloudRouter(_backend(authority)), notify=notify
+    )
+
+    assert result == _active(authority, 3)
+    builder.assert_not_awaited()
+    reload.assert_awaited_once()
+    notify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_same_installation_described_anew_is_adopted(monkeypatch):
+    """A Helm routing change on the same cloud: attest, activate, fan out."""
+    import orchestrator.services.cloud.instance_registry as registry
+
+    active = _authority()
+    moved = _authority(_B, base_url="https://moved.internal.example")
+    _describe(monkeypatch, moved)
+    candidate = _backend(moved)
+    db = _Startup(_active(active, 4), after=_active(moved, 5))
+    db.register_main_cloud_backend_instance.return_value = moved
+    db.activate_main_cloud_backend_instance.return_value = _active(moved, 5)
+    monkeypatch.setattr(
+        registry,
+        "build_attested_main_cloud_candidate",
+        AsyncMock(return_value=(candidate, moved)),
+    )
+    previous = _backend(active)
+    previous.bind_backend_instance(_A)
+    router = MainCloudRouter(previous)
+    notify = AsyncMock()
+
+    result = await initialize_main_cloud_instance_authority(db, router, notify=notify)
+
+    assert result == _active(moved, 5)
+    db.activate_main_cloud_backend_instance.assert_awaited_once_with(
+        _B, expected_activation_revision=4, activated_by="helm"
+    )
+    assert router.active is candidate
+    notify.assert_awaited_once_with(_B)
+
+
+@pytest.mark.asyncio
+async def test_another_installation_needs_the_operators_confirmation(monkeypatch):
+    """An overlay-born instance keeps serving: Helm's other cloud is not
+    adopted from values that merely drifted."""
+    import orchestrator.services.cloud.instance_registry as registry
+
+    active = _authority()
+    other = _authority(_B, proof=_PROOF_B, base_url="https://b.internal.example")
+    _describe(monkeypatch, other)
+    candidate = _backend(other)
+    db = _Startup(_active(active, 2))
+    monkeypatch.setattr(
+        registry,
+        "build_attested_main_cloud_candidate",
+        AsyncMock(return_value=(candidate, other)),
+    )
+    reload = AsyncMock(return_value=True)
+    monkeypatch.setattr(registry, "reload_active_main_cloud_instance", reload)
+    notify = AsyncMock()
+
+    result = await initialize_main_cloud_instance_authority(
+        db,
+        MainCloudRouter(_backend(active)),
+        replace_installation="some-other-instance",
+        notify=notify,
+    )
+
+    assert result == _active(active, 2)
+    db.register_main_cloud_backend_instance.assert_not_awaited()
+    db.activate_main_cloud_backend_instance.assert_not_awaited()
+    assert candidate.is_initialized is False  # closed, never installed
+    reload.assert_awaited_once()
+    notify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_confirmed_replacement_moves_new_work_to_the_described_cloud(
+    monkeypatch,
+):
+    import orchestrator.services.cloud.instance_registry as registry
+
+    active = _authority()
+    other = _authority(_B, proof=_PROOF_B, base_url="https://b.internal.example")
+    _describe(monkeypatch, other)
+    candidate = _backend(other)
+    db = _Startup(_active(active, 2), after=_active(other, 3))
+    db.register_main_cloud_backend_instance.return_value = other
+    db.activate_main_cloud_backend_instance.return_value = _active(other, 3)
+    monkeypatch.setattr(
+        registry,
+        "build_attested_main_cloud_candidate",
+        AsyncMock(return_value=(candidate, other)),
+    )
+    previous = _backend(active)
+    previous.bind_backend_instance(_A)
+    router = MainCloudRouter(previous)
+    router._instances[_A] = previous
+    notify = AsyncMock()
+
+    result = await initialize_main_cloud_instance_authority(
+        db, router, replace_installation=_A, notify=notify
+    )
+
+    assert result == _active(other, 3)
+    assert router.active is candidate
+    # The replaced installation stays cached for what is stamped with it.
+    assert previous.is_initialized is True
+    notify.assert_awaited_once_with(_B)
+
+
+@pytest.mark.asyncio
+async def test_a_description_that_does_not_attest_leaves_the_active_serving(
+    monkeypatch,
+):
+    import orchestrator.services.cloud.instance_registry as registry
+
+    active = _authority()
+    _describe(monkeypatch, _authority(base_url="https://unreachable.example"))
+    db = _Startup(_active(active, 6))
+    monkeypatch.setattr(
+        registry,
+        "build_attested_main_cloud_candidate",
+        AsyncMock(side_effect=RuntimeError("did not attest")),
+    )
+    reload = AsyncMock(return_value=True)
+    monkeypatch.setattr(registry, "reload_active_main_cloud_instance", reload)
+
+    result = await initialize_main_cloud_instance_authority(
+        db, MainCloudRouter(_backend(active))
+    )
+
+    assert result == _active(active, 6)
+    reload.assert_awaited_once()
+    db.activate_main_cloud_backend_instance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_racing_replica_that_activated_first_wins(monkeypatch):
+    """The CAS refuses a stale revision: the loser loads what won."""
+    import orchestrator.services.cloud.instance_registry as registry
+
+    active = _authority()
+    moved = _authority(_B, base_url="https://moved.internal.example")
+    _describe(monkeypatch, moved)
+    candidate = _backend(moved)
+    db = _Startup(_active(active, 4), after=_active(moved, 5), raced=True)
+    monkeypatch.setattr(
+        registry,
+        "build_attested_main_cloud_candidate",
+        AsyncMock(return_value=(candidate, moved)),
+    )
+    reload = AsyncMock(return_value=True)
+    monkeypatch.setattr(registry, "reload_active_main_cloud_instance", reload)
+    notify = AsyncMock()
+
+    await initialize_main_cloud_instance_authority(
+        db, MainCloudRouter(_backend(active)), notify=notify
+    )
+
+    db.register_main_cloud_backend_instance.assert_not_awaited()
+    reload.assert_awaited_once()
+    notify.assert_not_awaited()
+    assert candidate.is_initialized is False

@@ -15,7 +15,7 @@ fake with ``fail_on=...`` or manipulate its state directly.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from orchestrator.services.cloud import (
     CloudBackendError,
@@ -29,14 +29,30 @@ from orchestrator.services.cloud import (
     UserHome,
     UserId,
 )
+from orchestrator.services.cloud.capabilities import (
+    MATRIX_ROWS,
+    CloudCapability,
+    ProviderCapabilities,
+)
 
 BACKEND_ID = "fake"
+
+#: The fake offers nothing: a test that needs a capability declares its own.
+FAKE_CAPABILITIES = ProviderCapabilities(
+    backend_id=BACKEND_ID,
+    title="Fake",
+    capabilities=tuple(
+        CloudCapability(*row, "unsupported", "an in-memory test double")
+        for row in MATRIX_ROWS
+    ),
+)
 
 
 class FakeMainCloudBackend:
     """Minimal in-memory backend for contract tests."""
 
     backend_id = BACKEND_ID
+    capabilities = FAKE_CAPABILITIES
 
     def __init__(
         self,
@@ -129,6 +145,18 @@ class FakeMainCloudBackend:
     @property
     def webdav_credentials(self) -> dict[str, str]:
         return {"username": "fake-agent", "password": "fake-password"}
+
+    def cloud_sync_config(
+        self, webdav_url: str, *, target_user_sub: Optional[str] = None
+    ) -> Optional[dict[str, Any]]:
+        return {
+            "backend": self.backend_id,
+            "webdav_url": webdav_url,
+            "auth": {"type": "basic", **self.webdav_credentials},
+        }
+
+    def legacy_folder_id(self, handle: ProjectFolderHandle) -> Optional[int]:
+        return None
 
     # ---------------------------------------------------------------- Lifecycle
 

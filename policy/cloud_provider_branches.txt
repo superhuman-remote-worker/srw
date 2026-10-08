@@ -1,0 +1,26 @@
+# Main-cloud provider branches outside the adapters: maintained by
+# scripts/check_cloud_provider_branches.py (its docstring says what it finds).
+# Regenerate with `python scripts/check_cloud_provider_branches.py --write`;
+# a new site is marked `unclassified` until reviewed, and fails the tests.
+#
+# Ask the provider support matrix (`provider_offers`) or call the adapter
+# rather than classifying a site. Every classification needs a reason:
+#   sql               a provider test in SQL text (the protected tables are
+#                     Nextcloud-only by trigger, migration 0186)
+#   protected-record  a protected record only the Nextcloud adapter writes;
+#                     frozen at its reviewed sites
+#   legacy-column     the pre-abstraction Nextcloud columns; frozen
+# SQL files, the cockpit and prompts are outside this gate.
+#
+# <file>  <qualname>  <kind>  <provider ids>  <fingerprint>  #<ordinal>  <classification>  [<reason>]
+
+src/orchestrator/database/postgres.py  PostgresDB.install_cloud_ro_effect_intent  compare  nextcloud  57f72ffa720c  #1  protected-record  re-reads the signed effect intent this method inserts with the Nextcloud provider literal; the record is Nextcloud's format
+src/orchestrator/database/postgres.py  PostgresDB.install_cloud_ro_effect_intent  sql-literal  nextcloud  98ff2a28d06a  #1  sql  the protected tables are Nextcloud-only by trigger (migration 0186); a second protected provider brings a migration
+src/orchestrator/database/postgres.py  PostgresDB.install_ro_mount_engage_intent  sql-literal  nextcloud  4fe3c18255ee  #1  sql  the protected tables are Nextcloud-only by trigger (migration 0186); a second protected provider brings a migration
+src/orchestrator/database/postgres.py  PostgresDB.install_ro_mount_engage_intent  sql-literal  nextcloud  59b16beabc74  #1  sql  the protected tables are Nextcloud-only by trigger (migration 0186); a second protected provider brings a migration
+src/orchestrator/database/postgres.py  PostgresDB.pinned_thread_agent_is_reciprocal  sql-literal  nextcloud  5f7d7d24036a  #1  sql  the protected tables are Nextcloud-only by trigger (migration 0186); a second protected provider brings a migration
+src/orchestrator/database/postgres.py  PostgresDB.update_thread_main_cloud  compare  nextcloud  792c497b2a90  #1  legacy-column  nc_session_folder and nc_share_id, written for Nextcloud only until the pre-abstraction columns are dropped
+src/orchestrator/database/postgres.py  PostgresDB.update_thread_main_cloud  compare  nextcloud  792c497b2a90  #2  legacy-column  nc_session_folder and nc_share_id, written for Nextcloud only until the pre-abstraction columns are dropped
+src/orchestrator/services/cloud_staging/source_identity.py  ProtectedMountSourceIdentity.__post_init__  compare  nextcloud  b1e17f0a2f6d  #1  protected-record  canonical identity of a protected Nextcloud source (folder id and mountpoint format); pure module in the Nextcloud adapter's import chain
+src/orchestrator/services/cloud_staging/source_identity.py  ProtectedMountSourceIdentity.from_mount_row  compare  nextcloud  1b692dcecbfb  #1  protected-record  parses a mount row and its serialized handle into the Nextcloud source format; refuses any other provider's handle
+src/orchestrator/services/cloud_staging/source_identity.py  ProtectedMountSourceIdentity.from_mount_row  compare  nextcloud  d2f0e7772cb5  #1  protected-record  parses a mount row and its serialized handle into the Nextcloud source format; refuses any other provider's handle

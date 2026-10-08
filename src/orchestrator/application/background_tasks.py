@@ -1005,8 +1005,9 @@ async def start_background_tasks(
         lambda se: reconciler.lifecycle_reconciler_loop(se, lifecycle_reconciler),
     )
 
-    # Phase 4: main-cloud config LISTEN task — reacts to pg_notify when
-    # an admin PUTs a new config via /api/admin/system-settings/main_cloud.
+    # Main-cloud LISTEN task — reacts to pg_notify when another replica
+    # activated the installation Helm describes at its startup
+    # (instance_registry; the main cloud is configured by Helm only).
     async def _main_cloud_reload_callback() -> None:
         await reload._reload_from_db_and_swap(
             resources.postgres_db, resources.main_cloud_router

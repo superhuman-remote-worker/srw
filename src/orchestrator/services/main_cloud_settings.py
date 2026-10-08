@@ -1,498 +1,139 @@
-"""System Settings — Main Cloud (Phase 4, Admin-only).
+"""Main cloud administration (admin-only): the read-only page and two
+operator operations.
 
-Extracted verbatim from ``orchestrator.main`` (R1.B04 lane M).
+Extracted from ``orchestrator.main`` (R1.B04 lane M). The main cloud is
+configured by Helm only (main_cloud_as_connectors.md, slice 2): the admin
+connection form, its ``GET/PUT/DELETE/test/reload`` API and the DB overlay
+are gone, and :func:`get_main_cloud_page` only reports. What stays, as
+operator operations until their work is done, are the one-shot
+instance-authority backfill and the thread-mount transport repair.
 
-These operations drive the cockpit admin "Cloud Storage" panel. GETs
-return the current immutable instance snapshot with secrets stripped, PUT
-remotely attests and CAS-activates a new instance, and POST /test does a
-dry-run connection check without persisting.
+Two properties are load-bearing:
 
-Secret handling: non-secret fields (URLs, usernames, quota) are stored
-in the `value` JSONB column. Secret fields (passwords, client secrets)
-are referenced via `credentials_ref` — a pointer like
-`env:OPENCLOUD_KEYCLOAK_CLIENT_SECRET` that the loader resolves against
-the orchestrator's own environment. This keeps secrets in Vault/ESO/.env
-and lets the UI manage only the non-secret knobs.
-
-Two properties are load-bearing and moved unchanged:
-
-* **What leaves the process.** ``_sanitize_main_cloud_value`` drops every
-  secret-field key from an incoming body before it can reach JSONB, and
-  ``_env_var_provenance`` answers "is it set?" and nothing more. No read or
-  write path in this module returns, logs, or echoes a secret value.
+* **What leaves the process.** No read path in this module returns, logs, or
+  echoes a secret value; the page shows the routing snapshot's public URL and
+  never the upstream text of a failed health probe.
 * **Installation authority.** ``cloud_router.active`` raising when no active
   backend instance is bound is correct and is never softened here; the
-  backfill refuses to guess an installation, and both it and the reload path
-  re-attest against the live installation before trusting a proof.
+  backfill refuses to guess an installation and re-attests against the live
+  installation before trusting a proof.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Optional
-from uuid import uuid4
+from typing import Any
 
 from fastapi import HTTPException
 
-from orchestrator.services.cloud import build_backend
+from orchestrator.services import thread_mount_rows
+from orchestrator.services.cloud import provider_capabilities, provider_matrix
 from orchestrator.services.cloud.instance_registry import (
-    activate_main_cloud_config,
+    helm_configuration_status,
     reload_active_main_cloud_instance,
 )
-from orchestrator.services.cloud.reload import fire_reload
-from orchestrator.services import thread_mount_rows
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class MainCloudSettingsDependencies:
-    """Collaborators for one main-cloud settings operation, per invocation.
+    """Collaborators for one main-cloud operation, per invocation.
 
     ``store`` is main's ``postgres_db`` and ``cloud_router`` its
-    ``main_cloud_router``. ``rebind_cloud_router`` is the application-owned
-    setter from port §3.3: the router object is normally mutated in place by
-    ``replace_active``, and nothing in the moved code reassigns it — but a
-    service must never be the thing that rebinds an application global, so the
-    seam is declared here rather than invented later.
+    ``main_cloud_router``; both are rebound during ``lifespan``.
 
     ``thread_mount_dependencies`` is main's ``_thread_mount_dependencies``
     factory: the transport repair rebuilds mount rows through the same
     builder thread create uses, so it needs that lane's collaborators, and it
     needs them resolved per call for the same rebinding reason as the two
-    above.
+    above. ``replace_installation`` is the deployment's
+    ``cloud.replaceInstallation``, which the page reports.
     """
 
     store: Any
     cloud_router: Any
-    rebind_cloud_router: Callable[[Any], None]
     thread_mount_dependencies: Callable[[], Any]
+    replace_installation: str = ""
 
 
-_MAIN_CLOUD_NONSECRET_FIELDS_BY_BACKEND: dict[str, list[str]] = {
-    "nextcloud": [
-        "base_url",
-        "public_url",
-        "admin_user",
-        "agent_user",
-    ],
-    "opencloud": [
-        "base_url",
-        "public_url",
-        "keycloak_issuer",
-        "keycloak_client_id",
-        "admin_role_claim_value",
-        "default_quota_bytes",
-    ],
-}
-
-_MAIN_CLOUD_SECRET_FIELDS_BY_BACKEND: dict[str, list[str]] = {
-    "nextcloud": ["admin_password", "agent_password", "oidc_client_secret"],
-    "opencloud": ["keycloak_client_secret"],
-}
-
-_MAIN_CLOUD_ALLOWED_BACKENDS = {"nextcloud", "opencloud"}
+#: How long the page waits for the active provider's health probe.
+_HEALTH_TIMEOUT_SECONDS = 5.0
+_HEALTH_DETAIL = re.compile(r"^(status=\d{3}|not initialized)$")
 
 
-def _sanitize_main_cloud_value(
-    backend_id: str, raw_value: dict[str, Any]
-) -> dict[str, Any]:
-    """Strip unknown keys + secret fields from an incoming overlay body.
-
-    Secrets are never stored in JSONB — they always come from env vars
-    resolved via `credentials_ref`. The sanitizer drops any secret-field
-    key from the incoming dict so a careless UI PUT cannot accidentally
-    persist a client secret into `system_settings.value`.
-    """
-    nonsecret = _MAIN_CLOUD_NONSECRET_FIELDS_BY_BACKEND.get(backend_id, [])
-    secret = set(_MAIN_CLOUD_SECRET_FIELDS_BY_BACKEND.get(backend_id, []))
-    clean: dict[str, Any] = {"backend_id": backend_id}
-    for key in nonsecret:
-        if key in raw_value and raw_value[key] not in (None, ""):
-            clean[key] = raw_value[key]
-    # Record which fields are secret-credential-sourced so the loader
-    # knows to resolve them via credentials_ref at read time.
-    if secret:
-        clean["__secret_fields__"] = sorted(secret)
-    return clean
-
-
-def _current_effective_config(
-    *, dependencies: MainCloudSettingsDependencies
-) -> dict[str, Any]:
-    """Read the active backend's current config shape for GET responses."""
-    active = dependencies.cloud_router.active
-    backend_id = active.backend_id
-    result: dict[str, Any] = {
-        "backend_id": backend_id,
-        "backend_instance_id": active.backend_instance_id,
-        "is_initialized": active.is_initialized,
-        "is_configured": active.is_configured,
-    }
-
-    # Non-secret fields come directly from the backend's settings where
-    # possible. NextcloudBackend reads env vars into private attrs;
-    # OpenCloudBackend holds a full settings dataclass.
-    if backend_id == "nextcloud":
-        # Attributes follow the adapter's internal names.
-        result.update(
-            {
-                "base_url": getattr(active, "_base_url", None),
-                "public_url": getattr(active, "_public_url", None),
-                "admin_user": getattr(active, "_admin_user", None),
-                "agent_user": getattr(active, "_agent_user", None),
-            }
+async def _health(backend: Any) -> dict[str, Any]:
+    """The active provider's health, without echoing an upstream error text."""
+    try:
+        status = await asyncio.wait_for(
+            backend.health_check(), timeout=_HEALTH_TIMEOUT_SECONDS
         )
-    elif backend_id == "opencloud":
-        settings = getattr(active, "_settings", None)
-        if settings is not None:
-            result.update(
-                {
-                    "base_url": str(settings.base_url),
-                    "public_url": str(settings.public_url),
-                    "keycloak_issuer": str(settings.keycloak_issuer),
-                    "keycloak_client_id": settings.keycloak_client_id,
-                    "admin_role_claim_value": settings.admin_role_claim_value,
-                    "default_quota_bytes": settings.default_quota_bytes,
-                }
-            )
-    return result
-
-
-def _env_var_provenance(env_name: str) -> dict[str, Any]:
-    """Report whether a secret env var is set, without leaking its value."""
-    val = os.getenv(env_name)
+    except Exception:
+        return {"ok": False, "latency_ms": None, "detail": "unreachable"}
+    detail = str(status.detail or "")
     return {
-        "env_var": env_name,
-        "set": bool(val),
+        "ok": bool(status.ok),
+        "latency_ms": round(float(status.latency_ms), 1),
+        "detail": detail if _HEALTH_DETAIL.fullmatch(detail) else "unreachable",
     }
 
 
-async def get_main_cloud_settings(
+async def get_main_cloud_page(
     *, dependencies: MainCloudSettingsDependencies
 ) -> dict[str, Any]:
-    """Return the current effective main-cloud config + persisted overlay.
+    """The read-only admin Main cloud page: provider, installation, health,
+    where the configuration comes from, and the provider support matrix.
 
-    Admin-only. The response is safe to log: every secret field is
-    replaced with its env-var provenance (name + set/unset flag + length).
+    Nothing here can change the configuration (Helm owns it). The response
+    holds no secret: the routing snapshot's public URL is the only address.
     """
-    effective = _current_effective_config(dependencies=dependencies)
-
+    active = dependencies.cloud_router.active
     try:
         active_row = await dependencies.store.get_active_main_cloud_backend_instance()
     except Exception:
         active_row = None
     authority = active_row.get("authority") if isinstance(active_row, dict) else None
-    overlay_value: dict[str, Any] = {}
-    overlay_updated_at: Optional[str] = None
-    credentials_ref: Optional[str] = None
-    activation_revision = 0
-    secret_refs: dict[str, str] = {}
-    if authority is not None:
-        overlay_value = authority.routing
-        secret_refs = authority.secret_refs
-        overlay_value["__secret_fields__"] = sorted(secret_refs)
-        distinct_refs = set(secret_refs.values())
-        if len(distinct_refs) == 1:
-            credentials_ref = next(iter(distinct_refs))
-        activated_at = active_row.get("activated_at")
-        overlay_updated_at = (
-            activated_at.isoformat() if activated_at is not None else None
-        )
-        activation_revision = int(active_row.get("activation_revision") or 0)
-        effective.update(authority.routing)
-        effective["backend_instance_id"] = authority.backend_instance_id
-
-    secret_provenance: dict[str, dict[str, Any]] = {}
-    for field, reference in secret_refs.items():
-        secret_provenance[field] = _env_var_provenance(reference.removeprefix("env:"))
-
-    return {
-        "effective": effective,
-        "activation_revision": activation_revision,
-        "backend_instance": (
-            {
-                "id": authority.backend_instance_id,
-                "routing_sha256": authority.routing_sha256,
-                "installation_proof_sha256": (authority.installation_proof_sha256),
-                "secret_revision": authority.secret_revision,
-            }
-            if authority is not None
-            else None
-        ),
-        "overlay": {
-            # Compatibility name for the existing Cockpit form. This is the
-            # immutable active routing snapshot, not system_settings authority.
-            "present": authority is not None,
-            "value": overlay_value,
-            "credentials_ref": credentials_ref,
-            "updated_at": overlay_updated_at,
-            "updated_by": None,
-        },
-        "secrets": secret_provenance,
-        "allowed_backends": sorted(_MAIN_CLOUD_ALLOWED_BACKENDS),
-    }
-
-
-async def put_main_cloud_settings(
-    *,
-    body: dict[str, Any],
-    admin: dict[str, Any],
-    dependencies: MainCloudSettingsDependencies,
-) -> dict[str, Any]:
-    """Attest and CAS-activate a new main-cloud backend instance.
-
-    Admin-only. The request body is ``{"value": {...}, "credentials_ref": "env:..."}``:
-
-    * ``value.backend_id`` must be one of ``allowed_backends``.
-    * Secret fields in ``value`` are silently dropped by the sanitizer —
-      never persist secrets in the DB. Rotate via the secret store.
-    * ``credentials_ref`` is an optional pointer (e.g. ``env:NEW_VAR``)
-      that the loader resolves for secret fields at read time.
-    * ``expected_activation_revision`` must match the GET snapshot.
-    * Routing edits create a new immutable instance UUID. Secret-reference
-      edits rotate only the exact same proven installation.
-    * Other replicas resolve the durable pointer via the pg_notify LISTEN task.
-    """
-    postgres_db = dependencies.store
-
-    value_in = body.get("value") or {}
-    if not isinstance(value_in, dict):
-        raise HTTPException(status_code=400, detail="`value` must be an object")
-    backend_id = value_in.get("backend_id")
-    if backend_id not in _MAIN_CLOUD_ALLOWED_BACKENDS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"unknown backend_id {backend_id!r}; "
-                f"must be one of {sorted(_MAIN_CLOUD_ALLOWED_BACKENDS)}"
-            ),
-        )
-    credentials_ref = body.get("credentials_ref")
-    if credentials_ref is not None and not isinstance(credentials_ref, str):
-        raise HTTPException(
-            status_code=400, detail="`credentials_ref` must be a string or null"
-        )
-    expected_activation_revision = body.get("expected_activation_revision")
-    if (
-        type(expected_activation_revision) is not int
-        or expected_activation_revision < 0
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="`expected_activation_revision` must be a non-negative integer",
-        )
-
-    clean_value = _sanitize_main_cloud_value(backend_id, value_in)
-
-    # Validate the proposed config before persisting — raises on
-    # missing required fields so we fail fast with a 422-style message.
-    from orchestrator.services.cloud.config import (
-        load_main_cloud_config,
-        missing_secret_envs,
+    backend_id = authority.backend_id if authority is not None else active.backend_id
+    declared = provider_capabilities(backend_id)
+    activated_at = (
+        active_row.get("activated_at") if isinstance(active_row, dict) else None
     )
-
-    probe_overlay = {
-        "value": clean_value,
-        "credentials_ref": credentials_ref,
-    }
-    try:
-        load_main_cloud_config(db_overlay=probe_overlay)
-    except Exception as e:
-        raise HTTPException(
-            status_code=400, detail=f"invalid main cloud config: {e}"
-        ) from e
-
-    # Fail loud if the backend's real secrets are not wired (Issue 5). The
-    # loader above validates the *shape* but silently substitutes built-in dev
-    # defaults for missing secrets, so a config that could only ever connect
-    # with `admin` / `agent-service-dev` would otherwise persist + activate and
-    # fail much later at the first cloud call (surviving restarts). Refuse here,
-    # naming the exact env var(s) to set.
-    missing = missing_secret_envs(backend_id, probe_overlay)
-    if missing:
-        names = ", ".join(sorted({m["env_var"] for m in missing}))
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"secret env not set for backend {backend_id!r}: {names}. "
-                "Wire the secret(s) into the orchestrator env (Helm/Vault) or "
-                "point `credentials_ref` at a set env var, then retry. Refusing "
-                "to activate a backend that would fall back to built-in dev "
-                "credentials."
-            ),
-        )
-
-    actor = str(admin.get("id") or admin.get("email") or "admin")
-    try:
-        activated = await activate_main_cloud_config(
-            postgres_db,
-            dependencies.cloud_router,
-            db_overlay=probe_overlay,
-            expected_activation_revision=expected_activation_revision,
-            activated_by=actor,
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "main cloud backend attestation failed; no unverified adapter "
-                f"was activated: {e}"
-            ),
-        ) from e
-    if activated is None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "main cloud activation authority changed; reload the current "
-                "settings and retry"
-            ),
-        )
-
-    # Fan-out to other replicas via pg_notify. Best-effort.
-    authority = activated["authority"]
-    try:
-        await postgres_db.delete_system_setting("main_cloud")
-    except Exception:
-        logger.warning(
-            "Failed to remove inert legacy main_cloud setting after activation",
-            exc_info=True,
-        )
-    await fire_reload(postgres_db, authority.backend_instance_id)
+    helm = helm_configuration_status(authority)
     return {
-        "status": "ok",
-        "backend_id": backend_id,
-        "backend_instance_id": authority.backend_instance_id,
-        "activation_revision": activated["activation_revision"],
-        "reloaded": True,
-    }
-
-
-async def test_main_cloud_settings(
-    *,
-    body: dict[str, Any],
-    dependencies: MainCloudSettingsDependencies,
-) -> dict[str, Any]:
-    """Dry-run a proposed main-cloud config without persisting.
-
-    Builds a backend from the proposed overlay, calls
-    ``ensure_initialized()``, and tears it down. Returns whether the
-    probe succeeded plus a short detail string. Useful for "Test"
-    buttons in the admin UI before the operator commits to saving.
-    """
-    value_in = body.get("value") or {}
-    backend_id = value_in.get("backend_id")
-    if backend_id not in _MAIN_CLOUD_ALLOWED_BACKENDS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"unknown backend_id {backend_id!r}",
-        )
-    credentials_ref = body.get("credentials_ref")
-
-    clean_value = _sanitize_main_cloud_value(backend_id, value_in)
-    probe_overlay = {
-        "value": clean_value,
-        "credentials_ref": credentials_ref,
-    }
-
-    # Issue 5: surface unwired secrets as the precise reason, instead of letting
-    # the probe connect with built-in dev credentials and report a cryptic
-    # upstream-auth failure.
-    from orchestrator.services.cloud.config import missing_secret_envs
-
-    missing = missing_secret_envs(backend_id, probe_overlay)
-    if missing:
-        names = ", ".join(sorted({m["env_var"] for m in missing}))
-        return {
-            "ok": False,
-            "detail": (
-                f"secret env not set for backend {backend_id!r}: {names} "
-                "(would fall back to built-in dev credentials). Wire the "
-                "secret(s) or set `credentials_ref` before testing."
+        "provider": {
+            "backend_id": backend_id,
+            "title": declared.title if declared is not None else backend_id,
+            "public_url": (
+                authority.routing.get("public_url") if authority is not None else None
             ),
-        }
-
-    try:
-        probe_backend = build_backend(db_overlay=probe_overlay)
-    except Exception:
-        error_ref = uuid4().hex[:12]
-        logger.exception(
-            "Main-cloud dry run: build_backend failed for backend %r (error_ref=%s)",
-            backend_id,
-            error_ref,
-        )
-        return {
-            "ok": False,
-            "detail": "build_backend failed",
-            "error_ref": error_ref,
-        }
-
-    try:
-        try:
-            ok = await probe_backend.ensure_initialized()
-        except Exception:
-            error_ref = uuid4().hex[:12]
-            logger.exception(
-                "Main-cloud dry run: ensure_initialized raised for backend %r "
-                "(error_ref=%s)",
-                backend_id,
-                error_ref,
-            )
-            return {
-                "ok": False,
-                "detail": "ensure_initialized raised",
-                "error_ref": error_ref,
-            }
-        if not ok:
-            return {
-                "ok": False,
-                "detail": "backend reported not initialized — check config + upstream",
-            }
-        health = await probe_backend.health_check()
-        return {
-            "ok": health.ok,
-            "detail": health.detail or "",
-            "latency_ms": health.latency_ms,
-        }
-    finally:
-        try:
-            await probe_backend.close()
-        except Exception:
-            pass
-
-
-async def reload_main_cloud_settings(
-    *, dependencies: MainCloudSettingsDependencies
-) -> dict[str, Any]:
-    """Force a local re-attestation of the durable active instance.
-
-    Admin-only. Useful when an operator has rotated a secret out-of-band
-    (new Keycloak client secret in .env) and wants this orchestrator
-    replica to rebuild its client after an out-of-band secret-value update.
-    The immutable secret reference and installation proof remain unchanged.
-    """
-    try:
-        ok = await reload_active_main_cloud_instance(
-            dependencies.store,
-            dependencies.cloud_router,
-            force_rebuild=True,
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"active instance re-attestation failed: {e}"
-        ) from e
-    if ok is not True:
-        raise HTTPException(
-            status_code=409,
-            detail="active instance changed during re-attestation; retry",
-        )
-    return {
-        "status": "ok",
-        "backend_id": dependencies.cloud_router.active.backend_id,
-        "backend_instance_id": dependencies.cloud_router.active_instance_id,
+            "backend_instance_id": (
+                authority.backend_instance_id if authority is not None else None
+            ),
+            "activation_revision": (
+                int(active_row.get("activation_revision") or 0)
+                if isinstance(active_row, dict)
+                else 0
+            ),
+            "activated_at": (
+                activated_at.isoformat() if activated_at is not None else None
+            ),
+            "initialized": bool(active.is_initialized),
+        },
+        "health": await _health(active),
+        "configuration": {
+            "source": "helm",
+            "helm": {
+                "state": helm.state,
+                "backend_id": helm.backend_id,
+                "detail": helm.detail,
+            },
+            "replace_installation": dependencies.replace_installation or None,
+        },
+        "matrix": provider_matrix(active=backend_id),
     }
 
 
@@ -828,54 +469,4 @@ async def repair_thread_mount_transport(
         "repairable": len(writes),
         "repaired": repaired,
         "skipped": skipped,
-    }
-
-
-async def delete_main_cloud_settings(
-    *,
-    admin: dict[str, Any],
-    dependencies: MainCloudSettingsDependencies,
-) -> dict[str, Any]:
-    """Attest and activate the current env-described installation.
-
-    History is retained; reset never deletes an instance referenced by an
-    existing project, session, grant, or staged review.
-    """
-    postgres_db = dependencies.store
-    current = await postgres_db.get_active_main_cloud_backend_instance()
-    expected_revision = (
-        int(current.get("activation_revision") or 0) if isinstance(current, dict) else 0
-    )
-    try:
-        activated = await activate_main_cloud_config(
-            postgres_db,
-            dependencies.cloud_router,
-            db_overlay=None,
-            expected_activation_revision=expected_revision,
-            activated_by=str(admin.get("id") or admin.get("email") or "admin"),
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"env-described main cloud attestation failed: {e}",
-        ) from e
-    if activated is None:
-        raise HTTPException(
-            status_code=409,
-            detail="main cloud activation authority changed; reload and retry",
-        )
-    try:
-        await postgres_db.delete_system_setting("main_cloud")
-    except Exception:
-        logger.warning(
-            "Failed to remove inert legacy main_cloud setting", exc_info=True
-        )
-    authority = activated["authority"]
-    await fire_reload(postgres_db, authority.backend_instance_id)
-    return {
-        "status": "ok",
-        "existed": current is not None,
-        "backend_id": authority.backend_id,
-        "backend_instance_id": authority.backend_instance_id,
-        "activation_revision": activated["activation_revision"],
     }

@@ -46,6 +46,11 @@ from uuid import UUID, uuid4
 import httpx
 
 from orchestrator.services.agent_cloud_mounts import _build_protected_cloud_mount
+from orchestrator.services.cloud import (
+    PROTECTED_PROJECT_FOLDER,
+    protected_provider,
+    provider_offers,
+)
 from orchestrator.services.cloud.protected_reader_authority import (
     ProtectedNextcloudReaderGrantPlan,
 )
@@ -137,7 +142,7 @@ def _ro_mount_matches_protected_selection(
         return False
     if not isinstance(ro_row.get("etag_baseline"), dict):
         return False
-    if str(ro_row.get("backend") or "") != "nextcloud":
+    if not provider_offers(ro_row.get("backend"), PROTECTED_PROJECT_FOLDER):
         return False
     if str(ro_row.get("auth_kind") or "") != "basic":
         return False
@@ -185,15 +190,16 @@ async def _resolve_protected_reader_backend(
 ):
     """Resolve the immutable installation captured by a protected attempt."""
 
+    expected_backend_id = protected_provider(plan.backend)
     try:
         return dependencies.cloud_router.for_backend_instance(
             plan.backend_instance_id,
-            expected_backend_id="nextcloud",
+            expected_backend_id=expected_backend_id,
         )
     except Exception:
         authority = await dependencies.store.get_main_cloud_backend_instance(
             plan.backend_instance_id,
-            expected_backend_id="nextcloud",
+            expected_backend_id=expected_backend_id,
         )
         if authority is None:
             raise RuntimeError("protected reader backend installation is unavailable")
