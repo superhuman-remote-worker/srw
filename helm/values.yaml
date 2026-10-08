@@ -331,11 +331,12 @@ orchestrator:
   # the workspace receives a short-lived lease token, and the driver exchanges
   # it for the credential on a dedicated orchestrator port.
   connectorLeases:
-    # -- The lease exchange's own container and Service port. It serves the
-    # exchange and introspection routes and nothing else, no ingress routes
-    # it, and the NetworkPolicy below admits only driver pods to it. 0 turns
-    # the exchange off. Never 8085 (the API port).
-    exchangePort: 8088
+    # -- The lease exchange's own container and Service port; 0 (the default)
+    # serves no exchange. It serves the exchange and introspection routes and
+    # nothing else, and no ingress routes it. Setting a port always renders
+    # the NetworkPolicy below, which admits only driver pods to it. Off until
+    # service-plane hosting (D5) brings the drivers that call it. Never 8085.
+    exchangePort: 0
     # -- Seconds a lease lives after its last renewal (decision 9: 900). The
     # leader renews leases of live executions in the second half of this
     # window; a paused Job's lease lapses after it. Minimum 60.
@@ -346,11 +347,11 @@ orchestrator:
     # a fake secret behind a lease so a gate can drive the lease lifecycle and
     # the exchange before a real lease driver exists. Never in production.
     probeDriver: false
+    # -- Rendered whenever exchangePort is set: the orchestrator pods' ingress
+    # keeps the API port (8085) open to every source, as today, and admits
+    # only pods in driverNamespace to the exchange port. There is no switch:
+    # the exchange is never served without it.
     networkPolicy:
-      # -- Restrict ingress to the orchestrator pods: the API port (8085)
-      # stays open to every source, as today; the exchange port admits only
-      # pods in driverNamespace.
-      enabled: true
       # -- The namespace connector driver pods run in. Empty selects
       # <release fullname>-connectors (service-plane hosting, D5).
       driverNamespace: ""

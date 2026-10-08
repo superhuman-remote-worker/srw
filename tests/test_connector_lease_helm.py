@@ -74,9 +74,24 @@ def _policy(docs: list[dict]) -> dict | None:
     )
 
 
-def test_the_exchange_has_its_own_port_and_the_probe_is_off():
+ON = "orchestrator.connectorLeases.exchangePort=8088"
+
+
+def test_the_exchange_is_off_by_default():
     docs = render()
     _deployment, container, service = _orchestrator(docs)
+    assert all(port.get("name") != "lease-exchange" for port in container["ports"])
+    assert [port["port"] for port in service["spec"]["ports"]] == [8085]
+    env = _env(container)
+    assert env["CONNECTOR_LEASE_EXCHANGE_PORT"] == "0"
+    assert env["CONNECTOR_LEASE_TTL_SECONDS"] == "900"
+    assert env["CONNECTOR_LEASE_PROBE_ENABLED"] == "false"
+    # No ingress policy on the orchestrator of a cluster without drivers.
+    assert _policy(docs) is None
+
+
+def test_a_set_port_gets_its_own_container_and_service_port():
+    _deployment, container, service = _orchestrator(render(ON))
     assert {"name": "lease-exchange", "containerPort": 8088} in container["ports"]
     ports = {port["name"]: port for port in service["spec"]["ports"]}
     assert ports["http"]["port"] == 8085
@@ -85,14 +100,11 @@ def test_the_exchange_has_its_own_port_and_the_probe_is_off():
         "port": 8088,
         "targetPort": "lease-exchange",
     }
-    env = _env(container)
-    assert env["CONNECTOR_LEASE_EXCHANGE_PORT"] == "8088"
-    assert env["CONNECTOR_LEASE_TTL_SECONDS"] == "900"
-    assert env["CONNECTOR_LEASE_PROBE_ENABLED"] == "false"
+    assert _env(container)["CONNECTOR_LEASE_EXCHANGE_PORT"] == "8088"
 
 
-def test_the_policy_keeps_the_api_open_and_admits_only_drivers_to_the_exchange():
-    policy = _policy(render())
+def test_a_set_port_always_gets_the_policy():
+    policy = _policy(render(ON))
     assert policy is not None
     assert policy["spec"]["policyTypes"] == ["Ingress"]
     api, exchange = policy["spec"]["ingress"]
@@ -106,10 +118,13 @@ def test_the_policy_keeps_the_api_open_and_admits_only_drivers_to_the_exchange()
             }
         }
     }
+    # There is no switch to serve the port without it.
+    with pytest.raises(subprocess.CalledProcessError):
+        render(ON, "orchestrator.connectorLeases.networkPolicy.enabled=false")
 
 
 def test_no_ingress_routes_the_exchange_port():
-    for doc in render():
+    for doc in render(ON):
         if doc["kind"] != "Ingress":
             continue
         for rule in doc["spec"].get("rules", []):
@@ -119,17 +134,9 @@ def test_no_ingress_routes_the_exchange_port():
                 assert port.get("name") != "lease-exchange"
 
 
-def test_port_zero_turns_the_exchange_and_its_policy_off():
-    docs = render("orchestrator.connectorLeases.exchangePort=0")
-    _deployment, container, service = _orchestrator(docs)
-    assert all(port.get("name") != "lease-exchange" for port in container["ports"])
-    assert [port["port"] for port in service["spec"]["ports"]] == [8085]
-    assert _env(container)["CONNECTOR_LEASE_EXCHANGE_PORT"] == "0"
-    assert _policy(docs) is None
-
-
-def test_the_driver_namespace_and_the_policy_switch_are_settable():
+def test_the_driver_namespace_and_the_probe_are_settable():
     docs = render(
+        ON,
         "orchestrator.connectorLeases.networkPolicy.driverNamespace=drivers",
         "orchestrator.connectorLeases.probeDriver=true",
     )
@@ -138,10 +145,6 @@ def test_the_driver_namespace_and_the_policy_switch_are_settable():
     assert selector["matchLabels"]["kubernetes.io/metadata.name"] == "drivers"
     _deployment, container, _service = _orchestrator(docs)
     assert _env(container)["CONNECTOR_LEASE_PROBE_ENABLED"] == "true"
-    assert (
-        _policy(render("orchestrator.connectorLeases.networkPolicy.enabled=false"))
-        is None
-    )
 
 
 def test_the_api_port_is_refused_as_the_exchange_port():
@@ -149,11 +152,12 @@ def test_the_api_port_is_refused_as_the_exchange_port():
         render("orchestrator.connectorLeases.exchangePort=8085")
 
 
-def test_the_k3d_profile_turns_the_probe_on_with_a_short_window():
+def test_the_k3d_profile_serves_the_exchange_with_the_probe_and_a_short_window():
     example = yaml.safe_load(
         (ROOT / "deployment/values-local.yaml.example").read_text()
     )
     leases = example["orchestrator"]["connectorLeases"]
+    assert leases["exchangePort"] == 8088
     assert leases["probeDriver"] is True
     assert leases["ttlSeconds"] <= 300
     assert leases["sweepIntervalSeconds"] <= leases["ttlSeconds"] / 4

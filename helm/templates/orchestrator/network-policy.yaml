@@ -1,5 +1,5 @@
 {{- $leases := .Values.orchestrator.connectorLeases }}
-{{- if and $leases.exchangePort $leases.networkPolicy.enabled }}
+{{- if $leases.exchangePort }}
 {{- $driverNamespace := $leases.networkPolicy.driverNamespace | default (printf "%s-connectors" (include "srw.fullname" .)) }}
 # Orchestrator ingress (connector drivers C2, "Reachability").
 #

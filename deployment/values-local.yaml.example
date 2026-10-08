@@ -276,10 +276,12 @@ orchestrator:
   # Uncomment to turn it off for this cluster:
   # sessionSubagentFanoutLanes: ""
   # Connector credential leases (connector drivers C2): the k3d profile
-  # installs the development lease probe driver and shortens the lease window
-  # so scripts/k3d-credential-lease-gate.py can watch a paused Job's lease
-  # lapse and an idle session's lease outlive it in minutes, not 15.
+  # serves the exchange port (with its NetworkPolicy), installs the
+  # development lease probe driver and shortens the lease window so
+  # scripts/k3d-credential-lease-gate.py can watch a paused Job's lease lapse
+  # and an idle session's lease outlive it in minutes, not 15.
   connectorLeases:
+    exchangePort: 8088
     probeDriver: true
     ttlSeconds: 120
     sweepIntervalSeconds: 15

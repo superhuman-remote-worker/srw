@@ -1604,7 +1604,7 @@
               "minimum": 0,
               "maximum": 65535,
               "not": {"const": 8085},
-              "description": "The lease exchange's own port; 0 turns it off. Never the API port."
+              "description": "The lease exchange's own port; 0 (the default) serves no exchange. Never the API port. A set port always renders the exchange NetworkPolicy."
             },
             "ttlSeconds": {"type": "integer", "minimum": 60},
             "sweepIntervalSeconds": {"type": "integer", "minimum": 5},
@@ -1616,7 +1616,6 @@
               "type": "object",
               "additionalProperties": false,
               "properties": {
-                "enabled": {"type": "boolean"},
                 "driverNamespace": {"type": "string"}
               }
             }
