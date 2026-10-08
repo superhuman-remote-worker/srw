@@ -27,6 +27,7 @@ from fastapi import FastAPI
 
 from orchestrator.application import (
     completion as completion_composition,
+    connectors as connectors_composition,
     http,
     lifecycle,
     routes,
@@ -40,7 +41,7 @@ from orchestrator.database import (
     PostgresDB,
 )
 from orchestrator.security.auth import set_provisioning_backends
-from orchestrator.services import connector_credential_leases
+from orchestrator.services import connector_credential_leases, connector_service_images
 from orchestrator.services import ssh_access as ssh_access_operations
 from orchestrator.services.catalogue_resources import CatalogueResources
 from orchestrator.services.cloud import MainCloudRouter, build_backend
@@ -202,6 +203,11 @@ def build_application_resources(
     connector_credential_leases.configure_lease_window(
         ttl_seconds=settings.connector_lease_ttl_seconds,
         sweep_seconds=settings.connector_lease_sweep_seconds,
+    )
+    # Service driver images (D5): the reference each service driver runs and
+    # how a bind resolves it, process-wide like the lease window.
+    connector_service_images.configure_service_images(
+        connectors_composition.service_image_settings(resources)
     )
     if settings.connector_lease_probe_enabled:
         logger.warning(

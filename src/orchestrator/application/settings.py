@@ -79,6 +79,11 @@ def parse_positive_number(
     return max(minimum, number)
 
 
+def parse_name_list(raw: str | None) -> frozenset[str]:
+    """A comma-separated list of names (hosts, CIDRs); blanks are dropped."""
+    return frozenset(item.strip() for item in (raw or "").split(",") if item.strip())
+
+
 def parse_session_subagent_fanout_lanes(raw: str | None) -> frozenset[str]:
     """The lanes named by ``SESSION_SUBAGENT_FANOUT_LANES``.
 
@@ -171,6 +176,13 @@ class DeploymentSettings:
     #: (``orchestrator.connectorLeases.sweepIntervalSeconds``); the sweeper
     #: never waits longer than a quarter of the TTL.
     connector_lease_sweep_seconds: float = 60.0
+    #: Driver image resolution (``connectors.drivers.registry``, D5):
+    #: registries reached over plain HTTP, extra bearer-token hosts, how long
+    #: a resolution is reused, and the deadline of one lookup.
+    connector_driver_registry_insecure_hosts: frozenset[str] = frozenset()
+    connector_driver_registry_token_hosts: frozenset[str] = frozenset()
+    connector_driver_resolve_cache_seconds: float = 60.0
+    connector_driver_resolve_timeout_seconds: float = 10.0
 
     def session_subagent_fanout(self, lane: str | None) -> bool:
         """Whether a session on ``lane`` may fan out right now."""
@@ -224,6 +236,24 @@ class DeploymentSettings:
                 default=60.0,
                 minimum=5.0,
             ),
+            connector_driver_registry_insecure_hosts=parse_name_list(
+                os.environ.get("CONNECTOR_DRIVER_REGISTRY_INSECURE_HOSTS")
+            ),
+            connector_driver_registry_token_hosts=parse_name_list(
+                os.environ.get("CONNECTOR_DRIVER_REGISTRY_TOKEN_HOSTS")
+            ),
+            connector_driver_resolve_cache_seconds=parse_positive_number(
+                "CONNECTOR_DRIVER_RESOLVE_CACHE_SECONDS",
+                os.environ.get("CONNECTOR_DRIVER_RESOLVE_CACHE_SECONDS"),
+                default=60.0,
+                minimum=0.0,
+            ),
+            connector_driver_resolve_timeout_seconds=parse_positive_number(
+                "CONNECTOR_DRIVER_RESOLVE_TIMEOUT_SECONDS",
+                os.environ.get("CONNECTOR_DRIVER_RESOLVE_TIMEOUT_SECONDS"),
+                default=10.0,
+                minimum=1.0,
+            ),
         )
 
 
@@ -232,6 +262,7 @@ __all__ = [
     "SESSION_SUBAGENT_FANOUT_LANES_ENV",
     "DeploymentSettings",
     "parse_exchange_port",
+    "parse_name_list",
     "parse_positive_number",
     "parse_session_subagent_fanout_lanes",
 ]

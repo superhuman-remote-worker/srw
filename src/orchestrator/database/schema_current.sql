@@ -26780,6 +26780,39 @@ COMMENT ON TABLE public.connector_driver_identities IS 'Connector driver identit
 
 
 --
+-- Name: connector_driver_images; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.connector_driver_images (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    driver text NOT NULL,
+    reference text NOT NULL,
+    digest text NOT NULL,
+    entrypoint jsonb DEFAULT '[]'::jsonb NOT NULL,
+    cmd jsonb DEFAULT '[]'::jsonb NOT NULL,
+    spec jsonb,
+    spec_hash text,
+    protocol_version text NOT NULL,
+    first_resolved_at timestamp with time zone DEFAULT now() NOT NULL,
+    resolved_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT connector_driver_images_cmd_check CHECK ((jsonb_typeof(cmd) = 'array'::text)),
+    CONSTRAINT connector_driver_images_digest_check CHECK ((digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT connector_driver_images_driver_check CHECK ((driver <> ''::text)),
+    CONSTRAINT connector_driver_images_entrypoint_check CHECK ((jsonb_typeof(entrypoint) = 'array'::text)),
+    CONSTRAINT connector_driver_images_protocol_check CHECK ((protocol_version ~ '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'::text)),
+    CONSTRAINT connector_driver_images_reference_check CHECK (((reference <> ''::text) AND (char_length(reference) <= 512))),
+    CONSTRAINT connector_driver_images_spec_check CHECK (((spec IS NULL) OR (jsonb_typeof(spec) = 'object'::text)))
+);
+
+
+--
+-- Name: TABLE connector_driver_images; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.connector_driver_images IS 'Connector driver image resolutions: one row per (driver, reference, digest) with the image entrypoint, command and spec label. Written at bind; read by the service-pod launch and the moved-tag check.';
+
+
+--
 -- Name: contact_addresses; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -33650,6 +33683,22 @@ ALTER TABLE ONLY public.connector_driver_identities
 
 
 --
+-- Name: connector_driver_images connector_driver_images_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_images
+    ADD CONSTRAINT connector_driver_images_key UNIQUE (driver, reference, digest);
+
+
+--
+-- Name: connector_driver_images connector_driver_images_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_images
+    ADD CONSTRAINT connector_driver_images_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: contact_addresses contact_addresses_owner_user_id_channel_address_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -36797,6 +36846,20 @@ CREATE INDEX idx_connector_driver_identities_connector ON public.connector_drive
 --
 
 CREATE INDEX idx_connector_driver_identities_pod ON public.connector_driver_identities USING btree (pod_uid) WHERE ((revoked_at IS NULL) AND (pod_uid IS NOT NULL));
+
+
+--
+-- Name: idx_connector_driver_images_digest; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_driver_images_digest ON public.connector_driver_images USING btree (driver, digest);
+
+
+--
+-- Name: idx_connector_driver_images_latest; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_driver_images_latest ON public.connector_driver_images USING btree (driver, reference, resolved_at DESC);
 
 
 --

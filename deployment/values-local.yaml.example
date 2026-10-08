@@ -303,6 +303,13 @@ connectors:
   servicePods:
     enabled: true
     maxInstallation: 4
+  drivers:
+    registry:
+      # The k3d registry Tilt pushes driver images to; the orchestrator pod
+      # resolves `srw-registry` on the k3d network and reaches it over HTTP.
+      insecureHosts: ["srw-registry:5000"]
+      # A re-pushed tag is seen within seconds (the gate's moved-tag check).
+      resolveCacheSeconds: 5
 
 databases:
   # Non-HA local default. All five PostgreSQL engines continue to inherit

@@ -190,6 +190,21 @@ connectors:
       # -- One Secret and one Service per service pod, plus room for D6.
       secrets: 64
       services: 32
+  drivers:
+    # -- How a bind resolves a driver image reference to a digest. Any
+    # registry may serve a driver image; anonymous pulls only (private
+    # registries need pull credentials SRW does not hold yet).
+    registry:
+      # -- Registries reached over plain HTTP (host[:port]), e.g. the k3d
+      # registry. Everything else is HTTPS.
+      insecureHosts: []
+      # -- Extra bearer-token hosts a registry may send SRW to. The
+      # registry's own host and auth.docker.io are always allowed.
+      tokenHosts: []
+      # -- Seconds a tag's resolution is reused before the next lookup.
+      resolveCacheSeconds: 60
+      # -- Deadline of one registry lookup at bind.
+      resolveTimeoutSeconds: 10
 
 orchestrator:
   # -- 1 replica by default. NOT a statement about what HA needs: leader

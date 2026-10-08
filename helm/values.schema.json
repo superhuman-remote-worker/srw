@@ -1427,6 +1427,27 @@
               }
             }
           }
+        },
+        "drivers": {
+          "type": "object",
+          "properties": {
+            "registry": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "insecureHosts": {
+                  "type": "array",
+                  "items": {"type": "string", "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]{1,5})?$"}
+                },
+                "tokenHosts": {
+                  "type": "array",
+                  "items": {"type": "string", "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]{1,5})?$"}
+                },
+                "resolveCacheSeconds": {"type": "integer", "minimum": 0},
+                "resolveTimeoutSeconds": {"type": "integer", "minimum": 1}
+              }
+            }
+          }
         }
       }
     },

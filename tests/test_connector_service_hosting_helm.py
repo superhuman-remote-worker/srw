@@ -189,3 +189,44 @@ def test_the_k3d_profile_turns_hosting_on_and_renders():
     docs = in_namespace(render(values=(example,)), "srw-connectors")
     assert one(docs, "Namespace")
     assert one(docs, "NetworkPolicy", "srw-connectors-default-deny")
+
+
+def orchestrator_env(docs: list[dict]) -> dict[str, str]:
+    deployment = next(
+        doc
+        for doc in docs
+        if doc["kind"] == "Deployment"
+        and doc["metadata"]["name"].endswith("-orchestrator")
+    )
+    container = next(
+        c
+        for c in deployment["spec"]["template"]["spec"]["containers"]
+        if c["name"] == "orchestrator"
+    )
+    return {item["name"]: item.get("value") for item in container.get("env", [])}
+
+
+def test_driver_image_resolution_settings_reach_the_orchestrator():
+    env = orchestrator_env(render())
+    assert env["CONNECTOR_DRIVER_REGISTRY_INSECURE_HOSTS"] == ""
+    assert env["CONNECTOR_DRIVER_REGISTRY_TOKEN_HOSTS"] == ""
+    assert env["CONNECTOR_DRIVER_RESOLVE_CACHE_SECONDS"] == "60"
+    assert env["CONNECTOR_DRIVER_RESOLVE_TIMEOUT_SECONDS"] == "10"
+    env = orchestrator_env(
+        render(
+            "connectors.drivers.registry.insecureHosts[0]=srw-registry:5000",
+            "connectors.drivers.registry.insecureHosts[1]=other:5000",
+            "connectors.drivers.registry.tokenHosts[0]=tokens.example",
+        )
+    )
+    assert env["CONNECTOR_DRIVER_REGISTRY_INSECURE_HOSTS"] == (
+        "srw-registry:5000,other:5000"
+    )
+    assert env["CONNECTOR_DRIVER_REGISTRY_TOKEN_HOSTS"] == "tokens.example"
+
+
+def test_the_k3d_profile_resolves_from_the_k3d_registry_over_http():
+    example = ROOT / "deployment/values-local.yaml.example"
+    registry = yaml.safe_load(example.read_text())["connectors"]["drivers"]["registry"]
+    assert registry["insecureHosts"] == ["srw-registry:5000"]
+    assert registry["resolveCacheSeconds"] <= 10

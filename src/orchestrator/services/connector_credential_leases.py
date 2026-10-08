@@ -499,12 +499,24 @@ async def deliver_connector_leases(
                 "Driver %s has no access levels; no lease delivered", spec.name
             )
             continue
+        image_digest = None
+        if spec.plane == "service":
+            # A service driver's binding runs on one image digest, resolved
+            # (and checked when it moved) at bind; it keys the shared pod.
+            from orchestrator.services.connector_service_images import (
+                bind_service_image,
+            )
+
+            image_digest = await bind_service_image(
+                conn, spec=spec, connector_id=connector_id, owner=owner
+            )
         lease = await issue_or_redeliver(
             conn,
             owner=owner,
             connector_id=connector_id,
             driver=spec.name,
             access=access,
+            image_digest=image_digest,
             ttl_seconds=ttl_seconds,
         )
         entry["credentials"] = {

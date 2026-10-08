@@ -846,7 +846,11 @@ class TestLeaseOwner:
         ]
         issued: list[str] = []
 
-        async def issue(_conn, *, owner, connector_id, driver, access, ttl_seconds):
+        async def issue(
+            _conn, *, owner, connector_id, driver, access, image_digest, ttl_seconds
+        ):
+            # A lease driver outside the service plane runs on no image.
+            assert image_digest is None
             issued.append(connector_id.lower())
             return SimpleNamespace(id="l", connector_id=connector_id, token="scl_x")
 

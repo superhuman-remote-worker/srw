@@ -1,4 +1,5 @@
-"""Connector credential leases: the exchange port and the sweeper (slice C2).
+"""Connector credential leases: the exchange port and the sweeper (slice C2),
+and service-plane driver hosting (D5): driver image resolution.
 
 The exchange runs as a second, minimal ASGI application on its own port in
 the orchestrator process (``orchestrator.connectorLeases.exchangePort``, off
@@ -36,6 +37,8 @@ from orchestrator.services.connector_lease_exchange import (
     ConnectorLeaseExchange,
     DenialLimiter,
 )
+from orchestrator.services.connector_service_images import ServiceImageSettings
+from shared.oci_registry import DEFAULT_TOKEN_HOSTS, RegistryResolver
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +129,35 @@ class BodyLimit:
                 raise
         if overflow and not started:
             await self._refuse(send)
+
+
+def service_image_settings(resources: ApplicationResources) -> ServiceImageSettings:
+    """How this application resolves service driver images (D5).
+
+    Each installed service-plane driver names its image reference. Any
+    registry may serve a driver image (there is no allow-list); plain HTTP
+    only for the hosts the chart names, and a bearer-token challenge only to
+    the registry's own host, Docker Hub's or a host the chart names.
+    """
+    settings = resources.settings
+    references = {
+        driver.spec.name: driver.image_reference
+        for driver in resources.connector_drivers.drivers()
+        if driver.spec.plane == "service" and getattr(driver, "image_reference", "")
+    }
+    return ServiceImageSettings(
+        references=references,
+        resolver=RegistryResolver(
+            hosts=None,
+            insecure_hosts=settings.connector_driver_registry_insecure_hosts,
+            token_hosts=DEFAULT_TOKEN_HOSTS
+            | settings.connector_driver_registry_token_hosts,
+            same_host_tokens=True,
+            timeout=settings.connector_driver_resolve_timeout_seconds,
+        ),
+        cache_seconds=settings.connector_driver_resolve_cache_seconds,
+        timeout_seconds=settings.connector_driver_resolve_timeout_seconds,
+    )
 
 
 def connector_lease_exchange(
@@ -250,4 +282,5 @@ __all__ = [
     "connector_lease_exchange_app",
     "exchange_server_config",
     "serve_connector_lease_exchange",
+    "service_image_settings",
 ]

@@ -1886,6 +1886,17 @@ spec:
               value: {{ .Values.orchestrator.connectorLeases.sweepIntervalSeconds | quote }}
             - name: CONNECTOR_LEASE_PROBE_ENABLED
               value: {{ .Values.orchestrator.connectorLeases.probeDriver | quote }}
+            # Driver image resolution (connector drivers D5).
+            {{- with .Values.connectors.drivers.registry }}
+            - name: CONNECTOR_DRIVER_REGISTRY_INSECURE_HOSTS
+              value: {{ join "," .insecureHosts | quote }}
+            - name: CONNECTOR_DRIVER_REGISTRY_TOKEN_HOSTS
+              value: {{ join "," .tokenHosts | quote }}
+            - name: CONNECTOR_DRIVER_RESOLVE_CACHE_SECONDS
+              value: {{ .resolveCacheSeconds | quote }}
+            - name: CONNECTOR_DRIVER_RESOLVE_TIMEOUT_SECONDS
+              value: {{ .resolveTimeoutSeconds | quote }}
+            {{- end }}
             - name: KB_EXTERNAL_REINDEX_CONCURRENCY
               value: {{ .Values.orchestrator.kbExternalReindexConcurrency | quote }}
             - name: KB_REINDEX_SWEEP_SECONDS
