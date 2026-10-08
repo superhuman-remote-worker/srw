@@ -11,16 +11,29 @@ scrubbed from every printed line, every in-pod program capping its own memory,
 and a cleanup in ``finally`` that touches only what this run created and then
 checks for residue by gate id.
 
-Why a real forge. A git swap driver pod may reach neither the cluster's pod
-and service ranges nor (on k3d) the docker network the node and load
-balancer live on: those are refused by design, so the in-cluster Gitea is out
-of reach. It verifies its upstream's certificate against public roots (v1
-has no private upstream CA), so an HTTPS git server this gate started on the
-workstation would be refused too. The least-bad option is the operator's own
-DISPOSABLE repository on a public forge (GitHub, GitLab.com, Gitea.com) and a
-token that can read and push it, passed as a file. The gate pushes branches
-named srw-gate-<gate id>[-...] there and deletes them again at cleanup,
-directly with the token from this workstation (never through a workspace).
+The upstream. A git swap driver pod may reach neither the cluster's pod and
+service ranges nor (on k3d) the docker network the node and load balancer
+live on: those are refused by design, so the in-cluster Gitea's Service is
+out of reach. Two ways:
+
+  --self-hosted-upstream (self-contained) publishes that Gitea through
+      Traefik at <gate id>.<LAN IP>.sslip.io, the workstation's private LAN
+      address (outside clusterCidrs and refusedCidrs; k3d's load balancer
+      publishes 443 there), with a TLS certificate a CA this run makes
+      signs. The connectors carry that CA as their upstream_ca and the
+      gate's project is on the home-allowed tier, so a driver pod may reach
+      the address. A disposable Gitea user owns the repository, a renamed
+      one (Gitea answers git for its old name with a redirect) and the
+      token. A pod in the driver namespace proves the address reachable
+      first. Cleanup removes the Ingress, its Secret, the probe and the
+      user with its repositories. The host's needs are in --help.
+  --upstream-url and --upstream-token-file: the operator's own DISPOSABLE
+      repository on a public forge (GitHub, GitLab.com, Gitea.com) and a
+      token that can read and push it, passed as a file.
+
+Either way the gate pushes branches named srw-gate-<gate id>[-...] there and
+deletes them again at cleanup, directly with the token from this workstation
+(never through a workspace).
 
 It needs the k3d profile of deployment/values-local.yaml.example (keys in
 --help) and Tilt, which builds srw-driver-shim and srw-driver-git-swap and pins
@@ -30,13 +43,17 @@ Fixtures (all disposable, named after the gate id):
 
   client      ``<gate id>-oauth``, a public Keycloak client with direct
               access grants, which the owner logs in with (the D3c fixture)
-  project     one project of the owner
+  project     one project of the owner (self-hosted: on home-allowed)
   connectors  of the owner, repository connectors with token auth, all on
-              the operator's token: ``rw`` (--upstream-url, linked ReadWrite),
-              ``ro`` (the same URL, linked read-only, so it binds ReadOnly),
-              ``redirect`` (--redirect-url, a repository whose forge answers
-              git with a redirect) and ``private`` (--private-url, a host
-              inside the cluster's service range, with a fake token)
+              the upstream token: ``rw`` (--upstream-url or the self-hosted
+              repository, linked ReadWrite), ``ro`` (the same URL, linked
+              read-only, so it binds ReadOnly), ``redirect`` (--redirect-url
+              or the renamed self-hosted repository's old URL: the forge
+              answers git with a redirect) and ``private`` (--private-url, a
+              host inside the cluster's service range, with a fake token);
+              self-hosted, the first three carry the gate's CA
+  self-hosted the Ingress and its TLS Secret, a Gitea user with its token
+              and two repositories, and a reach probe in the driver namespace
   sessions    ``one`` (rw and ro) and ``two`` (rw, redirect and private),
               stateless
 
@@ -49,7 +66,10 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               matrix; migrations applied; room for three pods; the driver
               namespace's baseline and default deny, enforced (the 12-probe
               harness); refusedCidrs covers the node; the forge host resolves
-              and answers from the orchestrator
+              and answers from the orchestrator; self-hosted: home-allowed is
+              a private tier, a LAN address outside clusterCidrs and
+              refusedCidrs, the Gitea fixture, and a pod in the driver
+              namespace reaching the address on 443
   startup     each swap pod's canary wait ran first and exited 0; the driver
               runs the pinned swap image with every capability dropped and no
               ServiceAccount token; its Secret holds its TLS certificate and
@@ -107,6 +127,8 @@ mutating gate.
 
   .venv/bin/python scripts/k3d-git-swap-gate.py           # plan
   .venv/bin/python scripts/k3d-git-swap-gate.py \\
+      --run --confirm LOCAL-K3D-DISPOSABLE --self-hosted-upstream
+  .venv/bin/python scripts/k3d-git-swap-gate.py \\
       --run --confirm LOCAL-K3D-DISPOSABLE \\
       --upstream-url https://github.com/<you>/<disposable>.git \\
       --upstream-token-file ~/.config/srw-gate/<disposable>.token
@@ -116,6 +138,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import hashlib
 import ipaddress
 import json
@@ -127,6 +150,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -921,6 +945,584 @@ class Api:
         return parsed
 
 
+# ---------------------------------------------------------------------------
+# The self-hosted upstream (--self-hosted-upstream)
+# ---------------------------------------------------------------------------
+
+#: The project tier the gate puts its project on: a driver pod reaches a
+#: private address only for a connector whose every project is on one of
+#: connectors.servicePods.privateTiers (the chart's default lists this one).
+SELF_HOSTED_TIER = "home-allowed"
+#: The sslip.io wildcard DNS: <anything>.<a-b-c-d>.sslip.io answers a.b.c.d,
+#: so the gate never edits the cluster's or the workstation's DNS.
+SSLIP_DOMAIN = "sslip.io"
+#: Interfaces that never carry the workstation's LAN address: loopback,
+#: container and VM bridges, the cluster's own, VPN tunnels.
+_NOT_LAN = re.compile(
+    r"(lo|docker\d*|br-.*|veth.*|cni\d*|flannel.*|k3d.*|virbr\d*|vnet\d*|"
+    r"tailscale\d*|wg\d*|tun\d*|tap\d*|podman\d*|cali.*|vxlan.*|kube.*)"
+)
+
+
+def lan_ipv4_candidates(ip_addr_output: str) -> list[tuple[str, str]]:
+    """``(interface, address)`` of every private global IPv4 address that
+    ``ip -4 -o addr show`` lists on a LAN-like interface."""
+    found: list[tuple[str, str]] = []
+    for line in ip_addr_output.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or parts[2] != "inet" or "global" not in parts:
+            continue
+        interface = parts[1].split("@", 1)[0]
+        if _NOT_LAN.fullmatch(interface):
+            continue
+        try:
+            address = ipaddress.ip_interface(parts[3]).ip
+        except ValueError:
+            continue
+        if (
+            address.version == 4
+            and address.is_private
+            and not (address.is_loopback or address.is_link_local)
+        ):
+            found.append((interface, str(address)))
+    return found
+
+
+def choose_lan_ip(candidates: list[tuple[str, str]], refused: list[str]) -> str | None:
+    """The first candidate outside every refused range: the cluster's own
+    ranges (clusterCidrs) and refusedCidrs, which no driver pod may reach."""
+    networks = []
+    for cidr in refused:
+        try:
+            networks.append(ipaddress.ip_network(cidr.strip(), strict=False))
+        except ValueError:
+            continue
+    for _interface, address in candidates:
+        ip = ipaddress.ip_address(address)
+        if not any(ip.version == net.version and ip in net for net in networks):
+            return address
+    return None
+
+
+def sslip_host(gate_id: str, address: str) -> str:
+    return f"{gate_id}.{address.replace('.', '-')}.{SSLIP_DOMAIN}"
+
+
+def make_gate_ca(host: str) -> tuple[str, str, str]:
+    """A CA the gate makes and a server certificate for ``host`` it signs:
+    ``(ca_pem, cert_pem, key_pem)``. Strict verifiers (OpenSSL 3.5's
+    X509_STRICT, Go) want the CA's key usage and key identifier and the
+    leaf's SAN, server-auth usage and authority key identifier."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+    def usage(*, sign: bool) -> x509.KeyUsage:
+        return x509.KeyUsage(
+            digital_signature=True,
+            content_commitment=False,
+            key_encipherment=False,
+            data_encipherment=False,
+            key_agreement=False,
+            key_cert_sign=sign,
+            crl_sign=sign,
+            encipher_only=False,
+            decipher_only=False,
+        )
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "SRW C3 gate CA")])
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name)
+        .issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(days=2))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(usage(sign=True), critical=True)
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()),
+            critical=False,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    key = ec.generate_private_key(ec.SECP256R1())
+    leaf = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host[:64])]))
+        .issuer_name(ca_name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(host)]), False)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
+        .add_extension(usage(sign=False), critical=True)
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), False)
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+            critical=False,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    return (
+        ca.public_bytes(serialization.Encoding.PEM).decode("ascii"),
+        leaf.public_bytes(serialization.Encoding.PEM).decode("ascii"),
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode("ascii"),
+    )
+
+
+def forge_objects(
+    *,
+    gate_id: str,
+    namespace: str,
+    host: str,
+    service: str,
+    port: int,
+    cert_pem: str,
+    key_pem: str,
+) -> list[dict[str, Any]]:
+    """The TLS Secret and the Ingress that publish the in-cluster Gitea at
+    ``host`` through Traefik (k3d's load balancer publishes 443 on the
+    workstation's addresses)."""
+    name = f"srw-gate-{gate_id}"
+    labels = {GATE_LABEL: gate_id}
+    backend = {"service": {"name": service, "port": {"number": port}}}
+    return [
+        {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "type": "kubernetes.io/tls",
+            "metadata": {
+                "name": f"{name}-tls",
+                "namespace": namespace,
+                "labels": labels,
+            },
+            "data": {
+                "tls.crt": base64.b64encode(cert_pem.encode()).decode(),
+                "tls.key": base64.b64encode(key_pem.encode()).decode(),
+            },
+        },
+        {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {"name": name, "namespace": namespace, "labels": labels},
+            "spec": {
+                "ingressClassName": "traefik",
+                "tls": [{"hosts": [host], "secretName": f"{name}-tls"}],
+                "rules": [
+                    {
+                        "host": host,
+                        "http": {
+                            "paths": [
+                                {"path": "/", "pathType": "Prefix", "backend": backend}
+                            ]
+                        },
+                    }
+                ],
+            },
+        },
+    ]
+
+
+_REACH_SCRIPT = r"""
+for i in 1 2 3 4 5 6 7 8; do
+  out=$(wget -q -T 5 -O /dev/null "http://$1:443/" 2>&1)
+  if [ $? -eq 0 ] || echo "$out" | grep -q "server returned error"; then
+    echo reach=ok
+    exit 0
+  fi
+  sleep 3
+done
+echo "reach=failed $out"
+"""
+
+
+def reach_probe_objects(
+    *, gate_id: str, namespace: str, address: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """A NetworkPolicy and a busybox pod in the driver namespace: does a
+    pod there reach ``address``:443 (the hairpin a driver pod takes)? The
+    policy opens that one address and port, as a pinned driver's does. The
+    pod has a deadline, so it counts as a bind-time pod, never against the
+    service pods' room."""
+    name = f"{gate_id}-reach"
+    labels = {GATE_LABEL: gate_id, "srw.io/gate-probe": "reach"}
+    policy = {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {"name": name, "namespace": namespace, "labels": labels},
+        "spec": {
+            "podSelector": {"matchLabels": labels},
+            "policyTypes": ["Egress"],
+            "egress": [
+                {
+                    "to": [{"ipBlock": {"cidr": f"{address}/32"}}],
+                    "ports": [{"protocol": "TCP", "port": 443}],
+                }
+            ],
+        },
+    }
+    pod = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": name, "namespace": namespace, "labels": labels},
+        "spec": {
+            "restartPolicy": "Never",
+            "activeDeadlineSeconds": 150,
+            "automountServiceAccountToken": False,
+            "containers": [
+                {
+                    "name": "reach",
+                    "image": "busybox:1.36",
+                    # Plain HTTP to the TLS port: any HTTP answer (Traefik's
+                    # 400) proves the connection, as the default-deny probe's
+                    # "server returned error" does.
+                    "command": ["sh", "-c", _REACH_SCRIPT, "reach", address],
+                    "securityContext": {
+                        "allowPrivilegeEscalation": False,
+                        "capabilities": {"drop": ["ALL"]},
+                    },
+                }
+            ],
+        },
+    }
+    return policy, pod
+
+
+# The Gitea API from the orchestrator's pod, at its internal URL and with
+# its admin credentials, which never leave the pod. The disposable user's
+# password travels on stdin; its new token comes back (the gate scrubs it
+# from every printed line).
+_GITEA_PROGRAM = (
+    _POD_MEMORY_CAP
+    + r"""
+import base64, json, os, sys, urllib.error, urllib.request
+cap_memory()
+request = json.loads(sys.stdin.readline())
+base = (
+    os.environ.get("GITEA_INTERNAL_URL") or os.environ.get("GITEA_URL", "")
+).rstrip("/") + "/api/v1"
+def basic(user, password):
+    return "Basic " + base64.b64encode((user + ":" + password).encode()).decode()
+admin = basic(
+    os.environ.get("GITEA_ADMIN_USER", "srw"), os.environ.get("GITEA_ADMIN_PASSWORD", "")
+)
+user = request["user"]
+def call(method, path, body=None, auth=admin):
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Authorization": auth, "Accept": "application/json"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    sent = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(sent, timeout=30) as response:
+            raw = response.read()
+            return response.status, json.loads(raw) if raw.strip() else None
+    except urllib.error.HTTPError as exc:
+        return exc.code, None
+    except (OSError, ValueError) as exc:
+        return type(exc).__name__, None
+out = {}
+action = request["action"]
+if action == "create":
+    statuses = []
+    status, _body = call("POST", "/admin/users", {
+        "username": user, "login_name": user, "source_id": 0,
+        "email": user + "@gate.invalid", "password": request["password"],
+        "must_change_password": False,
+    })
+    statuses.append(status)
+    if status == 201:
+        status, made = call(
+            "POST", "/users/" + user + "/tokens",
+            {"name": request["token_name"],
+             "scopes": ["write:repository", "write:user"]},
+            auth=basic(user, request["password"]),
+        )
+        statuses.append(status)
+        if status == 201 and isinstance(made, dict) and made.get("sha1"):
+            out["token"] = made["sha1"]
+            token = "token " + made["sha1"]
+            for name in (request["repo"], request["old_repo"]):
+                statuses.append(call("POST", "/user/repos", {
+                    "name": name, "auto_init": True, "private": True,
+                    "default_branch": "main",
+                }, auth=token)[0])
+            statuses.append(call(
+                "PATCH", "/repos/" + user + "/" + request["old_repo"],
+                {"name": request["moved_repo"]}, auth=token,
+            )[0])
+    out["statuses"] = statuses
+elif action == "delete":
+    out["status"] = call("DELETE", "/admin/users/" + user + "?purge=true")[0]
+elif action == "exists":
+    out["status"] = call("GET", "/users/" + user)[0]
+print(json.dumps(out))
+"""
+)
+
+#: The answers of a complete "create": the user, its token, two repositories
+#: and the rename.
+GITEA_CREATED = [201, 201, 201, 201, 200]
+
+
+class SelfHostedForge:
+    """The gate's own upstream: the in-cluster Gitea, published through
+    Traefik at ``<gate id>.<lan ip>.sslip.io`` on the workstation's LAN
+    address (k3d's load balancer publishes 443 there), with a server
+    certificate a CA this run makes signs. The connectors carry that CA as
+    their ``upstream_ca`` and the project is on the ``home-allowed`` tier,
+    so a driver pod may reach the private address. A disposable Gitea user
+    owns the repository and a renamed one, whose old name Gitea answers git
+    with a redirect for (the redirect check). Cleanup removes all of it."""
+
+    def __init__(self, gate: Any) -> None:
+        self.gate = gate
+        self.address = ""
+        self.host = ""
+        self.ca_pem = ""
+        self.user = f"srw-{gate.gate_id}"
+        self.password = secret(secrets.token_urlsafe(24))
+        self.token = ""
+        self.repo = f"{gate.gate_id}-repo"
+        self.old_repo = f"{gate.gate_id}-old"
+        self.moved_repo = f"{gate.gate_id}-moved"
+        self.scratch: str | None = None
+        self.user_started = False
+        self.objects_started = False
+        self.probe_started = False
+
+    def gitea(self, action: str, **extra: Any) -> dict[str, Any]:
+        return in_pod(
+            ORCHESTRATOR,
+            ORCHESTRATOR_CONTAINER,
+            _GITEA_PROGRAM,
+            {"action": action, "user": self.user, **extra},
+        )
+
+    def prepare(self, env: dict[str, str]) -> None:
+        """In the preflight, before the upstream checks: the address, the
+        name, the CA and the Ingress, the Gitea user, its token and
+        repositories, and a pod in the driver namespace reaching the
+        address."""
+        gate = self.gate
+        tiers = [
+            tier.strip()
+            for tier in env.get("CONNECTOR_SERVICE_PRIVATE_TIERS", "").split(",")
+        ]
+        gate.report.check(
+            f"self-hosted: the {SELF_HOSTED_TIER} tier lets driver pods reach "
+            "private addresses (connectors.servicePods.privateTiers)",
+            SELF_HOSTED_TIER in tiers,
+            f"privateTiers={tiers}",
+        )
+        if SELF_HOSTED_TIER not in tiers:
+            raise GateError(
+                f"add {SELF_HOSTED_TIER} to connectors.servicePods.privateTiers"
+            )
+        refused = [
+            cidr.strip()
+            for name in (
+                "CONNECTOR_SERVICE_CLUSTER_CIDRS",
+                "CONNECTOR_SERVICE_REFUSED_CIDRS",
+            )
+            for cidr in env.get(name, "").split(",")
+            if cidr.strip()
+        ]
+        rc, listing, _err = run(["ip", "-4", "-o", "addr", "show"], timeout=30)
+        candidates = lan_ipv4_candidates(listing if rc == 0 else "")
+        self.address = choose_lan_ip(candidates, refused) or ""
+        gate.report.check(
+            "self-hosted: this workstation has a private LAN IPv4 address "
+            "outside clusterCidrs and refusedCidrs",
+            bool(self.address),
+            f"chose {self.address or 'none'} of {candidates}; refused {refused}",
+        )
+        if not self.address:
+            raise GateError(
+                "no LAN IPv4 address a driver pod may reach: connect the "
+                "workstation to a LAN (an address outside the ranges above), "
+                "or use --upstream-url"
+            )
+        self.host = sslip_host(gate.gate_id, self.address)
+        internal = urllib.parse.urlsplit(gate.orchestrator_env("GITEA_INTERNAL_URL"))
+        if not internal.hostname:
+            raise GateError("the orchestrator names no GITEA_INTERNAL_URL")
+        service = internal.hostname.split(".", 1)[0]
+        self.ca_pem, cert_pem, key_pem = make_gate_ca(self.host)
+        secret(key_pem)
+        self.objects_started = True
+        command(
+            K + ["apply", "-f", "-"],
+            data=json.dumps(
+                {
+                    "apiVersion": "v1",
+                    "kind": "List",
+                    "items": forge_objects(
+                        gate_id=gate.gate_id,
+                        namespace=LOCAL_NAMESPACE,
+                        host=self.host,
+                        service=service,
+                        port=internal.port or 80,
+                        cert_pem=cert_pem,
+                        key_pem=key_pem,
+                    ),
+                }
+            ),
+        )
+        self.user_started = True
+        made = self.gitea(
+            "create",
+            password=self.password,
+            token_name=gate.gate_id,
+            repo=self.repo,
+            old_repo=self.old_repo,
+            moved_repo=self.moved_repo,
+        )
+        if isinstance(made.get("token"), str):
+            self.token = secret(made["token"])
+        statuses = made.get("statuses")
+        created = statuses == GITEA_CREATED and bool(self.token)
+        gate.report.check(
+            "self-hosted: a disposable Gitea user owns the repository and a "
+            "renamed one, whose old name Gitea redirects",
+            created,
+            f"{statuses} (user, token, repository, repository, rename); 401 or "
+            "403 first: the orchestrator's GITEA_ADMIN_* credentials",
+        )
+        if not created:
+            raise GateError("the Gitea fixture was not created")
+        self.scratch = tempfile.mkdtemp(prefix="srw-gate-")
+        token_file = Path(self.scratch) / "token"
+        token_file.touch(mode=0o600)
+        token_file.write_text(self.token)
+        ca_file = Path(self.scratch) / "ca.pem"
+        ca_file.write_text(self.ca_pem)
+        gate.token = self.token
+        gate.token_file = str(token_file)
+        gate.git_ca_file = str(ca_file)
+        gate.upstream_ca = self.ca_pem
+        gate.upstream = f"https://{self.host}/{self.user}/{self.repo}.git"
+        gate.redirect = f"https://{self.host}/{self.user}/{self.old_repo}.git"
+        gate.urls.update(rw=gate.upstream, ro=gate.upstream, redirect=gate.redirect)
+        print(f"self-hosted upstream: {gate.upstream} ({self.address})", flush=True)
+        self.reach()
+
+    def reach(self) -> None:
+        """A pod in the driver namespace reaches the address on 443."""
+        gate = self.gate
+        policy, pod = reach_probe_objects(
+            gate_id=gate.gate_id, namespace=gate.namespace, address=self.address
+        )
+        name = pod["metadata"]["name"]
+        self.probe_started = True
+        command(
+            gate.kc + ["apply", "-f", "-"],
+            data=json.dumps(
+                {"apiVersion": "v1", "kind": "List", "items": [policy, pod]}
+            ),
+        )
+
+        def finished() -> bool:
+            phase = command(
+                gate.kc + ["get", "pod", name, "-o", "jsonpath={.status.phase}"]
+            )
+            return phase in ("Succeeded", "Failed")
+
+        wait_for("the reach probe finished", finished, timeout=240, interval=5)
+        _rc, log, _err = run(gate.kc + ["logs", name], timeout=60)
+        reached = "reach=ok" in log
+        gate.report.check(
+            f"self-hosted: a pod in {gate.namespace} reaches {self.address}:443 "
+            "(the way a driver pod takes, through k3d's load balancer)",
+            reached,
+            "reached"
+            if reached
+            else f"{log.strip()[-120:] or 'no log'}: k3d must publish 443 on the "
+            "host (scripts/local-dev-up.sh multi-host mode: "
+            "--port 443:443@loadbalancer), and the host firewall must accept "
+            "443 from the k3d docker network (firewalld: the bridge in the "
+            "docker zone, or firewall-cmd --zone=<its zone> --add-service=https)",
+        )
+        self.delete_probe()
+        if not reached:
+            raise GateError(
+                f"{self.address}:443 is not reachable from {gate.namespace}"
+            )
+
+    def delete_probe(self) -> bool:
+        gate = self.gate
+        command(
+            gate.kc
+            + ["delete", "pod,networkpolicy", "-l"]
+            + [f"{GATE_LABEL}={gate.gate_id},srw.io/gate-probe=reach"]
+            + ["--ignore-not-found", "--wait=true", "--timeout=120s"]
+        )
+        return True
+
+    def cleanup(self, step: Callable[[str, Callable[[], Any]], None]) -> None:
+        gate = self.gate
+        if self.probe_started and gate.namespace:
+            step("delete the reach probe", self.delete_probe)
+        if self.objects_started:
+            step(
+                "delete the self-hosted Ingress and its TLS Secret",
+                lambda: command(
+                    K
+                    + ["delete", "ingress,secret", "-l", f"{GATE_LABEL}={gate.gate_id}"]
+                    + ["--ignore-not-found", "--wait=true", "--timeout=120s"]
+                )
+                is not None,
+            )
+        if self.user_started:
+            step(
+                "delete the disposable Gitea user and its repositories",
+                lambda: self.gitea("delete").get("status") in (204, 404),
+            )
+        if self.scratch:
+            shutil.rmtree(self.scratch, ignore_errors=True)
+            self.scratch = None
+
+    def residue(self) -> list[str]:
+        gate = self.gate
+        left: list[str] = []
+        if self.objects_started:
+            listed = run(
+                K
+                + ["get", "ingress,secret", "-l", f"{GATE_LABEL}={gate.gate_id}"]
+                + ["-o", "name"],
+                timeout=60,
+            )[1]
+            if listed:
+                left.append(f"self-hosted objects {listed.split()}")
+        if self.probe_started and gate.namespace:
+            listed = run(
+                gate.kc
+                + ["get", "pod,networkpolicy", "-l", f"{GATE_LABEL}={gate.gate_id}"]
+                + ["-o", "name"],
+                timeout=60,
+            )[1]
+            if listed:
+                left.append(f"driver-namespace probe objects {listed.split()}")
+        if self.user_started:
+            status = self.gitea("exists").get("status")
+            if status != 404:
+                left.append(f"Gitea user {self.user} (HTTP {status})")
+        return left
+
+
 PLAN = [
     "preflight: orchestrator and stateless agent pods serve this checkout's C3 "
     "modules; hosting on with an exchange and canary port, a digest-pinned shim "
@@ -928,6 +1530,11 @@ PLAN = [
     "migrations; room for three pods; the driver namespace's baseline and "
     "default deny, enforced (12-probe harness); refusedCidrs covers the node; "
     "the forge host resolves and answers from the orchestrator",
+    "self-hosted (--self-hosted-upstream, in the preflight): home-allowed is a "
+    "private tier; a LAN IPv4 outside clusterCidrs and refusedCidrs; Gitea "
+    "published at <gate id>.<LAN IP>.sslip.io with the gate's CA; a disposable "
+    "user, token, repository and renamed repository; a pod in the driver "
+    "namespace reaches the address on 443; the project goes on home-allowed",
     "accounts: a disposable OAuth client the owner logs in with",
     "startup: each swap pod's canary wait ran first; the pinned swap image, "
     "capabilities dropped, no ServiceAccount token; its Secret holds its TLS "
@@ -990,9 +1597,15 @@ class GitSwapGate:
         self.token_file = args.upstream_token_file
         self.token = (
             secret(Path(self.token_file).expanduser().read_text().strip())
-            if args.run
+            if args.run and self.token_file
             else ""
         )
+        #: --self-hosted-upstream: the in-cluster Gitea at a LAN name; it
+        #: sets the upstream, the redirect, the token (file) and the CA in
+        #: the preflight.
+        self.forge = SelfHostedForge(self) if args.self_hosted_upstream else None
+        self.git_ca_file: str | None = None
+        self.upstream_ca: str | None = None
         self.fake = secret(f"srw-gate-fake-{secrets.token_hex(16)}")
         self.private = args.private_url
         self.urls = {
@@ -1189,10 +1802,14 @@ class GitSwapGate:
     def upstream_git(self, *args: str, url: str | None = None) -> tuple[int, str]:
         """git on this workstation against the forge with the operator's
         token, which reaches git only through an askpass program that reads
-        the token file (never argv, never an environment value)."""
+        the token file (never argv, never an environment value). A
+        self-hosted upstream is trusted by the gate's CA only."""
         git = shutil.which("git")
         if git is None:
             raise GateError("git is not installed on this workstation")
+        if not self.token_file:
+            raise GateError("no upstream token yet")
+        trust = ["-c", f"http.sslCAInfo={self.git_ca_file}"] if self.git_ca_file else []
         with tempfile.TemporaryDirectory(prefix="srw-gate-") as scratch:
             askpass = Path(scratch) / "askpass"
             askpass.write_text(
@@ -1210,7 +1827,8 @@ class GitSwapGate:
                 "GIT_CONFIG_NOSYSTEM": "1",
             }
             rc, out, err = run(
-                [git, "-c", "credential.helper=", *args[:1], target, *args[1:]],
+                [git, "-c", "credential.helper=", *trust, *args[:1], target]
+                + list(args[1:]),
                 env=env,
                 timeout=120,
             )
@@ -1299,6 +1917,8 @@ class GitSwapGate:
                 "CONNECTOR_SERVICE_MAX_INSTALLATION",
                 "CONNECTOR_SERVICE_RECONCILE_SECONDS",
                 "CONNECTOR_SERVICE_REFUSED_CIDRS",
+                "CONNECTOR_SERVICE_CLUSTER_CIDRS",
+                "CONNECTOR_SERVICE_PRIVATE_TIERS",
                 "CONNECTOR_SERVICE_NODE_IP",
             )
         }
@@ -1396,6 +2016,8 @@ class GitSwapGate:
         )
         if not _IPV4_RE.fullmatch(self.orchestrator_ip):
             raise GateError("the orchestrator Service has no IPv4 ClusterIP")
+        if self.forge is not None:
+            self.forge.prepare(env)
         for url in dict.fromkeys(self.urls.values()):
             host = url.split("://", 1)[1].split("/", 1)[0]
             upstream = in_pod(
@@ -1412,7 +2034,15 @@ class GitSwapGate:
                 if upstream.get("reachable")
                 else f"{upstream.get('error')}: on k3d a dead DNS upstream after a "
                 "host network change; restart the node: docker restart "
-                "k3d-srw-server-0",
+                "k3d-srw-server-0"
+                + (
+                    "; for sslip.io a resolver that drops private answers for "
+                    "public names (DNS rebinding protection) on the host or "
+                    "router; for a refused connection the k3d load balancer's "
+                    "443 or the host firewall"
+                    if self.forge is not None
+                    else ""
+                ),
             )
             if not upstream.get("reachable"):
                 raise GateError(f"{host} is not reachable")
@@ -1481,6 +2111,14 @@ class GitSwapGate:
             json.dumps((swap or {}).get("trust")),
         )
 
+    def connector_config(self, label: str) -> dict[str, Any]:
+        """The forge, and for a self-hosted upstream the gate's CA (the
+        driver trusts it, and only it, for that connector)."""
+        config: dict[str, Any] = {"forge": self.args.forge}
+        if self.upstream_ca and label != "private":
+            config["upstream_ca"] = self.upstream_ca
+        return config
+
     def create_connector(self, label: str) -> str:
         """POST a token repository connector; its id is recorded before
         anything checks it."""
@@ -1497,7 +2135,7 @@ class GitSwapGate:
                     "auth_method": "token",
                     "token": self.fake if label == "private" else self.token,
                 },
-                "config": {"forge": self.args.forge},
+                "config": self.connector_config(label),
             },
         )
         if isinstance(parsed, dict) and parsed.get("id"):
@@ -1517,6 +2155,8 @@ class GitSwapGate:
             },
         )
         self.project = str(created["id"])
+        if self.forge is not None:
+            self.home_allowed()
         for label in ("rw", "ro", "redirect", "private"):
             self.create_connector(label)
             self.owner.ok(
@@ -1525,6 +2165,32 @@ class GitSwapGate:
                 {"read_only": label == "ro"},
             )
         print(f"fixture: project {self.project}, connectors {self.connectors}")
+
+    def home_allowed(self) -> None:
+        """The project on the tier that lets its connectors' pods reach the
+        LAN name: by the API when the owner is an admin (the tier is
+        admin-gated), else on the app database (a disposable project)."""
+        path = f"/api/projects/{self.project}"
+        status, _body = self.owner.call(
+            "PATCH", path, {"network_tier": SELF_HOSTED_TIER}
+        )
+        how = "the API"
+        if status in (401, 403):
+            sql(
+                f"UPDATE projects SET network_tier = {lit(SELF_HOSTED_TIER)} "
+                f"WHERE id = {lit(self.project)}"
+            )
+            how = "SQL (the owner is no admin)"
+        elif status not in (200, 204):
+            raise GateError(f"PATCH {path} -> HTTP {status}")
+        tier = sql(f"SELECT network_tier FROM projects WHERE id = {lit(self.project)}")
+        self.report.check(
+            f"self-hosted: the gate's project is on the {SELF_HOSTED_TIER} tier",
+            tier == SELF_HOSTED_TIER,
+            f"{tier} (set by {how})",
+        )
+        if tier != SELF_HOSTED_TIER:
+            raise GateError(f"the project's tier is {tier!r}")
 
     def create_session(
         self, label: str, connectors: list[str], *, fallback: tuple[str, ...] = ()
@@ -2200,6 +2866,9 @@ class GitSwapGate:
                 return True
 
             step("delete this run's refs upstream", delete_branches)
+        if self.forge is not None:
+            # Last: the refs above are deleted with its token.
+            self.forge.cleanup(step)
         for problem in problems:
             print(f"cleanup: {problem} failed", flush=True)
         return problems
@@ -2284,7 +2953,10 @@ class GitSwapGate:
             )["items"]
             if listing:
                 left.append(f"pods {GATE_LABEL}={self.gate_id} in {self.namespace}")
-        if self.pushed:
+        if self.forge is not None:
+            # The repositories went with the disposable user.
+            left += self.forge.residue()
+        elif self.pushed:
             try:
                 upstream = [ref for ref in self.upstream_refs() if self.gate_id in ref]
                 if upstream:
@@ -2332,6 +3004,15 @@ class GitSwapGate:
                             "threads": self.threads,
                             "project": self.project,
                             "branch": self.branch,
+                            "self_hosted": (
+                                {
+                                    "upstream": self.upstream,
+                                    "gitea_user": self.forge.user,
+                                    "token_dir": self.forge.scratch,
+                                }
+                                if self.forge is not None
+                                else None
+                            ),
                         }
                     )
                 )
@@ -2372,8 +3053,28 @@ VALUES_LOCAL_KEYS = """values-local.yaml keys (the k3d profile of values-local.y
   connectors.drivers.gitSwap.fallback: token-in-url
   connectors.drivers.ca: {}                      (the chart generates SRW's driver CA)
 Tilt overrides the shim and swap images (repository, tag, digest). The upstream
-is the operator's disposable repository on a public forge (--upstream-url and
---upstream-token-file): driver pods may not reach the in-cluster Gitea.
+is either the operator's disposable repository on a public forge
+(--upstream-url and --upstream-token-file), or, with --self-hosted-upstream,
+the in-cluster Gitea at a name on the workstation's LAN address, which also
+needs:
+  connectors.servicePods.privateTiers: [home-allowed]   (the chart default;
+                                         the gate puts its project on it)
+  connectors.servicePods.clusterCidrs and refusedCidrs must not cover the
+      workstation's LAN address (the k3d profile's do not cover 192.168/16
+      or a 10.x outside 10.42/10.43; 172.16/12 is refused, so a LAN there
+      cannot be used)
+  the k3d cluster in multi-host mode (scripts/local-dev-up.sh's default):
+      its load balancer publishes 443 on all host addresses
+  the host accepting 443 from the k3d docker network on its LAN address
+      (firewalld: docker puts its bridges in the "docker" zone, target
+      ACCEPT; if the k3d bridge is in another zone: firewall-cmd
+      --zone=<zone> --add-service=https)
+  public DNS for sslip.io from the cluster and the host, with no DNS
+      rebinding protection dropping private answers (some routers,
+      dnsmasq stop-dns-rebind, Pi-hole); the gate's preflight says which
+      step failed
+  the orchestrator's GITEA_INTERNAL_URL and GITEA_ADMIN_* (the chart sets
+      them); nothing on the host is changed and nothing needs restoring
 """
 
 
@@ -2426,6 +3127,18 @@ def build_parser() -> argparse.ArgumentParser:
             "refuses): it must fall back visibly; it gets a fake token"
         ),
     )
+    parser.add_argument(
+        "--self-hosted-upstream",
+        action="store_true",
+        help=(
+            "instead of --upstream-url and --upstream-token-file: the gate "
+            "publishes the in-cluster Gitea at <gate id>.<LAN IP>.sslip.io "
+            "with a certificate its own CA signs (the connectors' upstream_ca), "
+            "puts its project on the home-allowed tier and makes a disposable "
+            "Gitea user, repository, renamed repository (the redirect) and "
+            "token; cleanup removes all of it (host needs: see below)"
+        ),
+    )
     parser.add_argument("--forge", choices=FORGES, help="defaults from the host")
     parser.add_argument("--keep", action="store_true", help="skip cleanup")
     return parser
@@ -2454,11 +3167,21 @@ def validate(args: argparse.Namespace) -> None:
                 f"--{name.replace('_', '-')} must be a clean https://host/path URL "
                 "(lowercase host, port 443, no credentials, no trailing slash)"
             )
-    if args.run:
+    if args.self_hosted_upstream:
+        if args.upstream_url or args.upstream_token_file:
+            raise SafetyError(
+                "--self-hosted-upstream makes its own repository and token: "
+                "drop --upstream-url and --upstream-token-file"
+            )
+        if args.forge not in (None, "gitea"):
+            raise SafetyError("--self-hosted-upstream is the in-cluster Gitea")
+        args.forge = "gitea"
+    elif args.run:
         if not args.upstream_url or not args.upstream_token_file:
             raise SafetyError(
-                "--run needs --upstream-url and --upstream-token-file: the "
-                "operator's disposable repository and a token for it"
+                "--run needs --upstream-url and --upstream-token-file (the "
+                "operator's disposable repository and a token for it), or "
+                "--self-hosted-upstream"
             )
         token_file = Path(args.upstream_token_file).expanduser()
         if not token_file.is_file() or not token_file.read_text().strip():
