@@ -2,7 +2,7 @@
 
 import json
 from unittest.mock import AsyncMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -203,6 +203,23 @@ async def test_ordinary_vm_approval_atomically_selects_terminal_cleanup(
         "orchestrator.services.completion.apply_terminal_job_side_effects",
         AsyncMock(return_value={}),
     )
+    # A credential lease still inside its window (connector drivers C2).
+    from orchestrator.services import connector_credential_leases as leases
+
+    connector = uuid4()
+    await db.execute(
+        "INSERT INTO datasources (id, name, type) VALUES ($1, $2, 'lease_probe')",
+        connector,
+        f"probe-{connector}",
+    )
+    async with db.acquire() as conn:
+        lease = await leases.issue_or_redeliver(
+            conn,
+            owner=leases.LeaseOwner.job(str(owner)),
+            connector_id=str(connector),
+            driver="srw.lease-probe/v1",
+            access="ReadWrite",
+        )
 
     result = await controls.approve_job(
         str(owner),
@@ -212,6 +229,13 @@ async def test_ordinary_vm_approval_atomically_selects_terminal_cleanup(
     )
 
     assert result["status"] == "approved" and result["cleanup_pending"] is True
+    assert (
+        await db.fetchval(
+            "SELECT revoke_reason FROM connector_credential_leases WHERE id = $1",
+            UUID(lease.id),
+        )
+        == "job_completed"
+    )
     row = await db.fetchrow("SELECT status,context FROM jobs WHERE id=$1", owner)
     assert row["status"] == "completed"
     assert json.loads(row["context"])["_job_terminal_vm_cleanup"] == {

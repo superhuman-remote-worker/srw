@@ -513,6 +513,26 @@ async def revoke_execution_leases(
     )
 
 
+async def revoke_execution_leases_with(
+    db: Any,
+    *,
+    job_id: Any = None,
+    thread_id: Any = None,
+    reason: RevokeReason,
+) -> None:
+    """:func:`revoke_execution_leases` on ``db`` after a decision committed
+    elsewhere; best effort, since the lease already stopped renewing."""
+    try:
+        async with db.acquire() as conn:
+            await revoke_execution_leases(
+                conn, job_id=job_id, thread_id=thread_id, reason=reason
+            )
+    except Exception:
+        logger.warning(
+            "Lease revoke failed after a terminal decision (%s)", reason, exc_info=True
+        )
+
+
 async def revoke_connector_leases(
     conn: Any,
     *,

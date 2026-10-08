@@ -28,6 +28,7 @@ from orchestrator.schemas.job_controls import (
     WorkspaceRecoveryRetryRequest,
 )
 from orchestrator.schemas.workspaces import VMCreateRequest
+from orchestrator.services import connector_credential_leases
 from orchestrator.services.grant_enforcement import GrantDenied
 from orchestrator.services.job_projection import (
     public_live_vm_status,
@@ -2332,6 +2333,11 @@ class JobControlOperations:
             # terminal branch). Without it an approved job got neither the merge
             # of its contracted deliverables nor a change record, and its work sat
             # on `job/<short_id>` forever. Best-effort: never fails the approval.
+            # Its credential leases (connector drivers C2) stopped renewing at
+            # pending_review; revoke what is left of their window.
+            await connector_credential_leases.revoke_execution_leases_with(
+                self.dependencies.store, job_id=job_id, reason="job_completed"
+            )
             try:
                 from orchestrator.services.completion import (
                     apply_terminal_job_side_effects,
