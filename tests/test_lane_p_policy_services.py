@@ -58,6 +58,7 @@ from orchestrator.services import session_tool_policy as session_tool_policy_mod
 from orchestrator.services import virtual_workspace as virtual_workspace_module
 from orchestrator.services import vm_workspace_policy as vm_workspace_policy_module
 from orchestrator.services import workspace_tier_policy as workspace_tier_policy_module
+from shared.connectors.builtin import MCP_STDIO_RETIRED
 
 # ---------------------------------------------------------------------------
 # Feature gates
@@ -94,12 +95,6 @@ _GATES = [
         gates.datasource_scope_auto_attach_v1_enabled,
         deployment_gates_module.datasource_scope_auto_attach_v1_enabled,
         "DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED",
-        False,
-    ),
-    (
-        gates.mcp_stdio_enabled,
-        deployment_gates_module.mcp_stdio_enabled,
-        "MCP_STDIO_ENABLED",
         False,
     ),
     (
@@ -140,10 +135,16 @@ def test_gate_vocabulary_matches_main(
 
 
 def test_gates_are_read_live_not_cached(monkeypatch):
-    monkeypatch.setenv("MCP_STDIO_ENABLED", "true")
-    assert gates.mcp_stdio_enabled() is True
-    monkeypatch.setenv("MCP_STDIO_ENABLED", "false")
-    assert gates.mcp_stdio_enabled() is False
+    monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "true")
+    assert gates.mcp_datasources_enabled() is True
+    monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "false")
+    assert gates.mcp_datasources_enabled() is False
+
+
+def test_the_stdio_gate_is_gone():
+    """Connector drivers D5b retired the agent-pod stdio path with its flag."""
+    assert not hasattr(gates, "mcp_stdio_enabled")
+    assert "mcp_stdio_enabled" not in deployment_gates_module.__all__
 
 
 # ---------------------------------------------------------------------------
@@ -192,9 +193,7 @@ _MCP_CASES = [
 
 
 @pytest.mark.parametrize(("url", "creds", "fragment"), _MCP_CASES)
-def test_validate_mcp_datasource_matches_main(monkeypatch, url, creds, fragment):
-    monkeypatch.delenv("MCP_STDIO_ENABLED", raising=False)
-
+def test_validate_mcp_datasource_matches_main(url, creds, fragment):
     def run(fn):
         try:
             fn(url, creds)
@@ -212,35 +211,21 @@ def test_validate_mcp_datasource_matches_main(monkeypatch, url, creds, fragment)
         assert moved[0] == 400
 
 
-def test_validate_mcp_datasource_reads_the_stdio_gate_from_the_new_module(monkeypatch):
-    """The moved body consults ``deployment_gates`` on every call, so env still steers."""
-    monkeypatch.delenv("MCP_STDIO_ENABLED", raising=False)
-    with pytest.raises(HTTPException) as off:
-        datasource_config.validate_mcp_datasource(None, {"transport": "stdio"})
-    assert "disabled on this deployment" in str(off.value.detail)
-
-    monkeypatch.setenv("MCP_STDIO_ENABLED", "true")
-    with pytest.raises(HTTPException) as on:
-        datasource_config.validate_mcp_datasource(None, {"transport": "stdio"})
-    assert "credentials.command" in str(on.value.detail)
-
-    datasource_config.validate_mcp_datasource(
-        None,
+@pytest.mark.parametrize(
+    "creds",
+    [
+        {"transport": "stdio"},
+        {"transport": " STDIO "},
         {"transport": "stdio", "command": "srv", "args": ["-x"], "env": {"A": "b"}},
-    )
-
-
-def test_validate_mcp_datasource_rejects_null_bytes(monkeypatch):
+    ],
+)
+def test_validate_mcp_datasource_refuses_every_stdio_server(monkeypatch, creds):
+    """Stdio is retired (connector drivers D5b), whatever the old flag says."""
     monkeypatch.setenv("MCP_STDIO_ENABLED", "true")
-    for creds in (
-        {"transport": "stdio", "command": "sr\x00v"},
-        {"transport": "stdio", "command": "srv", "args": ["a\x00"]},
-        {"transport": "stdio", "command": "srv", "env": {"A=B": "c"}},
-        {"transport": "stdio", "command": "srv", "env": {"A": 1}},
-        {"transport": "stdio", "command": "srv", "unknown": 1},
-    ):
-        with pytest.raises(HTTPException):
-            datasource_config.validate_mcp_datasource(None, creds)
+    with pytest.raises(HTTPException) as refused:
+        datasource_config.validate_mcp_datasource(None, creds)
+    assert refused.value.status_code == 400
+    assert refused.value.detail == MCP_STDIO_RETIRED
 
 
 # ---------------------------------------------------------------------------

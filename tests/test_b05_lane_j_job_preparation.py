@@ -136,7 +136,6 @@ def _datasource_payload_deps() -> (
     return agent_datasource_payload.DatasourcePayloadDependencies(
         logger=preparation_composition.logger,
         mcp_datasources_enabled=deployment_gates_module.mcp_datasources_enabled,
-        mcp_stdio_enabled=deployment_gates_module.mcp_stdio_enabled,
         connector_drivers=main.app.state.resources.connector_drivers,
         workspace_ssh_known_hosts=lambda: (
             main.app.state.resources.settings.workspace_ssh_known_hosts
@@ -822,16 +821,17 @@ class TestDatasourcePayload:
         ],
     )
     @pytest.mark.parametrize("mcp_on", [False, True])
-    @pytest.mark.parametrize("stdio_on", [False, True])
     def test_mcp_runtime_gate_answers_from_the_deployment_flags(
-        self, datasource, mcp_on, stdio_on, monkeypatch
+        self, datasource, mcp_on, monkeypatch
     ):
         """B06 deleted the `main` bridge this used to compare against, so the
-        gate is asserted against the two flags it actually reads instead of
+        gate is asserted against the flag it actually reads instead of
         against a second spelling of itself. The rows an agent receives
-        (``forwarded_datasources``) are where the gate applies."""
+        (``forwarded_datasources``) are where the gate applies. A stored
+        stdio server is never forwarded (connector drivers D5b), whatever
+        the retired ``MCP_STDIO_ENABLED`` says."""
         monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "true" if mcp_on else "false")
-        monkeypatch.setenv("MCP_STDIO_ENABLED", "true" if stdio_on else "false")
+        monkeypatch.setenv("MCP_STDIO_ENABLED", "true")
 
         allowed = bool(
             agent_datasource_payload.forwarded_datasources(
@@ -855,7 +855,7 @@ class TestDatasourcePayload:
         elif not mcp_on:
             assert allowed is False
         elif str(transport).lower() == "stdio":
-            assert allowed is stdio_on
+            assert allowed is False
         else:
             assert allowed is True
 
@@ -3606,13 +3606,6 @@ LATE_BINDING_TABLE = [
         "mcp_datasources_enabled",
         _OWNER,
         (deployment_gates_module, "mcp_datasources_enabled"),
-        None,
-    ),
-    (
-        _datasource_payload_deps,
-        "mcp_stdio_enabled",
-        _OWNER,
-        (deployment_gates_module, "mcp_stdio_enabled"),
         None,
     ),
     (

@@ -30,7 +30,6 @@ from orchestrator.services import agent_datasource_payload as payload_module
 from orchestrator.services.connector_drivers import builtin_connector_drivers
 from orchestrator.services.deployment_gates import (
     mcp_datasources_enabled,
-    mcp_stdio_enabled,
 )
 from shared.datasource_policy import datasource_tool_categories
 from tests._connector_goldens import Golden, all_rows, resolved_row
@@ -41,7 +40,6 @@ class ToolCase:
     rows: list[dict[str, Any]]
     config_override: dict[str, Any] | None = None
     mcp: bool = True
-    stdio: bool = True
     pinned_defect: str | None = None
 
 
@@ -117,10 +115,11 @@ CASES: dict[str, ToolCase] = {
     "mcp_datasources_gate_off": ToolCase(
         [resolved_row("mcp_remote"), resolved_row("postgresql")], mcp=False
     ),
-    "mcp_stdio_gate_off_with_remote": ToolCase(
-        [resolved_row("mcp_stdio"), resolved_row("mcp_remote")], stdio=False
+    # A stored stdio server is never delivered (connector drivers D5b).
+    "mcp_stdio_with_remote": ToolCase(
+        [resolved_row("mcp_stdio"), resolved_row("mcp_remote")]
     ),
-    "mcp_stdio_gate_off_alone": ToolCase([resolved_row("mcp_stdio")], stdio=False),
+    "mcp_stdio_alone": ToolCase([resolved_row("mcp_stdio")]),
     "mcp_read_only_link_still_wildcard": ToolCase(
         [resolved_row("mcp_remote", project_read_only=True)]
     ),
@@ -144,14 +143,10 @@ def golden():
 @pytest.fixture
 def gates(monkeypatch):
     def apply(case: ToolCase) -> None:
-        for name, on in (
-            ("MCP_DATASOURCES_ENABLED", case.mcp),
-            ("MCP_STDIO_ENABLED", case.stdio),
-        ):
-            if on:
-                monkeypatch.setenv(name, "true")
-            else:
-                monkeypatch.delenv(name, raising=False)
+        if case.mcp:
+            monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "true")
+        else:
+            monkeypatch.delenv("MCP_DATASOURCES_ENABLED", raising=False)
 
     return apply
 
@@ -163,7 +158,6 @@ def test_tool_categories_match_golden(case_id, golden, gates):
     dependencies = payload_module.DatasourcePayloadDependencies(
         logger=SimpleNamespace(warning=lambda *_args, **_kwargs: None),
         mcp_datasources_enabled=mcp_datasources_enabled,
-        mcp_stdio_enabled=mcp_stdio_enabled,
         connector_drivers=builtin_connector_drivers(),
         workspace_ssh_known_hosts=lambda: "",
     )

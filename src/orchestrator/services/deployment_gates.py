@@ -85,15 +85,6 @@ def datasource_scope_auto_attach_v1_enabled() -> bool:
     ).lower().strip() in ("true", "1", "yes")
 
 
-def mcp_stdio_enabled() -> bool:
-    """Whether MCP datasources may execute local stdio server commands."""
-    return os.getenv("MCP_STDIO_ENABLED", "").lower().strip() in (
-        "true",
-        "1",
-        "yes",
-    )
-
-
 def is_protected_cloud_mode_enabled() -> bool:
     """Whether protected cloud mode (RO-reader provisioning + capture overlay)
     is enabled for this deployment. Dev-ON / prod-OFF via the helm
@@ -131,7 +122,6 @@ __all__ = [
     "is_protected_cloud_mode_enabled",
     "is_skills_db_enabled",
     "mcp_datasources_enabled",
-    "mcp_stdio_enabled",
     "require_pinned_status_identity",
     "stateless_idle_conversation_rewind_enabled",
 ]

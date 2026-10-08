@@ -1,5 +1,7 @@
 """Agent-side MCP slice from datasource config through live tool loading."""
 
+import asyncio
+import socket
 import sys
 import textwrap
 
@@ -17,16 +19,17 @@ from agent.tools.registry import (
 
 ECHO_SERVER = textwrap.dedent(
     """
+    import sys
     from mcp.server.fastmcp import FastMCP
 
-    mcp = FastMCP("echo")
+    mcp = FastMCP("echo", host="127.0.0.1", port=int(sys.argv[1]), log_level="ERROR")
 
     @mcp.tool()
     def echo(text: str) -> str:
         \"\"\"Echo the input back.\"\"\"
         return f"echo: {text}"
 
-    mcp.run(transport="stdio")
+    mcp.run(transport="streamable-http")
     """
 )
 
@@ -58,26 +61,45 @@ def test_resolved_config_preserves_mcp_wildcard():
     assert "*" in get_all_tool_names(config)
 
 
+async def _wait_for_port(port: int) -> None:
+    for _ in range(100):
+        try:
+            _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.close()
+            await writer.wait_closed()
+            return
+        except OSError:
+            await asyncio.sleep(0.05)
+    raise AssertionError(f"test MCP server did not listen on port {port}")
+
+
 @pytest.mark.asyncio
 async def test_full_job_path_slice(tmp_path):
     script = tmp_path / "echo_server.py"
     script.write_text(ECHO_SERVER)
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    server = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(script),
+        str(port),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
     datasource = {
         "type": "mcp",
         "name": "Echo",
-        "connection_url": None,
-        "credentials": {
-            "transport": "stdio",
-            "command": sys.executable,
-            "args": [str(script)],
-            "env": {},
-        },
+        "connection_url": f"http://127.0.0.1:{port}/mcp",
+        "credentials": {"transport": "http"},
     }
 
-    connections, _ = open_harness([datasource])
-    manager = connections["mcp"]
-    await manager.connect_all()
+    manager = None
     try:
+        await _wait_for_port(port)
+        connections, _ = open_harness([datasource])
+        manager = connections["mcp"]
+        await manager.connect_all()
         register_mcp_tools(manager)
         manager.annotate_configs()
         assert datasource["_mcp_status"] == "connected"
@@ -89,4 +111,7 @@ async def test_full_job_path_slice(tmp_path):
         result = await tools[0].coroutine(text="hi")
         assert "echo: hi" in str(result)
     finally:
-        await manager.aclose()
+        if manager is not None:
+            await manager.aclose()
+        server.terminate()
+        await server.wait()

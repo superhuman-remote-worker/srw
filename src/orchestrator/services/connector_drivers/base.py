@@ -76,7 +76,6 @@ class DeploymentGates:
     """
 
     mcp_datasources_enabled: Callable[[], bool]
-    mcp_stdio_enabled: Callable[[], bool]
 
     def enabled(self, gate: str) -> bool:
         if gate == "mcp_datasources":

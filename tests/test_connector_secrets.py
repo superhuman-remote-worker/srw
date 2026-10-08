@@ -849,7 +849,6 @@ class TestTheReader:
         dependencies = payload.DatasourcePayloadDependencies(
             logger=MagicMock(),
             mcp_datasources_enabled=lambda: True,
-            mcp_stdio_enabled=lambda: True,
             connector_drivers=REGISTRY,
             workspace_ssh_known_hosts=lambda: "",
         )
@@ -900,7 +899,6 @@ async def test_test_connection_probes_with_what_the_secret_holds():
             vector_db=MagicMock(),
             knowledge_index=MagicMock(),
             mcp_datasources_enabled=lambda: True,
-            mcp_stdio_enabled=lambda: True,
             validate_mcp_datasource=lambda _url, _creds: None,
             connector_drivers=SimpleNamespace(for_type=lambda _type: Driver()),
             connector_credentials=connector_credentials,

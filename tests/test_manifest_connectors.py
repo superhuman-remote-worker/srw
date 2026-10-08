@@ -568,7 +568,6 @@ def _datasource_dependencies(store):
         vector_db=MagicMock(),
         knowledge_index=MagicMock(),
         mcp_datasources_enabled=lambda: True,
-        mcp_stdio_enabled=lambda: True,
         validate_mcp_datasource=lambda _url, _creds: None,
         connector_drivers=REGISTRY,
     )

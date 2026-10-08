@@ -627,11 +627,23 @@ _MCP_ACCESS = (
     ),
 )
 
+#: Why a stdio MCP connector is refused and never delivered (connector
+#: drivers D5b): the agent pod no longer runs a stdio server as its
+#: subprocess. A stdio image runs as a managed MCP server instead, one
+#: process per binding behind SRW's front; a remote server connects by URL.
+MCP_STDIO_RETIRED = (
+    "stdio MCP servers no longer run in the agent pod: run the server's image "
+    "as a managed MCP server (SRW hosts it, one process per binding behind its "
+    "front) or connect the server by URL (http or sse)"
+)
+
 # The stored ``mcp`` type has two drivers, by transport: a stdio server
-# (``srw.mcp/v1``, the type's catalogue entry, whose subprocess path managed
-# MCP images replace in D5) and a remote http or sse server
-# (``srw.mcp-remote/v1``). One control-plane driver implementation serves
-# both; a row's Connector resource names the one its transport needs.
+# (``srw.mcp/v1``, the type's catalogue entry) and a remote http or sse
+# server (``srw.mcp-remote/v1``). One control-plane driver implementation
+# serves both; a row's Connector resource names the one its transport needs.
+# The stdio path is retired (D5b, MCP_STDIO_RETIRED): a stored stdio row is
+# kept (it can be read, deleted, or edited to a remote transport) but no new
+# one is created and none is delivered or tested.
 MCP_SPEC = DriverSpec(
     name="srw.mcp/v1",
     legacy_type="mcp",
@@ -640,8 +652,9 @@ MCP_SPEC = DriverSpec(
     plane="harness",
     delivery_forms=("mcp_client",),
     config_schema=_config(transport={"enum": ["stdio"], "readOnly": True}),
-    # The stored type's column: a remote row of the type has its URL there.
-    legacy_connection_url="optional",
+    # The stored type's column: a remote row of the type has its URL there,
+    # and with stdio retired (D5b) every new row of the type is remote.
+    legacy_connection_url="required",
     credential_slots=(
         CredentialSlot(
             "server",
@@ -663,8 +676,9 @@ MCP_SPEC = DriverSpec(
     default_access="ReadWrite",
     supported_backends=ALL_BACKENDS,
     workspace_requirements=(
-        "None: the agent process runs the server as its subprocess and is "
-        "its MCP client."
+        "Retired: a stdio server no longer runs in the agent pod; a stored "
+        "stdio connector is never delivered. Run its image as a managed MCP "
+        "server, or connect it by URL."
     ),
     deployment_gate="mcp_datasources",
     holds_upstream_credentials=True,

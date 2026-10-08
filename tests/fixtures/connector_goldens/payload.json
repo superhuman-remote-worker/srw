@@ -616,48 +616,10 @@
     ]
   },
   "mcp_stdio/read_write": {
-    "payload": [
-      {
-        "type": "mcp",
-        "name": "Local MCP",
-        "description": "Local tool server",
-        "connection_url": null,
-        "credentials": {
-          "transport": "stdio",
-          "command": "npx",
-          "args": [
-            "-y",
-            "@acme/mcp"
-          ],
-          "env": {
-            "ACME_KEY": "stdio-secret"
-          }
-        },
-        "project_read_only": false
-      }
-    ]
+    "payload": null
   },
   "mcp_stdio/read_only": {
-    "payload": [
-      {
-        "type": "mcp",
-        "name": "Local MCP",
-        "description": "Local tool server",
-        "connection_url": null,
-        "credentials": {
-          "transport": "stdio",
-          "command": "npx",
-          "args": [
-            "-y",
-            "@acme/mcp"
-          ],
-          "env": {
-            "ACME_KEY": "stdio-secret"
-          }
-        },
-        "project_read_only": true
-      }
-    ]
+    "payload": null
   },
   "postgresql/unlinked": {
     "payload": [
@@ -1016,27 +978,6 @@
   "mcp_stdio/datasources_gate_off": {
     "payload": null
   },
-  "mcp_stdio/stdio_gate_off": {
-    "payload": null
-  },
-  "mcp_remote/stdio_gate_off_keeps_remote": {
-    "payload": [
-      {
-        "type": "mcp",
-        "name": "Docs MCP",
-        "description": "Documentation search",
-        "connection_url": "https://mcp.example.test/mcp",
-        "credentials": {
-          "transport": "http",
-          "auth": {
-            "type": "bearer",
-            "token": "mcp-secret"
-          }
-        },
-        "project_read_only": false
-      }
-    ]
-  },
   "mixed/all_kinds_read_write": {
     "payload": [
       {
@@ -1283,24 +1224,6 @@
           "auth": {
             "type": "bearer",
             "token": "mcp-secret"
-          }
-        },
-        "project_read_only": false
-      },
-      {
-        "type": "mcp",
-        "name": "Local MCP",
-        "description": "Local tool server",
-        "connection_url": null,
-        "credentials": {
-          "transport": "stdio",
-          "command": "npx",
-          "args": [
-            "-y",
-            "@acme/mcp"
-          ],
-          "env": {
-            "ACME_KEY": "stdio-secret"
           }
         },
         "project_read_only": false
@@ -1553,24 +1476,6 @@
           "auth": {
             "type": "bearer",
             "token": "mcp-secret"
-          }
-        },
-        "project_read_only": true
-      },
-      {
-        "type": "mcp",
-        "name": "Local MCP",
-        "description": "Local tool server",
-        "connection_url": null,
-        "credentials": {
-          "transport": "stdio",
-          "command": "npx",
-          "args": [
-            "-y",
-            "@acme/mcp"
-          ],
-          "env": {
-            "ACME_KEY": "stdio-secret"
           }
         },
         "project_read_only": true

@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 from collections import deque
 from contextlib import AsyncExitStack
@@ -49,7 +48,7 @@ MANAGED_MCP_CONNECT_TIMEOUT = 30.0
 MANAGED_MCP_RECONNECTS = 3
 MANAGED_MCP_RECONNECT_WINDOW = 600.0
 _READY_POLL_SECONDS = (1.0, 2.0, 3.0, 5.0)
-_TRANSPORTS = ("http", "sse", "stdio")
+_TRANSPORTS = ("http", "sse")
 #: JSON-RPC errors that mean the session is gone, not that a tool failed:
 #: the transport's "Session terminated" (a 404 from the server) and a
 #: closed connection.
@@ -73,9 +72,6 @@ class MCPServerConfig:
     transport: str
     url: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
-    command: str | None = None
-    args: list[str] = field(default_factory=list)
-    env: dict[str, str] = field(default_factory=dict)
     #: A managed server's front readiness URL (``None`` for any other).
     ready_url: str | None = None
 
@@ -126,34 +122,16 @@ def parse_mcp_config(ds: dict[str, Any]) -> MCPServerConfig:
     if not isinstance(raw_transport, str):
         raise ValueError("transport must be a string")
     transport = raw_transport.lower().strip()
+    if transport == "stdio":
+        # Never a subprocess of the agent: an orchestrator older than this
+        # agent may still send a stored stdio server.
+        from shared.connectors.builtin import MCP_STDIO_RETIRED
+
+        raise ValueError(MCP_STDIO_RETIRED)
     if transport not in _TRANSPORTS:
         raise ValueError(f"unknown transport (expected one of {_TRANSPORTS})")
 
     name = str(ds.get("name") or "unnamed")
-    if transport == "stdio":
-        command = credentials.get("command")
-        if not isinstance(command, str) or not command.strip():
-            raise ValueError("stdio transport requires credentials.command")
-
-        args = credentials.get("args") or []
-        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
-            raise ValueError("credentials.args must be a list of strings")
-
-        env = credentials.get("env") or {}
-        if not isinstance(env, dict) or not all(
-            isinstance(key, str) and isinstance(value, str)
-            for key, value in env.items()
-        ):
-            raise ValueError("credentials.env must map strings to strings")
-
-        return MCPServerConfig(
-            name=name,
-            transport=transport,
-            command=command,
-            args=list(args),
-            env=dict(env),
-        )
-
     url = ds.get("connection_url")
     if not isinstance(url, str) or not url.strip():
         raise ValueError(f"{transport} transport requires connection_url")
@@ -345,22 +323,7 @@ class MCPManager:
                     logger.warning("Managed MCP server %s %s", handle.name, exc)
                     return
             async with AsyncExitStack() as stack:
-                if config.transport == "stdio":
-                    from mcp import StdioServerParameters
-                    from mcp.client.stdio import get_default_environment, stdio_client
-
-                    parameters = StdioServerParameters(
-                        command=config.command,
-                        args=config.args,
-                        env={**get_default_environment(), **config.env},
-                    )
-                    # A third-party server's stderr may contain its environment.
-                    # Discard it so datasource credentials cannot reach agent logs.
-                    error_sink = stack.enter_context(open(os.devnull, "w"))
-                    read, write = await stack.enter_async_context(
-                        stdio_client(parameters, errlog=error_sink)
-                    )
-                elif config.transport == "sse":
+                if config.transport == "sse":
                     from mcp.client.sse import sse_client
 
                     read, write = await stack.enter_async_context(
@@ -505,7 +468,7 @@ class MCPManager:
 
     @staticmethod
     def _may_reconnect(handle: _ServerHandle) -> bool:
-        """A remote or stdio server reconnects once per runtime; a managed
+        """A remote server reconnects once per runtime; a managed
         one within its budget, since its pod is replaced on a re-pin, a lost
         pod or a credential change while the session lives on."""
         if not handle.managed:

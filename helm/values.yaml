@@ -927,11 +927,11 @@ agent:
   # -- Separate canary gate for the persistent-session capability tool.
   # Operators must also enable the endpoint gate for controlled live probes.
   productCapabilitiesToolEnabled: "false"
-  # -- Enable user-added MCP servers as datasources. Both gates default off;
-  # stdio executes third-party commands in agent pods and should remain off
-  # for hosted/multi-tenant deployments without suitable isolation.
+  # -- Enable user-added MCP servers (http or sse) as datasources. Off by
+  # default. A stdio server no longer runs in agent pods (connector drivers
+  # D5b): its image runs as a managed MCP server (connectors.drivers), and
+  # the former agent.mcpStdioEnabled fails the render when set to true.
   mcpDatasourcesEnabled: "false"
-  mcpStdioEnabled: "false"
   # -- Temporary compatibility gate for REST/session requests that omit
   # datasource_ids. Cockpit submits an explicit reviewed array; enable this
   # after legacy clients no longer encode "none" by omission.

@@ -292,7 +292,6 @@ def _dependencies(registry, fallback: str = "token-in-url"):
     return payloads.DatasourcePayloadDependencies(
         logger=logging.getLogger("test"),
         mcp_datasources_enabled=lambda: False,
-        mcp_stdio_enabled=lambda: False,
         connector_drivers=registry,
         workspace_ssh_known_hosts=lambda: "",
         git_swap_fallback=lambda: fallback,
@@ -345,14 +344,13 @@ class TestPayload:
         deps = payloads.DatasourcePayloadDependencies(
             logger=logging.getLogger("test"),
             mcp_datasources_enabled=lambda: False,
-            mcp_stdio_enabled=lambda: False,
             connector_drivers=builtin_connector_drivers(),
             workspace_ssh_known_hosts=lambda: "",
         )
         assert deps.git_swap_fallback() == "token-in-url"
         assert (
             BindContext(
-                gates=DeploymentGates(lambda: False, lambda: False),
+                gates=DeploymentGates(lambda: False),
                 logger=logging.getLogger("t"),
                 default_known_hosts="",
             ).git_swap

@@ -20,9 +20,9 @@ job-side reauthorization lives in ``job_datasource_selection``. This module
 assumes it was handed an already-authorized, exactly-resolved set and only
 decides what of it crosses the wire.
 
-Deployment gates (``MCP_DATASOURCES_ENABLED`` / ``MCP_STDIO_ENABLED``) arrive as
-injected callables rather than being read here, so a test that steers the gate
-on the application module still steers this module.
+The deployment gate (``MCP_DATASOURCES_ENABLED``) arrives as an injected
+callable rather than being read here, so a test that steers the gate on the
+application module still steers this module.
 """
 
 from __future__ import annotations
@@ -55,14 +55,13 @@ from shared.datasource_policy import datasource_tool_categories
 class DatasourcePayloadDependencies:
     """Per-invocation collaborators for the agent datasource payload.
 
-    ``mcp_datasources_enabled`` / ``mcp_stdio_enabled`` are callables, not
-    booleans: the deployment gates they read are evaluated per call by the
-    application, so a monkeypatched gate is observed here too.
+    ``mcp_datasources_enabled`` is a callable, not a boolean: the
+    deployment gate it reads is evaluated per call by the application, so a
+    monkeypatched gate is observed here too.
     """
 
     logger: logging.Logger
     mcp_datasources_enabled: Callable[[], bool]
-    mcp_stdio_enabled: Callable[[], bool]
     #: The application's installed connector drivers.
     connector_drivers: ConnectorDriverRegistry
     #: The deployment's default SSH host-key pins, as known_hosts
@@ -78,7 +77,6 @@ class DatasourcePayloadDependencies:
     def deployment_gates(self) -> DeploymentGates:
         return DeploymentGates(
             mcp_datasources_enabled=self.mcp_datasources_enabled,
-            mcp_stdio_enabled=self.mcp_stdio_enabled,
         )
 
 

@@ -1421,7 +1421,7 @@
         "virtual",
         "vm"
       ],
-      "workspace_requirements": "None: the agent process runs the server as its subprocess and is its MCP client.",
+      "workspace_requirements": "Retired: a stdio server no longer runs in the agent pod; a stored stdio connector is never delivered. Run its image as a managed MCP server, or connect it by URL.",
       "tool_category": "mcp",
       "operations": [],
       "access_levels": [
@@ -1483,7 +1483,7 @@
           }
         }
       },
-      "legacy_connection_url": "optional",
+      "legacy_connection_url": "required",
       "egress": {
         "declared": {
           "rules": [],

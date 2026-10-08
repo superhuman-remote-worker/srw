@@ -37,7 +37,7 @@ def _refuse_mcp(_url: str | None, _credentials: dict[str, Any]) -> None:
 
 
 PLATFORM_ENVIRONMENT = DriverEnvironment(
-    gates=DeploymentGates(mcp_datasources_enabled=_closed, mcp_stdio_enabled=_closed),
+    gates=DeploymentGates(mcp_datasources_enabled=_closed),
     validate_mcp_datasource=_refuse_mcp,
 )
 

@@ -90,7 +90,6 @@ class ApiCase:
     user: dict[str, Any] = field(default_factory=lambda: dict(USER))
     authenticated: bool = True
     mcp: bool = True
-    stdio: bool = True
     can_publish: bool = True
     can_send: bool = False
     linked_project_ids: tuple[str, ...] = ()
@@ -749,25 +748,9 @@ CASES: dict[str, ApiCase] = {
         )
     ),
     "create/mcp/config_refused_after_auth": _create(_with(MCP_REMOTE, config={"a": 1})),
-    "create/mcp/stdio_valid_url_dropped": _create(MCP_STDIO),
-    "create/mcp/stdio_gate_off": _create(MCP_STDIO, stdio=False),
-    "create/mcp/stdio_missing_command": _create(
-        _with(MCP_STDIO, credentials={"transport": "stdio", "command": " "})
-    ),
-    "create/mcp/stdio_bad_args": _create(
-        _with(
-            MCP_STDIO, credentials={"transport": "stdio", "command": "x", "args": "a"}
-        )
-    ),
-    "create/mcp/stdio_bad_env": _create(
-        _with(
-            MCP_STDIO,
-            credentials={"transport": "stdio", "command": "x", "env": {"A=B": "c"}},
-        )
-    ),
-    "create/mcp/stdio_unknown_field": _create(
-        _with(MCP_STDIO, credentials={"transport": "stdio", "command": "x", "cwd": "/"})
-    ),
+    # A stdio server no longer runs in the agent pod (connector drivers D5b):
+    # every stdio create is refused with the way forward.
+    "create/mcp/stdio_refused": _create(MCP_STDIO),
 }
 
 # A duplicate name per type: the store's unique violation becomes a 409.
@@ -1082,12 +1065,21 @@ CASES.update(
         "update/mcp/remote_clear_url_refused": _update(
             _stored("mcp_remote"), {"connection_url": None}
         ),
-        "update/mcp/switch_to_stdio_clears_url": _update(
+        "update/mcp/switch_to_stdio_refused": _update(
             _stored("mcp_remote"),
             {"credentials": {"transport": "stdio", "command": "uvx", "args": ["x"]}},
         ),
-        "update/mcp/stdio_row_locked_when_stdio_gate_off": _update(
-            _stored("mcp_stdio"), {"description": "Edited"}, stdio=False
+        # A stored stdio row is kept (read, delete), but an edit that leaves
+        # it stdio is refused; one that moves it to http or sse is not.
+        "update/mcp/stdio_row_edit_refused": _update(
+            _stored("mcp_stdio"), {"description": "Edited"}
+        ),
+        "update/mcp/stdio_row_moved_to_remote": _update(
+            _stored("mcp_stdio"),
+            {
+                "connection_url": "https://mcp.example.com/mcp",
+                "credentials": {"transport": "http"},
+            },
         ),
         "update/mcp/config_refused": _update(
             _stored("mcp_remote"), {"config": {"a": 1}}
@@ -1236,19 +1228,14 @@ def _client(case: ApiCase, calls: list[dict[str, Any]], monkeypatch) -> TestClie
     from orchestrator.services import knowledge_index
     from orchestrator.services.datasource_config import validate_mcp_datasource
     from orchestrator.services.datasources import DatasourceDependencies
-    from orchestrator.services.deployment_gates import mcp_stdio_enabled
     from orchestrator.services.connector_drivers import builtin_connector_drivers
     from orchestrator.services.deployment_gates import mcp_datasources_enabled
     from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
 
-    for name, on in (
-        ("MCP_DATASOURCES_ENABLED", case.mcp),
-        ("MCP_STDIO_ENABLED", case.stdio),
-    ):
-        if on:
-            monkeypatch.setenv(name, "true")
-        else:
-            monkeypatch.delenv(name, raising=False)
+    if case.mcp:
+        monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "true")
+    else:
+        monkeypatch.delenv("MCP_DATASOURCES_ENABLED", raising=False)
     # The KB create/update validators only accept admin-trusted Git hosts.
     monkeypatch.setenv("KB_GIT_ALLOWED_HOSTS", "git.example.test")
 
@@ -1316,7 +1303,6 @@ def _client(case: ApiCase, calls: list[dict[str, Any]], monkeypatch) -> TestClie
         ),
         mcp_datasources_enabled=mcp_datasources_enabled,
         validate_mcp_datasource=validate_mcp_datasource,
-        mcp_stdio_enabled=mcp_stdio_enabled,
         connector_drivers=builtin_connector_drivers(),
     )
     dependencies = DatasourcesDependencies(

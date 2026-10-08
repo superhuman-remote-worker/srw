@@ -525,7 +525,7 @@
       "mcp": []
     }
   },
-  "mcp_stdio_gate_off_with_remote": {
+  "mcp_stdio_with_remote": {
     "orchestrator_override": {
       "tools": {
         "graph": [],
@@ -551,7 +551,7 @@
       ]
     }
   },
-  "mcp_stdio_gate_off_alone": {
+  "mcp_stdio_alone": {
     "orchestrator_override": {
       "tools": {
         "graph": [],

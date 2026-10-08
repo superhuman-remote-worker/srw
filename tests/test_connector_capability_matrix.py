@@ -145,7 +145,6 @@ def _client(*, registry=None, approved=None):
             vector_db=MagicMock(),
             knowledge_index=MagicMock(),
             mcp_datasources_enabled=lambda: False,
-            mcp_stdio_enabled=lambda: False,
             validate_mcp_datasource=lambda _url, _creds: None,
             connector_drivers=registry or builtin_connector_drivers(),
         ),

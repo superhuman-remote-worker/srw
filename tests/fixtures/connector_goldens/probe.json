@@ -1014,41 +1014,11 @@
       }
     ]
   },
-  "mcp/stdio_connected": {
+  "mcp/stdio_retired": {
     "status": 200,
     "body": {
-      "status": "ok",
-      "message": "Connected: 1 tools (echo)"
-    },
-    "probe_calls": [
-      {
-        "transport": "stdio",
-        "command": "npx",
-        "args": [
-          "-y",
-          "@acme/mcp"
-        ],
-        "credential_env": {
-          "ACME_KEY": "stdio-secret"
-        },
-        "stderr_discarded": true
-      },
-      "initialize",
-      "list_tools"
-    ]
-  },
-  "mcp/stdio_runtime_missing": {
-    "status": 200,
-    "body": {
-      "status": "ok",
-      "message": "stdio server untested here (runtime not on the orchestrator); it will resolve on the agent at job start"
-    },
-    "probe_calls": []
-  },
-  "mcp/stdio_gate_off": {
-    "status": 400,
-    "body": {
-      "detail": "stdio MCP servers are disabled on this deployment"
+      "status": "unsupported",
+      "message": "stdio MCP servers no longer run in the agent pod: run the server's image as a managed MCP server (SRW hosts it, one process per binding behind its front) or connect the server by URL (http or sse)"
     },
     "probe_calls": []
   }

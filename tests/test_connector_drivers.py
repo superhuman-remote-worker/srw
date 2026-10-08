@@ -160,9 +160,7 @@ _REGISTRY = builtin_connector_drivers()
 
 
 def _bind_context() -> BindContext:
-    gates = DeploymentGates(
-        mcp_datasources_enabled=lambda: True, mcp_stdio_enabled=lambda: True
-    )
+    gates = DeploymentGates(mcp_datasources_enabled=lambda: True)
     return BindContext(
         gates=gates, logger=logging.getLogger(__name__), default_known_hosts=""
     )
@@ -410,7 +408,7 @@ class TestPlatformConnectors:
         db.upsert_default_datasource.assert_not_awaited()
 
 
-def test_connector_writes_see_the_real_stdio_gate():
+def test_connector_writes_see_the_real_mcp_gate():
     from orchestrator.application import build_application_resources, projects
     from orchestrator.services import deployment_gates
 
@@ -418,7 +416,6 @@ def test_connector_writes_see_the_real_stdio_gate():
     environment = projects.datasources_dependencies(
         resources
     ).operations.driver_environment()
-    assert environment.gates.mcp_stdio_enabled is deployment_gates.mcp_stdio_enabled
     assert (
         environment.gates.mcp_datasources_enabled
         is deployment_gates.mcp_datasources_enabled
@@ -461,7 +458,6 @@ def _environment(*, gates_on: bool, validate=None):
     return DriverEnvironment(
         gates=DeploymentGates(
             mcp_datasources_enabled=lambda: gates_on,
-            mcp_stdio_enabled=lambda: gates_on,
         ),
         validate_mcp_datasource=validate or validate_mcp_datasource,
     )
@@ -503,14 +499,14 @@ async def _accepts(type_id: str, body: dict) -> bool:
 def _valid_create(type_id: str) -> dict:
     from tests.test_connector_goldens_api import (
         _VALID_CREATE,
-        MCP_STDIO,
+        MCP_REMOTE,
         REPOSITORY_TOKEN,
     )
 
-    # The most permissive valid body: MCP over stdio needs no URL, and a
-    # token repository that declares its forge needs none to infer the forge.
+    # The most permissive valid body: a token repository that declares its
+    # forge needs no URL to infer the forge. MCP is remote only (D5b).
     return {
-        "mcp": MCP_STDIO,
+        "mcp": MCP_REMOTE,
         "repository": {**REPOSITORY_TOKEN, "config": {"forge": "github"}},
     }.get(type_id, _VALID_CREATE[type_id])
 
@@ -536,7 +532,6 @@ async def test_spec_metadata_says_what_validation_does(type_id, monkeypatch):
     """legacy_connection_url, publishable and forced_read_only are the
     driver's real behaviour, so a form or the matrix can rely on them."""
     monkeypatch.setenv("KB_GIT_ALLOWED_HOSTS", "git.example.test")
-    monkeypatch.setenv("MCP_STDIO_ENABLED", "true")
     spec = _REGISTRY.for_type(type_id).spec
     body = _valid_create(type_id)
     assert await _accepts(type_id, body)
@@ -609,7 +604,6 @@ def test_workspace_ssh_identities_are_the_drivers_answer():
             dependencies=DatasourcePayloadDependencies(
                 logger=logging.getLogger(__name__),
                 mcp_datasources_enabled=lambda: True,
-                mcp_stdio_enabled=lambda: True,
                 connector_drivers=ConnectorDriverRegistry(drivers),
                 workspace_ssh_known_hosts=lambda: "",
             ),

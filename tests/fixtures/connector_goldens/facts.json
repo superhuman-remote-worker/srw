@@ -25,7 +25,6 @@
       "",
       "### MCP Servers",
       "- **Docs MCP** (mcp, http) — not connected yet",
-      "- **Local MCP** (mcp, stdio) — not connected yet",
       "",
       "### Credential Files",
       "- **Service account** (file) — `~/.config/gcloud/sa.json` (`$GOOGLE_APPLICATION_CREDENTIALS`), `~/.config/gcloud/ca.pem`",
@@ -62,7 +61,6 @@
       "",
       "### MCP Servers",
       "- **Docs MCP** (mcp, http) — not connected yet",
-      "- **Local MCP** (mcp, stdio) — not connected yet",
       "",
       "### Credential Files",
       "- **Service account** (file) — `~/.config/gcloud/sa.json` (`$GOOGLE_APPLICATION_CREDENTIALS`), `~/.config/gcloud/ca.pem`",
@@ -113,7 +111,7 @@
       "## Connectors",
       "",
       "### MCP Servers",
-      "- **Local MCP** (mcp, stdio) — unavailable: ConnectError",
+      "- **Docs MCP** (mcp, http) — unavailable: ConnectError",
       ""
     ]
   },

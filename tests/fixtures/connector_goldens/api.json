@@ -4614,7 +4614,7 @@
     },
     "status": 400,
     "body": {
-      "detail": "Invalid MCP transport (expected http, sse, or stdio)"
+      "detail": "Invalid MCP transport (expected http or sse)"
     },
     "calls": []
   },
@@ -4729,84 +4729,7 @@
     },
     "calls": []
   },
-  "create/mcp/stdio_valid_url_dropped": {
-    "request": {
-      "method": "POST",
-      "path": "/api/datasources",
-      "body": {
-        "name": "Local MCP",
-        "type": "mcp",
-        "connection_url": "https://ignored.example.test/mcp",
-        "credentials": {
-          "transport": "STDIO",
-          "command": "npx",
-          "args": [
-            "-y",
-            "@acme/mcp"
-          ],
-          "env": {
-            "ACME_KEY": "stdio-secret"
-          }
-        }
-      }
-    },
-    "status": 200,
-    "body": {
-      "id": "00000000-0000-0000-0000-0000000000d1",
-      "name": "Local MCP",
-      "description": null,
-      "type": "mcp",
-      "connection_url": null,
-      "config": {},
-      "job_id": null,
-      "cli_hint": null,
-      "default_branch": null,
-      "created_by": "00000000-0000-0000-0000-0000000000c1",
-      "is_global": false,
-      "read_only": null,
-      "scope_mode": "all",
-      "auto_attach": false,
-      "policy_revision": 1,
-      "created_at": "2026-01-02T03:04:05Z",
-      "updated_at": "2026-01-02T03:04:05Z",
-      "project_ids": []
-    },
-    "calls": [
-      {
-        "call": "create_datasource",
-        "kwargs": {
-          "name": "Local MCP",
-          "ds_type": "mcp",
-          "connection_url": null,
-          "description": null,
-          "credentials": {
-            "transport": "STDIO",
-            "command": "npx",
-            "args": [
-              "-y",
-              "@acme/mcp"
-            ],
-            "env": {
-              "ACME_KEY": "stdio-secret"
-            }
-          },
-          "job_id": null,
-          "cli_hint": null,
-          "default_branch": null,
-          "config": {},
-          "created_by": "00000000-0000-0000-0000-0000000000c1",
-          "is_global": false,
-          "read_only": null,
-          "scope_mode": "all",
-          "auto_attach": false,
-          "project_ids": [],
-          "authority_user_id": "00000000-0000-0000-0000-0000000000c1",
-          "authority_is_admin": false
-        }
-      }
-    ]
-  },
-  "create/mcp/stdio_gate_off": {
+  "create/mcp/stdio_refused": {
     "request": {
       "method": "POST",
       "path": "/api/datasources",
@@ -4829,92 +4752,7 @@
     },
     "status": 400,
     "body": {
-      "detail": "stdio MCP servers are disabled on this deployment"
-    },
-    "calls": []
-  },
-  "create/mcp/stdio_missing_command": {
-    "request": {
-      "method": "POST",
-      "path": "/api/datasources",
-      "body": {
-        "name": "Local MCP",
-        "type": "mcp",
-        "connection_url": "https://ignored.example.test/mcp",
-        "credentials": {
-          "transport": "stdio",
-          "command": " "
-        }
-      }
-    },
-    "status": 400,
-    "body": {
-      "detail": "stdio MCP servers require a valid credentials.command"
-    },
-    "calls": []
-  },
-  "create/mcp/stdio_bad_args": {
-    "request": {
-      "method": "POST",
-      "path": "/api/datasources",
-      "body": {
-        "name": "Local MCP",
-        "type": "mcp",
-        "connection_url": "https://ignored.example.test/mcp",
-        "credentials": {
-          "transport": "stdio",
-          "command": "x",
-          "args": "a"
-        }
-      }
-    },
-    "status": 400,
-    "body": {
-      "detail": "MCP credentials.args must be a list of valid strings"
-    },
-    "calls": []
-  },
-  "create/mcp/stdio_bad_env": {
-    "request": {
-      "method": "POST",
-      "path": "/api/datasources",
-      "body": {
-        "name": "Local MCP",
-        "type": "mcp",
-        "connection_url": "https://ignored.example.test/mcp",
-        "credentials": {
-          "transport": "stdio",
-          "command": "x",
-          "env": {
-            "A=B": "c"
-          }
-        }
-      }
-    },
-    "status": 400,
-    "body": {
-      "detail": "MCP credentials.env must map valid names to string values"
-    },
-    "calls": []
-  },
-  "create/mcp/stdio_unknown_field": {
-    "request": {
-      "method": "POST",
-      "path": "/api/datasources",
-      "body": {
-        "name": "Local MCP",
-        "type": "mcp",
-        "connection_url": "https://ignored.example.test/mcp",
-        "credentials": {
-          "transport": "stdio",
-          "command": "x",
-          "cwd": "/"
-        }
-      }
-    },
-    "status": 400,
-    "body": {
-      "detail": "Unknown stdio MCP credential field(s)"
+      "detail": "stdio MCP servers no longer run in the agent pod: run the server's image as a managed MCP server (SRW hosts it, one process per binding behind its front) or connect the server by URL (http or sse)"
     },
     "calls": []
   },
@@ -7905,7 +7743,7 @@
     },
     "calls": []
   },
-  "update/mcp/switch_to_stdio_clears_url": {
+  "update/mcp/switch_to_stdio_refused": {
     "request": {
       "method": "PUT",
       "path": "/api/datasources/d500000f-0000-0000-0000-00000000000f",
@@ -7919,13 +7757,44 @@
         }
       }
     },
+    "status": 400,
+    "body": {
+      "detail": "stdio MCP servers no longer run in the agent pod: run the server's image as a managed MCP server (SRW hosts it, one process per binding behind its front) or connect the server by URL (http or sse)"
+    },
+    "calls": []
+  },
+  "update/mcp/stdio_row_edit_refused": {
+    "request": {
+      "method": "PUT",
+      "path": "/api/datasources/d5000010-0000-0000-0000-000000000010",
+      "body": {
+        "description": "Edited"
+      }
+    },
+    "status": 400,
+    "body": {
+      "detail": "stdio MCP servers no longer run in the agent pod: run the server's image as a managed MCP server (SRW hosts it, one process per binding behind its front) or connect the server by URL (http or sse)"
+    },
+    "calls": []
+  },
+  "update/mcp/stdio_row_moved_to_remote": {
+    "request": {
+      "method": "PUT",
+      "path": "/api/datasources/d5000010-0000-0000-0000-000000000010",
+      "body": {
+        "connection_url": "https://mcp.example.com/mcp",
+        "credentials": {
+          "transport": "http"
+        }
+      }
+    },
     "status": 200,
     "body": {
-      "id": "d500000f-0000-0000-0000-00000000000f",
-      "name": "Docs MCP",
-      "description": "Documentation search",
+      "id": "d5000010-0000-0000-0000-000000000010",
+      "name": "Local MCP",
+      "description": "Local tool server",
       "type": "mcp",
-      "connection_url": null,
+      "connection_url": "https://mcp.example.com/mcp",
       "config": {},
       "cli_hint": null,
       "default_branch": null,
@@ -7943,42 +7812,23 @@
       {
         "call": "update_datasource",
         "args": [
-          "d500000f-0000-0000-0000-00000000000f"
+          "d5000010-0000-0000-0000-000000000010"
         ],
         "kwargs": {
           "name": null,
           "description": null,
-          "connection_url": null,
+          "connection_url": "https://mcp.example.com/mcp",
           "credentials": {
-            "transport": "stdio",
-            "command": "uvx",
-            "args": [
-              "x"
-            ]
+            "transport": "http"
           },
           "cli_hint": null,
           "default_branch": null,
           "config": null,
           "is_global": null,
-          "read_only": null,
-          "connection_url_set": true
+          "read_only": null
         }
       }
     ]
-  },
-  "update/mcp/stdio_row_locked_when_stdio_gate_off": {
-    "request": {
-      "method": "PUT",
-      "path": "/api/datasources/d5000010-0000-0000-0000-000000000010",
-      "body": {
-        "description": "Edited"
-      }
-    },
-    "status": 400,
-    "body": {
-      "detail": "stdio MCP servers are disabled on this deployment"
-    },
-    "calls": []
   },
   "update/mcp/config_refused": {
     "request": {

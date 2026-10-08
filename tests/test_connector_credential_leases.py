@@ -307,7 +307,7 @@ class TestProbeDriver:
             "project_read_only": True,
         }
         ctx = BindContext(
-            gates=DeploymentGates(lambda: False, lambda: False),
+            gates=DeploymentGates(lambda: False),
             logger=MagicMock(),
             default_known_hosts="",
         )

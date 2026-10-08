@@ -31,7 +31,6 @@ from orchestrator.services.datasource_config import (
     validate_kb_repository_url,
 )
 from orchestrator.services.datasources import DatasourceDependencies
-from orchestrator.services.deployment_gates import mcp_stdio_enabled
 from orchestrator.services.connector_drivers import builtin_connector_drivers
 from orchestrator.services.kb_datasources import (
     index_status_payload,
@@ -80,7 +79,6 @@ def _ds_deps(store=None, **gates) -> DatasourcesDependencies:
             ),
             mcp_datasources_enabled=deployment_gates_module.mcp_datasources_enabled,
             validate_mcp_datasource=datasource_config_module.validate_mcp_datasource,
-            mcp_stdio_enabled=mcp_stdio_enabled,
             connector_drivers=builtin_connector_drivers(),
         ),
         **gates,

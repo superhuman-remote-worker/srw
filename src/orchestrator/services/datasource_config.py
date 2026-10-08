@@ -22,7 +22,7 @@ from urllib.parse import urlparse
 
 from fastapi import HTTPException
 
-from orchestrator.services.deployment_gates import mcp_stdio_enabled
+from shared.connectors.builtin import MCP_STDIO_RETIRED
 from shared.runtime.utils.ssh_key import (
     InvalidSSHKeyError,
     validate_private_key as _validate_ssh_private_key,
@@ -234,10 +234,9 @@ def validate_kb_repository_auth(
 # ---------------------------------------------------------------------------
 # MCP server connectors
 #
-# Moved verbatim from ``orchestrator.main`` (R1.B05 lane P). The stdio branch
-# consults ``deployment_gates.mcp_stdio_enabled`` on every call rather than
-# taking the answer as an argument: the gate is a pure ``os.getenv`` read, and
-# every caller of this validator already steers it with the environment.
+# Moved verbatim from ``orchestrator.main`` (R1.B05 lane P). A stdio server is
+# refused: stdio servers no longer run in the agent pod (connector drivers
+# D5b); a stdio image runs as a managed MCP server instead.
 #
 # The refusal shape is the contract. Every rejection here is
 # ``HTTPException(400)`` with a message that names the offending FIELD and
@@ -258,55 +257,13 @@ def validate_mcp_datasource(
     if not isinstance(raw_transport, str):
         raise HTTPException(status_code=400, detail="MCP transport must be a string")
     transport = raw_transport.lower().strip()
-    if transport not in ("http", "sse", "stdio"):
+    if transport == "stdio":
+        raise HTTPException(status_code=400, detail=MCP_STDIO_RETIRED)
+    if transport not in ("http", "sse"):
         raise HTTPException(
             status_code=400,
-            detail="Invalid MCP transport (expected http, sse, or stdio)",
+            detail="Invalid MCP transport (expected http or sse)",
         )
-
-    if transport == "stdio":
-        if not mcp_stdio_enabled():
-            raise HTTPException(
-                status_code=400,
-                detail="stdio MCP servers are disabled on this deployment",
-            )
-        unknown = sorted(set(credentials) - {"transport", "command", "args", "env"})
-        if unknown:
-            raise HTTPException(
-                status_code=400,
-                detail="Unknown stdio MCP credential field(s)",
-            )
-        command = credentials.get("command")
-        if not isinstance(command, str) or not command.strip() or "\x00" in command:
-            raise HTTPException(
-                status_code=400,
-                detail="stdio MCP servers require a valid credentials.command",
-            )
-        args = credentials.get("args") or []
-        if (
-            not isinstance(args, list)
-            or not all(isinstance(arg, str) for arg in args)
-            or any("\x00" in arg for arg in args)
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="MCP credentials.args must be a list of valid strings",
-            )
-        env = credentials.get("env") or {}
-        if not isinstance(env, dict) or not all(
-            isinstance(key, str)
-            and bool(key)
-            and "=" not in key
-            and "\x00" not in key
-            and isinstance(value, str)
-            and "\x00" not in value
-            for key, value in env.items()
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="MCP credentials.env must map valid names to string values",
-            )
-        return
 
     unknown = sorted(set(credentials) - {"transport", "auth"})
     if unknown:

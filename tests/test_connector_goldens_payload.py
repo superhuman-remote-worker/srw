@@ -28,7 +28,6 @@ from orchestrator.services import agent_datasource_payload as payload_module
 from orchestrator.services.connector_drivers import builtin_connector_drivers
 from orchestrator.services.deployment_gates import (
     mcp_datasources_enabled,
-    mcp_stdio_enabled,
 )
 from tests._connector_goldens import (
     KINDS,
@@ -43,7 +42,6 @@ class PayloadCase:
     rows: list[dict[str, Any]]
     job_context: dict[str, Any] = field(default_factory=dict)
     mcp: bool = True
-    stdio: bool = True
     pinned_defect: str | None = None
 
 
@@ -158,15 +156,9 @@ CASES.update(
         "mcp_stdio/datasources_gate_off": PayloadCase(
             [resolved_row("mcp_stdio")], mcp=False
         ),
-        "mcp_stdio/stdio_gate_off": PayloadCase(
-            [resolved_row("mcp_stdio")], stdio=False
-        ),
-        "mcp_remote/stdio_gate_off_keeps_remote": PayloadCase(
-            [resolved_row("mcp_remote")], stdio=False
-        ),
         "mixed/all_kinds_read_write": PayloadCase(all_rows()),
         "mixed/all_kinds_read_only": PayloadCase(all_rows(project_read_only=True)),
-        "mixed/all_kinds_gates_off": PayloadCase(all_rows(), mcp=False, stdio=False),
+        "mixed/all_kinds_gates_off": PayloadCase(all_rows(), mcp=False),
         # Key order after the driver's own fields: cli_hint, default_branch,
         # then require_default_branch.
         "generic/cli_hint_and_default_branch": PayloadCase(
@@ -207,14 +199,10 @@ def golden():
 @pytest.fixture
 def gates(monkeypatch):
     def apply(case: PayloadCase) -> None:
-        for name, on in (
-            ("MCP_DATASOURCES_ENABLED", case.mcp),
-            ("MCP_STDIO_ENABLED", case.stdio),
-        ):
-            if on:
-                monkeypatch.setenv(name, "true")
-            else:
-                monkeypatch.delenv(name, raising=False)
+        if case.mcp:
+            monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "true")
+        else:
+            monkeypatch.delenv("MCP_DATASOURCES_ENABLED", raising=False)
 
     return apply
 
@@ -230,7 +218,6 @@ def build_payload(case: PayloadCase) -> tuple[list[dict] | None, list[str]]:
         dependencies=payload_module.DatasourcePayloadDependencies(
             logger=logger,
             mcp_datasources_enabled=mcp_datasources_enabled,
-            mcp_stdio_enabled=mcp_stdio_enabled,
             connector_drivers=builtin_connector_drivers(),
             workspace_ssh_known_hosts=lambda: "",
         ),

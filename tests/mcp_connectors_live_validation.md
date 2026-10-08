@@ -10,6 +10,16 @@ closure audit, the `srw` k3d containers were running and both MCP flags were
 enabled in `deployment/values-local.yaml`, but the Kubernetes API was
 unresponsive and Tilt was not running.
 
+**Superseded for stdio (connector drivers D5b):** stdio MCP servers no longer
+run in agent pods, and `MCP_STDIO_ENABLED` / `agent.mcpStdioEnabled` are gone
+(setting the Helm key to true fails the render). A stored stdio connector is
+refused on create and edit, never delivered, and its Test answers
+"unsupported". Every stdio check below (the local connector, the npm/uvx
+runtimes, stdio canaries and subprocess reaping, the stdio gate matrix rows)
+no longer applies; a stdio image runs as a managed MCP server behind the
+front, gated by `scripts/k3d-managed-mcp-stdio-gate.py`. The remote (http and
+sse) checks still stand.
+
 **Source documents:**
 
 - `knowledge-base/knowledge/features/mcp_datasources.md`

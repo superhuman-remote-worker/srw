@@ -432,7 +432,6 @@ def _service_dependencies(db):
         vector_db=MagicMock(),
         knowledge_index=MagicMock(),
         mcp_datasources_enabled=lambda: True,
-        mcp_stdio_enabled=lambda: True,
         validate_mcp_datasource=lambda _url, _creds: None,
         connector_drivers=REGISTRY,
     )
@@ -839,7 +838,6 @@ def _payload(rows):
         dependencies=DatasourcePayloadDependencies(
             logger=MagicMock(),
             mcp_datasources_enabled=lambda: True,
-            mcp_stdio_enabled=lambda: True,
             connector_drivers=REGISTRY,
             workspace_ssh_known_hosts=lambda: "",
         ),

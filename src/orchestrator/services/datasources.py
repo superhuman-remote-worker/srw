@@ -105,7 +105,6 @@ class DatasourceDependencies:
     vector_db: Any
     knowledge_index: knowledge_index.KnowledgeIndexDependencies
     mcp_datasources_enabled: Callable[[], bool]
-    mcp_stdio_enabled: Callable[[], bool]
     validate_mcp_datasource: Callable[[str | None, dict[str, Any]], None]
     #: The application's installed connector drivers.
     connector_drivers: ConnectorDriverRegistry
@@ -131,7 +130,6 @@ class DatasourceDependencies:
         return DriverEnvironment(
             gates=DeploymentGates(
                 mcp_datasources_enabled=self.mcp_datasources_enabled,
-                mcp_stdio_enabled=self.mcp_stdio_enabled,
             ),
             validate_mcp_datasource=self.validate_mcp_datasource,
         )

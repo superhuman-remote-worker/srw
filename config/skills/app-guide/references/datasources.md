@@ -8,8 +8,9 @@ agents never see connectors you didn't attach.
 
 ## Supported types
 
-- **MCP Server** — tools discovered from a remote HTTP/SSE server or a trusted
-  local stdio command, when MCP connectors are enabled on the deployment.
+- **MCP Server** — tools discovered from a remote HTTP/SSE server, when MCP
+  connectors are enabled on the deployment. A local stdio command no longer
+  runs inside the agent; a stdio server's image runs as a managed MCP server.
 - **PostgreSQL, MongoDB, and Neo4j** — relational, document, and graph
   database access.
 - **WebDAV** — cloud file storage (this is how the built-in cloud storage and

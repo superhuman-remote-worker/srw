@@ -165,7 +165,7 @@ def test_a_binding_never_carries_the_token_and_is_leased():
         "project_read_only": False,
     }
     ctx = BindContext(
-        gates=DeploymentGates(lambda: False, lambda: False),
+        gates=DeploymentGates(lambda: False),
         logger=MagicMock(),
         default_known_hosts="",
     )

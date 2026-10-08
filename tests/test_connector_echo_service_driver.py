@@ -154,7 +154,7 @@ def test_bind_never_carries_the_secret_and_leases_it():
         "project_read_only": False,
     }
     ctx = BindContext(
-        gates=DeploymentGates(lambda: False, lambda: False),
+        gates=DeploymentGates(lambda: False),
         logger=MagicMock(),
         default_known_hosts="",
     )

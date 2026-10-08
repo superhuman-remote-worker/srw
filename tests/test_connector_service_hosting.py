@@ -970,7 +970,6 @@ def test_the_egress_route_needs_access_to_the_connector_and_shows_its_pods():
             vector_db=MagicMock(),
             knowledge_index=MagicMock(),
             mcp_datasources_enabled=lambda: False,
-            mcp_stdio_enabled=lambda: False,
             validate_mcp_datasource=lambda _url, _creds: None,
             connector_drivers=builtin_connector_drivers(echo_service_image="r/echo:1"),
         ),

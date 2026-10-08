@@ -34,7 +34,6 @@ from orchestrator.services.connector_drivers import builtin_connector_drivers
 from orchestrator.services import knowledge_projection
 from orchestrator.services.deployment_gates import (
     mcp_datasources_enabled,
-    mcp_stdio_enabled,
 )
 from tests._connector_goldens import KINDS, PROJECT_ID, Golden, all_rows, resolved_row
 
@@ -77,7 +76,7 @@ README_CASES: dict[str, ReadmeCase] = {
         annotate={"mcp": {"_mcp_status": "connected", "_mcp_tools": _mcp_tools(43)}},
     ),
     "mcp_unavailable": ReadmeCase(
-        [resolved_row("mcp_stdio")],
+        [resolved_row("mcp_remote")],
         annotate={
             "mcp": {"_mcp_status": "unavailable: ConnectError", "_mcp_tools": []}
         },
@@ -233,7 +232,6 @@ def golden():
 @pytest.fixture(autouse=True)
 def _gates_on(monkeypatch):
     monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "true")
-    monkeypatch.setenv("MCP_STDIO_ENABLED", "true")
 
 
 def _payload(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -243,7 +241,6 @@ def _payload(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             dependencies=payload_module.DatasourcePayloadDependencies(
                 logger=SimpleNamespace(warning=lambda *_args, **_kwargs: None),
                 mcp_datasources_enabled=mcp_datasources_enabled,
-                mcp_stdio_enabled=mcp_stdio_enabled,
                 connector_drivers=builtin_connector_drivers(),
                 workspace_ssh_known_hosts=lambda: "",
             ),

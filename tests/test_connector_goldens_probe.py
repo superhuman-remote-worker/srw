@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import copy
 import imaplib
-import shutil
 import smtplib
 import sys
 from collections.abc import Callable
@@ -54,7 +53,6 @@ class ProbeCase:
     row: dict[str, Any]
     scenario: Scenario | None = None
     mcp: bool = True
-    stdio: bool = True
     gate_crashes: bool = False
     pinned_defect: str | None = None
 
@@ -355,7 +353,6 @@ def mcp_sdk(
     def install(monkeypatch, calls):
         import mcp
         import mcp.client.sse
-        import mcp.client.stdio
         import mcp.client.streamable_http
 
         def opened(record):
@@ -394,23 +391,6 @@ def mcp_sdk(
             opened({"transport": "sse", "url": url, "headers": dict(headers or {})})
             yield "read", "write"
 
-        @asynccontextmanager
-        async def stdio_client(parameters, errlog=None):
-            opened(
-                {
-                    "transport": "stdio",
-                    "command": parameters.command,
-                    "args": list(parameters.args),
-                    "credential_env": {
-                        key: parameters.env[key]
-                        for key in ("ACME_KEY",)
-                        if key in (parameters.env or {})
-                    },
-                    "stderr_discarded": getattr(errlog, "name", None) == "/dev/null",
-                }
-            )
-            yield "read", "write"
-
         class Session:
             def __init__(self, read, write):
                 pass
@@ -445,16 +425,7 @@ def mcp_sdk(
                 streamable, "streamablehttp_client", streamablehttp_client
             )
         monkeypatch.setattr(mcp.client.sse, "sse_client", sse_client)
-        monkeypatch.setattr(mcp.client.stdio, "stdio_client", stdio_client)
         monkeypatch.setattr(mcp, "ClientSession", Session)
-        monkeypatch.setattr(shutil, "which", lambda command: f"/usr/bin/{command}")
-
-    return install
-
-
-def which_finds_nothing() -> Scenario:
-    def install(monkeypatch, calls):
-        monkeypatch.setattr(shutil, "which", lambda command: None)
 
     return install
 
@@ -714,9 +685,9 @@ CASES: dict[str, ProbeCase] = {
     "mcp/remote_timed_out": ProbeCase(
         _stored("mcp_remote"), mcp_sdk(error=TimeoutError())
     ),
-    "mcp/stdio_connected": ProbeCase(_stored("mcp_stdio"), mcp_sdk(tools=("echo",))),
-    "mcp/stdio_runtime_missing": ProbeCase(_stored("mcp_stdio"), which_finds_nothing()),
-    "mcp/stdio_gate_off": ProbeCase(_stored("mcp_stdio"), mcp_sdk(), stdio=False),
+    # A stored stdio server is never run, here or in the agent pod
+    # (connector drivers D5b): Test answers unsupported and touches no SDK.
+    "mcp/stdio_retired": ProbeCase(_stored("mcp_stdio"), mcp_sdk(tools=("echo",))),
 }
 
 
@@ -730,19 +701,14 @@ def run_case(case: ProbeCase, monkeypatch) -> dict[str, Any]:
     from orchestrator.services import knowledge_index
     from orchestrator.services.datasource_config import validate_mcp_datasource
     from orchestrator.services.datasources import DatasourceDependencies
-    from orchestrator.services.deployment_gates import mcp_stdio_enabled
     from orchestrator.services.connector_drivers import builtin_connector_drivers
     from orchestrator.services.deployment_gates import mcp_datasources_enabled
     from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
 
-    for name, on in (
-        ("MCP_DATASOURCES_ENABLED", case.mcp),
-        ("MCP_STDIO_ENABLED", case.stdio),
-    ):
-        if on:
-            monkeypatch.setenv(name, "true")
-        else:
-            monkeypatch.delenv(name, raising=False)
+    if case.mcp:
+        monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "true")
+    else:
+        monkeypatch.delenv("MCP_DATASOURCES_ENABLED", raising=False)
 
     calls: Recorder = []
     if case.scenario is not None:
@@ -769,7 +735,6 @@ def run_case(case: ProbeCase, monkeypatch) -> dict[str, Any]:
             ),
             mcp_datasources_enabled=mcp_datasources_enabled,
             validate_mcp_datasource=validate_mcp_datasource,
-            mcp_stdio_enabled=mcp_stdio_enabled,
             connector_drivers=builtin_connector_drivers(),
         ),
         require_datasource_owner=datasource_owner,

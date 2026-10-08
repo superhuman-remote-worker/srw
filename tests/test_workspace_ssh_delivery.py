@@ -40,7 +40,6 @@ def _deps(known_hosts: str = "") -> DatasourcePayloadDependencies:
     return DatasourcePayloadDependencies(
         logger=logging.getLogger("test"),
         mcp_datasources_enabled=lambda: True,
-        mcp_stdio_enabled=lambda: True,
         connector_drivers=builtin_connector_drivers(),
         workspace_ssh_known_hosts=lambda: known_hosts,
     )

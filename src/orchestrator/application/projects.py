@@ -81,7 +81,6 @@ def datasources_dependencies(
             vector_db=resources.vector_db,
             knowledge_index=knowledge_index_dependencies(resources),
             mcp_datasources_enabled=deployment_gates.mcp_datasources_enabled,
-            mcp_stdio_enabled=deployment_gates.mcp_stdio_enabled,
             validate_mcp_datasource=datasource_config.validate_mcp_datasource,
             connector_drivers=resources.connector_drivers,
             connector_credentials=bound(

@@ -127,7 +127,6 @@ def test_the_payload_never_carries_a_lease_drivers_secret(installed):
     deps = DatasourcePayloadDependencies(
         logger=MagicMock(),
         mcp_datasources_enabled=lambda: False,
-        mcp_stdio_enabled=lambda: False,
         connector_drivers=builtin_connector_drivers(lease_probe=installed),
         workspace_ssh_known_hosts=lambda: "",
     )
@@ -150,7 +149,6 @@ def test_the_payload_blanks_a_lease_entry_whatever_its_bind_returned(monkeypatch
     deps = DatasourcePayloadDependencies(
         logger=MagicMock(),
         mcp_datasources_enabled=lambda: False,
-        mcp_stdio_enabled=lambda: False,
         connector_drivers=builtin_connector_drivers(lease_probe=True),
         workspace_ssh_known_hosts=lambda: "",
     )

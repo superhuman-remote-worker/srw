@@ -483,10 +483,12 @@ data:
   # Separate default-off canary for the persistent-session capability tool.
   # Agent pods inherit it through envFrom; it does not enable the endpoint.
   PRODUCT_CAPABILITIES_TOOL_ENABLED: {{ .Values.agent.productCapabilitiesToolEnabled | default "false" | quote }}
-  # User-added MCP servers. stdio is separately gated because it runs
-  # third-party commands inside dynamically provisioned agent pods.
+  # User-added MCP servers (http or sse). A stdio server no longer runs in
+  # agent pods (connector drivers D5b): its image runs as a managed MCP server.
+  {{- if eq (toString (.Values.agent.mcpStdioEnabled | default "false")) "true" }}
+  {{- fail "agent.mcpStdioEnabled was removed (connector drivers D5b): stdio MCP servers no longer run in agent pods. Run a stdio server's image as a managed MCP server (connectors.drivers), or connect the server by URL" }}
+  {{- end }}
   MCP_DATASOURCES_ENABLED: {{ .Values.agent.mcpDatasourcesEnabled | default "false" | quote }}
-  MCP_STDIO_ENABLED: {{ .Values.agent.mcpStdioEnabled | default "false" | quote }}
   # Compatibility gate for omitted datasource_ids on root REST/session work.
   DATASOURCE_DEFAULTS_ON_OMISSION: {{ .Values.agent.datasourceDefaultsOnOmission | default "false" | quote }}
   # Capability-advertisement gate for datasource project scope + auto-attach.

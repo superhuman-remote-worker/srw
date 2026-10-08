@@ -150,7 +150,6 @@ def _tools_for(server, *, read_only: bool):
     deps = DatasourcePayloadDependencies(
         logger=logging.getLogger("test"),
         mcp_datasources_enabled=lambda: False,
-        mcp_stdio_enabled=lambda: False,
         connector_drivers=builtin_connector_drivers(),
         workspace_ssh_known_hosts=lambda: "",
     )

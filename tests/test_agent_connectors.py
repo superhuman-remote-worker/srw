@@ -52,17 +52,36 @@ def _payload(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         dependencies=payload_module.DatasourcePayloadDependencies(
             logger=SimpleNamespace(warning=lambda *_args, **_kwargs: None),
             mcp_datasources_enabled=lambda: True,
-            mcp_stdio_enabled=lambda: True,
             connector_drivers=builtin_connector_drivers(),
             workspace_ssh_known_hosts=lambda: "",
         ),
     )
 
 
+#: A stored stdio server is never delivered (connector drivers D5b).
+DELIVERED_KINDS = tuple(kind for kind in KINDS if kind != "mcp_stdio")
+
+#: What an orchestrator from before D5b sent for a stdio server; an agent
+#: image can still meet one while the two roll apart.
+_PRE_D5B_STDIO_ENTRY: dict[str, Any] = {
+    "type": "mcp",
+    "name": "Local MCP",
+    "description": "Local tool server",
+    "connection_url": None,
+    "credentials": {
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@acme/mcp"],
+        "env": {"ACME_KEY": "stdio-secret"},
+    },
+    "project_read_only": False,
+}
+
+
 def _by_kind(**over: Any) -> dict[str, dict[str, Any]]:
     entries = _payload(all_rows(**over))
-    assert len(entries) == len(KINDS)
-    return dict(zip(KINDS, entries))
+    assert len(entries) == len(DELIVERED_KINDS)
+    return dict(zip(DELIVERED_KINDS, entries))
 
 
 def _forms(descriptor: BindingDescriptor) -> list[str]:
@@ -98,10 +117,17 @@ def test_every_canonical_entry_reads_as_a_valid_descriptor(read_only):
 def test_a_remote_mcp_entry_names_the_remote_driver():
     entries = _by_kind()
     remote = binding_from_legacy_entry(entries["mcp_remote"])
-    stdio = binding_from_legacy_entry(entries["mcp_stdio"])
+    stdio = binding_from_legacy_entry(_PRE_D5B_STDIO_ENTRY)
     assert (remote.driver, stdio.driver) == ("srw.mcp-remote/v1", "srw.mcp/v1")
-    # One driver implementation, so the same delivery either way.
+    # One driver implementation, so the same delivery either way; the MCP
+    # manager refuses a stdio entry (D5b).
     assert _forms(remote) == _forms(stdio) == ["mcp_client"]
+
+
+def test_a_stored_stdio_server_is_never_delivered():
+    entries = _payload([resolved_row("mcp_stdio"), resolved_row("mcp_remote")])
+    assert [entry["name"] for entry in entries] == [resolved_row("mcp_remote")["name"]]
+    assert "stdio-secret" not in repr(entries)
 
 
 def test_reading_an_entry_never_mutates_it():
@@ -155,7 +181,7 @@ def test_the_descriptor_carries_each_forms_values():
     assert pg["kind"] == "postgresql"
     assert pg["read_only"] is False
 
-    stdio = _value(binding_from_legacy_entry(entries["mcp_stdio"]), "mcp_client")
+    stdio = _value(binding_from_legacy_entry(_PRE_D5B_STDIO_ENTRY), "mcp_client")
     assert stdio == {
         "transport": "stdio",
         "url": None,

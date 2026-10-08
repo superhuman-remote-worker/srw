@@ -96,7 +96,6 @@ def _wire(
     from orchestrator.routers.datasources import DatasourcesDependencies as RouteDeps
     from orchestrator.routers.datasources import router
     from orchestrator.services.datasources import DatasourceDependencies as OpDeps
-    from orchestrator.services.deployment_gates import mcp_stdio_enabled
     from orchestrator.services.connector_drivers import builtin_connector_drivers
     from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
     from orchestrator.services.knowledge_index import KnowledgeIndexDependencies
@@ -138,7 +137,6 @@ def _wire(
         ),
         mcp_datasources_enabled=lambda: mcp_enabled,
         validate_mcp_datasource=validate_mcp or (lambda _url, _creds: None),
-        mcp_stdio_enabled=mcp_stdio_enabled,
         connector_drivers=builtin_connector_drivers(),
     )
     deps = RouteDeps(

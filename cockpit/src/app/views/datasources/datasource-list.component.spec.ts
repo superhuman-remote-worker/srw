@@ -438,30 +438,14 @@ describe('DatasourceListComponent MCP support', () => {
     );
   });
 
-  it('builds stdio credentials with args split per line', () => {
-    const {api, component} = createComponent();
+  it('offers no stdio transport: a stdio server no longer runs in the agent', () => {
+    const {component} = createComponent();
     component.openCreateForm();
-    component.formData.name = 'GitHub tools';
     component.onTypeSelect('mcp');
-    component.formData.mcpTransport = 'stdio';
-    component.formData.mcpCommand = 'npx';
-    component.formData.mcpArgs =
-      '-y\n@modelcontextprotocol/server-github\n\n';
-
-    component.saveForm();
-
-    expect(api.createDatasource).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: 'mcp',
-        connection_url: undefined,
-        credentials: {
-          transport: 'stdio',
-          command: 'npx',
-          args: ['-y', '@modelcontextprotocol/server-github'],
-          env: {},
-        },
-      }),
-    );
+    component.onMcpTransportSelect('stdio');
+    expect(component.formData.mcpTransport).toBe('http');
+    component.onMcpTransportSelect('sse');
+    expect(component.formData.mcpTransport).toBe('sse');
   });
 });
 
