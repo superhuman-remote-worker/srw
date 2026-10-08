@@ -3,11 +3,12 @@
 Only the program and destination paths appear in the command. Values travel
 in stdin. Environment values are retained in the session workspace as
 explicitly agreed for v1; credential files are synced (removed once no
-longer delivered) and retired with the work item.
+longer delivered) and retired with the work item; a connector's credential
+lease token (slice C2) is one file under ``~/.srw-credentials/leases/``.
 
-Everything both programs write lives under ``~/.srw-credentials/`` (0700),
+Everything these programs write lives under ``~/.srw-credentials/`` (0700),
 which a workspace snapshot never captures (``CREDENTIAL_EXCLUDE_PATTERNS`` in
-``orchestrator.services.snapshot_service``). Both run as
+``orchestrator.services.snapshot_service``). All run as
 ``/usr/bin/python3 -I`` (:data:`WORKSPACE_PYTHON`), never a ``python3`` found
 on the workspace's ``PATH`` or a site directory the workspace can write: the
 secrets on their stdin must not reach a planted interpreter or ``.pth`` file.
@@ -302,4 +303,34 @@ print(json.dumps({'store': store, 'linked': sorted(kept), 'skipped': skipped,
                   'env': sorted(env_set), 'env_skipped': env_skipped,
                   'env_retired': sorted(retired),
                   'env_file': os.path.exists(env_sh)}))
+"""
+
+#: Writes (``install``) or removes (``remove``) one connector's credential
+#: lease token file (slice C2). The token arrives on stdin only; the file is
+#: 0600 in a 0700 directory and replaced atomically, so a reader never sees
+#: half a token.
+CONNECTOR_LEASE_FILE = r"""
+import os, pathlib, sys, tempfile
+
+mode, target = sys.argv[1], pathlib.Path(sys.argv[2])
+if mode == 'remove':
+    try:
+        target.unlink()
+    except FileNotFoundError:
+        pass
+    sys.exit(0)
+token = sys.stdin.read()
+if not token:
+    sys.exit(2)
+target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+os.chmod(target.parent, 0o700)
+fd, temporary = tempfile.mkstemp(dir=target.parent, prefix='.lease-')
+try:
+    with os.fdopen(fd, 'w') as output:
+        output.write(token)
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, target)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
 """

@@ -38,12 +38,19 @@ DeliveryForm = Literal[
     "pod_env",
     "pod_file",
     "ssh_identity",
+    "lease_token",
 ]
 CredentialKind = Literal[
     "secret_string", "file", "ssh_private_key", "oauth2", "kubeconfig"
 ]
 CredentialDelivery = Literal["env", "file", "ssh_agent"]
 CredentialUpdate = Literal["keep_if_blank", "merge", "replace"]
+#: How a connector's upstream credential is handed out.  ``inline``: the
+#: credential itself travels in the binding (every built-in driver today).
+#: ``lease``: SRW issues a short-lived lease token instead, delivered in the
+#: ``lease_token`` form, and the driver exchanges it for the credential
+#: (slice C2, "The lease service").
+CredentialDeliveryMode = Literal["inline", "lease"]
 LiveDetach = Literal["immediate", "next_attach", "refused"]
 Operation = Literal[
     "spec", "check", "bind", "revoke", "renew", "discover", "gc", "status", "reindex"
@@ -54,6 +61,7 @@ DELIVERY_FORMS: tuple[str, ...] = get_args(DeliveryForm)
 CREDENTIAL_KINDS: tuple[str, ...] = get_args(CredentialKind)
 CREDENTIAL_DELIVERIES: tuple[str, ...] = get_args(CredentialDelivery)
 CREDENTIAL_UPDATES: tuple[str, ...] = get_args(CredentialUpdate)
+CREDENTIAL_DELIVERY_MODES: tuple[str, ...] = get_args(CredentialDeliveryMode)
 LIVE_DETACH: tuple[str, ...] = get_args(LiveDetach)
 OPERATIONS: tuple[str, ...] = get_args(Operation)
 REQUIRED_OPERATIONS: frozenset[str] = frozenset({"spec", "check", "bind", "revoke"})
@@ -197,6 +205,11 @@ class DriverSpec:
     (an installation switch that must be on) and
     ``holds_upstream_credentials``.  ``service`` is set for service-plane
     drivers only.
+
+    ``credential_delivery`` is ``lease`` for a driver whose upstream
+    credential never reaches the agent: SRW issues one lease per
+    workspace-owning execution and delivers its token in the
+    ``lease_token`` form (which such a driver must list, and no other may).
     """
 
     name: str
@@ -227,6 +240,7 @@ class DriverSpec:
     deployment_gate: str | None = None
     holds_upstream_credentials: bool = False
     service: ServiceSpec | None = None
+    credential_delivery: CredentialDeliveryMode = "inline"
 
     def access_level(self, level_id: str) -> AccessLevel | None:
         return next(
@@ -294,6 +308,18 @@ def validate_spec(spec: DriverSpec) -> list[str]:
         problems.append(f"live_detach {spec.live_detach!r} is not one of {LIVE_DETACH}")
     if spec.max_per_execution is not None and spec.max_per_execution < 1:
         problems.append("max_per_execution must be positive")
+    if spec.credential_delivery not in CREDENTIAL_DELIVERY_MODES:
+        problems.append(
+            f"credential_delivery {spec.credential_delivery!r} is not one of "
+            f"{CREDENTIAL_DELIVERY_MODES}"
+        )
+    elif (spec.credential_delivery == "lease") != (
+        "lease_token" in spec.delivery_forms
+    ):
+        problems.append(
+            "a driver delivers in the lease_token form exactly when its "
+            "credential_delivery is 'lease'"
+        )
     problems += _access_problems(spec)
     problems += _slot_problems(spec)
     if (spec.service is not None) != (spec.plane == "service"):

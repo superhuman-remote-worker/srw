@@ -1,5 +1,6 @@
-"""Specs of the drivers SRW ships: the 13 datasource types and the two
-generic-hosting delivery drivers.
+"""Specs of the drivers SRW ships: the 13 datasource types, the two
+generic-hosting delivery drivers and one development driver (the lease
+probe, off unless an installation turns it on).
 
 The datasource drivers are named ``srw.<type>/v1`` and keep the stored
 ``datasources.type`` as ``legacy_type``.  Their order here is the connector
@@ -639,6 +640,46 @@ GENERIC_FILE_SPEC = _credential_file(
     "generic_file", "generic-file", "Generic file", "file", "file"
 )
 
+#: A development driver behind a credential lease (slice C2). It stores a
+#: fake upstream secret that never leaves SRW: the agent receives only a lease
+#: token, and the exchange hands the secret to a driver identity of this
+#: connector. It lets a k3d gate drive the lease lifecycle before the first
+#: real lease driver (the swap driver of C3) exists. The orchestrator installs
+#: it only when ``orchestrator.connectorLeases.probeDriver`` is on, and no
+#: catalogue lists it.
+LEASE_PROBE_SPEC = DriverSpec(
+    name="srw.lease-probe/v1",
+    legacy_type="lease_probe",
+    title="Lease probe (development)",
+    plane="bind_time",
+    delivery_forms=("lease_token",),
+    config_schema={
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"upstream": {"type": "string", "maxLength": 512}},
+    },
+    credential_slots=(
+        CredentialSlot(
+            "secret",
+            "secret_string",
+            {"type": "object", "properties": {"secret": _SECRET}},
+            required=True,
+        ),
+    ),
+    access_levels=(
+        AccessLevel("ReadOnly", 0, "The lease exchange refuses a write operation."),
+        AccessLevel("ReadWrite", 1, "The lease exchange allows reads and writes."),
+    ),
+    default_access="ReadWrite",
+    supported_backends=SHELL_BACKENDS,
+    workspace_requirements=(
+        "A shell workspace: a lease token is written under "
+        "~/.srw-credentials/leases/; the secret itself never is."
+    ),
+    publishable=False,
+    credential_delivery="lease",
+)
+
 #: Datasource drivers in catalogue order.
 DATASOURCE_SPECS: tuple[DriverSpec, ...] = (
     GENERIC_SPEC,
@@ -657,11 +698,18 @@ DATASOURCE_SPECS: tuple[DriverSpec, ...] = (
 )
 MANIFEST_SPECS: tuple[DriverSpec, ...] = (ENV_SPEC, FILES_SPEC)
 BUILTIN_SPECS: tuple[DriverSpec, ...] = MANIFEST_SPECS + DATASOURCE_SPECS
+#: Drivers an installation turns on for development only. Their stored types
+#: resolve (an agent must read what it is sent) but no catalogue lists them.
+DEVELOPMENT_SPECS: tuple[DriverSpec, ...] = (LEASE_PROBE_SPEC,)
 
 _BY_TYPE: dict[str, DriverSpec] = {
-    spec.legacy_type: spec for spec in DATASOURCE_SPECS if spec.legacy_type
+    spec.legacy_type: spec
+    for spec in DATASOURCE_SPECS + DEVELOPMENT_SPECS
+    if spec.legacy_type
 }
-LEGACY_TYPE_IDS: tuple[str, ...] = tuple(_BY_TYPE)
+LEGACY_TYPE_IDS: tuple[str, ...] = tuple(
+    spec.legacy_type for spec in DATASOURCE_SPECS if spec.legacy_type
+)
 
 #: The datasource tool map's key order, kept from before the specs existed so
 #: a job's tool override keeps its key order across the move.

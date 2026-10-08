@@ -3,7 +3,8 @@
 * :mod:`.contract` — ``DriverSpec`` and the vocabularies it uses;
 * :mod:`.binding` — the binding descriptor, its JSON Schema and validator;
 * :mod:`.envelope` — the request, the typed output lines and error classes;
-* :mod:`.builtin` — the specs of the drivers SRW ships.
+* :mod:`.builtin` — the specs of the drivers SRW ships;
+* :mod:`.leases` — credential lease and driver identity tokens (C2).
 
 The control-plane drivers live in ``orchestrator.services.connector_drivers``;
 the agent's materializers will live in ``agent.connectors``.  Import-linter
@@ -22,6 +23,7 @@ from .binding import (
 from .builtin import (
     BUILTIN_SPECS,
     DATASOURCE_SPECS,
+    DEVELOPMENT_SPECS,
     LEGACY_TYPE_IDS,
     MANIFEST_SPECS,
     legacy_types_with_form,
@@ -59,6 +61,7 @@ __all__ = [
     "API_CHECK_STATUSES",
     "BUILTIN_SPECS",
     "DATASOURCE_SPECS",
+    "DEVELOPMENT_SPECS",
     "ERROR_CLASSES",
     "LEGACY_TYPE_IDS",
     "MANIFEST_SPECS",

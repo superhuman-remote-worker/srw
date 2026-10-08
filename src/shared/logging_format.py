@@ -41,6 +41,8 @@ _STANDALONE = [
     re.compile(r"\bsk-[A-Za-z0-9_\-]{16,512}"),  # OpenAI / Anthropic style
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{8,512}"),  # Slack
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,255}"),  # GitHub
+    # SRW credential lease / driver identity (shared.connectors.leases)
+    re.compile(r"\bs(?:cl|di)_[0-9A-Za-z]{49}\b"),
     # scheme://user:password@host — the userinfo only, so the line still names
     # the host. A failed fetch or push logs its credential-bearing remote, and
     # archived agent logs are served back through get_job_log. Anchored after

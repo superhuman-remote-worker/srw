@@ -367,6 +367,11 @@ _VALUES = {
         "user": "deploy",
         "known_hosts": ["ssh-ed25519 AAAA"],
     },
+    "lease_token": {
+        "lease_id": "00000000-0000-4000-8000-0000000000c2",
+        "connector_id": "00000000-0000-4000-8000-0000000000c3",
+        "token": "scl_x",
+    },
 }
 
 

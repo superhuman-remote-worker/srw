@@ -242,8 +242,37 @@ def _knowledge_entries(
     ]
 
 
+def _lease_entries(entry: Mapping[str, Any], spec: DriverSpec) -> list[BindingEntry]:
+    # The orchestrator puts the lease where an inline driver's secret would
+    # be (``credentials``), so every path that strips credentials from a
+    # payload (checkpoints, audit) strips the token too. An entry it could
+    # not lease carries none and delivers nothing.
+    lease = _mapping(_credentials(entry).get("lease"))
+    value = {
+        key: lease.get(source)
+        for key, source in (
+            ("lease_id", "id"),
+            ("connector_id", "connector_id"),
+            ("token", "token"),
+        )
+    }
+    if not all(isinstance(item, str) and item for item in value.values()):
+        return []
+    return [
+        BindingEntry(
+            recipient="workspace",
+            form="lease_token",
+            value=value,
+            collision="last_wins",
+            refresh="on_backend_swap",
+            retire="remove",
+        )
+    ]
+
+
 _ENTRY_BUILDERS = {
     "env_file": _env_entries,
+    "lease_token": _lease_entries,
     "credential_file": _file_entries,
     "checkout": _checkout_entries,
     "managed_connection": _connection_entries,

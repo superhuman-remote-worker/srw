@@ -6,20 +6,22 @@ records the calls through every entry point:
 
 * **workspace init** (worker and session): the SSH identities load while the
   workspace initializes, before anything clones;
-* **worker setup** (``UniversalAgent._setup_job_tools``): environment, managed
-  connections, MCP, checkouts, credential files;
+* **worker setup** (``UniversalAgent._setup_job_tools``): environment, lease
+  tokens, managed connections, MCP, checkouts, credential files;
 * **session attach**, in two phases (``agent.api.session_attach``): the
   harness phase (managed connections, MCP) runs before the workspace exists,
-  so the tool set can be resolved; the workspace phase (environment,
-  checkouts, credential files) after it is initialized;
+  so the tool set can be resolved; the workspace phase (environment, lease
+  tokens, checkouts, credential files) after it is initialized;
 * **live update** (``PersistentSession.resetup_datasources``): environment,
-  SSH identities, the KB deferral, a fresh harness that the caller swaps in
-  place, then checkouts and credential files;
-* **backend swap** (``PersistentSession.swap_backend``): the environment and
-  the credential files follow the physical workspace.
+  lease tokens, SSH identities, the KB deferral, a fresh harness that the
+  caller swaps in place, then checkouts and credential files;
+* **backend swap** (``PersistentSession.swap_backend``): the environment, the
+  lease tokens and the credential files follow the physical workspace.
 
 Credential files reach the workspace, never the agent pod (slice D1d). They
 come after the checkouts in every order, as they always did on a worker.
+Lease tokens (slice C2) are written before any checkout, so a checkout whose
+driver swaps credentials can read its lease.
 
 Blocking steps that the async entry points ran off the event loop still do
 (``offload``); the rest run inline, as they did.
@@ -50,6 +52,7 @@ from agent.connectors.connections import ManagedConnectionMaterializer
 from agent.connectors.env import EnvFileMaterializer
 from agent.connectors.files import CredentialFileMaterializer
 from agent.connectors.knowledge import KnowledgeIndexMaterializer
+from agent.connectors.lease import LeaseTokenMaterializer
 from agent.connectors.mcp import McpClientMaterializer
 from agent.connectors.ssh_identity import SshIdentityMaterializer
 
@@ -58,6 +61,7 @@ logger = logging.getLogger(__name__)
 WORKSPACE_INIT_ORDER: tuple[str, ...] = ("ssh_identity",)
 WORKER_ORDER: tuple[str, ...] = (
     "env_file",
+    "lease_token",
     "managed_connection",
     "mcp_client",
     "checkout",
@@ -66,6 +70,7 @@ WORKER_ORDER: tuple[str, ...] = (
 SESSION_HARNESS_ORDER: tuple[str, ...] = ("managed_connection", "mcp_client")
 SESSION_WORKSPACE_ORDER: tuple[str, ...] = (
     "env_file",
+    "lease_token",
     "checkout",
     "credential_file",
 )
@@ -73,19 +78,23 @@ SESSION_WORKSPACE_ORDER: tuple[str, ...] = (
 LIVE_HARNESS_FORMS: tuple[str, ...] = ("managed_connection", "mcp_client")
 LIVE_ORDER: tuple[str, ...] = (
     "env_file",
+    "lease_token",
     "ssh_identity",
     "knowledge_index",
     *LIVE_HARNESS_FORMS,
     "checkout",
     "credential_file",
 )
-BACKEND_SWAP_ORDER: tuple[str, ...] = ("env_file", "credential_file")
+BACKEND_SWAP_ORDER: tuple[str, ...] = ("env_file", "lease_token", "credential_file")
 #: What the entry points release when an execution ends. What lives in the
-#: workspace (environment, credential files) lives as long as it does.
+#: workspace (environment, lease tokens, credential files) lives as long as
+#: it does.
 RELEASE_ORDER: tuple[str, ...] = ("managed_connection",)
 
 #: Steps an async entry point runs in a worker thread.
-_SESSION_OFFLOAD = frozenset({"env_file", "ssh_identity", "credential_file"})
+_SESSION_OFFLOAD = frozenset(
+    {"env_file", "lease_token", "ssh_identity", "credential_file"}
+)
 
 
 def routed(deliveries: Iterable[Delivery], form: str) -> list[Delivery]:
@@ -108,6 +117,7 @@ class ConnectorRegistry:
         return cls(
             (
                 EnvFileMaterializer(),
+                LeaseTokenMaterializer(),
                 CredentialFileMaterializer(),
                 CheckoutMaterializer(),
                 SshIdentityMaterializer(),

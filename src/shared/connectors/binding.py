@@ -110,6 +110,15 @@ VALUE_FIELDS: dict[str, dict[str, tuple[ValueType, bool, bool]]] = {
         "user": ("string_or_null", False, False),
         "known_hosts": ("string_list", False, False),
     },
+    # A credential lease token (slice C2), written to a 0600 file under
+    # ~/.srw-credentials/leases/ named after the connector. The driver
+    # exchanges it with SRW for the upstream credential; it is never the
+    # credential itself.
+    "lease_token": {
+        "lease_id": ("string", True, False),
+        "connector_id": ("string", True, False),
+        "token": ("string", True, True),
+    },
 }
 #: Closed value enums inside a form (``null`` stays allowed where the type
 #: allows it).  A checkout's ``auth`` names how the credential reaches git:

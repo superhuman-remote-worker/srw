@@ -39,9 +39,22 @@ PAYLOAD = [
     {"type": "kubeconfig", "name": "Kube", "credentials": {"files": []}},
     {"type": "ssh_key", "name": "Key", "credentials": {"files": []}},
     {"type": "kb", "name": "KB", "datasource_id": "kb-1"},
+    {
+        "type": "lease_probe",
+        "name": "Lease",
+        "datasource_id": "00000000-0000-4000-8000-0000000000c3",
+        "credentials": {
+            "lease": {
+                "id": "00000000-0000-4000-8000-0000000000c2",
+                "connector_id": "00000000-0000-4000-8000-0000000000c3",
+                "token": "scl_test",
+            }
+        },
+    },
 ]
 AGENT_FORMS = (
     "env_file",
+    "lease_token",
     "credential_file",
     "checkout",
     "ssh_identity",
@@ -119,6 +132,7 @@ def test_every_agent_form_has_a_materializer():
 def test_the_orders_are_the_runtime_orders():
     assert WORKER_ORDER == (
         "env_file",
+        "lease_token",
         "managed_connection",
         "mcp_client",
         "checkout",
@@ -126,10 +140,16 @@ def test_the_orders_are_the_runtime_orders():
     )
     assert SESSION_HARNESS_ORDER == ("managed_connection", "mcp_client")
     # Credential files reach the session workspace too (slice D1d), after
-    # the checkouts as on a worker.
-    assert SESSION_WORKSPACE_ORDER == ("env_file", "checkout", "credential_file")
+    # the checkouts as on a worker; lease tokens (C2) before them.
+    assert SESSION_WORKSPACE_ORDER == (
+        "env_file",
+        "lease_token",
+        "checkout",
+        "credential_file",
+    )
     assert LIVE_ORDER == (
         "env_file",
+        "lease_token",
         "ssh_identity",
         "knowledge_index",
         "managed_connection",
@@ -137,7 +157,7 @@ def test_the_orders_are_the_runtime_orders():
         "checkout",
         "credential_file",
     )
-    assert BACKEND_SWAP_ORDER == ("env_file", "credential_file")
+    assert BACKEND_SWAP_ORDER == ("env_file", "lease_token", "credential_file")
     # What lives in the workspace lives as long as it does.
     assert RELEASE_ORDER == ("managed_connection",)
 
@@ -155,6 +175,7 @@ async def test_each_materializer_sees_only_its_routed_deliveries(log):
     routed = {form: names for form, step, names in log if step == "materialize"}
     assert routed == {
         "env_file": ["Env"],
+        "lease_token": ["Lease"],
         "managed_connection": ["PG"],
         "mcp_client": ["Docs"],
         "checkout": ["Repo"],
@@ -198,6 +219,7 @@ async def test_worker_setup_runs_the_worker_order(log):
 
     assert [(form, step) for form, step, _ in log] == [
         ("env_file", "materialize"),
+        ("lease_token", "materialize"),
         ("managed_connection", "materialize"),
         ("mcp_client", "materialize"),
         ("mcp_client", "ready"),
@@ -334,6 +356,7 @@ async def test_session_attach_runs_the_harness_phase_then_the_workspace_phase(
         ("session", "construct"),
         ("workspace", "initialize"),
         ("env_file", "materialize"),
+        ("lease_token", "materialize"),
         ("checkout", "materialize"),
         ("credential_file", "materialize"),
         ("readme", "inject"),
@@ -390,6 +413,7 @@ async def test_live_update_swaps_the_harness_before_the_checkouts(log):
 
     assert [(form, step) for form, step, _ in log] == [
         ("env_file", "replace"),
+        ("lease_token", "replace"),
         ("ssh_identity", "replace"),
         ("knowledge_index", "replace"),
         ("managed_connection", "materialize"),
@@ -421,7 +445,7 @@ async def test_live_update_offloads_the_workspace_round_trips(log, monkeypatch):
         RuntimeContext(execution="session"),
         on_harness_replaced=lambda connections, clients: None,
     )
-    assert offloaded == ["env_file", "ssh_identity", "credential_file"]
+    assert offloaded == ["env_file", "lease_token", "ssh_identity", "credential_file"]
 
 
 # =============================================================================
@@ -444,8 +468,10 @@ def test_backend_swap_delivers_the_workspace_forms_before_the_old_one_retires(
 
     assert [(form, step) for form, step, _ in log] == [
         ("env_file", "on_backend_swap"),
+        ("lease_token", "on_backend_swap"),
         ("credential_file", "on_backend_swap"),
         ("backend", "retire"),
     ]
     assert log[0][2] == ["Env"]
-    assert log[1][2] == ["Kube"]
+    assert log[1][2] == ["Lease"]
+    assert log[2][2] == ["Kube"]

@@ -1590,6 +1590,48 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             '(exit "$_srw_files_rc")\n'
         )
 
+    def install_connector_lease(self, connector_id: str, token: str) -> str:
+        """Write one connector's lease token to its 0600 file; return the path.
+
+        The token travels on the secret stdin channel only, never in a
+        command line, the environment or tmux (slice C2).
+        """
+        from shared.connectors.leases import lease_file_name
+        from shared.runtime.core.credential_env import (
+            CONNECTOR_LEASE_FILE,
+            WORKSPACE_PYTHON,
+        )
+
+        if not token:
+            raise ValueError("A lease token is required")
+        self._init_shell()
+        path = self._resolve_home_path(lease_file_name(connector_id))
+        command = (
+            f"{WORKSPACE_PYTHON} -c {shlex.quote(CONNECTOR_LEASE_FILE)} install "
+            f"{shlex.quote(path)}"
+        )
+        if not self.execute_claim_resource_with_secret_stdin(
+            command, token, timeout=30
+        ):
+            raise WorkspaceUnavailableError("Could not install a connector lease")
+        return path
+
+    def remove_connector_lease(self, connector_id: str) -> None:
+        """Remove one connector's lease token file, if it exists."""
+        from shared.connectors.leases import lease_file_name
+        from shared.runtime.core.credential_env import (
+            CONNECTOR_LEASE_FILE,
+            WORKSPACE_PYTHON,
+        )
+
+        path = self._resolve_home_path(lease_file_name(connector_id))
+        command = (
+            f"{WORKSPACE_PYTHON} -c {shlex.quote(CONNECTOR_LEASE_FILE)} remove "
+            f"{shlex.quote(path)}"
+        )
+        if not self.execute_claim_resource_with_secret_stdin(command, "", timeout=30):
+            raise WorkspaceUnavailableError("Could not remove a connector lease")
+
     def open_forward_channel(self, dest_host: str = "127.0.0.1", dest_port: int = 8080):
         """Open a ``direct-tcpip`` channel to a loopback port on the workspace.
 

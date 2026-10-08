@@ -75,7 +75,8 @@
             "knowledge_index",
             "pod_env",
             "pod_file",
-            "ssh_identity"
+            "ssh_identity",
+            "lease_token"
           ]
         },
         "value": {
@@ -471,6 +472,34 @@
                 "authority_id",
                 "private_key",
                 "fingerprint"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "form": {
+              "const": "lease_token"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "lease_id": {
+                  "type": "string"
+                },
+                "connector_id": {
+                  "type": "string"
+                },
+                "token": {
+                  "type": "string",
+                  "writeOnly": true
+                }
+              },
+              "required": [
+                "lease_id",
+                "connector_id",
+                "token"
               ],
               "additionalProperties": false
             }

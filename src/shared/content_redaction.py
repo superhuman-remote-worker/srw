@@ -145,6 +145,8 @@ _PREFIXED: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bnpm_[A-Za-z0-9]{36,255}"),  # npm
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),  # AWS access key id
     re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"),  # Google API key
+    # SRW credential lease / driver identity (shared.connectors.leases)
+    re.compile(r"\bs(?:cl|di)_[0-9A-Za-z]{49}\b"),
 )
 # "Bearer <anything>" — right for a report, wrong for a README the agent is
 # editing ("send a Bearer token in the header" would lose its noun).
