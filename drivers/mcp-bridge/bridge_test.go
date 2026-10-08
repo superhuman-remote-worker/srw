@@ -9,14 +9,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 )
 
 // testClock is the bridge's clock in a test: idle stops are decided on it.
@@ -65,6 +69,12 @@ type harness struct {
 
 func newHarness(t *testing.T, mutate func(*options)) *harness {
 	t.Helper()
+	return newHarnessEnv(t, mutate)
+}
+
+// newHarnessEnv is newHarness with more of the container's environment.
+func newHarnessEnv(t *testing.T, mutate func(*options), extra ...string) *harness {
+	t.Helper()
 	h := &harness{
 		t:      t,
 		clock:  &testClock{now: time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)},
@@ -92,6 +102,7 @@ func newHarness(t *testing.T, mutate func(*options)) *harness {
 		"SRW_POD_VALUE=never-in-a-process",
 		fakeTokenEnv+"=a-value-from-the-pod",
 	)
+	env = append(env, extra...)
 	h.bridge = newBridge(opts, env, h.logs.printf, h.clock.Now)
 	h.server = httptest.NewServer(h.bridge)
 	t.Cleanup(func() {
@@ -316,10 +327,35 @@ func TestAProcessSeesTheCredentialAndNothingOfSRWs(t *testing.T) {
 			t.Fatalf("the process sees %s", name)
 		}
 	}
-	// The probe (no binding) gets no credential at all, not even the pod's.
-	probe := h.open("", "")
-	if h.whoami("", "", probe).Credential != "" {
+	// The probe (no binding) gets no credential, not even the pod's: only
+	// the placeholder, whatever the front sends.
+	probe := h.open("", "credential-a")
+	if h.whoami("", "credential-a", probe).Credential != digest(probePlaceholder) {
 		t.Fatal("the probe's process got a credential")
+	}
+	for _, process := range h.status().Processes {
+		if process.Probe && process.Credential {
+			t.Fatalf("status says the probe holds a credential: %+v", process)
+		}
+	}
+}
+
+func TestTheProbeStartsAServerThatExitsWithoutItsCredential(t *testing.T) {
+	// mcp/brave-search and mcp/slack exit at startup without their
+	// variable: the probe's process gets the placeholder in it.
+	h := newHarnessEnv(t, nil, requireTokenEnv+"=1")
+	probe := h.open("", "")
+	if found := h.whoami("", "", probe); found.Credential != digest(probePlaceholder) {
+		t.Fatalf("the probe's process saw %+v", found)
+	}
+	session := h.open("lease-a", "credential-a")
+	if h.whoami("lease-a", "credential-a", session).Credential != digest("credential-a") {
+		t.Fatal("a binding's process did not get its own credential")
+	}
+	// A server that takes no credential gets no placeholder either.
+	none := newHarnessEnv(t, func(o *options) { o.credentialEnv = "" })
+	if none.whoami("", "", none.open("", "")).Credential != digest("a-value-from-the-pod") {
+		t.Fatal("the probe's environment changed for a server that takes no credential")
 	}
 }
 
@@ -420,6 +456,107 @@ func TestAProcessWithACallUnansweredIsRestartedForANewSession(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the call in flight was never answered")
 	}
+}
+
+func TestACallReadBeforeATakeoverNeverTakesTheNewSessionsAnswer(t *testing.T) {
+	// The old session reads its call 7, then a new session takes the
+	// process over (nothing is pending yet), then the old call would be
+	// registered: it is dropped, so the process never answers it to the new
+	// session's call 7.
+	h := newHarness(t, nil)
+	first := h.open("lease-a", "credential-a")
+	before := h.whoami("lease-a", "credential-a", first)
+	held, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	hook := func(message jsonrpc.Message) {
+		if request, ok := message.(*jsonrpc.Request); ok && request.Method == "tools/call" && strings.Contains(string(request.Params), `"slow"`) {
+			once.Do(func() { close(held) })
+			<-release
+		}
+	}
+	testHookRead.Store(&hook)
+	t.Cleanup(func() { testHookRead.Store(nil) })
+	oldCall := make(chan struct{})
+	go func() {
+		defer close(oldCall)
+		request, _ := http.NewRequest(http.MethodPost, h.server.URL+"/mcp", strings.NewReader(callBody(7, "slow")))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Accept", "application/json, text/event-stream")
+		request.Header.Set(bindingHeader, "lease-a")
+		request.Header.Set(credentialHeader, base64.StdEncoding.EncodeToString([]byte("credential-a")))
+		request.Header.Set(sessionHeader, first)
+		if response, err := http.DefaultClient.Do(request); err == nil {
+			io.Copy(io.Discard, response.Body)
+			response.Body.Close()
+		}
+	}()
+	<-held
+	second := h.open("lease-a", "credential-a")
+	close(release)
+	after := h.whoami("lease-a", "credential-a", second) // its id is 7 too
+	if after.PID != before.PID {
+		t.Fatalf("the new session did not take the process over: %+v", after)
+	}
+	if after.Calls != 2 {
+		t.Fatalf("the taken-over session's call reached the process: %+v", after)
+	}
+	<-oldCall
+	for _, line := range received(t, h.logDir, before.PID) {
+		if strings.Contains(line, `"slow"`) {
+			t.Fatalf("the process read the old session's call: %s", line)
+		}
+	}
+}
+
+func TestOrphansAreReapedWhileTheirBindingLives(t *testing.T) {
+	if err := becomeSubreaper(); err != nil {
+		t.Skipf("no subreaper here: %v", err)
+	}
+	h := newHarness(t, nil)
+	session := h.open("lease-a", "credential-a")
+	pid := h.whoami("lease-a", "credential-a", session).PID
+	if text := h.call("lease-a", "credential-a", session, "orphans"); text != fmt.Sprint(orphanCount) {
+		t.Fatalf("orphans: %s", text)
+	}
+	// The orphans exit soon after: zombies the bridge adopted, in the group
+	// of a process that still runs.
+	deadline := time.Now().Add(10 * time.Second)
+	for adoptedZombies(h.bridge) < orphanCount {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d orphans became zombies", adoptedZombies(h.bridge))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	h.bridge.reapOrphans()
+	if left := adoptedZombies(h.bridge); left != 0 {
+		t.Fatalf("%d zombies left while the binding lives", left)
+	}
+	if gone(pid) {
+		t.Fatal("the binding's own process was reaped")
+	}
+	if h.whoami("lease-a", "credential-a", session).PID != pid {
+		t.Fatal("the binding lost its process")
+	}
+}
+
+// adoptedZombies counts the zombies this process adopted, the bridge's own
+// processes excepted.
+func adoptedZombies(b *bridge) int {
+	b.mu.Lock()
+	mains := maps.Clone(b.mains)
+	b.mu.Unlock()
+	entries, _ := os.ReadDir("/proc")
+	count := 0
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || mains[pid] {
+			continue
+		}
+		if state, parent, ok := procState(pid); ok && state == "Z" && parent == os.Getpid() {
+			count++
+		}
+	}
+	return count
 }
 
 func TestAProcessEndsWithItsBinding(t *testing.T) {

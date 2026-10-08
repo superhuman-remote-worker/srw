@@ -37,8 +37,11 @@ var (
 // notifications/initialized, tools/list and, when the server opened a
 // session, DELETE. The probe carries no credential (the front has no lease
 // of its own), so a server that refuses to list its tools without one is
-// never ready. The tool list's hash is pinned on the first success; a
-// change is logged, and refused with tool_pinning "block".
+// never ready. Behind the stdio bridge the probe's process finds a
+// placeholder in the credential's variable, so a server that only exits
+// when the variable is unset starts; one that uses the credential to list
+// its tools is still never ready. The tool list's hash is pinned on the
+// first success; a change is logged, and refused with tool_pinning "block".
 type prober struct {
 	cfg    *config
 	client *http.Client

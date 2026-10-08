@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -50,12 +51,29 @@ func reapGroup(pid int, within time.Duration) {
 	}
 }
 
-// reapOrphans waits for zombies the bridge inherited as the container's
-// first process that belong to no process group it still manages (one that
-// left its group and outlived it). It never waits for a live session's
-// process, which its own command waits for.
-func reapOrphans(live map[int]bool) {
-	if os.Getpid() != 1 {
+const prSetChildSubreaper = 36
+
+// subreaper is set once the bridge adopts its processes' orphans.
+var subreaper atomic.Bool
+
+// becomeSubreaper makes the bridge the parent of every orphan its processes
+// leave (PR_SET_CHILD_SUBREAPER), as the container's first process is
+// anyway, so it reaps them whatever its process id.
+func becomeSubreaper() error {
+	if _, _, errno := syscall.RawSyscall(syscall.SYS_PRCTL, prSetChildSubreaper, 1, 0); errno != 0 {
+		return errno
+	}
+	subreaper.Store(true)
+	return nil
+}
+
+// reapOrphans waits for every zombie the bridge adopted (an orphan of a
+// process, in its group or not), while the process lives too. It never
+// waits for a process the bridge started (mains): that process's own
+// command waits for it.
+func reapOrphans(mains map[int]bool) {
+	self := os.Getpid()
+	if self != 1 && !subreaper.Load() {
 		return
 	}
 	entries, err := os.ReadDir("/proc")
@@ -64,27 +82,37 @@ func reapOrphans(live map[int]bool) {
 	}
 	for _, entry := range entries {
 		pid, err := strconv.Atoi(entry.Name())
-		if err != nil || pid == 1 {
+		if err != nil || pid == self || mains[pid] {
 			continue
 		}
-		raw, err := os.ReadFile("/proc/" + entry.Name() + "/stat")
-		if err != nil {
-			continue
-		}
-		// pid (comm) state ppid pgrp ...: comm may hold spaces and ')'.
-		end := bytes.LastIndexByte(raw, ')')
-		if end < 0 {
-			continue
-		}
-		fields := bytes.Fields(raw[end+1:])
-		if len(fields) < 3 || string(fields[0]) != "Z" || string(fields[1]) != "1" {
-			continue
-		}
-		group, err := strconv.Atoi(string(fields[2]))
-		if err != nil || live[group] {
+		state, parent, ok := procState(pid)
+		if !ok || state != "Z" || parent != self {
 			continue
 		}
 		var status syscall.WaitStatus
 		syscall.Wait4(pid, &status, syscall.WNOHANG, nil)
 	}
+}
+
+// procState is a process's state letter and parent's process id, from
+// /proc/PID/stat.
+func procState(pid int) (string, int, bool) {
+	raw, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return "", 0, false
+	}
+	// pid (comm) state ppid ...: comm may hold spaces and ')'.
+	end := bytes.LastIndexByte(raw, ')')
+	if end < 0 {
+		return "", 0, false
+	}
+	fields := bytes.Fields(raw[end+1:])
+	if len(fields) < 2 {
+		return "", 0, false
+	}
+	parent, err := strconv.Atoi(string(fields[1]))
+	if err != nil {
+		return "", 0, false
+	}
+	return string(fields[0]), parent, true
 }

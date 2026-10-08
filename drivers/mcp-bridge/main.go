@@ -19,7 +19,9 @@
 //   - the front names the binding (the lease) of every request in
 //     Srw-Bridge-Binding and hands over the binding's credential in
 //     Srw-Bridge-Credential (base64); a request without a binding is the
-//     front's readiness probe, which gets a process of its own;
+//     front's readiness probe, which gets a process of its own with a
+//     placeholder in the credential's variable (srw-probe-placeholder,
+//     never a credential), so a server that exits without it still starts;
 //   - the binding's first initialize starts its process (the image's
 //     program, with the container's environment and, in --credential-env,
 //     the binding's credential; never the pod's Secret, which holds none),
@@ -38,7 +40,9 @@
 //     flight at once; it runs at most --max-processes binding processes at
 //     once (503 past it);
 //   - each process runs in its own process group, which is killed with it;
-//     its stderr goes to the container log with the credential scrubbed.
+//     the bridge adopts every orphan a process leaves (it is a subreaper)
+//     and reaps it while the process still runs; a process's stderr goes
+//     to the container log with the credential scrubbed.
 //
 // It is built on the official MCP Go SDK: CommandTransport runs each process
 // and StreamableServerTransport serves its session to the front. It is
@@ -180,6 +184,9 @@ func loopback(host string) bool {
 
 func serve(opts options) int {
 	logger := log.New(os.Stderr, "srw-mcp-bridge: ", log.LstdFlags)
+	if err := becomeSubreaper(); err != nil {
+		logger.Printf("the bridge cannot adopt its processes' orphans (%v): only the container's first process reaps them", err)
+	}
 	b := newBridge(opts, os.Environ(), logger.Printf, time.Now)
 	listener, err := net.Listen("tcp", opts.listen)
 	if err != nil {

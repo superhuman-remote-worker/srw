@@ -56,6 +56,9 @@ The block, ``ServiceSpec.mcp``, is plain JSON, so it can ride an image label:
     (stdio servers read credentials from their environment), never a name
     that loads code (``NODE_OPTIONS``, ``PYTHONPATH``, ``PATH``...). Either
     way it comes from the lease exchange per binding, never from the pod.
+    The front's readiness probe has no lease: a stdio probe's process finds
+    the placeholder ``srw-probe-placeholder`` in the variable, so a server
+    that exits when it is unset still starts and lists its tools.
 ``env``, ``args``, ``command``
     The server container's environment, arguments and (optional) program,
     else the image's own. ``${config.<key>}`` in an environment value or an

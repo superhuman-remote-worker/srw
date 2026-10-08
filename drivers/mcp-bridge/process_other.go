@@ -14,3 +14,6 @@ func ownGroup(*exec.Cmd)           {}
 func killGroup(int)                {}
 func reapGroup(int, time.Duration) {}
 func reapOrphans(map[int]bool)     {}
+func becomeSubreaper() error       { return nil }
+
+func procState(int) (string, int, bool) { return "", 0, false }

@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
@@ -40,7 +41,16 @@ const (
 	// answered: the SDKs' "connection closed", which SRW's client reads as
 	// a session that ended, not a tool that failed.
 	connectionClosed = -32000
+	// What the probe's process finds in the credential's variable: never a
+	// real credential (the probe has no lease), only enough for a server
+	// that exits without one to start and list its tools.
+	probePlaceholder = "srw-probe-placeholder"
 )
+
+// testHookRead, when a test sets it, runs between reading a session's
+// message and handing it to the process: a test holds a message there to
+// order it against a takeover.
+var testHookRead atomic.Pointer[func(jsonrpc.Message)]
 
 // A binding id is the lease's id the front names (a UUID in SRW).
 var bindingShape = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\z`)
@@ -66,9 +76,10 @@ type bridge struct {
 	closed    bool
 	processes map[string]*process // by binding; "" is the front's probe
 	sessions  map[string]*session // by Mcp-Session-Id
-	// Process groups not yet reaped (live processes and stopping ones): the
-	// orphan reaper never waits for one of them.
-	groups   map[int]bool
+	// The processes the bridge started and has not waited for yet (live
+	// ones and stopping ones): their own command waits for each, so the
+	// orphan reaper never does.
+	mains    map[int]bool
 	stopping sync.WaitGroup
 }
 
@@ -80,7 +91,7 @@ func newBridge(opts options, env []string, logf func(string, ...any), now func()
 		now:       now,
 		processes: map[string]*process{},
 		sessions:  map[string]*session{},
-		groups:    map[int]bool{},
+		mains:     map[int]bool{},
 	}
 }
 
@@ -185,11 +196,11 @@ func (p *process) idleFor(now time.Time) time.Duration {
 	return now.Sub(p.lastUsed)
 }
 
-// reusable: a new session may take the process over (it is initialized,
-// and no earlier session's call is still unanswered).
-func (p *process) reusable() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+// reusableLocked: a new session may take the process over (it runs, it is
+// initialized, and no earlier session's call is still unanswered). The
+// caller holds p.mu, and switches the process's session under the same
+// hold, so no call of the old session is registered in between.
+func (p *process) reusableLocked() bool {
 	select {
 	case <-p.done:
 		return false
@@ -332,45 +343,55 @@ func (b *bridge) lookup(sessionID, binding string) *session {
 // open starts a session of a binding on the binding's process: the one it
 // has, or a new one.
 func (b *bridge) open(binding, credential string) (*session, int, error) {
-	if b.opts.credentialEnv != "" && binding != "" && credential == "" {
-		return nil, http.StatusBadRequest, errors.New("the front named no credential for this binding")
-	}
-	if b.opts.credentialEnv == "" || binding == "" {
-		// The probe never runs with a credential, and a server that takes
-		// none gets none.
+	switch {
+	case b.opts.credentialEnv == "":
+		// A server that takes no credential gets none.
 		credential = ""
+	case binding == "":
+		// The probe has no lease, so no credential: its process gets a
+		// placeholder, never a real credential, so a server that exits
+		// without its variable still starts and lists its tools.
+		credential = probePlaceholder
+	case credential == "":
+		return nil, http.StatusBadRequest, errors.New("the front named no credential for this binding")
 	}
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
 		return nil, http.StatusServiceUnavailable, errors.New("the bridge is stopping")
 	}
-	p := b.processes[binding]
 	var replaced *process
-	if p != nil && !p.reusable() {
-		replaced, p = p, nil
-	}
-	if p == nil {
-		if binding != "" && b.bindingCount(replaced) >= b.opts.maxProcesses {
+	if p := b.processes[binding]; p != nil {
+		s, previous, ok, err := b.attach(p, false)
+		if ok || err != nil {
 			b.mu.Unlock()
-			b.logf("refused %s: %d binding processes run, the most this pod runs", labelOf(binding), b.opts.maxProcesses)
-			return nil, http.StatusServiceUnavailable, fmt.Errorf("this server's pod runs at most %d binding processes", b.opts.maxProcesses)
+			return b.opened(s, previous, err)
 		}
-		started, err := b.start(binding, credential)
-		if err != nil {
-			b.mu.Unlock()
-			b.logf("%s: the server's program did not start: %v", labelOf(binding), err)
-			return nil, http.StatusBadGateway, errors.New("the server's program did not start")
-		}
-		b.processes[binding] = started
-		b.groups[started.pid()] = true
-		p = started
+		replaced = p
 	}
-	s, previous, err := b.attach(p)
+	if binding != "" && b.bindingCount(replaced) >= b.opts.maxProcesses {
+		b.mu.Unlock()
+		b.logf("refused %s: %d binding processes run, the most this pod runs", labelOf(binding), b.opts.maxProcesses)
+		return nil, http.StatusServiceUnavailable, fmt.Errorf("this server's pod runs at most %d binding processes", b.opts.maxProcesses)
+	}
+	started, err := b.start(binding, credential)
+	if err != nil {
+		b.mu.Unlock()
+		b.logf("%s: the server's program did not start: %v", labelOf(binding), err)
+		return nil, http.StatusBadGateway, errors.New("the server's program did not start")
+	}
+	b.processes[binding] = started
+	b.mains[started.pid()] = true
+	s, previous, _, err := b.attach(started, true)
 	b.mu.Unlock()
 	if replaced != nil {
 		replaced.stop("a new session of its binding came while it had a call unanswered")
 	}
+	return b.opened(s, previous, err)
+}
+
+// opened closes the session a new one took over from, and answers open.
+func (b *bridge) opened(s, previous *session, err error) (*session, int, error) {
 	if previous != nil {
 		previous.close()
 	}
@@ -392,15 +413,18 @@ func (b *bridge) bindingCount(except *process) int {
 	return count
 }
 
-// attach opens a session on a process; it returns the session the process
-// served until now, for the caller to close. The caller holds b.mu.
-func (b *bridge) attach(p *process) (*session, *session, error) {
+// attach opens a session on a process and returns the session the process
+// served until now, for the caller to close. A process just started takes
+// any session; another is taken over only when it is reusable, decided
+// under its lock together with the switch (ok is false when it is not).
+// The caller holds b.mu.
+func (b *bridge) attach(p *process, fresh bool) (s, previous *session, ok bool, err error) {
 	transport := &mcp.StreamableServerTransport{SessionID: rand.Text()}
 	server, err := transport.Connect(context.Background())
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
-	s := &session{
+	s = &session{
 		id:        transport.SessionID,
 		process:   p,
 		transport: transport,
@@ -408,7 +432,12 @@ func (b *bridge) attach(p *process) (*session, *session, error) {
 		closed:    make(chan struct{}),
 	}
 	p.mu.Lock()
-	previous := p.current
+	if !fresh && !p.reusableLocked() {
+		p.mu.Unlock()
+		server.Close()
+		return nil, nil, false, nil
+	}
+	previous = p.current
 	p.current = s
 	s.reused = p.initDone
 	p.lastUsed = b.now()
@@ -418,13 +447,16 @@ func (b *bridge) attach(p *process) (*session, *session, error) {
 	if s.reused {
 		b.logf("%s: a new session took over process %d", p.label(), p.pid())
 	}
-	return s, previous, nil
+	return s, previous, true, nil
 }
 
 // start runs the program for one binding and connects to it.
 func (b *bridge) start(binding, credential string) (*process, error) {
 	cmd := exec.Command(b.opts.program[0], b.opts.program[1:]...)
 	cmd.Env = childEnv(b.env, b.opts.credentialEnv, credential)
+	if binding == "" {
+		credential = "" // the probe's placeholder is no credential
+	}
 	stderr := &lineLogger{logf: b.logf, label: labelOf(binding), scrub: newScrubber(credential)}
 	cmd.Stderr = stderr
 	// A process that leaves its stderr open in a child never holds Wait.
@@ -481,14 +513,26 @@ func (s *session) toProcess() {
 				}
 			}
 		}
+		if hook := testHookRead.Load(); hook != nil {
+			(*hook)(message)
+		}
+		p.mu.Lock()
+		if p.current != s {
+			// A new session took the process over since this message was
+			// read: a call of this one registered now could take the answer
+			// of the new session's call of the same id. Dropped, with the
+			// session.
+			p.mu.Unlock()
+			s.close()
+			return
+		}
 		if request, ok := message.(*jsonrpc.Request); ok && request.IsCall() {
-			p.mu.Lock()
 			if request.Method == "initialize" && !p.initDone && !p.initID.IsValid() {
 				p.initID = request.ID
 			}
 			p.pending[request.ID] = s
-			p.mu.Unlock()
 		}
+		p.mu.Unlock()
 		if err := p.child.Write(ctx, message); err != nil {
 			p.stop("its process stopped reading")
 			return
@@ -609,7 +653,7 @@ func (p *process) stop(reason string) {
 			reapGroup(pid, reapWithin)
 			p.stderr.flush()
 			b.mu.Lock()
-			delete(b.groups, pid)
+			delete(b.mains, pid)
 			b.mu.Unlock()
 			outcome := "exited"
 			if err != nil {
@@ -677,12 +721,12 @@ func (b *bridge) stopIdle() {
 
 func (b *bridge) reapOrphans() {
 	b.mu.Lock()
-	live := make(map[int]bool, len(b.groups))
-	for pid := range b.groups {
-		live[pid] = true
+	mains := make(map[int]bool, len(b.mains))
+	for pid := range b.mains {
+		mains[pid] = true
 	}
 	b.mu.Unlock()
-	reapOrphans(live)
+	reapOrphans(mains)
 }
 
 // close stops every process and waits for them, within their grace.

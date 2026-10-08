@@ -24,6 +24,11 @@ const (
 	fakeLogEnv    = "BRIDGE_TEST_LOG_DIR"
 	sleeperEnv    = "BRIDGE_TEST_SLEEPER"
 	fakeTokenEnv  = "FAKE_TOKEN"
+	// The fake server exits at once without its credential, as
+	// mcp/brave-search and mcp/slack do.
+	requireTokenEnv = "BRIDGE_TEST_REQUIRE_TOKEN"
+	// How many orphans the orphans tool leaves.
+	orphanCount = 100
 )
 
 func TestMain(m *testing.M) {
@@ -43,9 +48,13 @@ type fakeMessage struct {
 	Params json.RawMessage `json:"params"`
 }
 
-var fakeTools = []string{"whoami", "notes_write", "leak_credential", "crash", "notify", "spawn_sleeper", "slow"}
+var fakeTools = []string{"whoami", "notes_write", "leak_credential", "crash", "notify", "spawn_sleeper", "slow", "orphans"}
 
 func fakeServer() int {
+	if os.Getenv(requireTokenEnv) == "1" && os.Getenv(fakeTokenEnv) == "" {
+		fmt.Fprintf(os.Stderr, "%s is not set\n", fakeTokenEnv)
+		return 4
+	}
 	var logFile *os.File
 	if dir := os.Getenv(fakeLogEnv); dir != "" {
 		logFile, _ = os.Create(filepath.Join(dir, fmt.Sprintf("%d.log", os.Getpid())))
@@ -134,6 +143,13 @@ func fakeServer() int {
 			case "slow":
 				time.Sleep(300 * time.Millisecond)
 				text(message.ID, "slow")
+			case "orphans":
+				// Each shell exits at once and leaves its sleep behind: an
+				// orphan in this process's group, which exits soon after.
+				for range orphanCount {
+					exec.Command("sh", "-c", "sleep 0.05 </dev/null >/dev/null 2>&1 &").Run()
+				}
+				text(message.ID, fmt.Sprint(orphanCount))
 			default:
 				write(map[string]any{"jsonrpc": "2.0", "id": message.ID, "error": map[string]any{"code": -32602, "message": "Unknown tool: " + params.Name}})
 			}
