@@ -2,9 +2,11 @@
 
 import asyncio
 from copy import deepcopy
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from tests.test_vm_initial_ready_retention_binding import ready_pair
 from tests.test_vm_job_retained_resume_protocol import (
@@ -24,6 +26,174 @@ from shared.vm_pre_ssh_stop import (
     valid_positive_stop_proof,
 )
 from tests.test_vm_pre_ssh_stop_protocol import candidate, proof, uid
+
+
+def initial_ready_transport_payload():
+    frozen, preflight = ready_pair()
+    return {
+        "action": "inspect_initial_ready",
+        "job_id": frozen["job_id"],
+        "provision_generation": frozen["provision_generation"],
+        "expected_vm_uid": frozen["vm_uid"],
+        "expected_pvc_uid": frozen["pvc_uid"],
+        "parent_cleanup": {
+            "admission_id": frozen["cleanup_admission_id"],
+            "request_id": frozen["cleanup_request_id"],
+            "intent_digest": frozen["cleanup_intent_digest"],
+            "intent": {
+                "owner_id": frozen["job_id"],
+                "owner_kind": "job",
+                "provision_generation": frozen["provision_generation"],
+                "purge_disk": False,
+                "pvc_uid": frozen["pvc_uid"],
+                "resource": "vm_workspace",
+                "source": "job_terminal_vm_release",
+                "vm_uid": frozen["vm_uid"],
+            },
+            "retention_preflight": preflight,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_initial_ready_inspect_reaches_signed_http_stop_transport(monkeypatch):
+    from orchestrator.services.vm_provisioner import VMProvisioner
+    from orchestrator.services.vm_lifecycle_auth import (
+        AUTH_FIELD,
+        sign_payload,
+        unsigned_payload,
+        verify_payload,
+    )
+
+    payload = initial_ready_transport_payload()
+    secret = b"test-ready-stop-secret-32-bytes-long!"
+    requests = []
+
+    class Client:
+        async def post(self, path, *, json):
+            requests.append(path)
+            assert path == "/vm-pre-ssh-stop"
+            assert verify_payload(
+                json,
+                direction="request",
+                operation="pre-ssh-stop",
+                secret=secret,
+            )
+            assert unsigned_payload(json) == payload
+            reply = sign_payload(
+                {
+                    "job_id": payload["job_id"],
+                    "provision_generation": payload["provision_generation"],
+                    "status": "candidate",
+                },
+                direction="response",
+                operation="pre-ssh-stop",
+                secret=secret,
+                correlation_id=json[AUTH_FIELD]["request_id"],
+            )
+            return httpx.Response(
+                200,
+                json=reply,
+                request=httpx.Request("POST", "http://controller" + path),
+            )
+
+    monkeypatch.setattr(VMProvisioner, "_nats_available", property(lambda self: False))
+    monkeypatch.setattr(VMProvisioner, "_http_available", property(lambda self: True))
+    provisioner = VMProvisioner.__new__(VMProvisioner)
+    provisioner._lifecycle_hmac_secret = secret
+    provisioner._http_client = Client()
+    result = await provisioner._request_pre_ssh_stop(payload)
+    assert result == {
+        "job_id": payload["job_id"],
+        "provision_generation": payload["provision_generation"],
+        "status": "candidate",
+        "_identity_authenticated": True,
+    }
+    assert requests == ["/vm-pre-ssh-stop"]
+
+
+@pytest.mark.asyncio
+async def test_initial_ready_inspect_reaches_signed_nats_stop_transport(monkeypatch):
+    from orchestrator.services import vm_provisioner as module
+    from orchestrator.services.nats_bridge import NatsBridge
+    from orchestrator.services.vm_provisioner import VMProvisioner
+    from orchestrator.services.vm_lifecycle_auth import (
+        AUTH_FIELD,
+        sign_payload,
+        unsigned_payload,
+        verify_payload,
+    )
+
+    payload = initial_ready_transport_payload()
+    secret = b"test-ready-stop-secret-32-bytes-long!"
+    bridge = NatsBridge(url="nats://test.invalid")
+    bridge._available = True
+    bridge._orchestrator_id = "test"
+    bridge._lifecycle_hmac_secret = secret
+    subjects = []
+
+    class NC:
+        async def request(self, subject, raw, *, timeout):
+            subjects.append(subject)
+            assert timeout == 8.0
+            sent = json.loads(raw)
+            assert verify_payload(
+                sent,
+                direction="request",
+                operation="pre-ssh-stop",
+                secret=secret,
+            )
+            assert unsigned_payload(sent) == {
+                **payload,
+                "orchestrator_id": "test",
+            }
+            reply = sign_payload(
+                {
+                    "job_id": payload["job_id"],
+                    "provision_generation": payload["provision_generation"],
+                    "status": "candidate",
+                },
+                direction="response",
+                operation="pre-ssh-stop",
+                secret=secret,
+                correlation_id=sent[AUTH_FIELD]["request_id"],
+            )
+            return SimpleNamespace(data=json.dumps(reply).encode())
+
+    bridge._nc = NC()
+    monkeypatch.setattr(module, "nats_bridge", bridge)
+    monkeypatch.setattr(VMProvisioner, "_nats_available", property(lambda self: True))
+    monkeypatch.setattr(VMProvisioner, "_http_available", property(lambda self: False))
+    provisioner = VMProvisioner.__new__(VMProvisioner)
+    provisioner._lifecycle_hmac_secret = secret
+    provisioner._http_client = None
+    result = await provisioner._request_pre_ssh_stop(payload)
+    assert result == {
+        "job_id": payload["job_id"],
+        "provision_generation": payload["provision_generation"],
+        "status": "candidate",
+        "_identity_authenticated": True,
+    }
+    assert subjects == ["vm.lifecycle.pre_ssh_stop.test"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_pre_ssh_stop_action_refuses_before_http_send(monkeypatch):
+    from orchestrator.services.vm_provisioner import VMProvisioner
+
+    payload = initial_ready_transport_payload()
+    payload["action"] = "inspect_initial_ready_unowned"
+    monkeypatch.setattr(VMProvisioner, "_nats_available", property(lambda self: False))
+    monkeypatch.setattr(VMProvisioner, "_http_available", property(lambda self: True))
+
+    class Client:
+        async def post(self, path, *, json):
+            pytest.fail("invalid action reached controller transport")
+
+    provisioner = VMProvisioner.__new__(VMProvisioner)
+    provisioner._lifecycle_hmac_secret = b"test-ready-stop-secret-32-bytes-long!"
+    provisioner._http_client = Client()
+    assert await provisioner._request_pre_ssh_stop(payload) is None
 
 
 @pytest.mark.asyncio

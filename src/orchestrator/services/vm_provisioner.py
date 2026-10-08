@@ -1777,7 +1777,8 @@ class VMProvisioner:
 
         if (
             self._lifecycle_hmac_secret is None
-            or payload.get("action") not in {"inspect", "stop", "release"}
+            or payload.get("action")
+            not in {"inspect", "inspect_initial_ready", "stop", "release"}
             or _provision_generation(payload.get("provision_generation")) is None
             or not isinstance(payload.get("job_id"), str)
         ):
