@@ -20,7 +20,11 @@ its pod) and writes one JSON object per line to stdout:
   how the pod ran. Every name it sets is declared in ``env_names`` in its
   spec. ``driver_state`` holds what ``revoke`` needs to revoke the minted
   credential (SRW hands it back; a real driver puts the upstream id here);
-* ``revoke``: succeeds, whether or not the binding still exists;
+* ``revoke``: succeeds, whether or not the binding still exists. It checks
+  what SRW hands it, as a real driver would need it: the connector's token
+  as it was at bind (SRW keeps it on the binding, so a revoke after the
+  connector was deleted still has it) and, when given, a ``driver_state``
+  that names what this binding minted;
 * ``gc``: retires nothing (it keeps no state of its own; SRW never calls it,
   the test kit does);
 * anything else: an ``unsupported`` error.
@@ -100,6 +104,26 @@ def minted(token: str, binding_id: str) -> str:
     return "example-" + digest.hexdigest()[:32]
 
 
+def fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()[:16]
+
+
+def revoke(request: dict[str, Any]) -> int:
+    token = request.get("credentials", {}).get("token")
+    if not token:
+        return error("credentials", "Revoke needs the token the binding was made with")
+    state = request.get("driver_state")
+    if state is not None:
+        try:
+            named = json.loads(state).get("minted")
+        except (ValueError, AttributeError):
+            named = None
+        if named != fingerprint(minted(token, request["binding_id"])):
+            return error("system", "The driver_state does not name this binding")
+    # Nothing minted here outlives the binding: already gone is success.
+    return result({})
+
+
 def check(request: dict[str, Any]) -> int:
     if not request.get("credentials", {}).get("token"):
         return result({"status": "FAILED", "message": "The connector holds no token"})
@@ -152,7 +176,7 @@ def bind(request: dict[str, Any]) -> int:
         entries.append(credential_file("~/.kube/config", "{}\n", None))
     emit({"type": "log", "level": "info", "message": "minted a credential"})
     # What revoke needs to revoke the minted credential upstream.
-    state = json.dumps({"minted": hashlib.sha256(value.encode()).hexdigest()[:16]})
+    state = json.dumps({"minted": fingerprint(value)})
     return result(
         {
             "binding": {
@@ -182,8 +206,7 @@ def main() -> int:
     if operation == "bind":
         return bind(request)
     if operation == "revoke":
-        # Nothing minted here outlives the binding: already gone is success.
-        return result({})
+        return revoke(request)
     if operation == "gc":
         return result({"retired": []})
     return error("unsupported", f"The example driver has no {operation!r} operation")

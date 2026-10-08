@@ -24,6 +24,7 @@ PROGRAMS = {
     "api": gate._API_PROGRAM,
     "keycloak": gate._KEYCLOAK_PROGRAM,
     "hash": gate._HASH_PROGRAM,
+    "exchange": gate._EXCHANGE_PROGRAM,
 }
 DIGEST = "sha256:" + "ab" * 32
 CONNECTOR = "66666666-7777-4888-8999-aaaaaaaaaaaa"
@@ -62,6 +63,12 @@ def test_refuses_anything_outside_the_local_disposable_boundary(argv, no_cluster
     assert gate.main(argv) == 2
 
 
+def test_the_job_lane_is_one_srw_has(no_cluster):
+    with pytest.raises(SystemExit):
+        gate.main(["--job-lane", "elsewhere"])
+    assert gate.build_parser().parse_args([]).job_lane == "pinned"
+
+
 def test_dry_run_prints_the_plan_and_the_values_keys(no_cluster, capsys):
     assert gate.main([]) == 0
     out = capsys.readouterr().out
@@ -70,8 +77,13 @@ def test_dry_run_prints_the_plan_and_the_values_keys(no_cluster, capsys):
         "accounts",
         "register",
         "bind",
+        "identity",
         "moved-tag",
-        "revoke",
+        "detach",
+        "refusals",
+        "pinned",
+        "job",
+        "disable",
         "cleanup",
     ):
         assert f"- {phase}:" in out
@@ -204,6 +216,151 @@ def _launched_pod() -> dict:
         deadline_seconds=120,
     )
     return json.loads(json.dumps(plan.pod))
+
+
+def _launch_plan():
+    from orchestrator.services.connector_bind_time_launch import (
+        BindTimePod,
+        build_bind_time_launch,
+    )
+    from orchestrator.services.connector_egress import EgressPins
+    from orchestrator.services.connector_service_launch import ServiceLaunchPolicy
+
+    return build_bind_time_launch(
+        BindTimePod(
+            operation_id=OPERATION,
+            operation="bind",
+            driver=gate.DRIVER,
+            digest=DIGEST,
+            connector_id=CONNECTOR,
+        ),
+        request={"protocol_version": "1.0", "operation": "bind"},
+        image=f"srw-registry:5000/srw-driver-example@{DIGEST}",
+        entrypoint=["python3", "/driver/srw_example_driver.py"],
+        cmd=[],
+        identity_token="sdi_" + "A" * 49,
+        pins=EgressPins(hosts=(), resolved_at=datetime.now(timezone.utc)),
+        policy=ServiceLaunchPolicy(
+            namespace="srw-superhuman-remote-worker-connectors",
+            release_namespace="srw",
+            shim_image="srw-registry:5000/srw-driver-shim@sha256:" + "cd" * 32,
+            exchange_host="srw-orchestrator.srw.svc",
+            exchange_address="10.43.0.20",
+            exchange_port=8088,
+            orchestrator_labels={"app.kubernetes.io/component": "orchestrator"},
+        ),
+        deadline_seconds=120,
+    )
+
+
+def test_the_policy_evaluator_accepts_what_the_launch_builder_makes():
+    plan = json.loads(json.dumps({"pod": plan_pod(), "policy": plan_policy()}))
+    assert (
+        gate.policy_problems(
+            plan["policy"], plan["pod"], exchange_port=8088, namespace="srw"
+        )
+        == []
+    )
+
+
+def plan_pod() -> dict:
+    return json.loads(json.dumps(_launch_plan().pod))
+
+
+def plan_policy() -> dict:
+    return json.loads(json.dumps(_launch_plan().network_policy))
+
+
+@pytest.mark.parametrize(
+    ("mutate", "needle"),
+    [
+        (lambda p: p["spec"].update(podSelector={}), "selects"),
+        (lambda p: p["spec"].update(ingress=[{"from": [{}]}]), "ingress"),
+        (lambda p: p["spec"].update(policyTypes=["Ingress"]), "policyTypes"),
+        (
+            lambda p: p["spec"]["egress"].append(
+                {"to": [{"ipBlock": {"cidr": "0.0.0.0/0"}}]}
+            ),
+            "egress rules",
+        ),
+        (
+            lambda p: p["spec"]["egress"][0].update(
+                ports=[{"protocol": "TCP", "port": 8085}]
+            ),
+            "ports",
+        ),
+        (
+            lambda p: p["spec"]["egress"][0].update(
+                to=[{"ipBlock": {"cidr": "10.43.0.20/32"}}]
+            ),
+            "peers",
+        ),
+    ],
+)
+def test_the_policy_evaluator_refuses_what_the_gate_must_not_accept(mutate, needle):
+    policy = plan_policy()
+    mutate(policy)
+    problems = gate.policy_problems(
+        policy, plan_pod(), exchange_port=8088, namespace="srw"
+    )
+    assert any(needle in problem for problem in problems), problems
+    assert gate.policy_problems(None, plan_pod(), exchange_port=8088, namespace="srw")
+
+
+def test_a_presented_lease_token_has_srw_s_shape():
+    from shared.connectors.leases import token_shape_valid
+
+    token = gate.well_formed_token("scl")
+    assert token_shape_valid(token, "scl")
+    assert token != gate.well_formed_token("scl")
+
+
+def test_the_refusal_reasons_are_srw_s_own_words():
+    """Each misbehaviour of the example driver, through SRW's bind check,
+    gives the reason the gate looks for on the connector and in the README."""
+    from shared.connectors.registration import (
+        declared_env_names,
+        image_binding_problems,
+        spec_from_json,
+    )
+    from shared.connectors.testkit import CommandDriver
+
+    spec_json = json.loads(gate.SPEC_FILE.read_text())
+    driver = CommandDriver(
+        [sys.executable, str(ROOT / "drivers/example/srw_example_driver.py")],
+        label=spec_json,
+    )
+
+    def bind(config):
+        from shared.connectors.envelope import DriverRequest, read_output
+
+        out, code = driver.run(
+            DriverRequest(
+                operation="bind",
+                config=config,
+                credentials={"token": "t"},
+                binding_id="b-1",
+            ).to_json()
+        )
+        return read_output(out, code, operation="bind")
+
+    for _label, (misbehave, reason) in gate.REFUSALS.items():
+        outcome = bind({"misbehave": misbehave})
+        problems = image_binding_problems(
+            outcome.result["binding"],
+            spec_from_json(spec_json),
+            env_names=declared_env_names(spec_json),
+        )
+        assert any(reason in problem for problem in problems), problems
+    failed = bind({"misbehave": "fail"})
+    assert failed.error.error_class == "config"
+    assert failed.error.message == gate.FAILING
+
+
+def test_notices_are_the_readme_s_not_delivered_lines():
+    facts = {"notices": "- **a** (image_driver) — Not delivered: x|other line|"}
+    assert gate.notice_lines(facts) == ["- **a** (image_driver) — Not delivered: x"]
+    assert gate.notice_lines({}) == []
 
 
 def test_the_pod_evaluator_accepts_what_the_launch_builder_makes():

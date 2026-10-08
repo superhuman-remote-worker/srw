@@ -5,21 +5,25 @@ Design: knowledge-base/knowledge/features/connector_drivers.md, "Trust and
 registration", "The driver namespace baseline", "Driver versions", "Three
 planes" (bind-time) and slice D6, whose gate this proves: a custom driver
 image registered at Account scope delivers an env binding to a workspace and
-runs unprivileged; a moved tag with an incompatible spec is refused at bind.
-Templates: scripts/k3d-service-driver-gate.py (D5: the hosting preflights,
-the moved tag pushed to the k3d registry) and scripts/k3d-managed-mcp-gate.py
-(D5a: disposable OAuth client and accounts). The same safety envelope:
-dry-run by default, the exact k3d-srw/srw context, secrets only on
-``kubectl exec -i`` stdin and scrubbed from every printed line, every in-pod
-program capping its own memory, and a cleanup in ``finally`` that touches
-only what this run created and then checks for residue by gate id.
+runs unprivileged; a moved tag with an incompatible spec is refused at bind;
+what a driver returns cannot run code in the workspace; nothing it minted
+outlives its binding. Templates: scripts/k3d-service-driver-gate.py (D5: the
+hosting preflights, the moved tag pushed to the k3d registry),
+scripts/k3d-managed-mcp-gate.py (D5a: disposable OAuth client and accounts)
+and scripts/parallel-subagents-k3d-gate.py (a pinned session: an Officer
+conference). The same safety envelope: dry-run by default, the exact
+k3d-srw/srw context, secrets only on ``kubectl exec -i`` stdin and scrubbed
+from every printed line, every in-pod program capping its own memory, and a
+cleanup in ``finally`` that touches only what this run created and then
+checks for residue by gate id.
 
 It needs the k3d profile of deployment/values-local.yaml.example (keys in
 --help), Tilt (which builds the shim and pins it by digest) and a local
 docker that can push to localhost:5005. The driver is SRW's example driver
 (docker/Dockerfile.driver-example, example.env/v1), built by this gate with
 its io.srw.driver.spec label from drivers/example/spec.json: a custom image,
-outside srw.* and outside any trusted repository.
+outside srw.* and outside any trusted repository. Its ``misbehave`` config
+makes a bind return what SRW refuses, or fail.
 
 Fixtures (all disposable, named after the gate id):
 
@@ -29,12 +33,20 @@ Fixtures (all disposable, named after the gate id):
               Project viewer, and the "other user" of the Account checks):
               Keycloak users and app rows admitted before their first login
   images      localhost:5005/srw-driver-example:<gate id> (the compatible
-              build, then the incompatible one under the same tag) and
-              :<gate id>-srw (a label naming srw.example/v1)
+              build, the incompatible one under the same tag, then the
+              compatible one again) and :<gate id>-srw (a label naming
+              srw.example/v1)
   project     one project of the owner, the editor and the viewer members
-  connector   ``example`` of the owner, of the owner's Account registration
-  sessions    ``one`` (bound with the compatible image) and ``two`` (after
-              the tag moved)
+  connectors  of the owner's Account registration: ``example`` (a file too),
+              ``denied``, ``undeclared`` and ``file`` (each misbehaving one
+              way), ``fail`` (fails with a config error) and ``doomed``
+              (deleted while bound)
+  sessions    ``one`` (bound, then detached live), ``two`` (after the tag
+              moved), ``refusals`` (the misbehaving connectors and
+              ``doomed``), ``pinned`` (an Officer conference: the pinned
+              lane, with ``example`` and ``fail``) and ``disabled`` (after
+              the registration was disabled)
+  job         ``job`` (``--job-lane``, pinned by default), with ``example``
 
 Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
 
@@ -48,40 +60,69 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               enforces NetworkPolicy (12 probes); docker pushes to the k3d
               registry
   register    the owner registers the image at Account scope: the label's
-              spec, the pushed digest, tier custom, no privilege; an image
-              naming srw.example/v1 is refused ("SRW's own"); the viewer
-              (another user) neither lists nor reads it, and cannot create a
-              connector of it by id or by name; the project editor registers
-              at Project scope, the viewer cannot (403) but lists it; the
-              owner's capability matrix shows the registration, the
-              viewer's does not
-  bind        session one binds the connector: one bind-time pod ran,
+              spec and declared variables, the pushed digest, tier custom, no
+              privilege; an image naming srw.example/v1 is refused ("SRW's
+              own"); the viewer (another user) neither lists nor reads it, and
+              cannot create a connector of it by id or by name; the project
+              editor registers at Project scope, the viewer cannot (403) but
+              lists it; the owner's capability matrix shows the registration,
+              the viewer's does not
+  bind        session one binds ``example``: one bind-time pod ran,
               unprivileged (restartPolicy Never, a deadline, no
               ServiceAccount token, every capability dropped, no privilege
               escalation, seccomp RuntimeDefault, no host namespaces, the
               image by its digest under the shim), its Secret held only
-              request.json and the identity; inside the driver, the kernel
+              request.json and the identity, and its NetworkPolicy existed
+              while it ran: it selects the pod, admits nothing and reaches
+              only the lease exchange's port; inside the driver, the kernel
               reported UID 10001, no effective or bounding capability,
-              no_new_privs and seccomp filtering (EXAMPLE_DRIVER_PROCESS);
-              the workspace has the variable the driver minted for this
-              binding (never the connector's token) and its credential file
-              (0600); the binding records reference, digest, resolution time,
-              spec hash and protocol version; afterwards the pod, its Secret
-              and its policy are gone and the operation is recorded removed
+              no_new_privs and seccomp filtering (EXAMPLE_DRIVER_PROCESS); the
+              workspace has the variable the driver minted for this binding
+              (never the connector's token) and its credential file (0600);
+              the binding records reference, digest, resolution time, spec
+              hash and protocol version; afterwards the pod, its Secret and
+              its policy are gone and the operation is recorded removed
+  identity    the bind pod's sdi_ identity is refused by the lease exchange
+              and its introspection (unknown_driver_identity), and a replay
+              of its result is refused (409 operation_closed)
   moved-tag   an incompatible image is pushed under the same tag; session
               two's bind is refused without a pod ("changed its contract",
               the removed slot and the new required config named), recorded
               on the binding with the new digest, shown on the connector
-              (driver_status.last_bind) and audited
-  revoke      session one ends: the reconciler revokes its binding in a
-              revoke pod (reason execution_ended), and that pod is gone too
-  cleanup     sessions, connector, registrations, project, accounts, OAuth
-              client, probe pod, the gate's registry tags and image rows are
-              gone; no driver-namespace object names this run's connector
+              (driver_status.last_bind) and in session two's README, and
+              audited; the compatible image is pushed back
+  detach      session one's connector is detached live: its binding is
+              revoking at once (connector_detached) and revoked by a revoke
+              pod within a reconciler pass, which received the binding's own
+              inputs and driver_state, and is gone afterwards
+  refusals    a variable a driver may not set, one the spec does not declare
+              and a file outside ~/.srw-files/, ~/.netrc and ~/.pgpass are
+              each refused at bind with the reason on the connector and in
+              the README, and what the bind minted is revoked
+              (binding_refused); ``doomed``, bound, is deleted: its binding is
+              still revoked by a revoke pod (connector_deleted) with the
+              inputs it was bound with
+  pinned      a pinned session (an Officer conference) binds and delivers
+              ``example``, and ``fail`` fails for good without holding it:
+              the README and the connector say why, the session answers a
+              turn, and no attach of it logged a connector delivery failure
+  job         a job (``--job-lane``) is held until ``example`` is bound,
+              delivers it to its workspace, runs to an end, and its binding
+              is revoked (execution_ended) in a revoke pod
+  disable     the owner disables the registration: the viewer may not, the
+              connector says "registration disabled", the pinned session's
+              live binding is revoked (registration_disabled), and a new
+              session's bind is refused with the reason, without a pod
+  cleanup     jobs, sessions, connectors, registrations (once their bindings
+              are revoked), project, accounts, OAuth client, probe pod, the
+              gate's registry tags and image rows are gone; no binding of the
+              run's connectors is unrevoked and no driver-namespace object
+              names one of them
 
 Run with the repository venv on the k3d-srw cluster, alone: this is a
 mutating gate. The owner (--user) must be an administrator (it admits and
-deletes the disposable accounts).
+deletes the disposable accounts) and must own no open Officer conference
+(the gate's own project holds the pinned session).
 
   .venv/bin/python scripts/k3d-custom-driver-gate.py           # plan
   .venv/bin/python scripts/k3d-custom-driver-gate.py \\
@@ -91,6 +132,7 @@ deletes the disposable accounts).
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import hmac
 import json
@@ -101,6 +143,7 @@ import sys
 import threading
 import time
 import urllib.request
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -133,6 +176,34 @@ SPEC_LABEL = "io.srw.driver.spec"
 BIND_TIME_MANAGER = "connector-bind-time"
 #: The UID docker/Dockerfile.driver-example runs the driver as.
 DRIVER_UID = "10001"
+#: What the example driver sets (drivers/example/spec.json, env_names) and
+#: where its file lands.
+TOKEN_VARIABLE = "EXAMPLE_TOKEN"
+FILE_VARIABLE = "EXAMPLE_TOKEN_FILE"
+TOKEN_FILE = "~/.srw-files/example/token"
+#: The lease exchange's routes and the result route, on the exchange port.
+EXCHANGE_PATH = "/v1/leases/exchange"
+INTROSPECT_PATH = "/v1/leases/introspect"
+RESULT_PATH = "/v1/drivers/result"
+#: The example driver's misbehaviours (its ``misbehave`` config) and the
+#: reason SRW gives for refusing each binding.
+REFUSALS = {
+    "denied": (
+        "denied_variable",
+        "GIT_SSH_COMMAND is not a variable a driver may set",
+    ),
+    "undeclared": (
+        "undeclared_variable",
+        "sets EXAMPLE_UNDECLARED, which the driver's spec does not declare",
+    ),
+    "file": ("refused_file", "a driver's file goes to ~/.srw-files/"),
+}
+#: The ``fail`` connector's bind error, a final ``config`` failure.
+FAILING = "Told to fail (misbehave)"
+#: What a session's README says of a connector it was not delivered.
+NOTICE = "Not delivered"
+PINNED_LANE = "pinned"
+JOB_TERMINAL = frozenset({"completed", "failed", "cancelled", "pending_review"})
 #: The k3d registry's container (scripts/local-dev-up.sh) and where it keeps
 #: a repository's tags; the gate removes its own tags' links only (the
 #: service-driver gate's way).
@@ -183,6 +254,11 @@ SERVED_SETS = (
             "src/orchestrator/services/connector_driver_registrations.py",
             "src/orchestrator/services/connector_service_images.py",
             "src/orchestrator/services/datasources.py",
+            "src/orchestrator/services/job_dispatcher.py",
+            "src/orchestrator/services/job_start_bundle.py",
+            "src/orchestrator/services/session_attach_binding.py",
+            "src/orchestrator/services/thread_config_update.py",
+            "src/orchestrator/services/unit_claim_bundle.py",
             *(
                 f"src/orchestrator/database/migrations/app/{name}"
                 for name in MIGRATIONS
@@ -200,6 +276,7 @@ SERVED_SETS = (
             "src/agent/connectors/env.py",
             "src/agent/connectors/files.py",
             "src/agent/connectors/legacy.py",
+            "src/shared/runtime/core/backends/remote.py",
         ),
     ),
 )
@@ -506,17 +583,50 @@ done
 """
 DENYPROBE_SETTLED = 5
 
-# What the workspace holds after the bind, as the agent-host user (the
-# variable's value and the file's contents only as hashes).
+# What the workspace holds after a bind, as the agent-host user (the
+# variable's value and the file's contents only as hashes), and the README
+# lines that say a connector was not delivered.
 _WORKSPACE_SCRIPT = r"""
 for f in ~/.srw-credentials/*.sh; do [ -r "$f" ] && . "$f"; done
-printf 'value_sha=%s\n' "$(printf '%s' "${!GATE_VAR:-}" | sha256sum | cut -d' ' -f1)"
+printf 'value_sha=%s\n' "$(printf '%s' "${EXAMPLE_TOKEN:-}" | sha256sum | cut -d' ' -f1)"
 printf 'process=%s\n' "${EXAMPLE_DRIVER_PROCESS:-}"
+printf 'file_var=%s\n' "${EXAMPLE_TOKEN_FILE:-}"
 if [ -e "$GATE_FILE" ]; then
   printf 'file_sha=%s\n' "$(sha256sum < "$GATE_FILE" | cut -d' ' -f1)"
   printf 'file_mode=%s\n' "$(stat -L -c %a "$GATE_FILE")"
 fi
+printf 'notices=%s\n' "$(grep -rhF --include=README.md 'Not delivered' ~ 2>/dev/null | tr '\n' '|' | head -c 4000)"
 """
+
+# Calls to the lease exchange's port from inside the orchestrator pod (the
+# driver identity rides stdin, never argv).
+_EXCHANGE_PROGRAM = (
+    _POD_MEMORY_CAP
+    + r"""
+import json, sys, urllib.error, urllib.request
+cap_memory()
+envelope = json.loads(sys.stdin.readline())
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+answers = []
+for call in envelope["calls"]:
+    request = urllib.request.Request(
+        "http://127.0.0.1:%d%s" % (int(envelope["port"]), call["path"]),
+        data=json.dumps(call["body"]).encode(),
+        method="POST",
+        headers={
+            "Authorization": "Bearer " + call["token"],
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with opener.open(request, timeout=30) as response:
+            status, text = response.status, response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as error:
+        status, text = error.code, error.read().decode("utf-8", "replace")
+    answers.append({"status": status, "body": text[:400]})
+print(json.dumps({"answers": answers}))
+"""
+)
 
 
 def parse_denyprobe(log: str) -> bool:
@@ -682,6 +792,71 @@ def refusal_problems(row: dict, *, digest: str) -> list[str]:
     return problems
 
 
+def policy_problems(
+    policy: dict | None, pod: dict, *, exchange_port: int, namespace: str
+) -> list[str]:
+    """Why a bind-time pod's NetworkPolicy, read while the pod ran, is not
+    the one SRW builds for a driver without egress: named after the pod, it
+    selects exactly that pod, admits nothing, and reaches only the
+    orchestrator pods' exchange port in the release namespace."""
+    if not policy:
+        return ["no NetworkPolicy named after the pod while it ran"]
+    problems: list[str] = []
+    metadata = pod.get("metadata") or {}
+    spec = policy.get("spec") or {}
+    operation = (metadata.get("labels") or {}).get("srw.io/driver-operation")
+    if (policy.get("metadata") or {}).get("name") != metadata.get("name"):
+        problems.append("not named after its pod")
+    if not operation or spec.get("podSelector") != {
+        "matchLabels": {"srw.io/driver-operation": operation}
+    }:
+        problems.append(f"selects {spec.get('podSelector')}, not the pod")
+    if sorted(spec.get("policyTypes") or []) != ["Egress", "Ingress"]:
+        problems.append(f"policyTypes {spec.get('policyTypes')}")
+    if spec.get("ingress"):
+        problems.append("admits ingress")
+    egress = spec.get("egress") or []
+    if len(egress) != 1:
+        problems.append(f"{len(egress)} egress rules, not the exchange's alone")
+        return problems
+    if egress[0].get("ports") != [{"protocol": "TCP", "port": exchange_port}]:
+        problems.append(f"egress ports {egress[0].get('ports')}")
+    peers = egress[0].get("to") or []
+    if (
+        len(peers) != 1
+        or "ipBlock" in peers[0]
+        or not (peers[0].get("podSelector") or {}).get("matchLabels")
+        or (peers[0].get("namespaceSelector") or {}).get("matchLabels")
+        != {"kubernetes.io/metadata.name": namespace}
+    ):
+        problems.append(f"egress peers {peers}, not the orchestrator's pods")
+    return problems
+
+
+_BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+
+def _base62(value: int, width: int) -> str:
+    digits = []
+    while value:
+        value, digit = divmod(value, 62)
+        digits.append(_BASE62[digit])
+    return "".join(reversed(digits)).rjust(width, "0")
+
+
+def well_formed_token(prefix: str) -> str:
+    """A token of SRW's shape (``shared.connectors.leases.mint_token``) that
+    no row holds: what a caller that was never issued one presents."""
+    body = _base62(int.from_bytes(secrets.token_bytes(32), "big"), 43)
+    checksum = _base62(zlib.crc32(f"{prefix}_{body}".encode("ascii")), 6)
+    return f"{prefix}_{body}{checksum}"
+
+
+def notice_lines(facts: dict[str, str]) -> list[str]:
+    """The README's "Not delivered" lines a workspace script reported."""
+    return [line for line in facts.get("notices", "").split("|") if NOTICE in line]
+
+
 # ---------------------------------------------------------------------------
 # The API, as each account
 # ---------------------------------------------------------------------------
@@ -774,16 +949,19 @@ class Report:
 
 
 class PodWatch(threading.Thread):
-    """Records every bind-time pod of one connector while it exists, with
-    its Secret's keys (a bind-time pod lives seconds)."""
+    """Records every bind-time pod of the run's connectors while it exists:
+    the pod, its Secret's keys, owners and identity, and its NetworkPolicy (a
+    bind-time pod lives seconds)."""
 
-    def __init__(self, namespace: str, connector_id: str) -> None:
+    def __init__(self, namespace: str) -> None:
         super().__init__(daemon=True)
         self.namespace = namespace
-        self.connector_id = connector_id
+        self.connectors: set[str] = set()
         self.pods: dict[str, dict] = {}
         self.secret_keys: dict[str, list[str]] = {}
         self.secret_owners: dict[str, list[str]] = {}
+        self.identities: dict[str, str] = {}
+        self.policies: dict[str, dict] = {}
         self.stopped = threading.Event()
 
     def _get(self, *args: str) -> dict | None:
@@ -798,24 +976,35 @@ class PodWatch(threading.Thread):
         except ValueError:
             return None
 
+    def _record(self, pod: dict) -> None:
+        name = pod["metadata"]["name"]
+        self.pods.setdefault(name, pod)
+        if name not in self.secret_keys:
+            found = self._get("secret", name)
+            if found:
+                data = found.get("data") or {}
+                self.secret_keys[name] = sorted(data)
+                self.secret_owners[name] = [
+                    owner.get("kind", "")
+                    for owner in found["metadata"].get("ownerReferences") or []
+                ]
+                if data.get("identity"):
+                    self.identities[name] = secret(
+                        base64.b64decode(data["identity"]).decode("ascii")
+                    )
+        if name not in self.policies:
+            policy = self._get("networkpolicy", name)
+            if policy:
+                self.policies[name] = policy
+
     def run(self) -> None:
-        selector = (
-            f"srw/managed-by={BIND_TIME_MANAGER},"
-            f"srw.io/connector-id={self.connector_id}"
-        )
+        selector = f"srw/managed-by={BIND_TIME_MANAGER}"
         while not self.stopped.is_set():
             listing = self._get("pods", "-l", selector) or {}
             for pod in listing.get("items") or []:
-                name = pod["metadata"]["name"]
-                self.pods.setdefault(name, pod)
-                if name not in self.secret_keys:
-                    found = self._get("secret", name)
-                    if found:
-                        self.secret_keys[name] = sorted(found.get("data") or {})
-                        self.secret_owners[name] = [
-                            owner.get("kind", "")
-                            for owner in found["metadata"].get("ownerReferences") or []
-                        ]
+                labels = pod["metadata"].get("labels") or {}
+                if labels.get("srw.io/connector-id") in self.connectors:
+                    self._record(pod)
             self.stopped.wait(0.25)
 
 
@@ -828,23 +1017,37 @@ PLAN = [
     "docker pushes to localhost:5005",
     "accounts: a disposable OAuth client, a project editor and a project viewer",
     "register: the example image registers at the owner's Account (label spec, "
-    "pushed digest, tier custom, unprivileged); srw.example/v1 is refused; "
-    "another user neither sees nor uses it; a Project editor registers at "
-    "Project scope, a viewer cannot; the matrix shows registrations to who "
-    "may see them",
-    "bind: session one's bind runs one unprivileged pod (spec, Secret, the "
-    "driver's own UID and capabilities) that delivers the minted variable and "
-    "file to the workspace; the binding records reference, digest, "
-    "resolved_at, spec_hash and protocol_version; the pod, its Secret and "
-    "policy are gone afterwards",
+    "declared variables, pushed digest, tier custom, unprivileged); "
+    "srw.example/v1 is refused; another user neither sees nor uses it; a "
+    "Project editor registers at Project scope, a viewer cannot; the matrix "
+    "shows registrations to who may see them",
+    "bind: session one's bind runs one unprivileged pod (spec, Secret, its "
+    "NetworkPolicy while it ran, the driver's own UID and capabilities) that "
+    "delivers the minted variable and file to the workspace; the binding "
+    "records reference, digest, resolved_at, spec_hash and protocol_version; "
+    "the pod, its Secret and policy are gone afterwards",
+    "identity: the bind pod's sdi_ is refused by the lease exchange and its "
+    "introspection; a replay of its result is refused (409)",
     "moved-tag: an incompatible image under the same tag is refused at "
     "session two's bind without a pod; the refusal is on the binding, the "
-    "connector (driver_status.last_bind) and in the audit",
-    "revoke: ending session one revokes its binding in a revoke pod, which is "
-    "gone afterwards",
-    "cleanup: sessions, connector, registrations, project, accounts, OAuth "
-    "client, probe pod, registry tags and image rows are gone; no "
-    "driver-namespace object names this run's connector",
+    "connector, session two's README and in the audit; the compatible image "
+    "is pushed back",
+    "detach: detaching session one's connector live revokes its binding "
+    "(connector_detached) in a revoke pod within a reconciler pass",
+    "refusals: a denied variable, an undeclared one and a refused file are "
+    "each refused at bind with a visible reason, and revoked "
+    "(binding_refused); a bound connector deleted is still revoked "
+    "(connector_deleted) with the inputs of its bind",
+    "pinned: a pinned session binds and delivers; a driver that fails for good "
+    "leaves it usable, with the notice in its README and on the connector",
+    "job: a job is held until its bind ends, receives the binding, and its "
+    "binding is revoked when it ends (execution_ended)",
+    "disable: disabling the registration revokes its live bindings "
+    "(registration_disabled) and refuses new binds; the viewer may not",
+    "cleanup: jobs, sessions, connectors, registrations, project, accounts, "
+    "OAuth client, probe pod, registry tags and image rows are gone; no "
+    "binding of the run's connectors is unrevoked; no driver-namespace object "
+    "names one of them",
 ]
 
 
@@ -854,7 +1057,6 @@ class CustomDriverGate:
         self.gate_id = args.gate_id or f"d6-{secrets.token_hex(5)}"
         self.report = Report(self.gate_id)
         self.owner = Api(args.user, args.password)
-        hexid = self.gate_id.removeprefix("d6-")
         self.editor = Api(f"{self.gate_id}-ed", secrets.token_urlsafe(24))
         self.viewer = Api(f"{self.gate_id}-vw", secrets.token_urlsafe(24))
         self.accounts_by_role = {"editor": self.editor, "viewer": self.viewer}
@@ -868,21 +1070,28 @@ class CustomDriverGate:
         self.owner_id = ""
         self.project: str | None = None
         self.registrations: dict[str, tuple[str, str]] = {}  # label -> (id, who)
-        self.connector: str | None = None
+        self.connectors: dict[str, str] = {}  # label -> id
+        self.deleted_connectors: set[str] = set()
         self.threads: dict[str, str] = {}
+        self.jobs: dict[str, str] = {}
         self.images_pushed = False
         self.digests: dict[str, str] = {}
         self.deny_probe = f"{self.gate_id}-denyprobe"
         self.deny_probe_started = False
         self.namespace = ""
         self.orchestrator_ip = ""
+        self.exchange_port = 8088
         self.reconcile_seconds = 15
         self.deadline_seconds = 120
         self.watch: PodWatch | None = None
+        self.bind_identity = ""
         self.token = secret(f"d6-token-{secrets.token_hex(16)}")
-        self.variable = f"D6_GATE_{hexid.upper()}"
-        self.file = f"~/.srw-files/{self.gate_id}/token"
         self.spec = json.loads(SPEC_FILE.read_text(encoding="utf-8"))
+
+    @property
+    def connector(self) -> str | None:
+        """The ``example`` connector, the one every delivery check uses."""
+        return self.connectors.get("example")
 
     # -- naming and helpers ------------------------------------------------
     def name(self, label: str) -> str:
@@ -929,17 +1138,6 @@ class CustomDriverGate:
         )
         return out.strip() if rc == 0 else ""
 
-    def workspace_pod(self, thread: str) -> str:
-        def probe() -> str | None:
-            running = [
-                pod["metadata"]["name"]
-                for pod in self.release_pods(f"srw/thread-id={thread}")
-                if pod.get("status", {}).get("phase") == "Running"
-            ]
-            return running[0] if len(running) == 1 else None
-
-        return wait_for(f"workspace of {thread}", probe, timeout=300)
-
     def ws(self, pod: str, script: str) -> tuple[int, str]:
         """Run ``script`` as agent-host in the workspace (stdin, never argv)."""
         rc, out, _err = run(
@@ -958,20 +1156,186 @@ class CustomDriverGate:
         )
         return [row for row in out.splitlines() if _UUID_RE.fullmatch(row)]
 
-    def binding(self, thread: str) -> dict | None:
+    def workspace_pod(self, selector: str) -> str:
+        """The one running workspace pod of ``srw/thread-id=…`` or
+        ``srw/job-id=…``."""
+
+        def probe() -> str | None:
+            running = [
+                pod["metadata"]["name"]
+                for pod in self.release_pods(selector)
+                if pod.get("status", {}).get("phase") == "Running"
+            ]
+            return running[0] if len(running) == 1 else None
+
+        return wait_for(f"workspace of {selector}", probe, timeout=300)
+
+    def workspace_facts(self, pod: str) -> dict[str, str]:
+        rc, out = self.ws(
+            pod, f"GATE_FILE={TOKEN_FILE.replace('~', HOME, 1)}\n" + _WORKSPACE_SCRIPT
+        )
+        if rc:
+            return {}
+        return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+
+    def delivered(self, selector: str, binding_id: str) -> dict[str, str]:
+        """The workspace's facts once it holds the variable the driver minted
+        for ``binding_id``; ``{}`` when it never does."""
+        pod = self.workspace_pod(selector)
+        expected = hashlib.sha256(
+            secret(minted(self.token, binding_id)).encode()
+        ).hexdigest()
+
+        def probe() -> dict | None:
+            facts = self.workspace_facts(pod)
+            return facts if facts.get("value_sha") == expected else None
+
+        try:
+            return wait_for(
+                f"the minted variable in {selector}'s workspace",
+                probe,
+                timeout=self.args.turn_timeout,
+                interval=5,
+            )
+        except GateError:
+            return {}
+
+    def noticed(self, selector: str, needles: list[str]) -> list[str]:
+        """The workspace README's "Not delivered" lines once every needle is
+        in one; what it has when they never all are."""
+        pod = self.workspace_pod(selector)
+        lines: list[str] = []
+
+        def probe() -> bool:
+            nonlocal lines
+            lines = notice_lines(self.workspace_facts(pod))
+            return all(any(needle in line for line in lines) for needle in needles)
+
+        try:
+            wait_for(
+                f"the notices in {selector}'s README",
+                probe,
+                timeout=self.args.turn_timeout,
+                interval=5,
+            )
+        except GateError:
+            pass
+        return lines
+
+    def binding(
+        self, owner: str, connector: str | None = None, kind: str = "thread"
+    ) -> dict | None:
+        """The newest binding of an execution (a thread, or a job with
+        ``kind="job"``) and a connector (``example`` by default)."""
         out = sql(
             "SELECT coalesce(row_to_json(b)::text, '') FROM (SELECT id, status, "
             "image_reference, image_digest, resolved_at, spec_hash, "
-            "protocol_version, error_class, error_message, revoke_reason, "
-            "revoked_at FROM connector_bind_time_bindings WHERE connector_id = "
-            f"{lit(self.connector)} AND owner_kind = 'thread' AND owner_id = "
-            f"{lit(thread)} ORDER BY created_at DESC LIMIT 1) b"
+            "protocol_version, access, error_class, error_message, retry_at, "
+            "revoke_reason, revoke_error, revoked_at, revoke_requested_at, "
+            "bound_at FROM connector_bind_time_bindings WHERE connector_id = "
+            f"{lit(connector or self.connector)} AND owner_kind = {lit(kind)} "
+            f"AND owner_id = {lit(owner)} ORDER BY created_at DESC LIMIT 1) b"
         )
         return json.loads(out) if out else None
 
-    def binding_in(self, thread: str, statuses: tuple[str, ...]) -> dict | None:
-        found = self.binding(thread)
+    def binding_in(
+        self,
+        owner: str,
+        statuses: tuple[str, ...],
+        connector: str | None = None,
+        kind: str = "thread",
+    ) -> dict | None:
+        found = self.binding(owner, connector, kind)
         return found if found and found["status"] in statuses else None
+
+    def settled(
+        self, owner: str, connector: str | None = None, kind: str = "thread"
+    ) -> dict:
+        """The binding once its bind ended: bound, failed, or revoking or
+        revoked after a refusal."""
+
+        def probe() -> dict | None:
+            row = self.binding(owner, connector, kind)
+            if row is None or row["status"] == "pending":
+                return None
+            if row["status"] in ("revoking", "revoked") and not row["error_message"]:
+                return None  # a revoke asked for a bound one; wait for a refusal
+            return row
+
+        return wait_for(
+            f"the bind of {kind} {owner}",
+            probe,
+            timeout=self.args.turn_timeout,
+            interval=3,
+        )
+
+    def revoked(self, binding_id: str, *, passes: int = 3) -> dict | None:
+        """The binding once a revoke retired it, within ``passes`` reconciler
+        passes and a pod's deadline; ``None`` when it never is."""
+        try:
+            return wait_for(
+                f"binding {binding_id} revoked",
+                lambda: (
+                    row
+                    if (
+                        row := json.loads(
+                            sql(
+                                "SELECT coalesce(row_to_json(b)::text, '{}') FROM "
+                                "(SELECT id, status, revoke_reason, revoke_error, "
+                                "revoked_at FROM connector_bind_time_bindings "
+                                f"WHERE id = {lit(binding_id)}) b"
+                            )
+                            or "{}"
+                        )
+                    ).get("status")
+                    == "revoked"
+                    else None
+                ),
+                timeout=passes * self.reconcile_seconds + self.deadline_seconds + 60,
+                interval=3,
+            )
+        except GateError:
+            return None
+
+    def revoke_operation(self, binding_id: str) -> dict | None:
+        revokes = [
+            op for op in self.operations(binding_id) if op["operation"] == "revoke"
+        ]
+        return revokes[-1] if revokes else None
+
+    def objects_gone(self, name: str) -> bool:
+        try:
+            wait_for(
+                f"{name}'s pod, Secret and policy gone",
+                lambda: self.gone("pod", name)
+                and self.gone("secret", name)
+                and self.gone("networkpolicy", name),
+                timeout=120,
+                interval=3,
+            )
+            return True
+        except GateError:
+            return False
+
+    def exchange_calls(self, calls: list[dict]) -> list[dict]:
+        result = in_pod(
+            ORCHESTRATOR,
+            ORCHESTRATOR_CONTAINER,
+            _EXCHANGE_PROGRAM,
+            {"port": self.exchange_port, "calls": calls},
+        )
+        answers = []
+        for answer in result["answers"]:
+            try:
+                body = json.loads(_scrub(answer["body"]) or "{}")
+            except ValueError:
+                body = {"raw": _scrub(answer["body"])[:200]}
+            answers.append({"status": answer["status"], "body": body})
+        return answers
+
+    def driver_status(self, label: str) -> dict:
+        detail = self.owner.ok("GET", f"/api/datasources/{self.connectors[label]}")
+        return (detail or {}).get("driver_status") or {}
 
     def operations(self, binding_id: str) -> list[dict]:
         out = sql(
@@ -1113,6 +1477,7 @@ class CustomDriverGate:
                 "registry out of connectors.drivers.trustedRepositories"
             )
         self.namespace = env["CONNECTOR_SERVICE_NAMESPACE"]
+        self.exchange_port = int(env["CONNECTOR_LEASE_EXCHANGE_PORT"])
         self.reconcile_seconds = int(
             float(env["CONNECTOR_SERVICE_RECONCILE_SECONDS"] or 15)
         )
@@ -1320,13 +1685,15 @@ class CustomDriverGate:
         trust = (account or {}).get("trust") or {}
         self.report.check(
             "register: the example image registers at the owner's Account from "
-            "its label: the pushed digest, tier custom, no privilege",
+            "its label: the variables it declares, the pushed digest, tier "
+            "custom, no privilege",
             status == 201
             and account.get("scope") == {"kind": "Account", "name": self.owner_id}
             and account.get("name") == DRIVER
             and account.get("image_digest") == self.digests["compatible"]
             and account.get("spec_source") == "label"
             and account.get("spec_hash") == spec_hash(self.spec)
+            and account.get("env_names") == self.spec["env_names"]
             and trust.get("tier") == "custom"
             and trust.get("privileged") is False,
             f"HTTP {status}: {json.dumps(account)[:400]}",
@@ -1353,7 +1720,7 @@ class CustomDriverGate:
                 "name": self.name("stolen-by-id"),
                 "type": IMAGE_TYPE,
                 "driver_registration_id": registration,
-                "config": {"variable": self.variable},
+                "config": {"file": True},
                 "credentials": {"token": "x"},
             },
         )
@@ -1364,7 +1731,7 @@ class CustomDriverGate:
                 "name": self.name("stolen-by-name"),
                 "type": IMAGE_TYPE,
                 "driver": DRIVER,
-                "config": {"variable": self.variable},
+                "config": {"file": True},
                 "credentials": {"token": "x"},
             },
         )
@@ -1442,27 +1809,39 @@ class CustomDriverGate:
             ),
         )
 
-    # -- bind ------------------------------------------------------------------
-    def create_connector(self) -> str:
+    # -- connectors and executions ------------------------------------------
+    def create_connector(self, label: str, config: dict | None = None) -> str:
         status, parsed = self.owner.call(
             "POST",
             "/api/datasources",
             {
-                "name": self.name("example"),
+                "name": self.name(label),
                 "type": IMAGE_TYPE,
                 "scope_mode": "all",
                 "driver_registration_id": self.registrations["account"][0],
-                "config": {"variable": self.variable, "file": self.file},
+                "config": config if config is not None else {"file": True},
                 "credentials": {"token": self.token},
             },
         )
         if isinstance(parsed, dict) and parsed.get("id"):
-            self.connector = str(parsed["id"])
-        if status not in (200, 201) or not self.connector:
-            raise GateError(f"the connector create answered HTTP {status}: {parsed}")
-        return self.connector
+            self.connectors[label] = str(parsed["id"])
+            if self.watch is not None:
+                self.watch.connectors.add(self.connectors[label])
+        if status not in (200, 201) or label not in self.connectors:
+            raise GateError(f"the {label} connector create answered HTTP {status}")
+        return self.connectors[label]
 
-    def create_session(self, label: str) -> str:
+    def create_session(
+        self,
+        label: str,
+        connectors: list[str],
+        *,
+        pinned: bool = False,
+    ) -> str:
+        config: dict[str, Any] = {"workspace": {"backend": "sandbox"}}
+        if pinned:
+            # An Officer conference runs on the pinned lane (one per project).
+            config["officer"] = {"conference": True}
         created = self.owner.ok(
             "POST",
             "/api/persistent/threads",
@@ -1470,8 +1849,8 @@ class CustomDriverGate:
                 "title": self.title(label),
                 "permission_mode": "autonomous",
                 "project_id": self.project,
-                "datasource_ids": [self.connector],
-                "config_override": {"workspace": {"backend": "sandbox"}},
+                "datasource_ids": [self.connectors[name] for name in connectors],
+                "config_override": config,
                 "model": self.args.model,
             },
         )
@@ -1485,17 +1864,57 @@ class CustomDriverGate:
         )
         return thread
 
-    def bind_checks(self) -> None:
-        connector = self.create_connector()
-        self.watch = PodWatch(self.namespace, connector)
-        self.watch.start()
-        thread = self.create_session("one")
-        row = wait_for(
-            "session one's binding",
-            lambda: self.binding_in(thread, ("bound", "failed")),
-            timeout=self.args.turn_timeout,
-            interval=3,
+    def create_job(self, label: str, connectors: list[str]) -> str:
+        created = self.owner.ok(
+            "POST",
+            "/api/jobs",
+            {
+                "description": (
+                    f"[{self.gate_id} {label}] Run the shell command "
+                    f"`printenv {TOKEN_VARIABLE} | sha256sum` once, write the "
+                    "word done to output/d6.txt and complete the job."
+                ),
+                "project_id": self.project,
+                "datasource_ids": [self.connectors[name] for name in connectors],
+                "execution_lane": self.args.job_lane,
+                "config_override": {
+                    "workspace": {"backend": "sandbox"},
+                    "llm": {"model": self.args.model},
+                },
+            },
         )
+        job = str(created.get("job_id") or created["id"])
+        self.jobs[label] = job
+        print(f"job {label}: {job}", flush=True)
+        return job
+
+    def job_status(self, job: str) -> str:
+        return sql(f"SELECT status FROM jobs WHERE id = {lit(job)}")
+
+    def answered(self, thread: str) -> bool:
+        """Whether the session answered a turn (an assistant message)."""
+        try:
+            wait_for(
+                f"session {thread} answers",
+                lambda: sql(
+                    "SELECT count(*) FROM thread_messages WHERE thread_id = "
+                    f"{lit(thread)} AND role = 'assistant'"
+                )
+                not in ("", "0"),
+                timeout=self.args.turn_timeout,
+                interval=5,
+            )
+            return True
+        except GateError:
+            return False
+
+    # -- bind ------------------------------------------------------------------
+    def bind_checks(self) -> None:
+        self.watch = PodWatch(self.namespace)
+        self.watch.start()
+        self.create_connector("example")
+        thread = self.create_session("one", ["example"])
+        row = self.settled(thread)
         self.report.check(
             "bind: session one's binding is bound and records reference, digest, "
             "resolution time, spec hash and protocol version",
@@ -1515,9 +1934,10 @@ class CustomDriverGate:
         (operation,) = [
             op for op in self.operations(row["id"]) if op["operation"] == "bind"
         ]
+        name = operation["pod_name"]
         pod = wait_for(
             "the bind pod seen while it ran",
-            lambda: self.watch.pods.get(operation["pod_name"]),
+            lambda: self.watch.pods.get(name),
             timeout=30,
             interval=1,
         )
@@ -1532,45 +1952,38 @@ class CustomDriverGate:
             not problems,
             "; ".join(problems),
         )
-        keys = self.watch.secret_keys.get(operation["pod_name"])
-        owners = self.watch.secret_owners.get(operation["pod_name"]) or []
+        keys = self.watch.secret_keys.get(name)
+        owners = self.watch.secret_owners.get(name) or []
         self.report.check(
             "bind: the pod's Secret held only request.json and its identity, "
             "owned by the pod (never the app Secret)",
             keys == ["identity", "request.json"] and owners in ([], ["Pod"]),
             f"keys={keys} owners={owners}",
         )
-        workspace = self.workspace_pod(thread)
-        script = (
-            f"GATE_VAR={self.variable}\n"
-            f"GATE_FILE={self.file.replace('~', HOME, 1)}\n" + _WORKSPACE_SCRIPT
+        problems = policy_problems(
+            self.watch.policies.get(name),
+            pod,
+            exchange_port=self.exchange_port,
+            namespace=LOCAL_NAMESPACE,
         )
-
-        def delivered() -> dict | None:
-            rc, out = self.ws(workspace, script)
-            if rc:
-                return None
-            facts = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
-            expected = hashlib.sha256(value.encode()).hexdigest()
-            return facts if facts.get("value_sha") == expected else None
-
-        try:
-            facts = wait_for(
-                "the minted variable in session one's workspace",
-                delivered,
-                timeout=self.args.turn_timeout,
-                interval=5,
-            )
-        except GateError:
-            facts = {}
+        self.report.check(
+            "bind: the pod's NetworkPolicy existed while it ran: it selects the "
+            "pod, admits nothing and reaches only the lease exchange's port",
+            not problems,
+            "; ".join(problems),
+        )
+        self.bind_identity = self.watch.identities.get(name, "")
+        facts = self.delivered(f"srw/thread-id={thread}", row["id"])
         self.report.check(
             "bind: the workspace has the variable the driver minted for this "
-            "binding and its credential file (0600)",
+            "binding and its credential file (0600), named by "
+            f"{FILE_VARIABLE}",
             bool(facts)
             and facts.get("file_sha")
             == hashlib.sha256((value + "\n").encode()).hexdigest()
-            and facts.get("file_mode") == "600",
-            json.dumps({k: facts.get(k) for k in ("file_mode",)}),
+            and facts.get("file_mode") == "600"
+            and facts.get("file_var", "").endswith("/.srw-files/example/token"),
+            json.dumps({k: facts.get(k) for k in ("file_mode", "file_var")}),
         )
         process = process_facts(facts.get("process", ""))
         problems = unprivileged_process(process)
@@ -1581,6 +1994,7 @@ class CustomDriverGate:
             bool(process) and not problems,
             facts.get("process", "") + ("; " + "; ".join(problems) if problems else ""),
         )
+        workspace = self.workspace_pod(f"srw/thread-id={thread}")
         leaked = run(
             K
             + ["exec", "-i", workspace, "-c", WORKSPACE_CONTAINER, "--"]
@@ -1594,19 +2008,7 @@ class CustomDriverGate:
             leaked[0] == 1 and not leaked[1],
             leaked[1][:200],
         )
-        name = operation["pod_name"]
-        try:
-            wait_for(
-                "the bind pod, its Secret and policy gone",
-                lambda: self.gone("pod", name)
-                and self.gone("secret", name)
-                and self.gone("networkpolicy", name),
-                timeout=120,
-                interval=3,
-            )
-            gone = True
-        except GateError:
-            gone = False
+        gone = self.objects_gone(name)
         (closed,) = [
             op for op in self.operations(row["id"]) if op["operation"] == "bind"
         ]
@@ -1620,19 +2022,60 @@ class CustomDriverGate:
             json.dumps(closed),
         )
 
+    # -- identity --------------------------------------------------------------
+    def identity_checks(self) -> None:
+        if not self.bind_identity:
+            raise GateError("the bind pod's identity was not seen")
+        lease = secret(well_formed_token("scl"))
+        exchange, introspect, replay = self.exchange_calls(
+            [
+                {
+                    "path": EXCHANGE_PATH,
+                    "token": self.bind_identity,
+                    "body": {"lease_token": lease, "operation": "read"},
+                },
+                {
+                    "path": INTROSPECT_PATH,
+                    "token": self.bind_identity,
+                    "body": {"lease_token": lease},
+                },
+                {
+                    "path": RESULT_PATH,
+                    "token": self.bind_identity,
+                    "body": {
+                        "protocol_version": "1.0",
+                        "operation": "bind",
+                        "exit_code": 0,
+                        "lines": [{"type": "result", "result": {}}],
+                    },
+                },
+            ]
+        )
+        self.report.check(
+            "identity: the bind pod's sdi_ is refused by the lease exchange and "
+            "its introspection (unknown_driver_identity)",
+            exchange["status"] == 401
+            and exchange["body"].get("error") == "unknown_driver_identity"
+            and introspect["status"] == 401
+            and introspect["body"].get("error") == "unknown_driver_identity",
+            json.dumps([exchange, introspect]),
+        )
+        self.report.check(
+            "identity: a replay of the bind pod's result is refused "
+            "(409 operation_closed)",
+            replay["status"] == 409
+            and replay["body"].get("error") == "operation_closed",
+            json.dumps(replay),
+        )
+
     # -- moved tag -------------------------------------------------------------
     def moved_tag_checks(self) -> None:
         self.digests["incompatible"] = self.build(self.gate_id, incompatible(self.spec))
         seen_before = set(self.watch.pods) if self.watch else set()
         # The k3d profile caches a tag's resolution for 5 seconds.
         time.sleep(8)
-        thread = self.create_session("two")
-        row = wait_for(
-            "session two's binding refused",
-            lambda: self.binding_in(thread, ("failed", "bound")),
-            timeout=self.args.turn_timeout,
-            interval=3,
-        )
+        thread = self.create_session("two", ["example"])
+        row = self.settled(thread)
         problems = refusal_problems(row, digest=self.digests["incompatible"])
         self.report.check(
             "moved-tag: session two's bind is refused: the image behind the tag "
@@ -1645,14 +2088,20 @@ class CustomDriverGate:
             self.operations(row["id"]) == []
             and set(self.watch.pods if self.watch else ()) == seen_before,
         )
-        detail = self.owner.ok("GET", f"/api/datasources/{self.connector}")
-        last = ((detail or {}).get("driver_status") or {}).get("last_bind") or {}
+        last = self.driver_status("example").get("last_bind") or {}
         self.report.check(
             "moved-tag: the connector shows the refusal (driver_status.last_bind)",
             last.get("status") == "failed"
             and "changed its contract" in (last.get("message") or "")
             and last.get("digest") == self.digests["incompatible"],
             json.dumps(last)[:400],
+        )
+        lines = self.noticed(f"srw/thread-id={thread}", ["changed its contract"])
+        self.report.check(
+            "moved-tag: session two goes on without the connector, and its "
+            "README says why",
+            any("changed its contract" in line for line in lines),
+            " | ".join(lines)[:400],
         )
         audited = sql(
             "SELECT count(*) FROM security_events WHERE event_type = "
@@ -1664,42 +2113,275 @@ class CustomDriverGate:
             audited.isdigit() and int(audited) >= 1,
             f"{audited} events",
         )
-        self.owner.call("DELETE", f"/api/persistent/threads/{thread}?force=true")
+        # The compatible image again, for every later bind.
+        self.digests["restored"] = self.build(self.gate_id, self.spec)
+        time.sleep(8)
 
-    # -- revoke ----------------------------------------------------------------
-    def revoke_checks(self) -> None:
+    # -- detach ------------------------------------------------------------------
+    def detach_checks(self) -> None:
         thread = self.threads["one"]
         bound = self.binding(thread)
-        self.owner.ok("DELETE", f"/api/persistent/threads/{thread}?force=true")
-        row = wait_for(
-            "session one's binding revoked",
-            lambda: self.binding_in(thread, ("revoked",)),
-            timeout=max(240, 8 * self.reconcile_seconds + self.deadline_seconds),
-            interval=5,
+        if not bound or bound["status"] != "bound":
+            raise GateError("session one has no bound binding to detach")
+        self.owner.ok(
+            "PATCH",
+            f"/api/persistent/threads/{thread}/config",
+            {"datasource_ids": []},
         )
-        revokes = [
-            op for op in self.operations(bound["id"]) if op["operation"] == "revoke"
-        ]
-        name = revokes[0]["pod_name"] if revokes else ""
-        try:
-            wait_for(
-                "the revoke pod gone",
-                lambda: name and self.gone("pod", name) and self.gone("secret", name),
-                timeout=120,
-                interval=3,
-            )
-            gone = True
-        except GateError:
-            gone = False
+        at_once = self.binding(thread) or {}
+        row = self.revoked(bound["id"], passes=2)
+        revoke = self.revoke_operation(bound["id"])
         self.report.check(
-            "revoke: ending session one revoked its binding in a revoke pod "
-            "(execution_ended), which is gone afterwards",
-            row["revoke_reason"] == "execution_ended"
-            and len(revokes) == 1
-            and revokes[0]["status"] == "finished"
-            and revokes[0]["exit_code"] == 0
-            and gone,
-            json.dumps(revokes)[:400],
+            "detach: the live detach moved session one's binding to revoking at "
+            "once (connector_detached), and a revoke pod retired it within a "
+            "reconciler pass with the binding's inputs and driver_state",
+            at_once.get("status") in ("revoking", "revoked")
+            and at_once.get("revoke_reason") == "connector_detached"
+            and row is not None
+            and not row.get("revoke_error")
+            and revoke is not None
+            and revoke["status"] == "finished"
+            and revoke["exit_code"] == 0,
+            json.dumps({"at_once": at_once.get("status"), "revoke": revoke})[:400],
+        )
+        self.report.check(
+            "detach: the revoke pod, its Secret and its policy are gone",
+            revoke is not None and self.objects_gone(revoke["pod_name"]),
+        )
+
+    # -- refusals ------------------------------------------------------------------
+    def refusal_checks(self) -> None:
+        for label, (misbehave, _reason) in REFUSALS.items():
+            self.create_connector(label, {"misbehave": misbehave})
+        self.create_connector("doomed")
+        thread = self.create_session("refusals", [*REFUSALS, "doomed"])
+        rows = {
+            label: self.settled(thread, self.connectors[label])
+            for label in [*REFUSALS, "doomed"]
+        }
+        for label, (_misbehave, reason) in REFUSALS.items():
+            row = rows[label]
+            last = self.driver_status(label).get("last_bind") or {}
+            self.report.check(
+                f"refusals: {label}: the bind is refused with a visible reason on "
+                "the binding and the connector",
+                row["status"] in ("revoking", "revoked")
+                and "will not deliver" in (row.get("error_message") or "")
+                and reason in (row.get("error_message") or "")
+                and reason in (last.get("message") or ""),
+                (row.get("error_message") or "")[:300],
+            )
+        lines = self.noticed(
+            f"srw/thread-id={thread}", [self.name(label) for label in REFUSALS]
+        )
+        self.report.check(
+            "refusals: the session's README says each refused connector was not "
+            "delivered, and why",
+            all(
+                any(self.name(label) in line and reason in line for line in lines)
+                for label, (_misbehave, reason) in REFUSALS.items()
+            ),
+            " | ".join(lines)[:600],
+        )
+        retired = {label: self.revoked(rows[label]["id"]) for label in REFUSALS}
+        self.report.check(
+            "refusals: what each refused bind minted is revoked (binding_refused) "
+            "in a revoke pod",
+            all(
+                row is not None
+                and row.get("revoke_reason") == "binding_refused"
+                and not row.get("revoke_error")
+                for row in retired.values()
+            ),
+            json.dumps(retired)[:400],
+        )
+        doomed = rows["doomed"]
+        if doomed["status"] != "bound":
+            raise GateError(f"doomed did not bind: {doomed.get('error_message')}")
+        connector = self.connectors["doomed"]
+        status, _body = self.owner.call("DELETE", f"/api/datasources/{connector}")
+        if status in (200, 204):
+            self.deleted_connectors.add("doomed")
+        row = self.revoked(doomed["id"])
+        revoke = self.revoke_operation(doomed["id"])
+        self.report.check(
+            "refusals: a bound connector deleted is still revoked "
+            "(connector_deleted) by a revoke pod that received the inputs and "
+            "driver_state of its bind",
+            status in (200, 204)
+            and row is not None
+            and row.get("revoke_reason") == "connector_deleted"
+            and not row.get("revoke_error")
+            and revoke is not None
+            and revoke["exit_code"] == 0,
+            json.dumps({"delete": status, "row": row, "revoke": revoke})[:400],
+        )
+
+    # -- pinned --------------------------------------------------------------------
+    def pinned_checks(self) -> None:
+        self.create_connector("fail", {"misbehave": "fail"})
+        started = time.time()
+        thread = self.create_session("pinned", ["example", "fail"], pinned=True)
+        lane = sql(f"SELECT execution_lane FROM threads WHERE id = {lit(thread)}")
+        self.report.check(
+            "pinned: the Officer conference runs on the pinned lane",
+            lane == PINNED_LANE,
+            lane,
+        )
+        if lane != PINNED_LANE:
+            raise GateError(f"session lane is {lane!r}, not pinned")
+        row = self.settled(thread)
+        failing = self.settled(thread, self.connectors["fail"])
+        facts = (
+            self.delivered(f"srw/thread-id={thread}", row["id"])
+            if row["status"] == "bound"
+            else {}
+        )
+        self.report.check(
+            "pinned: the pinned session binds example and its workspace has the "
+            "minted variable",
+            row["status"] == "bound" and bool(facts),
+            json.dumps({"status": row["status"], "error": row.get("error_message")}),
+        )
+        self.report.check(
+            "pinned: fail fails for good (a config error, never retried)",
+            failing["status"] == "failed"
+            and failing.get("error_class") == "config"
+            and failing.get("retry_at") is None
+            and FAILING in (failing.get("error_message") or ""),
+            json.dumps(failing)[:300],
+        )
+        lines = self.noticed(f"srw/thread-id={thread}", [FAILING])
+        last = self.driver_status("fail").get("last_bind") or {}
+        self.report.check(
+            "pinned: the README and the connector say why fail was not delivered",
+            any(FAILING in line for line in lines)
+            and FAILING in (last.get("message") or ""),
+            " | ".join(lines)[:300],
+        )
+        self.report.check(
+            "pinned: the session stays usable: it answers its turn",
+            self.answered(thread),
+        )
+        since = max(60, int(time.time() - started) + 30)
+        rc, logs, _err = run(
+            K
+            + ["logs", ORCHESTRATOR, "-c", ORCHESTRATOR_CONTAINER, f"--since={since}s"],
+            timeout=120,
+        )
+        failures = [
+            line
+            for line in logs.splitlines()
+            if thread in line
+            and ("connector leases unavailable" in line or "Traceback" in line)
+        ]
+        self.report.check(
+            "pinned: no attach of the session logged a connector delivery failure",
+            rc == 0 and not failures,
+            " | ".join(failures)[:300],
+        )
+
+    # -- job -------------------------------------------------------------------------
+    def job_checks(self) -> None:
+        job = self.create_job("job", ["example"])
+        row = self.settled(job, kind="job")
+        claimed = sql(
+            "SELECT coalesce(min(created_at)::text, '') FROM connector_driver_operations "
+            f"WHERE binding_id = {lit(row['id'])} AND operation = 'bind'"
+        )
+        self.report.check(
+            f"job: the {self.args.job_lane} job's binding is bound",
+            row["status"] == "bound",
+            json.dumps({"status": row["status"], "error": row.get("error_message")}),
+        )
+        if row["status"] != "bound":
+            return
+        facts = self.delivered(f"srw/job-id={job}", row["id"])
+        self.report.check(
+            "job: its workspace received the variable the driver minted for it",
+            bool(facts),
+        )
+        def ended(statuses: frozenset[str]) -> str:
+            try:
+                return wait_for(
+                    f"job {job} ends",
+                    lambda: (s if (s := self.job_status(job)) in statuses else None),
+                    timeout=self.args.turn_timeout * 2,
+                    interval=5,
+                )
+            except GateError:
+                return self.job_status(job)
+
+        status = ended(JOB_TERMINAL)
+        if status == "pending_review":
+            # A review pause keeps the execution (and its binding) alive.
+            self.owner.call("POST", f"/api/jobs/{job}/approve", {})
+            status = ended(JOB_TERMINAL - {"pending_review"})
+        retired = self.revoked(row["id"])
+        revoke = self.revoke_operation(row["id"])
+        self.report.check(
+            "job: when the job ends its binding is revoked (execution_ended) in "
+            "a revoke pod",
+            status in JOB_TERMINAL
+            and status != "pending_review"
+            and retired is not None
+            and retired.get("revoke_reason") == "execution_ended"
+            and revoke is not None
+            and revoke["exit_code"] == 0,
+            json.dumps({"job": status, "bind": claimed, "revoke": revoke})[:400],
+        )
+
+    # -- disable ---------------------------------------------------------------------
+    def disable_checks(self) -> None:
+        registration = self.registrations["account"][0]
+        refused, _body = self.viewer.call(
+            "POST", f"/api/connector-drivers/{registration}/disable"
+        )
+        project_registration = self.registrations.get("project", ("", ""))[0]
+        refused_project, _body = (
+            self.viewer.call(
+                "POST", f"/api/connector-drivers/{project_registration}/disable"
+            )
+            if project_registration
+            else (403, None)
+        )
+        self.report.check(
+            "disable: the viewer may disable neither the owner's registration "
+            "(404: it cannot see it) nor the project's (403)",
+            refused == 404 and refused_project == 403,
+            f"account={refused} project={refused_project}",
+        )
+        live = self.binding_in(self.threads.get("pinned", ""), ("bound",))
+        status, body = self.owner.call(
+            "POST", f"/api/connector-drivers/{registration}/disable"
+        )
+        self.report.check(
+            "disable: the owner disables the registration",
+            status == 200 and (body or {}).get("disabled") is True,
+            f"HTTP {status}",
+        )
+        if live is not None:
+            row = self.revoked(live["id"])
+            self.report.check(
+                "disable: the pinned session's live binding is revoked "
+                "(registration_disabled)",
+                row is not None and row.get("revoke_reason") == "registration_disabled",
+                json.dumps(row)[:300],
+            )
+        self.report.check(
+            "disable: the connector says its registration is disabled",
+            self.driver_status("example").get("notice") == "registration disabled",
+        )
+        seen_before = set(self.watch.pods if self.watch else ())
+        thread = self.create_session("disabled", ["example"])
+        row = self.settled(thread)
+        self.report.check(
+            "disable: a new session's bind is refused (disabled), without a pod",
+            row["status"] == "failed"
+            and "disabled" in (row.get("error_message") or "")
+            and self.operations(row["id"]) == []
+            and set(self.watch.pods if self.watch else ()) == seen_before,
+            (row.get("error_message") or "")[:200],
         )
 
     # -- cleanup ---------------------------------------------------------------
@@ -1713,8 +2395,18 @@ class CustomDriverGate:
             except GateError as exc:
                 problems.append(f"{label} ({exc})")
 
-        if self.watch is not None:
-            self.watch.stopped.set()
+        for label, job in self.jobs.items():
+
+            def delete_job(job=job) -> bool:
+                self.owner.call("PUT", f"/api/jobs/{job}/cancel")
+
+                def gone() -> bool:
+                    status, _body = self.owner.call("DELETE", f"/api/jobs/{job}")
+                    return status in (200, 204, 404)
+
+                return bool(wait_for("job deleted", gone, timeout=240, interval=10))
+
+            step(f"delete job {label}", delete_job)
         for thread in dict.fromkeys([*self.threads.values(), *self.titled_threads()]):
 
             def delete_thread(thread=thread) -> bool:
@@ -1733,23 +2425,44 @@ class CustomDriverGate:
                 return bool(wait_for("session deleted", gone, timeout=300, interval=5))
 
             step(f"delete session {thread}", delete_thread)
-        if self.connector:
+        for label, connector in self.connectors.items():
+            if label in self.deleted_connectors:
+                continue
             step(
-                "delete the connector",
-                lambda: self.owner.call("DELETE", f"/api/datasources/{self.connector}")[
-                    0
-                ]
+                f"delete the {label} connector",
+                lambda connector=connector: self.owner.call(
+                    "DELETE", f"/api/datasources/{connector}"
+                )[0]
                 in (200, 204, 404),
             )
         apis = {"owner": self.owner, "editor": self.editor, "viewer": self.viewer}
         for label, (registration, who) in list(self.registrations.items()):
-            step(
-                f"delete registration {label}",
-                lambda registration=registration, who=who: apis[who].call(
-                    "DELETE", f"/api/connector-drivers/{registration}"
-                )[0]
-                in (200, 204, 404),
-            )
+
+            def delete_registration(registration=registration, who=who) -> bool:
+                # Refused (409) while a binding of it is unrevoked: the
+                # reconciler revokes the deleted connectors' first.
+                def deleted() -> bool:
+                    status, _body = apis[who].call(
+                        "DELETE", f"/api/connector-drivers/{registration}"
+                    )
+                    if status == 409:
+                        apis[who].call(
+                            "POST", f"/api/connector-drivers/{registration}/disable"
+                        )
+                    return status in (200, 204, 404)
+
+                return bool(
+                    wait_for(
+                        "registration deleted",
+                        deleted,
+                        timeout=max(300, 10 * self.reconcile_seconds),
+                        interval=10,
+                    )
+                )
+
+            step(f"delete registration {label}", delete_registration)
+        if self.watch is not None:
+            self.watch.stopped.set()
         if self.project:
 
             def project_deleted() -> bool:
@@ -1841,6 +2554,9 @@ class CustomDriverGate:
         titled = self.titled_threads()
         if titled:
             left.append(f"sessions titled with the gate id: {titled}")
+        for label, job in self.jobs.items():
+            if sql(f"SELECT count(*) FROM jobs WHERE id = {lit(job)}") != "0":
+                left.append(f"job {label} {job}")
         prefix = self.gate_id + " %"
         count = sql(f"SELECT count(*) FROM datasources WHERE name LIKE {lit(prefix)}")
         if count != "0":
@@ -1853,19 +2569,19 @@ class CustomDriverGate:
             )
             if rows != "0":
                 left.append(f"{rows} registrations")
-        if self.connector:
-            for table in (
-                "connector_bind_time_bindings",
-                "connector_driver_operations",
+        connectors = [c for c in self.connectors.values() if _UUID_RE.fullmatch(c)]
+        if connectors:
+            listed = ", ".join(lit(value) for value in connectors)
+            for table, open_rows in (
+                (
+                    "connector_bind_time_bindings",
+                    "status IN ('pending', 'bound', 'revoking')",
+                ),
+                ("connector_driver_operations", "removed_at IS NULL"),
             ):
                 rows = sql(
-                    f"SELECT count(*) FROM {table} WHERE connector_id = "
-                    f"{lit(self.connector)} AND "
-                    + (
-                        "status NOT IN ('revoked', 'failed')"
-                        if table == "connector_bind_time_bindings"
-                        else "removed_at IS NULL"
-                    )
+                    f"SELECT count(*) FROM {table} WHERE connector_id IN ({listed}) "
+                    f"AND {open_rows}"
                 )
                 if rows != "0":
                     left.append(f"{rows} open rows in {table}")
@@ -1892,21 +2608,22 @@ class CustomDriverGate:
                     left.append("the OAuth client")
             except GateError as exc:
                 left.append(f"Keycloak residue unknown ({exc})")
-        if self.namespace and self.connector:
-            try:
-                wait_for(
-                    "driver objects of the connector gone",
-                    lambda: not run(
-                        self.kc
-                        + ["get", "pod,secret,networkpolicy", "-l"]
-                        + [f"srw.io/connector-id={self.connector}", "-o", "name"],
-                        timeout=60,
-                    )[1],
-                    timeout=max(120, 6 * self.reconcile_seconds),
-                    interval=5,
-                )
-            except GateError:
-                left.append(f"driver objects of connector {self.connector}")
+        if self.namespace:
+            for connector in connectors:
+                try:
+                    wait_for(
+                        "driver objects of the connector gone",
+                        lambda connector=connector: not run(
+                            self.kc
+                            + ["get", "pod,secret,networkpolicy", "-l"]
+                            + [f"srw.io/connector-id={connector}", "-o", "name"],
+                            timeout=60,
+                        )[1],
+                        timeout=max(120, 6 * self.reconcile_seconds),
+                        interval=5,
+                    )
+                except GateError:
+                    left.append(f"driver objects of connector {connector}")
         if self.deny_probe_started and self.namespace:
             listing = json.loads(
                 command(
@@ -1931,10 +2648,18 @@ class CustomDriverGate:
             self.preflight()
             self.accounts()
             self.register_checks()
-            # bind creates the connector and the session every later phase
-            # needs; a failure there ends the run (cleanup still runs).
+            # bind creates the example connector and session one every later
+            # phase needs; a failure there ends the run (cleanup still runs).
             self.bind_checks()
-            for phase in (self.moved_tag_checks, self.revoke_checks):
+            for phase in (
+                self.identity_checks,
+                self.moved_tag_checks,
+                self.detach_checks,
+                self.refusal_checks,
+                self.pinned_checks,
+                self.job_checks,
+                self.disable_checks,
+            ):
                 try:
                     phase()
                 except GateError as exc:
@@ -1945,12 +2670,15 @@ class CustomDriverGate:
             self.report.check("gate infrastructure", False, str(exc))
         finally:
             if self.args.keep:
+                if self.watch is not None:
+                    self.watch.stopped.set()
                 print(
                     "kept: "
                     + json.dumps(
                         {
-                            "connector": self.connector,
+                            "connectors": self.connectors,
                             "threads": self.threads,
+                            "jobs": self.jobs,
                             "registrations": self.registrations,
                             "project": self.project,
                         }
@@ -1985,7 +2713,9 @@ VALUES_LOCAL_KEYS = """values-local.yaml keys (the k3d profile of values-local.y
   connectors.drivers.registry.resolveCacheSeconds: 5
 Left at their defaults: connectors.customDrivers.privileged (false) and
 connectors.drivers.trustedRepositories (empty; never the k3d registry), so the
-example image is a custom, unprivileged driver.
+example image is a custom, unprivileged driver; connectors.customDrivers.
+bindWaitSeconds (20). The pinned session is an Officer conference in the
+gate's own project; the job's lane is --job-lane (pinned by default).
 Tilt overrides the shim image (repository, tag, digest).
 """
 
@@ -2005,6 +2735,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--password", default="srw-k3d-dev-test")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--turn-timeout", type=int, default=420)
+    parser.add_argument(
+        "--job-lane",
+        choices=("pinned", "stateless"),
+        default="pinned",
+        help="the job phase's execution lane (both go through the dispatcher)",
+    )
     parser.add_argument("--keep", action="store_true", help="skip cleanup")
     return parser
 
