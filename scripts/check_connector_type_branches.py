@@ -16,9 +16,9 @@ the gate without an edit here.
 
 * a comparison of a *type expression* with a type id or a literal collection
   holding one. A type expression is ``x["type"]``, ``x.get("type")``,
-  ``x.type``, ``x.type_id``, ``x["driver"]`` or a name such as ``ds_type``
-  or ``datasource_type``, also through ``str()``, ``.lower()``, ``.strip()``
-  and ``x or ""``;
+  ``x.type``, ``x.type_id``, ``x.kind``, ``x["driver"]`` or a name such as
+  ``ds_type``, ``datasource_type`` or ``kind``, also through ``str()``,
+  ``.lower()``, ``.strip()`` and ``x or ""``;
 * a ``match`` on a type expression with a type-id case;
 * a set, list or tuple literal naming two or more type ids;
 * a dict literal with three or more type-id keys;
@@ -38,19 +38,27 @@ cannot see them; D2 replaces the cockpit's copies with the server's answer.
 **Classifications**:
 
 * ``legacy-pending``: still to convert to a spec flag or a capability. Must
-  reach zero by the end of slice D1;
+  reach zero by the end of slice D1, and can only go down: a site may carry
+  it only if its key is in the frozen baseline
+  (``policy/connector_type_branches_baseline.txt``), which ``--write``
+  shrinks as sites go and never grows;
 * ``not-a-connector-type``: the literal names something else (a cloud mount's
   ``source.type``, an MCP token kind, a tool category);
 * ``sql``: a type test in SQL text, listed for D3's platform-owned marker;
 * ``kb-domain``: OKF knowledge-base indexing, which stays outside the driver;
-* ``platform-owned``: a connector SRW provisions itself (seeded defaults, the
-  main-cloud WebDAV connectors), which D3's ``managed_key`` marker identifies;
-* ``driver-internal``: a helper module only drivers call, with their own type.
+* ``platform-owned``: a connector SRW provisions itself (seeded defaults,
+  the personal cloud storage, the native KB row and marker), which D3's
+  ``managed_key`` marker identifies;
+* ``pending-d3-d4``: a branch D1 cannot convert, because the marker it needs
+  arrives with D3 (``managed_key``) or D4 (the ``cloud_folder`` driver);
+* ``driver-internal``: a helper module only drivers call, with their own type
+  (import-linter keeps everything else out of it).
 
 A site is identified by what it is, not where: the enclosing qualname, the
 kind, the type ids and a fingerprint of the node's structure. An ordinal
-only tells identical duplicates in one scope apart. Moving code around keeps
-every reviewed classification; reshaping the branch mints a new site.
+only tells identical duplicates in one scope apart. Reordering code within a
+function keeps every reviewed classification; reshaping the branch, or
+moving it to another function, mints a new site.
 """
 
 from __future__ import annotations
@@ -67,6 +75,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC = REPO_ROOT / "src"
 MANIFEST = REPO_ROOT / "policy" / "connector_type_branches.txt"
+BASELINE = REPO_ROOT / "policy" / "connector_type_branches_baseline.txt"
 
 #: Driver packages: deciding by type inside them is their job.
 ALLOWLIST: tuple[str, ...] = (
@@ -84,18 +93,23 @@ ALLOWED_CLASSIFICATIONS = frozenset(
         "sql",
         "kb-domain",
         "platform-owned",
+        "pending-d3-d4",
         "driver-internal",
     }
 )
 
-#: Names that hold a connector type.
+#: Names that hold a connector type.  ``kind`` is how an identity or a
+#: binding often carries one (``identity.kind == "ssh_key"``); it also names
+#: unrelated vocabularies (an MCP token's kind), which are classified.
 TYPE_NAMES = frozenset(
-    {"ds_type", "datasource_type", "connector_type", "type_id", "driver_name"}
+    {"ds_type", "datasource_type", "connector_type", "type_id", "driver_name", "kind"}
 )
 #: Attributes that hold one (``row.type``, ``driver.type_id``).
-TYPE_ATTRIBUTES = frozenset({"type", "type_id", "ds_type", "datasource_type", "driver"})
+TYPE_ATTRIBUTES = frozenset(
+    {"type", "type_id", "ds_type", "datasource_type", "driver", "kind"}
+)
 #: Mapping keys that hold one (``row["type"]``, ``row.get("type")``).
-TYPE_KEYS = frozenset({"type", "ds_type", "datasource_type", "driver"})
+TYPE_KEYS = frozenset({"type", "ds_type", "datasource_type", "driver", "kind"})
 _UNWRAP_METHODS = frozenset({"lower", "strip", "casefold"})
 _SLOT_CALLS = frozenset({"has_datasource", "get_datasource"})
 _COLLECTION_CALLS = frozenset({"frozenset", "set", "tuple", "list"})
@@ -517,7 +531,10 @@ HEADER = """\
 #   sql                   a type test in SQL text (D3's platform-owned marker)
 #   kb-domain             OKF knowledge-base indexing, outside the driver
 #   platform-owned        a connector SRW provisions itself (D3's managed_key)
+#   pending-d3-d4         needs a marker D3 or D4 brings; not convertible in D1
 #   driver-internal       a helper only drivers call, with their own type
+# `legacy-pending` is allowed only on a key in the frozen baseline,
+# policy/connector_type_branches_baseline.txt, which --write only shrinks.
 # SQL files, the cockpit and prompts are outside this gate.
 #
 # A site is identified by what it is, not where it is: reordering code keeps
@@ -539,10 +556,64 @@ def render_manifest(
     return HEADER + "\n".join(lines) + ("\n" if lines else "")
 
 
+BASELINE_HEADER = """\
+# The frozen `legacy-pending` connector-type sites: maintained by
+# scripts/check_connector_type_branches.py. A site may be `legacy-pending`
+# only while its key is listed here, so the count can only go down: --write
+# drops a key once its site is converted, reshaped or reclassified, and never
+# adds one. Never add a line by hand; convert or classify the new branch.
+#
+# <file>  <qualname>  <kind>  <type ids>  <fingerprint>  #<ordinal>
+
+"""
+
+
+def read_baseline(text: str | None = None) -> set[Key]:
+    """The frozen ``legacy-pending`` keys."""
+    if text is None:
+        if not BASELINE.exists():
+            raise RuntimeError(f"The legacy-pending baseline is missing: {BASELINE}")
+        text = BASELINE.read_text()
+    keys: set[Key] = set()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = re.split(r"\s{2,}", line)
+        if len(parts) != 6 or not parts[5].startswith("#"):
+            raise ValueError(f"malformed connector-type baseline line: {raw_line}")
+        keys.add((*parts[:5], int(parts[5][1:])))
+    return keys
+
+
+def shrink_baseline(
+    baseline: set[Key],
+    sites: list[Site],
+    classifications: dict[Key, tuple[str, str]],
+) -> set[Key]:
+    """The baseline keys still ``legacy-pending``: it never grows."""
+    pending = {
+        site.key
+        for site in sites
+        if classifications.get(site.key, (UNCLASSIFIED, ""))[0] == LEGACY_PENDING
+    }
+    return baseline & pending
+
+
+def render_baseline(keys: set[Key]) -> str:
+    lines = ["  ".join((*key[:5], f"#{key[5]}")) for key in sorted(keys)]
+    return BASELINE_HEADER + "\n".join(lines) + ("\n" if lines else "")
+
+
 def problems(
-    sites: list[Site], classifications: dict[Key, tuple[str, str]]
+    sites: list[Site],
+    classifications: dict[Key, tuple[str, str]],
+    baseline: set[Key] | None = None,
 ) -> list[str]:
-    """Why the inventory fails review, one line per problem."""
+    """Why the inventory fails review, one line per problem.
+
+    With ``baseline``, a ``legacy-pending`` site outside it is a problem too.
+    """
     found: list[str] = []
     for site in sites:
         classification, reason = classifications.get(site.key, (UNCLASSIFIED, ""))
@@ -553,6 +624,12 @@ def problems(
             found.append(f"unknown classification {classification!r}: {where}")
         elif classification != LEGACY_PENDING and not reason:
             found.append(f"{classification} without a reason: {where}")
+        elif (
+            classification == LEGACY_PENDING
+            and baseline is not None
+            and site.key not in baseline
+        ):
+            found.append(f"legacy-pending outside the frozen baseline: {where}")
     return found
 
 
@@ -564,15 +641,23 @@ def main() -> int:
     sites = collect_sites()
     classifications = read_classifications()
     rendered = render_manifest(sites, classifications)
+    baseline = read_baseline()
+    rendered_baseline = render_baseline(
+        shrink_baseline(baseline, sites, classifications)
+    )
     if args.write:
         MANIFEST.write_text(rendered)
+        BASELINE.write_text(rendered_baseline)
         print(f"wrote {len(sites)} connector-type sites")
         return 0
     if args.check:
         if not MANIFEST.exists() or MANIFEST.read_text() != rendered:
             print("ERROR: connector-type manifest is stale", file=sys.stderr)
             return 1
-        failures = problems(sites, classifications)
+        if BASELINE.read_text() != rendered_baseline:
+            print("ERROR: legacy-pending baseline is stale", file=sys.stderr)
+            return 1
+        failures = problems(sites, classifications, baseline)
         for failure in failures:
             print(f"ERROR: {failure}", file=sys.stderr)
         if failures:

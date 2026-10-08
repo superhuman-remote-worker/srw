@@ -10,7 +10,10 @@
 #   sql                   a type test in SQL text (D3's platform-owned marker)
 #   kb-domain             OKF knowledge-base indexing, outside the driver
 #   platform-owned        a connector SRW provisions itself (D3's managed_key)
+#   pending-d3-d4         needs a marker D3 or D4 brings; not convertible in D1
 #   driver-internal       a helper only drivers call, with their own type
+# `legacy-pending` is allowed only on a key in the frozen baseline,
+# policy/connector_type_branches_baseline.txt, which --write only shrinks.
 # SQL files, the cockpit and prompts are outside this gate.
 #
 # A site is identified by what it is, not where it is: reordering code keeps
@@ -74,6 +77,10 @@ src/agent/tools/registry.py  load_tools  registry-slot  postgresql  2bd4cf6c228b
 src/agent/tools/registry.py  load_tools  registry-slot  webdav  5e933d241a1c  #1  legacy-pending
 src/agent/tools/sql/postgresql.py  create_postgresql_tools  registry-slot  postgresql  03e18ffc14fe  #1  legacy-pending
 src/agent/tools/webdav/tools.py  create_webdav_tools  registry-slot  webdav  e72ff2f3619b  #1  legacy-pending
+src/mcp_server/server.py  _get_mcp_caller_ctx  type-keyword  mcp  0665ab3128f9  #1  not-a-connector-type  the MCP server's caller kind (an MCP token principal), not a connector
+src/mcp_server/server.py  _get_mcp_caller_ctx  type-keyword  mcp  0665ab3128f9  #2  not-a-connector-type  the MCP server's caller kind (an MCP token principal), not a connector
+src/mcp_server/server.py  _get_mcp_caller_ctx  type-keyword  mcp  0665ab3128f9  #3  not-a-connector-type  the MCP server's caller kind (an MCP token principal), not a connector
+src/mcp_server/server.py  _get_mcp_caller_ctx  type-keyword  mcp  0665ab3128f9  #4  not-a-connector-type  the MCP server's caller kind (an MCP token principal), not a connector
 src/orchestrator/database/postgres.py  PostgresDB.delete_project  sql-literal  kb  ea9c71ab6b6f  #1  sql  native project KB marker (type kb + config.native_project_id) tested in SQL; D3 moves it to managed_key
 src/orchestrator/database/postgres.py  PostgresDB.get_native_project_kb_datasource_ref  sql-literal  kb  ea9c71ab6b6f  #1  sql  native project KB marker (type kb + config.native_project_id) tested in SQL; D3 moves it to managed_key
 src/orchestrator/database/postgres.py  PostgresDB.link_datasource_to_project  sql-literal  kb  ea9c71ab6b6f  #1  sql  native project KB marker (type kb + config.native_project_id) tested in SQL; D3 moves it to managed_key
@@ -85,9 +92,10 @@ src/orchestrator/init.py  _seed_default_datasources  type-keyword  mongodb  09d1
 src/orchestrator/init.py  _seed_default_datasources  type-keyword  neo4j  0de91ca2e721  #1  platform-owned  seeds a DEFAULT_DS_* platform row of a fixed type; the row goes through its driver's validate first
 src/orchestrator/init.py  _seed_default_datasources  type-keyword  postgresql  3b0630c7d02d  #1  platform-owned  seeds a DEFAULT_DS_* platform row of a fixed type; the row goes through its driver's validate first
 src/orchestrator/init.py  _seed_default_datasources  type-keyword  webdav  7ff7afb11c1a  #1  platform-owned  seeds a DEFAULT_DS_* platform row of a fixed type; the row goes through its driver's validate first
+src/orchestrator/security/auth.py  _resolve_legacy_mcp_token  compare  mcp  9005443c3314  #1  not-a-connector-type  an auth token's kind (a legacy MCP token), not a connector
 src/orchestrator/security/credential_files.py  normalize_credential_files  compare  kubeconfig  2a42d5debf7a  #1  driver-internal  file layout rules of the kubeconfig, generic_file and ssh_key drivers; only those drivers call it, with their own type_id
 src/orchestrator/security/credential_files.py  normalize_credential_files  compare  ssh_key  c53a27ade630  #1  driver-internal  file layout rules of the kubeconfig, generic_file and ssh_key drivers; only those drivers call it, with their own type_id
-src/orchestrator/services/agent_datasource_payload.py  apply_cloud_storage_override  compare  webdav  31c49729257b  #1  platform-owned  job cloud_storage_read_only targets the main-cloud WebDAV connector; D3 managed_key project-cloud and D4 cloud_folder replace it
+src/orchestrator/services/agent_datasource_payload.py  apply_cloud_storage_override  compare  webdav  31c49729257b  #1  pending-d3-d4  tightens every attached WebDAV connector, not only the main-cloud one: the type stands in for the marker D3's managed_key (project-cloud) or D4's cloud_folder driver brings; the override only ever tightens
 src/orchestrator/services/datasource_policy.py  _native_project_id  compare  kb  6e98445ca669  #1  platform-owned  reads the native project KB marker, only meaningful on a kb row; D3's platform_owned(row) replaces it
 src/orchestrator/services/kb_datasources.py  reindex_kb_datasource  compare  kb  6e98445ca669  #1  kb-domain  the OKF KB indexer refuses to index a row that is not a KB repository
 src/orchestrator/services/kb_forge.py  kb_client_for_repo  compare  kb  449b038286e5  #1  kb-domain  a GitHub KB repository's token is read only from a KB connector row
@@ -109,8 +117,10 @@ src/orchestrator/services/manifest_user_retirement.py  retire_user_manifests  sq
 src/orchestrator/services/project_provisioning.py  plan_kb_vault_from_connector  compare  kb  8295e37d7780  #1  kb-domain  only an OKF KB repository can back a project knowledge base
 src/orchestrator/services/project_provisioning.py  provision_external_project_knowledge_repo  type-keyword  kb  1048cce392f8  #1  platform-owned  creates the project's native KB row (D3 managed_key project-kb)
 src/orchestrator/services/project_provisioning.py  provision_project_knowledge_repo  type-keyword  kb  1048cce392f8  #1  platform-owned  creates the project's native KB row (D3 managed_key project-kb)
-src/orchestrator/services/projects.py  update_project  compare  webdav  31c49729257b  #1  platform-owned  project cloud_storage_read_only syncs the project's main-cloud WebDAV link; D3 managed_key project-cloud and D4 cloud_folder replace it
+src/orchestrator/services/projects.py  update_project  compare  webdav  31c49729257b  #1  pending-d3-d4  sets read_only on the project's first WebDAV link, whichever it is: the type stands in for the project's main-cloud connector, which only D3's managed_key (project-cloud) or D4's cloud_folder driver can name
 src/orchestrator/services/user_administration.py  create_user  type-keyword  webdav  95d7c870a563  #1  platform-owned  creates the user's personal cloud-storage WebDAV row (D3 managed_key user-cloud-root); validated by its driver first
+src/orchestrator/services/workspace_ssh_connector.py  WorkspaceSshIdentity.descriptor  compare  ssh_key  da3d482c8925  #1  driver-internal  the ssh_key and SSH-key repository drivers' shared rules (C1); only WorkspaceSshDriver subclasses call it, with their own type_id
+src/orchestrator/services/workspace_ssh_connector.py  WorkspaceSshIdentity.to_payload  compare  ssh_key  da3d482c8925  #1  driver-internal  the ssh_key and SSH-key repository drivers' shared rules (C1); only WorkspaceSshDriver subclasses call it, with their own type_id
 src/orchestrator/services/workspace_ssh_connector.py  apply_ssh_test_overrides  compare  repository  4b0c84e39241  #1  driver-internal  the ssh_key and SSH-key repository drivers' shared rules (C1); only WorkspaceSshDriver subclasses call it, with their own type_id
 src/orchestrator/services/workspace_ssh_connector.py  is_workspace_ssh_connector  compare  repository  b9fa1c7f847e  #1  driver-internal  the ssh_key and SSH-key repository drivers' shared rules (C1); only WorkspaceSshDriver subclasses call it, with their own type_id
 src/orchestrator/services/workspace_ssh_connector.py  is_workspace_ssh_connector  compare  ssh_key  c53a27ade630  #1  driver-internal  the ssh_key and SSH-key repository drivers' shared rules (C1); only WorkspaceSshDriver subclasses call it, with their own type_id
@@ -119,3 +129,5 @@ src/orchestrator/services/workspace_ssh_connector.py  validate_workspace_ssh_con
 src/orchestrator/services/workspace_ssh_connector.py  validate_workspace_ssh_connector  compare  ssh_key  c53a27ade630  #1  driver-internal  the ssh_key and SSH-key repository drivers' shared rules (C1); only WorkspaceSshDriver subclasses call it, with their own type_id
 src/orchestrator/services/workspace_ssh_connector.py  workspace_ssh_identity  compare  repository  40f10e30d9e7  #1  driver-internal  the ssh_key and SSH-key repository drivers' shared rules (C1); only WorkspaceSshDriver subclasses call it, with their own type_id
 src/orchestrator/services/workspace_ssh_connector.py  workspace_ssh_identity  compare  ssh_key  1345831a533a  #1  driver-internal  the ssh_key and SSH-key repository drivers' shared rules (C1); only WorkspaceSshDriver subclasses call it, with their own type_id
+src/shared/orch_surface/jobs/descriptors.py  make_bound_handler.invoke  compare  mcp  78ee40e1c953  #1  not-a-connector-type  the caller's principal kind (an MCP token), not a connector
+src/shared/orch_surface/jobs/inspection.py  read_job_evidence  compare  mcp  799bf38e6297  #1  not-a-connector-type  the caller's principal kind (an MCP token), not a connector

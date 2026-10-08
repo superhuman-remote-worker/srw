@@ -27,15 +27,20 @@ from shared.connectors.builtin import BUILTIN_SPECS, DATASOURCE_SPECS, GENERIC_S
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "check_connector_type_branches.py"
 MANIFEST = REPO_ROOT / "policy" / "connector_type_branches.txt"
+BASELINE = REPO_ROOT / "policy" / "connector_type_branches_baseline.txt"
 
 #: Where ``legacy-pending`` may still sit once the orchestrator and shared half
 #: of slice D1c is done: the agent (its materializers arrive in D1b) and the
 #: KB projection notes D1b rewrites. The agent-side half of D1c empties these;
-#: the gate is then that no ``legacy-pending`` site remains at all.
+#: the gate is then that no ``legacy-pending`` site remains at all. Within
+#: this scope, the frozen baseline decides which sites may stay pending.
 LEGACY_PENDING_SCOPE = (
     "src/agent/",
     "src/orchestrator/services/knowledge_projection.py",
 )
+#: How many sites the baseline froze (2026-10-08). Lower it when --write
+#: shrinks the baseline; never raise it. It stops a hand-added baseline line.
+LEGACY_PENDING_CEILING = 63
 
 
 def _load_script():
@@ -96,8 +101,33 @@ def test_connector_type_inventory_matches_manifest(script, inventory):
 
 def test_every_site_has_a_reviewed_classification(script, inventory):
     sites, classifications = inventory
-    assert script.problems(sites, classifications) == []
+    assert script.problems(sites, classifications, script.read_baseline()) == []
     assert set(classifications) == {site.key for site in sites}
+
+
+def test_the_legacy_pending_baseline_only_goes_down(script, inventory):
+    """The baseline on disk is exactly the pending sites it still covers:
+    --write drops a converted site's key, and a new key never enters."""
+    sites, classifications = inventory
+    baseline = script.read_baseline()
+    shrunk = script.shrink_baseline(baseline, sites, classifications)
+    if script.render_baseline(shrunk) != BASELINE.read_text():
+        gone = sorted(baseline - shrunk)
+        pytest.fail(
+            "The legacy-pending baseline is stale: run `python "
+            "scripts/check_connector_type_branches.py --write` to drop "
+            f"{len(gone)} converted site(s): {gone}"
+        )
+    pending = {
+        site.key
+        for site in sites
+        if classifications[site.key][0] == script.LEGACY_PENDING
+    }
+    assert pending == baseline
+    assert len(baseline) <= LEGACY_PENDING_CEILING, (
+        "The legacy-pending baseline grew; convert or classify the new "
+        "branch instead of adding it to the baseline"
+    )
 
 
 def test_legacy_pending_remains_only_on_the_agent_side(script, inventory):
@@ -199,6 +229,11 @@ def build(ds):
         ),
         ('ok = (ds["type"] or "").strip() == "kb"', "compare", "kb"),
         ('ok = connector["driver"] == "srw.env/v1"', "compare", "srw.env/v1"),
+        # A kind often carries a type (an identity's); it also names other
+        # vocabularies, which the manifest classifies.
+        ('ok = identity.kind == "ssh_key"', "compare", "ssh_key"),
+        ('ok = kind == "repository"', "compare", "repository"),
+        ('ok = row["kind"] != "mcp"', "compare", "mcp"),
         (
             'KINDS = frozenset({"kubeconfig", "ssh_key"})',
             "collection",
@@ -247,8 +282,7 @@ def route(ds):
 @pytest.mark.parametrize(
     "statement",
     (
-        # An MCP token kind and a tool category coincide with type ids.
-        'ok = row["kind"] != "mcp"',
+        # A tool category coincides with a type id.
         'ok = category == "email"',
         # One type id is no collection of types; two keys are no type map.
         'ONE = ("email",)',
@@ -383,6 +417,48 @@ def test_malformed_and_duplicate_manifest_lines_are_refused(script):
     line = "src/x.py  f  compare  kb  abc123abc123  #1  legacy-pending\n"
     with pytest.raises(ValueError, match="duplicate"):
         script.read_classifications(line + line)
+
+
+def test_a_new_legacy_pending_site_outside_the_baseline_fails(script):
+    """Hand-classifying a new branch legacy-pending does not get it past."""
+    sites = _scan(script, _TWO_BRANCHES)
+    pending = {site.key: ("legacy-pending", "") for site in sites}
+    frozen = {sites[0].key}
+    assert script.problems(sites, pending, frozen) == [
+        f"legacy-pending outside the frozen baseline: synthetic.py deliver "
+        f"(compare {sites[1].ids})"
+    ]
+    assert script.problems(sites, pending, {site.key for site in sites}) == []
+
+
+def test_write_shrinks_the_baseline_and_never_grows_it(script):
+    sites = _scan(script, _TWO_BRANCHES)
+    pending = {site.key: ("legacy-pending", "") for site in sites}
+    stale = ("src/gone.py", "f", "compare", "kb", "000000000000", 1)
+    # A converted site's key leaves; a new pending site's key never enters.
+    assert script.shrink_baseline({sites[0].key, stale}, sites, pending) == {
+        sites[0].key
+    }
+    assert script.shrink_baseline(set(), sites, pending) == set()
+    # Reclassifying a site out of legacy-pending drops it for good.
+    reclassified = {**pending, sites[0].key: ("kb-domain", "reviewed")}
+    assert script.shrink_baseline(
+        {sites[0].key, sites[1].key}, sites, reclassified
+    ) == {sites[1].key}
+
+
+def test_the_baseline_round_trips(script):
+    sites = _scan(script, _TWO_BRANCHES)
+    keys = {site.key for site in sites}
+    assert script.read_baseline(script.render_baseline(keys)) == keys
+    with pytest.raises(ValueError, match="malformed"):
+        script.read_baseline("src/x.py  f  compare  kb\n")
+
+
+def test_a_missing_baseline_is_an_error(script, monkeypatch, tmp_path):
+    monkeypatch.setattr(script, "BASELINE", tmp_path / "absent.txt")
+    with pytest.raises(RuntimeError, match="baseline is missing"):
+        script.read_baseline()
 
 
 def test_review_problems_are_reported(script):
