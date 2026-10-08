@@ -1016,6 +1016,9 @@ MCP_TEST_SPEC = DriverSpec(
     config_schema={
         "type": "object",
         "additionalProperties": False,
+        # The server reports the message (whoami): what a gate set reaches
+        # the server only through its configuration, never a secret.
+        "required": ["message"],
         "properties": {
             "message": {"type": "string", "maxLength": 256},
             "access": _ACCESS_CHOICE,
@@ -1056,6 +1059,7 @@ MCP_TEST_SPEC = DriverSpec(
             },
             "access": _MANAGED_MCP_TOOL_ACCESS,
             "credential": {"header": "Authorization", "scheme": "Bearer"},
+            "env": {"MCP_TEST_MESSAGE": "${config.message}"},
             "args": ["-listen", "127.0.0.1:8091"],
             "max_in_flight_per_binding": 4,
             "tool_pinning": "warn",

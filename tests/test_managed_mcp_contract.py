@@ -201,6 +201,18 @@ def test_gitea_classes_only_its_read_tools_as_read():
     assert mcp.server_args({}) == ["-b", "127.0.0.1", "-p", "8091"]
 
 
+def test_the_test_server_is_told_its_connectors_message():
+    """The k3d gate proves injection by the message whoami reports: it
+    reaches the server through the connector's configuration only."""
+    mcp = managed_mcp(MCP_TEST_SPEC)
+    assert mcp.server_env({"message": "d5a-0123456789"}) == {
+        "MCP_TEST_MESSAGE": "d5a-0123456789"
+    }
+    assert MCP_TEST_SPEC.config_schema["required"] == ["message"]
+    source = (ROOT / "drivers/mcp-test/main.go").read_text()
+    assert 'os.Getenv("MCP_TEST_MESSAGE")' in source
+
+
 def test_a_managed_server_is_called_by_the_agent_alone_and_delivers_by_lease():
     workspace = dataclasses.replace(
         MCP_TEST_SPEC,

@@ -182,7 +182,7 @@ def _managed_pod(**over) -> dict:
         image=f"srw-registry:5000/srw-driver-mcp-test@{DIGEST}",
         entrypoint=["/srw-mcp-test"],
         cmd=[],
-        config={},
+        config={"message": "d5a-0123456789"},
         credentials={"token": "t"},
         identity_token="sdi_" + "A" * 49,
         pins=EgressPins(hosts=(), resolved_at=datetime.now(timezone.utc)),

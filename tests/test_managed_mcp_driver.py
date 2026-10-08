@@ -461,14 +461,15 @@ def test_the_test_server_runs_its_own_program_with_its_arguments():
         image=f"srw-registry:5000/srw-driver-mcp-test@{DIGEST}",
         entrypoint=["/srw-mcp-test"],
         cmd=[],
-        config={},
+        config={"message": "d5a-0123456789"},
         # It declares no egress: its pod reaches the exchange and nothing else.
         pins=EgressPins(hosts=(), resolved_at=PINS.resolved_at),
     )
     server = plan.pod["spec"]["containers"][0]
     assert server["command"] == ["/srw-mcp-test"]
     assert server["args"] == ["-listen", "127.0.0.1:8091"]
-    assert server["env"] == []
+    # The connector's message, which whoami reports: configuration only.
+    assert server["env"] == [{"name": "MCP_TEST_MESSAGE", "value": "d5a-0123456789"}]
     assert plan.network_policy["spec"]["egress"] == [
         {
             "to": [
