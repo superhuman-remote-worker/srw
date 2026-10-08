@@ -8,11 +8,16 @@ an ssh_key's private key is loaded into a workspace ssh-agent instead. This modu
 is the single source of truth for:
 
 - per-file size cap (64 KB) and per-datasource count cap (5)
-- ``target_path`` resolution (``~`` expansion against ``/home/srw``) and safety
-  (writable mounts, blocklist of system roots and agent-managed files)
-- file ``mode`` well-formedness (4-digit octal)
-- ``env_var`` well-formedness (POSIX identifier)
-- type-specific defaults (e.g. ssh_key private at ``~/.ssh/<slug>`` with 0600)
+- ``target_path`` resolution (``~`` expansion against ``/home/srw``) and safety:
+  a file the workspace receives must target the credential-file allowlist
+  (``shared.connectors.file_targets``: ``~/.kube/``, ``~/.aws/``,
+  ``~/.config/<app>/``...); an ssh_key's paths keep the older root rules
+- file ``mode`` well-formedness (4-digit octal), never an execute bit for a
+  file the workspace receives
+- ``env_var`` well-formedness (POSIX identifier), and for a file the
+  workspace receives no reserved name and not ``KUBECONFIG``
+- type-specific defaults (e.g. ssh_key private at ``~/.ssh/<slug>`` with 0600,
+  a generic file without a target in ``~/.srw-files/<slug>/``)
 
 Used by ``src/orchestrator/main.py`` at the create/update endpoints so the agent only
 ever sees a fully-normalized payload.
@@ -24,13 +29,25 @@ import os
 import re
 from typing import Any
 
-from shared.connectors.builtin import legacy_types_with_slot
+from shared.connectors.builtin import (
+    legacy_types_with_form,
+    legacy_types_with_slot,
+)
+from shared.connectors.file_targets import (
+    DEFAULT_DIRECTORY,
+    allowed_targets_text,
+    mode_problem,
+    target_problem,
+)
+from shared.credential_connectors import normalize_credential_env
 
 #: Stored types whose credentials are a ``files[]`` list, normalized here
 #: (from the driver specs). An ssh_key's first file is its private key: it is
 #: validated here like any file but loaded into a workspace ssh-agent, never
 #: written out.
 CREDENTIAL_FILE_TYPES: frozenset[str] = legacy_types_with_slot("files")
+#: Of those, the types whose files are written into the workspace home.
+WORKSPACE_FILE_TYPES: frozenset[str] = legacy_types_with_form("credential_file")
 
 MAX_FILES_PER_DATASOURCE = 5
 MAX_FILE_BYTES = 64 * 1024  # 64 KB UTF-8
@@ -58,6 +75,7 @@ BLOCKED_FILES: frozenset[str] = frozenset(
 _MODE_RE = re.compile(r"^0[0-7]{3}$")
 _ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+_FILE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 class CredentialFileValidationError(ValueError):
@@ -89,13 +107,24 @@ def _resolve_target_path(path: str) -> str:
     return os.path.normpath(expanded)
 
 
-def _validate_target_path(path: str) -> str:
-    """Return the resolved absolute path; raise if it points anywhere unsafe."""
+def _validate_target_path(path: str, *, written: bool = False) -> str:
+    """Return the resolved absolute path; raise if it points anywhere unsafe.
+
+    ``written``: the file lands in the workspace home, so the target must be
+    on the credential-file allowlist.
+    """
     if not isinstance(path, str) or not path:
         raise CredentialFileValidationError(
             "target_path is required and must be a string"
         )
     resolved = _resolve_target_path(path)
+    if written:
+        _relative, problem = target_problem(resolved)
+        if problem is not None:
+            raise CredentialFileValidationError(
+                f"target_path {path!r} is {problem}: credential files go under "
+                f"{allowed_targets_text()}"
+            )
 
     for blocked in BLOCKED_ROOTS:
         if resolved == blocked or resolved.startswith(blocked + "/"):
@@ -116,23 +145,37 @@ def _validate_target_path(path: str) -> str:
     return resolved
 
 
-def _validate_mode(mode: Any) -> str:
+def _validate_mode(mode: Any, *, written: bool = False) -> str:
     if mode is None or mode == "":
         return "0600"
     if not isinstance(mode, str) or not _MODE_RE.match(mode):
         raise CredentialFileValidationError(
             f"mode must be a 4-digit octal string like '0600', got {mode!r}"
         )
+    problem = mode_problem(int(mode, 8)) if written else None
+    if problem is not None:
+        raise CredentialFileValidationError(
+            f"mode {mode} is refused: {problem} (use 0600 or 0644)"
+        )
     return mode
 
 
-def _validate_env_var(env_var: Any) -> str | None:
+def _validate_env_var(env_var: Any, *, written: bool = False) -> str | None:
     if env_var is None or env_var == "":
         return None
     if not isinstance(env_var, str) or not _ENV_RE.match(env_var):
         raise CredentialFileValidationError(
             f"env_var must be a POSIX identifier ([A-Za-z_][A-Za-z0-9_]*), got {env_var!r}"
         )
+    if written:
+        if env_var == "KUBECONFIG":
+            raise CredentialFileValidationError(
+                "env_var KUBECONFIG is reserved: it names the merged kubeconfig"
+            )
+        try:
+            normalize_credential_env({env_var: ""})
+        except ValueError as exc:
+            raise CredentialFileValidationError(f"env_var: {exc}") from exc
     return env_var
 
 
@@ -156,6 +199,7 @@ def _normalize_one_file(
     default_target_path: str | None,
     default_mode: str,
     default_env_var: str | None = None,
+    written: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(entry, dict):
         raise CredentialFileValidationError(
@@ -167,12 +211,14 @@ def _normalize_one_file(
     target_path = entry.get("target_path") or default_target_path
     if not target_path:
         raise CredentialFileValidationError(f"{label}: target_path is required")
-    resolved = _validate_target_path(target_path)
+    resolved = _validate_target_path(target_path, written=written)
     mode_raw = entry.get("mode")
-    mode = _validate_mode(mode_raw if mode_raw not in (None, "") else default_mode)
+    mode = _validate_mode(
+        mode_raw if mode_raw not in (None, "") else default_mode, written=written
+    )
     env_raw = entry.get("env_var")
     env_var = _validate_env_var(
-        env_raw if env_raw not in (None, "") else default_env_var
+        env_raw if env_raw not in (None, "") else default_env_var, written=written
     )
 
     out: dict[str, Any] = {
@@ -184,6 +230,15 @@ def _normalize_one_file(
     if env_var:
         out["env_var"] = env_var
     return out
+
+
+def _default_generic_target(slug: str, entry: Any, idx: int) -> str:
+    """``~/.srw-files/<slug>/<file name>``: a neutral home for a file
+    the user gave no target."""
+    raw = entry.get("name") if isinstance(entry, dict) else None
+    base = os.path.basename(str(raw or ""))
+    name = _FILE_NAME_RE.sub("-", base).strip("-.") or f"file-{idx}"
+    return f"~/{DEFAULT_DIRECTORY}/{slug}/{name}"
 
 
 def normalize_credential_files(
@@ -200,8 +255,12 @@ def normalize_credential_files(
       ``target_path=~/.kube/configs/<slug>.yaml`` and ``mode=0600`` if absent.
     - For ``ssh_key``: expects 1 or 2 files (private, optional public);
       fills in ``~/.ssh/<slug>`` (0600) and ``~/.ssh/<slug>.pub`` (0644).
-    - For ``generic_file``: every entry must carry its own ``target_path``;
-      ``mode`` defaults to ``0600``.
+    - For ``generic_file``: an entry without a ``target_path`` goes to
+      ``~/.srw-files/<slug>/<file name>``; ``mode`` defaults to ``0600``.
+
+    A kubeconfig's or generic file's target must be on the credential-file
+    allowlist, its mode must not grant execute, and its ``env_var`` must be
+    neither reserved nor ``KUBECONFIG``.
 
     For all other types the credentials dict is returned untouched.
 
@@ -224,6 +283,7 @@ def normalize_credential_files(
         )
 
     slug = slugify_datasource_name(ds_name)
+    written = ds_type in WORKSPACE_FILE_TYPES
 
     if ds_type == "kubeconfig":
         if len(files) != 1:
@@ -238,6 +298,7 @@ def normalize_credential_files(
                 default_target_path=f"~/.kube/configs/{slug}.yaml",
                 default_mode="0600",
                 default_env_var=None,
+                written=written,
             )
         ]
     elif ds_type == "ssh_key":
@@ -270,8 +331,9 @@ def normalize_credential_files(
                 entry,
                 idx=idx,
                 default_name=f"file-{idx}",
-                default_target_path=None,
+                default_target_path=_default_generic_target(slug, entry, idx),
                 default_mode="0600",
+                written=written,
             )
             for idx, entry in enumerate(files)
         ]

@@ -5,10 +5,12 @@ invoked from ``orchestrator/main.py`` at the create_datasource /
 update_datasource endpoints. It enforces:
 
 - per-file size cap (64 KB) and per-datasource count cap (5)
-- target_path safety (must resolve under writable mounts, not under system
-  roots, not the agent-managed files like ``~/workspace.md``)
-- file ``mode`` well-formedness (4-digit octal)
-- ``env_var`` well-formedness (POSIX identifier)
+- target_path safety: a kubeconfig's or generic file's target is on the
+  credential-file allowlist (``shared.connectors.file_targets``); an ssh_key's
+  must resolve under writable mounts, not under system roots
+- file ``mode`` well-formedness (4-digit octal), never an execute bit for a
+  file the workspace receives
+- ``env_var`` well-formedness (POSIX identifier), not reserved, not KUBECONFIG
 - type-specific defaults for ``kubeconfig`` and ``ssh_key``
 
 The validator's output is what eventually gets encrypted into the
@@ -172,13 +174,21 @@ class TestSshKey:
 
 
 class TestGenericFile:
-    def test_requires_target_path_from_user(self):
-        with pytest.raises(CredentialFileValidationError, match="target_path"):
-            normalize_credential_files(
-                "generic_file",
-                "x",
-                {"files": [{"contents": "data"}]},
-            )
+    def test_a_file_without_a_target_goes_to_the_neutral_directory(self):
+        out = normalize_credential_files(
+            "generic_file",
+            "Vendor Keys",
+            {
+                "files": [
+                    {"contents": "data"},
+                    {"contents": "more", "name": "../api token.json"},
+                ]
+            },
+        )
+        assert [f["target_path"] for f in out["files"]] == [
+            f"{AGENT_HOME}/.srw-files/vendor-keys/file-0",
+            f"{AGENT_HOME}/.srw-files/vendor-keys/api-token.json",
+        ]
 
     def test_minimal_user_payload(self):
         out = normalize_credential_files(
@@ -207,7 +217,7 @@ class TestGenericFile:
                 "files": [
                     {
                         "contents": "abc",
-                        "target_path": "/tmp/foo",
+                        "target_path": "~/.srw-files/foo",
                         "env_var": "MY_TOKEN_FILE",
                     }
                 ]
@@ -224,7 +234,7 @@ class TestGenericFile:
 class TestCaps:
     def test_too_many_files(self):
         files = [
-            {"contents": "x", "target_path": f"/tmp/{i}"}
+            {"contents": "x", "target_path": f"~/.srw-files/{i}"}
             for i in range(MAX_FILES_PER_DATASOURCE + 1)
         ]
         with pytest.raises(CredentialFileValidationError, match="At most"):
@@ -232,7 +242,7 @@ class TestCaps:
 
     def test_max_files_accepted(self):
         files = [
-            {"contents": "x", "target_path": f"/tmp/{i}"}
+            {"contents": "x", "target_path": f"~/.srw-files/{i}"}
             for i in range(MAX_FILES_PER_DATASOURCE)
         ]
         out = normalize_credential_files("generic_file", "x", {"files": files})
@@ -244,7 +254,7 @@ class TestCaps:
             normalize_credential_files(
                 "generic_file",
                 "x",
-                {"files": [{"contents": too_big, "target_path": "/tmp/big"}]},
+                {"files": [{"contents": too_big, "target_path": "~/.srw-files/big"}]},
             )
 
     def test_contents_must_be_string(self):
@@ -252,7 +262,7 @@ class TestCaps:
             normalize_credential_files(
                 "generic_file",
                 "x",
-                {"files": [{"contents": 123, "target_path": "/tmp/x"}]},
+                {"files": [{"contents": 123, "target_path": "~/.srw-files/x"}]},
             )
 
 
@@ -292,32 +302,63 @@ def test_blocked_paths(bad_path):
 
 
 @pytest.mark.parametrize(
-    "managed_path",
+    "refused_path",
     [
+        # Accepted before D1d's review, never delivered: not in the home.
+        "/tmp/something",
+        "/run/secret.txt",
+        "/workspace/.secrets/key",
+        # The shell, sshd and SRW's managed repositories run these.
+        "~/.ssh/config",
+        "~/.ssh/id_ed25519",
+        "~/.ssh/rc",
         "~/.bashrc",
         "~/.bash_profile",
         "~/.profile",
+        "~/.bash_aliases",
         "~/workspace.md",
+        # First on PATH, Python's user site, git's config.
+        "~/.local/bin/git",
+        "~/bin/git",
+        "~/.local/lib/python3.12/site-packages/x.pth",
+        "~/.config/git/config",
+        "~/.config/fish/config.fish",
+        "~/.config/systemd/user/x.service",
+        "~/.config/autostart/x.desktop",
+        "~/.config/mimeapps.list",
+        # Cloud sync uploads the workspace.
+        "~/workspace/creds.txt",
+        # The subtrees CLIs load code from.
+        "~/.docker/cli-plugins/docker-x",
+        "~/.azure/cliextensions/x/__init__.py",
+        # SRW's own store.
+        "~/.srw-credentials/x.sh",
     ],
 )
-def test_blocked_managed_files(managed_path):
-    with pytest.raises(CredentialFileValidationError, match="reserved"):
-        normalize_credential_files(
-            "generic_file",
-            "x",
-            {"files": [{"contents": "x", "target_path": managed_path}]},
-        )
+def test_targets_off_the_allowlist_are_refused(refused_path):
+    for ds_type in ("generic_file", "kubeconfig"):
+        with pytest.raises(CredentialFileValidationError) as caught:
+            normalize_credential_files(
+                ds_type,
+                "x",
+                {"files": [{"contents": "x", "target_path": refused_path}]},
+            )
+        assert "credential files go under ~/.kube/" in str(caught.value)
 
 
 @pytest.mark.parametrize(
     "good_path",
     [
         "~/.kube/configs/foo.yaml",
-        "~/.ssh/id_ed25519",
+        "~/.kube/config",
+        "~/.aws/credentials",
+        "~/.azure/msal_token_cache.json",
+        "~/.docker/config.json",
         "~/.config/gcloud/creds.json",
-        "/tmp/something",
-        "/run/secret.txt",
-        "/workspace/.secrets/key",
+        "~/.config/gh/hosts.yml",
+        "~/.netrc",
+        "~/.pgpass",
+        "~/.srw-files/vendor/key.pem",
     ],
 )
 def test_allowed_paths(good_path):
@@ -326,10 +367,17 @@ def test_allowed_paths(good_path):
         "x",
         {"files": [{"contents": "x", "target_path": good_path}]},
     )
-    # No exception means the path resolved to a writable root.
-    assert out["files"][0]["target_path"].startswith(
-        ("/home/srw", "/tmp", "/run", "/workspace")
+    assert out["files"][0]["target_path"] == AGENT_HOME + good_path[1:]
+
+
+def test_an_ssh_key_keeps_its_ssh_paths():
+    """An ssh_key's files are never written: the allowlist is not theirs."""
+    out = normalize_credential_files(
+        "ssh_key",
+        "Deploy",
+        {"files": [{"contents": "k", "target_path": "~/.ssh/id_deploy"}]},
     )
+    assert out["files"][0]["target_path"] == f"{AGENT_HOME}/.ssh/id_deploy"
 
 
 def test_etcd_not_treated_as_etc():
@@ -352,27 +400,38 @@ def test_etcd_not_treated_as_etc():
 # =============================================================================
 
 
-@pytest.mark.parametrize("good_mode", ["0600", "0644", "0400", "0755"])
+@pytest.mark.parametrize("good_mode", ["0600", "0644", "0400", "0640"])
 def test_mode_accepted(good_mode):
     out = normalize_credential_files(
         "generic_file",
         "x",
-        {"files": [{"contents": "x", "target_path": "/tmp/x", "mode": good_mode}]},
+        {
+            "files": [
+                {"contents": "x", "target_path": "~/.srw-files/x", "mode": good_mode}
+            ]
+        },
     )
     assert out["files"][0]["mode"] == good_mode
 
 
-@pytest.mark.parametrize("bad_mode", ["600", "8888", "rwxrwxrwx", "0999", 0o600])
+@pytest.mark.parametrize(
+    "bad_mode",
+    ["600", "8888", "rwxrwxrwx", "0999", 0o600, "0755", "0700", "0711", "0601"],
+)
 def test_mode_rejected(bad_mode):
     with pytest.raises(CredentialFileValidationError, match="mode"):
         normalize_credential_files(
             "generic_file",
             "x",
-            {"files": [{"contents": "x", "target_path": "/tmp/x", "mode": bad_mode}]},
+            {
+                "files": [
+                    {"contents": "x", "target_path": "~/.srw-files/x", "mode": bad_mode}
+                ]
+            },
         )
 
 
-@pytest.mark.parametrize("good_env", ["KUBECONFIG", "MY_VAR", "_X", "AWS_PROFILE_2"])
+@pytest.mark.parametrize("good_env", ["MY_VAR", "_X", "AWS_PROFILE_2"])
 def test_env_var_accepted(good_env):
     out = normalize_credential_files(
         "generic_file",
@@ -381,7 +440,7 @@ def test_env_var_accepted(good_env):
             "files": [
                 {
                     "contents": "x",
-                    "target_path": "/tmp/x",
+                    "target_path": "~/.srw-files/x",
                     "env_var": good_env,
                 }
             ]
@@ -392,7 +451,18 @@ def test_env_var_accepted(good_env):
 
 @pytest.mark.parametrize(
     "bad_env",
-    ["2_LEADING_DIGIT", "has space", "has-dash", "has.dot"],
+    [
+        "2_LEADING_DIGIT",
+        "has space",
+        "has-dash",
+        "has.dot",
+        # The kubeconfig merge owns it; the workspace reserves the rest.
+        "KUBECONFIG",
+        "PATH",
+        "LD_PRELOAD",
+        "SRW_TOKEN",
+        "PYTHONPATH",
+    ],
 )
 def test_env_var_rejected(bad_env):
     with pytest.raises(CredentialFileValidationError, match="env_var"):
@@ -403,7 +473,7 @@ def test_env_var_rejected(bad_env):
                 "files": [
                     {
                         "contents": "x",
-                        "target_path": "/tmp/x",
+                        "target_path": "~/.srw-files/x",
                         "env_var": bad_env,
                     }
                 ]
@@ -416,7 +486,7 @@ def test_empty_env_var_dropped():
     out = normalize_credential_files(
         "generic_file",
         "x",
-        {"files": [{"contents": "x", "target_path": "/tmp/x", "env_var": ""}]},
+        {"files": [{"contents": "x", "target_path": "~/.srw-files/x", "env_var": ""}]},
     )
     assert "env_var" not in out["files"][0]
 

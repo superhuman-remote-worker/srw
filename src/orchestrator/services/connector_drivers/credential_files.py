@@ -2,9 +2,10 @@
 
 The connector stores ``credentials.files[]``; validation applies the type's
 defaults and path rules (``orchestrator.security.credential_files``) on every
-write.  The agent writes the files to its own pod for worker jobs only, so
-there is no workspace to probe from here.  ``ssh_key`` shares the file rules
-but stays on the legacy path until the ssh-agent rework (slice C1) lands.
+write.  The agent writes the files into the workspace home of each job or
+session it is attached to, so there is no connection to probe from here.
+Test reports what a connector saved before the credential-file allowlist
+would no longer deliver (``shared.connectors.file_targets``).
 """
 
 from __future__ import annotations
@@ -26,7 +27,43 @@ from orchestrator.services.connector_drivers.base import (
     ValidationContext,
 )
 from shared.connectors.builtin import GENERIC_FILE_SPEC, KUBECONFIG_SPEC
-from shared.connectors.envelope import unsupported_check
+from shared.connectors.envelope import (
+    DriverError,
+    DriverOutcome,
+    api_check_result,
+    unsupported_check,
+)
+from shared.connectors.file_targets import (
+    allowed_targets_text,
+    mode_problem,
+    target_problem,
+)
+
+
+def undeliverable_files(credentials: Mapping[str, Any] | None) -> list[str]:
+    """Why each stored file would not be delivered as saved (empty: none).
+
+    A row saved before the allowlist keeps its target; the agent skips it
+    and an execute bit is dropped. Paths and modes only, never contents.
+    """
+    files = (
+        (credentials or {}).get("files") if isinstance(credentials, Mapping) else None
+    )
+    problems: list[str] = []
+    for item in files if isinstance(files, list) else []:
+        if not isinstance(item, Mapping):
+            continue
+        path = str(item.get("target_path") or "")
+        _relative, refused = target_problem(path)
+        if refused is not None:
+            problems.append(f"{path or '(no target)'} is {refused}")
+        try:
+            mode = int(str(item.get("mode") or "0600"), 8)
+        except ValueError:
+            continue
+        if mode_problem(mode) is not None:
+            problems.append(f"{path} has mode {mode:04o}: {mode_problem(mode)}")
+    return problems
 
 
 class CredentialFileDriver(DatasourceDriver):
@@ -64,8 +101,21 @@ class CredentialFileDriver(DatasourceDriver):
     async def check(
         self, row: Mapping[str, Any], credentials: dict[str, Any], *, ctx: CheckContext
     ) -> dict[str, Any]:
-        # Nothing to connect to: the file is the credential, and its path and
-        # size were checked when it was saved.
+        # Nothing to connect to: the file is the credential. A row saved
+        # before the allowlist says what the workspace will not receive.
+        problems = undeliverable_files(credentials)
+        if problems:
+            return api_check_result(
+                DriverOutcome(
+                    error=DriverError(
+                        "config",
+                        "Not delivered as saved: "
+                        + "; ".join(problems)
+                        + f". Credential files go under {allowed_targets_text()}; "
+                        "save the connector with a new target.",
+                    )
+                )
+            )
         return unsupported_check(
             f"{self.spec.title} connectors have no connection test; the "
             "file's path and size are checked when it is saved"
