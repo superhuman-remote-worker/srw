@@ -1342,6 +1342,20 @@ class VMResourceReservationStore:
                 '\'{"status":"deleted","compute_released":true,"disk_kept":true}\'::jsonb) WHERE id=$1',
                 job["id"],
             )
+        elif intent["intent"]["purge_disk"] is True:
+            # A lost DELETE reply can leave the projection retiring even after
+            # the exact disk is gone. Project only this proven, released tuple;
+            # the native stop/zero checks above remain the settlement authority.
+            updated = await conn.execute(
+                "UPDATE jobs SET context=jsonb_set(context,'{vm}',(context->'vm')||"
+                "'{\"status\":\"deleted\",\"compute_released\":true,\"disk_kept\":false}'::jsonb) "
+                "WHERE id=$1 AND context->'vm'->>'provision_generation'=$2 "
+                "AND context->'vm'->>'vm_uid'=$3 AND context->'vm'->>'rootdisk_pvc_uid'=$4",
+                job["id"], str(retry["provision_generation"]),
+                str(charge["vm_uid"]), str(retry["observed_pvc_uid"]),
+            )
+            if updated != "UPDATE 1":
+                raise ResourceAdmissionError("resource_cleanup_owner_changed")
         return True
 
     async def _lock_policy(self, conn, *, allow_drain=False, allow_off=False):

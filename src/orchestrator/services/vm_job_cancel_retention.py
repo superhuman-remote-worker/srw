@@ -168,6 +168,96 @@ async def retention_settlement_is_current_on_conn(
     )
 
 
+async def _ready_purge_replay_on_conn(
+    conn, store, *, owner, identity, generation, vm_uid, pvc
+):
+    """Classify an already-admitted Ready purge; grant no new cleanup authority."""
+    _, _, request_id, digest, _ = vm_cleanup_request_identity(
+        owner_kind="job",
+        owner_id=owner,
+        identity=identity,
+        source="job_terminal_vm_release",
+        purge_disk=True,
+    )
+    parent = await conn.fetchrow(
+        "SELECT * FROM vm_workspace_cleanup_admissions WHERE owner_kind='job' "
+        "AND owner_id=$1 AND request_id=$2 AND pvc_uid=$3 "
+        "AND source='job_terminal_vm_release' AND intent_digest=$4 "
+        "AND parent_admission_id IS NULL AND completed_at IS NULL AND outcome IS NULL "
+        "FOR UPDATE",
+        owner,
+        request_id,
+        pvc,
+        digest,
+    )
+    if parent is None:
+        return False
+    from orchestrator.services.vm_creation_retry_store import (
+        VMCreationRetryConflict,
+        VMCreationRetryStore,
+    )
+
+    try:
+        job = await VMCreationRetryStore(store.db)._scope(
+            conn, owner, pvc, own_admission=parent["id"], hold_queue=False
+        )
+    except VMCreationRetryConflict:
+        return False
+    # Re-read after all owner/PVC/parent/queue/Job lock waits. Projection alone
+    # cannot establish Ready history, and a later Ready observation is drift.
+    context = _json(job["context"])
+    vm = context.get("vm") if isinstance(context, dict) else None
+    if (
+        job["status"] != "cancelled"
+        or job["execution_lane"] != "stateless"
+        or job["parent_job_id"] is not None
+        or job["assigned_agent_id"] is not None
+        or not isinstance(vm, dict)
+        or vm.get("status") not in {"retiring_process_zero", "deleting", "deleted"}
+        or vm.get("workspace_storage") is not None
+        or context.get("_vm_job_retained_resume") is not None
+        or context.get("_vm_creation_pending") is not None
+        or context.get("_stateless_cancel_cleanup_pending") is not True
+        or vm.get("identity_authenticated") is not True
+        or vm.get("identity_provision_generation") != str(generation)
+        or vm.get("provision_generation") != str(generation)
+        or vm.get("vm_uid") != str(vm_uid)
+        or vm.get("rootdisk_pvc_uid") != str(pvc)
+    ):
+        return False
+    retry = await conn.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE owner_kind='job' AND job_id=$1 "
+        "AND request_id::text=$2 FOR SHARE",
+        owner,
+        vm.get("creation_request_id"),
+    )
+    if (
+        retry is None
+        or retry["state"] != "succeeded"
+        or retry["reason"] != "creation_adopted"
+        or retry["provision_generation"] != generation
+        or retry["observed_vm_uid"] != vm_uid
+        or retry["observed_pvc_uid"] != pvc
+        or retry["ready_at"] is None
+        or retry["ready_at"] >= parent["admitted_at"]
+    ):
+        return False
+    return bool(
+        await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM run_queue WHERE unit_kind='worker_batch' "
+            "AND unit_id=$1 AND state='done' AND leased_by IS NULL AND leased_until IS NULL) "
+            "AND NOT EXISTS(SELECT 1 FROM vm_creation_retries WHERE owner_kind='job' "
+            "AND job_id=$1 AND (created_at,request_id)>($2,$3)) "
+            "AND NOT EXISTS(SELECT 1 FROM vm_job_cancel_retention_authorities "
+            "WHERE job_id=$1 OR pvc_uid=$4)",
+            owner,
+            retry["created_at"],
+            retry["request_id"],
+            pvc,
+        )
+    )
+
+
 async def acquire_cancel_retention(
     store, *, job_id: str, identity, retention_preflight=None
 ):
@@ -240,6 +330,23 @@ async def acquire_cancel_retention(
             # An exact currently and durably Ready source is outside this policy.
             # Ready history appearing on an already-retiring candidate is drift;
             # missing/uncertain sources remain recognized refusals below.
+            return None
+        if (
+            prior is None
+            and await _installed(conn)
+            and await _ready_purge_replay_on_conn(
+                conn,
+                store,
+                owner=owner,
+                identity=identity,
+                generation=generation,
+                vm_uid=vm_uid,
+                pvc=pvc,
+            )
+        ):
+            # Ordinary cleanup changes the Ready projection while its original
+            # True parent is still open. Resume that parent through the existing
+            # stop, process-zero, signed attestation and charge-release checks.
             return None
         if prior is not None:
             if (
