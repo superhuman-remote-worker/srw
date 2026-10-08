@@ -1,6 +1,6 @@
 import {Injector, runInInjectionContext, signal} from '@angular/core';
 import {TranslocoService} from '@jsverse/transloco';
-import {of} from 'rxjs';
+import {of, throwError} from 'rxjs';
 import {describe, expect, it, vi} from 'vitest';
 
 import {Datasource, DatasourceIndexStatus} from '../../core/models/api.model';
@@ -10,6 +10,14 @@ import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
 import {ActivatedRoute} from '@angular/router';
 import {DatasourceListComponent} from './datasource-list.component';
+import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
+import {
+  ConnectorDriver,
+  ConnectorDriverMatrix,
+  driverForType,
+} from '../../core/models/connector-driver.model';
+// The API's own capability matrix for the built-in drivers.
+import driversFixture from '../../core/models/fixtures/connector-drivers.json';
 
 // The real catalogue, so these specs also prove the keys they name exist.
 import en from '../../../assets/i18n/en.json';
@@ -57,7 +65,14 @@ function kbDatasource(overrides: Partial<Datasource> = {}): Datasource {
   };
 }
 
-function createComponent(policyAvailable = true, contextProjectId: string | null = null) {
+const BUILTIN_DRIVERS = (driversFixture as unknown as ConnectorDriverMatrix).drivers;
+
+/** `drivers: null` is the matrix not (yet) loaded: the pre-matrix rules. */
+function createComponent(
+  policyAvailable = true,
+  contextProjectId: string | null = null,
+  drivers: ConnectorDriver[] | null = null,
+) {
   const ds = kbDatasource();
   const api = {
     getDatasources: vi.fn().mockReturnValue(of([])),
@@ -90,6 +105,14 @@ function createComponent(policyAvailable = true, contextProjectId: string | null
       },
       {provide: ViewportService, useValue: {isMobile: signal(false)}},
       {provide: UserService, useValue: {currentUser}},
+      {
+        provide: ConnectorDriversService,
+        useValue: {
+          drivers: signal(drivers),
+          load: vi.fn(),
+          forType: (type: string) => driverForType(drivers, type),
+        },
+      },
       {
         provide: ActivatedRoute,
         useValue: {
@@ -1231,5 +1254,162 @@ describe('DatasourceListComponent Test connection results', () => {
     component.testDatasource('kube-1');
 
     expect(component.testResults()['kube-1']).toEqual(answer);
+  });
+});
+
+describe('DatasourceListComponent access levels from the capability matrix', () => {
+  function create(type: Datasource['type'], drivers: ConnectorDriver[] | null = BUILTIN_DRIVERS) {
+    const created = createComponent(false, null, drivers);
+    created.component.openCreateForm();
+    created.component.formData.name = 'Org connector';
+    created.component.onTypeSelect(type);
+    created.component.formData.is_global = true;
+    return created;
+  }
+
+  it('offers both levels for a driver that has both, each with what enforces it', () => {
+    const {component} = create('postgresql');
+    expect(component.offersReadOnly()).toBe(true);
+    expect(component.offersReadWrite()).toBe(true);
+    expect(component.publicAccessLevel()?.enforced_by).toContain('READ ONLY transaction');
+    component.formData.read_only = false;
+    expect(component.publicAccessLevel()?.id).toBe('ReadWrite');
+  });
+
+  it('hides read-write for a driver forced read-only and saves it read-only', () => {
+    const {api, component} = create('kb');
+    expect(component.offersReadOnly()).toBe(true);
+    expect(component.offersReadWrite()).toBe(false);
+    component.formData.read_only = false;
+    expect(component.publicReadOnly()).toBe(true);
+    expect(component.publishConfirmTier()).toBe('warn');
+    component.doSave();
+    expect(api.createDatasource.mock.calls[0][0].read_only).toBe(true);
+  });
+
+  it('hides read-only for a driver with one level and saves what it binds', () => {
+    const {api, component} = create('mcp');
+    expect(component.offersReadOnly()).toBe(false);
+    expect(component.offersReadWrite()).toBe(true);
+    // The form's default is read-only; an MCP server is bound read-write.
+    expect(component.formData.read_only).toBe(true);
+    expect(component.publicReadOnly()).toBe(false);
+    expect(component.publishConfirmTier()).toBe('name');
+    expect(component.publicAccessLevel()?.tools).toBe('*');
+    component.formData.mcpTransport = 'http';
+    component.formData.connection_url = 'https://mcp.example.com';
+    component.doSave();
+    expect(api.createDatasource.mock.calls[0][0].read_only).toBe(false);
+  });
+
+  it('marks an advisory read-only level', () => {
+    const {component} = create('generic');
+    expect(component.publicAccessLevel()?.advisory).toBe(true);
+  });
+
+  it('keeps the pre-matrix rule until the matrix loads', () => {
+    const kb = create('kb', null).component;
+    expect(kb.offersReadWrite()).toBe(false);
+    expect(kb.publicAccessLevel()).toBeNull();
+    const mcp = create('mcp', null).component;
+    expect(mcp.offersReadOnly()).toBe(true);
+    expect(mcp.offersReadWrite()).toBe(true);
+  });
+});
+
+describe('DatasourceListComponent bespoke and generic forms', () => {
+  const IMAGE_DRIVER: ConnectorDriver = {
+    ...BUILTIN_DRIVERS.find((driver) => driver.name === 'srw.generic/v1')!,
+    name: 'community.ticketing/v1',
+    legacy_type: 'generic',
+  };
+
+  it('uses the bespoke section of every built-in, and the generic form only in the dev preview', () => {
+    const {component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openCreateForm();
+    component.onTypeSelect('postgresql');
+    expect(component.hasBespokeForm()).toBe(true);
+    expect(component.useGenericForm()).toBe(false);
+    component.setGenericFormPreview(true);
+    expect(component.useGenericForm()).toBe(true);
+    component.closeForm();
+    expect(component.genericFormPreview()).toBe(false);
+  });
+
+  it('keeps the bespoke form while the matrix is unknown', () => {
+    const {component} = createComponent(false, null, null);
+    component.openCreateForm();
+    component.setGenericFormPreview(true);
+    expect(component.useGenericForm()).toBe(false);
+  });
+
+  it('gives a driver without a bespoke form the generic form', () => {
+    const {component} = createComponent(false, null, [IMAGE_DRIVER]);
+    component.openCreateForm();
+    component.onTypeSelect('generic');
+    expect(component.hasBespokeForm()).toBe(false);
+    expect(component.useGenericForm()).toBe(true);
+  });
+
+  it('submits what the generic form holds, and lets the API decide', () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openCreateForm();
+    component.formData.name = 'Graph';
+    component.onTypeSelect('neo4j');
+    component.setGenericFormPreview(true);
+    expect(component.canSave()).toBe(false);
+    component.genericFormValue.set({
+      connection_url: 'bolt://graph:7687',
+      credentials: {username: 'neo', password: 'pw'},
+      problems: [],
+    });
+    expect(component.canSave()).toBe(true);
+    component.doSave();
+    expect(api.createDatasource).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'neo4j',
+        connection_url: 'bolt://graph:7687',
+        credentials: {username: 'neo', password: 'pw'},
+        config: undefined,
+      }),
+    );
+  });
+
+  it("shows the API's refusal in the generic form, at the field it names", () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    api.createDatasource.mockReturnValue(
+      throwError(() => ({error: {detail: {message: 'bad host', field: '/config/host'}}})),
+    );
+    component.openCreateForm();
+    component.formData.name = 'Box';
+    component.onTypeSelect('ssh_key');
+    component.setGenericFormPreview(true);
+    component.genericFormValue.set({config: {host: '-oProxyCommand=x'}, problems: []});
+    component.doSave();
+    expect(component.genericFormError()).toEqual({message: 'bad host', field: '/config/host'});
+    expect(component.errorMessage()).toBeNull();
+  });
+
+  it('keeps the bespoke error banner outside the generic form', () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    api.createDatasource.mockReturnValue(throwError(() => ({error: {detail: 'refused'}})));
+    component.openCreateForm();
+    component.formData.name = 'Graph';
+    component.onTypeSelect('neo4j');
+    component.formData.connection_url = 'bolt://graph:7687';
+    component.doSave();
+    expect(component.errorMessage()).toBe('refused');
+    expect(component.genericFormError()).toBeNull();
+  });
+
+  it('prefills the generic form on an edit from config and URL only', () => {
+    const {component} = createComponent(false, null, BUILTIN_DRIVERS);
+    const email = emailDatasource();
+    component.openEditForm(email);
+    expect(component.genericFormExisting).toEqual({
+      connection_url: null,
+      connection_url_redacted: undefined,
+      config: email.config,
+    });
   });
 });

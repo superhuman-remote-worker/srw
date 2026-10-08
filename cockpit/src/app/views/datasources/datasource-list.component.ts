@@ -1,4 +1,4 @@
-import {Component, computed, DestroyRef, inject, OnInit, signal} from '@angular/core';
+import {Component, computed, DestroyRef, inject, isDevMode, OnInit, signal} from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {forkJoin, timer} from 'rxjs';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
@@ -35,7 +35,22 @@ import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
 import {ViewportService} from '../../core/services/viewport.service';
 import {UserService} from '../../core/services/user.service';
-import {ActivatedRoute} from '@angular/router';
+import {ActivatedRoute, RouterLink} from '@angular/router';
+import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
+import {
+  ConnectorAccessLevel,
+  ConnectorDriver,
+  OfferedAccess,
+  offeredAccess,
+} from '../../core/models/connector-driver.model';
+import {GenericConnectorFormComponent} from './connector-forms/generic-connector-form.component';
+import {bespokeFormFor} from './connector-forms/connector-form-registry';
+import {
+  ConnectorFormError,
+  ExistingConnector,
+  GenericFormValue,
+  connectorFormError,
+} from './connector-forms/schema-form';
 
 type McpTransport = 'http' | 'sse' | 'stdio';
 type KeyValueRow = {key: string; value: string};
@@ -63,6 +78,8 @@ type KeyValueRow = {key: string; value: string};
     AppMenuComponent,
     AppMenuItemComponent,
     AppMenuTriggerDirective,
+    GenericConnectorFormComponent,
+    RouterLink,
   ],
   template: `
     <div class="ds-container" [class.form-open]="showForm()">
@@ -98,6 +115,14 @@ type KeyValueRow = {key: string; value: string};
           >
             <app-icon size="sm">refresh</app-icon>
           </app-icon-button>
+          <a
+            class="drivers-link"
+            routerLink="/settings/connector-drivers"
+            [title]="'datasources.driversLinkHint' | transloco"
+          >
+            <app-icon size="sm">fact_check</app-icon>
+            <span class="drivers-link-text">{{ 'datasources.driversLink' | transloco }}</span>
+          </a>
         </div>
       </div>
 
@@ -238,6 +263,26 @@ type KeyValueRow = {key: string; value: string};
               </app-form-field>
             </div>
 
+            <!-- Development only: render this built-in through the generic
+                 form instead of its bespoke section (connector-form-registry). -->
+            @if (devMode && formDriver() && hasBespokeForm()) {
+              <label class="generic-preview-toggle">
+                <input
+                  type="checkbox"
+                  [checked]="genericFormPreview()"
+                  (change)="setGenericFormPreview($any($event.target).checked)"
+                  [disabled]="isSaving()"
+                >
+                <span>
+                  {{ 'datasources.generic.previewToggle' | transloco }}
+                  <small>{{ 'datasources.generic.previewHint' | transloco }}</small>
+                </span>
+              </label>
+            }
+
+            <!-- Bespoke sections (by driver name, connector-form-registry.ts)
+                 until the description; the generic form replaces them all. -->
+            @if (!useGenericForm()) {
             @if (formData.type === 'mcp') {
               <app-form-field
                 [label]="'datasources.form.mcpTransportLabel' | transloco"
@@ -286,6 +331,7 @@ type KeyValueRow = {key: string; value: string};
                 />
               </app-form-field>
             }
+            }
 
             <app-form-field
               [label]="'datasources.form.descriptionLabel' | transloco"
@@ -301,6 +347,16 @@ type KeyValueRow = {key: string; value: string};
               />
             </app-form-field>
 
+            @if (useGenericForm()) {
+              <app-generic-connector-form
+                [driver]="formDriver()!"
+                [editing]="!!editingId()"
+                [disabled]="isSaving()"
+                [existing]="genericFormExisting"
+                [error]="genericFormError()"
+                (valueChange)="genericFormValue.set($event)"
+              />
+            } @else {
             @if (formData.type === 'mcp' && formData.mcpTransport !== 'stdio') {
               <app-form-field
                 [label]="'datasources.form.mcpTokenLabel' | transloco"
@@ -1165,6 +1221,7 @@ type KeyValueRow = {key: string; value: string};
                 </div>
               </div>
             }
+            }
 
             <!-- Policy controls are rollout-gated. Older orchestrators keep
                  legacy connector CRUD without receiving unknown fields. -->
@@ -1308,10 +1365,10 @@ type KeyValueRow = {key: string; value: string};
               <div class="form-row">
                 <app-form-field
                   [label]="'datasources.form.visibilityLabel' | transloco"
-                  [hint]="formData.is_global
-                    ? ((formData.type === 'kb'
-                        ? 'datasources.form.visibilityKbHint'
-                        : 'datasources.form.visibilityCredentialHint') | transloco)
+                  [hint]="formData.is_global && !publicAccessLevel()
+                    ? ((offersReadWrite()
+                        ? 'datasources.form.visibilityCredentialHint'
+                        : 'datasources.form.visibilityKbHint') | transloco)
                     : ''"
                 >
                   <div class="visibility-controls">
@@ -1324,23 +1381,35 @@ type KeyValueRow = {key: string; value: string};
                       >
                       {{ 'datasources.form.visibilityPublic' | transloco }}
                     </label>
+                    <!-- Only the levels the driver offers (its spec's access
+                         levels and forced_read_only), each with what enforces it. -->
                     @if (formData.is_global) {
                       <div class="access-radio">
-                        <label>
-                          <input type="radio" name="ds-access"
-                            [checked]="formData.read_only"
-                            (change)="formData.read_only = true"
-                            [disabled]="isSaving()">
-                          {{ 'datasources.form.accessReadOnly' | transloco }}
-                        </label>
-                        <label>
-                          <input type="radio" name="ds-access"
-                            [checked]="!formData.read_only"
-                            (change)="formData.read_only = false"
-                            [disabled]="isSaving() || formData.type === 'kb'">
-                          {{ 'datasources.form.accessReadWrite' | transloco }}
-                        </label>
+                        @if (offersReadOnly()) {
+                          <label data-access="read_only">
+                            <input type="radio" name="ds-access"
+                              [checked]="publicReadOnly()"
+                              (change)="formData.read_only = true"
+                              [disabled]="isSaving() || !offersReadWrite()">
+                            {{ 'datasources.form.accessReadOnly' | transloco }}
+                          </label>
+                        }
+                        @if (offersReadWrite()) {
+                          <label data-access="read_write">
+                            <input type="radio" name="ds-access"
+                              [checked]="!publicReadOnly()"
+                              (change)="formData.read_only = false"
+                              [disabled]="isSaving() || !offersReadOnly()">
+                            {{ 'datasources.form.accessReadWrite' | transloco }}
+                          </label>
+                        }
                       </div>
+                      @if (publicAccessLevel(); as level) {
+                        <div class="access-enforced" [class.access-advisory]="level.advisory">
+                          <strong>{{ (level.advisory ? 'datasources.form.accessAdvisory' : 'datasources.form.accessEnforcedBy') | transloco }}</strong>
+                          {{ level.enforced_by }}
+                        </div>
+                      }
                     }
                   </div>
                 </app-form-field>
@@ -1795,6 +1864,27 @@ type KeyValueRow = {key: string; value: string};
         align-items: center;
       }
 
+      .drivers-link {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 12px;
+        color: var(--text-secondary);
+        text-decoration: none;
+        white-space: nowrap;
+      }
+
+      .drivers-link:hover {
+        color: var(--text-primary);
+      }
+
+      /* One responsive layout: the icon alone on a phone header. */
+      @media (max-width: 640px) {
+        .drivers-link-text {
+          display: none;
+        }
+      }
+
       .catalog-filter-bar {
         display: grid;
         grid-template-columns: minmax(220px, 1fr) minmax(300px, 1.2fr) repeat(4, minmax(130px, auto));
@@ -2046,6 +2136,35 @@ type KeyValueRow = {key: string; value: string};
       .access-radio {
         display: flex;
         gap: 20px;
+      }
+
+      .access-enforced {
+        margin-top: 6px;
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+
+      .access-enforced.access-advisory {
+        color: var(--warning);
+      }
+
+      .generic-preview-toggle {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        margin: 4px 0 8px;
+        font-size: 12px;
+        color: var(--text-secondary);
+        cursor: pointer;
+      }
+
+      .generic-preview-toggle span {
+        display: flex;
+        flex-direction: column;
+      }
+
+      .generic-preview-toggle small {
+        color: var(--text-muted);
       }
 
       .availability-section {
@@ -2554,8 +2673,77 @@ export class DatasourceListComponent implements OnInit {
   protected readonly viewport = inject(ViewportService);
   protected readonly capabilities = inject(CapabilitiesService);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly connectorDrivers = inject(ConnectorDriversService);
   /** Poll cadence for a KB that is still indexing. */
   private readonly INDEX_POLL_MS = 5000;
+
+  // -- Driver specs (connector_drivers.md, D2) ------------------------------
+  // The capability matrix decides which access levels the form offers and
+  // whether the type has a bespoke section; until it loads, the form keeps
+  // its pre-matrix behaviour.
+
+  /** `ng serve` builds offer a built-in through the generic form. */
+  protected readonly devMode = isDevMode();
+  readonly genericFormPreview = signal(false);
+  /** The generic form's latest config, credentials and connection URL. */
+  readonly genericFormValue = signal<GenericFormValue | null>(null);
+  /** The API's refusal, shown inside the generic form at the field it names. */
+  readonly genericFormError = signal<ConnectorFormError | null>(null);
+  /** What the generic form prefills on an edit; set once per open. */
+  genericFormExisting: ExistingConnector | null = null;
+
+  /** The installed driver behind the form's type; null until the matrix loads. */
+  formDriver(): ConnectorDriver | null {
+    return this.connectorDrivers.forType(this.formData.type);
+  }
+
+  formAccess(): OfferedAccess | null {
+    return offeredAccess(this.formDriver());
+  }
+
+  offersReadOnly(): boolean {
+    const access = this.formAccess();
+    return access ? access.readOnly !== null : true;
+  }
+
+  offersReadWrite(): boolean {
+    const access = this.formAccess();
+    // Before the matrix loads: the one rule the form always had.
+    return access ? access.readWrite !== null : this.formData.type !== 'kb';
+  }
+
+  /** The `read_only` a public connector saves: the user's choice when the
+   *  driver offers both, else the only one it offers. */
+  publicReadOnly(): boolean {
+    if (!this.offersReadWrite()) return true;
+    if (!this.offersReadOnly()) return false;
+    return this.formData.read_only;
+  }
+
+  /** The level a public connector binds at, with what enforces it. */
+  publicAccessLevel(): ConnectorAccessLevel | null {
+    const access = this.formAccess();
+    if (!access) return null;
+    return this.publicReadOnly() ? access.readOnly : access.readWrite;
+  }
+
+  hasBespokeForm(): boolean {
+    return bespokeFormFor(this.formDriver()?.name) !== null;
+  }
+
+  /** The generic form replaces the bespoke sections for a driver without
+   *  one, or for any built-in under the development preview. */
+  useGenericForm(): boolean {
+    const driver = this.formDriver();
+    if (!driver) return false;
+    return !this.hasBespokeForm() || (this.devMode && this.genericFormPreview());
+  }
+
+  setGenericFormPreview(on: boolean): void {
+    this.genericFormPreview.set(on);
+    this.genericFormValue.set(null);
+    this.genericFormError.set(null);
+  }
 
   // State signals
   readonly datasources = signal<Datasource[]>([]);
@@ -2749,6 +2937,9 @@ export class DatasourceListComponent implements OnInit {
         return false;
       }
     }
+    // The generic form submits what it holds: the driver's validate is the
+    // authority, and its refusal shows at the field it names.
+    if (this.useGenericForm()) return this.genericFormValue() !== null;
     if (this.formData.type === 'credentials') {
       return this.editingId() !== null || this.envVars.some(row => row.key.trim() && row.value);
     }
@@ -3056,6 +3247,7 @@ export class DatasourceListComponent implements OnInit {
         }
       });
     initialising = false;
+    this.connectorDrivers.load();
     this.refresh();
     if (this.capabilities.datasourceScopeAutoAttachAvailable()) {
       this.loadCatalogProjects(true);
@@ -3261,6 +3453,7 @@ export class DatasourceListComponent implements OnInit {
 
   openCreateForm(): void {
     this.resetFormData();
+    this.resetGenericForm(null);
     this.editingId.set(null);
     this.showForm.set(true);
     this.formTestResult.set(null);
@@ -3274,6 +3467,11 @@ export class DatasourceListComponent implements OnInit {
 
   openEditForm(ds: Datasource): void {
     this.editingOriginal = ds;
+    this.resetGenericForm({
+      connection_url: ds.connection_url,
+      connection_url_redacted: ds.connection_url_redacted,
+      config: ds.config,
+    });
     this.formData = {
       name: ds.name,
       type: ds.type,
@@ -3373,6 +3571,15 @@ export class DatasourceListComponent implements OnInit {
     this.scopeTargetsLoading.set(false);
     this.scopeTargetsError.set(false);
     this.resetFormData();
+    this.resetGenericForm(null);
+  }
+
+  /** A fresh generic form; `existing` is what an edit prefills (no secrets). */
+  private resetGenericForm(existing: ExistingConnector | null): void {
+    this.genericFormExisting = existing;
+    this.genericFormPreview.set(false);
+    this.genericFormValue.set(null);
+    this.genericFormError.set(null);
   }
 
   onScopeModeChange(mode: DatasourceScopeMode): void {
@@ -3629,8 +3836,9 @@ export class DatasourceListComponent implements OnInit {
   onTypeSelect(value: DatasourceType | null): void {
     if (value) {
       this.formData.type = value;
-      // kb datasources are read-only by architecture (OKF org-vault policy).
-      if (value === 'kb') this.formData.read_only = true;
+      // A driver forced read-only (the KB) saves read-only: publicReadOnly().
+      this.genericFormValue.set(null);
+      this.genericFormError.set(null);
       // Mailboxes are private-only; the server rejects is_global for email.
       if (value === 'email') this.formData.is_global = false;
       this.onTypeChange();
@@ -3782,7 +3990,7 @@ export class DatasourceListComponent implements OnInit {
     const prev = this.editingId() ? this.editingOriginal : null;
     const wasPublic = prev?.is_global === true;
     const wasRw = wasPublic && prev?.read_only === false;
-    const isRw = !this.formData.read_only && this.formData.type !== 'kb';
+    const isRw = !this.publicReadOnly();
     if (isRw && !wasRw) return 'name';
     if (!wasPublic) return 'warn';
     return null;
@@ -3805,6 +4013,8 @@ export class DatasourceListComponent implements OnInit {
   }
 
   private connectionUrlForPayload(): string | undefined {
+    // Blank there means unchanged on an edit, and none on a create.
+    if (this.useGenericForm()) return this.genericFormValue()?.connection_url;
     if (
       this.editingId() && this.editingOriginal?.connection_url_redacted &&
       !this.connectionUrlDirty
@@ -3865,7 +4075,7 @@ export class DatasourceListComponent implements OnInit {
         config: this.buildTypeConfig(),
         is_global: this.formData.is_global,
         read_only: this.formData.is_global
-          ? (this.formData.type === 'kb' ? true : this.formData.read_only)
+          ? this.publicReadOnly()
           : undefined,
       };
       const connectionUrl = this.connectionUrlForPayload();
@@ -3897,6 +4107,7 @@ export class DatasourceListComponent implements OnInit {
         },
         error: (err) => {
           this.isSaving.set(false);
+          if (this.showGenericFormError(err)) return;
           // Surface the server detail (e.g. the publish-capability 403)
           // instead of the generic message — mirrors the create path.
           const detail = err?.error?.detail;
@@ -3917,7 +4128,7 @@ export class DatasourceListComponent implements OnInit {
         config: this.buildTypeConfig(),
         is_global: this.formData.is_global,
         read_only: this.formData.is_global
-          ? (this.formData.type === 'kb' ? true : this.formData.read_only)
+          ? this.publicReadOnly()
           : undefined,
         ...this.createAvailabilityPolicy(),
       };
@@ -3931,11 +4142,22 @@ export class DatasourceListComponent implements OnInit {
         },
         error: (err) => {
           this.isSaving.set(false);
+          if (this.showGenericFormError(err)) return;
           const detail = err?.error?.detail;
           this.errorMessage.set(detail || this.transloco.translate('datasources.messages.createFailed'));
         },
       });
     }
+  }
+
+  /** In the generic form the API's refusal shows at the field its pointer
+   *  names (or above the form); true when it took the error. */
+  private showGenericFormError(err: unknown): boolean {
+    if (!this.useGenericForm()) return false;
+    const error = connectorFormError(err);
+    if (!error) return false;
+    this.genericFormError.set(error);
+    return true;
   }
 
   testFromForm(): void {
@@ -3961,6 +4183,7 @@ export class DatasourceListComponent implements OnInit {
       if (!this.canTestFromForm()) return;
       this.isSaving.set(true);
       this.formTestResult.set(null);
+      this.genericFormError.set(null);
 
       const create: DatasourceCreateRequest = {
         name: this.formData.name,
@@ -4007,8 +4230,9 @@ export class DatasourceListComponent implements OnInit {
             this.errorMessage.set(this.transloco.translate('datasources.messages.createForTestFailed'));
           }
         },
-        error: () => {
+        error: (err) => {
           this.isSaving.set(false);
+          if (this.showGenericFormError(err)) return;
           this.errorMessage.set(this.transloco.translate('datasources.messages.createError'));
         },
       });
@@ -4227,6 +4451,9 @@ export class DatasourceListComponent implements OnInit {
   /** Non-secret, type-specific config for the create/update/test payloads.
    *  `undefined` for types without config so the column stays untouched. */
   private buildTypeConfig(): DatasourceConfig | undefined {
+    if (this.useGenericForm()) {
+      return this.genericFormValue()?.config as DatasourceConfig | undefined;
+    }
     if (this.formData.type === 'kb') {
       return {root_path: this.formData.root_path.trim()};
     }
@@ -4276,6 +4503,8 @@ export class DatasourceListComponent implements OnInit {
     // (the API never returns credentials, so the form can't show them
     // back). Returning undefined skips the credentials column in the
     // PUT body so the orchestrator preserves the stored secret.
+    // The generic form applies the same rule per writeOnly field and slot.
+    if (this.useGenericForm()) return this.genericFormValue()?.credentials;
     const isEditing = this.editingId() !== null;
     if (this.isEnvType()) {
       const envVarsObj: Record<string, string> = {};
@@ -4521,5 +4750,6 @@ export class DatasourceListComponent implements OnInit {
   private clearMessages(): void {
     this.successMessage.set(null);
     this.errorMessage.set(null);
+    this.genericFormError.set(null);
   }
 }

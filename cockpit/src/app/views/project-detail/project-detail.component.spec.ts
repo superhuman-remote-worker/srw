@@ -18,6 +18,16 @@ import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
 import {ProjectDetailPageComponent} from './project-detail.component';
+import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
+import {
+  ConnectorDriver,
+  ConnectorDriverMatrix,
+  driverForType,
+} from '../../core/models/connector-driver.model';
+// The API's own capability matrix for the built-in drivers.
+import driversFixture from '../../core/models/fixtures/connector-drivers.json';
+
+const BUILTIN_DRIVERS = (driversFixture as unknown as ConnectorDriverMatrix).drivers;
 
 function datasource(id: string, overrides: Partial<Datasource> = {}): Datasource {
   return {
@@ -74,8 +84,19 @@ const WORKSPACE_DEFAULTS: ProjectWorkspaceDefaults = {
  *  endpoints do), so the mock no longer carries it; the workspace-defaults
  *  tests drive edit/template access through the `getProjectWorkspaceDefaults`
  *  mock's `can_edit`/`account_templates` instead — see WORKSPACE_DEFAULTS. */
-function createComponent(options: boolean | {policyAvailable?: boolean; userRole?: ProjectMemberRole} = true) {
+function createComponent(
+  options:
+    | boolean
+    | {policyAvailable?: boolean; userRole?: ProjectMemberRole; drivers?: ConnectorDriver[] | null} = true,
+) {
   const opts = typeof options === 'boolean' ? {policyAvailable: options} : options;
+  // null: the capability matrix has not loaded, so the pre-matrix rules hold.
+  const drivers = 'drivers' in opts ? (opts.drivers ?? null) : null;
+  const connectorDrivers = {
+    drivers: signal(drivers),
+    load: vi.fn(),
+    forType: (type: string) => driverForType(drivers, type),
+  };
   const policyAvailable = opts.policyAvailable ?? true;
   const api = {
     getProjectDatasources: vi.fn().mockReturnValue(of([])),
@@ -127,6 +148,7 @@ function createComponent(options: boolean | {policyAvailable?: boolean; userRole
       // a 409 body reaching the sentence the user reads.
       {provide: ErrorMessageService, useClass: ErrorMessageService, deps: []},
       {provide: ViewportService, useValue: {isMobile: signal(false)}},
+      {provide: ConnectorDriversService, useValue: connectorDrivers},
     ],
   });
   const component = runInInjectionContext(
@@ -134,7 +156,7 @@ function createComponent(options: boolean | {policyAvailable?: boolean; userRole
     () => new ProjectDetailPageComponent(),
   );
   (component as unknown as {projectId: string}).projectId = 'project-a';
-  return {api, component, currentUser};
+  return {api, component, currentUser, connectorDrivers};
 }
 
 describe('ProjectDetailPageComponent connector candidates', () => {
@@ -753,5 +775,45 @@ describe('ProjectDetailPageComponent workspace defaults', () => {
 
   it("account_templates: false does not list Account/me, even when the Project is_default", () => {
     expect(personalProject(false)).toEqual(['Catalog/shared', 'Project/project-a']);
+  });
+});
+
+describe('ProjectDetailPageComponent link access from the capability matrix', () => {
+  it('offers the read-only switch only where the driver has both levels', () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    expect(component.linkAccess({type: 'postgresql'})).toBe('choice');
+    expect(component.linkAccess({type: 'kb'})).toBe('read_only');
+    // An MCP server binds every tool it lists: there is no read-only level.
+    expect(component.linkAccess({type: 'mcp'})).toBe('read_write');
+    expect(component.linkAccessHint({type: 'mcp'})).toContain('MCP server');
+    expect(component.linkAccessHint({type: 'kb'})).toContain('never the URL');
+  });
+
+  it('keeps the KB rule until the matrix loads', () => {
+    const {component} = createComponent({drivers: null});
+    expect(component.linkAccess({type: 'kb'})).toBe('read_only');
+    expect(component.linkAccess({type: 'mcp'})).toBe('choice');
+    expect(component.linkAccessHint({type: 'kb'})).toBe('');
+  });
+
+  it('ignores a read-only change for a link with one level', () => {
+    const {api, component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const updateProjectDatasource = vi.fn().mockReturnValue(of({status: 'updated'}));
+    (api as unknown as {updateProjectDatasource: unknown}).updateProjectDatasource =
+      updateProjectDatasource;
+    component.projectDatasources.set([
+      {...datasource('mcp-1', {type: 'mcp'}), linked_at: '', project_read_only: null, project_description: null},
+      {...datasource('pg-1'), linked_at: '', project_read_only: null, project_description: null},
+    ]);
+    component.updateDatasourceReadOnly('mcp-1', 'true');
+    expect(updateProjectDatasource).not.toHaveBeenCalled();
+    component.updateDatasourceReadOnly('pg-1', 'true');
+    expect(updateProjectDatasource).toHaveBeenCalledWith('project-a', 'pg-1', {read_only: true});
+  });
+
+  it('loads the matrix with the linked connectors', () => {
+    const {component, connectorDrivers} = createComponent({drivers: BUILTIN_DRIVERS});
+    component.loadProjectDatasources();
+    expect(connectorDrivers.load).toHaveBeenCalled();
   });
 });

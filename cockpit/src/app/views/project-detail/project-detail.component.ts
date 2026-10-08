@@ -8,6 +8,8 @@ import {stripMarkdown} from '../../core/util/strip-markdown';
 import {effectiveJobStatus} from '../../core/util/job-status';
 import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
+import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
+import {offeredAccess} from '../../core/models/connector-driver.model';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
@@ -653,24 +655,34 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                           />
                         </td>
                         <td>
-                          @if (ds.type === 'kb') {
-                            <app-badge
-                              tone="info"
-                              size="sm"
-                              [title]="'projectDetail.datasources.accessKbReadOnlyHint' | transloco"
-                            >
-                              {{ 'projectDetail.datasources.accessReadOnly' | transloco }}
-                            </app-badge>
-                          } @else {
-                            <app-select
-                              size="sm"
-                              [value]="boolToText(ds.project_read_only)"
-                              (changed)="updateDatasourceReadOnly(ds.id, $event ?? '')"
-                            >
-                              <option value="">{{ 'projectDetail.datasources.accessDefault' | transloco }}</option>
-                              <option value="true">{{ 'projectDetail.datasources.accessReadOnly' | transloco }}</option>
-                              <option value="false">{{ 'projectDetail.datasources.accessReadWrite' | transloco }}</option>
-                            </app-select>
+                          <!-- Only the levels the connector's driver offers
+                               (capability matrix): one level is shown, not chosen. -->
+                          @switch (linkAccess(ds)) {
+                            @case ('read_only') {
+                              <app-badge
+                                tone="info"
+                                size="sm"
+                                [title]="linkAccessHint(ds) || ('projectDetail.datasources.accessKbReadOnlyHint' | transloco)"
+                              >
+                                {{ 'projectDetail.datasources.accessReadOnly' | transloco }}
+                              </app-badge>
+                            }
+                            @case ('read_write') {
+                              <app-badge tone="neutral" size="sm" [title]="linkAccessHint(ds)">
+                                {{ 'projectDetail.datasources.accessReadWrite' | transloco }}
+                              </app-badge>
+                            }
+                            @default {
+                              <app-select
+                                size="sm"
+                                [value]="boolToText(ds.project_read_only)"
+                                (changed)="updateDatasourceReadOnly(ds.id, $event ?? '')"
+                              >
+                                <option value="">{{ 'projectDetail.datasources.accessDefault' | transloco }}</option>
+                                <option value="true">{{ 'projectDetail.datasources.accessReadOnly' | transloco }}</option>
+                                <option value="false">{{ 'projectDetail.datasources.accessReadWrite' | transloco }}</option>
+                              </app-select>
+                            }
                           }
                         </td>
                         <td>
@@ -2028,6 +2040,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   private readonly transloco = inject(TranslocoService);
   private readonly errors = inject(ErrorMessageService);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly connectorDrivers = inject(ConnectorDriversService);
   protected readonly viewport = inject(ViewportService);
   readonly effectiveJobStatus = effectiveJobStatus;
 
@@ -2354,6 +2367,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   // Datasources
   loadProjectDatasources(): void {
+    this.connectorDrivers.load();
     this.api.getProjectDatasources(this.projectId).subscribe((ds) => {
       this.projectDatasources.set(ds);
       this.reconcileDatasourceSelection();
@@ -2487,7 +2501,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
       this.dsLinkId.set('');
       return;
     }
-    const settings = datasource?.type === 'kb' ? {read_only: true} : {};
+    const settings = this.linkAccess(datasource) === 'read_only' ? {read_only: true} : {};
     this.api.linkProjectDatasource(this.projectId, dsId, settings).subscribe((res) => {
       if (res) {
         this.dsLinkId.set('');
@@ -2504,8 +2518,28 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     });
   }
 
+  /** A link's access choice: one fixed level, or the read-only switch.
+   *  Before the capability matrix loads, the KB rule the page always had. */
+  linkAccess(ds: Pick<Datasource, 'type'>): 'read_only' | 'read_write' | 'choice' {
+    const access = offeredAccess(this.connectorDrivers.forType(ds.type));
+    if (!access) return ds.type === 'kb' ? 'read_only' : 'choice';
+    if (access.readOnly && access.readWrite) return 'choice';
+    if (access.readWrite) return 'read_write';
+    return access.readOnly ? 'read_only' : 'choice';
+  }
+
+  /** What enforces a fixed level, from the driver's spec. */
+  linkAccessHint(ds: Pick<Datasource, 'type'>): string {
+    const access = offeredAccess(this.connectorDrivers.forType(ds.type));
+    return (access?.readOnly ?? access?.readWrite)?.enforced_by ?? '';
+  }
+
   updateDatasourceReadOnly(datasourceId: string, value: string): void {
-    if (this.projectDatasources().some((ds) => ds.id === datasourceId && ds.type === 'kb')) {
+    if (
+      this.projectDatasources().some(
+        (ds) => ds.id === datasourceId && this.linkAccess(ds) !== 'choice',
+      )
+    ) {
       return;
     }
     const readOnly = value === '' ? null : value === 'true';
