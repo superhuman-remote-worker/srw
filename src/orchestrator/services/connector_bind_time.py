@@ -1018,12 +1018,17 @@ async def _fail(
     message: str,
     attempt: int,
     source: str | None = None,
+    image: BoundImage | None = None,
 ) -> None:
     """End a bind that minted nothing: a transient failure waits for a
     retry (until :data:`MAX_BIND_ATTEMPTS`), any other is final. A revoke
     asked meanwhile retires it instead. ``source`` is ``driver`` when
     ``message`` is the driver's own text. A posted outcome stays for the
-    leader (:func:`_recover_unread`): a result line in it is revoked."""
+    leader (:func:`_recover_unread`): a result line in it is revoked.
+    ``image``, when the bind got as far as resolving one (a refused moved
+    tag), is recorded on the binding so the connector shows which digest
+    was refused; it never becomes a baseline, since :func:`_previous_bind`
+    reads only bindings that were bound."""
     retry_at: datetime | None = None
     if error_class == "transient":
         if attempt < MAX_BIND_ATTEMPTS:
@@ -1043,7 +1048,12 @@ async def _fail(
                    revoked_at = CASE WHEN revoke_requested_at IS NULL
                                      THEN NULL ELSE now() END,
                    failed_at = now(), error_class = $2, error_message = $3,
-                   retry_at = $4, inputs_ciphertext = NULL, error_source = $5
+                   retry_at = $4, inputs_ciphertext = NULL, error_source = $5,
+                   image_reference = coalesce($6, image_reference),
+                   image_digest = coalesce($7, image_digest),
+                   resolved_at = coalesce($8, resolved_at),
+                   spec_hash = coalesce($9, spec_hash),
+                   protocol_version = coalesce($10, protocol_version)
              WHERE id = $1 AND status = 'pending'
             """,
             UUID(binding_id),
@@ -1051,6 +1061,11 @@ async def _fail(
             message[:1000],
             retry_at,
             source,
+            image.reference if image is not None else None,
+            image.digest if image is not None else None,
+            image.resolved_at if image is not None else None,
+            image.spec_hash if image is not None else None,
+            image.protocol_version if image is not None else None,
         )
 
 
@@ -1296,7 +1311,12 @@ async def _run_bind(
     store = runtime.store
     row = dict(row)
 
-    async def fail(error_class: str, message: str, source: str | None = None) -> None:
+    async def fail(
+        error_class: str,
+        message: str,
+        source: str | None = None,
+        image: BoundImage | None = None,
+    ) -> None:
         await _fail(
             store,
             binding_id,
@@ -1304,6 +1324,7 @@ async def _run_bind(
             message=message,
             attempt=attempt,
             source=source,
+            image=image,
         )
 
     if registration is None:
@@ -1328,7 +1349,9 @@ async def _run_bind(
         return
     if checked.problems or checked.spec is None:
         await fail(
-            "config", refusal_message(registration.image_reference, checked.problems)
+            "config",
+            refusal_message(registration.image_reference, checked.problems),
+            image=checked.image,
         )
         return
     spec, image = checked.spec, checked.image

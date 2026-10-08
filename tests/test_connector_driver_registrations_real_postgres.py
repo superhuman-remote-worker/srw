@@ -1370,11 +1370,18 @@ class TestMovedTags:
         status = await registrations.connector_driver_status(db, connector)
         assert status["last_bind"]["status"] == "failed"
         assert "changed its contract" in status["last_bind"]["message"]
+        # The connector shows which digest was refused, and the refusal is
+        # never the next bind's baseline.
+        assert status["last_bind"]["digest"] == D2
+        assert status["last_bind"]["reference"] == REFERENCE
+        assert status["last_bind"]["resolved_at"] is not None
         audit = await db.fetchval(
             "SELECT count(*) FROM security_events "
             "WHERE event_type='connector_driver_image_refused'"
         )
         assert audit == 1
+        await prepare_lease_delivery(db, entries, owner=LeaseOwner.job(await _job(db)))
+        assert len(operations.calls) == 1  # still refused, still no pod
 
     @pytest.mark.parametrize(
         ("labels", "message"),
