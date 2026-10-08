@@ -295,6 +295,43 @@ connectors:
         repository: ""
         tag: ""
         digest: ""
+    # -- SRW's front for managed MCP servers (docker/Dockerfile.driver-mcp-front):
+    # the only exposed port of every managed MCP driver pod. It checks each
+    # request's lease token with the lease exchange, injects the connector's
+    # upstream credential, hides and refuses the tools a ReadOnly binding may
+    # not call, and scrubs the credential from every answer. A managed MCP
+    # driver needs a digest (the chart fails to render without one); CI
+    # stamps tag and digest.
+    mcpFront:
+      image:
+        repository: ghcr.io/superhuman-remote-worker/srw-driver-mcp-front
+        tag: latest
+        digest: ""
+    # -- Managed MCP servers from SRW's catalogue (connector drivers D5a):
+    # stock MCP server images that speak streamable HTTP, run as shared
+    # service pods behind the front. Each needs servicePods.enabled and the
+    # front's digest. The image reference may follow a tag or pin a digest
+    # (tag@digest; the digest wins).
+    managedMcp:
+      # -- srw.gitea-mcp/v1: the official Gitea MCP server. A connector names
+      # its Gitea URL and holds a Gitea token, which only the front and the
+      # server ever see (per request, from the lease exchange).
+      gitea:
+        enabled: false
+        image:
+          repository: docker.gitea.com/gitea-mcp-server
+          tag: "1.8.0"
+          digest: "sha256:5fad9c4a1148071fd58ed617f779115f65a13c517c20427a3b39f80cac43e600"
+    # -- Development only: srw.mcp-test/v1, SRW's MCP test server
+    # (docker/Dockerfile.driver-mcp-test, built by Tilt; never published),
+    # which scripts/k3d-managed-mcp-gate.py runs behind the front. Never in
+    # production.
+    mcpTest:
+      enabled: false
+      image:
+        repository: ""
+        tag: ""
+        digest: ""
 
 orchestrator:
   # -- 1 replica by default. NOT a statement about what HA needs: leader

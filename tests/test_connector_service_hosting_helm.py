@@ -531,7 +531,7 @@ def test_tilt_builds_the_echo_driver_for_the_dev_profile_only():
         "('srw-driver-echo', 'connectors.drivers.echo.image.repository', "
         "'connectors.drivers.echo.image.tag')" in tiltfile
     )
-    assert "'srw-driver-shim', 'srw-driver-echo']" in tiltfile
+    assert "'srw-driver-shim', 'srw-driver-echo'" in tiltfile
     # Never published: no CI workflow builds it.
     for workflow in (ROOT / ".github/workflows").glob("*.yml"):
         assert "driver-echo" not in workflow.read_text()
@@ -570,3 +570,120 @@ def test_the_k3d_profile_resolves_from_the_k3d_registry_over_http():
     # registry may resolve to.
     assert registry["privateHosts"] == ["srw-registry:5000"]
     assert registry["resolveCacheSeconds"] <= 10
+
+
+# =============================================================================
+# Managed MCP (D5a): the front, the catalogue's servers and the test server
+# =============================================================================
+
+FRONT_DIGEST = "sha256:" + "6" * 64
+FRONT = f"connectors.drivers.mcpFront.image.digest={FRONT_DIGEST}"
+GITEA = "connectors.drivers.managedMcp.gitea.enabled=true"
+MCP_TEST = (
+    "connectors.drivers.mcpTest.enabled=true",
+    "connectors.drivers.mcpTest.image.repository=srw-registry:5000/srw-driver-mcp-test",
+    "connectors.drivers.mcpTest.image.tag=tilt-1",
+)
+
+
+def test_no_managed_mcp_server_is_installed_by_default():
+    env = orchestrator_env(render(EXCHANGE, ON))
+    assert "CONNECTOR_MANAGED_MCP_IMAGES" not in env
+    assert "CONNECTOR_MCP_FRONT_IMAGE" not in env
+
+
+def test_the_gitea_server_runs_the_pinned_official_image_behind_a_pinned_front():
+    import json
+
+    env = orchestrator_env(render(EXCHANGE, ON, GITEA, FRONT))
+    assert json.loads(env["CONNECTOR_MANAGED_MCP_IMAGES"]) == {
+        "srw.gitea-mcp/v1": "docker.gitea.com/gitea-mcp-server:1.8.0@sha256:"
+        "5fad9c4a1148071fd58ed617f779115f65a13c517c20427a3b39f80cac43e600"
+    }
+    assert env["CONNECTOR_MCP_FRONT_IMAGE"] == (
+        f"ghcr.io/superhuman-remote-worker/srw-driver-mcp-front@{FRONT_DIGEST}"
+    )
+
+
+def test_the_test_server_follows_its_tag_or_pins_a_digest():
+    import json
+
+    env = orchestrator_env(render(EXCHANGE, ON, FRONT, *MCP_TEST))
+    assert json.loads(env["CONNECTOR_MANAGED_MCP_IMAGES"]) == {
+        "srw.mcp-test/v1": "srw-registry:5000/srw-driver-mcp-test:tilt-1"
+    }
+    digest = "sha256:" + "c" * 64
+    env = orchestrator_env(
+        render(
+            EXCHANGE,
+            ON,
+            FRONT,
+            *MCP_TEST,
+            f"connectors.drivers.mcpTest.image.digest={digest}",
+        )
+    )
+    assert json.loads(env["CONNECTOR_MANAGED_MCP_IMAGES"]) == {
+        "srw.mcp-test/v1": f"srw-registry:5000/srw-driver-mcp-test:tilt-1@{digest}"
+    }
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        (GITEA, FRONT),  # a service driver without service hosting
+        (EXCHANGE, ON, GITEA),  # no pinned front
+        (EXCHANGE, ON, FRONT, "connectors.drivers.mcpTest.enabled=true"),  # no image
+        (EXCHANGE, ON, GITEA, "connectors.drivers.mcpFront.image.digest=latest"),
+        (EXCHANGE, ON, FRONT, "connectors.drivers.managedMcp.other.enabled=true"),
+    ],
+)
+def test_an_incomplete_managed_mcp_setup_fails_to_render(settings):
+    with pytest.raises(subprocess.CalledProcessError):
+        render(*settings)
+
+
+def test_tilt_builds_the_front_and_the_test_server_and_pins_both():
+    import ast
+
+    tiltfile = (ROOT / "Tiltfile").read_text()
+    builds = {
+        node.args[0].value: {item.arg: item.value for item in node.keywords}
+        for node in ast.walk(ast.parse(tiltfile))
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "docker_build"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+    }
+    for image, directory in (
+        ("srw-driver-mcp-front", "drivers/mcp-front/"),
+        ("srw-driver-mcp-test", "drivers/mcp-test/"),
+    ):
+        keywords = builds[image]
+        assert ast.literal_eval(keywords["dockerfile"]) == (
+            f"docker/Dockerfile.{image.removeprefix('srw-')}"
+        )
+        assert directory in ast.literal_eval(keywords["only"])
+    assert (
+        "('srw-driver-mcp-front', 'connectors.drivers.mcpFront.image.repository', "
+        "'connectors.drivers.mcpFront.image.tag')" in tiltfile
+    )
+    assert (
+        "('srw-driver-mcp-test', 'connectors.drivers.mcpTest.image.repository', "
+        "'connectors.drivers.mcpTest.image.tag')" in tiltfile
+    )
+    assert "'srw-driver-mcp-front', 'srw-driver-mcp-test']" in tiltfile
+
+
+def test_the_k3d_profile_installs_the_test_server_and_gitea_behind_the_front():
+    import json
+
+    example = ROOT / "deployment/values-local.yaml.example"
+    drivers = yaml.safe_load(example.read_text())["connectors"]["drivers"]
+    assert drivers["mcpTest"]["enabled"] is True
+    assert drivers["managedMcp"]["gitea"]["enabled"] is True
+    env = orchestrator_env(render(values=(example,)))
+    images = json.loads(env["CONNECTOR_MANAGED_MCP_IMAGES"])
+    assert set(images) == {"srw.gitea-mcp/v1", "srw.mcp-test/v1"}
+    assert env["CONNECTOR_MCP_FRONT_IMAGE"].startswith(
+        "srw-registry:5000/srw-driver-mcp-front@sha256:"
+    )

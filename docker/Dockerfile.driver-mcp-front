@@ -1,0 +1,38 @@
+# =============================================================================
+# srw-driver-mcp-front — SRW's front for managed MCP servers
+# =============================================================================
+# Connector drivers D5a: the only exposed port of a managed MCP driver pod.
+# It authenticates each request with the caller's lease token (the lease
+# exchange's introspection route), injects the connector's upstream
+# credential, hides and refuses the tools the binding's access level does not
+# allow, scrubs the credential from every answer, and serves /readyz from a
+# real MCP probe of the server beside it. One static Go binary (standard
+# library only) on scratch, run as an unprivileged user; the pod drops every
+# capability and mounts its root filesystem read-only.
+#
+#   docker build -f docker/Dockerfile.driver-mcp-front -t srw-driver-mcp-front .
+#
+# The Go toolchain is the shim's (docker/Dockerfile.driver-shim): a supported
+# release pinned by digest (bump both together). It runs on the build
+# platform and cross-compiles for the target platform BuildKit names.
+# =============================================================================
+FROM --platform=$BUILDPLATFORM golang:1.26.8-alpine3.24@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c AS build
+
+ARG SRW_SOURCE_REVISION="dev"
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /src
+COPY drivers/mcp-front/ ./
+RUN set -eu; \
+    goarch="${TARGETARCH:-$(go env GOARCH)}"; \
+    CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="$goarch" go build -trimpath \
+        -ldflags "-s -w -X main.version=${SRW_SOURCE_REVISION}" \
+        -o /out/srw-mcp-front .; \
+    if [ "$goarch" = "$(go env GOHOSTARCH)" ]; then /out/srw-mcp-front version; fi
+
+FROM scratch
+COPY --from=build /out/srw-mcp-front /srw-mcp-front
+USER 65532:65532
+ENTRYPOINT ["/srw-mcp-front"]
+CMD ["serve"]

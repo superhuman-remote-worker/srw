@@ -340,6 +340,25 @@ connectors:
       image:
         repository: srw-registry:5000/srw-driver-echo
         tag: dev
+    # Managed MCP (D5a). Tilt builds srw-driver-mcp-front and srw-driver-mcp-test
+    # and overrides their repository, tag and digest; these placeholders only
+    # keep a plain `helm install` rendering. The official Gitea MCP server is
+    # pulled from docker.gitea.com at the chart's pinned digest.
+    mcpFront:
+      image:
+        repository: srw-registry:5000/srw-driver-mcp-front
+        tag: dev
+        digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    managedMcp:
+      gitea:
+        enabled: true
+    # The development MCP test server (srw.mcp-test/v1) the managed MCP gate
+    # drives.
+    mcpTest:
+      enabled: true
+      image:
+        repository: srw-registry:5000/srw-driver-mcp-test
+        tag: dev
 
 databases:
   # Non-HA local default. All five PostgreSQL engines continue to inherit

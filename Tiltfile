@@ -438,6 +438,26 @@ docker_build(
     only=['drivers/echo/', 'docker/Dockerfile.driver-echo'],
 )
 
+# Managed MCP front (connector drivers D5a): SRW's static Go front every
+# managed MCP driver pod runs beside its server, the pod's only exposed port.
+# The chart pins it by digest, as it does the shim.
+docker_build(
+    'srw-driver-mcp-front',
+    context='.',
+    dockerfile='docker/Dockerfile.driver-mcp-front',
+    only=['drivers/mcp-front/', 'docker/Dockerfile.driver-mcp-front'],
+)
+
+# Development MCP test server (D5a): the image behind srw.mcp-test/v1, which
+# only the k3d profile installs (connectors.drivers.mcpTest) and
+# scripts/k3d-managed-mcp-gate.py drives. Dev-only, like the echo driver.
+docker_build(
+    'srw-driver-mcp-test',
+    context='.',
+    dockerfile='docker/Dockerfile.driver-mcp-test',
+    only=['drivers/mcp-test/', 'docker/Dockerfile.driver-mcp-test'],
+)
+
 _srw_images = [
     ('srw-orchestrator', 'image.orchestrator.repository', 'image.orchestrator.tag'),
     ('srw-cockpit', 'image.cockpit.repository', 'image.cockpit.tag'),
@@ -449,6 +469,8 @@ _srw_images = [
     ('srw-vm-preparer', 'vmController.preparation.image.repository', 'vmController.preparation.image.tag'),
     ('srw-driver-shim', 'connectors.drivers.shim.image.repository', 'connectors.drivers.shim.image.tag'),
     ('srw-driver-echo', 'connectors.drivers.echo.image.repository', 'connectors.drivers.echo.image.tag'),
+    ('srw-driver-mcp-front', 'connectors.drivers.mcpFront.image.repository', 'connectors.drivers.mcpFront.image.tag'),
+    ('srw-driver-mcp-test', 'connectors.drivers.mcpTest.image.repository', 'connectors.drivers.mcpTest.image.tag'),
 ]
 
 # Tilt fills in TILT_IMAGE_<i> (the freshly built+pushed ref) per image_deps
@@ -464,7 +486,7 @@ for i in range(len(_srw_images)):
     _srw_helm_env['TILT_IMAGE_KEY_TAG_%s' % i] = _srw_images[i][2]
     # These chart images also accept a digest, which outranks the tag. Tilt
     # owns the local image selection, including a pin saved by an earlier gate.
-    if _srw_images[i][0] in ['srw-mcp', 'srw-vm-preparer', 'srw-driver-shim', 'srw-driver-echo']:
+    if _srw_images[i][0] in ['srw-mcp', 'srw-vm-preparer', 'srw-driver-shim', 'srw-driver-echo', 'srw-driver-mcp-front', 'srw-driver-mcp-test']:
         _srw_helm_env['TILT_IMAGE_KEY_DIGEST_%s' % i] = _srw_images[i][2][:-4] + '.digest'
 
 _srw_exposure_mode = os.getenv('SRW_EXPOSURE_MODE') or 'multi-host'

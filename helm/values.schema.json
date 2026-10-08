@@ -1477,6 +1477,56 @@
                 }
               }
             },
+            "mcpFront": {
+              "type": "object",
+              "properties": {
+                "image": {
+                  "type": "object",
+                  "properties": {
+                    "repository": {"type": "string", "minLength": 1},
+                    "tag": {"type": "string"},
+                    "digest": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"}
+                  }
+                }
+              }
+            },
+            "managedMcp": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "gitea": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": {"type": "boolean"},
+                    "image": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "repository": {"type": "string"},
+                        "tag": {"type": "string"},
+                        "digest": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"}
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "mcpTest": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "image": {
+                  "type": "object",
+                  "properties": {
+                    "repository": {"type": "string"},
+                    "tag": {"type": "string"},
+                    "digest": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"}
+                  }
+                }
+              }
+            },
             "registry": {
               "type": "object",
               "additionalProperties": false,

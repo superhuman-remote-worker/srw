@@ -286,3 +286,51 @@ def test_develop_rebuilds_the_shim_when_its_inputs_change():
     text, _ = workflow("develop")
     assert "DRIVER_SHIM_PATHS=(drivers/shim/" in text
     assert 'image_missing driver-shim "$DRIVER_SHIM_SHA"' in text
+
+
+@pytest.mark.parametrize(
+    ("name", "publication"),
+    [("develop", "deploy-experimental"), ("main", "release-chart")],
+)
+def test_the_mcp_front_is_vetted_tested_built_and_pinned_by_digest(name, publication):
+    """Every managed MCP pod runs the front (D5a): CI vets and tests it with
+    the toolchain its pinned base carries, publishes it, and the chart pins
+    its digest; publication waits for it."""
+    import re
+
+    _, jobs = workflow(name)
+    steps = jobs["build-driver-mcp-front"]["steps"]
+    test = next(s for s in steps if s.get("name") == "Vet and test the front")
+    assert test["working-directory"] == "drivers/mcp-front"
+    assert "go vet ./..." in test["run"] and "go test" in test["run"]
+    go = next(s for s in steps if s.get("uses", "").startswith("actions/setup-go@"))
+    dockerfile = (SCRIPT.parents[1] / "docker/Dockerfile.driver-mcp-front").read_text()
+    base = re.search(
+        r"FROM --platform=\$BUILDPLATFORM golang:([0-9.]+)-alpine[0-9.]*"
+        r"@sha256:[0-9a-f]{64} AS build",
+        dockerfile,
+    )
+    assert base is not None and base.group(1) == go["with"]["go-version"]
+    build = next(
+        s["with"] for s in steps if s.get("uses", "").startswith("docker/build-push")
+    )
+    assert build["file"] == "./docker/Dockerfile.driver-mcp-front"
+    assert "driver-mcp-front" in build["cache-to"]
+    scripts = "\n".join(step.get("run", "") for step in jobs[publication]["steps"])
+    assert (
+        ".connectors.drivers.mcpFront.image.digest = strenv(DRIVER_MCP_FRONT_DIGEST)"
+        in scripts
+    )
+    assert "build-driver-mcp-front" in jobs[publication]["needs"]
+    assert "driver-mcp-front" in gate.COMPONENTS
+
+
+def test_develop_rebuilds_the_mcp_front_when_its_inputs_change():
+    text, jobs = workflow("develop")
+    assert "DRIVER_MCP_FRONT_PATHS=(drivers/mcp-front/" in text
+    assert 'image_missing driver-mcp-front "$DRIVER_MCP_FRONT_SHA"' in text
+    outputs = jobs["changes"]["outputs"]
+    assert "driver-mcp-front" in outputs and "driver-mcp-front-sha" in outputs
+    # The development MCP test server is never published.
+    for name in ("develop", "main"):
+        assert "mcp-test" not in workflow(name)[0]

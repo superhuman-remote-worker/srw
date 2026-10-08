@@ -2000,6 +2000,37 @@ spec:
               value: {{ printf "%s:%s%s" .image.repository (.image.tag | default "latest") (ternary (printf "@%s" .image.digest) "" (ne (.image.digest | default "") "")) | quote }}
             {{- end }}
             {{- end }}
+            # Managed MCP servers (connector drivers D5a): driver name ->
+            # image reference (tag, or tag@digest), and the front they run behind.
+            {{- $managedMcp := dict }}
+            {{- range $key, $name := dict "gitea" "srw.gitea-mcp/v1" }}
+            {{- $entry := index $.Values.connectors.drivers.managedMcp $key }}
+            {{- if $entry.enabled }}
+            {{- $_ := set $managedMcp $name $entry.image }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.connectors.drivers.mcpTest.enabled }}
+            {{- $_ := set $managedMcp "srw.mcp-test/v1" .Values.connectors.drivers.mcpTest.image }}
+            {{- end }}
+            {{- if $managedMcp }}
+            {{- if not .Values.connectors.servicePods.enabled }}
+            {{- fail "a managed MCP server (connectors.drivers.managedMcp, mcpTest) needs connectors.servicePods.enabled: it runs as a service-plane driver" }}
+            {{- end }}
+            {{- if not .Values.connectors.drivers.mcpFront.image.digest }}
+            {{- fail "a managed MCP server needs connectors.drivers.mcpFront.image.digest: every managed MCP pod runs the front, so it is pinned by digest (CI stamps it; Tilt sets it in k3d)" }}
+            {{- end }}
+            {{- $references := dict }}
+            {{- range $name, $image := $managedMcp }}
+            {{- if not $image.repository }}
+            {{- fail (printf "the managed MCP server %s needs its image.repository" $name) }}
+            {{- end }}
+            {{- $_ := set $references $name (printf "%s:%s%s" $image.repository ($image.tag | default "latest") (ternary (printf "@%s" $image.digest) "" (ne ($image.digest | default "") ""))) }}
+            {{- end }}
+            - name: CONNECTOR_MANAGED_MCP_IMAGES
+              value: {{ $references | toJson | quote }}
+            - name: CONNECTOR_MCP_FRONT_IMAGE
+              value: {{ include "srw.imageRef" (dict "image" .Values.connectors.drivers.mcpFront.image) | quote }}
+            {{- end }}
             - name: KB_EXTERNAL_REINDEX_CONCURRENCY
               value: {{ .Values.orchestrator.kbExternalReindexConcurrency | quote }}
             - name: KB_REINDEX_SWEEP_SECONDS
