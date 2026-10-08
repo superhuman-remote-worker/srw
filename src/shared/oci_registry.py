@@ -74,11 +74,26 @@ _NEVER: tuple[_Network, ...] = tuple(
     )
 )
 #: Public by the registry of special addresses, yet able to carry a private
-#: IPv4 address: only for listed hosts.
-_TRANSLATED: tuple[_Network, ...] = tuple(
-    ipaddress.ip_network(cidr)
-    for cidr in ("64:ff9b::/96", "64:ff9b:1::/48", "2002::/16")
-)
+#: IPv4 address: only for listed hosts, and never one whose embedded IPv4
+#: address is never dialled.
+_NAT64 = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("64:ff9b:1::/48"))
+_6TO4 = ipaddress.ip_network("2002::/16")
+_TRANSLATED: tuple[_Network, ...] = (*_NAT64, _6TO4)
+#: Deprecated IPv4-compatible IPv6 (``::a.b.c.d``), never dialled (``::``
+#: and ``::1`` excepted, which are not IPv4 addresses).
+_IPV4_COMPATIBLE = ipaddress.ip_network("::/96")
+
+
+def _embedded_ipv4(address: _Address) -> ipaddress.IPv4Address | None:
+    """The IPv4 address a NAT64 or 6to4 address carries, or ``None``."""
+    if address.version != 6:
+        return None
+    value = int(address)
+    if any(address in network for network in _NAT64):
+        return ipaddress.IPv4Address(value & 0xFFFFFFFF)
+    if address in _6TO4:
+        return ipaddress.IPv4Address((value >> 80) & 0xFFFFFFFF)
+    return None
 
 
 class RegistryResolutionError(ValueError):
@@ -101,9 +116,15 @@ def address_refusal(
     mapped = getattr(address, "ipv4_mapped", None)
     if mapped is not None:
         address = mapped
-    for network in _NEVER:
-        if network.version == address.version and address in network:
-            return "is link-local, metadata, multicast or unspecified"
+    if address.version == 6 and address in _IPV4_COMPATIBLE and int(address) > 1:
+        return "is an IPv4-compatible address"
+    embedded = _embedded_ipv4(address)
+    for candidate in (address, embedded):
+        if candidate is None:
+            continue
+        for network in _NEVER:
+            if network.version == candidate.version and candidate in network:
+                return "is link-local, metadata, multicast or unspecified"
     if private_allowed:
         return None
     for network in refused:
@@ -226,15 +247,17 @@ class RegistryResolver:
         if self.hosts is not None and not self.insecure_hosts <= self.hosts:
             raise ValueError("Insecure registry hosts must be explicitly allowed.")
 
-    async def _dial(self, url: str) -> tuple[str, dict[str, str], dict[str, Any]]:
-        """The URL to request, extra headers and extensions.
+    async def _dial(self, url: str) -> list[tuple[str, dict[str, str], dict[str, Any]]]:
+        """The URLs to request in turn, with extra headers and extensions.
 
         With address checks, the host is resolved once and every answer must
-        be allowed; the request dials the first, keeping the name for the
-        Host header and for TLS (SNI and certificate check).
+        be allowed; the request dials them in order (the next when one does
+        not connect), keeping the name for the Host header and for TLS (SNI
+        and certificate check). No connection is kept alive: a pool keyed by
+        address would reuse one name's TLS session for another.
         """
         if not self.checks_addresses:
-            return url, {}, {}
+            return [(url, {}, {})]
         parsed = httpx.URL(url)
         host = parsed.host
         netloc = parsed.netloc.decode("ascii")
@@ -266,15 +289,18 @@ class RegistryResolver:
                 )
                 raise RegistryResolutionError("Registry address is not allowed.")
         if literal:
-            return url, {}, {}
+            return [(url, {"Connection": "close"}, {})]
         extensions: dict[str, Any] = {}
         if parsed.scheme == "https":
             extensions["sni_hostname"] = host
-        return (
-            str(parsed.copy_with(host=str(answers[0]))),
-            {"Host": netloc},
-            extensions,
-        )
+        return [
+            (
+                str(parsed.copy_with(host=str(address))),
+                {"Host": netloc, "Connection": "close"},
+                extensions,
+            )
+            for address in answers
+        ]
 
     def permitted(self, image):
         host, _, _ = image_reference(image)
@@ -284,33 +310,54 @@ class RegistryResolver:
     async def _response(self, client, url, *, headers=None, params=None):
         try:
             async with asyncio.timeout(self.timeout):
-                dial, pinned, extensions = await self._dial(url)
-                async with client.stream(
-                    "GET",
-                    dial,
-                    headers={**(headers or {}), **pinned},
-                    params=params,
-                    extensions=extensions,
-                ) as response:
-                    content = bytearray()
-                    async for block in response.aiter_bytes():
-                        content.extend(block)
-                        if len(content) > MAX_RESPONSE_BYTES:
-                            raise RegistryResolutionError(
-                                "Registry response exceeds its size limit."
-                            )
-                    return response.status_code, response.headers, bytes(content)
+                candidates = await self._dial(url)
+                for index, (dial, pinned, extensions) in enumerate(candidates):
+                    try:
+                        return await self._fetch(
+                            client,
+                            dial,
+                            headers={**(headers or {}), **pinned},
+                            params=params,
+                            extensions=extensions,
+                        )
+                    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                        if index == len(candidates) - 1:
+                            raise
+                        logger.info("Registry address did not connect (%s)", exc)
+                raise RegistryResolutionError("Registry host does not resolve.")
         except TimeoutError:
             raise RegistryResolutionError(
                 "Registry response deadline exceeded."
             ) from None
 
+    @staticmethod
+    async def _fetch(client, url, *, headers, params, extensions):
+        async with client.stream(
+            "GET", url, headers=headers, params=params, extensions=extensions
+        ) as response:
+            content = bytearray()
+            async for block in response.aiter_bytes():
+                content.extend(block)
+                if len(content) > MAX_RESPONSE_BYTES:
+                    raise RegistryResolutionError(
+                        "Registry response exceeds its size limit."
+                    )
+            return response.status_code, response.headers, bytes(content)
+
     def _client(self) -> httpx.AsyncClient:
+        options: dict[str, Any] = {}
+        if self.checks_addresses:
+            # Requests dial checked addresses with a name for TLS: never reuse
+            # one name's connection for another name at the same address.
+            options["limits"] = httpx.Limits(
+                max_connections=10, max_keepalive_connections=0
+            )
         return httpx.AsyncClient(
             timeout=self.timeout,
             follow_redirects=False,
             trust_env=False,
             transport=self.transport,
+            **options,
         )
 
     async def _authorize(self, client, response_headers, *, endpoint, repository):

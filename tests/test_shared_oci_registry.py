@@ -34,6 +34,7 @@ DNS = {
     "storage.internal": ["192.168.1.10"],
     "mixed.example": ["93.184.216.37", "10.0.0.7"],
     "pods.example": ["11.1.2.3"],
+    "two.example": ["93.184.216.40", "93.184.216.41"],
 }
 
 
@@ -278,6 +279,21 @@ async def test_vm_preparation_trusts_its_allow_list_by_name():
         ("fe80::1", True, True),
         ("0.0.0.0", True, True),
         ("224.0.0.1", True, True),
+        # IPv4-mapped addresses are their IPv4 address: listed private ones
+        # pass, mapped metadata never does.
+        ("::ffff:10.0.0.1", True, False),
+        ("::ffff:169.254.169.254", True, True),
+        ("::ffff:168.63.129.16", True, True),
+        # A NAT64 or 6to4 address carrying a metadata address, listed or not.
+        ("64:ff9b::a9fe:a9fe", True, True),
+        ("64:ff9b:1::a9fe:a9fe", True, True),
+        ("2002:a9fe:a9fe::1", True, True),
+        ("64:ff9b::a00:1", True, False),
+        # IPv4-compatible IPv6 is deprecated: never.
+        ("::a00:1", True, True),
+        ("::a9fe:a9fe", False, True),
+        # ...but loopback stays loopback.
+        ("::1", True, False),
     ],
 )
 def test_address_refusal(address, listed, refused):
@@ -377,6 +393,54 @@ async def test_a_token_realm_at_a_private_address_is_refused():
     with pytest.raises(RegistryResolutionError, match="address is not allowed"):
         await resolver.resolve_image("anywhere.example/team/echo:1.0")
     assert [_name(r) for r in seen] == ["anywhere.example"]
+
+
+@pytest.mark.asyncio
+async def test_the_next_answer_is_dialled_when_one_does_not_connect():
+    seen: list = []
+    _manifest_bytes, registry = _registry(_config(), seen=seen)
+
+    def handler(request):
+        if request.url.host == "93.184.216.40":
+            seen.append(request)
+            raise httpx.ConnectError("unreachable", request=request)
+        return registry(request)
+
+    image = await _resolver(handler).resolve_image("two.example/team/echo:1")
+    assert image.entrypoint == ()
+    hosts = [r.url.host for r in seen]
+    assert hosts[:2] == ["93.184.216.40", "93.184.216.41"]
+    assert {r.headers["Host"] for r in seen} == {"two.example"}
+
+
+@pytest.mark.asyncio
+async def test_every_answer_failing_is_an_error():
+    def handler(request):
+        raise httpx.ConnectError("unreachable", request=request)
+
+    with pytest.raises(httpx.ConnectError):
+        await _resolver(handler).resolve_image("two.example/team/echo:1")
+
+
+@pytest.mark.asyncio
+async def test_no_connection_is_kept_alive_across_names():
+    """A pool keyed by address would reuse one name's TLS session for
+    another name at the same address."""
+    seen: list = []
+    _manifest_bytes, handler = _registry(_config(), seen=seen)
+    await _resolver(handler).resolve_image("anywhere.example/team/echo:1.0")
+    assert {r.headers.get("Connection") for r in seen} == {"close"}
+    client = RegistryResolver(hosts=None)._client()
+    try:
+        assert client._transport._pool._max_keepalive_connections == 0
+    finally:
+        await client.aclose()
+    # An operator's allow-list keeps httpx's default pool.
+    allowed = RegistryResolver(hosts=["registry.internal"])._client()
+    try:
+        assert allowed._transport._pool._max_keepalive_connections > 0
+    finally:
+        await allowed.aclose()
 
 
 @pytest.mark.asyncio
