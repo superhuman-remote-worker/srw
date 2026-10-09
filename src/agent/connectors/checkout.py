@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import re
 import shlex
+import threading
 from collections.abc import Callable, Sequence
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -38,6 +39,7 @@ from agent.connectors.base import (
     declared_read_only_note,
 )
 from agent.connectors.git_swap import (
+    CANCELLED,
     SwapBinding,
     binding_options,
     install_wiring,
@@ -203,12 +205,14 @@ if changed and not os.path.islink(config):
 """
 
 
-def _legacy_ssh_key_files(backend: Any, ssh_dir: str) -> set[str]:
+def _legacy_ssh_key_files(
+    backend: Any, ssh_dir: str, *, tab_name: str = "git"
+) -> set[str]:
     """Names of pre-agent ``~/.ssh/repo_*`` key files; empty when unsure."""
 
     output = str(
         backend.shell_run(
-            _list_legacy_keys_command(ssh_dir), timeout=10, tab_name="git"
+            _list_legacy_keys_command(ssh_dir), timeout=10, tab_name=tab_name
         )
     )
     answers = [
@@ -222,7 +226,11 @@ def _legacy_ssh_key_files(backend: Any, ssh_dir: str) -> set[str]:
 
 
 def _retire_legacy_ssh_key_files(
-    backend: Any, outcomes: List[Tuple[str, Any]], *, mode: str
+    backend: Any,
+    outcomes: List[Tuple[str, Any]],
+    *,
+    mode: str,
+    tab_name: str = "git",
 ) -> None:
     """Delete pre-agent key files whose repository works through its alias.
 
@@ -245,7 +253,7 @@ def _retire_legacy_ssh_key_files(
         )
 
         ssh_dir = backend.resolve_home_path(".ssh")
-        found = _legacy_ssh_key_files(backend, ssh_dir)
+        found = _legacy_ssh_key_files(backend, ssh_dir, tab_name=tab_name)
         if not found:
             return
         can_sweep = mode == "sweep" and all(
@@ -503,6 +511,8 @@ def clone_repository_datasources(
     ssh_identity_status: Optional[Dict[str, str]] = None,
     legacy_key_files: str = "sweep",
     clone_names: Optional[List[str]] = None,
+    shell_tab: str = "git",
+    cancel: Optional[threading.Event] = None,
 ) -> None:
     """Clone repository datasources onto the workspace backend.
 
@@ -537,6 +547,11 @@ def clone_repository_datasources(
             full set (key files no listed repository owns may go too),
             ``own`` for a partial set (a live add), ``keep`` when the
             workspace is someone else's (a child job on its parent's).
+        shell_tab: The backend shell tab the git commands run on (a live
+            add's own tab, so the event loop's git never waits for it).
+        cancel: Set when the clone is no longer wanted (the live change
+            was cancelled, the session ends): no further repository is
+            started, and a wait for a driver stops at its next try.
     """
     if not isinstance(ssh_identity_status, dict):
         ssh_identity_status = None
@@ -593,6 +608,9 @@ def clone_repository_datasources(
     )
     ssh_outcomes: List[List[Any]] = []
     for index, (ds, repo_name) in enumerate(zip(repo_datasources, clone_names)):
+        if cancel is not None and cancel.is_set():
+            logger.info("Repository clone stopped before %s: %s", repo_name, CANCELLED)
+            return
         # ds_name is the safe form of the user-supplied datasource label.
         ds_name = (
             re.sub(r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()).strip("-")
@@ -658,6 +676,7 @@ def clone_repository_datasources(
                     target,
                     backend=backend,
                     remote_cwd=remote_cwd,
+                    shell_tab=shell_tab,
                 )
                 other = _other_repository(git_mgr, ds.get("connection_url", ""))
                 if other is not None:
@@ -720,7 +739,9 @@ def clone_repository_datasources(
             else:
                 if swap is not None:
                     # A new binding's pod may still be starting.
-                    unserved = wait_for_driver(backend, swap)
+                    unserved = wait_for_driver(
+                        backend, swap, tab_name=shell_tab, cancel=cancel
+                    )
                     if unserved is not None:
                         logger.warning(
                             "Skipping repository datasource %r: %s",
@@ -729,11 +750,19 @@ def clone_repository_datasources(
                         )
                         _note_skipped(workspace_manager, repo_name, unserved)
                         continue
+                if cancel is not None and cancel.is_set():
+                    logger.info(
+                        "Repository clone stopped before %s: %s",
+                        repo_name,
+                        CANCELLED,
+                    )
+                    return
                 git_mgr = GitManager.clone(
                     repo_url,
                     target,
                     backend=backend,
                     remote_cwd=remote_cwd,
+                    shell_tab=shell_tab,
                     # The checkout does not exist yet, so its gitdir-scoped
                     # rules do not apply to the clone: name them.
                     **(
@@ -844,11 +873,12 @@ def clone_repository_datasources(
                 workspace_manager, repo_name, f"the clone failed ({type(e).__name__})"
             )
 
-    if ssh_outcomes:
+    if ssh_outcomes and not (cancel is not None and cancel.is_set()):
         _retire_legacy_ssh_key_files(
             backend,
             [(name, outcome) for name, outcome in ssh_outcomes],
             mode=legacy_key_files,
+            tab_name=shell_tab,
         )
 
 
@@ -906,6 +936,52 @@ def _clone_names_of(old: Sequence[Delivery], removed: set[str]) -> List[str]:
 #: while a turn's tools may read the workspace. Replaced whole, never
 #: mutated.
 PENDING_META = "source_repo_pending_meta"
+#: The workspace manager attribute holding the tokens of repositories
+#: detached live: their checkouts stay on the workspace (a token-in-URL
+#: one's ``.git/config`` holds its token), so redaction keeps them for the
+#: rest of the session. Replaced whole, never mutated.
+DETACHED_META = "source_repo_detached_meta"
+#: The shell tab every git command of the session itself runs on.
+GIT_TAB = "git"
+#: The shell tab a live add clones on. A backend runs one command at a time
+#: per tab (``RemoteBackend`` holds the tab's lock for the whole command):
+#: on ``git``, a clone of minutes in its worker thread would hold up the
+#: event loop's own git (the turn's commit, the repo tools, the final
+#: commit). Live changes are serialized, so one tab serves them all; it is
+#: opened for the change and closed after it.
+LIVE_CHECKOUT_TAB = "srw-live-checkout"
+
+
+def _open_live_tab(backend: Any) -> str:
+    """The tab a live add clones on: :data:`LIVE_CHECKOUT_TAB`, or
+    :data:`GIT_TAB` when the backend cannot open it (its tab cap reached)."""
+    ensure = getattr(backend, "shell_ensure_tab", None)
+    if not callable(ensure):
+        return GIT_TAB
+    try:
+        ensure(LIVE_CHECKOUT_TAB)
+    except Exception as exc:
+        logger.warning(
+            "The live checkout runs on the %r tab (its own tab could not be "
+            "opened: %s); the session's own git waits for each of its commands",
+            GIT_TAB,
+            str(exc)[:200] or type(exc).__name__,
+        )
+        return GIT_TAB
+    return LIVE_CHECKOUT_TAB
+
+
+def _close_live_tab(backend: Any, tab: str) -> None:
+    """Close the live add's own tab (never ``git``); best effort."""
+    if tab == GIT_TAB:
+        return
+    close = getattr(backend, "shell_close_tab", None)
+    if not callable(close):
+        return
+    try:
+        close(tab)
+    except Exception as exc:
+        logger.debug("Could not close the %r tab: %s", tab, type(exc).__name__)
 
 
 class _StagedCheckouts:
@@ -928,12 +1004,18 @@ class _StagedCheckouts:
     def swap_into(self, workspace_manager: Any) -> None:
         """Register what was cloned and record why the rest was not.
 
-        Metadata first: a reader that finds a checkout finds its metadata
-        (the repo tools refuse a write without it; redaction reads its
-        token). Each update is one C-level dict operation, so a reader in
-        another thread (a synchronous git tool) sees a checkout whole or
-        not at all.
+        Each checkout's git moves to the session's own tab first (it cloned
+        on the live add's, which is closed). Metadata next: a reader that
+        finds a checkout finds its metadata (the repo tools refuse a write
+        without it; redaction reads its token). Each update is one C-level
+        dict operation, so a reader in another thread (a synchronous git
+        tool) sees a checkout whole or not at all.
         """
+        for git_mgr in self.source_repos.values():
+            try:
+                git_mgr.shell_tab = GIT_TAB
+            except AttributeError:
+                pass
         workspace_manager.source_repo_meta.update(self.source_repo_meta)
         workspace_manager.source_repos.update(self.source_repos)
         skipped = getattr(workspace_manager, "source_repo_skipped", None)
@@ -952,6 +1034,21 @@ def _pending_meta(entries: Sequence[Dict[str, Any]]) -> tuple[Dict[str, str], ..
         if isinstance(token, str) and token:
             pending.append({"token": token})
     return tuple(pending)
+
+
+def _keep_redacting(workspace_manager: Any, metas: Sequence[Any]) -> None:
+    """Add detached repositories' tokens to :data:`DETACHED_META` (once each)."""
+    kept = getattr(workspace_manager, DETACHED_META, None)
+    kept = tuple(kept) if isinstance(kept, tuple) else ()
+    known = {meta.get("token") for meta in kept if isinstance(meta, dict)}
+    added = []
+    for meta in metas:
+        token = meta.get("token") if isinstance(meta, dict) else None
+        if isinstance(token, str) and token and token not in known:
+            known.add(token)
+            added.append({"token": token})
+    if added:
+        setattr(workspace_manager, DETACHED_META, (*kept, *added))
 
 
 class CheckoutMaterializer:
@@ -998,18 +1095,28 @@ class CheckoutMaterializer:
         on the workspace.
 
         A removed repository keeps its clone on the workspace (cheap
-        honesty: scrubbing is not a security boundary). Its clone name is
-        resolved over the OLD full list (payload order), so collision
-        suffixes match what attach actually registered.
+        honesty: scrubbing is not a security boundary), so its token stays
+        redacted for the rest of the session (:data:`DETACHED_META`). Its
+        clone name is resolved over the OLD full list (payload order), so
+        collision suffixes match what attach actually registered.
         """
         added, removed = _live_changes(old, new)
         workspace_manager = rt.workspace_manager
         if not workspace_manager:
             return
-        for clone_name in _clone_names_of(old, removed):
+        removed_names = _clone_names_of(old, removed)
+        # Kept for redaction before the metadata that held it goes.
+        _keep_redacting(
+            workspace_manager,
+            [
+                workspace_manager.source_repo_meta.get(clone_name)
+                for clone_name in removed_names
+            ]
+            + list(_pending_meta([d.entry for d in old if _key(d) in removed])),
+        )
+        for clone_name in removed_names:
             # Repository first, then its metadata, which holds its plaintext
-            # token; leaving that behind keeps a detached credential live on
-            # the workspace manager for the rest of the session.
+            # token: the repo tools must not use a detached credential.
             workspace_manager.source_repos.pop(clone_name, None)
             workspace_manager.source_repo_meta.pop(clone_name, None)
         if added:
@@ -1025,6 +1132,7 @@ class CheckoutMaterializer:
         old: Sequence[Delivery],
         new: Sequence[Delivery],
         rt: RuntimeContext,
+        cancel: Optional[threading.Event] = None,
     ) -> Callable[[], None]:
         """Clone added repositories and drop a detached one's wiring (the
         slow step, for a worker thread, after :meth:`begin_replace`);
@@ -1033,12 +1141,16 @@ class CheckoutMaterializer:
 
         The clone fills a staging registry (:class:`_StagedCheckouts`), not
         the workspace manager's, so a turn in flight never reads a checkout
-        half made. A detached git swap binding loses its wiring (its lease
-        was revoked with the detach). An added repository's clone name is
-        resolved over the full new list: the name a resume resolves and the
-        README lists. A checkout already there whose origin is another
-        repository (an order that changed) is never re-pointed: that one
-        repository is skipped and the README says why.
+        half made, and its git runs on its own shell tab
+        (:data:`LIVE_CHECKOUT_TAB`), so the event loop's git never waits for
+        it. A set ``cancel`` stops it between steps: a wait for a driver at
+        its next try, the clone before its next repository. A detached git
+        swap binding loses its wiring (its lease was revoked with the
+        detach). An added repository's clone name is resolved over the full
+        new list: the name a resume resolves and the README lists. A
+        checkout already there whose origin is another repository (an order
+        that changed) is never re-pointed: that one repository is skipped
+        and the README says why.
         """
         added, removed = _live_changes(old, new)
         workspace_manager = rt.workspace_manager
@@ -1049,7 +1161,10 @@ class CheckoutMaterializer:
                 id(delivery): name for delivery, name in zip(new, names, strict=True)
             }
             staged = _StagedCheckouts(workspace_manager)
+            tab = GIT_TAB
             try:
+                if getattr(staged.backend, "supports_shell", False):
+                    tab = _open_live_tab(staged.backend)
                 clone_repository_datasources(
                     [delivery.entry for delivery in added],
                     staged,
@@ -1058,9 +1173,13 @@ class CheckoutMaterializer:
                     # not this batch's to sweep.
                     legacy_key_files="own",
                     clone_names=[named[id(delivery)] for delivery in added],
+                    shell_tab=tab,
+                    cancel=cancel,
                 )
             except Exception as e:
                 logger.warning("Live repository clone failed: %s", e)
+            finally:
+                _close_live_tab(staged.backend, tab)
         if removed and workspace_manager:
             # A detached swap repository's wiring goes too (housekeeping: its
             # lease is already revoked). The clean remote stays.

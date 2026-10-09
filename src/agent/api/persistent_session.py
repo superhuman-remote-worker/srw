@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import asdict as _dc_asdict
 from dataclasses import dataclass, field
@@ -358,6 +359,9 @@ class PersistentSession:
     # change must diff against what the last one applied. A backend swap (the
     # VM upgrade) takes it too: it re-delivers the applied connectors.
     _live_connector_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # The running live change's cancel event (a ``threading.Event``), set by
+    # cleanup so its clone thread stops with the session.
+    _live_change_cancel: Optional[Any] = field(default=None, repr=False)
     # ``{authority_id: status}`` of the connector SSH identities loaded into
     # workspace ssh-agents (C1); credential-free. Set at setup, updated live.
     workspace_ssh_identity_status: Dict[str, str] = field(default_factory=dict)
@@ -3176,19 +3180,28 @@ class PersistentSession:
             for category, names in datasource_tool_categories(new_configs).items():
                 setattr(self.config.tools, category, list(names))
 
+        # Set when this change is no longer wanted (its task cancelled, the
+        # session's cleanup): its clone in a worker thread stops at the next
+        # step boundary instead of running on after the session.
+        cancel = threading.Event()
         connector_runtime = RuntimeContext(
             execution="session",
             workspace_manager=self.workspace_manager,
             ssh_identities=workspace_ssh_identities,
             ssh_identity_status=self.workspace_ssh_identity_status,
+            cancel=cancel,
         )
         del workspace_ssh_identities
-        await connector_registry().replace_live(
-            deliveries_from_payload(old_configs),
-            deliveries_from_payload(new_configs),
-            connector_runtime,
-            on_harness_replaced=_swap_harness,
-        )
+        self._live_change_cancel = cancel
+        try:
+            await connector_registry().replace_live(
+                deliveries_from_payload(old_configs),
+                deliveries_from_payload(new_configs),
+                connector_runtime,
+                on_harness_replaced=_swap_harness,
+            )
+        finally:
+            self._live_change_cancel = None
         if connector_runtime.ssh_identity_status is not None:
             self.workspace_ssh_identity_status = connector_runtime.ssh_identity_status
 
@@ -3827,6 +3840,11 @@ class PersistentSession:
         # or remote cleanup. The monitor/controller active flags may remain
         # true until their teardown completes.
         self._protected_cloud_health_ready = False
+        # A live connector change still cloning in a worker thread stops at
+        # its next step boundary (its task may already be cancelled).
+        live_change = getattr(self, "_live_change_cancel", None)
+        if live_change is not None:
+            live_change.set()
         if not preserve_shell and not preserve_workspace_daemons:
             self.local_quiescence_protocol = ""
         if preserve_workspace_daemons and self.shell_owner_token is None:

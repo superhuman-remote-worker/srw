@@ -62,12 +62,17 @@ def workspace_secrets(tool_context: Optional[Any]) -> List[str]:
     if workspace is None:
         return secrets
     try:
-        # The tokens of a live add still cloning first, then a snapshot of
-        # the registered metadata (one C-level copy): the swap-in writes the
-        # metadata before it clears the pending tokens, so a reader in a
-        # worker thread holds a token in one or the other.
-        pending = getattr(workspace, "source_repo_pending_meta", None)
-        metas = list(pending) if isinstance(pending, tuple) else []
+        # The tokens of a live add still cloning and of repositories detached
+        # live (their checkouts stay on the workspace) first, then a snapshot
+        # of the registered metadata (one C-level copy): a live change keeps
+        # a token in the first two before it leaves the metadata, and writes
+        # the metadata before it clears the pending tokens, so a reader in a
+        # worker thread holds every token in one or the other.
+        metas: List[Any] = []
+        for name in ("source_repo_pending_meta", "source_repo_detached_meta"):
+            kept = getattr(workspace, name, None)
+            if isinstance(kept, tuple):
+                metas.extend(kept)
         metas.extend((getattr(workspace, "source_repo_meta", None) or {}).values())
         for meta in metas:
             token = meta.get("token") if isinstance(meta, dict) else None

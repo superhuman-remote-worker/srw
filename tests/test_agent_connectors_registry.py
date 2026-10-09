@@ -107,7 +107,7 @@ class _StagedRecorder(_Recorder):
     def begin_replace(self, old, new, rt):
         pass
 
-    def stage_replace(self, old, new, rt):
+    def stage_replace(self, old, new, rt, cancel=None):
         return lambda: self.replace(old, new, rt)
 
 
@@ -555,7 +555,7 @@ async def test_a_waiting_live_checkout_leaves_the_event_loop_running():
         def begin_replace(self, old, new, rt):
             pass
 
-        def stage_replace(self, old, new, rt):
+        def stage_replace(self, old, new, rt, cancel=None):
             loop.call_soon_threadsafe(loop_ran.set)
             waited = loop_ran.wait(timeout=5)
             return lambda: self.log.append((self.form, "replace", waited))
@@ -572,6 +572,62 @@ async def test_a_waiting_live_checkout_leaves_the_event_loop_running():
         on_harness_replaced=lambda connections, clients: None,
     )
     assert ("checkout", "replace", True) in calls
+
+
+@pytest.mark.asyncio
+async def test_a_live_update_can_be_stopped_by_the_sessions_cleanup(monkeypatch):
+    """The change runs with a cancel event the session holds while it runs
+    (cleanup sets it; see test_persistent_session) and forgets after."""
+    session = _live_session([])
+    seen: list = []
+
+    async def replace_live(self, old, new, rt, *, on_harness_replaced):
+        seen.append((rt.cancel, session._live_change_cancel))
+
+    monkeypatch.setattr(registry_module.ConnectorRegistry, "replace_live", replace_live)
+    with patch("agent.core.datasource_setup.inject_workspace_facts"):
+        await session.resetup_datasources([dict(PAYLOAD[3])])
+    [(cancel, held)] = seen
+    assert isinstance(cancel, threading.Event) and held is cancel
+    assert not cancel.is_set() and session._live_change_cancel is None
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_live_update_sets_its_cancel_event():
+    """Session end quiesces the update's task; the thread it awaits cannot
+    be cancelled, so the registry sets the change's cancel event."""
+    started = threading.Event()
+    stopped: list[bool] = []
+
+    class SlowCheckout(_StagedRecorder):
+        def stage_replace(self, old, new, rt, cancel=None):
+            started.set()
+            stopped.append(cancel.wait(5))
+            return lambda: None
+
+    calls: list = []
+    registry = ConnectorRegistry(
+        (SlowCheckout if form == "checkout" else _Recorder)(form, calls)
+        for form in AGENT_FORMS
+    )
+    rt = RuntimeContext(execution="session", cancel=threading.Event())
+    task = asyncio.create_task(
+        registry.replace_live(
+            [],
+            deliveries_from_payload(PAYLOAD),
+            rt,
+            on_harness_replaced=lambda connections, clients: None,
+        )
+    )
+    assert await asyncio.to_thread(started.wait, 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    for _ in range(100):
+        if stopped:
+            break
+        await asyncio.sleep(0.01)
+    assert stopped == [True] and rt.cancel.is_set()
 
 
 @pytest.mark.asyncio

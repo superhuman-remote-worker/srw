@@ -51,6 +51,7 @@ import os
 import posixpath
 import re
 import shlex
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -94,6 +95,9 @@ _STATE_SECONDS = 5.0
 #: The longest refusal reason a README line takes (the orchestrator sends
 #: one of its fixed reasons, which are shorter).
 _MAX_REASON = 200
+#: Why a wait (or a clone) stopped early: the live change was cancelled, or
+#: the session ends.
+CANCELLED = "the live connector change was cancelled before it was cloned"
 
 
 @dataclass(frozen=True)
@@ -300,6 +304,8 @@ def wait_for_driver(
     sleep: Callable[[float], None] | None = None,
     clock: Callable[[], float] | None = None,
     refusal: Callable[[SwapBinding, float], str | None] | None = None,
+    tab_name: str = "git",
+    cancel: threading.Event | None = None,
 ) -> str | None:
     """Wait until the workspace's git reaches the repository through the
     driver; ``None`` once it does, else why not.
@@ -312,8 +318,13 @@ def wait_for_driver(
     :func:`driver_refusal`, given the seconds left of the wait) reports
     after each failed try: that pod does not start within the wait, so its
     fixed reason is the answer, not the timeout.
+
+    The tries run on the backend shell tab ``tab_name``. A set ``cancel``
+    (the live change was cancelled, the session ends) ends the wait before
+    the next try, and wakes it from its pause between tries.
     """
-    sleep = sleep or time.sleep
+    if sleep is None:
+        sleep = cancel.wait if cancel is not None else time.sleep
     clock = clock or time.monotonic
     refusal = refusal or driver_refusal
     deadline = clock() + binding.wait_seconds
@@ -326,8 +337,10 @@ def wait_for_driver(
     )
     last = ""
     while True:
+        if cancel is not None and cancel.is_set():
+            return CANCELLED
         output = str(
-            backend.shell_run(command, timeout=_TRY_SECONDS + 10, tab_name="git")
+            backend.shell_run(command, timeout=_TRY_SECONDS + 10, tab_name=tab_name)
         )
         first = output.split("\n", 1)[0].strip()
         if first.startswith("Exit code: 0"):
@@ -338,6 +351,8 @@ def wait_for_driver(
             answered is not None and answered.group(1) != "503"
         ):
             break
+        if cancel is not None and cancel.is_set():
+            return CANCELLED
         try:
             refused = refusal(binding, max(0.0, deadline - clock()))
         except Exception:  # a question, never a reason to stop waiting
@@ -380,6 +395,7 @@ def swap_note(entry: Mapping[str, Any], *, cloned: bool = True) -> str:
 
 __all__ = [
     "BINDINGS_DIR",
+    "CANCELLED",
     "HELPER_FILE",
     "SwapBinding",
     "binding_options",

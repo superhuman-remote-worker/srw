@@ -1131,7 +1131,8 @@ class TestResetupDatasources:
         ):
             await session.resetup_datasources([repo_new])
 
-        [staged] = [call.args[1] for call in clone.call_args_list]
+        [call] = clone.call_args_list
+        staged, cancel = call.args[1], call.kwargs["cancel"]
         clone.assert_called_once_with(
             [repo_new],
             staged,
@@ -1140,6 +1141,16 @@ class TestResetupDatasources:
             legacy_key_files="own",
             # Named over the full new list (C3 re-review S4).
             clone_names=["new-repo"],
+            # Its git on a tab of its own, stoppable with the session.
+            shell_tab="srw-live-checkout",
+            cancel=cancel,
+        )
+        assert not cancel.is_set()
+        session.workspace_manager.backend.shell_ensure_tab.assert_called_once_with(
+            "srw-live-checkout"
+        )
+        session.workspace_manager.backend.shell_close_tab.assert_called_once_with(
+            "srw-live-checkout"
         )
         # It clones onto the session's workspace, into a staging registry
         # that is swapped in once cloned (live_connector_add_clones_on_the_

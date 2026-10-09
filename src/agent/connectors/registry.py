@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
@@ -252,9 +253,20 @@ class ConnectorRegistry:
             if form in _LIVE_STAGED and isinstance(materializer, SupportsStagedReplace):
                 removed_from, added_to = routed(old, form), routed(new, form)
                 materializer.begin_replace(removed_from, added_to, rt)
-                swap_in = await asyncio.to_thread(
-                    materializer.stage_replace, removed_from, added_to, rt
-                )
+                cancel = rt.cancel if rt.cancel is not None else threading.Event()
+                try:
+                    swap_in = await asyncio.to_thread(
+                        materializer.stage_replace,
+                        removed_from,
+                        added_to,
+                        rt,
+                        cancel=cancel,
+                    )
+                except asyncio.CancelledError:
+                    # The thread cannot be cancelled: it stops at its next
+                    # step boundary (session end quiesces this task).
+                    cancel.set()
+                    raise
                 swap_in()
                 continue
             if not isinstance(materializer, SupportsReplace):

@@ -130,7 +130,13 @@ class GitManager:
     DEFAULT_MAX_LINES = 500
     DEFAULT_MAX_WORDS = 10000
 
-    def __init__(self, workspace_path: Path, backend=None, remote_cwd=None):
+    def __init__(
+        self,
+        workspace_path: Path,
+        backend=None,
+        remote_cwd=None,
+        shell_tab: str = "git",
+    ):
         """Initialize GitManager for a workspace directory.
 
         Args:
@@ -143,8 +149,14 @@ class GitManager:
                 git working directory. Used for auxiliary repos cloned into
                 subdirectories (e.g. "repos/my-repo"). When None, commands
                 run in the backend's root directory.
+            shell_tab: The backend shell tab git commands run on. ``git``
+                unless a caller needs its git kept apart from everyone
+                else's (a live connector clone in a worker thread: the
+                backend serializes each tab's commands, so on ``git`` it
+                would hold up the event loop's own git calls).
         """
         self._workspace_path = Path(workspace_path)
+        self.shell_tab = shell_tab
         self._backend = backend
         self._remote_cwd = remote_cwd
         # Why the most recent push() returned False (None after a success), so
@@ -1641,6 +1653,7 @@ class GitManager:
         backend=None,
         remote_cwd=None,
         config: Sequence[str] = (),
+        shell_tab: str = "git",
     ) -> Optional["GitManager"]:
         """Clone a repository to a target path.
 
@@ -1655,6 +1668,8 @@ class GitManager:
             config: ``key=value`` settings for the clone command only
                 (``git -c``), never secrets: a command line is visible.
                 Backend clones only.
+            shell_tab: The backend shell tab the clone (and the returned
+                manager's git) runs on; ``git`` by default.
 
         Returns:
             GitManager instance for the cloned repo, or None on failure
@@ -1675,21 +1690,26 @@ class GitManager:
                     f"{shlex.quote(remote_target)}"
                 )
                 output = backend.shell_run(
-                    cmd, timeout=_CLONE_SHELL_TIMEOUT_SECONDS, tab_name="git"
+                    cmd, timeout=_CLONE_SHELL_TIMEOUT_SECONDS, tab_name=shell_tab
                 )
 
                 first_line = output.split("\n", 1)[0].strip()
                 if not first_line.startswith("Exit code: 0"):
                     if cls._clone_in_flight(output):
                         if not cls._wait_for_remote_clone(
-                            backend, remote_target, masked
+                            backend, remote_target, masked, shell_tab=shell_tab
                         ):
                             return None
                     else:
                         logger.warning(f"git clone failed for {masked}: {output}")
                         return None
 
-                mgr = cls(target_path, backend=backend, remote_cwd=remote_cwd)
+                mgr = cls(
+                    target_path,
+                    backend=backend,
+                    remote_cwd=remote_cwd,
+                    shell_tab=shell_tab,
+                )
                 mgr._run_git(["config", "user.email", "agent@workspace.local"])
                 mgr._run_git(["config", "user.name", "Agent"])
 
@@ -1716,8 +1736,10 @@ class GitManager:
         return _COLLIDING_MARKER in output and "NOT executed" in output
 
     @classmethod
-    def _wait_for_remote_clone(cls, backend, remote_target: str, masked: str) -> bool:
-        """Wait for an in-flight clone on the 'git' tab to finish, then verify.
+    def _wait_for_remote_clone(
+        cls, backend, remote_target: str, masked: str, *, shell_tab: str = "git"
+    ) -> bool:
+        """Wait for an in-flight clone on its tab to finish, then verify.
 
         Polls with a probe that the busy tab rejects until the clone exits;
         once it runs, the probe's answer — is there a git repo at the target —
@@ -1731,7 +1753,7 @@ class GitManager:
         )
         while time.monotonic() < deadline:
             time.sleep(_CLONE_POLL_INTERVAL_SECONDS)
-            output = backend.shell_run(probe, timeout=60, tab_name="git")
+            output = backend.shell_run(probe, timeout=60, tab_name=shell_tab)
             if cls._clone_in_flight(output):
                 continue
             first_line = output.split("\n", 1)[0].strip()
@@ -1864,7 +1886,7 @@ class GitManager:
                 output = self._backend.shell_run(
                     cmd_str,
                     timeout=timeout,
-                    tab_name="git",
+                    tab_name=self.shell_tab,
                     working_dir=self._remote_cwd,
                 )
                 return self._parse_shell_run_output(output, args)
@@ -1954,7 +1976,7 @@ class GitManager:
                 output = self._backend.shell_run(
                     encoded_cmd,
                     timeout=timeout,
-                    tab_name="git",
+                    tab_name=self.shell_tab,
                     working_dir=self._remote_cwd,
                 )
                 encoded_result = self._parse_shell_run_output(output, args)

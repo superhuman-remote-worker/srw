@@ -1609,6 +1609,288 @@ class TestLiveAddOffTheLoop:
         assert ws.source_repos == {} and ws.source_repo_pending_meta == ()
 
 
+class _TabLockedBackend:
+    """A shell backend with ``RemoteBackend``'s per-tab serialization: each
+    tab's lock is held for the whole command (``_shell_tab_lock``), tabs
+    open and close by name, and at most ``max_tabs`` are open."""
+
+    supports_shell = True
+    root = "/home/agent-host/workspace"
+
+    def __init__(self, *, clone_seconds=0.0, ls_remote="Exit code: 0", max_tabs=15):
+        import threading
+
+        self._guard = threading.Lock()
+        self._locks: dict = {}
+        self.tabs = {"default", "git"}
+        self.max_tabs = max_tabs
+        self.clone_seconds = clone_seconds
+        self.ls_remote = ls_remote
+        self.runs: list[tuple[str, str]] = []
+        self.opened: list[str] = []
+        self.closed: list[str] = []
+        self.first_try = threading.Event()
+
+    def _lock(self, tab):
+        import threading
+
+        with self._guard:
+            return self._locks.setdefault(tab, threading.RLock())
+
+    def shell_ensure_tab(self, name):
+        with self._lock(name):
+            if name in self.tabs:
+                return
+            if len(self.tabs) >= self.max_tabs:
+                raise ValueError(f"Maximum tabs ({self.max_tabs}) reached")
+            self.tabs.add(name)
+            self.opened.append(name)
+
+    def shell_close_tab(self, name):
+        with self._lock(name):
+            self.tabs.discard(name)
+            self.closed.append(name)
+
+    def shell_run(self, command, timeout=None, tab_name="default", working_dir=None):
+        import time
+
+        if tab_name not in self.tabs:
+            self.shell_ensure_tab(tab_name)
+        with self._lock(tab_name):
+            self.runs.append((tab_name, command))
+            if " clone " in command:
+                time.sleep(self.clone_seconds)
+            if " ls-remote " in command:
+                self.first_try.set()
+                return self.ls_remote
+            return "Exit code: 0\n"
+
+    def exists(self, path):
+        return False
+
+    def read_file(self, path):
+        return ""
+
+    def write_file(self, path, content):
+        pass
+
+    def append_file(self, path, content):
+        pass
+
+    def resolve_home_path(self, rel):
+        return f"/home/agent-host/{rel}"
+
+    def resolve_path(self, rel):
+        return f"/home/agent-host/workspace/{rel}"
+
+    def install_git_swap_wiring(self, items, *, remove=(), prune=False):
+        return {"bindings": [item["id"] for item in items]}
+
+
+def _token_entry():
+    """A token repository on the installation's fallback (no driver wait)."""
+    return {
+        "type": "repository",
+        "name": "Big",
+        "connection_url": "https://github.com/o/big.git",
+        "credentials": {"token": "ghp_" + "x" * 36},
+        "config": {"forge": "github"},
+    }
+
+
+def _tab_workspace(backend):
+    return SimpleNamespace(
+        backend=backend,
+        path=Path("/tmp/ws"),
+        source_repos={},
+        source_repo_meta={},
+        source_repo_skipped={},
+        source_repo_pending_meta=(),
+        source_repo_detached_meta=(),
+    )
+
+
+class TestLiveCheckoutTab:
+    """live_connector_add_clones_on_the_event_loop (coordinator review): the
+    backend runs one command at a time per tab, so a live clone on ``git``
+    would hold up the event loop's own git (the turn's commit, the repo
+    tools, the final commit). It runs on a tab of its own."""
+
+    @pytest.mark.asyncio
+    async def test_the_loops_git_never_waits_for_a_live_clone(self):
+        import asyncio
+        import time
+
+        from agent.managers.git_manager import GitManager
+
+        backend = _TabLockedBackend(clone_seconds=2.0)
+        ws = _tab_workspace(backend)
+        waited: list[float] = []
+        gaps: list[float] = []
+        stop = asyncio.Event()
+
+        async def ticker():
+            last = time.monotonic()
+            while not stop.is_set():
+                await asyncio.sleep(0.01)
+                now = time.monotonic()
+                gaps.append(now - last)
+                last = now
+
+        async def turn_end_commit():
+            # As the persistent loop does after a turn: git inline, on ``git``.
+            await asyncio.sleep(0.4)
+            started = time.monotonic()
+            GitManager(Path("/tmp/ws"), backend=backend)._run_git(
+                ["status", "--porcelain"]
+            )
+            waited.append(time.monotonic() - started)
+
+        tick = asyncio.create_task(ticker())
+        commit = asyncio.create_task(turn_end_commit())
+        await _checkout_only_registry().replace_live(
+            [],
+            deliveries_from_payload([_token_entry()]),
+            RuntimeContext(execution="session", workspace_manager=ws),
+            on_harness_replaced=lambda connections, clients: None,
+        )
+        await commit
+        stop.set()
+        await tick
+
+        assert waited and waited[0] < 0.5
+        assert max(gaps) < 0.5
+        # The clone, and every git command of the live add, ran on its own
+        # tab, opened for the change and closed after it.
+        clone_tabs = {tab for tab, command in backend.runs if " clone " in command}
+        assert clone_tabs == {"srw-live-checkout"}
+        assert backend.opened == ["srw-live-checkout"]
+        assert backend.closed == ["srw-live-checkout"]
+        # The registered checkout's git is the session's own again.
+        assert ws.source_repos["big"].shell_tab == "git"
+
+    def test_at_the_tab_cap_the_clone_runs_on_git(self, caplog):
+        backend = _TabLockedBackend(max_tabs=2)  # "default" and "git" open
+        ws = _tab_workspace(backend)
+        rt = RuntimeContext(execution="session", workspace_manager=ws)
+        CheckoutMaterializer().replace(
+            [], deliveries_from_payload([_token_entry()]), rt
+        )
+        assert {tab for tab, command in backend.runs if " clone " in command} == {"git"}
+        assert backend.opened == [] and backend.closed == []
+        assert "big" in ws.source_repos
+        assert "Maximum tabs" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_live_change_stops_its_clone_thread(self):
+        """The session ends mid-wait (its side tasks are cancelled): the
+        worker thread stops at its next step, asks nothing more, clones
+        nothing, and closes its tab."""
+        import asyncio
+        import time
+
+        backend = _TabLockedBackend(
+            ls_remote="Exit code: 128\nfatal: unable to access: Could not resolve host"
+        )
+        ws = _tab_workspace(backend)
+        asked: list[float] = []
+        with (
+            patch(
+                "agent.connectors.git_swap.driver_refusal",
+                side_effect=lambda binding, left: asked.append(left),
+            ),
+            patch("agent.managers.git_manager.GitManager.clone") as clone,
+        ):
+            change = asyncio.create_task(
+                _checkout_only_registry().replace_live(
+                    [],
+                    deliveries_from_payload([_entry()]),
+                    RuntimeContext(execution="session", workspace_manager=ws),
+                    on_harness_replaced=lambda connections, clients: None,
+                )
+            )
+            assert await asyncio.to_thread(backend.first_try.wait, 5)
+            change.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await change
+            deadline = time.monotonic() + 3
+            while not backend.closed and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            tries = sum(" ls-remote " in command for _, command in backend.runs)
+            questions = len(asked)
+            await asyncio.sleep(0.3)
+
+        # Stopped within its pause between tries: the tab closed at once.
+        assert backend.closed == ["srw-live-checkout"]
+        assert tries <= 2 and questions <= 2
+        assert sum(" ls-remote " in command for _, command in backend.runs) == tries
+        assert len(asked) == questions
+        clone.assert_not_called()
+        assert ws.source_repos == {}
+
+
+class TestWaitCancel:
+    def _binding(self):
+        binding, _ = swap_binding(_entry())
+        return binding
+
+    def test_a_set_cancel_stops_before_the_next_try(self):
+        import threading
+
+        from agent.connectors.git_swap import CANCELLED
+
+        cancel = threading.Event()
+        cancel.set()
+        backend = _home_backend()
+        assert wait_for_driver(backend, self._binding(), cancel=cancel) == CANCELLED
+        backend.shell_run.assert_not_called()
+
+    def test_a_cancel_wakes_the_pause_between_tries(self):
+        import threading
+        import time
+
+        from agent.connectors.git_swap import CANCELLED
+
+        cancel = threading.Event()
+        backend = _home_backend()
+        backend.shell_run.return_value = "Exit code: 124"
+        threading.Timer(0.2, cancel.set).start()
+        started = time.monotonic()
+        reason = wait_for_driver(
+            backend,
+            self._binding(),
+            cancel=cancel,
+            refusal=lambda _binding, _left: None,
+            tab_name="srw-live-checkout",
+        )
+        assert reason == CANCELLED and time.monotonic() - started < 2
+        assert backend.shell_run.call_count == 1
+        assert backend.shell_run.call_args.kwargs["tab_name"] == "srw-live-checkout"
+
+
+class TestDetachedTokens:
+    def test_a_detached_repositorys_token_stays_redacted(self):
+        """Its checkout stays on the workspace (a token-in-URL one's
+        .git/config holds the token), so redaction keeps the token for the
+        rest of the session; the repo tools lose it at once."""
+        from agent.core.tool_output_redaction import workspace_secrets
+
+        ws = _tab_workspace(_TabLockedBackend())
+        gone = _token_entry()
+        ws.source_repos["big"] = MagicMock()
+        ws.source_repo_meta["big"] = {"token": gone["credentials"]["token"]}
+        rt = RuntimeContext(execution="session", workspace_manager=ws)
+        materializer = CheckoutMaterializer()
+        for _ in range(2):  # detached twice: kept once
+            materializer.replace(deliveries_from_payload([gone]), [], rt)
+        assert ws.source_repos == {} and ws.source_repo_meta == {}
+        assert ws.source_repo_detached_meta == (
+            {"token": gone["credentials"]["token"]},
+        )
+        secrets = workspace_secrets(SimpleNamespace(workspace_manager=ws))
+        assert gone["credentials"]["token"] in secrets
+
+
 class TestLiveChanges:
     def test_a_detached_swap_repository_loses_its_wiring(self):
         ws = _workspace()

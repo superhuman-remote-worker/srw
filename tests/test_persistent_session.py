@@ -4065,6 +4065,24 @@ class TestCleanup:
         assert context.session_runtime_facts is None
 
     @pytest.mark.asyncio
+    async def test_cleanup_stops_a_live_connector_change_still_cloning(self):
+        """live_connector_add_clones_on_the_event_loop: a live change's clone
+        runs in a worker thread, which no task cancel stops; cleanup sets its
+        cancel event, so it stops at its next step instead of running on
+        after the session."""
+        import threading
+
+        session = _make_session()
+        session.workspace_manager = MagicMock()
+        session.workspace_manager.backend = MagicMock(spec=[])
+        cancel = threading.Event()
+        session._live_change_cancel = cancel
+
+        await session.cleanup()
+
+        assert cancel.is_set()
+
+    @pytest.mark.asyncio
     async def test_cleanup_shell_manager(self):
         """cleanup() calls shell_manager.cleanup()."""
         session = _make_session()

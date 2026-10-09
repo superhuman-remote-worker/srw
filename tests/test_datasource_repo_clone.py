@@ -332,6 +332,7 @@ class TestBackendClone:
             Path("/tmp/ws/repos/repo"),
             backend=ws.backend,
             remote_cwd="repos/repo",
+            shell_tab="git",
         )
         existing.checkout_branch.assert_called_once_with("design/hotel-rheinland-theme")
         assert ws.source_repos["repo"] is existing

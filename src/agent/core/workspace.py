@@ -389,6 +389,10 @@ class WorkspaceManager:
         # (agent.connectors.checkout.PENDING_META). Replaced whole, never
         # mutated: a reader holds one tuple or the other.
         self.source_repo_pending_meta: tuple[dict, ...] = ()
+        # The tokens of repositories detached live, whose checkouts stay on
+        # the workspace: redacted for the rest of the session
+        # (agent.connectors.checkout.DETACHED_META). Replaced whole.
+        self.source_repo_detached_meta: tuple[dict, ...] = ()
 
     @property
     def backend(self) -> "WorkspaceBackend":

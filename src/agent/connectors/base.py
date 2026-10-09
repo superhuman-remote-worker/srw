@@ -102,6 +102,10 @@ class RuntimeContext:
     legacy_key_files: str = "sweep"
     #: Forms whose live change waits for the next attach.
     deferred: set[str] = field(default_factory=set)
+    #: A live change's ``threading.Event``: set when the change is no longer
+    #: wanted (its task cancelled, the session ending), so a step still
+    #: running in a worker thread stops at its next step boundary.
+    cancel: Any = None
 
     @property
     def workspace_backend(self) -> Any:
@@ -183,7 +187,11 @@ class SupportsStagedReplace(Protocol):
         old: Sequence[Delivery],
         new: Sequence[Delivery],
         rt: RuntimeContext,
-    ) -> Callable[[], None]: ...
+        cancel: Any = None,
+    ) -> Callable[[], None]:
+        """``cancel`` (a ``threading.Event``) is set when the change is no
+        longer wanted: the slow step stops at its next step boundary."""
+        ...
 
 
 @runtime_checkable
