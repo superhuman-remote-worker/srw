@@ -598,6 +598,7 @@ async def acquire_retained_resume_cleanup(
     from orchestrator.services.vm_workspace_recovery_store import (
         CleanupPermit,
         bind_vm_cleanup_permit,
+        prepare_vm_cleanup_resource,
         vm_cleanup_request_identity,
     )
 
@@ -607,11 +608,6 @@ async def acquire_retained_resume_cleanup(
             return None
         operation, retry, authority, candidate = scoped
         if authority is not None:
-            if not await conn.fetchval(
-                "SELECT public.validate_vm_job_cancel_retention($1,false)",
-                authority["cleanup_admission_id"],
-            ):
-                raise ResourceAdmissionError("retained_continuation_authority_changed")
             parent = await conn.fetchrow(
                 "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1",
                 authority["cleanup_admission_id"],
@@ -636,6 +632,16 @@ async def acquire_retained_resume_cleanup(
                         "retention_preflight": proof,
                     },
                 )
+            if parent["completed_at"] is None:
+                # Controller DELETE may already have published vm.status=deleted.
+                # Fence the exact charged incarnation before the deleted-replay
+                # validator runs, and roll the fence back on any drift.
+                await prepare_vm_cleanup_resource(store, permit, _conn=conn)
+            if not await conn.fetchval(
+                "SELECT public.validate_vm_job_cancel_retention($1,false)",
+                authority["cleanup_admission_id"],
+            ):
+                raise ResourceAdmissionError("retained_continuation_authority_changed")
             return permit
         if candidate is None:
             return CleanupPermit(
@@ -710,6 +716,8 @@ async def acquire_retained_resume_cleanup(
                     "retention_preflight": retention_preflight,
                 },
             )
+        if await prepare_vm_cleanup_resource(store, permit, _conn=conn) is None:
+            raise ResourceAdmissionError("retained_continuation_charge_unproven")
         return permit
 
 

@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -766,6 +766,173 @@ async def test_deleted_controller_status_replays_exact_open_ready_cleanup(db, po
         == "released"
     )
     assert await db.complete_stateless_cancel_cleanup(state["job_id"])
+
+
+@pytest.mark.asyncio
+async def test_retained_ready_acquisition_fences_charge_before_controller_delete(db):
+    """The admitted policy-2 parent must own teardown before external DELETE."""
+    from tests.test_vm_job_retained_resume_real_postgres import ready_keep
+
+    state = await ready_keep(db)
+    charge_id = UUID(state["ready_proof"]["frozen"]["reservation_id"])
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE id=$1", charge_id
+        )
+        == "teardown"
+    )
+    assert await db.claim_managed_repository_workspace_retirement(
+        state["job_id"],
+        owner_kind="job",
+        scope="vm",
+        provisioner="vm",
+        runtime_incarnation=state["identity"].provision_generation,
+    )
+    assert await db.record_managed_repository_workspace_process_zero(
+        state["job_id"],
+        owner_kind="job",
+        scope="vm",
+        provisioner="vm",
+        runtime_incarnation=state["identity"].provision_generation,
+    )
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,status}','\"deleted\"') WHERE id=$1",
+        UUID(state["job_id"]),
+    )
+    replay = await acquire_cancel_retention(
+        state["recovery"], job_id=state["job_id"], identity=state["identity"]
+    )
+    assert replay == state["keep"]
+
+
+async def historical_unprepared_ready_keep(db):
+    """Admit the old policy-2 parent without bypassing any SQL transition guard."""
+    from orchestrator.services import vm_workspace_recovery_store as cleanup_module
+    from orchestrator.services.vm_job_retained_resume import retained_ready_candidate
+    from tests.test_vm_job_retained_resume_real_postgres import (
+        adopted_resume,
+        ready_witness,
+    )
+
+    state = await adopted_resume(db)
+    state["ready_proof"] = ready_witness(
+        await retained_ready_candidate(
+            db, job_id=state["job_id"], identity=state["identity"]
+        )
+    )
+    state["recovery"] = cleanup_module.VMWorkspaceRecoveryStore(db)
+    # Only the final policy-2 acquisition emulates the deployed pre-fix code.
+    # Ancestor Resume setup and every database constraint remain real.
+    with patch.object(
+        cleanup_module, "prepare_vm_cleanup_resource", AsyncMock(return_value={})
+    ) as skipped:
+        state["keep"] = await acquire_cancel_retention(
+            state["recovery"],
+            job_id=state["job_id"],
+            identity=state["identity"],
+            retention_preflight=state["ready_proof"],
+        )
+        skipped.assert_awaited_once()
+    assert state["keep"].allowed
+    return state
+
+
+@pytest.mark.asyncio
+async def test_retained_ready_replay_recovers_historical_active_deleted_charge(db):
+    """A committed exact parent can fence the charge missed by old DELETE order."""
+
+    state = await historical_unprepared_ready_keep(db)
+    charge_id = UUID(state["ready_proof"]["frozen"]["reservation_id"])
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE id=$1", charge_id
+        )
+        == "active"
+    )
+    assert await db.record_managed_repository_workspace_process_zero(
+        state["job_id"],
+        owner_kind="job",
+        scope="vm",
+        provisioner="vm",
+        runtime_incarnation=state["identity"].provision_generation,
+    )
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,status}','\"deleted\"') WHERE id=$1",
+        UUID(state["job_id"]),
+    )
+    replay = await acquire_cancel_retention(
+        state["recovery"], job_id=state["job_id"], identity=state["identity"]
+    )
+    assert replay == state["keep"]
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE id=$1", charge_id
+        )
+        == "teardown"
+    )
+
+
+@pytest.mark.asyncio
+async def test_retained_ready_replay_rolls_back_charge_on_queue_drift(db):
+    """A no-longer-done worker queue cannot launder replay preparation."""
+
+    state = await historical_unprepared_ready_keep(db)
+    charge_id = UUID(state["ready_proof"]["frozen"]["reservation_id"])
+    assert await db.record_managed_repository_workspace_process_zero(
+        state["job_id"],
+        owner_kind="job",
+        scope="vm",
+        provisioner="vm",
+        runtime_incarnation=state["identity"].provision_generation,
+    )
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,status}','\"deleted\"') WHERE id=$1",
+        UUID(state["job_id"]),
+    )
+    await db.execute(
+        "UPDATE run_queue SET state='queued' WHERE unit_id=$1", UUID(state["job_id"])
+    )
+    with pytest.raises(asyncpg.CheckViolationError, match="current authority changed"):
+        await acquire_cancel_retention(
+            state["recovery"], job_id=state["job_id"], identity=state["identity"]
+        )
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE id=$1", charge_id
+        )
+        == "active"
+    )
+
+
+@pytest.mark.asyncio
+async def test_retained_ready_replay_rolls_back_charge_on_storage_drift(db):
+    """An unrelated workspace binding cannot be laundered by replay prepare."""
+
+    state = await historical_unprepared_ready_keep(db)
+    charge_id = UUID(state["ready_proof"]["frozen"]["reservation_id"])
+    assert await db.record_managed_repository_workspace_process_zero(
+        state["job_id"],
+        owner_kind="job",
+        scope="vm",
+        provisioner="vm",
+        runtime_incarnation=state["identity"].provision_generation,
+    )
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(jsonb_set(context,'{vm,status}',"
+        "'\"deleted\"'),'{vm,workspace_storage}',"
+        '\'{"id":"changed"}\'::jsonb) WHERE id=$1',
+        UUID(state["job_id"]),
+    )
+    with pytest.raises(asyncpg.CheckViolationError, match="current authority changed"):
+        await acquire_cancel_retention(
+            state["recovery"], job_id=state["job_id"], identity=state["identity"]
+        )
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE id=$1", charge_id
+        )
+        == "active"
+    )
 
 
 @pytest.mark.asyncio
