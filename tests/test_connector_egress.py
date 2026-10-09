@@ -94,6 +94,8 @@ class TestExpandRule:
         ("::ffff:0:a9fe:a9fe", "IPv4-translated"),  # ::ffff:0:169.254.169.254
         ("fd00:ec2::254", "metadata"),
         ("168.63.129.16", "metadata"),
+        ("100.100.100.200", "metadata"),  # Alibaba Cloud, inside CGNAT
+        ("fec0::1", "site-local"),
     ],
 )
 def test_cluster_and_special_ranges_are_always_refused(address, reason):

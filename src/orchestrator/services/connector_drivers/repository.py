@@ -300,6 +300,9 @@ class RepositoryDriver(WorkspaceSshDriver):
     async def check(
         self, row: Mapping[str, Any], credentials: dict[str, Any], *, ctx: CheckContext
     ) -> dict[str, Any]:
+        # Why the forge probe did not ask the forge, if it did not: the
+        # delivery report then decides from it, with no lookup of its own.
+        outcome: dict[str, str] = {}
         if uses_github_app(credentials):
             result = await probe_github_app(
                 dict(row), credentials, requester=getattr(ctx, "requester", None)
@@ -318,6 +321,7 @@ class RepositoryDriver(WorkspaceSshDriver):
                 allow_private=await tier_allows_private(
                     getattr(ctx, "store", None), row.get("id")
                 ),
+                outcome=outcome,
             )
             if not token_auth(row, credentials):
                 return result
@@ -326,7 +330,12 @@ class RepositoryDriver(WorkspaceSshDriver):
         # probes the upstream's TLS without a credential (C3).
         from orchestrator.services import connector_git_swap_delivery as swaps
 
-        report = await swaps.delivery_report(row, token=credentials.get("token"))
+        report = await swaps.delivery_report(
+            row,
+            token=credentials.get("token"),
+            probe_reason=outcome.get("reason", ""),
+            probe_host=outcome.get("host", ""),
+        )
         if report is None:
             return result
         result = dict(result)
@@ -437,7 +446,9 @@ def _guarded_fetch(
                 lane=LANE_TEST,
             )
         except ProviderError as exc:
-            raise ForgeError(str(exc)) from None
+            error = ForgeError(str(exc))
+            error.provider_reason = exc.reason  # type: ignore[attr-defined]
+            raise error from None
         except httpx.InvalidURL:
             # urlparse took it, httpx does not (``010.0.0.1``, say).
             raise ForgeError(f"{forge}'s address is not one SRW can use") from None
@@ -454,6 +465,7 @@ async def probe_repository(
     creds: dict[str, Any],
     *,
     allow_private: bool = False,
+    outcome: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Probe a repository connector without exposing its credential.
 
@@ -469,7 +481,9 @@ async def probe_repository(
     The forge's address is checked before anything is sent to it
     (``allow_private``: the connector's project tier allows private
     addresses), and both reads run under one deadline
-    (:data:`PROBE_DEADLINE_SECONDS`).
+    (:data:`PROBE_DEADLINE_SECONDS`). ``outcome`` receives ``reason``, the
+    ``provider_http`` reason, and ``host``, the API host it was about, when
+    no answer came from the forge.
     """
     from orchestrator.services.connector_git_swap_delivery import upstream_ca_of
     from shared.runtime.services.forge import (  # noqa: PLC0415
@@ -531,6 +545,10 @@ async def probe_repository(
             ),
         }
     except ForgeError as exc:
+        reason = getattr(exc, "provider_reason", "")
+        if outcome is not None and reason:
+            outcome["reason"] = reason
+            outcome["host"] = (urlsplit(target.api_base).hostname or "").lower()
         return {"status": "error", "message": str(exc)}
 
     warnings = list(facts.get("warnings") or [])

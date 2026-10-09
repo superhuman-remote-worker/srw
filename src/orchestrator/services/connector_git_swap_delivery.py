@@ -72,6 +72,7 @@ from orchestrator.services.connector_egress import (
     DEFAULT_PRIVATE_TIERS,
     EgressPolicy,
     EgressRefused,
+    RESOLVE_TIMEOUT_SECONDS,
     pin_egress,
     private_addresses_allowed,
     system_resolver,
@@ -298,18 +299,23 @@ async def probe_upstream_tls(
 
 
 async def check_upstream(
-    host: str, *, ca_pem: str | None, private_allowed: bool
+    host: str,
+    *,
+    ca_pem: str | None,
+    private_allowed: bool,
+    resolver: Callable[[str, bool], Any] | None = None,
 ) -> Problem | str | None:
     """The reconciler's egress check for the upstream host, then its TLS.
 
     ``None`` when it serves, a :class:`Problem` for a definite refusal, and
     :data:`UNDECIDED` when the host does not resolve (a timeout, SERVFAIL,
     NXDOMAIN) or answer from the orchestrator: none of those says the
-    driver cannot reach it.
+    driver cannot reach it. ``resolver``: the lookup to use instead of the
+    settings' (a connector Test's own lane).
     """
     settings = git_swap_delivery_settings()
     try:
-        answers = list(await settings.resolver(host, settings.ipv6))
+        answers = list(await (resolver or settings.resolver)(host, settings.ipv6))
     except (OSError, UnicodeError, TimeoutError, asyncio.TimeoutError) as exc:
         logger.info("Upstream %s did not resolve from the orchestrator (%s)", host, exc)
         return UNDECIDED
@@ -357,7 +363,12 @@ def _remember(key: tuple[str, str, bool], verdict: Any) -> None:
 
 
 async def upstream_verdict(
-    host: str, *, ca_pem: str | None, private_allowed: bool, fresh: bool = False
+    host: str,
+    *,
+    ca_pem: str | None,
+    private_allowed: bool,
+    fresh: bool = False,
+    resolver: Callable[[str, bool], Any] | None = None,
 ) -> Problem | str | None:
     """:func:`check_upstream`, remembered per host, CA and tier."""
     key = (host, _ca_digest(ca_pem), private_allowed)
@@ -365,9 +376,35 @@ async def upstream_verdict(
         known, verdict = _remembered(key)
         if known:
             return verdict
-    verdict = await check_upstream(host, ca_pem=ca_pem, private_allowed=private_allowed)
+    verdict = await check_upstream(
+        host, ca_pem=ca_pem, private_allowed=private_allowed, resolver=resolver
+    )
     _remember(key, verdict)
     return verdict
+
+
+async def _test_lane_resolver(host: str, ipv6: bool) -> Any:
+    """A connector Test's lookup: on the Test resolver threads
+    (``provider_http``), never the event loop's shared executor, which a
+    name that never answers would hold for every Test a user starts."""
+    from orchestrator.services.connector_drivers.provider_http import (
+        connector_test_resolver,
+    )
+
+    async with asyncio.timeout(RESOLVE_TIMEOUT_SECONDS):
+        return await connector_test_resolver(host, ipv6)
+
+
+#: What a Test's forge probe already learnt about the upstream's address
+#: (``provider_http``'s reason), as this module's verdict: no second lookup.
+_PROBE_VERDICTS = {
+    # Test's address check is the reconciler's plus what Test alone trusts
+    # (the operator's list, SRW's own Gitea): what it refuses, a driver pod's
+    # egress refuses too.
+    "address_refused": "the connector's Test refused the upstream's address",
+    # Nothing to decide, as when this module's own lookup finds no answer.
+    "does_not_resolve": None,
+}
 
 
 def candidate_entry(row: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -860,7 +897,11 @@ def _tls_text(verdict: Any, ca_pem: str | None) -> str:
 
 
 async def delivery_report(
-    row: Mapping[str, Any], *, token: str | None = None
+    row: Mapping[str, Any],
+    *,
+    token: str | None = None,
+    probe_reason: str = "",
+    probe_host: str = "",
 ) -> dict[str, Any] | None:
     """How a token repository is delivered on this installation, for its
     Test: through the driver, or the fallback and why (a :data:`REASONS`
@@ -869,7 +910,13 @@ async def delivery_report(
     except on a ``refuse`` installation, where the repository is refused.
     The workspace's own reach is decided per delivery: container and
     same-cluster VM workspaces only. ``token`` is only measured, never
-    sent."""
+    sent.
+
+    ``probe_reason``: what the Test's forge probe already found about
+    ``probe_host`` (its address refused, or no address): when that is the
+    upstream's host, it is not looked up again (GitHub's API host is not its
+    git host). Otherwise the lookup runs on the Test resolver threads, under
+    a timeout."""
     settings = git_swap_delivery_settings()
     report: dict[str, Any] = {"driver": GIT_SWAP_SPEC.name}
     if not settings.installed:
@@ -893,9 +940,23 @@ async def delivery_report(
                     conn, connector_id, private_tiers=settings.private_tiers
                 )
                 launch = await launch_problem(conn, connector_id)
-            verdict = await upstream_verdict(
-                upstream.host, ca_pem=ca_pem, private_allowed=private, fresh=True
-            )
+            if probe_reason in _PROBE_VERDICTS and probe_host == upstream.host:
+                known = _PROBE_VERDICTS[probe_reason]
+                verdict = Problem("egress_refused", known) if known else UNDECIDED
+            else:
+                verdict = await upstream_verdict(
+                    upstream.host,
+                    ca_pem=ca_pem,
+                    private_allowed=private,
+                    fresh=True,
+                    # A test's installed resolver stands; the default
+                    # (the loop's shared executor) gives way to Test's own.
+                    resolver=(
+                        _test_lane_resolver
+                        if settings.resolver is system_resolver
+                        else None
+                    ),
+                )
         except Exception as exc:
             logger.warning("Git swap delivery report failed", exc_info=True)
             return {**report, "mode": "unknown", "reason": type(exc).__name__}

@@ -517,7 +517,10 @@ async def _pinned_host_key(
     an address the connector's projects may not reach, before any
     connection."""
 
+    import asyncio
+
     from orchestrator.services.connector_drivers.provider_http import (
+        ADDRESS_CONNECT_SECONDS,
         LANE_TEST,
         checked_addresses,
     )
@@ -530,11 +533,15 @@ async def _pinned_host_key(
         lane=LANE_TEST,
     )
     for index, address in enumerate(addresses):
-        try:
+        if index == len(addresses) - 1:
+            # The last address has what remains of the caller's deadline.
             return await fetch_ssh_host_key(str(address), port)
-        except OSError:
-            if index == len(addresses) - 1:
-                raise
+        try:
+            # One dead address of several never takes the whole deadline.
+            async with asyncio.timeout(ADDRESS_CONNECT_SECONDS):
+                return await fetch_ssh_host_key(str(address), port)
+        except OSError:  # TimeoutError included
+            continue
     raise OSError("no address to dial")  # checked_addresses returns at least one
 
 

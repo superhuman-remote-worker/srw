@@ -75,6 +75,9 @@ _ALWAYS_REFUSED: tuple[tuple[IPNetwork, str], ...] = tuple(
         ("::/128", "is an unspecified address"),
         ("::1/128", "is loopback"),
         ("fe80::/10", "is link-local"),
+        # Deprecated site-local: no public address, and never the private
+        # (ULA) range a project tier may allow.
+        ("fec0::/10", "is a site-local address"),
         ("ff00::/8", "is multicast"),
         # Public by the registry of special addresses, yet able to carry (and
         # reach) a private or cluster IPv4 address.
@@ -87,6 +90,9 @@ _ALWAYS_REFUSED: tuple[tuple[IPNetwork, str], ...] = tuple(
         # Cloud metadata outside link-local: AWS over IPv6, Azure's wireserver.
         ("fd00:ec2::254/128", "is a cloud metadata address"),
         ("168.63.129.16/32", "is a cloud metadata address"),
+        # Alibaba Cloud's metadata service, inside the CGNAT range a home
+        # tier may otherwise reach.
+        ("100.100.100.200/32", "is a cloud metadata address"),
     )
 )
 _PRIVATE: tuple[IPNetwork, ...] = tuple(

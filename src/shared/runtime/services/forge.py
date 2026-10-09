@@ -486,6 +486,10 @@ def parse_owner_repo(url: str) -> tuple[str, str]:
     )
 
 
+#: Characters an scp-style host (``user@host:path``) may not carry.
+_SCP_HOST_REFUSED = frozenset("?#[]@/\\%")
+
+
 def resolve_api_base(url: str, forge: str) -> str:
     """Return the API root for ``url`` on ``forge``."""
     if forge not in SUPPORTED_FORGES:
@@ -497,6 +501,14 @@ def resolve_api_base(url: str, forge: str) -> str:
     scp_host = None
     if "://" not in raw and separator and "/" in scp_path and "/" not in prefix:
         scp_host = prefix.rsplit("@", 1)[-1]
+        # The host becomes an API origin as written: a '#', '?' or '@'
+        # would move the request's path or authority (``git@h#:o/r`` ->
+        # ``https://h#/api/v1``), brackets and whitespace are no host.
+        if not scp_host or any(
+            ch in _SCP_HOST_REFUSED or ch.isspace() or not ch.isprintable()
+            for ch in scp_host
+        ):
+            raise ForgeError(f"Cannot parse host from URL: {url!r}")
 
     parsed = urlparse(raw)
     hostname = scp_host or parsed.hostname

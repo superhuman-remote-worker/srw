@@ -370,6 +370,64 @@ class TestReasons:
         assert "internal.corp" in caplog.text
 
     @pytest.mark.asyncio
+    async def test_the_certificate_text_names_a_ca_only_when_one_was_given(
+        self, monkeypatch
+    ):
+        from tests._provider_fakes import FAKE_CA
+
+        def handler(request):
+            raise httpx.ConnectError(
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed",
+                request=request,
+            )
+
+        _route(monkeypatch, handler)
+        with pytest.raises(ProviderError) as public_roots:
+            await _call()
+        assert str(public_roots.value) == "the provider's certificate does not verify"
+        with pytest.raises(ProviderError) as configured:
+            await _call(ca_pem=FAKE_CA)
+        assert str(configured.value) == (
+            "the provider's certificate does not verify against the configured CA"
+        )
+        assert public_roots.value.reason == configured.value.reason == "certificate"
+
+    @pytest.mark.asyncio
+    async def test_a_dead_address_leaves_the_next_one_a_try(self, monkeypatch):
+        """Each of several addresses may take at most
+        ADDRESS_CONNECT_SECONDS to connect; the last has what remains."""
+        timeouts: dict[str, dict] = {}
+
+        def handler(request):
+            timeouts[request.url.host] = request.extensions["timeout"]
+            if request.url.host == "203.0.113.5":
+                raise httpx.ConnectTimeout("no answer", request=request)
+            return httpx.Response(200, json={"ok": True})
+
+        _route(
+            monkeypatch,
+            handler,
+            addresses={"provider.test": ("203.0.113.5", "203.0.113.6")},
+        )
+        answer = await _call(deadline=15)
+
+        assert answer.status == 200
+        assert timeouts["203.0.113.5"]["connect"] == pytest.approx(
+            provider_http.ADDRESS_CONNECT_SECONDS
+        )
+        assert (
+            timeouts["203.0.113.6"]["connect"] > provider_http.ADDRESS_CONNECT_SECONDS
+        )
+        assert timeouts["203.0.113.6"]["connect"] <= 15
+        # A single address has the whole deadline to connect.
+        timeouts.clear()
+        _route(monkeypatch, handler, addresses={"provider.test": ("203.0.113.6",)})
+        await _call(deadline=15)
+        assert (
+            timeouts["203.0.113.6"]["connect"] > provider_http.ADDRESS_CONNECT_SECONDS
+        )
+
+    @pytest.mark.asyncio
     async def test_a_ca_that_does_not_load_is_final(self, monkeypatch):
         seen = _route(monkeypatch, _ok)
         with pytest.raises(ProviderError) as caught:
@@ -640,6 +698,45 @@ class TestResolver:
             == provider_http.RESOLVER_THREADS
         )
         assert sum(name.startswith("srw-provider-resolve") for name in names) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_lookup_cancelled_before_a_thread_took_it_frees_its_slot(
+        self, monkeypatch
+    ):
+        """A Test's deadline can cancel a lookup still queued for a thread:
+        its slot comes back, so the lane never shrinks."""
+        import socket
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        def lookup(host, *args, **kwargs):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.5", 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", lookup)
+        lane = provider_http._ResolverLane("cancel-test")
+        # One thread, held by work the lane does not count: the lookup
+        # queues behind it.
+        lane.pool = ThreadPoolExecutor(max_workers=1)
+        release = threading.Event()
+        lane.pool.submit(release.wait, 10)
+        try:
+            queued = asyncio.ensure_future(lane.resolve("queued.test", False))
+            await asyncio.sleep(0.1)
+            queued.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await queued
+        finally:
+            release.set()
+        await asyncio.sleep(0.1)
+        # Every slot is free again: as many lookups as threads at once.
+        lane.pool = ThreadPoolExecutor(max_workers=provider_http.RESOLVER_THREADS)
+        answers = await asyncio.gather(
+            *(
+                lane.resolve(f"x{i}.test", False)
+                for i in range(provider_http.RESOLVER_THREADS)
+            )
+        )
+        assert answers == [["203.0.113.5"]] * provider_http.RESOLVER_THREADS
 
     def test_an_installed_resolver_serves_every_lane(self):
         installed = fake_resolver({})

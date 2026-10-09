@@ -592,7 +592,7 @@ class TestUpstream:
         calls: list[tuple] = []
         answers: dict[str, Any] = {}
 
-        async def check(host, *, ca_pem, private_allowed):
+        async def check(host, *, ca_pem, private_allowed, resolver=None):
             calls.append((host, ca_pem, private_allowed))
             return answers.get(host)
 
@@ -1110,12 +1110,14 @@ def test_no_lease_is_picked_by_the_stored_rows_driver():
 class TestCheck:
     @pytest.mark.asyncio
     async def test_test_says_how_the_token_is_delivered(self, monkeypatch):
-        async def probe(ds, url, creds, *, allow_private):
+        async def probe(ds, url, creds, *, allow_private, outcome):
             # No store to read the tier on: public addresses only.
             assert allow_private is False
             return {"status": "ok", "message": "Authenticated as octo"}
 
-        async def report(row, *, token=None):
+        async def report(row, *, token=None, probe_reason="", probe_host=""):
+            # The probe answered: the report looks the upstream up itself.
+            assert probe_reason == "" and probe_host == ""
             assert token == TOKEN
             return {
                 "driver": GIT_SWAP_SPEC.name,
@@ -1149,7 +1151,7 @@ class TestCheck:
         asked: list[bool] = []
         verdicts: list[Any] = [None]
 
-        async def verdict(host, *, ca_pem, private_allowed, fresh=False):
+        async def verdict(host, *, ca_pem, private_allowed, fresh=False, resolver=None):
             asked.append(fresh)
             return verdicts[0]
 
@@ -1185,6 +1187,95 @@ class TestCheck:
         )
         assert report["mode"] == "token-in-url"
         assert report["reason"] == swaps.REASONS["url_not_served"]
+
+    @staticmethod
+    def _report_store(monkeypatch) -> None:
+        async def private(conn, connector_id, *, private_tiers):
+            return False
+
+        async def launch(conn, connector_id):
+            return None
+
+        monkeypatch.setattr(swaps, "private_addresses_allowed", private)
+        monkeypatch.setattr(swaps, "launch_problem", launch)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason", ["address_refused", "does_not_resolve"])
+    async def test_a_tests_probe_reason_spares_a_second_lookup(
+        self, monkeypatch, reason
+    ):
+        """Test's forge probe already found the address refused, or no
+        address: the report decides from that, with no lookup of its own."""
+
+        async def never(host, ipv6):
+            raise AssertionError("the upstream was looked up again")
+
+        self._report_store(monkeypatch)
+        swaps.configure_git_swap_delivery(
+            swaps.GitSwapDeliverySettings(
+                installed=True, store=_store(), resolver=never
+            )
+        )
+        report = await swaps.delivery_report(
+            {"id": CONNECTOR, "connection_url": "https://git.corp.example/o/r.git"},
+            token=TOKEN,
+            probe_reason=reason,
+            probe_host="git.corp.example",
+        )
+        if reason == "address_refused":
+            assert report["mode"] == "token-in-url"
+            assert report["reason"] == swaps.REASONS["egress_refused"]
+            assert report["upstream_tls"] == swaps.REASONS["egress_refused"]
+        else:
+            assert report["mode"] == "git-swap"
+            assert report["upstream_tls"].startswith("not checked")
+
+    @pytest.mark.asyncio
+    async def test_a_tests_lookup_never_runs_on_the_loops_shared_executor(
+        self, monkeypatch
+    ):
+        """Without a probe reason the upstream is looked up afresh, on the
+        Test resolver threads and under a timeout: a name that never answers
+        holds none of the threads every other blocking call shares."""
+        from orchestrator.services.connector_drivers import provider_http
+
+        asked: list[str] = []
+
+        async def lane(host, ipv6):
+            asked.append(host)
+            if host == "hang.example":
+                await asyncio.sleep(3600)
+            return ["203.0.113.30"]
+
+        async def tls(host, address, **kwargs):
+            return None
+
+        async def shared_executor(*args, **kwargs):
+            raise AssertionError("the loop's shared executor resolved")
+
+        self._report_store(monkeypatch)
+        monkeypatch.setattr(provider_http, "connector_test_resolver", lane)
+        monkeypatch.setattr(swaps, "probe_upstream_tls", tls)
+        monkeypatch.setattr(swaps, "RESOLVE_TIMEOUT_SECONDS", 0.2)
+        monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", shared_executor)
+        # The settings' resolver is the default (system_resolver).
+        swaps.configure_git_swap_delivery(
+            swaps.GitSwapDeliverySettings(installed=True, store=_store())
+        )
+        report = await swaps.delivery_report(
+            {"id": CONNECTOR, "connection_url": "https://github.com/o/r.git"},
+            token=TOKEN,
+        )
+        assert asked == ["github.com"]
+        assert report["mode"] == "git-swap"
+
+        started = asyncio.get_running_loop().time()
+        report = await swaps.delivery_report(
+            {"id": CONNECTOR, "connection_url": "https://hang.example/o/r.git"},
+            token=TOKEN,
+        )
+        assert asyncio.get_running_loop().time() - started < 2
+        assert report["upstream_tls"].startswith("not checked")
 
     @pytest.mark.asyncio
     async def test_a_refuse_installation_without_the_driver_says_so(self):

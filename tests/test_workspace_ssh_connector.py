@@ -9,6 +9,7 @@ never unlock it.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -1126,6 +1127,33 @@ class TestProbeEgress:
         assert result["status"] == "ok"
         # The pin names the host, never the address it was read at.
         assert result["details"]["host_key"] == f"git.example.com {presented}"
+
+    @pytest.mark.asyncio
+    async def test_a_dead_address_leaves_the_next_one_a_try(self, monkeypatch, reached):
+        """One address that never answers takes at most
+        ADDRESS_CONNECT_SECONDS of the probe's deadline."""
+        import time
+
+        from orchestrator.services import workspace_ssh_connector
+        from orchestrator.services.connector_drivers import provider_http
+
+        _ssh_network(monkeypatch, {"git.example.com": ("203.0.113.40", "203.0.113.41")})
+        monkeypatch.setattr(provider_http, "ADDRESS_CONNECT_SECONDS", 0.2)
+        presented = _host_key()
+
+        async def fetch(host, port):
+            reached.append((host, port))
+            if host == "203.0.113.40":
+                await asyncio.sleep(3600)
+            return presented
+
+        monkeypatch.setattr(workspace_ssh_connector, "fetch_ssh_host_key", fetch)
+        started = time.monotonic()
+        result = await self._probe({"host": "git.example.com"})
+
+        assert time.monotonic() - started < 2
+        assert result["status"] == "ok"
+        assert reached == [("203.0.113.40", 22), ("203.0.113.41", 22)]
 
     @pytest.mark.asyncio
     async def test_a_tier_that_allows_private_addresses(self, monkeypatch, reached):

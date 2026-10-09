@@ -813,7 +813,14 @@ class TestRepositoryTestEgress:
         assert seen[0].headers["host"] == "git.lan:3000"
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("origin", ["https://10.43.0.10", "http://169.254.169.254"])
+    @pytest.mark.parametrize(
+        "origin",
+        [
+            "https://10.43.0.10",
+            "http://169.254.169.254",
+            "http://100.100.100.200",  # Alibaba's metadata, inside CGNAT
+        ],
+    )
     async def test_a_private_tier_never_reaches_the_cluster_or_metadata(
         self, monkeypatch, origin
     ):
@@ -1183,4 +1190,150 @@ class TestSrwGiteaIsTrustedForTest:
                 "GET", "http://srw-gitea:3000/api/v1/user", who="x", headers={}
             )
         assert refused.value.reason == "address_refused"
+        assert seen == []
+
+
+class TestTheDeliveryReportAfterAProbe:
+    """Where the git swap driver is installed, Test also reports how the
+    token is delivered. When the forge probe already found the address
+    refused, or no address, that report looks nothing up again: a name that
+    never answers would otherwise hold a thread per Test."""
+
+    @pytest.fixture
+    def swap_installed(self, monkeypatch):
+        from orchestrator.services import connector_git_swap_delivery as swaps
+
+        looked_up: list[str] = []
+
+        async def never(host, ipv6):
+            looked_up.append(host)
+            raise AssertionError("the delivery report looked the upstream up")
+
+        async def private(conn, connector_id, *, private_tiers):
+            return False
+
+        async def launch(conn, connector_id):
+            return None
+
+        monkeypatch.setattr(swaps, "private_addresses_allowed", private)
+        monkeypatch.setattr(swaps, "launch_problem", launch)
+        monkeypatch.setitem(
+            swaps._state,
+            "settings",
+            swaps.GitSwapDeliverySettings(
+                installed=True, store=_TierStore(allowed=False), resolver=never
+            ),
+        )
+        return looked_up
+
+    @pytest.mark.asyncio
+    async def test_a_refused_forge_is_refused_to_the_driver_without_a_lookup(
+        self, monkeypatch, swap_installed
+    ):
+        seen = _forge(
+            monkeypatch,
+            _ok(),
+            addresses={"git.internal.example": ("10.43.0.10",)},
+        )
+        result = await _test(
+            _repository("https://git.internal.example/acme/widgets.git")
+        )
+
+        assert result["status"] == "error"
+        assert result["message"].startswith(REFUSED.format(forge="gitea"))
+        delivery = result["details"]["delivery"]
+        assert delivery["mode"] == "token-in-url"
+        assert delivery["reason"] == (
+            "the driver's egress policy refuses the upstream's address"
+        )
+        assert seen == [] and swap_installed == []
+
+    @pytest.mark.asyncio
+    async def test_githubs_git_host_is_still_checked_on_its_own(
+        self, monkeypatch, swap_installed
+    ):
+        """The probe asks api.github.com; the driver would reach github.com:
+        a refusal of the one is no verdict on the other."""
+        from orchestrator.services import connector_git_swap_delivery as swaps
+
+        looked_up: list[str] = []
+
+        async def public(host, ipv6):
+            looked_up.append(host)
+            return ["203.0.113.31"]
+
+        async def tls(host, address, **kwargs):
+            return None
+
+        settings = swaps._state["settings"]
+        monkeypatch.setitem(
+            swaps._state,
+            "settings",
+            swaps.GitSwapDeliverySettings(
+                installed=True, store=settings.store, resolver=public
+            ),
+        )
+        monkeypatch.setattr(swaps, "probe_upstream_tls", tls)
+        _forge(monkeypatch, _ok(), addresses={"api.github.com": ("10.43.0.10",)})
+        result = await _test(
+            _repository("https://github.com/acme/widgets.git", forge="github")
+        )
+
+        assert result["message"].startswith(REFUSED.format(forge="github"))
+        assert looked_up == ["github.com"]
+        assert result["details"]["delivery"]["mode"] == "git-swap"
+
+    @pytest.mark.asyncio
+    async def test_a_forge_with_no_address_is_not_looked_up_again(
+        self, monkeypatch, swap_installed
+    ):
+        seen = _forge(monkeypatch, _ok(), addresses={})
+        result = await _test(_repository("https://nowhere.example/acme/widgets.git"))
+
+        assert result["message"].startswith(UNRESOLVED.format(forge="gitea"))
+        assert result["details"]["delivery"]["upstream_tls"].startswith("not checked")
+        assert seen == [] and swap_installed == []
+
+
+class TestScpHosts:
+    """An scp-style URL's host becomes the API origin as written: a host
+    that would move the request's path or authority is no host."""
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "git@host#:acme/widgets",
+            "git@host?x=:acme/widgets",
+            "git@ho st:acme/widgets",
+            "git@[::1]:acme/widgets",
+            "git@host%2f:acme/widgets",
+            "git@host\t:acme/widgets",
+            "git@:acme/widgets",
+        ],
+    )
+    def test_a_host_that_steers_the_request_is_refused(self, url):
+        from shared.runtime.services.forge import resolve_api_base
+
+        with pytest.raises(ForgeError, match="Cannot parse host"):
+            resolve_api_base(url, "gitea")
+
+    def test_a_plain_scp_host_keeps_its_api_base(self):
+        from shared.runtime.services.forge import resolve_api_base
+
+        assert (
+            resolve_api_base("git@git.example.com:acme/widgets", "gitea")
+            == "https://git.example.com/api/v1"
+        )
+        assert (
+            resolve_api_base("git@github.com:acme/widgets", "github")
+            == "https://api.github.com"
+        )
+
+    @pytest.mark.asyncio
+    async def test_test_of_such_a_url_sends_nothing(self, monkeypatch):
+        seen = _forge(monkeypatch, _ok(), addresses={"host": (PUBLIC,)})
+        result = await _test(_repository("git@host?x=:acme/widgets"))
+
+        assert result["status"] == "error"
+        assert "Cannot parse host" in result["message"]
         assert seen == []

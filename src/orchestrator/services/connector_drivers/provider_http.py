@@ -86,6 +86,10 @@ DEFAULT_DEADLINE_SECONDS = 15.0
 MAX_BODY_BYTES = 64 * 1024
 #: Threads the provider calls' name lookups run on (and lookups at once).
 RESOLVER_THREADS = 4
+#: The longest one address of several may take to connect, so a dead one
+#: leaves the rest a try within the call's deadline (the last address has
+#: what remains).
+ADDRESS_CONNECT_SECONDS = 5.0
 
 ClientFactory = Callable[..., httpx.AsyncClient]
 
@@ -100,7 +104,7 @@ _TEXTS: dict[str, str] = {
         "(an operator may allow a private host in "
         "connectors.providerMinting.privateHosts)"
     ),
-    "certificate": "{who}'s certificate does not verify against the configured CA",
+    "certificate": "{who}'s certificate does not verify",
     "ca_unusable": "the configured CA certificates are not usable",
     "too_large": "{who}'s answer is larger than SRW reads",
     "malformed": "{who}'s answer is not what SRW expected",
@@ -134,11 +138,24 @@ class UnrevokedToken(ProviderError):
         self.minted = minted
 
 
+#: A reason's text where a CA was configured for the call (its own CA, not
+#: the public roots).
+_CA_TEXTS: dict[str, str] = {
+    "certificate": "{who}'s certificate does not verify against the configured CA",
+}
+
+
 def failure(
-    reason: str, who: str, *, transient: bool, reached: bool = True
+    reason: str,
+    who: str,
+    *,
+    transient: bool,
+    reached: bool = True,
+    configured_ca: bool = False,
 ) -> ProviderError:
+    text = (_CA_TEXTS.get(reason) if configured_ca else None) or _TEXTS[reason]
     return ProviderError(
-        _TEXTS[reason].format(who=who),
+        text.format(who=who),
         transient=transient,
         reason=reason,
         reached=reached,
@@ -164,24 +181,26 @@ class _ResolverLane:
         )
         self.slots = threading.BoundedSemaphore(RESOLVER_THREADS)
 
-    def _lookup(self, host: str, family: int) -> list[str]:
-        try:
-            infos = socket.getaddrinfo(host, None, family, socket.SOCK_STREAM)
-        finally:
-            self.slots.release()
+    @staticmethod
+    def _lookup(host: str, family: int) -> list[str]:
+        infos = socket.getaddrinfo(host, None, family, socket.SOCK_STREAM)
         return [str(info[4][0]) for info in infos]
 
     async def resolve(self, host: str, ipv6: bool) -> Sequence[str]:
         if not self.slots.acquire(blocking=False):
             raise OSError(f"every {self.name} resolver thread is busy")
         family = socket.AF_UNSPEC if ipv6 else socket.AF_INET
-        loop = asyncio.get_running_loop()
         try:
-            future = loop.run_in_executor(self.pool, self._lookup, host, family)
+            job = self.pool.submit(self._lookup, host, family)
         except BaseException:
             self.slots.release()
             raise
-        return await future
+        # The slot is the job's until it is done: answered, failed, or
+        # cancelled before a thread took it (a caller's deadline). A
+        # cancelled wait cancels a job not yet started; one already running
+        # keeps its slot until the lookup returns.
+        job.add_done_callback(lambda _job: self.slots.release())
+        return await asyncio.wrap_future(job)
 
 
 _PROVIDER_LANE = _ResolverLane("provider")
@@ -482,9 +501,15 @@ async def _exchange(
     json_body: Any,
     extensions: dict[str, Any],
     who: str,
+    timeout: httpx.Timeout | None = None,
 ) -> ProviderAnswer:
     async with client.stream(
-        method, url, headers=headers, json=json_body, extensions=extensions
+        method,
+        url,
+        headers=headers,
+        json=json_body,
+        extensions=extensions,
+        **({"timeout": timeout} if timeout is not None else {}),
     ) as response:
         coding = response.headers.get("content-encoding", "").strip().lower()
         if coding not in ("", "identity"):
@@ -525,16 +550,26 @@ async def _raw(response: httpx.Response) -> AsyncIterator[bytes]:
         yield chunk
 
 
-def transport_error(exc: Exception, who: str) -> ProviderError:
+def transport_error(
+    exc: Exception, who: str, *, configured_ca: bool = False
+) -> ProviderError:
     """A request that got no answer: an untrusted certificate is final,
-    anything else may pass. The exception's text is logged, never shown."""
+    anything else may pass. The exception's text is logged, never shown.
+    ``configured_ca``: the call verified against a CA it was given, not the
+    public roots (the text names it)."""
     text = str(exc)
     logger.info("Provider call to %s failed: %s", who, clean(text))
     if "CERTIFICATE_VERIFY_FAILED" in text or isinstance(
         getattr(exc, "__cause__", None), ssl.SSLCertVerificationError
     ):
         # The TLS handshake failed: nothing was sent.
-        return failure("certificate", who, transient=False, reached=False)
+        return failure(
+            "certificate",
+            who,
+            transient=False,
+            reached=False,
+            configured_ca=configured_ca,
+        )
     connected = not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
     if isinstance(exc, httpx.TimeoutException):
         return failure("timeout", who, transient=True, reached=connected)
@@ -564,6 +599,8 @@ async def provider_request(
     verify = tls_context(ca_pem)
     target = httpx.URL(url)
     resolving = True
+    loop = asyncio.get_running_loop()
+    ends = loop.time() + deadline
     try:
         async with asyncio.timeout(deadline):
             candidates = await _targets(
@@ -576,6 +613,8 @@ async def provider_request(
             resolving = False
             async with _state["factory"](verify=verify, timeout=deadline) as client:
                 for index, (dial, pinned, extensions) in enumerate(candidates):
+                    remaining = max(ends - loop.time(), 0.001)
+                    last = index == len(candidates) - 1
                     try:
                         return await _exchange(
                             client,
@@ -585,6 +624,16 @@ async def provider_request(
                             json_body=json_body,
                             extensions=extensions,
                             who=who,
+                            # One dead address of several never takes the
+                            # whole deadline: the next still gets a try.
+                            timeout=httpx.Timeout(
+                                remaining,
+                                connect=(
+                                    remaining
+                                    if last
+                                    else min(remaining, ADDRESS_CONNECT_SECONDS)
+                                ),
+                            ),
                         )
                     except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                         if index == len(candidates) - 1:
@@ -595,10 +644,11 @@ async def provider_request(
         logger.info("Provider call to %s exceeded its %.0fs deadline", who, deadline)
         raise failure("timeout", who, transient=True, reached=not resolving) from None
     except httpx.HTTPError as exc:
-        raise transport_error(exc, who) from None
+        raise transport_error(exc, who, configured_ca=bool(ca_pem)) from None
 
 
 __all__ = [
+    "ADDRESS_CONNECT_SECONDS",
     "ClientFactory",
     "DEFAULT_DEADLINE_SECONDS",
     "LANE_PROVIDER",
