@@ -621,6 +621,59 @@ class TestUpstream:
         )
         assert len(calls) == 9
 
+    @pytest.mark.asyncio
+    async def test_a_full_resolver_lane_is_never_remembered(self, monkeypatch):
+        """Any user can fill the Test lane: what a Test then sees decides
+        nothing for the host, neither remembered nor replacing the refusal
+        other connectors' deliveries read."""
+        from orchestrator.services.connector_drivers import provider_http
+        from orchestrator.services.connector_egress import ResolverBusy
+
+        now = [100.0]
+        swaps.configure_git_swap_delivery(
+            swaps.GitSwapDeliverySettings(verdict_seconds=300, clock=lambda: now[0])
+        )
+
+        async def cluster(host, ipv6):
+            return ["10.43.0.10"]
+
+        async def busy(host, ipv6):
+            raise ResolverBusy("every test-probe resolver thread is busy")
+
+        shared = "git.shared.example"
+        refused = await swaps.upstream_verdict(
+            shared, ca_pem=None, private_allowed=False, resolver=cluster
+        )
+        assert isinstance(refused, swaps.Problem)
+        assert refused.reason == "egress_refused"
+        # A Test with the lane full: no answer, and nothing remembered.
+        assert (
+            await swaps.upstream_verdict(
+                shared, ca_pem=None, private_allowed=False, fresh=True, resolver=busy
+            )
+            == swaps.UNDECIDED
+        )
+        # A delivery still reads the refusal.
+        assert (
+            await swaps.upstream_verdict(shared, ca_pem=None, private_allowed=False)
+            == refused
+        )
+        # A host nothing was remembered for stays unremembered.
+        await swaps.upstream_verdict(
+            "fresh.example", ca_pem=None, private_allowed=False, resolver=busy
+        )
+        assert swaps._remembered(("fresh.example", swaps._ca_digest(None), False)) == (
+            False,
+            None,
+        )
+
+        # The Test lane itself says busy with this exception.
+        lane = provider_http._ResolverLane("busy-test")
+        for _ in range(provider_http.RESOLVER_THREADS):
+            assert lane.slots.acquire(blocking=False)
+        with pytest.raises(ResolverBusy):
+            await lane.resolve("x.example", False)
+
     def test_the_ca_digest_is_the_whole_digest(self):
         assert len(swaps._ca_digest("CA")) == 64
 

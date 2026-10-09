@@ -73,6 +73,7 @@ from orchestrator.services.connector_egress import (
     EgressPolicy,
     IPAddress,
     Resolver,
+    ResolverBusy,
     private_addresses_allowed,
     refusal,
 )
@@ -188,7 +189,7 @@ class _ResolverLane:
 
     async def resolve(self, host: str, ipv6: bool) -> Sequence[str]:
         if not self.slots.acquire(blocking=False):
-            raise OSError(f"every {self.name} resolver thread is busy")
+            raise ResolverBusy(f"every {self.name} resolver thread is busy")
         family = socket.AF_UNSPEC if ipv6 else socket.AF_INET
         try:
             job = self.pool.submit(self._lookup, host, family)

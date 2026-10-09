@@ -227,7 +227,10 @@ connectors:
       - 10.43.0.0/16
     # -- Project network tiers whose connectors' pods may reach private and
     # home addresses (RFC 1918, CGNAT, IPv6 ULA). A connector qualifies only
-    # when every project it belongs to is on one of these tiers.
+    # when every project it belongs to is on one of these tiers. A declared
+    # egress CIDR that overlaps an always-refused range is refused as a whole:
+    # 100.64.0.0/10 contains Alibaba's metadata address 100.100.100.200, so
+    # declare the narrower ranges a driver needs.
     privateTiers:
       - home-allowed
     # -- Ranges no driver pod may reach even where private addresses are

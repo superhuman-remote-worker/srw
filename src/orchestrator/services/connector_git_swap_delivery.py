@@ -73,6 +73,7 @@ from orchestrator.services.connector_egress import (
     EgressPolicy,
     EgressRefused,
     RESOLVE_TIMEOUT_SECONDS,
+    ResolverBusy,
     pin_egress,
     private_addresses_allowed,
     system_resolver,
@@ -316,6 +317,8 @@ async def check_upstream(
     settings = git_swap_delivery_settings()
     try:
         answers = list(await (resolver or settings.resolver)(host, settings.ipv6))
+    except ResolverBusy:
+        raise  # no answer about the host: upstream_verdict decides nothing
     except (OSError, UnicodeError, TimeoutError, asyncio.TimeoutError) as exc:
         logger.info("Upstream %s did not resolve from the orchestrator (%s)", host, exc)
         return UNDECIDED
@@ -370,15 +373,22 @@ async def upstream_verdict(
     fresh: bool = False,
     resolver: Callable[[str, bool], Any] | None = None,
 ) -> Problem | str | None:
-    """:func:`check_upstream`, remembered per host, CA and tier."""
+    """:func:`check_upstream`, remembered per host, CA and tier. A lookup
+    refused because the resolver lane was full (a Test's, which any user
+    can fill) says nothing about the host: :data:`UNDECIDED`, neither
+    remembered nor replacing what was."""
     key = (host, _ca_digest(ca_pem), private_allowed)
     if not fresh:
         known, verdict = _remembered(key)
         if known:
             return verdict
-    verdict = await check_upstream(
-        host, ca_pem=ca_pem, private_allowed=private_allowed, resolver=resolver
-    )
+    try:
+        verdict = await check_upstream(
+            host, ca_pem=ca_pem, private_allowed=private_allowed, resolver=resolver
+        )
+    except ResolverBusy as exc:
+        logger.info("Upstream %s was not looked up (%s)", host, exc)
+        return UNDECIDED
     _remember(key, verdict)
     return verdict
 

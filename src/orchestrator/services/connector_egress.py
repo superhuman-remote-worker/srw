@@ -111,6 +111,11 @@ class EgressRefused(ValueError):
     """A declared destination SRW will not open for this pod."""
 
 
+class ResolverBusy(OSError):
+    """Every thread of a resolver lane is taken: no answer about the name
+    at all, only about the lane. Nothing decided from it is remembered."""
+
+
 @dataclass(frozen=True)
 class EgressPolicy:
     """What a pod's egress may reach on this installation."""
@@ -428,6 +433,7 @@ __all__ = [
     "EgressPins",
     "EgressPolicy",
     "EgressRefused",
+    "ResolverBusy",
     "PinnedHost",
     "expand_rule",
     "pin_egress",
