@@ -256,9 +256,12 @@ async function bootstrapCatalogAndReadiness(
     await journey.request.get(appUrl('/api/settings/preferences')),
     'journey preference verification',
   );
+  // Underscore keys are computed by the server, not stored: _resolved holds
+  // the defaults, _unavailable the stored models that can no longer run.
   const explicitPreferenceKeys = Object.keys(preferences)
-    .filter((key) => key !== '_resolved')
+    .filter((key) => !key.startsWith('_'))
     .sort();
+  expect(preferences['_unavailable']).toEqual({});
   // An owned browser rerun can retain the empty object written by the old
   // bootstrap before workspace_backend was retired. It is not a preference.
   if (OWNED_BROWSER_RERUN && explicitPreferenceKeys.includes('persistent_agent')) {
