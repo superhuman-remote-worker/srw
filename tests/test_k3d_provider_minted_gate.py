@@ -375,3 +375,58 @@ def test_the_pinned_served_set_exists():
         assert (_ROOT / directory).is_dir(), directory
     for path in gate.PINNED_SERVED.files:
         assert (_ROOT / path).is_file(), path
+
+
+def _runner():
+    return gate.ProviderMintedGate(
+        gate.build_parser().parse_args(["--gate-id", GATE_ID])
+    )
+
+
+def test_a_job_delete_is_retried_through_the_retirement_503(monkeypatch):
+    import time
+
+    runner = _runner()
+    runner.jobs["job-delete"] = "00000000-0000-0000-0000-000000000001"
+    answers = iter(
+        [
+            (503, {"detail": "Workspace authority retirement is incomplete"}),
+            (503, {"detail": "Workspace authority retirement is incomplete"}),
+            (200, {}),
+        ]
+    )
+    monkeypatch.setattr(runner.owner, "call", lambda *args, **kwargs: next(answers))
+    monkeypatch.setattr(gate, "sql", lambda query: "0")
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    assert runner.delete_job_until_gone("job-delete") == [503, 503, 200]
+
+
+def test_a_job_delete_refused_otherwise_stops_the_phase(monkeypatch):
+    import time
+
+    runner = _runner()
+    runner.jobs["job-delete"] = "00000000-0000-0000-0000-000000000001"
+    monkeypatch.setattr(
+        runner.owner, "call", lambda *args, **kwargs: (409, {"detail": "children"})
+    )
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    with pytest.raises(gate.GateError, match="HTTP 409"):
+        runner.delete_job_until_gone("job-delete")
+
+
+def test_the_job_check_waits_for_the_claim_to_deliver_the_kubeconfig(monkeypatch):
+    """The dispatcher mints before the claim: a live credential precedes the
+    workspace's kubeconfig, so the check waits for the delivery."""
+    import time
+
+    runner = _runner()
+    outputs = iter(["", "", "kubeconfig-delivered"])
+    monkeypatch.setattr(
+        runner, "ws", lambda label, script, timeout=180: (0, next(outputs))
+    )
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    assert runner.wait_kubeconfig("job-cancel") is True
+    # Never delivered within the bound: the check fails with the facts.
+    runner.args.turn_timeout = 0
+    monkeypatch.setattr(runner, "ws", lambda label, script, timeout=180: (0, ""))
+    assert runner.wait_kubeconfig("job-cancel") is False

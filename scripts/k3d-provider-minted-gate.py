@@ -1535,14 +1535,24 @@ class ProviderMintedGate:
         ):
             self.create_job(label, ["kube"])
             self.open_egress(label)
+            # The dispatcher mints before it admits the job (C5's pre-claim
+            # step), so the credential is live before the job is claimed;
+            # the kubeconfig reaches the workspace only with the claim's
+            # bundle, when the worker materializes its credential files.
             row = self.wait_live(label, "kube")
-            found = self.ws_kube(label)
-            problems = workspace_problems(
-                found,
-                digest=hashlib.sha256(row["token"].encode()).hexdigest(),
-                ids=self.ids,
-                marker=self.marker,
-            )
+            if self.wait_kubeconfig(label):
+                found = self.ws_kube(label)
+                problems = workspace_problems(
+                    found,
+                    digest=hashlib.sha256(row["token"].encode()).hexdigest(),
+                    ids=self.ids,
+                    marker=self.marker,
+                )
+            else:
+                problems = [
+                    "the claim never delivered a kubeconfig "
+                    f"({self.job_delivery_facts(label)})"
+                ]
             self.report.check(
                 f"{label}: the stateless worker's workspace holds the job's own "
                 "minted token only, and kubectl reads the marker",
@@ -1561,8 +1571,72 @@ class ProviderMintedGate:
             if ending == "cancel":
                 self.owner.ok("PUT", f"/api/jobs/{job}/cancel")
             else:
-                self.owner.ok("DELETE", f"/api/jobs/{job}")
+                answers = self.delete_job_until_gone(label)
+                self.report.note(
+                    f"{label}: DELETE answered {answers} (a 503 while the "
+                    "workspace authority retires, then the delete)"
+                )
             self.expect_revoked(label, label, "kube", reason, [row["token"]])
+
+    def wait_kubeconfig(self, label: str) -> bool:
+        """Whether the job's or session's workspace got its kubeconfig
+        (``KUBECONFIG`` names a non-empty file, credential environment
+        sourced) within the turn timeout. A credential is live before its
+        delivery (minted before a job's claim, or before a pinned session's
+        attach), so a check must wait for the delivery itself."""
+
+        def delivered() -> bool:
+            try:
+                _rc, out = self.ws(
+                    label,
+                    'test -n "${KUBECONFIG:-}" && test -s "$KUBECONFIG" '
+                    "&& echo kubeconfig-delivered\nexit 0\n",
+                    timeout=60,
+                )
+            except GateError:
+                return False
+            return "kubeconfig-delivered" in out
+
+        try:
+            wait_for(
+                f"{label}: the kubeconfig delivered into the workspace",
+                delivered,
+                timeout=self.args.turn_timeout,
+                interval=5,
+            )
+        except GateError:
+            return False
+        return True
+
+    def job_delivery_facts(self, label: str) -> str:
+        """What the job's claim did, for a delivery that never arrived."""
+        job = lit(self.jobs[label])
+        status = self.job_status(label)
+        queue = sql(
+            "SELECT coalesce(string_agg(state || ' attempts ' || "
+            "attempts_since_completion || coalesce(' ' || last_error, ''), ','), "
+            f"'none') FROM run_queue WHERE unit_id = {job}"
+        )
+        return f"job {status}, run_queue {queue}"
+
+    def delete_job_until_gone(self, label: str) -> list[int]:
+        """DELETE the job until it is gone: the delete answers 503 while its
+        workspace authority retires in the background, as the session
+        delete does. Bounded; the answers seen are returned."""
+        job = self.jobs[label]
+        answers: list[int] = []
+
+        def gone() -> bool:
+            status, body = self.owner.call("DELETE", f"/api/jobs/{job}")
+            answers.append(status)
+            if status in (200, 204, 404):
+                return sql(f"SELECT count(*) FROM jobs WHERE id = {lit(job)}") == "0"
+            if status == 503:
+                return False
+            raise GateError(f"DELETE /api/jobs/{job} -> HTTP {status}: {body}")
+
+        wait_for(f"{label}: job deleted", gone, timeout=300, interval=5)
+        return answers
 
     def pooled_pinned_pods(self) -> list[str]:
         pods = json.loads(command(K + ["get", "pods", "-o", "json"]))["items"]
@@ -1599,14 +1673,21 @@ class ProviderMintedGate:
             raise GateError("a pooled pinned agent pod serves stale connector code")
         self.create_session("pinned", ["kube"], pinned=True)
         self.open_egress("pinned")
+        # Minted when the agent's attach prepares its delivery: the
+        # kubeconfig lands only once the attach completes. Ending the
+        # session before that fails the attach, whose retirement then takes
+        # many minutes (the pinned lane's failed-attach cleanup).
         row = self.wait_live("pinned", "kube")
-        found = self.ws_kube("pinned")
-        problems = workspace_problems(
-            found,
-            digest=hashlib.sha256(row["token"].encode()).hexdigest(),
-            ids=self.ids,
-            marker=self.marker,
-        )
+        if self.wait_kubeconfig("pinned"):
+            found = self.ws_kube("pinned")
+            problems = workspace_problems(
+                found,
+                digest=hashlib.sha256(row["token"].encode()).hexdigest(),
+                ids=self.ids,
+                marker=self.marker,
+            )
+        else:
+            problems = ["the attach never delivered a kubeconfig"]
         self.report.check(
             "pinned: the attach delivered a kubeconfig with the session's own "
             "minted token only; kubectl reads the marker",
@@ -1983,7 +2064,8 @@ class ProviderMintedGate:
                         == "0"
                     )
 
-                return bool(wait_for("session deleted", gone, timeout=300, interval=5))
+                # A pinned session retires its agent and workspace first.
+                return bool(wait_for("session deleted", gone, timeout=600, interval=5))
 
             step(f"delete session {thread}", delete_thread)
         for label, job in list(self.jobs.items()):
