@@ -537,6 +537,33 @@ def _workspace(*, exists=False, shell_outputs=("Exit code: 0",)):
     return ws
 
 
+def _reused_checkout(
+    origin="https://github.com/o/r.git", credentials_in_url=None, *, reset=True
+):
+    """A reused checkout's GitManager: ``add_remote`` sets the origin (or
+    fails: ``reset=False``), and its config reads NUL-delimited, as
+    ``_config_values`` reads it (``None``: unset or unreadable)."""
+    git_mgr = MagicMock()
+    config = {
+        "remote.origin.url": origin,
+        "transfer.credentialsInUrl": credentials_in_url,
+    }
+
+    def add_remote(name, url):
+        if reset:
+            config["remote.origin.url"] = url
+        return reset
+
+    def records(args):
+        value = config.get(args[-1])
+        return None if value is None else [value]
+
+    git_mgr.add_remote.side_effect = add_remote
+    git_mgr._run_git_nul_records.side_effect = records
+    git_mgr.config = config
+    return git_mgr
+
+
 class TestClone:
     def test_the_wiring_comes_first_then_the_clean_url_is_cloned(self):
         ws = _workspace()
@@ -574,10 +601,7 @@ class TestClone:
 
     def test_a_reused_checkout_loses_its_old_token_url(self):
         ws = _workspace(exists=True)
-        reused = MagicMock()
-        reused._run_git.return_value = SimpleNamespace(
-            returncode=0, stdout="https://github.com/o/r.git\n"
-        )
+        reused = _reused_checkout(f"https://oauth2:{TOKEN}@github.com/o/r.git")
         with patch(
             "agent.managers.git_manager.GitManager", return_value=reused
         ) as manager:
@@ -588,29 +612,38 @@ class TestClone:
             "origin", "https://github.com/o/r.git"
         )
         reused._run_git.assert_any_call(["config", "transfer.credentialsInUrl", "die"])
+        # The origin is read back NUL-delimited, never as plain output.
+        reused._run_git_nul_records.assert_any_call(
+            ["config", "-z", "--get-all", "remote.origin.url"]
+        )
+        assert reused.config["remote.origin.url"] == "https://github.com/o/r.git"
         ws.backend.shell_run.assert_not_called()  # no wait for a reused checkout
         assert ws.source_repos == {"r": reused}
 
     @pytest.mark.parametrize(
-        ("reset", "found"),
+        ("reset", "read_back"),
         [
-            (False, SimpleNamespace(returncode=0, stdout="https://github.com/o/r.git")),
+            (False, None),
+            (True, [f"https://oauth2:{TOKEN}@github.com/o/r.git"]),
             (
                 True,
-                SimpleNamespace(
-                    returncode=0, stdout=f"https://oauth2:{TOKEN}@github.com/o/r.git"
-                ),
+                [
+                    "https://github.com/o/r.git",
+                    f"https://oauth2:{TOKEN}@github.com/o/r.git",
+                ],
             ),
-            (True, SimpleNamespace(returncode=1, stdout="")),
+            (True, None),
         ],
     )
     def test_a_reused_checkout_that_keeps_its_token_is_not_used(
-        self, reset, found, caplog
+        self, reset, read_back, caplog
     ):
         ws = _workspace(exists=True)
-        reused = MagicMock()
-        reused.add_remote.return_value = reset
-        reused._run_git.return_value = found
+        reused = _reused_checkout(
+            f"https://oauth2:{TOKEN}@github.com/o/r.git", reset=reset
+        )
+        if reset:
+            reused._run_git_nul_records.side_effect = lambda args: read_back
         with patch("agent.managers.git_manager.GitManager", return_value=reused):
             clone_repository_datasources([_entry()], ws)
         assert ws.source_repos == {}
@@ -682,6 +715,66 @@ class TestClone:
             f"bindings/{CONNECTOR}.gitconfig ls-remote --quiet "
         )
         assert "https://github.com/o/r.git" in command
+
+
+class _EchoFilteringBackend:
+    """A workspace backend that runs git for real in a local directory and
+    formats its output as the tmux-backed RemoteBackend does, echo filter
+    included: leading output lines naming the command's first word are
+    dropped as if they were the command's echo (the live C3 gate's finding:
+    a repository URL always names git)."""
+
+    supports_shell = True
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def exists(self, path):
+        return (self.root / path).exists()
+
+    def shell_run(self, command, timeout=None, tab_name="default", working_dir=None):
+        done = subprocess.run(
+            ["bash", "-c", command],
+            cwd=self.root / (working_dir or ""),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        lines = (done.stdout + done.stderr).splitlines()
+        while lines and (command.split()[0] in lines[0] or lines[0].endswith("$")):
+            lines = lines[1:]
+        text = "\n".join(lines).strip()
+        body = f"--- stdout ---\n{text}" if text else "(no output)"
+        return f"Exit code: {done.returncode}\nCWD: /w/{working_dir}\n{body}"
+
+
+def test_a_reused_checkout_through_the_tmux_shell_refuses_credentials_again(
+    tmp_path,
+):
+    """The live C3 gate's reused check: the origin was reset, the flag never
+    set, because the origin's read-back came back empty through the tmux
+    shell (its echo filter took the URL for the echo of ``git ...``). Read
+    NUL-delimited, a planted pre-C3 checkout loses its token URL and
+    refuses credentials in URLs again."""
+    from agent.connectors.checkout import _secure_swap_checkout
+    from agent.managers.git_manager import GitManager
+
+    repo = tmp_path / "repos" / "r"
+    repo.mkdir(parents=True)
+    git = ["git", "-C", str(repo)]
+    subprocess.run([*git, "init", "-q"], check=True)
+    planted = f"https://oauth2:{TOKEN}@github.com/o/r.git"
+    subprocess.run([*git, "remote", "add", "origin", planted], check=True)
+    backend = _EchoFilteringBackend(tmp_path)
+    git_mgr = GitManager(repo, backend=backend, remote_cwd="repos/r")
+    # The plain read is what the filter loses.
+    assert git_mgr._run_git(["config", "--get", "remote.origin.url"]).stdout == ""
+    binding, _ = swap_binding(_entry())
+    assert _secure_swap_checkout(git_mgr, binding, reused=True) is None
+    config = (repo / ".git" / "config").read_text()
+    assert "oauth2:" not in config and TOKEN not in config
+    assert "url = https://github.com/o/r.git" in config
+    assert "credentialsInUrl = die" in config
 
 
 def _home_backend():
@@ -827,18 +920,7 @@ class TestFallbackAfterSwap:
 
     @staticmethod
     def _swap_era_checkout(credentials_in_url: str | None):
-        reused = MagicMock()
-        reused.add_remote.return_value = True
-
-        def run_git(args):
-            if args == ["config", "--local", "--get", "transfer.credentialsInUrl"]:
-                if credentials_in_url is None:
-                    return SimpleNamespace(returncode=1, stdout="")
-                return SimpleNamespace(returncode=0, stdout=f"{credentials_in_url}\n")
-            return SimpleNamespace(returncode=0, stdout="https://github.com/o/r.git\n")
-
-        reused._run_git.side_effect = run_git
-        return reused
+        return _reused_checkout("https://github.com/o/r.git", credentials_in_url)
 
     @staticmethod
     def _driver_off():
@@ -891,10 +973,10 @@ class TestFallbackAfterSwap:
         setting, which ``--local`` never reads) is not."""
         from agent.connectors.checkout import _swap_era
 
-        git_mgr = self._swap_era_checkout(value.strip() if value else None)
+        git_mgr = self._swap_era_checkout(value)
         assert _swap_era(git_mgr) is swap_era
-        git_mgr._run_git.assert_called_once_with(
-            ["config", "--local", "--get", "transfer.credentialsInUrl"]
+        git_mgr._run_git_nul_records.assert_called_once_with(
+            ["config", "-z", "--local", "--get-all", "transfer.credentialsInUrl"]
         )
         # A "warn" checkout keeps its origin when reused.
         if value == "warn":
@@ -992,10 +1074,7 @@ class TestCheckoutNames:
         b = _entry(
             connector=OTHER, origin=OTHER_ORIGIN, url="https://github.com/x/r.git"
         )
-        reused = MagicMock()
-        reused._run_git.return_value = SimpleNamespace(
-            returncode=0, stdout=f"https://oauth2:{TOKEN}@github.com/o/r.git\n"
-        )
+        reused = _reused_checkout(f"https://oauth2:{TOKEN}@github.com/o/r.git")
         with patch("agent.managers.git_manager.GitManager", return_value=reused):
             clone_repository_datasources([b], ws, legacy_key_files="own")
         reused.add_remote.assert_not_called()
@@ -1023,12 +1102,11 @@ class TestCheckoutNames:
     def test_what_counts_as_the_same_repository(self, origin, expected, other):
         from agent.connectors.checkout import _other_repository
 
-        git_mgr = MagicMock()
-        git_mgr._run_git.return_value = SimpleNamespace(returncode=0, stdout=origin)
-        assert (_other_repository(git_mgr, expected) is not None) is other
+        assert (
+            _other_repository(_reused_checkout(origin), expected) is not None
+        ) is other
         # An origin that cannot be read decides nothing.
-        git_mgr._run_git.return_value = SimpleNamespace(returncode=1, stdout="")
-        assert _other_repository(git_mgr, expected) is None
+        assert _other_repository(_reused_checkout(None), expected) is None
 
 
 class TestLiveChanges:
@@ -1109,6 +1187,10 @@ def test_a_fallback_repository_that_did_not_clone_still_says_how_it_was_reached(
     assert "NOT cloned" in facts.lines[0] and "the clone failed" in facts.lines[0]
     assert "NOT through SRW's git swap driver" in facts.lines[0]
     assert "may not reach the upstream" in facts.lines[0]
+    # The live C3 gate's README line: a repository NOT cloned is never
+    # "cloned with" anything; it says how it was to be cloned.
+    assert "— to be cloned with the forge token in its remote URL" in facts.lines[0]
+    assert "— cloned with" not in facts.lines[0]
 
 
 class TestRemoteBackend:

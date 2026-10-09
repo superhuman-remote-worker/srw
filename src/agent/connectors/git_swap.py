@@ -271,17 +271,19 @@ def wait_for_driver(
     return f"the git swap driver did not serve the repository ({detail})"
 
 
-def swap_note(entry: Mapping[str, Any]) -> str:
+def swap_note(entry: Mapping[str, Any], *, cloned: bool = True) -> str:
     """The README's note on how a token repository is reached: through the
-    driver, refused, or on the installation's fallback (and why)."""
+    driver, refused, or on the installation's fallback (and why). For a
+    repository that was not cloned (``cloned=False``), how it was to be."""
     block = entry.get("git_swap")
     if not isinstance(block, Mapping):
         return ""
     if "unavailable" in block:
         return f" — NOT cloned: {block['unavailable']}"
     if "fallback" in block:
+        how = "cloned" if cloned else "to be cloned"
         return (
-            " — cloned with the forge token in its remote URL, NOT through "
+            f" — {how} with the forge token in its remote URL, NOT through "
             f"SRW's git swap driver: {block['fallback']}"
         )
     return (

@@ -350,6 +350,29 @@ def _wire_swap_repositories(
     return wired, reasons
 
 
+def _config_values(
+    git_mgr: Any, key: str, *, local: bool = False
+) -> Optional[List[str]]:
+    """Every value of ``key`` in a checkout's git config, or ``None`` when
+    it is unset or cannot be read.
+
+    Read NUL-delimited (``GitManager._run_git_nul_records``), never as plain
+    command output: on a remote workspace the tmux shell drops a first
+    output line that names the command it ran (its echo filter), and a
+    repository URL always names git (``…/repo.git``, ``github.com``), so
+    ``git config --get remote.origin.url`` comes back empty there. The live
+    C3 gate found every reused swap checkout skipped for that.
+    """
+    reader = getattr(git_mgr, "_run_git_nul_records", None)
+    if not callable(reader):
+        return None
+    args = ["config", "-z", *(["--local"] if local else []), "--get-all", key]
+    values = reader(args)
+    if not isinstance(values, list):
+        return None
+    return [str(value) for value in values]
+
+
 def _secure_swap_checkout(
     git_mgr: Any, binding: SwapBinding, *, reused: bool
 ) -> Optional[str]:
@@ -363,13 +386,9 @@ def _secure_swap_checkout(
     """
     if reused:
         reset = git_mgr.add_remote("origin", binding.clean_url)
-        found = git_mgr._run_git(["config", "--get", "remote.origin.url"])
-        current = str(getattr(found, "stdout", "") or "").strip()
-        if (
-            not reset
-            or getattr(found, "returncode", 1) != 0
-            or current != (binding.clean_url)
-        ):
+        if not reset or _config_values(git_mgr, "remote.origin.url") != [
+            binding.clean_url
+        ]:
             return (
                 "its existing checkout's origin could not be reset to the clean "
                 "URL (it may still hold a token from an earlier clone); remove "
@@ -409,13 +428,9 @@ def _swap_era(git_mgr: Any) -> bool:
     swap checkout is set to. A pre-C3 token checkout is not. Only the
     checkout's own config counts (``--local``): a global or system setting
     says nothing about how this checkout was made."""
-    found = git_mgr._run_git(
-        ["config", "--local", "--get", "transfer.credentialsInUrl"]
-    )
-    return (
-        getattr(found, "returncode", 1) == 0
-        and str(getattr(found, "stdout", "") or "").strip() == "die"
-    )
+    values = _config_values(git_mgr, "transfer.credentialsInUrl", local=True)
+    # The last value is the one git applies.
+    return bool(values) and values[-1].strip() == "die"
 
 
 def _fallback_checkout(git_mgr: Any, token_url: str) -> Optional[str]:
@@ -455,19 +470,18 @@ def _other_repository(git_mgr: Any, expected_url: str) -> Optional[str]:
     """The repository a reused checkout's origin names when it is not the
     one expected (credentials masked), else ``None``; an origin that cannot
     be read decides nothing."""
-    found = git_mgr._run_git(["config", "--get", "remote.origin.url"])
-    current = getattr(found, "stdout", None)
-    if not isinstance(current, str) or getattr(found, "returncode", None) != 0:
-        return None
-    have = _repository_identity(current.strip())
     want = _repository_identity(expected_url)
-    if have is None or want is None:
+    if want is None:
         return None
-    same_path = have[1] == want[1]
-    same_host = have[0] is None or want[0] is None or have[0] == want[0]
-    if same_path and same_host:
-        return None
-    return f"{have[0] or 'an SSH alias'}/{have[1]}"
+    for current in _config_values(git_mgr, "remote.origin.url") or ():
+        have = _repository_identity(current.strip())
+        if have is None:
+            continue
+        same_path = have[1] == want[1]
+        same_host = have[0] is None or want[0] is None or have[0] == want[0]
+        if not (same_path and same_host):
+            return f"{have[0] or 'an SSH alias'}/{have[1]}"
+    return None
 
 
 def _note_skipped(workspace_manager: Any, clone_name: str, reason: str) -> None:
@@ -1010,7 +1024,7 @@ class CheckoutMaterializer:
                     # the SSH alias (and its key's state) or the swap route.
                     + ssh_identity_note(ds, rt.ssh_identity_status)
                     + (
-                        swap_note(ds)
+                        swap_note(ds, cloned=False)
                         if isinstance(block, dict) and "fallback" in block
                         else ""
                     )
