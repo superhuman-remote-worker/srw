@@ -719,10 +719,11 @@ class TestClone:
 
 class _EchoFilteringBackend:
     """A workspace backend that runs git for real in a local directory and
-    formats its output as the tmux-backed RemoteBackend does, echo filter
+    formats its output as the tmux-backed RemoteBackend once did, echo filter
     included: leading output lines naming the command's first word are
     dropped as if they were the command's echo (the live C3 gate's finding:
-    a repository URL always names git)."""
+    a repository URL always names git). RemoteBackend no longer filters; the
+    NUL-delimited reads must stay correct through a lossy shell either way."""
 
     supports_shell = True
 

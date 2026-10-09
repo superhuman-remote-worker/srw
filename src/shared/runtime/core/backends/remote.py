@@ -282,6 +282,7 @@ _PENDING_GUARD_STALE_SECONDS = 15 * 60
 _STALE_GUARD_CLEARED_MARKER = "__SRW_STALE_GUARD_CLEARED__"
 _TMUX_PANE_ID_PATTERN = re.compile(r"^%(?:0|[1-9][0-9]*)$")
 _TMUX_PENDING_PATTERN = re.compile(r"^__DONE_[0-9a-f]{12}__$")
+_START_MARKER_PATTERN = re.compile(r"^__SRW_START_[0-9a-f]{12}__$")
 _TMUX_PROMPT_TOKEN_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _TMUX_STATE_VERSION = "1"
 _TMUX_LEGACY_INCARNATION_STATE_VERSION = "2"
@@ -353,6 +354,16 @@ def _parse_shell_completion_record(
     if not cwd.startswith("/"):
         return None
     return exit_code, cwd
+
+
+def _is_shell_completion_record(line: str) -> bool:
+    """Whether ``line`` is any command's exact completion record."""
+    head = line.strip().split(maxsplit=1)
+    return bool(
+        head
+        and _TMUX_PENDING_PATTERN.fullmatch(head[0])
+        and _parse_shell_completion_record(line, head[0]) is not None
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -4551,6 +4562,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                         all_lines[:sentinel_line_idx],
                         start_marker=start_marker,
                         sentinel=sentinel,
+                        pre_lines=pre_lines,
                     )
                     output_text = "\n".join(output_lines).strip()
                     break
@@ -4561,7 +4573,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                     prompt_type = self._detect_interactive_prompt(all_lines)
                     if prompt_type:
                         terminal_state = self._capture_terminal_state(
-                            tab_name, sentinel, pre_count
+                            tab_name, sentinel, pre_count, start_marker
                         )
                         # Command owns the pane; don't cwd-restore into it.
                         tab.pending_sentinel = sentinel
@@ -4583,7 +4595,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                     )
                     if timed_out:
                         terminal_state = self._capture_terminal_state(
-                            tab_name, sentinel, pre_count
+                            tab_name, sentinel, pre_count, start_marker
                         )
                         # Leave it running; don't cwd-restore into a busy pane.
                         tab.pending_sentinel = sentinel
@@ -4598,7 +4610,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             # Hard timeout: loop exited without the sentinel -> still running.
             if exit_code is None:
                 terminal_state = self._capture_terminal_state(
-                    tab_name, sentinel, pre_count
+                    tab_name, sentinel, pre_count, start_marker
                 )
                 tab.pending_sentinel = sentinel
                 tab.last_activity = datetime.now(timezone.utc)
@@ -4626,35 +4638,70 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         *,
         start_marker: str,
         sentinel: str,
+        pre_lines: List[str],
     ) -> List[str]:
         """Return what a finished command printed before its completion record.
 
-        The output starts after the command's own start-marker line. Lines
-        carrying the sentinel are the typed restore line's echo, never output.
+        The output starts after the command's own start-marker line. A line
+        carrying the sentinel is the echo of the typed cwd-restore line; when
+        the output did not end in a newline, the output's last line precedes
+        that echo's prompt on the same line.
         """
-        first = 0
+        prompt = self._prompt_marker
+        first = None
         for i in range(len(lines) - 1, -1, -1):
             if lines[i].strip() == start_marker:
                 first = i + 1
                 break
-        else:
-            # The marker never printed (a working_dir command line that bash
-            # rejected) or left the capture (the output overflowed the
-            # scrollback, or the command cleared it). Output then follows the
-            # typed command's echo, or fills the capture when that is gone too.
+        if first is None:
+            # The marker never printed (bash rejected a working_dir command
+            # line) or is gone (the output overflowed the scrollback, or moved
+            # the cursor or the screen over it). Output then starts after the
+            # last line the shell wrote: this command's echo, a prompt, or an
+            # earlier command's start marker or completion record. With none
+            # left, it is all output.
             echo = start_marker_command(start_marker)
+            first = 0
             for i in range(len(lines) - 1, -1, -1):
-                if echo in lines[i]:
+                line = lines[i]
+                if (
+                    echo in line
+                    or (prompt and line.startswith(prompt) and sentinel not in line)
+                    or _START_MARKER_PATTERN.fullmatch(line.strip())
+                    or _is_shell_completion_record(line)
+                ):
                     first = i + 1
                     break
-        return [line for line in lines[first:] if sentinel not in line]
+            # Lines the capture still shares with the pre-command capture,
+            # from the top, are older history unless they scrolled away.
+            shared = 0
+            for before, after in zip(pre_lines, lines):
+                if before != after:
+                    break
+                shared += 1
+            first = max(first, shared)
+        output = []
+        for line in lines[first:]:
+            if sentinel not in line:
+                output.append(line)
+            elif prompt and line.find(prompt) > 0:
+                output.append(line[: line.find(prompt)])
+        return output
 
     def _capture_terminal_state(
-        self, tab_name: str, sentinel: str, pre_count: int
+        self,
+        tab_name: str,
+        sentinel: str,
+        pre_count: int,
+        start_marker: Optional[str] = None,
     ) -> str:
         """Capture terminal state for timeout/stall reporting."""
         try:
-            all_lines = self._tmux_capture(tab_name)
+            all_lines = [
+                line
+                for line in self._tmux_capture(tab_name)
+                if not start_marker or line.strip() != start_marker
+            ]
             post_lines = all_lines[pre_count:]
             clean_lines = [line for line in post_lines if sentinel not in line]
             if not clean_lines:

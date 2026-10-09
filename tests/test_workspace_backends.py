@@ -4840,6 +4840,122 @@ class TestRemoteBackendShellRunOutput:
 
         assert result == (f"Exit code: 2\nCWD: {self._ROOT}\n--- stdout ---\n{error}")
 
+    def test_working_dir_output_without_a_final_newline_is_kept(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend._prompt_marker = self._PROMPT.strip()
+
+        def pane_after(typed):
+            # Bash prints the restore line's prompt right after the output.
+            return [
+                *self._HISTORY,
+                self._PROMPT + typed[0],
+                self._MARKER,
+                "first\tline",
+                "no newline" + self._PROMPT + typed[1],
+                "",
+                f"{self._SENTINEL} 0 {self._ROOT}",
+                self._PROMPT,
+            ]
+
+        result, _ = self._run(
+            backend,
+            "printf 'first\\tline\\nno newline'",
+            pane_after,
+            working_dir=self._ROOT,
+        )
+
+        assert result.endswith("--- stdout ---\nfirst\tline\nno newline")
+
+    @pytest.mark.parametrize(
+        ("pane", "output"),
+        (
+            # The command moved the cursor up over its echo and marker.
+            (
+                [
+                    "ancient history",
+                    "__SRW_PROMPT_0123456789abcdef0123456789abcdef__ ls",
+                    "tools.py",
+                    "",
+                    "__DONE_aaaaaaaaaaaa__ 0 /home/agent-host/workspace",
+                    "after",
+                ],
+                "after",
+            ),
+            # A killed TUI left the alternate screen on: the capture is the
+            # normal screen's history, cut inside the previous output, then
+            # the alternate screen.
+            (
+                [
+                    "ancient history",
+                    "__SRW_PROMPT_0123456789abcdef0123456789abcdef__ ls",
+                    "tools.py",
+                    "",
+                    "rc=137",
+                ],
+                "tools.py\n\nrc=137",
+            ),
+            # The command left an alternate screen its predecessor entered
+            # after printing its own marker.
+            (
+                [
+                    "__SRW_PROMPT_0123456789abcdef0123456789abcdef__ echo x",
+                    "__SRW_START_aaaaaaaaaaaa__",
+                    "back",
+                ],
+                "back",
+            ),
+        ),
+    )
+    def test_missing_marker_never_reports_history_before_the_shell_lines(
+        self, remote_backend, pane, output
+    ):
+        backend, _, _ = remote_backend
+        backend._prompt_marker = self._PROMPT.strip()
+
+        def pane_after(_typed):
+            return [*pane, "", f"{self._SENTINEL} 0 {self._ROOT}", self._PROMPT]
+
+        result, _ = self._run(backend, "printf '\\033[5A\\033[J'", pane_after)
+
+        assert result.endswith("--- stdout ---\n" + output)
+
+    def test_missing_marker_skips_lines_the_pane_already_showed(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend._prompt_marker = self._PROMPT.strip()
+
+        def pane_after(_typed):
+            # A killed TUI left the alternate screen on. Nothing scrolled, so
+            # the capture is the earlier history, then the alternate screen.
+            return [
+                *self._HISTORY,
+                "TUI",
+                "",
+                "rc=137",
+                "",
+                f"{self._SENTINEL} 137 {self._ROOT}",
+                self._PROMPT,
+            ]
+
+        result, _ = self._run(backend, "timeout -s KILL 1 top", pane_after)
+
+        assert result.endswith("--- stdout ---\nTUI\n\nrc=137")
+
+    def test_still_running_state_shows_the_pane_not_the_marker(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+        echo = self._PROMPT + "printf '__SRW_START_%s__\\n' 0123456789ab; sleep 30"
+        with patch.object(
+            backend,
+            "_tmux_capture",
+            return_value=[*self._HISTORY, echo, self._MARKER],
+        ):
+            state = backend._capture_terminal_state(
+                "default", self._SENTINEL, len(self._HISTORY) + 1, self._MARKER
+            )
+
+        assert self._MARKER not in state.splitlines()
+        assert state.splitlines()[-1] == echo
+
     @pytest.mark.parametrize(
         ("command", "working_dir"),
         (
