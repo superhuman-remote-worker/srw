@@ -57,7 +57,11 @@ from orchestrator.services.manifest_execution_snapshot import (
 )
 from shared.backend_kinds import LITE_BACKENDS
 from shared.connectors.builtin import needs_knowledge_profile
-from orchestrator.services.model_availability import WHERE_JOB, ModelUnavailable
+from orchestrator.services.model_availability import (
+    WHERE_JOB,
+    ModelUnavailable,
+    unavailable_slots,
+)
 from orchestrator.services.job_mutation_target import (
     FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS,
     FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S,
@@ -261,6 +265,74 @@ async def prepare_job_repository_before_claim(
             type(exc).__name__,
         )
         return False
+
+
+async def unavailable_models_before_claim(
+    job: Mapping[str, Any],
+    *,
+    dependencies: JobStartBundleDependencies,
+) -> ModelUnavailable | None:
+    """The model refusal :func:`build_job_start_request` would raise, asked
+    before the dispatcher claims the job (unavailable_model_handling.md S4).
+
+    The start bundle refuses only after the claim, and pinned delivery and the
+    stateless claim build it without persisting while completion commands own
+    job status. There the refusal only logs: the job stays ``processing``, is
+    re-queued when its lease expires and is claimed again on a fresh agent,
+    forever. Asked here, the dispatcher fails it with a status CAS like its
+    other pre-claim refusals.
+
+    Reads what the bundle will run: the job's frozen execution snapshot when
+    it has one (its account defaults already fell back when it was admitted,
+    D2). A historical job without one is checked for its explicit pins only,
+    its ``config_override`` over its expert's own configuration; an account
+    default still falls back when such a job is resolved, so it is never
+    refused here. Only the registry is asked; nothing is credentialed.
+
+    ``None`` when every model can run, and when the check cannot tell (no
+    registry source installed yet, or the check itself failed): the start
+    bundle's refusal stays the backstop.
+    """
+    from shared.runtime.core import model_registry
+
+    if not model_registry.lookups_registered():
+        return None
+    job_id = str(job["id"])
+    postgres_db = dependencies.store
+    try:
+        execution_snapshot = await read_execution(postgres_db, "Job", job_id)
+        if execution_snapshot is not None:
+            frozen_blob, _frozen_policy = srw_snapshot_config(execution_snapshot)
+            config = frozen_blob.get("agent")
+        else:
+            config = job.get("config_override") or {}
+            if isinstance(config, str):
+                config = json.loads(config)
+            if job.get("expert_id") and dependencies.is_experts_db_enabled():
+                expert_row = await postgres_db.get_expert_by_id(str(job["expert_id"]))
+                if expert_row is not None:
+                    from shared.runtime.core.expert_resolution import (
+                        build_expert_config,
+                    )
+                    from shared.runtime.core.loader import deep_merge
+
+                    expert_config, _prompts = build_expert_config({}, expert_row)
+                    config = deep_merge(expert_config, config)
+        found = await unavailable_slots(
+            config,
+            user_id=str(job["user_id"]) if job.get("user_id") else None,
+            store=postgres_db,
+            resolve_model=model_registry.resolve_model,
+        )
+    except Exception:  # noqa: BLE001 — the start bundle's refusal is the backstop
+        dependencies.logger.warning(
+            "Dispatch: model check before the claim failed for job %s; the start "
+            "bundle decides",
+            job_id,
+            exc_info=True,
+        )
+        return None
+    return ModelUnavailable(found) if found else None
 
 
 async def _fail_unavailable_model(

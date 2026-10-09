@@ -30,6 +30,7 @@ from orchestrator.services.job_dispatcher import (
     dispatch_pending_jobs as schedule_pending_jobs,
     trigger_dispatch,
 )
+from orchestrator.services.model_availability import ModelUnavailable, UnavailableModel
 
 GUARD_KWARGS = {"completion_generation_guard": "fenced"}
 LOGGER_NAME = "orchestrator.services.job_dispatcher"
@@ -179,6 +180,7 @@ def _deps(
     prepare_repository: Any = None,
     bind_gate: Any = None,
     mint_gate: Any = None,
+    unavailable_models: Any = None,
 ) -> JobDispatchDependencies:
     delivery = delivery or FakeDelivery()
 
@@ -215,6 +217,11 @@ def _deps(
         job_delivery_operations=lambda: delivery,
         **({"job_bind_gate": bind_gate} if bind_gate is not None else {}),
         **({"job_mint_gate": mint_gate} if mint_gate is not None else {}),
+        **(
+            {"unavailable_job_models": unavailable_models}
+            if unavailable_models is not None
+            else {}
+        ),
     )
 
 
@@ -614,6 +621,200 @@ class TestClaimAndDelivery:
         assert kwargs["status"] == "failed"
         assert kwargs["error_message"] == "Connector acme: No such tenant"
         assert kwargs["expected_status"] == "created"
+
+
+# =============================================================================
+# Unavailable models (unavailable_model_handling.md S4)
+# =============================================================================
+
+DISABLED_MESSAGE = (
+    "The model `MiniMax-M3` (main model) is no longer available. Choose "
+    "another model in the job's configuration, or ask your administrator."
+)
+
+
+def _unavailable(model: str = "MiniMax-M3", reason: str = "disabled"):
+    return ModelUnavailable([UnavailableModel(slot="llm", model=model, reason=reason)])
+
+
+class _AgentPool:
+    """Phase 1.5's pod provisioner with free capacity, recording each pod."""
+
+    def __init__(self) -> None:
+        self._k8s_available = False
+        self.is_available = True
+        self.max_agents = 5
+        self.active_count = AsyncMock(return_value=0)
+        self.provision_agent = AsyncMock(return_value="srw-agent-j-1")
+
+
+class TestUnavailableModelRefusal:
+    """A job whose model cannot run is failed before its claim: after the
+    claim the start bundle's refusal cannot write the status while completion
+    commands are on, and the job was claimed again at every lease expiry, each
+    time on a fresh agent pod (k3d gate G6, 2026-10-09)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "guard",
+        [{"completion_commands_enabled": True}, {}],
+        ids=["completion-commands-on", "completion-commands-off"],
+    )
+    @pytest.mark.parametrize(
+        ("refusal", "message"),
+        [
+            (_unavailable(), DISABLED_MESSAGE),
+            (
+                _unavailable("gpt-9-preview", "unknown"),
+                "The model `gpt-9-preview` (main model) is not configured on "
+                "this installation. Choose another model in the job's "
+                "configuration.",
+            ),
+        ],
+        ids=["disabled", "unknown"],
+    )
+    async def test_the_job_fails_before_any_claim_or_provision(
+        self, guard, refusal, message, no_dispatcher_error
+    ):
+        job = _job("j1", status="created")
+        # No ready agent: an accepted job would get a fresh pod.
+        store = FakeStore(pinned=[job])
+        pool = _AgentPool()
+        gate = AsyncMock(return_value=refusal)
+        prepare = AsyncMock(return_value=True)
+        bind = AsyncMock(return_value=("dispatch", None))
+        deps = dataclasses.replace(
+            _deps(
+                store,
+                agent_provisioner=pool,
+                prepare_repository=prepare,
+                bind_gate=bind,
+                unavailable_models=gate,
+            ),
+            completion_control_boundary=SimpleNamespace(
+                dispatch_guard_kwargs=lambda: dict(guard)
+            ),
+        )
+
+        await dispatch_pending_jobs(dependencies=deps)
+
+        gate.assert_awaited_once_with(job)
+        assert store.called("update_job_status") == [
+            (
+                ("j1",),
+                {
+                    "status": "failed",
+                    "error_message": message,
+                    "expected_status": "created",
+                },
+            )
+        ]
+        assert store.called("get_available_agents") == []
+        assert store.called("claim_job_for_agent") == []
+        pool.provision_agent.assert_not_awaited()
+        prepare.assert_not_awaited()
+        bind.assert_not_awaited()
+        assert any(
+            "refusing job j1, unavailable model slot(s)" in r.getMessage()
+            for r in no_dispatcher_error.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_resumed_job_is_refused_before_its_resume(
+        self, no_dispatcher_error
+    ):
+        job = _job("j1", status="paused")
+        store = FakeStore(
+            pinned=[job],
+            agents=[{"id": "a1", "metadata": {}}],
+            checkpoints={"j1": True},
+        )
+        delivery = FakeDelivery()
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(
+                store,
+                delivery=delivery,
+                unavailable_models=AsyncMock(return_value=_unavailable()),
+            )
+        )
+
+        assert store.called("update_job_status") == [
+            (
+                ("j1",),
+                {
+                    "status": "failed",
+                    "error_message": DISABLED_MESSAGE,
+                    "expected_status": "paused",
+                },
+            )
+        ]
+        assert store.called("claim_job_for_agent") == []
+        delivery.resume.assert_not_awaited()
+        delivery.dispatch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_stateless_job_is_refused_before_its_admission(
+        self, no_dispatcher_error
+    ):
+        job = _stateless_job("s1")
+        store = FakeStore(stateless=[job])
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(
+                store,
+                auto_assign_enabled=False,
+                stateless_worker_enabled=True,
+                unavailable_models=AsyncMock(return_value=_unavailable()),
+            )
+        )
+
+        ((args, kwargs),) = store.called("update_job_status")
+        assert args == ("s1",)
+        assert kwargs["error_message"] == DISABLED_MESSAGE
+        assert kwargs["expected_status"] == "created"
+        assert store.called("admit_stateless_worker_job") == []
+
+    @pytest.mark.asyncio
+    async def test_a_job_whose_models_can_run_is_claimed_as_before(
+        self, no_dispatcher_error
+    ):
+        job = _job("j1")
+        agent = {"id": "a1", "metadata": {}}
+        store = FakeStore(pinned=[job], agents=[agent])
+        delivery = FakeDelivery()
+        gate = AsyncMock(return_value=None)
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(store, delivery=delivery, unavailable_models=gate)
+        )
+
+        gate.assert_awaited_once_with(job)
+        assert store.called("update_job_status") == []
+        assert [args for args, _ in store.called("claim_job_for_agent")] == [
+            ("j1", "a1")
+        ]
+        delivery.dispatch.assert_awaited_once_with(job, agent)
+
+    @pytest.mark.asyncio
+    async def test_a_job_whose_models_can_run_still_gets_a_pod(
+        self, no_dispatcher_error
+    ):
+        """The control for the refusal above: the same job, accepted, makes
+        Phase 1.5 provision an agent."""
+        store = FakeStore(pinned=[_job("j1")])
+        pool = _AgentPool()
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(
+                store,
+                agent_provisioner=pool,
+                unavailable_models=AsyncMock(return_value=None),
+            )
+        )
+
+        assert store.called("update_job_status") == []
+        pool.provision_agent.assert_awaited_once_with(purpose="job")
 
 
 # =============================================================================

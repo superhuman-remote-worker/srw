@@ -946,6 +946,16 @@ async def test_moved_loops_receive_the_application_collaborators(monkeypatch):
     assert dispatch.store is world.store
     assert dispatch.state is resources.job_dispatch_state
     assert dispatch.agent_provisioner is live.agent_provisioner
+    # The pre-claim model check is the start bundle's own, bound to this
+    # application (unavailable_model_handling.md S4).
+    from orchestrator.application import preparation as preparation_composition
+    from orchestrator.services import job_start_bundle as job_start_bundle_module
+
+    assert _binding(dispatch.unavailable_job_models) == (
+        job_start_bundle_module.unavailable_models_before_claim,
+        preparation_composition.job_start_bundle_dependencies,
+        resources,
+    )
     # The pause-pending set preemption fills is the one delivery discards from.
     assert (
         controls_composition.job_delivery_operations(

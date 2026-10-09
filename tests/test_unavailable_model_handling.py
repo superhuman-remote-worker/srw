@@ -407,6 +407,167 @@ class TestStatelessAdmission:
 
 
 # ---------------------------------------------------------------------------
+# Jobs: the dispatcher asks before its claim (S4)
+# ---------------------------------------------------------------------------
+
+
+class TestJobCheckBeforeClaim:
+    """What the start bundle would refuse, asked before the dispatcher's claim
+    (k3d gate G6, 2026-10-09: with completion commands on, the post-claim
+    refusal only logged and the job was claimed again every lease expiry)."""
+
+    @pytest.fixture
+    def snapshot(self, monkeypatch):
+        from orchestrator.services import job_start_bundle as jsb
+        from shared.runtime.core import model_registry
+
+        monkeypatch.setattr(model_registry, "lookups_registered", lambda: True)
+        monkeypatch.setattr(
+            model_registry, "resolve_model", AsyncMock(side_effect=_resolve)
+        )
+        holder: dict = {"execution": None}
+
+        async def read_execution(store, kind, work_id):
+            assert (kind, work_id) == ("Job", "j")
+            return holder["execution"]
+
+        monkeypatch.setattr(jsb, "read_execution", read_execution)
+        monkeypatch.setattr(
+            jsb, "srw_snapshot_config", lambda execution: (execution["resolved"], {})
+        )
+        return holder
+
+    @staticmethod
+    def _deps(store=None, *, experts_db=True):
+        return SimpleNamespace(
+            store=store or _store(),
+            logger=logging.getLogger("test.unavailable_model"),
+            is_experts_db_enabled=lambda: experts_db,
+        )
+
+    @staticmethod
+    async def _check(job, deps):
+        from orchestrator.services import job_start_bundle as jsb
+
+        return await jsb.unavailable_models_before_claim(
+            {"id": "j", "user_id": "u", **job}, dependencies=deps
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_frozen_disabled_model_is_refused_with_the_job_message(
+        self, snapshot
+    ):
+        snapshot["execution"] = _execution("MiniMax-M3")
+        refusal = await self._check({}, self._deps())
+        assert [entry.as_dict() for entry in refusal.entries] == [
+            {"slot": "llm", "model": "MiniMax-M3", "reason": "disabled"}
+        ]
+        assert refusal.message(where=ma.WHERE_JOB) == (
+            "The model `MiniMax-M3` (main model) is no longer available. Choose "
+            "another model in the job's configuration, or ask your administrator."
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_frozen_unknown_model_is_refused_the_same_way(self, snapshot):
+        snapshot["execution"] = _execution("gpt-9-preview")
+        refusal = await self._check({}, self._deps())
+        assert [entry.as_dict() for entry in refusal.entries] == [
+            {"slot": "llm", "model": "gpt-9-preview", "reason": "unknown"}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_frozen_models_that_can_run_pass(self, snapshot):
+        snapshot["execution"] = _execution("gpt-6-astra")
+        assert await self._check({}, self._deps()) is None
+
+    @pytest.mark.asyncio
+    async def test_every_frozen_slot_is_checked_but_an_inherited_label(self, snapshot):
+        """The start bundle checks the auxiliary and roster slots too; a roster
+        entry that inherits its parent's model is not checked by name (D5)."""
+        snapshot["execution"] = {
+            "resolved": {
+                "agent": {
+                    "llm": {"model": "gpt-6-astra"},
+                    "auxiliary": {"model": "MiniMax-M3"},
+                    "subagents": {
+                        "roster": {
+                            "critic": {
+                                "llm": {"model": "MiniMax-M3", "_inherit_llm": True}
+                            }
+                        }
+                    },
+                }
+            }
+        }
+        refusal = await self._check({}, self._deps())
+        assert [entry.as_dict() for entry in refusal.entries] == [
+            {"slot": "auxiliary", "model": "MiniMax-M3", "reason": "disabled"}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_historical_job_pin_is_refused(self, snapshot):
+        refusal = await self._check(
+            {"config_override": '{"llm": {"model": "MiniMax-M3"}}'}, self._deps()
+        )
+        assert [entry.model for entry in refusal.entries] == ["MiniMax-M3"]
+
+    @pytest.mark.asyncio
+    async def test_a_historical_expert_pin_is_refused_unless_the_job_overrides_it(
+        self, snapshot
+    ):
+        store = _store(
+            get_expert_by_id=AsyncMock(
+                return_value={"config": {"llm": {"model": "MiniMax-M3"}}}
+            )
+        )
+        refusal = await self._check({"expert_id": "e"}, self._deps(store))
+        assert [entry.model for entry in refusal.entries] == ["MiniMax-M3"]
+        store.get_expert_by_id.assert_awaited_once_with("e")
+
+        overridden = {
+            "expert_id": "e",
+            "config_override": {"llm": {"model": "gpt-6-astra"}},
+        }
+        assert await self._check(overridden, self._deps(store)) is None
+        # Without the experts DB the start bundle never reads the expert.
+        assert (
+            await self._check({"expert_id": "e"}, self._deps(store, experts_db=False))
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_account_default_is_never_refused_here(self, snapshot):
+        """It falls back to the system default when the job is resolved (S2)."""
+        store = _store(
+            get_user_settings=AsyncMock(return_value={"default_model": "MiniMax-M3"})
+        )
+        assert await self._check({"config_override": {}}, self._deps(store)) is None
+        store.get_user_settings.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failing_check_lets_the_start_bundle_decide(
+        self, snapshot, monkeypatch, caplog
+    ):
+        from orchestrator.services import job_start_bundle as jsb
+
+        async def broken(*_a, **_k):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(jsb, "read_execution", broken)
+        with caplog.at_level(logging.WARNING, logger="test.unavailable_model"):
+            assert await self._check({}, self._deps()) is None
+        assert "model check before the claim failed for job j" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_an_unconfigured_registry_judges_nothing(self, snapshot, monkeypatch):
+        from shared.runtime.core import model_registry
+
+        snapshot["execution"] = _execution("MiniMax-M3")
+        monkeypatch.setattr(model_registry, "lookups_registered", lambda: False)
+        assert await self._check({}, self._deps()) is None
+
+
+# ---------------------------------------------------------------------------
 # Agent: the claim refusal is parsed; the OpenAI client refuses a missing route
 # ---------------------------------------------------------------------------
 

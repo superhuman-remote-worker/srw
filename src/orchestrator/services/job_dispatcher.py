@@ -58,6 +58,7 @@ from orchestrator.services.job_workspace_runtime import stateless_worker_workspa
 from orchestrator.services.job_workspace_runtime import (
     scholar_provision_parent_id as _scholar_provision_parent_id,
 )
+from orchestrator.services.model_availability import WHERE_JOB
 from orchestrator.services.session_runtime_identity import (
     agent_sha_is_current as _agent_sha_is_current,
 )
@@ -198,6 +199,10 @@ async def _dispatch_without_binds(_job: Any) -> tuple[str, str | None]:
     return "dispatch", None
 
 
+async def _no_unavailable_models(_job: Any) -> None:
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class JobDispatchDependencies:
     """Per-invocation collaborators for one dispatch pass.
@@ -240,6 +245,10 @@ class JobDispatchDependencies:
     job_mint_gate: Callable[[Any], Awaitable[tuple[str, str | None]]] = (
         _dispatch_without_binds
     )
+    #: The models a job runs, asked before its claim (unavailable model
+    #: handling S4, ``job_start_bundle.unavailable_models_before_claim``):
+    #: ``None``, or the ``ModelUnavailable`` its start bundle would refuse.
+    unavailable_job_models: Callable[[Any], Awaitable[Any]] = _no_unavailable_models
 
 
 def _needs_mutation(job: dict[str, Any], dependencies: JobDispatchDependencies) -> bool:
@@ -643,6 +652,25 @@ async def _preflight_job(
             error_message=(
                 "Workspace contract is ambiguous or invalid; refusing dispatch"
             ),
+            expected_status=str(job.get("status")),
+        )
+        return None
+    # A model the job runs that cannot run is refused before any workspace or
+    # agent is provisioned for it. The start bundle refuses it too, but after
+    # the claim, where completion commands keep it from writing the status: the
+    # job would be claimed again at every lease expiry (unavailable model
+    # handling S4). A resumed job comes back through here as 'paused'.
+    unavailable = await dependencies.unavailable_job_models(job)
+    if unavailable is not None:
+        logger.error(
+            "Dispatcher: refusing job %s, unavailable model slot(s): %s",
+            job_id,
+            [entry.as_dict() for entry in unavailable.entries],
+        )
+        await dependencies.store.update_job_status(
+            job_id,
+            status="failed",
+            error_message=unavailable.message(where=WHERE_JOB),
             expected_status=str(job.get("status")),
         )
         return None

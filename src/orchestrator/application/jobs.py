@@ -164,6 +164,12 @@ def job_dispatch_dependencies(
         job_bind_gate=connector_bind_time.job_bind_gate,
         # Provider-minted credentials before the claim (C5).
         job_mint_gate=connector_minted_credentials.job_mint_gate,
+        # A model that cannot run is refused before the claim (S4).
+        unavailable_job_models=bound(
+            job_start_bundle.unavailable_models_before_claim,
+            preparation_composition.job_start_bundle_dependencies,
+            resources,
+        ),
     )
 
 
