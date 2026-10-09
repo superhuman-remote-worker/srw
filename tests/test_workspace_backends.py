@@ -374,9 +374,7 @@ class TestRemoteShellCompletionRecords:
 
     def test_only_exact_newline_separated_record_completes(self, remote_backend):
         backend, _, _ = remote_backend
-        command, _ = backend._build_guarded_shell_command(
-            "echo ok", self._SENTINEL, None
-        )
+        command = backend._build_guarded_shell_command("echo ok", self._SENTINEL, None)
 
         assert f"printf '\\n{self._SENTINEL}" in command
         assert _parse_shell_completion_record(
@@ -4681,6 +4679,208 @@ class TestRemoteBackendShellRun:
         assert "CWD: /tmp" in second
         assert all(sent.args[1] != f"cd {self._ROOT}" for sent in send.call_args_list)
         assert len(reserve.call_args_list) == 2
+
+
+class TestRemoteBackendShellRunOutput:
+    """shell_run returns exactly what the command printed.
+
+    The fake pane looks like a real one: the typed command is echoed onto the
+    prompt line the pre-command capture ended with, so it sits before
+    ``pre_count``. Only the command's start marker tells output from echo.
+    """
+
+    _ROOT = "/home/agent-host/workspace"
+    _SENTINEL = "__DONE_0123456789ab__"
+    _MARKER = "__SRW_START_0123456789ab__"
+    _PROMPT = "__SRW_PROMPT_0123456789abcdef0123456789abcdef__ "
+    _HISTORY = ["$ make", "earlier output"]
+
+    def _run(self, backend, command, pane_after, *, working_dir=None):
+        """Run ``command``; ``pane_after(typed_lines)`` is the pane it leaves."""
+        backend._shell_initialized = True
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+        sent = {}
+
+        def reserve(_tab_name, *, sentinel, command, **_kwargs):
+            sent["command"] = command
+            backend._tabs["default"].pending_sentinel = sentinel
+
+        def capture(_tab_name):
+            if "command" not in sent:
+                return [*self._HISTORY, self._PROMPT]
+            return pane_after(sent["command"].split("\n"))
+
+        with (
+            patch("shared.runtime.core.backends.remote.uuid.uuid4") as uuid4,
+            patch("shared.runtime.core.backends.remote.time.sleep"),
+            patch.object(backend, "_tmux_capture", side_effect=capture),
+            patch.object(
+                backend, "_reserve_and_send_shell_command", side_effect=reserve
+            ),
+            patch.object(backend, "_clear_tab_pending"),
+        ):
+            uuid4.return_value.hex = "0123456789abcdef"
+            result = backend.shell_run(command, working_dir=working_dir)
+        return result, sent["command"]
+
+    def _bash_pane(self, output, *, rc=0):
+        def pane_after(typed):
+            echo = [self._PROMPT + typed[0]] + [f"> {line}" for line in typed[1:]]
+            return [
+                *self._HISTORY,
+                *echo,
+                self._MARKER,
+                *output,
+                "",
+                f"{self._SENTINEL} {rc} {self._ROOT}",
+                self._PROMPT,
+            ]
+
+        return pane_after
+
+    @pytest.mark.parametrize(
+        ("command", "output"),
+        (
+            (
+                "git remote -v",
+                [
+                    "origin\thttps://git.example/acme/repo.git (fetch)",
+                    "origin\thttps://git.example/acme/repo.git (push)",
+                ],
+            ),
+            (
+                "git config --get remote.origin.url",
+                ["https://git.example/acme/repo.git"],
+            ),
+            ("cat notes.txt", ["the cat sat on the mat", "second line"]),
+            ("ls", ["tools.py", "lstrip.py", "README.md"]),
+            ("python report.py", ["python 3.13 report", "total: 5$"]),
+            ("cat prompt.txt", ["agent@host:~$", "user$", "after"]),
+        ),
+    )
+    def test_output_lines_naming_the_command_are_kept(
+        self, remote_backend, command, output
+    ):
+        backend, _, _ = remote_backend
+
+        result, _ = self._run(backend, command, self._bash_pane(output))
+
+        assert result == (
+            f"Exit code: 0\nCWD: {self._ROOT}\n--- stdout ---\n" + "\n".join(output)
+        )
+        assert "__SRW_" not in result and "printf" not in result
+
+    def test_working_dir_output_keeps_lines_and_drops_the_restore_echo(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        output = ["origin\thttps://git.example/acme/repo.git (fetch)"]
+
+        def pane_after(typed):
+            assert len(typed) == 2
+            return [
+                *self._HISTORY,
+                self._PROMPT + typed[0],
+                self._MARKER,
+                *output,
+                self._PROMPT + typed[1],
+                "",
+                f"{self._SENTINEL} 0 {self._ROOT}/repo",
+                self._PROMPT,
+            ]
+
+        result, _ = self._run(
+            backend, "git remote -v", pane_after, working_dir=f"{self._ROOT}/repo"
+        )
+
+        assert result.endswith("--- stdout ---\n" + "\n".join(output))
+
+    def test_multiline_output_is_kept_after_the_heredoc_echo(self, remote_backend):
+        backend, _, _ = remote_backend
+        output = ["git version 2.47.0", "python3 ok"]
+
+        result, typed = self._run(
+            backend,
+            "git --version\npython3 -c 'print(\"python3 ok\")'",
+            self._bash_pane(output),
+        )
+
+        assert typed.startswith('bash << "SRW_DELIM_')
+        assert result.endswith("--- stdout ---\n" + "\n".join(output))
+
+    def test_output_overflowing_the_scrollback_is_all_kept(self, remote_backend):
+        backend, _, _ = remote_backend
+        tail = [f"line {i}" for i in range(4990, 5000)]
+
+        def pane_after(_typed):
+            # Marker and echo scrolled out of the capture with older history.
+            return [*tail, "", f"{self._SENTINEL} 0 {self._ROOT}", self._PROMPT]
+
+        result, _ = self._run(backend, "seq 5000", pane_after)
+
+        assert result.endswith("--- stdout ---\n" + "\n".join(tail))
+
+    def test_rejected_command_line_reports_only_what_bash_printed(self, remote_backend):
+        backend, _, _ = remote_backend
+        error = "bash: syntax error near unexpected token `)'"
+
+        def pane_after(typed):
+            # Bash refused line one, so no marker; line two still completes.
+            return [
+                *self._HISTORY,
+                self._PROMPT + typed[0],
+                error,
+                self._PROMPT + typed[1],
+                "",
+                f"{self._SENTINEL} 2 {self._ROOT}",
+                self._PROMPT,
+            ]
+
+        result, _ = self._run(backend, "echo )", pane_after, working_dir=self._ROOT)
+
+        assert result == (f"Exit code: 2\nCWD: {self._ROOT}\n--- stdout ---\n{error}")
+
+    @pytest.mark.parametrize(
+        ("command", "working_dir"),
+        (
+            ("cat notes.txt; ls", None),
+            ("cat notes.txt; ls", "sub"),
+            ("cat notes.txt\nls", None),
+            ("cat notes.txt\nls", "sub"),
+        ),
+    )
+    def test_bash_prints_the_marker_the_extraction_looks_for(
+        self, remote_backend, tmp_path, command, working_dir
+    ):
+        backend, _, _ = remote_backend
+        backend._sandbox_cwd = str(tmp_path)
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        for directory in (tmp_path, sub):
+            (directory / "notes.txt").write_text("cat: first line\nsecond line\n")
+        cwd = str(sub if working_dir else tmp_path)
+
+        def pane_after(typed):
+            ran = subprocess.run(
+                ["bash", "--norc", "--noprofile"],
+                input="\n".join(typed) + "\n",
+                cwd=str(tmp_path),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=True,
+                timeout=10,
+            )
+            echo = [self._PROMPT + typed[0]] + [f"> {line}" for line in typed[1:]]
+            return [*self._HISTORY, *echo, *ran.stdout.splitlines(), self._PROMPT]
+
+        result, _ = self._run(backend, command, pane_after, working_dir=working_dir)
+
+        assert result == (
+            f"Exit code: 0\nCWD: {cwd}\n--- stdout ---\n"
+            "cat: first line\nsecond line\nnotes.txt"
+            + ("\nsub" if not working_dir else "")
+        )
 
 
 class TestRemoteBackendShellSend:

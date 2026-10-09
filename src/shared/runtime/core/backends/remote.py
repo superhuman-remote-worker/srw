@@ -47,6 +47,8 @@ from shared.runtime.core.shell_protocol import (
     SUDO_FREEZE_SENTINEL,
     build_sentinel_command,
     compute_no_change_state,
+    new_start_marker,
+    start_marker_command,
 )
 from shared.runtime.core.workspace_backend import (
     SEARCH_RESULT_HARD_CAP,
@@ -4384,11 +4386,12 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         command: str,
         sentinel: str,
         working_dir: Optional[str],
-    ) -> Tuple[str, Optional[str]]:
+        start_marker: Optional[str] = None,
+    ) -> str:
         """Build one command whose sentinel follows any requested cwd restore."""
         command = self._with_credential_environment(command)
         if not working_dir:
-            return build_sentinel_command(command, sentinel)
+            return build_sentinel_command(command, sentinel, start_marker)
 
         full_dir = posixpath.normpath(
             posixpath.join(self._sandbox_cwd, working_dir)
@@ -4397,24 +4400,20 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         )
         if "\n" in command:
             outer_delim = f"SRW_DELIM_{uuid.uuid4().hex[:12]}"
-            start_marker = f"__SRW_START_{uuid.uuid4().hex[:12]}__"
-            user_command = (
-                f'bash << "{outer_delim}"\n'
-                f'echo "{start_marker}"\n'
-                f"{command}\n"
-                f"{outer_delim}"
-            )
+            user_command = f'bash << "{outer_delim}"\n{command}\n{outer_delim}'
         else:
-            start_marker = None
             user_command = command
+        # The marker prints before the cd, so a failed cd's error is output
+        # too. Bash reads a heredoc body before it runs the line, so the
+        # body's echoed lines still come before the marker.
+        mark = f"{start_marker_command(start_marker)}; " if start_marker else ""
         root_dir = self._sandbox_cwd or self._remote_root
-        full_command = (
-            f"cd {shlex.quote(full_dir)} && {user_command}\n"
+        return (
+            f"{mark}cd {shlex.quote(full_dir)} && {user_command}\n"
             '_srw_rc=$?; _srw_cwd="$PWD"; '
             f"cd {shlex.quote(root_dir)} && "
             f'printf \'\\n{sentinel} %s %s\\n\' "$_srw_rc" "$_srw_cwd"'
         )
-        return full_command, start_marker
 
     def shell_run(
         self,
@@ -4500,10 +4499,12 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             # Build the sentinel-suffixed command. When working_dir is set the
             # cwd enter, user command, root restore and sentinel stay inside
             # this one remotely reserved send.
-            full_cmd, start_marker = self._build_guarded_shell_command(
+            start_marker = new_start_marker()
+            full_cmd = self._build_guarded_shell_command(
                 command,
                 sentinel,
                 working_dir,
+                start_marker,
             )
             # Persist ownership before typing the command. If this agent dies
             # immediately afterward, the next claimant blocks a colliding
@@ -4546,36 +4547,11 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                     # Command finished — tab is no longer busy.
                     self._clear_tab_pending_if_current(tab_name, sentinel)
 
-                    if start_marker is not None:
-                        # Multi-line wrap path: locate the start marker output
-                        # line and extract everything between it and the sentinel.
-                        start_idx = None
-                        for i in range(sentinel_line_idx - 1, -1, -1):
-                            if all_lines[i].strip() == start_marker:
-                                start_idx = i
-                                break
-                        if start_idx is not None:
-                            new_lines = all_lines[start_idx + 1 : sentinel_line_idx]
-                            output_lines = [
-                                ol
-                                for ol in new_lines
-                                if start_marker not in ol and sentinel not in ol
-                            ]
-                        else:
-                            new_lines = all_lines[pre_count:sentinel_line_idx]
-                            output_lines = [
-                                ol for ol in new_lines if sentinel not in ol
-                            ]
-                    else:
-                        new_lines = all_lines[pre_count:sentinel_line_idx]
-                        output_lines = [ol for ol in new_lines if sentinel not in ol]
-                        # Skip prompt/command echo lines
-                        while output_lines and (
-                            command.split()[0] in output_lines[0]
-                            or output_lines[0].strip().endswith("$")
-                        ):
-                            output_lines = output_lines[1:]
-
+                    output_lines = self._extract_shell_output(
+                        all_lines[:sentinel_line_idx],
+                        start_marker=start_marker,
+                        sentinel=sentinel,
+                    )
                     output_text = "\n".join(output_lines).strip()
                     break
 
@@ -4643,6 +4619,35 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 parts.append("(no output)")
 
             return "\n".join(parts)
+
+    def _extract_shell_output(
+        self,
+        lines: List[str],
+        *,
+        start_marker: str,
+        sentinel: str,
+    ) -> List[str]:
+        """Return what a finished command printed before its completion record.
+
+        The output starts after the command's own start-marker line. Lines
+        carrying the sentinel are the typed restore line's echo, never output.
+        """
+        first = 0
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].strip() == start_marker:
+                first = i + 1
+                break
+        else:
+            # The marker never printed (a working_dir command line that bash
+            # rejected) or left the capture (the output overflowed the
+            # scrollback, or the command cleared it). Output then follows the
+            # typed command's echo, or fills the capture when that is gone too.
+            echo = start_marker_command(start_marker)
+            for i in range(len(lines) - 1, -1, -1):
+                if echo in lines[i]:
+                    first = i + 1
+                    break
+        return [line for line in lines[first:] if sentinel not in line]
 
     def _capture_terminal_state(
         self, tab_name: str, sentinel: str, pre_count: int
@@ -4721,7 +4726,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 # v2 durable guard says the shell is idle. Only a response sent
                 # while an existing guard is present is raw foreground input.
                 sentinel = f"__DONE_{uuid.uuid4().hex[:12]}__"
-                guarded_command, _ = self._build_guarded_shell_command(
+                guarded_command = self._build_guarded_shell_command(
                     text,
                     sentinel,
                     working_dir,
@@ -5000,7 +5005,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         if command:
             if tab_type == "shell":
                 sentinel = f"__DONE_{uuid.uuid4().hex[:12]}__"
-                guarded_command, _ = self._build_guarded_shell_command(
+                guarded_command = self._build_guarded_shell_command(
                     command,
                     sentinel,
                     None,

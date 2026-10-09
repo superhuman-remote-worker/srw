@@ -169,7 +169,7 @@ def test_remote_delivery_uses_private_transport_and_work_identity(
 
         monkeypatch.setattr(backend, "_exec", execute)
         assert backend.exec_command('printf "%s" "$API_KEY"') == value
-        command, _ = backend._build_guarded_shell_command(
+        command = backend._build_guarded_shell_command(
             'printf "%s\\n" "$API_KEY"', "__DONE_test__", None
         )
         assert (

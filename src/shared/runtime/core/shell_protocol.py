@@ -9,8 +9,32 @@ import uuid
 from typing import List, Optional, Tuple
 
 
-def build_sentinel_command(command: str, sentinel: str) -> Tuple[str, Optional[str]]:
+def new_start_marker() -> str:
+    """Return a unique line that marks where one command's output starts."""
+    return f"__SRW_START_{uuid.uuid4().hex[:12]}__"
+
+
+def start_marker_command(start_marker: str) -> str:
+    """Return the command that prints ``start_marker`` on a line of its own.
+
+    It assembles the marker at run time, so the echo of the typed command
+    contains this command text but never the marker itself: only the printed
+    line matches the marker exactly.
+    """
+    token = start_marker.removeprefix("__SRW_START_").removesuffix("__")
+    return f"printf '__SRW_START_%s__\\n' {token}"
+
+
+def build_sentinel_command(
+    command: str,
+    sentinel: str,
+    start_marker: Optional[str] = None,
+) -> str:
     """Build the command string to send to tmux for sentinel-based completion.
+
+    With ``start_marker`` the command prints that line before it runs, so a
+    caller that extracts the output takes the lines between the marker and
+    the sentinel and never has to tell output from the typed command's echo.
 
     Single-line commands use simple ';' chaining: this preserves the
     existing interactive-prompt detection semantics — when a single-line
@@ -23,28 +47,21 @@ def build_sentinel_command(command: str, sentinel: str) -> Tuple[str, Optional[s
     line-by-line into tmux. This fixes BUG-5: previously the heredoc
     terminator landed on the same line as the sentinel echo (`PY; echo ...`)
     and the heredoc never closed, leaving the tab permanently stuck.
-
-    Returns:
-        (full_cmd, start_marker) where start_marker is a unique string for
-        multi-line commands (used by extraction to locate where the user
-        command's stdout begins) or None for single-line commands.
     """
+    mark = start_marker_command(start_marker) if start_marker else None
     if "\n" not in command:
-        return (
-            f'{command}; printf \'\\n{sentinel} %s %s\\n\' "$?" "$PWD"',
-            None,
-        )
+        prefix = f"{mark}; " if mark else ""
+        return f'{prefix}{command}; printf \'\\n{sentinel} %s %s\\n\' "$?" "$PWD"'
 
     outer_delim = f"SRW_DELIM_{uuid.uuid4().hex[:12]}"
-    start_marker = f"__SRW_START_{uuid.uuid4().hex[:12]}__"
-    full_cmd = (
+    mark_line = f"{mark}\n" if mark else ""
+    return (
         f'bash << "{outer_delim}"\n'
-        f'echo "{start_marker}"\n'
+        f"{mark_line}"
         f"{command}\n"
         f'printf "\\n{sentinel} %s %s\\n" "$?" "$PWD"\n'
         f"{outer_delim}"
     )
-    return full_cmd, start_marker
 
 
 # Auto-detected tab types based on command prefix
