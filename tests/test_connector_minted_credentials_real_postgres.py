@@ -19,6 +19,7 @@ import copy
 import json
 import logging
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -1606,6 +1607,27 @@ async def test_a_sessions_stored_selection_is_minted_at_its_project_links_level(
     assert row["access"] == "ReadOnly" and row["status"] == "live"
     [token] = github.tokens
     assert github.tokens[token]["permissions"]["contents"] == "read"
+
+
+@pytest.mark.asyncio
+async def test_a_session_without_a_minting_connector_costs_one_query(db, github):
+    # Every workspace poll prepares: a session that selects no minting
+    # connector (a plain repository, or nothing) must not read its thread.
+    plain = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO datasources (id, name, type, scope_mode, policy_revision, "
+            "connection_url, config) VALUES ($1, 'plain', 'repository', 'all', 1, "
+            '$2, \'{"forge": "github"}\'::jsonb)',
+            plain,
+            URL,
+        )
+    for metadata in ({"datasource_ids": [str(plain)]}, {}):
+        thread = await _thread(db, metadata=metadata)
+        with patch.object(db, "get_thread", AsyncMock()) as get_thread:
+            await minted.prepare_thread_minted(db, thread)
+        get_thread.assert_not_awaited()
+    assert await _rows(db) == []
 
 
 @pytest.mark.asyncio

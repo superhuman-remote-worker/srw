@@ -1296,6 +1296,20 @@ _MINTING_ROWS_SQL = f"""
  OR (d.type = '{REPOSITORY_SPEC.legacy_type}' AND d.config ? '{GITHUB_APP_KEY}'))
 """
 
+#: Whether a session's stored selection names any minting connector: the
+#: one query a workspace poll pays when it names none (most sessions).
+_THREAD_SELECTS_MINTING = f"""
+SELECT EXISTS (
+  SELECT 1
+    FROM threads AS t
+   CROSS JOIN LATERAL jsonb_array_elements_text(
+         CASE WHEN jsonb_typeof(t.metadata -> 'datasource_ids') = 'array'
+              THEN t.metadata -> 'datasource_ids' ELSE '[]'::jsonb END) AS sel(id)
+    JOIN datasources AS d ON d.id::text = lower(sel.id)
+   WHERE t.id = $1::uuid AND {_MINTING_ROWS_SQL}
+)
+"""
+
 _THREAD_TARGETS = f"""
 SELECT d.id,
        COALESCE({_OWN_READ_ONLY_SQL}, false)
@@ -1398,11 +1412,16 @@ async def prepare_thread_minted(store: Any, thread_id: str) -> None:
     datasource lock. The access level is read as the delivery reads it
     (``resolve_datasources_for_thread`` and the entry's marker): read-only
     when the connector is, or any link of it to the session's projects is.
-    Never raises."""
+    A session that selects no minting connector costs one query and reads
+    nothing else, since every workspace poll comes through here. Never
+    raises."""
     from orchestrator.services.thread_mount_rows import durable_project_ids
 
     try:
         owner = LeaseOwner.thread(str(UUID(str(thread_id))))
+        async with store.acquire() as conn:
+            if not await conn.fetchval(_THREAD_SELECTS_MINTING, owner.id):
+                return
         thread = await store.get_thread(owner.id)
         if not thread:
             return
