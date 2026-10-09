@@ -414,7 +414,10 @@ def _guarded_fetch(
     """The probe's GET through ``provider_http``: a checked, pinned address,
     a capped answer, no redirect or proxy, and a fixed text when no answer
     came."""
+    import httpx
+
     from orchestrator.services.connector_drivers.provider_http import (
+        LANE_TEST,
         ProviderError,
         provider_request,
     )
@@ -430,9 +433,13 @@ def _guarded_fetch(
                 ca_pem=ca_pem,
                 allow_private=allow_private,
                 deadline=PROBE_DEADLINE_SECONDS,
+                lane=LANE_TEST,
             )
         except ProviderError as exc:
             raise ForgeError(str(exc)) from None
+        except httpx.InvalidURL:
+            # urlparse took it, httpx does not (``010.0.0.1``, say).
+            raise ForgeError(f"{forge}'s address is not one SRW can use") from None
         return ProbeAnswer(
             status=answer.status, headers=answer.headers, body=answer.body
         )

@@ -673,8 +673,22 @@ class TestRepositoryTestEgress:
     async def test_a_numeric_spelling_is_checked_as_what_it_resolves_to(
         self, monkeypatch, host
     ):
-        """The system resolver turns these into 127.0.0.1; the check sees
-        that address, and the request would dial it, never the spelling."""
+        """The system resolver turns these into 127.0.0.1 (glibc's
+        inet_aton, no DNS); the check sees that address, and the request
+        would dial it, never the spelling."""
+        import socket
+
+        try:
+            answers = {
+                info[4][0]
+                for info in socket.getaddrinfo(
+                    host, None, socket.AF_INET, socket.SOCK_STREAM
+                )
+            }
+        except OSError:
+            answers = set()
+        if answers != {"127.0.0.1"}:
+            pytest.skip(f"this platform's resolver reads {host!r} as {answers}")
         seen = _forge(monkeypatch, _ok())
         monkeypatch.setitem(
             provider_http._state,
@@ -683,11 +697,85 @@ class TestRepositoryTestEgress:
         )
         result = await _test(_repository(f"https://{host}/acme/widgets.git"))
 
-        assert result["status"] == "error"
-        assert result["message"] in (
-            REFUSED.format(forge="gitea"),
-            UNRESOLVED.format(forge="gitea"),
+        assert result == {"status": "error", "message": REFUSED.format(forge="gitea")}
+        assert seen == []
+
+    @pytest.mark.asyncio
+    async def test_a_tests_lookups_run_on_threads_of_their_own(self, monkeypatch):
+        """In the installation's own network (no installed resolver), Test
+        resolves on the Test lane, never on the threads mints use."""
+        seen = _forge(monkeypatch, _ok())
+        asked: list[str] = []
+
+        async def test_lane(host, ipv6):
+            asked.append(host)
+            return (PUBLIC,)
+
+        async def mint_lane(host, ipv6):
+            raise AssertionError("a Test resolved on the mints' threads")
+
+        monkeypatch.setattr(provider_http, "connector_test_resolver", test_lane)
+        monkeypatch.setattr(provider_http, "provider_resolver", mint_lane)
+        monkeypatch.setitem(
+            provider_http._state, "network", ProviderNetwork(resolver=mint_lane)
         )
+        result = await _test(
+            _repository("https://github.com/acme/widgets.git", forge="github")
+        )
+
+        assert result["status"] == "ok", result
+        assert asked == ["api.github.com", "api.github.com"]
+        assert len(seen) == 2
+
+    @pytest.mark.asyncio
+    async def test_an_ipv6_literal_on_an_ipv4_only_network_is_refused(
+        self, monkeypatch
+    ):
+        """Its pod or service range (k3s: 2001:cafe:43::/112) is in no list
+        an IPv4-only installation checks."""
+        url = "https://[2001:cafe:43::a]:8085/acme/widgets.git"
+        seen = _forge(monkeypatch, _ok())
+        result = await _test(_repository(url))
+        assert result == {"status": "error", "message": REFUSED.format(forge="gitea")}
+        assert seen == []
+
+        # A dual-stack installation checks it, as any address.
+        monkeypatch.setitem(
+            provider_http._state,
+            "network",
+            ProviderNetwork(resolver=fake_resolver({}), ipv6=True),
+        )
+        result = await _test(_repository(url))
+        assert result["status"] == "ok", result
+        assert {str(request.url.host) for request in seen} == {"2001:cafe:43::a"}
+
+    @pytest.mark.asyncio
+    async def test_an_international_name_is_resolved_and_named_as_its_ascii_form(
+        self, monkeypatch
+    ):
+        """Python's resolver and TLS encode a Unicode name by IDNA 2003
+        (``faß.de`` -> ``fass.de``), the Host header by IDNA 2008
+        (``xn--fa-hia.de``): Test asks one name, the one the header names."""
+        seen = _forge(monkeypatch, _ok(), addresses={"xn--fa-hia.de": (PUBLIC,)})
+        result = await _test(_repository("https://faß.de/acme/widgets.git"))
+
+        assert result["status"] == "ok", result
+        assert {request.headers["host"] for request in seen} == {"xn--fa-hia.de"}
+        assert {request.extensions.get("sni_hostname") for request in seen} == {
+            "xn--fa-hia.de"
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_url_httpx_refuses_is_a_fixed_answer_not_a_server_error(
+        self, monkeypatch
+    ):
+        seen = _forge(monkeypatch, _ok())
+        result = await _test(_repository("https://010.0.0.1/acme/widgets.git"))
+
+        assert result == {
+            "status": "error",
+            "message": "gitea's address is not one SRW can use",
+        }
         assert seen == []
 
     @pytest.mark.asyncio

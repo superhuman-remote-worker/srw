@@ -518,11 +518,16 @@ async def _pinned_host_key(
     connection."""
 
     from orchestrator.services.connector_drivers.provider_http import (
+        LANE_TEST,
         checked_addresses,
     )
 
     addresses, _literal = await checked_addresses(
-        host, port, who=f"SSH host {endpoint}", allow_private=allow_private
+        host,
+        port,
+        who=f"SSH host {endpoint}",
+        allow_private=allow_private,
+        lane=LANE_TEST,
     )
     for index, address in enumerate(addresses):
         try:

@@ -90,6 +90,8 @@ class TestExpandRule:
         ("64:ff9b::a2a:1", "NAT64"),
         ("64:ff9b:1::1", "NAT64"),
         ("2002:a00:1::1", "6to4"),
+        ("::a2b:a0a", "IPv4-compatible"),  # ::10.43.10.10
+        ("::ffff:0:a9fe:a9fe", "IPv4-translated"),  # ::ffff:0:169.254.169.254
         ("fd00:ec2::254", "metadata"),
         ("168.63.129.16", "metadata"),
     ],

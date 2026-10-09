@@ -593,3 +593,56 @@ class TestResolver:
         ] * provider_http.RESOLVER_THREADS
         # The threads are free again.
         assert await provider_http.provider_resolver("z.test", False) == ["203.0.113.5"]
+
+    @pytest.mark.asyncio
+    async def test_a_connectors_tests_never_hold_a_mints_threads(self, monkeypatch):
+        """Any user may start Tests: with every Test thread held by a name
+        that never answers, a mint's lookup still runs at once."""
+        import socket
+        import threading
+
+        release = threading.Event()
+        names: list[str] = []
+
+        def lookup(host, *args, **kwargs):
+            names.append(threading.current_thread().name)
+            if host.startswith("hang"):
+                release.wait(10)
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.5", 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", lookup)
+        network = ProviderNetwork()
+        test_lane = network.resolver_for(provider_http.LANE_TEST)
+        assert test_lane is provider_http.connector_test_resolver
+        assert (
+            network.resolver_for(provider_http.LANE_PROVIDER)
+            is provider_http.provider_resolver
+        )
+        try:
+            held = [
+                asyncio.ensure_future(test_lane(f"hang{i}.test", False))
+                for i in range(provider_http.RESOLVER_THREADS)
+            ]
+            await asyncio.sleep(0.2)
+            with pytest.raises(OSError, match="busy"):
+                await test_lane("next.test", False)
+            started = time.monotonic()
+            assert await provider_http.provider_resolver("mint.test", False) == [
+                "203.0.113.5"
+            ]
+            assert time.monotonic() - started < 0.5
+        finally:
+            release.set()
+        for lookup_future in held:
+            await lookup_future
+        assert (
+            sum(name.startswith("srw-test-probe-resolve") for name in names)
+            == provider_http.RESOLVER_THREADS
+        )
+        assert sum(name.startswith("srw-provider-resolve") for name in names) == 1
+
+    def test_an_installed_resolver_serves_every_lane(self):
+        installed = fake_resolver({})
+        network = ProviderNetwork(resolver=installed)
+        assert network.resolver_for(provider_http.LANE_TEST) is installed
+        assert network.resolver_for(provider_http.LANE_PROVIDER) is installed

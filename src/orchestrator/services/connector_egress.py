@@ -81,6 +81,9 @@ _ALWAYS_REFUSED: tuple[tuple[IPNetwork, str], ...] = tuple(
         ("64:ff9b::/96", "is a NAT64 address"),
         ("64:ff9b:1::/48", "is a NAT64 address"),
         ("2002::/16", "is a 6to4 address"),
+        # Deprecated or translator-only spellings of an IPv4 address.
+        ("::/96", "is an IPv4-compatible address"),
+        ("::ffff:0:0:0/96", "is an IPv4-translated address"),
         # Cloud metadata outside link-local: AWS over IPv6, Azure's wireserver.
         ("fd00:ec2::254/128", "is a cloud metadata address"),
         ("168.63.129.16/32", "is a cloud metadata address"),

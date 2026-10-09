@@ -38,7 +38,10 @@ A connector's Test reaches user-chosen hosts from this process too, and is
 held to the same rules: a repository's forge API goes through
 :func:`provider_request`, and its SSH endpoint dials an address
 :func:`checked_addresses` passed (``workspace_ssh_connector``), on the tier
-:func:`tier_allows_private` reads.
+:func:`tier_allows_private` reads. Its lookups run on resolver threads of
+their own (:data:`LANE_TEST`): Tests any user may start never hold the
+threads a mint needs. On an IPv4-only installation an IPv6 address is
+refused, as a driver pod's egress refuses it.
 
 Tests replace the client factory and the network (resolver) with
 :func:`configure_provider_http` and :func:`configure_provider_network`.
@@ -139,34 +142,59 @@ def failure(
     )
 
 
-_RESOLVER_POOL = ThreadPoolExecutor(
-    max_workers=RESOLVER_THREADS, thread_name_prefix="srw-provider-resolve"
-)
-_RESOLVER_SLOTS = threading.BoundedSemaphore(RESOLVER_THREADS)
+#: Whose lookups a call makes: a provider call (a mint, a revoke) or a
+#: connector's Test. Each has its own threads, so Tests a user can start at
+#: will never hold the ones a mint needs.
+LANE_PROVIDER = "provider"
+LANE_TEST = "test"
 
 
-def _lookup(host: str, family: int) -> list[str]:
-    try:
-        infos = socket.getaddrinfo(host, None, family, socket.SOCK_STREAM)
-    finally:
-        _RESOLVER_SLOTS.release()
-    return [str(info[4][0]) for info in infos]
+class _ResolverLane:
+    """A small pool of lookup threads and as many slots: a lookup the system
+    resolver never answers holds one, and with every one held the next
+    lookup fails at once instead of queueing."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.pool = ThreadPoolExecutor(
+            max_workers=RESOLVER_THREADS, thread_name_prefix=f"srw-{name}-resolve"
+        )
+        self.slots = threading.BoundedSemaphore(RESOLVER_THREADS)
+
+    def _lookup(self, host: str, family: int) -> list[str]:
+        try:
+            infos = socket.getaddrinfo(host, None, family, socket.SOCK_STREAM)
+        finally:
+            self.slots.release()
+        return [str(info[4][0]) for info in infos]
+
+    async def resolve(self, host: str, ipv6: bool) -> Sequence[str]:
+        if not self.slots.acquire(blocking=False):
+            raise OSError(f"every {self.name} resolver thread is busy")
+        family = socket.AF_UNSPEC if ipv6 else socket.AF_INET
+        loop = asyncio.get_running_loop()
+        try:
+            future = loop.run_in_executor(self.pool, self._lookup, host, family)
+        except BaseException:
+            self.slots.release()
+            raise
+        return await future
+
+
+_PROVIDER_LANE = _ResolverLane("provider")
+_TEST_LANE = _ResolverLane("test-probe")
 
 
 async def provider_resolver(host: str, ipv6: bool) -> Sequence[str]:
     """A and (on dual-stack) AAAA answers, on the provider calls' own
     threads; ``OSError`` at once when all of them are taken (a hung system
     resolver), never a queue behind them."""
-    if not _RESOLVER_SLOTS.acquire(blocking=False):
-        raise OSError("every provider resolver thread is busy")
-    family = socket.AF_UNSPEC if ipv6 else socket.AF_INET
-    loop = asyncio.get_running_loop()
-    try:
-        future = loop.run_in_executor(_RESOLVER_POOL, _lookup, host, family)
-    except BaseException:
-        _RESOLVER_SLOTS.release()
-        raise
-    return await future
+    return await _PROVIDER_LANE.resolve(host, ipv6)
+
+
+async def connector_test_resolver(host: str, ipv6: bool) -> Sequence[str]:
+    """:func:`provider_resolver` on threads of the connector Tests' own."""
+    return await _TEST_LANE.resolve(host, ipv6)
 
 
 @dataclass(frozen=True)
@@ -200,12 +228,19 @@ class ProviderNetwork:
         """Whether the operator listed this host (``host``, or ``host:port``
         with the port the call uses)."""
         port = url.port or (443 if url.scheme == "https" else 80)
-        return self.lists(url.host or "", port)
+        return self.lists(url.raw_host.decode("ascii"), port)
 
     def lists(self, host: str, port: int) -> bool:
         """Whether the operator listed ``host`` (alone, or with ``port``)."""
         host = host.lower()
         return host in self.private_hosts or f"{host}:{port}" in self.private_hosts
+
+    def resolver_for(self, lane: str) -> Resolver:
+        """The resolver a lane's lookups run on: a Test's on threads of its
+        own. An installed resolver (a test's) serves every lane."""
+        if lane == LANE_TEST and self.resolver is provider_resolver:
+            return connector_test_resolver
+        return self.resolver
 
     def policy(self, *, listed: bool, allow_private: bool) -> EgressPolicy:
         if listed:
@@ -340,10 +375,16 @@ def parse_time(value: Any) -> datetime:
 
 
 async def checked_addresses(
-    host: str, port: int, *, who: str, allow_private: bool
+    host: str,
+    port: int,
+    *,
+    who: str,
+    allow_private: bool,
+    lane: str = LANE_PROVIDER,
 ) -> tuple[list[IPAddress], bool]:
-    """``host`` resolved once, every answer checked: ``(addresses, literal)``,
-    the addresses to dial in turn (``literal``: ``host`` was one). A
+    """``host`` (ASCII: an IDNA name's ``xn--`` form) resolved once on
+    ``lane``'s threads, every answer checked: ``(addresses, literal)``, the
+    addresses to dial in turn (``literal``: ``host`` was one). A
     :class:`ProviderError` (``does_not_resolve`` or ``address_refused``)
     otherwise, before anything connects."""
     network = provider_network()
@@ -357,7 +398,7 @@ async def checked_addresses(
     except ValueError:
         literal = False
         try:
-            answers = await network.resolver(host, network.ipv6)
+            answers = await network.resolver_for(lane)(host, network.ipv6)
         except (OSError, UnicodeError) as exc:
             logger.info("Provider host %s does not resolve: %s", label, clean(exc))
             raise failure(
@@ -374,6 +415,11 @@ async def checked_addresses(
         raise failure("does_not_resolve", who, transient=True, reached=False)
     for address in addresses:
         reason = refusal(address, policy)
+        if reason is None and address.version == 6 and not network.ipv6:
+            # As a driver pod's egress pins it: an IPv4-only installation
+            # names no IPv6 range, so none is checked (an IPv6 answer of a
+            # name is dropped above).
+            reason = "is an IPv6 address, and this installation checks IPv4 only"
         if reason is not None:
             logger.warning("Provider call to %s refused: %s %s", label, address, reason)
             raise failure("address_refused", who, transient=False, reached=False)
@@ -381,15 +427,21 @@ async def checked_addresses(
 
 
 async def _targets(
-    url: httpx.URL, *, who: str, allow_private: bool, sni_hostname: str | None
+    url: httpx.URL,
+    *,
+    who: str,
+    allow_private: bool,
+    sni_hostname: str | None,
+    lane: str = LANE_PROVIDER,
 ) -> list[tuple[httpx.URL, dict[str, str], dict[str, Any]]]:
     """The checked addresses to dial in turn, with the headers and the TLS
-    name each needs."""
-    host = url.host
+    name each needs. The host is resolved, matched and named to TLS in its
+    ASCII form, the one the ``Host`` header carries."""
+    host = url.raw_host.decode("ascii")
     netloc = url.netloc.decode("ascii")
     port = url.port or (443 if url.scheme == "https" else 80)
     addresses, literal = await checked_addresses(
-        host, port, who=who, allow_private=allow_private
+        host, port, who=who, allow_private=allow_private, lane=lane
     )
     extensions: dict[str, Any] = {"sni_hostname": sni_hostname} if sni_hostname else {}
     # No content coding: SRW never decodes one (see the module docstring).
@@ -485,10 +537,13 @@ async def provider_request(
     allow_private: bool = False,
     sni_hostname: str | None = None,
     deadline: float | None = None,
+    lane: str = LANE_PROVIDER,
 ) -> ProviderAnswer:
     """One provider call under one deadline (``None``:
     :data:`DEFAULT_DEADLINE_SECONDS`), to a checked, pinned address, reading
-    at most :data:`MAX_BODY_BYTES`; ``ProviderError`` otherwise."""
+    at most :data:`MAX_BODY_BYTES`; ``ProviderError`` otherwise. ``lane``:
+    whose resolver threads the lookup runs on (:data:`LANE_TEST` for a
+    connector's Test)."""
     if deadline is None:
         deadline = DEFAULT_DEADLINE_SECONDS
     verify = tls_context(ca_pem)
@@ -497,7 +552,11 @@ async def provider_request(
     try:
         async with asyncio.timeout(deadline):
             candidates = await _targets(
-                target, who=who, allow_private=allow_private, sni_hostname=sni_hostname
+                target,
+                who=who,
+                allow_private=allow_private,
+                sni_hostname=sni_hostname,
+                lane=lane,
             )
             resolving = False
             async with _state["factory"](verify=verify, timeout=deadline) as client:
@@ -527,6 +586,8 @@ async def provider_request(
 __all__ = [
     "ClientFactory",
     "DEFAULT_DEADLINE_SECONDS",
+    "LANE_PROVIDER",
+    "LANE_TEST",
     "MAX_BODY_BYTES",
     "RESOLVER_THREADS",
     "MintedToken",
@@ -538,6 +599,7 @@ __all__ = [
     "clean",
     "configure_provider_http",
     "configure_provider_network",
+    "connector_test_resolver",
     "failure",
     "parse_time",
     "provider_network",
