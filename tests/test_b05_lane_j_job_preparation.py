@@ -1949,6 +1949,36 @@ class TestFailSubjobAndUnblockParent:
         assert store.update_job_status.await_args.kwargs["expected_status"] is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("lane", ["pinned", "stateless"])
+    @pytest.mark.parametrize("committed", [True, False])
+    async def test_an_explicit_expected_status_holds_on_both_lanes(
+        self, lane, committed
+    ):
+        """The dispatcher's model refusal (unavailable model handling S4)
+        keeps its status CAS for a pinned subjob too: a lost CAS neither
+        overwrites the winner nor unblocks the parent."""
+        store = MagicMock()
+        store.update_job_status = AsyncMock(return_value=committed)
+        scholar = AsyncMock()
+        delegation = AsyncMock()
+        job = {"id": "child", "status": "paused", "execution_lane": lane}
+        await job_workspace_authority.fail_subjob_and_unblock_parent(
+            job,
+            "model unavailable",
+            expected_status="paused",
+            dependencies=_authority_deps(
+                store=store,
+                handle_scholar_completion=scholar,
+                handle_delegation_child_completion=delegation,
+            ),
+        )
+        assert store.update_job_status.await_args.kwargs["expected_status"] == (
+            "paused"
+        )
+        assert scholar.await_count == delegation.await_count == int(committed)
+        assert job["status"] == ("failed" if committed else "paused")
+
+    @pytest.mark.asyncio
     async def test_one_failing_handler_does_not_suppress_the_other(self):
         store = MagicMock()
         store.update_job_status = AsyncMock(return_value=True)

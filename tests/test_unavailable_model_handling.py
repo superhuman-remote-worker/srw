@@ -536,6 +536,27 @@ class TestJobCheckBeforeClaim:
         )
 
     @pytest.mark.asyncio
+    async def test_a_historical_phase_tier_is_read_as_the_start_bundle_reads_it(
+        self, snapshot
+    ):
+        beside = {"llm": {"model": "gpt-6-astra", "tactical": {"model": "MiniMax-M3"}}}
+        # Experts DB on: resolve_config drops a tier beside an explicit model...
+        assert await self._check({"config_override": beside}, self._deps()) is None
+        # ...and lifts a lone one into llm.model.
+        lone = {"llm": {"strategic": {"model": "MiniMax-M3"}}}
+        refusal = await self._check({"config_override": lone}, self._deps())
+        assert [entry.as_dict() for entry in refusal.entries] == [
+            {"slot": "llm", "model": "MiniMax-M3", "reason": "disabled"}
+        ]
+        # Experts DB off: the flat override is delivered, and refused, as it is.
+        refusal = await self._check(
+            {"config_override": beside}, self._deps(experts_db=False)
+        )
+        assert [entry.as_dict() for entry in refusal.entries] == [
+            {"slot": "llm.tactical", "model": "MiniMax-M3", "reason": "disabled"}
+        ]
+
+    @pytest.mark.asyncio
     async def test_an_account_default_is_never_refused_here(self, snapshot):
         """It falls back to the system default when the job is resolved (S2)."""
         store = _store(

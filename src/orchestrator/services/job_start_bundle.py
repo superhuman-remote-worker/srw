@@ -67,7 +67,11 @@ from orchestrator.services.job_mutation_target import (
     FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S,
     PinnedJobMutationTarget,
 )
-from shared.runtime.core.loader import canonical_config_name
+from shared.runtime.core.loader import (
+    canonical_config_name,
+    deep_merge,
+    normalize_llm_tiers,
+)
 from shared.workspace_contract import WORKSPACE_RUNTIME_CONTEXT_KEY
 
 
@@ -308,13 +312,21 @@ async def unavailable_models_before_claim(
             config = job.get("config_override") or {}
             if isinstance(config, str):
                 config = json.loads(config)
-            if job.get("expert_id") and dependencies.is_experts_db_enabled():
-                expert_row = await postgres_db.get_expert_by_id(str(job["expert_id"]))
+            if dependencies.is_experts_db_enabled():
+                # As resolve_config takes the request layer: a pre-U1 phase
+                # tier is lifted into llm.model, or dropped beside an explicit
+                # one. The flat path (experts DB off) delivers and checks the
+                # tiers as they are.
+                config = normalize_llm_tiers(config, source="request-override")
+                expert_row = (
+                    await postgres_db.get_expert_by_id(str(job["expert_id"]))
+                    if job.get("expert_id")
+                    else None
+                )
                 if expert_row is not None:
                     from shared.runtime.core.expert_resolution import (
                         build_expert_config,
                     )
-                    from shared.runtime.core.loader import deep_merge
 
                     expert_config, _prompts = build_expert_config({}, expert_row)
                     config = deep_merge(expert_config, config)
@@ -947,4 +959,5 @@ __all__ = [
     "mask_repository_transport",
     "prepare_job_repository_before_claim",
     "redispatch_livelock_trip",
+    "unavailable_models_before_claim",
 ]

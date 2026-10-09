@@ -667,12 +667,22 @@ async def _preflight_job(
             job_id,
             [entry.as_dict() for entry in unavailable.entries],
         )
-        await dependencies.store.update_job_status(
-            job_id,
-            status="failed",
-            error_message=unavailable.message(where=WHERE_JOB),
-            expected_status=str(job.get("status")),
-        )
+        message = unavailable.message(where=WHERE_JOB)
+        if job.get("parent_job_id"):
+            # A scholar holds its parent in 'waiting', which only the
+            # completion-side unblock releases. It carries the parent's own
+            # llm override, so a parent pinned to the same model is refused
+            # here in turn once it is dispatchable again.
+            await dependencies.fail_subjob_and_unblock_parent(
+                job, message, expected_status=str(job.get("status"))
+            )
+        else:
+            await dependencies.store.update_job_status(
+                job_id,
+                status="failed",
+                error_message=message,
+                expected_status=str(job.get("status")),
+            )
         return None
 
     job_needs_vm = _job_needs_vm(job)

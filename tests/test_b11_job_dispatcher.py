@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import dataclasses
+import functools
 import inspect
 import logging
 from datetime import datetime, timezone
@@ -22,7 +23,7 @@ import pytest
 
 from orchestrator.database.dispatch_discovery import discovery_order
 from orchestrator.security.access import vm_workspaces_on_pod_network
-from orchestrator.services import job_dispatcher
+from orchestrator.services import job_dispatcher, job_workspace_authority
 from orchestrator.services.job_dispatcher import (
     JobDispatchDependencies,
     JobDispatchState,
@@ -181,6 +182,7 @@ def _deps(
     bind_gate: Any = None,
     mint_gate: Any = None,
     unavailable_models: Any = None,
+    fail_subjob: Any = None,
 ) -> JobDispatchDependencies:
     delivery = delivery or FakeDelivery()
 
@@ -207,7 +209,7 @@ def _deps(
         manifest_execution_service=manifest_service
         or MagicMock(side_effect=AssertionError("manifest reconcile not gated")),
         prepare_job_workspace_runtime=prepare_job_workspace_runtime,
-        fail_subjob_and_unblock_parent=unexpected,
+        fail_subjob_and_unblock_parent=fail_subjob or unexpected,
         check_vm_permission=unexpected,
         fail_vm_parked_job=unexpected,
         job_needs_sandbox=lambda job: False,
@@ -774,6 +776,77 @@ class TestUnavailableModelRefusal:
         assert kwargs["error_message"] == DISABLED_MESSAGE
         assert kwargs["expected_status"] == "created"
         assert store.called("admit_stateless_worker_job") == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("lane", ["pinned", "stateless"])
+    async def test_a_refused_subjob_unblocks_its_parent(
+        self, lane, no_dispatcher_error
+    ):
+        """A scholar holds its parent in 'waiting', which only the
+        completion-side unblock releases; a plain status write would strand
+        the parent there for good."""
+        if lane == "pinned":
+            job = _job("child", parent_job_id="parent")
+            store = FakeStore(pinned=[job])
+            lanes: dict[str, bool] = {}
+        else:
+            job = _stateless_job("child", parent_job_id="parent")
+            store = FakeStore(stateless=[job])
+            lanes = {"auto_assign_enabled": False, "stateless_worker_enabled": True}
+        scholar, delegation = AsyncMock(), AsyncMock()
+        fail_subjob = functools.partial(
+            job_workspace_authority.fail_subjob_and_unblock_parent,
+            dependencies=SimpleNamespace(
+                store=store,
+                logger=logging.getLogger("test.unavailable_model"),
+                handle_scholar_completion=scholar,
+                handle_delegation_child_completion=delegation,
+            ),
+        )
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(
+                store,
+                fail_subjob=fail_subjob,
+                unavailable_models=AsyncMock(return_value=_unavailable()),
+                **lanes,
+            )
+        )
+
+        # The failure keeps the dispatcher's status CAS on both lanes.
+        assert store.called("update_job_status") == [
+            (
+                ("child",),
+                {
+                    "status": "failed",
+                    "error_message": DISABLED_MESSAGE,
+                    "expected_status": "created",
+                },
+            )
+        ]
+        scholar.assert_awaited_once()
+        assert scholar.await_args.args[0]["status"] == "failed"
+        delegation.assert_awaited_once()
+        assert store.called("claim_job_for_agent") == []
+        assert store.called("admit_stateless_worker_job") == []
+
+    @pytest.mark.asyncio
+    async def test_a_top_level_job_is_failed_directly(self, no_dispatcher_error):
+        store = FakeStore(pinned=[_job("j1")])
+        fail_subjob = AsyncMock()
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(
+                store,
+                fail_subjob=fail_subjob,
+                unavailable_models=AsyncMock(return_value=_unavailable()),
+            )
+        )
+
+        fail_subjob.assert_not_awaited()
+        ((args, kwargs),) = store.called("update_job_status")
+        assert args == ("j1",)
+        assert kwargs["expected_status"] == "created"
 
     @pytest.mark.asyncio
     async def test_a_job_whose_models_can_run_is_claimed_as_before(

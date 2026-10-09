@@ -631,6 +631,7 @@ async def fail_subjob_and_unblock_parent(
     job: dict,
     message: str,
     *,
+    expected_status: str | None = None,
     dependencies: JobWorkspaceAuthorityDependencies,
 ) -> None:
     """Fail a subjob at dispatch time AND unblock the parent it was holding.
@@ -645,25 +646,29 @@ async def fail_subjob_and_unblock_parent(
     knowledge-base/knowledge/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md).
     Mirror ``complete_job``'s terminal-subjob unblock here so any dispatch-path
     failure is self-healing, not just today's inherit-timeout.
+
+    A stateless row is always failed with a CAS on its scanned status. A caller
+    that needs the same precondition for a pinned row passes
+    ``expected_status``; without it a pinned row is failed unconditionally.
     """
     job_id = str(job["id"])
-    stateless_worker = job.get("execution_lane") == "stateless"
+    if expected_status is None and job.get("execution_lane") == "stateless":
+        expected_status = str(job.get("status"))
     updated = await dependencies.store.update_job_status(
         job_id,
         status="failed",
         error_message=message,
-        expected_status=(str(job.get("status")) if stateless_worker else None),
+        expected_status=expected_status,
     )
-    if stateless_worker and not updated:
+    if expected_status is not None and not updated:
         # The dispatcher row is a stale snapshot. A control verb may have
         # cancelled/completed the child while workspace inheritance was being
         # resolved; never overwrite that winner or unblock the parent from a
         # failure disposition that did not commit.
         dependencies.logger.info(
-            "Dispatcher: skipped stale stateless subjob failure for %s "
-            "(expected_status=%s)",
+            "Dispatcher: skipped stale subjob failure for %s (expected_status=%s)",
             job_id,
-            job.get("status"),
+            expected_status,
         )
         return
     # The unblock handlers classify the outcome from job['status']; the in-memory
