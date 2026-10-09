@@ -412,7 +412,7 @@ def test_session_tool_use_reads_the_ai_role_and_the_exact_tool_name(monkeypatch)
     assert "'\"webdav_list\"'" in query
 
 
-def _session(monkeypatch, tools, probe):
+def _session(monkeypatch, tools, probe, tool_use=lambda tool, text: (1, 1)):
     runner = _runner()
     runner.thread = "00000000-0000-4000-8000-000000000001"
     runner.project = "00000000-0000-4000-8000-0000000000bb"
@@ -432,7 +432,7 @@ def _session(monkeypatch, tools, probe):
         "agent_log_lines",
         lambda needles: [f"INFO Connected to webdav datasource: {dav} (read-only)"],
     )
-    monkeypatch.setattr(runner, "tool_use", lambda tool, text: (1, 1))
+    monkeypatch.setattr(runner, "tool_use", tool_use)
     turns: list[int] = []
     monkeypatch.setattr(runner, "turn", lambda text, step: turns.append(step))
     runner.session_checks()
@@ -447,7 +447,7 @@ def test_session_checks_read_the_session_selection_and_probe_the_write(
     )
 
     assert runner.report.passed
-    assert turns == [2]
+    assert turns == [2, 3]
     assert requests[0] == {"datasource_ids": ["ds-dav"], "project": runner.project}
     assert requests[1]["method"] == "GET"
     assert requests[1]["url"].endswith(runner.dav_probe)
@@ -459,6 +459,17 @@ def test_session_checks_read_the_session_selection_and_probe_the_write(
 )
 def test_write_tools_or_a_written_probe_fail_the_session(monkeypatch, tools, probe):
     runner, _requests, _turns = _session(monkeypatch, tools, probe)
+    assert not runner.report.passed
+
+
+@pytest.mark.parametrize("missing", ["(fetch)", "(push)"])
+def test_a_dropped_git_remote_line_fails_the_session(monkeypatch, missing):
+    def tool_use(tool, text):
+        return (1, 0) if tool == "run_command" and text.endswith(missing) else (1, 1)
+
+    runner, _requests, _turns = _session(
+        monkeypatch, ["webdav_list", "webdav_read"], 404, tool_use
+    )
     assert not runner.report.passed
 
 
