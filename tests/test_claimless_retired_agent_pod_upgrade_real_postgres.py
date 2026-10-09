@@ -460,7 +460,7 @@ class _EraConnection:
     """A pool connection that writes what the replayed history's agent wrote.
 
     The lives before each upgrade stand in for that era's agent with today's
-    writers. Every replayed history predates 0337, whose pinned admission CAS
+    writers. Every replayed history predates 0344, whose pinned admission CAS
     also counts the admission (``admission_count``); until the upgrade adds
     the column, the CAS runs without that assignment, as it did then.
     """

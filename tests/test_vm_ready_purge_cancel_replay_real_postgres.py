@@ -30,6 +30,7 @@ from orchestrator.services.vm_workspace_recovery_store import (
     acquire_vm_cleanup_permit,
     vm_cleanup_request_identity,
 )
+from tests._connector_lease_migrations import is_lease_table_migration
 from tests.test_vm_job_cancel_retention_real_postgres import acquire, cancelled, child
 from tests.test_vm_job_retained_resume_real_postgres import (
     _base_db,  # noqa: F401
@@ -59,7 +60,9 @@ async def _schema_applied(pg_dsn, tmp_path_factory):  # noqa: F811
     )
     stage = tmp_path_factory.mktemp("ready-purge-pre0340")
     for path in migrations.glob("*.sql"):
-        if path.name.split("_", 1)[0] <= "0339":
+        # Today's delete revokes credential leases (C2), so the old head
+        # carries the lease tables the code it runs needs.
+        if path.name.split("_", 1)[0] <= "0339" or is_lease_table_migration(path.name):
             (stage / path.name).write_bytes(path.read_bytes())
     pool = await asyncpg.create_pool(pg_dsn, min_size=1, max_size=3)
     try:
