@@ -101,6 +101,7 @@ GET    /api/admin/users                                                         
 POST   /api/admin/users/approve                                                         pat=admin           admin:_require_admin
 PATCH  /api/admin/users/{user_id}                                                       pat=admin           admin:_require_admin
 GET    /api/agents                                                                      pat=admin           admin:_require_admin
+POST   /api/agents/git-swap/driver-state                                                pat=refused         internal:require_internal
 POST   /api/agents/jobs/{job_id}/subagents                                              pat=refused         internal:require_internal
 POST   /api/agents/jobs/{job_id}/subagents/live                                         pat=refused         internal:require_internal
 POST   /api/agents/jobs/{job_id}/subagents/{thread_id}                                  pat=refused         internal:require_internal

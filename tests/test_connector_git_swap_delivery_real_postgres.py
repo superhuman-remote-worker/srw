@@ -401,3 +401,158 @@ async def test_the_reconcilers_listen_comes_back_after_its_backend_ends(
         shutdown.set()
         await asyncio.wait_for(task, 10)
         await pool.close()
+
+
+# =============================================================================
+# A binding's pod, while its workspace waits for it
+# =============================================================================
+
+
+async def _lease(db, connector: str, *, driver: str = GIT_SWAP_SPEC.name):
+    """A thread's live lease of ``connector``: (owner thread, token)."""
+    thread_id = await _thread(db)
+    async with db.acquire() as conn:
+        lease = await leases.issue_or_redeliver(
+            conn,
+            owner=leases.LeaseOwner.thread(thread_id),
+            connector_id=connector,
+            driver=driver,
+            access="ReadWrite",
+            image_digest=DIGEST,
+        )
+    return thread_id, lease.token
+
+
+async def _state(db, token: object) -> dict:
+    async with db.acquire() as conn:
+        return await swaps.binding_driver_state(conn, token)
+
+
+async def _generation(db, connector: str) -> str:
+    async with db.acquire() as conn:
+        return await swaps.current_generation(conn, connector)
+
+
+@pytest.mark.asyncio
+async def test_a_binding_learns_its_own_pods_refusal_and_nothing_else(db):
+    """git_swap_refused_driver_still_costs_the_full_wait: the reconciler
+    refused the binding's pod (its upstream does not resolve), so the
+    waiting agent is told at once, with a fixed reason; another binding's
+    agent learns nothing of it."""
+    mine, other = await _connector(db), await _connector(db)
+    _owner, token = await _lease(db, mine)
+    other_owner, other_token = await _lease(db, other)
+    generation = await _generation(db, mine)
+    other_generation = await _generation(db, other)
+    # No pod yet (the reconciler's pass has not run), then starting: wait.
+    assert await _state(db, token) == {"state": "waiting"}
+    starting = await _pod(db, mine, generation=generation)
+    assert await _state(db, token) == {"state": "waiting"}
+    # Refused at launch: no pod starts while its key backs off.
+    await _set(
+        db,
+        starting,
+        "revoked_at = now(), revoke_reason = 'launch_refused', launch_error = "
+        "'c0-gate.invalid does not resolve ([Errno -2] Name or service not known)'",
+    )
+    answer = await _state(db, token)
+    retry_in = answer.pop("retry_in_seconds")
+    assert answer == {"state": "refused", "reason": swaps.REASONS["driver_not_started"]}
+    # The key may start again once the back-off (300 s) has passed.
+    assert 295 <= retry_in <= 300
+    # The reconciler's words never reach the agent.
+    assert "c0-gate" not in json.dumps(answer) and "resolve" not in json.dumps(answer)
+    # Another connector's binding learns nothing of it.
+    assert await _state(db, other_token) == {"state": "waiting"}
+    # A binding's key is its connector, its digest and the connector's
+    # current generation: an earlier generation's refusal, or another
+    # digest's, says nothing about its pod.
+    await _pod(db, other, stop="launch_refused", generation="an-earlier-one")
+    async with db.acquire() as conn:
+        minted = await mint_driver_identity(
+            conn,
+            connector_id=other,
+            driver=GIT_SWAP_SPEC.name,
+            image_digest="sha256:" + "cd" * 32,
+            pod_namespace="srw-connectors",
+        )
+        await conn.execute(
+            "UPDATE connector_driver_identities SET pod_name = 'srw-drv-x', "
+            "credential_generation = $2, image_reference = 'ghcr.io/x/y:1' "
+            "WHERE id = $1",
+            UUID(minted.id),
+            other_generation,
+        )
+        await revoke_driver_identity(conn, identity_id=minted.id, reason="capacity")
+    assert await _state(db, other_token) == {"state": "waiting"}
+    # The driver's own report at start keeps its fixed reason.
+    await _pod(
+        db,
+        other,
+        stop="upstream_unreachable",
+        error="untrusted certificate: unknown authority",
+        generation=other_generation,
+    )
+    answer = await _state(db, other_token)
+    assert answer["state"] == "refused"
+    assert answer["reason"] == swaps.REASONS["untrusted_certificate"]
+    # An idle stop is no refusal.
+    idle_connector = await _connector(db)
+    _, idle_token = await _lease(db, idle_connector)
+    await _pod(
+        db,
+        idle_connector,
+        stop="idle",
+        generation=await _generation(db, idle_connector),
+    )
+    assert await _state(db, idle_token) == {"state": "waiting"}
+    # Past the back-off the reconciler starts the key again: wait.
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE connector_driver_identities SET revoked_at = now() - "
+            "interval '1 hour' WHERE connector_id = $1",
+            UUID(mine),
+        )
+    assert await _state(db, token) == {"state": "waiting"}
+    # Four minutes into the back-off: refused, with about a minute left
+    # (the agent waits on when that is within its own wait).
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE connector_driver_identities SET revoked_at = now() - "
+            "interval '4 minutes' WHERE connector_id = $1",
+            UUID(mine),
+        )
+    answer = await _state(db, token)
+    assert answer["state"] == "refused" and 55 <= answer["retry_in_seconds"] <= 60
+    # A pod of the key lives again: wait, whatever an earlier one did.
+    await _pod(db, mine, generation=generation)
+    assert await _state(db, token) == {"state": "waiting"}
+    # A lease that ended, a token that names no lease, a malformed one, and
+    # an installation without the driver: nothing is known.
+    async with db.acquire() as conn:
+        await leases.revoke_connector_leases(
+            conn,
+            owner=leases.LeaseOwner.thread(other_owner),
+            connector_ids=[other],
+        )
+    assert await _state(db, other_token) == {"state": "unknown"}
+    from shared.connectors.leases import LEASE_TOKEN_PREFIX, mint_token
+
+    assert await _state(db, mint_token(LEASE_TOKEN_PREFIX)) == {"state": "unknown"}
+    for malformed in ("", "scl_short", None, 42, token + "x"):
+        assert await _state(db, malformed) == {"state": "unknown"}
+    swaps.configure_git_swap_delivery(swaps.GitSwapDeliverySettings())
+    assert await _state(db, token) == {"state": "unknown"}
+
+
+@pytest.mark.asyncio
+async def test_another_drivers_lease_learns_nothing_of_a_git_swap_pod(db):
+    connector = await _connector(db)
+    _owner, token = await _lease(db, connector, driver="srw.managed-mcp/v1")
+    await _pod(
+        db,
+        connector,
+        stop="launch_refused",
+        generation=await _generation(db, connector),
+    )
+    assert await _state(db, token) == {"state": "unknown"}

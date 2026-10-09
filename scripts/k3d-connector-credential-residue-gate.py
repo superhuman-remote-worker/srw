@@ -34,6 +34,15 @@ under the workspace home, then fails if any secret appears in:
 - the job's real S3 snapshot, taken by the completion teardown after the gate
   approves the job; it is reported as skipped only if it never appears.
 
+Where the git swap driver (C3) serves the token repository, its pod is
+refused at launch (``c0-gate.invalid`` does not resolve), and the agent must
+learn that instead of waiting out the binding's ``wait_seconds`` (210 s on
+k3d): the job's first graph step (its first checkpoint's ``ts``) must come
+less than ``FIRST_STEP_BOUND_SECONDS`` after the binding's lease was issued
+(the claim's delivery), both read from the app database. The measured
+seconds, and when the reconciler refused the pod, are reported; the residue
+scans still run when the bound is missed, and the gate fails at the end.
+
 A job that fails, or pauses on an LLM outage, before the scans can run fails
 the gate as "LLM unavailable". The gate then deletes the job and the
 connectors. Secrets travel only on ``kubectl exec -i`` stdin, never in an
@@ -75,8 +84,21 @@ AGENT_FILES = (
     "src/agent/core/state.py",
     "src/shared/runtime/core/shell_protocol.py",
     "src/shared/runtime/core/backends/remote.py",
+    # The wait for a refused git swap driver ends early.
+    "src/agent/connectors/git_swap.py",
 )
-ORCHESTRATOR_FILES = ("src/orchestrator/services/snapshot_service.py",)
+ORCHESTRATOR_FILES = (
+    "src/orchestrator/services/snapshot_service.py",
+    # The agent learns its binding's pod was refused.
+    "src/orchestrator/services/connector_git_swap_delivery.py",
+    "src/orchestrator/routers/agent_git_swap.py",
+)
+GIT_SWAP_DRIVER = "srw.git-swap/v1"
+# From the token repository's git swap lease (the claim's delivery) to the
+# job's first graph step. Generous: the setup's other steps (the workspace,
+# the SSH identities, the env file) run in it too. A refused driver that the
+# agent never learns about costs the binding's whole wait (210 s on k3d).
+FIRST_STEP_BOUND_SECONDS = 60
 # Archive members the snapshot excludes must have dropped.
 EXCLUDED_MEMBER_PATTERN = (
     r"(?:^|/)(?:\.srw-credentials(?:/|$)|\.ssh/srw-managed(?:/|$)|\.ssh/repo_"
@@ -686,6 +708,29 @@ SELECT json_build_object(
 """
 
 
+def first_step_sql(*, job_id: str, connector_id: str) -> str:
+    """When the token repository's git swap lease was issued (the claim's
+    delivery), when the reconciler refused its driver pod, and when the
+    job's first graph step ran (its first checkpoint's ``ts``), as epoch
+    seconds; ``null`` for what did not happen."""
+    job_id = str(UUID(job_id))
+    connector_id = str(UUID(connector_id))
+    return f"""
+SELECT json_build_object(
+  'issued', (SELECT extract(epoch FROM min(l.issued_at))
+               FROM connector_credential_leases l
+              WHERE l.job_id = '{job_id}' AND l.connector_id = '{connector_id}'
+                AND l.driver = '{GIT_SWAP_DRIVER}'),
+  'refused', (SELECT extract(epoch FROM min(i.revoked_at))
+                FROM connector_driver_identities i
+               WHERE i.connector_id = '{connector_id}'
+                 AND i.revoke_reason = 'launch_refused'),
+  'first_step', (SELECT extract(epoch FROM min((c.checkpoint->>'ts')::timestamptz))
+                   FROM checkpoints c WHERE c.thread_id = '{job_id}')
+);
+"""
+
+
 # ---------------------------------------------------------------------------
 # Cluster access
 # ---------------------------------------------------------------------------
@@ -876,6 +921,8 @@ class Gate:
         self.datasource_ids: list[str] = []
         self.job_id: str | None = None
         self.scans_started = False
+        # A missed bound fails the gate once the residue scans have run.
+        self.timing_failure: str | None = None
 
     # -- preflight -------------------------------------------------------
 
@@ -1151,6 +1198,60 @@ class Gate:
             raise GateFailure(f"{phase}: credential found in checkpoint rows")
         self.report.record(phase, "pass", job_rows=result["job_rows"])
 
+    def first_step_timing(self) -> None:
+        """The first graph step came soon after the git swap claim.
+
+        The token repository's driver pod is refused at launch (its host
+        does not resolve); the agent must learn that and go on, not wait
+        out the binding's ``wait_seconds``. Measured in the app database
+        from the lease's ``issued_at`` to the first checkpoint's ``ts``,
+        once this job's checkpoint rows exist. Skipped when the driver did
+        not serve the repository (not installed, or its fallback).
+        """
+        result = json.loads(
+            self.kube.sql(
+                first_step_sql(
+                    job_id=str(self.job_id), connector_id=self.datasource_ids[0]
+                ),
+                operation="first step timing",
+            )
+            or "{}"
+        )
+        name = "first_step_after_swap_claim"
+        issued, refused, first = (
+            result.get("issued"),
+            result.get("refused"),
+            result.get("first_step"),
+        )
+        if issued is None:
+            self.report.record(
+                name,
+                "skipped",
+                reason="the token repository was not served through the git swap driver",
+            )
+            return
+        if first is None:
+            self.report.record(name, "fail", reason="no first step recorded")
+            self.timing_failure = f"{name}: the job recorded no first step"
+            return
+        seconds = round(float(first) - float(issued), 1)
+        detail: dict[str, Any] = {
+            "seconds": seconds,
+            "bound_seconds": FIRST_STEP_BOUND_SECONDS,
+        }
+        if refused is not None:
+            detail["driver_refused_after_seconds"] = round(
+                float(refused) - float(issued), 1
+            )
+        if seconds < FIRST_STEP_BOUND_SECONDS:
+            self.report.record(name, "pass", **detail)
+            return
+        self.report.record(name, "fail", **detail)
+        self.timing_failure = (
+            f"{name}: the first step came {seconds} s after the git swap claim "
+            f"(bound {FIRST_STEP_BOUND_SECONDS} s)"
+        )
+
     def scan_pinned_sqlite(self, pod: str, markers: dict[str, str]) -> None:
         # WORKSPACE_PATH is /workspace on agent pods (helm configmap).
         script = file_scan_script(
@@ -1363,6 +1464,7 @@ class Gate:
             self.runtime_received_credentials(workspace_pod, markers, values)
             self.no_key_on_disk(workspace_pod, markers)
             self.scan_checkpoints(markers, phase="checkpoint_scan_running")
+            self.first_step_timing()
             if self.config.lane == "pinned":
                 self.scan_pinned_sqlite(agent_pod, markers)
             self.scan_live_snapshots(markers, container, phase="running")
@@ -1392,6 +1494,8 @@ class Gate:
             self.scan_checkpoints(
                 markers, phase="checkpoint_scan_final", require_rows=False
             )
+            if self.timing_failure is not None:
+                raise GateFailure(self.timing_failure)
         finally:
             self.cleanup()
         return self.report
@@ -1461,6 +1565,7 @@ def plan_report(config: GateConfig) -> SafeReport:
         "runtime_received_credentials",
         "workspace_holds_no_key_file",
         "checkpoint_scan_running",
+        "first_step_after_swap_claim",
         *(["pinned_sqlite_scan"] if config.lane == "pinned" else []),
         "snapshot_running_non_strict",
         "snapshot_running_strict",

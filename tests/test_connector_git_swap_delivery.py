@@ -367,6 +367,19 @@ class TestLaunch:
     def test_every_stop_that_backs_off_makes_a_connector_unservable(self):
         assert set(swaps.UNSERVABLE_STOPS) == set(hosting._BACKOFF_REASONS)
 
+    def test_the_back_off_is_the_reconcilers(self):
+        """The delivery and a binding's driver state count the reconciler's
+        back-off: a refused key starts again when it ends."""
+        import dataclasses
+
+        def default(cls, name):
+            [found] = [f for f in dataclasses.fields(cls) if f.name == name]
+            return found.default
+
+        assert default(
+            swaps.GitSwapDeliverySettings, "launch_backoff_seconds"
+        ) == default(ServiceHostingSettings, "launch_backoff_seconds")
+
 
 # =============================================================================
 # The upstream

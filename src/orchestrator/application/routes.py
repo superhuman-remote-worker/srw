@@ -40,6 +40,7 @@ from orchestrator.routers import (
     actions as actions_routes,
     agent_child_threads as agent_child_threads_routes,
     agent_cloud_stage as agent_cloud_stage_routes,
+    agent_git_swap as agent_git_swap_routes,
     agent_officer as agent_officer_routes,
     agent_registration as agent_registration_routes,
     agent_thread_status as agent_thread_status_routes,
@@ -209,6 +210,9 @@ def bind_router_dependencies(app: FastAPI, resources: ApplicationResources) -> N
     )
     app.state.connector_drivers_dependencies_factory = (
         lambda: connectors_composition.connector_drivers_dependencies(resources)
+    )
+    app.state.agent_git_swap_dependencies_factory = (
+        lambda: connectors_composition.agent_git_swap_dependencies(resources)
     )
     app.state.projects_dependencies_factory = (
         lambda: projects_composition.projects_dependencies(resources)
@@ -462,6 +466,7 @@ def include_routers(app: FastAPI) -> None:
     app.include_router(thread_cloud_diff_routes.router)
     app.include_router(main_cloud_settings_routes.router)
     app.include_router(agent_thread_workspace_routes.router)
+    app.include_router(agent_git_swap_routes.router)
     app.include_router(job_assignment_routes.router)
     app.include_router(unit_claim_routes.router)
     app.include_router(thread_admission_routes.router)

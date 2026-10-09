@@ -31,6 +31,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from orchestrator.application.resources import ApplicationResources
+from orchestrator.routers import agent_git_swap as agent_git_swap_routes
 from orchestrator.routers import connector_drivers as connector_drivers_routes
 from orchestrator.routers import connector_lease_exchange as exchange_routes
 from orchestrator.services.connector_driver_ca import driver_ca
@@ -499,6 +500,18 @@ def connector_drivers_dependencies(
     )
 
 
+def agent_git_swap_dependencies(
+    resources: ApplicationResources,
+) -> agent_git_swap_routes.AgentGitSwapDependencies:
+    """Compose the agent's question about a git swap binding's pod (C3)."""
+    from orchestrator.security import access
+
+    return agent_git_swap_routes.AgentGitSwapDependencies(
+        store=resources.postgres_db,
+        require_internal=access.require_internal,
+    )
+
+
 def connector_lease_exchange(
     resources: ApplicationResources,
     limiter: DenialLimiter | None = None,
@@ -665,6 +678,7 @@ __all__ = [
     "MAX_BODY_BYTES",
     "MAX_CONCURRENT_CONNECTIONS",
     "BodyLimit",
+    "agent_git_swap_dependencies",
     "bind_time_pod_runtime_builder",
     "bind_time_runtime",
     "connector_lease_exchange",

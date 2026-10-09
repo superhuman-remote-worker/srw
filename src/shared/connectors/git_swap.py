@@ -44,6 +44,15 @@ WIRING_INCLUDE = f"~/{WIRING_DIR}/config"
 FALLBACK_TOKEN_IN_URL = "token-in-url"
 FALLBACK_REFUSE = "refuse"
 FALLBACKS: tuple[str, ...] = (FALLBACK_TOKEN_IN_URL, FALLBACK_REFUSE)
+#: The orchestrator's internal route an agent asks, with a binding's lease
+#: token, whether that binding's driver pod was refused: a first clone stops
+#: waiting for a pod that will not start (``{"state": "refused", "reason":
+#: <a fixed reason>, "retry_in_seconds": <until the reconciler may start it
+#: again>}``; otherwise ``waiting`` or ``unknown``).
+DRIVER_STATE_PATH = "/api/agents/git-swap/driver-state"
+DRIVER_REFUSED = "refused"
+DRIVER_WAITING = "waiting"
+DRIVER_UNKNOWN = "unknown"
 
 _SEGMENT = re.compile(r"[A-Za-z0-9._~-]{1,128}\Z")
 _HOSTNAME = re.compile(
@@ -154,6 +163,10 @@ def driver_repository_url(
 
 
 __all__ = [
+    "DRIVER_REFUSED",
+    "DRIVER_STATE_PATH",
+    "DRIVER_UNKNOWN",
+    "DRIVER_WAITING",
     "FALLBACKS",
     "FALLBACK_REFUSE",
     "FALLBACK_TOKEN_IN_URL",

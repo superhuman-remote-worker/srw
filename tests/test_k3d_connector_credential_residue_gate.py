@@ -534,6 +534,74 @@ def test_checkpoint_sql_refuses_malformed_input() -> None:
         gate.checkpoint_scan_sql(MARKERS, job_id="not-a-uuid")
 
 
+# git_swap_refused_driver_still_costs_the_full_wait: the first step comes
+# soon after the git swap claim.
+
+
+def test_the_plan_measures_the_first_step_once_checkpoints_exist(capsys) -> None:
+    for lane in ("pinned", "stateless"):
+        assert gate.main(["--gate-id", GATE_ID, "--lane", lane]) == 0
+        names = [p["name"] for p in json.loads(capsys.readouterr().out)["phases"]]
+        assert names.index("first_step_after_swap_claim") == (
+            names.index("checkpoint_scan_running") + 1
+        )
+    # The deployed code must carry the early end of the wait.
+    assert "src/agent/connectors/git_swap.py" in gate.AGENT_FILES
+    assert "src/orchestrator/routers/agent_git_swap.py" in gate.ORCHESTRATOR_FILES
+
+
+def test_first_step_sql_reads_the_token_repositorys_swap_lease() -> None:
+    job, connector = str(uuid4()), str(uuid4())
+    sql = gate.first_step_sql(job_id=job, connector_id=connector)
+    assert f"l.job_id = '{job}' AND l.connector_id = '{connector}'" in sql
+    assert "l.driver = 'srw.git-swap/v1'" in sql
+    assert "revoke_reason = 'launch_refused'" in sql
+    assert "(c.checkpoint->>'ts')::timestamptz" in sql
+    with pytest.raises(ValueError):
+        gate.first_step_sql(job_id="x'; DROP TABLE jobs;--", connector_id=connector)
+    with pytest.raises(ValueError):
+        gate.first_step_sql(job_id=job, connector_id="not-a-uuid")
+
+
+def _timed(row: dict) -> "gate.Gate":
+    kube = _FakeKube([row])
+    runner = gate.Gate(gate.validate_config(_args(lane="stateless")), kube, "pw")
+    runner.job_id = str(uuid4())
+    runner.datasource_ids = [str(uuid4()), str(uuid4())]
+    runner.first_step_timing()
+    assert runner.datasource_ids[0] in kube.calls[-1][1]
+    return runner
+
+
+def test_a_first_step_seconds_after_the_claim_passes() -> None:
+    runner = _timed({"issued": 1000.0, "refused": 1001.25, "first_step": 1009.5})
+    assert runner.report.phases[-1] == {
+        "name": "first_step_after_swap_claim",
+        "result": "pass",
+        "seconds": 9.5,
+        "bound_seconds": 60,
+        "driver_refused_after_seconds": 1.2,
+    }
+    assert runner.timing_failure is None
+
+
+def test_a_first_step_after_the_whole_wait_fails_after_the_scans() -> None:
+    runner = _timed({"issued": 1000.0, "refused": 1001.0, "first_step": 1214.0})
+    phase = runner.report.phases[-1]
+    assert phase["result"] == "fail" and phase["seconds"] == 214.0
+    # Recorded now; the gate fails once the residue scans have run.
+    assert "214.0 s after the git swap claim" in runner.timing_failure
+
+
+def test_without_a_swap_lease_the_timing_is_skipped() -> None:
+    runner = _timed({"issued": None, "refused": None, "first_step": 1000.0})
+    assert runner.report.phases[-1]["result"] == "skipped"
+    assert runner.timing_failure is None
+    runner = _timed({"issued": 1000.0, "refused": None, "first_step": None})
+    assert runner.report.phases[-1]["result"] == "fail"
+    assert runner.timing_failure
+
+
 def _run_script(script: str, *, env: dict | None = None) -> dict:
     completed = subprocess.run(
         [sys.executable, "-"],

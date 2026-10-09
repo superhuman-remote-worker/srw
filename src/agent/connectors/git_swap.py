@@ -34,6 +34,11 @@ with ``git -c include.path=<file>``.
 A checkout of such a repository also gets ``transfer.credentialsInUrl =
 die``, so a token in its remote URL fails loudly instead of working.
 
+While a first clone waits for a starting driver pod, the agent asks the
+orchestrator between tries whether the reconciler refused that pod
+(:func:`driver_refusal`, with the binding's own lease token): a refused pod
+never starts, so the wait ends at once with the refusal's fixed reason.
+
 Design: knowledge-base/knowledge/features/connector_drivers.md, "The git
 swap driver" (workspace wiring).
 """
@@ -41,16 +46,22 @@ swap driver" (workspace wiring).
 from __future__ import annotations
 
 import logging
+import math
+import os
 import posixpath
 import re
 import shlex
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
+import httpx
+
 from shared.connectors.git_swap import (
+    DRIVER_REFUSED,
+    DRIVER_STATE_PATH,
     WIRING_DIR,
     UnservedUpstream,
     connector_path_id,
@@ -78,6 +89,11 @@ _GITDIR = re.compile(r"/(?:[A-Za-z0-9_-][A-Za-z0-9._-]*/)+")
 #: stopping, the lease exchange unavailable), which may pass.
 _HTTP_ANSWER = re.compile(r"returned error: (\d{3})")
 _FINAL_FAILURES = ("Authentication failed",)
+#: One question to the orchestrator about a binding's driver pod.
+_STATE_SECONDS = 5.0
+#: The longest refusal reason a README line takes (the orchestrator sends
+#: one of its fixed reasons, which are shorter).
+_MAX_REASON = 200
 
 
 @dataclass(frozen=True)
@@ -95,6 +111,9 @@ class SwapBinding:
     origin: str
     ca: str
     wait_seconds: float
+    #: The binding's lease token: what the agent asks the orchestrator about
+    #: the binding's pod with (:func:`driver_refusal`). Never in a repr.
+    lease_token: str = field(default="", repr=False, compare=False)
 
 
 def swap_binding(entry: Mapping[str, Any]) -> tuple[SwapBinding | None, str]:
@@ -140,6 +159,7 @@ def swap_binding(entry: Mapping[str, Any]) -> tuple[SwapBinding | None, str]:
             origin=origin,
             ca=ca,
             wait_seconds=wait,
+            lease_token=str(lease["token"]),
         ),
         "",
     )
@@ -225,12 +245,61 @@ def binding_options(backend: Any, binding: SwapBinding) -> list[str]:
     return [f"include.path={rule_file(binding, home=home)}"]
 
 
+def driver_refusal(binding: SwapBinding, remaining: float = math.inf) -> str | None:
+    """Why the orchestrator refused to start the binding's driver pod, or
+    ``None`` while that pod may still serve (not started yet, starting,
+    serving) or nothing is known.
+
+    Asks the orchestrator's internal route (:data:`DRIVER_STATE_PATH`) with
+    the binding's own lease token, in the body: the agent learns about its
+    own bindings only, and the answer is one of the orchestrator's fixed
+    reasons. A refusal whose back-off ends within the ``remaining`` wait is
+    no answer yet (the reconciler may start the pod again by then). Never
+    raises: without an answer the wait goes on as before. Blocking; it runs
+    where the wait runs, in a worker thread.
+    """
+    base = os.getenv("ORCHESTRATOR_URL", "").strip().rstrip("/")
+    if not base or not binding.lease_token:
+        return None
+    headers: dict[str, str] = {}
+    internal_key = os.getenv("MCP_INTERNAL_KEY", "")
+    if internal_key:
+        headers["X-Internal-Key"] = internal_key
+    try:
+        response = httpx.post(
+            f"{base}{DRIVER_STATE_PATH}",
+            json={"lease_token": binding.lease_token},
+            headers=headers,
+            timeout=_STATE_SECONDS,
+        )
+        body = response.json() if response.status_code == 200 else None
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.debug(
+            "Could not ask about the git swap driver of connector %s (%s)",
+            binding.connector_id,
+            type(exc).__name__,
+        )
+        return None
+    if not isinstance(body, dict) or body.get("state") != DRIVER_REFUSED:
+        return None
+    retry_in = body.get("retry_in_seconds")
+    if (
+        isinstance(retry_in, (int, float))
+        and not isinstance(retry_in, bool)
+        and retry_in < remaining
+    ):
+        return None
+    reason = " ".join(str(body.get("reason") or "").split())[:_MAX_REASON]
+    return reason or "its driver pod did not start"
+
+
 def wait_for_driver(
     backend: Any,
     binding: SwapBinding,
     *,
     sleep: Callable[[float], None] | None = None,
     clock: Callable[[], float] | None = None,
+    refusal: Callable[[SwapBinding, float], str | None] | None = None,
 ) -> str | None:
     """Wait until the workspace's git reaches the repository through the
     driver; ``None`` once it does, else why not.
@@ -238,10 +307,15 @@ def wait_for_driver(
     A new binding's pod starts on the reconciler's next pass, and its
     ingress policy for this workspace lands after it, so the first clone
     retries a connection failure for up to the binding's ``wait_seconds``.
-    A refusal (the lease, the repository) is final at once.
+    A refusal (the lease, the repository) is final at once, and so is the
+    reconciler's refusal of the pod itself, which ``refusal`` (by default
+    :func:`driver_refusal`, given the seconds left of the wait) reports
+    after each failed try: that pod does not start within the wait, so its
+    fixed reason is the answer, not the timeout.
     """
     sleep = sleep or time.sleep
     clock = clock or time.monotonic
+    refusal = refusal or driver_refusal
     deadline = clock() + binding.wait_seconds
     options = " ".join(
         f"-c {shlex.quote(option)}" for option in binding_options(backend, binding)
@@ -264,6 +338,17 @@ def wait_for_driver(
             answered is not None and answered.group(1) != "503"
         ):
             break
+        try:
+            refused = refusal(binding, max(0.0, deadline - clock()))
+        except Exception:  # a question, never a reason to stop waiting
+            refused = None
+        if refused:
+            logger.info(
+                "The git swap driver of connector %s was refused: %s",
+                binding.connector_id,
+                refused,
+            )
+            return f"the git swap driver could not serve the repository: {refused}"
         if clock() + _WAIT_INTERVAL_SECONDS > deadline:
             break
         sleep(_WAIT_INTERVAL_SECONDS)
@@ -299,6 +384,7 @@ __all__ = [
     "SwapBinding",
     "binding_options",
     "checkout_gitdir",
+    "driver_refusal",
     "install_wiring",
     "render_include",
     "rule_file",

@@ -825,9 +825,256 @@ class TestWait:
             now[0] += seconds
 
         reason = wait_for_driver(
-            backend, self._binding(wait=12), sleep=sleep, clock=lambda: now[0]
+            backend,
+            self._binding(wait=12),
+            sleep=sleep,
+            clock=lambda: now[0],
+            refusal=lambda _binding, _left: None,
         )
         assert reason is not None and backend.shell_run.call_count == 3
+
+    # git_swap_refused_driver_still_costs_the_full_wait
+
+    def test_a_refused_pod_ends_the_wait_at_the_next_try(self):
+        """The reconciler refused the binding's pod (its upstream does not
+        resolve): the wait ends at the next try with the refusal's fixed
+        reason, not the 210 s timeout."""
+        backend = _home_backend()
+        backend.shell_run.return_value = (
+            "Exit code: 128\nfatal: unable to access: Could not resolve host"
+        )
+        answers = iter([None, "its driver pod did not start"])
+        asked: list[SwapBinding] = []
+        lefts: list[float] = []
+        sleeps: list[float] = []
+        now = [0.0]
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            now[0] += seconds
+
+        def refusal(binding, left):
+            asked.append(binding)
+            lefts.append(left)
+            return next(answers)
+
+        reason = wait_for_driver(
+            backend,
+            self._binding(wait=210),
+            sleep=sleep,
+            clock=lambda: now[0],
+            refusal=refusal,
+        )
+        assert reason == (
+            "the git swap driver could not serve the repository: "
+            "its driver pod did not start"
+        )
+        assert backend.shell_run.call_count == 2 and sleeps == [5.0]
+        # Asked about this binding, with its own lease, and told how much
+        # of the wait is left.
+        assert [binding.lease_token for binding in asked] == [LEASE, LEASE]
+        assert lefts == [210.0, 205.0]
+
+    def test_a_starting_pod_keeps_waiting(self):
+        backend = _home_backend()
+        backend.shell_run.side_effect = [
+            "Exit code: 128\nfatal: unable to access: Could not resolve host",
+            "Exit code: 124",
+            "Exit code: 0",
+        ]
+        asked: list[SwapBinding] = []
+        assert (
+            wait_for_driver(
+                backend,
+                self._binding(),
+                sleep=lambda _s: None,
+                refusal=lambda binding, _left: asked.append(binding),
+            )
+            is None
+        )
+        assert backend.shell_run.call_count == 3 and len(asked) == 2
+
+    def test_a_driver_answer_needs_no_question(self):
+        backend = _home_backend()
+        backend.shell_run.return_value = (
+            "Exit code: 128\nfatal: The requested URL returned error: 404"
+        )
+        asked: list[SwapBinding] = []
+        wait_for_driver(
+            backend,
+            self._binding(),
+            sleep=lambda _s: None,
+            refusal=lambda binding, _left: asked.append(binding),
+        )
+        assert asked == []
+
+    def test_a_question_that_fails_never_stops_the_wait(self):
+        backend = _home_backend()
+        backend.shell_run.side_effect = ["Exit code: 124", "Exit code: 0"]
+
+        def refusal(_binding, _left):
+            raise RuntimeError("boom")
+
+        assert (
+            wait_for_driver(
+                backend, self._binding(), sleep=lambda _s: None, refusal=refusal
+            )
+            is None
+        )
+
+    def test_the_refusal_reaches_the_readme(self):
+        ws = _workspace(
+            shell_outputs=(
+                "Exit code: 128\nfatal: unable to access: Could not resolve host",
+            )
+        )
+        with (
+            patch(
+                "agent.connectors.git_swap.driver_refusal",
+                return_value="the driver could not reach the upstream",
+            ),
+            patch("agent.connectors.git_swap.time.sleep") as slept,
+            patch("agent.managers.git_manager.GitManager.clone") as clone,
+        ):
+            clone_repository_datasources([_entry()], ws)
+        clone.assert_not_called()
+        slept.assert_not_called()
+        rt = RuntimeContext(execution="session", workspace_manager=ws)
+        [facts] = CheckoutMaterializer().facts(deliveries_from_payload([_entry()]), rt)
+        assert "repository NOT cloned" in facts.lines[0]
+        assert "the driver could not reach the upstream" in facts.lines[0]
+        assert "did not serve" not in facts.lines[0]
+
+
+class TestDriverRefusal:
+    """The agent's question to the orchestrator (``driver_refusal``)."""
+
+    class _Response:
+        def __init__(self, status: int, body: object) -> None:
+            self.status_code = status
+            self._body = body
+
+        def json(self):
+            if isinstance(self._body, Exception):
+                raise self._body
+            return self._body
+
+    def _binding(self):
+        return swap_binding(_entry())[0]
+
+    def test_it_asks_with_the_bindings_lease_in_the_body(self, monkeypatch):
+        from shared.connectors.git_swap import DRIVER_STATE_PATH
+        from agent.connectors import git_swap as module
+
+        monkeypatch.setenv("ORCHESTRATOR_URL", "http://srw-orchestrator:8085/")
+        monkeypatch.setenv("MCP_INTERNAL_KEY", "the-key")
+        calls: list[tuple] = []
+
+        def post(url, **kwargs):
+            calls.append((url, kwargs))
+            return self._Response(
+                200, {"state": "refused", "reason": "its driver pod did not start"}
+            )
+
+        monkeypatch.setattr(module.httpx, "post", post)
+        assert module.driver_refusal(self._binding()) == "its driver pod did not start"
+        [(url, kwargs)] = calls
+        assert url == "http://srw-orchestrator:8085" + DRIVER_STATE_PATH
+        assert kwargs["json"] == {"lease_token": LEASE}
+        assert kwargs["headers"]["X-Internal-Key"] == "the-key"
+        assert kwargs["timeout"] <= 5
+        # Never in the URL; never in a repr.
+        assert LEASE not in url and LEASE not in repr(self._binding())
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            (200, {"state": "waiting"}),
+            (200, {"state": "unknown"}),
+            (200, ["refused"]),
+            (200, ValueError("not json")),
+            (401, {"detail": "Invalid internal key"}),
+            (404, {"state": "refused", "reason": "x"}),
+        ],
+    )
+    def test_anything_but_a_refusal_keeps_the_wait(self, monkeypatch, response):
+        from agent.connectors import git_swap as module
+
+        monkeypatch.setenv("ORCHESTRATOR_URL", "http://srw-orchestrator:8085")
+        monkeypatch.setattr(
+            module.httpx, "post", lambda url, **kwargs: self._Response(*response)
+        )
+        assert module.driver_refusal(self._binding()) is None
+
+    def test_an_unreachable_orchestrator_keeps_the_wait(self, monkeypatch):
+        import httpx
+
+        from agent.connectors import git_swap as module
+
+        monkeypatch.setenv("ORCHESTRATOR_URL", "http://srw-orchestrator:8085")
+
+        def post(url, **kwargs):
+            raise httpx.ConnectError("refused")
+
+        monkeypatch.setattr(module.httpx, "post", post)
+        assert module.driver_refusal(self._binding()) is None
+
+    def test_nothing_is_asked_without_an_orchestrator_or_a_lease(self, monkeypatch):
+        from agent.connectors import git_swap as module
+
+        def post(url, **kwargs):
+            raise AssertionError("asked")
+
+        monkeypatch.setattr(module.httpx, "post", post)
+        monkeypatch.delenv("ORCHESTRATOR_URL", raising=False)
+        assert module.driver_refusal(self._binding()) is None
+        monkeypatch.setenv("ORCHESTRATOR_URL", "http://srw-orchestrator:8085")
+        binding = SwapBinding(**{**self._binding().__dict__, "lease_token": ""})
+        assert module.driver_refusal(binding) is None
+
+    def test_the_reason_is_one_line_and_bounded(self, monkeypatch):
+        from agent.connectors import git_swap as module
+
+        monkeypatch.setenv("ORCHESTRATOR_URL", "http://srw-orchestrator:8085")
+        monkeypatch.setattr(
+            module.httpx,
+            "post",
+            lambda url, **kwargs: self._Response(
+                200, {"state": "refused", "reason": "a\nb " + "x" * 500}
+            ),
+        )
+        reason = module.driver_refusal(self._binding())
+        assert "\n" not in reason and len(reason) <= 200
+        monkeypatch.setattr(
+            module.httpx,
+            "post",
+            lambda url, **kwargs: self._Response(200, {"state": "refused"}),
+        )
+        assert module.driver_refusal(self._binding()) == "its driver pod did not start"
+
+    def test_a_back_off_that_ends_within_the_wait_is_no_answer_yet(self, monkeypatch):
+        """The reconciler may start the key again once its back-off ends: a
+        refusal is final only when that is past the wait."""
+        from agent.connectors import git_swap as module
+
+        monkeypatch.setenv("ORCHESTRATOR_URL", "http://srw-orchestrator:8085")
+        monkeypatch.setattr(
+            module.httpx,
+            "post",
+            lambda url, **kwargs: self._Response(
+                200,
+                {
+                    "state": "refused",
+                    "reason": "its driver pod did not start",
+                    "retry_in_seconds": 60,
+                },
+            ),
+        )
+        assert module.driver_refusal(self._binding(), 200.0) is None
+        for left in (60.0, 10.0):
+            assert module.driver_refusal(self._binding(), left) == (
+                "its driver pod did not start"
+            )
 
 
 class TestFallbackAfterSwap:

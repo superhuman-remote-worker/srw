@@ -42,6 +42,11 @@ server log only, cleaned. Each connector's Test reports the same verdict
 credential. An installation without the driver changes nothing, but on a
 ``refuse`` installation Test says the repository is refused.
 
+A served entry's first clone waits for the connector's pod. When the
+reconciler refuses that pod, :func:`binding_driver_state` tells the agent
+holding the binding's lease, with the same fixed reason, so the wait ends at
+once instead of running out.
+
 Design: knowledge-base/knowledge/features/connector_drivers.md, "The git
 swap driver"; the C3 reviews (B1, the re-review's B2, S5, S8).
 """
@@ -52,6 +57,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import re
 import ssl
 import time
@@ -189,6 +195,8 @@ class GitSwapDeliverySettings:
     fallback: str = FALLBACK_TOKEN_IN_URL
     store: Any = None
     max_installation: int = 10
+    #: The reconciler's (``ServiceHostingSettings.launch_backoff_seconds``);
+    #: a test holds the two defaults equal.
     launch_backoff_seconds: float = 300.0
     cluster_cidrs: tuple[str, ...] = DEFAULT_CLUSTER_CIDRS
     refused_cidrs: tuple[str, ...] = ()
@@ -695,6 +703,103 @@ async def git_swap_problem(
 
 
 # =============================================================================
+# A binding's pod, while its workspace waits for it
+# =============================================================================
+
+#: The newest stop of a binding's pod key (its connector, its digest, the
+#: connector's current generation) that backs the key off, while no pod of
+#: that key lives. The reconciler starts no pod for a backed-off key
+#: (``connector_service_hosting``'s ``_backed_off``), so a first clone
+#: waiting for one waits in vain, unless the back-off ends within its wait
+#: (``retry_in``: seconds until the reconciler may start the key again).
+_REFUSED_KEY = """
+SELECT stopped.revoke_reason, stopped.launch_error,
+       extract(epoch FROM stopped.revoked_at
+                          + make_interval(secs => $6::float8) - now()) AS retry_in
+  FROM connector_driver_identities AS stopped
+ WHERE stopped.connector_id = $1 AND stopped.driver = $2
+   AND stopped.image_digest = $3 AND stopped.credential_generation = $4
+   AND stopped.revoke_reason = ANY($5::text[])
+   AND stopped.revoked_at > now() - make_interval(secs => $6::float8)
+   AND NOT EXISTS (
+        SELECT 1 FROM connector_driver_identities AS live
+         WHERE live.connector_id = $1 AND live.driver = $2
+           AND live.image_digest = $3 AND live.credential_generation = $4
+           AND live.revoked_at IS NULL)
+ ORDER BY stopped.revoked_at DESC
+ LIMIT 1
+"""
+
+
+async def binding_driver_state(conn: Any, lease_token: Any) -> dict[str, str]:
+    """Whether the pod a git swap binding's first clone waits for was
+    refused, for the agent holding the binding's lease.
+
+    ``{"state": "refused", "reason": <a REASONS text>, "retry_in_seconds":
+    <n>}`` when the reconciler stopped the binding's pod key for a reason
+    that backs it off (a refused launch, a start that failed or timed out,
+    the upstream the driver could not reach or verify) and no pod of that
+    key lives; the reconciler may start the key again in ``n`` seconds, so
+    the agent stops only when that is past its own wait. ``waiting`` while a pod may still serve (none started yet, starting,
+    serving); ``unknown`` for a token that names no live git swap lease.
+    The lease token is the authority: only its holder learns this, and only
+    for that lease's connector and digest. The answer is a fixed reason,
+    never the reconciler's or the upstream's words.
+    """
+    from shared.connectors.git_swap import (
+        DRIVER_REFUSED,
+        DRIVER_UNKNOWN,
+        DRIVER_WAITING,
+    )
+    from shared.connectors.leases import (
+        LEASE_TOKEN_PREFIX,
+        token_digest,
+        token_shape_valid,
+    )
+
+    unknown = {"state": DRIVER_UNKNOWN}
+    settings = git_swap_delivery_settings()
+    if not settings.installed or not token_shape_valid(lease_token, LEASE_TOKEN_PREFIX):
+        return unknown
+    lease = await conn.fetchrow(
+        """
+        SELECT connector_id, driver, image_digest
+          FROM connector_credential_leases
+         WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()
+        """,
+        token_digest(lease_token),
+    )
+    if (
+        lease is None
+        or lease["driver"] != GIT_SWAP_SPEC.name
+        or not lease["image_digest"]
+    ):
+        return unknown
+    connector_id = str(lease["connector_id"])
+    generation = await current_generation(conn, connector_id)
+    if generation is None:
+        return unknown
+    stopped = await conn.fetchrow(
+        _REFUSED_KEY,
+        UUID(connector_id),
+        GIT_SWAP_SPEC.name,
+        str(lease["image_digest"]),
+        generation,
+        list(UNSERVABLE_STOPS),
+        float(settings.launch_backoff_seconds),
+    )
+    if stopped is None:
+        return {"state": DRIVER_WAITING}
+    problem = _stop_problem(str(stopped["revoke_reason"]), stopped["launch_error"])
+    return {
+        "state": DRIVER_REFUSED,
+        "reason": problem.text,
+        # The agent waits on when the back-off ends within its own wait.
+        "retry_in_seconds": max(0, math.ceil(float(stopped["retry_in"] or 0))),
+    }
+
+
+# =============================================================================
 # The entry
 # =============================================================================
 
@@ -888,6 +993,7 @@ __all__ = [
     "UNDECIDED",
     "UNSERVABLE_STOPS",
     "apply_fallback",
+    "binding_driver_state",
     "candidate_entry",
     "check_upstream",
     "clean_detail",
