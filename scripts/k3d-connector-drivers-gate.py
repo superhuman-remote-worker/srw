@@ -50,8 +50,8 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
              read-only: the agent logs the read-only WebDAV connection, the
              deployed builder binds read tools only (a session's audit rows
              carry no tool list), a webdav_list call returns the marker,
-             asking for a webdav_write creates no file in Nextcloud, and a
-             run_command of ``git remote -v`` returns both remote lines
+             asking for a webdav_write creates no file in Nextcloud, and the
+             shell tool's ``git remote -v`` returns both remote lines
   live       (D1b) every pooled pinned agent pod (``srw-agent-j-*``, which
              keeps its image after a Tilt rebuild while idle) serves this
              checkout's connector modules, or the phase refuses and names the
@@ -1777,21 +1777,24 @@ class ConnectorDriversGate:
         """
         repo = f"srw-echo-{self.gate_id}"
         url = f"https://git.example.invalid/acme/{self.gate_id}.git"
+        # The model family decides the shell mode: run_command (stateless) or
+        # shell_execute (persistent); both run through the remote shell.
         self.turn(
-            "Use the run_command tool to run exactly this command, unchanged, "
-            "then reply with its output verbatim:\n"
+            "Use your shell tool (run_command or shell_execute, whichever you "
+            "have) to run exactly this command, unchanged, then reply with its "
+            "output verbatim:\n"
             f"git init -q {repo} && git -C {repo} remote add origin {url} && "
             f"git -C {repo} remote -v",
             3,
         )
-        called, fetch = self.tool_use("run_command", f"{url} (fetch)")
-        _called, push = self.tool_use("run_command", f"{url} (push)")
+        stateless, fetch = self.tool_use("run_command", f"{url} (fetch)")
+        persistent, push = self.tool_use("shell_execute", f"{url} (push)")
         self.report.check(
-            "session agent: run_command returns git remote -v's lines, which "
+            "session agent: the shell tool returns git remote -v's lines, which "
             "contain the command's first word",
-            called > 0 and fetch > 0 and push > 0,
-            f"{called} run_command calls, {fetch}/{push} tool results with the "
-            "fetch/push line",
+            stateless + persistent > 0 and fetch > 0 and push > 0,
+            f"{stateless} run_command and {persistent} shell_execute calls, "
+            f"{fetch}/{push} tool results with the fetch/push line",
         )
 
     def tool_use(self, tool: str, text: str) -> tuple[int, int]:

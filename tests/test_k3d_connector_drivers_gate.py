@@ -462,10 +462,20 @@ def test_write_tools_or_a_written_probe_fail_the_session(monkeypatch, tools, pro
     assert not runner.report.passed
 
 
+def test_no_shell_call_fails_the_session(monkeypatch):
+    def tool_use(tool, text):
+        return (0, 1) if tool in {"run_command", "shell_execute"} else (1, 1)
+
+    runner, _requests, _turns = _session(
+        monkeypatch, ["webdav_list", "webdav_read"], 404, tool_use
+    )
+    assert not runner.report.passed
+
+
 @pytest.mark.parametrize("missing", ["(fetch)", "(push)"])
 def test_a_dropped_git_remote_line_fails_the_session(monkeypatch, missing):
     def tool_use(tool, text):
-        return (1, 0) if tool == "run_command" and text.endswith(missing) else (1, 1)
+        return (1, 0) if text.endswith(missing) else (1, 1)
 
     runner, _requests, _turns = _session(
         monkeypatch, ["webdav_list", "webdav_read"], 404, tool_use
