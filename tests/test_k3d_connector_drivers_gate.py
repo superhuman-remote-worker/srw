@@ -22,6 +22,18 @@ sys.modules[_SPEC.name] = gate
 _SPEC.loader.exec_module(gate)
 
 
+@pytest.fixture(autouse=True)
+def _never_a_cluster(monkeypatch):
+    """No test here reaches a cluster: every kubectl, tilt and psql call goes
+    through ``gate.run``, which fails the test unless the test replaces it
+    (a phase a test forgot to stub must fail here, never run for real)."""
+
+    def refuse(args, **kwargs):
+        pytest.fail(f"a test reached the cluster: {' '.join(args[:7])}")
+
+    monkeypatch.setattr(gate, "run", refuse)
+
+
 @pytest.fixture
 def no_cluster(monkeypatch):
     monkeypatch.setattr(
@@ -66,6 +78,12 @@ def test_dry_run_prints_the_plan_and_touches_nothing(no_cluster, capsys):
         "cleanup",
         "live (D1b)",
         "pinned",
+        "listed",
+        "egress",
+        "169.254.169.254",
+        "srw-orchestrator.srw.svc:8085",
+        "public",
+        "octocat/Hello-World",
     ):
         assert phase in out
 
@@ -78,6 +96,7 @@ def test_embedded_programs_compile():
         gate._PAYLOAD_PROGRAM,
         gate._HASH_PROGRAM,
         gate._LIVE_UPDATE_PROGRAM,
+        gate._REACH_PROGRAM,
     ):
         compile(program, "<gate program>", "exec")
 
@@ -270,6 +289,8 @@ def test_a_refused_connector_answered_201_is_still_cleaned_up(monkeypatch):
         return 200, {}
 
     monkeypatch.setattr(runner.api, "call", call)
+    # cleanup() also looks for sessions titled with the gate id (SQL).
+    monkeypatch.setattr(runner, "titled_threads", lambda: [])
     runner.refusals()
 
     assert not runner.report.passed
@@ -615,8 +636,11 @@ def test_skip_live_runs_the_d1a_gate_alone(monkeypatch):
         for phase in (
             "preflight",
             "fixture",
+            "gitea_listed",
             "lifecycle",
             "refusals",
+            "egress",
+            "public",
             "attach_setup",
             "job_run",
             "session",
@@ -646,6 +670,7 @@ def test_cleanup_deletes_the_live_session_after_the_first(monkeypatch):
         return 404, {}
 
     monkeypatch.setattr(runner.api, "call", call)
+    monkeypatch.setattr(runner, "titled_threads", lambda: [])
     assert runner.cleanup() == []
     assert order == [
         f"DELETE /api/persistent/threads/{runner.thread}",
@@ -661,6 +686,7 @@ def test_every_pod_program_caps_its_memory():
         gate._DAV_PROGRAM,
         gate._PAYLOAD_PROGRAM,
         gate._HASH_PROGRAM,
+        gate._REACH_PROGRAM,
     ):
         assert program.startswith(gate._POD_MEMORY_CAP)
         assert "\ncap_memory()\n" in program
@@ -749,8 +775,11 @@ def test_a_live_failure_never_skips_the_later_checks(monkeypatch):
     for phase in (
         "preflight",
         "fixture",
+        "gitea_listed",
         "lifecycle",
         "refusals",
+        "egress",
+        "public",
         "attach_setup",
         "job_run",
         "session",
@@ -980,3 +1009,182 @@ def test_the_pool_is_checked_before_the_live_session_exists(monkeypatch):
     with pytest.raises(gate.GateError):
         runner.live()
     assert order == ["setup", "pool", "session"]
+
+
+# -- egress: Test never reaches a refused address (the C5 SSRF follow-up) -------
+
+
+def _tests_answer(monkeypatch, runner, answers):
+    """Connector creates succeed; each Test answers ``answers[label]``."""
+    created: dict[str, str] = {}
+    by_id: dict[str, str] = {}
+
+    def call(method, path, body=None):
+        if method == "POST" and path == "/api/datasources":
+            label = next(
+                label for label in answers if body["name"] == runner.name(label)
+            )
+            created[label] = body["connection_url"]
+            by_id[f"id-{label}"] = label
+            return 201, {"id": f"id-{label}"}
+        if method == "POST" and path.endswith("/test"):
+            return 200, answers[by_id[path.split("/")[3]]]
+        return 200, {}
+
+    monkeypatch.setattr(runner.api, "call", call)
+    return created
+
+
+_SWAP_NOTE = (
+    "; delivered with the token in its clone URL, NOT through SRW's git swap "
+    "driver: the git swap driver serves HTTPS repositories on port 443 only"
+)
+
+
+def _refused(who: str, suffix: str = "") -> dict:
+    return {
+        "status": "error",
+        "message": gate.ADDRESS_REFUSED.format(who=who) + suffix,
+        "details": {"delivery": {"mode": "token-in-url"}} if suffix else {},
+    }
+
+
+def test_egress_passes_on_the_fixed_refusal_for_every_target(monkeypatch):
+    runner = _runner()
+    answers = {
+        label: _refused(who, _SWAP_NOTE if who == "gitea" else "")
+        for label, _url, who in gate.EGRESS_CASES
+    }
+    created = _tests_answer(monkeypatch, runner, answers)
+    runner.egress()
+
+    assert runner.report.passed, runner.report.results
+    assert len(runner.report.results) == 3
+    assert set(created.values()) == {
+        "https://srw-orchestrator.srw.svc:8085/acme/widgets.git",
+        "http://169.254.169.254/acme/widgets.git",
+        "ssh://git@srw-orchestrator.srw.svc:8085/acme/widgets.git",
+    }
+    # Every connector it made is cleaned up with the rest.
+    assert set(runner.connectors) == set(answers)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {
+            "status": "ok",
+            "message": "Authenticated as admin (token); read-only access to acme/widgets",
+            "details": {"principal": "admin"},
+        },
+        {"status": "error", "message": "gitea could not be reached"},
+        {"status": "error", "message": "gitea refused the repository read (HTTP 404)"},
+        {
+            "status": "error",
+            "message": gate.ADDRESS_REFUSED.format(who="gitea"),
+            "details": {"principal": "admin"},
+        },
+    ],
+)
+def test_egress_fails_when_the_forge_was_reached(monkeypatch, answer):
+    runner = _runner()
+    answers = {label: answer for label, _url, _who in gate.EGRESS_CASES}
+    _tests_answer(monkeypatch, runner, answers)
+    runner.egress()
+    assert not runner.report.passed
+
+
+def _reach(monkeypatch, *, ssh: bool, https: bool, private_hosts: str = ""):
+    asked: list[dict] = []
+
+    def program(source, payload, **kwargs):
+        assert source is gate._REACH_PROGRAM
+        asked.append(payload)
+        return {
+            "private_hosts": private_hosts,
+            "reach": {"ssh": ssh, "https": https},
+        }
+
+    monkeypatch.setattr(gate, "in_orchestrator", program)
+    return asked
+
+
+def test_public_passes_on_githubs_host_key_and_its_answer_to_an_unknown_token(
+    monkeypatch,
+):
+    runner = _runner()
+    asked = _reach(monkeypatch, ssh=True, https=True)
+    _tests_answer(
+        monkeypatch,
+        runner,
+        {
+            "public-ssh": {
+                "status": "ok",
+                "message": "Reached github.com:22; host key SHA256:abc is not pinned",
+                "details": {"host_key": "github.com ssh-ed25519 AAAA"},
+            },
+            "public-token": {
+                "status": "error",
+                "message": "github rejected the token (HTTP 401)"
+                "; delivered through SRW's git swap driver",
+            },
+        },
+    )
+    runner.public()
+
+    assert runner.report.passed, runner.report.results
+    assert len(runner.report.results) == 2 and not runner.report.notes
+    assert asked == [
+        {"reach": {"ssh": ["github.com", 22], "https": ["github.com", 443]}}
+    ]
+
+
+@pytest.mark.parametrize(
+    "token_answer",
+    [
+        {"status": "error", "message": gate.ADDRESS_REFUSED.format(who="github")},
+        {"status": "error", "message": "github could not be reached"},
+        {"status": "error", "message": "github's host does not resolve"},
+    ],
+)
+def test_public_fails_when_github_was_not_reached(monkeypatch, token_answer):
+    runner = _runner()
+    _reach(monkeypatch, ssh=False, https=True)
+    _tests_answer(monkeypatch, runner, {"public-token": token_answer})
+    runner.public()
+    assert not runner.report.passed
+
+
+def test_public_is_only_noted_without_internet(monkeypatch):
+    runner = _runner()
+    _reach(monkeypatch, ssh=False, https=False)
+    monkeypatch.setattr(
+        runner.api,
+        "call",
+        lambda *a, **k: pytest.fail("no connector without a route to GitHub"),
+    )
+    runner.public()
+
+    assert runner.report.results == []
+    assert len(runner.report.notes) == 2
+    assert all("no route to github.com" in note for note in runner.report.notes)
+
+
+@pytest.mark.parametrize(
+    ("private_hosts", "ok"),
+    [
+        ("kubernetes.default.svc,srw-gitea:3000,srw-gitea-ssh:2222", True),
+        ("srw-gitea,srw-gitea-ssh", True),
+        ("kubernetes.default.svc,srw-gitea:3000", False),
+        ("srw-gitea:443,srw-gitea-ssh:22", False),
+        ("", False),
+    ],
+)
+def test_the_gitea_endpoints_must_be_listed_for_test(monkeypatch, private_hosts, ok):
+    runner = _runner()
+    _reach(monkeypatch, ssh=False, https=False, private_hosts=private_hosts)
+    runner.gitea_listed()
+
+    assert runner.report.passed is ok
+    if not ok:
+        assert "connectors.providerMinting.privateHosts" in runner.report.results[0][2]

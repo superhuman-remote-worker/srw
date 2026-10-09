@@ -35,9 +35,24 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
              deliberate changes: kubeconfig, generic_file and a host-less
              ssh_key answer ``unsupported``. WebDAV's Test answer is printed
              as a NOTE: the orchestrator image has no webdav client
+  listed     the lifecycle's repository Tests reach SRW's Gitea at its
+             service address, which the orchestrator reaches for a Test only
+             where the operator lists it: its API and SSH host:port must be in
+             connectors.providerMinting.privateHosts (values-local.yaml)
   kb         index status and reindex answer; the index reaches ``ready``
   refusals   a repository without a URL is refused (400); with
              MCP_DATASOURCES_ENABLED off an MCP create is refused (403)
+  egress     Test asks a forge only at an address the connector's projects
+             may reach: a token repository at
+             https://srw-orchestrator.srw.svc:8085/ (the cluster's service
+             range) or http://169.254.169.254/ (cloud metadata), and an SSH
+             repository at srw-orchestrator.srw.svc:8085, each answer the
+             fixed address refusal and no forge facts or host key
+  public     Test of github.com/octocat/Hello-World still reaches GitHub: an
+             SSH repository reports GitHub's host key (no credential needed),
+             and a token repository reads GitHub's own 401 for a token it
+             does not know. Each is a NOTE, not a check, when the orchestrator
+             has no route to github.com (no internet on the cluster)
   job        a stateless job in the project with Postgres linked read-only,
              a generic and a credentials connector, and an MCP row written
              straight to the table (the API refuses to create one): the
@@ -111,6 +126,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL_CONTEXT = "k3d-srw"
@@ -191,6 +207,9 @@ SERVED_SETS = (
             NEO4J_DB,
             "src/shared/orch_surface/formatters.py",
             "src/shared/runtime/core/datasource_catalog.py",
+            # The repository probe Test runs (the egress and public phases).
+            "src/shared/runtime/services/forge.py",
+            "src/orchestrator/services/connector_egress.py",
             "src/orchestrator/application/__init__.py",
             "src/orchestrator/application/catalogue.py",
             "src/orchestrator/application/controls.py",
@@ -461,6 +480,28 @@ async def main():
         await client.close()
     print(json.dumps(out))
 asyncio.run(main())
+"""
+)
+
+# What the orchestrator's Test may reach: the operator's private hosts as the
+# orchestrator reads them, and whether named host:ports accept a connection
+# from its pod (the public phase skips where the cluster has no internet).
+_REACH_PROGRAM = (
+    _POD_MEMORY_CAP
+    + r"""
+import json, os, socket, sys
+cap_memory()
+request = json.loads(sys.stdin.readline())
+out = {"private_hosts": os.environ.get("CONNECTOR_PROVIDER_MINTING_PRIVATE_HOSTS", "")}
+reach = {}
+for name, (host, port) in request["reach"].items():
+    try:
+        socket.create_connection((host, int(port)), timeout=5).close()
+        reach[name] = True
+    except OSError:
+        reach[name] = False
+out["reach"] = reach
+print(json.dumps(out))
 """
 )
 
@@ -811,8 +852,17 @@ PLAN = [
     "credentials, kubeconfig, generic_file, host-less ssh_key",
     "lifecycle: kubeconfig, generic_file and a host-less ssh_key Test as "
     "unsupported; WebDAV Test reported as a NOTE",
+    "listed: SRW's Gitea API and SSH host:port are in "
+    "connectors.providerMinting.privateHosts (the repository Tests reach it "
+    "at its service address)",
     "kb: index status and reindex answer; the index reaches ready",
     "refusals: repository without URL (400); MCP create with the gate off (403)",
+    "egress: Test of a repository at https://srw-orchestrator.srw.svc:8085/, "
+    "http://169.254.169.254/ and ssh://srw-orchestrator.srw.svc:8085 answers "
+    "the fixed address refusal, with no forge facts or host key",
+    "public: Test of github.com/octocat/Hello-World reaches GitHub (its SSH "
+    "host key; GitHub's 401 for an unknown token); a NOTE when the cluster "
+    "has no route to github.com",
     "job: stateless, Postgres read-only via the project + generic + "
     "credentials + an MCP row; payload drops MCP; sql_query without "
     "sql_execute; env vars in ~/.srw-credentials/",
@@ -848,6 +898,48 @@ UNSUPPORTED = {
     "generic_file": "Generic file connectors have no connection test",
     "ssh_key": "SSH Key connectors without a host have no endpoint to test",
 }
+
+# Test reaches a connector's host from the orchestrator only at an address
+# the connector's projects may reach (provider_http): anything else answers
+# this fixed text, before any request (``{who}``: the forge, or the SSH host).
+ADDRESS_REFUSED = (
+    "{who}'s address is not one this connector's projects may reach (an "
+    "operator may allow a private host in connectors.providerMinting.privateHosts)"
+)
+#: ``(label, connection URL, who)``: the orchestrator's own service (the
+#: cluster's service range) and cloud metadata (link-local), by token, and
+#: the orchestrator's service again by SSH.
+EGRESS_CASES = (
+    (
+        "egress-service",
+        "https://srw-orchestrator.srw.svc:8085/acme/widgets.git",
+        "gitea",
+    ),
+    ("egress-metadata", "http://169.254.169.254/acme/widgets.git", "gitea"),
+    (
+        "egress-ssh",
+        "ssh://git@srw-orchestrator.srw.svc:8085/acme/widgets.git",
+        "SSH host srw-orchestrator.srw.svc:8085",
+    ),
+)
+#: A real public repository Test must still reach (no token needed to read
+#: its SSH host key; a token GitHub does not know answers 401).
+PUBLIC_HOST = "github.com"
+PUBLIC_REPOSITORY = "https://github.com/octocat/Hello-World.git"
+PUBLIC_SSH_REPOSITORY = "git@github.com:octocat/Hello-World.git"
+#: GitHub's answers to a token it does not know: proof the probe reached it
+#: at a checked public address and read its answer.
+PUBLIC_TOKEN_ANSWERS = (
+    "github rejected the token (HTTP 401)",
+    "github could not identify the token (HTTP 403)",  # failed-login throttle
+)
+
+
+def host_listed(hosts: set[str], host: str, port: int) -> bool:
+    """``connectors.providerMinting.privateHosts`` lists ``host`` (alone or
+    with ``port``), as the orchestrator reads it."""
+    host = host.lower()
+    return host in hosts or f"{host}:{port}" in hosts
 
 
 @dataclass(frozen=True)
@@ -1477,6 +1569,145 @@ class ConnectorDriversGate:
             status == 403 and "MCP connectors are disabled" in json.dumps(body),
             f"HTTP {status}: {str(body)[:160]}",
         )
+
+    def gitea_listed(self) -> None:
+        """The lifecycle's repository Tests reach SRW's Gitea at its service
+        address (the cluster's service range): only a host the operator lists
+        in ``connectors.providerMinting.privateHosts`` may be reached there."""
+        found = in_orchestrator(_REACH_PROGRAM, {"reach": {}})
+        hosts = {
+            entry.strip().lower()
+            for entry in str(found.get("private_hosts") or "").split(",")
+            if entry.strip()
+        }
+        api = urlsplit(str(self.gitea["url"]))
+        wanted = (
+            (api.hostname or "", api.port or (443 if api.scheme == "https" else 80)),
+            (str(self.gitea["ssh_host"]), int(self.gitea["ssh_port"])),
+        )
+        missing = [
+            f"{host}:{port}"
+            for host, port in wanted
+            if not host_listed(hosts, host, port)
+        ]
+        self.report.check(
+            "listed: SRW's Gitea API and SSH endpoints are in "
+            "connectors.providerMinting.privateHosts, so Test reaches them",
+            not missing,
+            (
+                f"add {' and '.join(missing)} to connectors.providerMinting."
+                "privateHosts in deployment/values-local.yaml"
+                if missing
+                else ", ".join(sorted(hosts))
+            ),
+        )
+
+    def tested(self, label: str, body: dict[str, Any]) -> tuple[int, dict]:
+        """Create a connector and Test it: ``(Test HTTP status, answer)``;
+        ``(create status, {})`` when the create was refused."""
+        status, created = self.create_connector(label, body)
+        if status not in (200, 201) or label not in self.connectors:
+            return status, {"create": str(created)[:200]}
+        status, answer = self.api.call(
+            "POST", f"/api/datasources/{self.connectors[label]}/test"
+        )
+        return status, answer if isinstance(answer, dict) else {}
+
+    def egress(self) -> None:
+        """Test asks a forge only at an address the connector's projects may
+        reach: the orchestrator's own service and cloud metadata answer the
+        fixed refusal, never a forge fact, an HTTP status or a host key."""
+        token = secret(f"srw-egress-{secrets.token_hex(16)}")  # valid nowhere
+        for label, url, who in EGRESS_CASES:
+            credentials = (
+                {"auth_method": "ssh", "ssh_key": make_key()}
+                if url.startswith("ssh://")
+                else {"auth_method": "token", "token": token}
+            )
+            status, answer = self.tested(
+                label,
+                {
+                    "type": "repository",
+                    "connection_url": url,
+                    "config": {"forge": "gitea"},
+                    "credentials": credentials,
+                },
+            )
+            message = str(answer.get("message", ""))
+            details = answer.get("details") or {}
+            self.report.check(
+                f"egress: Test of a repository at {url} answers the fixed "
+                "address refusal",
+                status == 200
+                and answer.get("status") == "error"
+                # The git swap delivery note may follow the refusal.
+                and message.startswith(ADDRESS_REFUSED.format(who=who))
+                and not {"principal", "host_key", "default_branch"} & set(details),
+                f"HTTP {status} {answer.get('status')!r}: {message[:240]}",
+            )
+
+    def public(self) -> None:
+        """Test of a real public repository still reaches it: GitHub's SSH
+        host key (no credential), and GitHub's own answer to a token it does
+        not know. A NOTE, not a check, where the cluster has no internet."""
+        found = in_orchestrator(
+            _REACH_PROGRAM,
+            {"reach": {"ssh": [PUBLIC_HOST, 22], "https": [PUBLIC_HOST, 443]}},
+        )
+        reach = found.get("reach") or {}
+        if reach.get("ssh"):
+            status, answer = self.tested(
+                "public-ssh",
+                {
+                    "type": "repository",
+                    "connection_url": PUBLIC_SSH_REPOSITORY,
+                    "config": {"forge": "github"},
+                    "credentials": {"auth_method": "ssh", "ssh_key": make_key()},
+                },
+            )
+            message = str(answer.get("message", ""))
+            self.report.check(
+                f"public: Test of {PUBLIC_SSH_REPOSITORY} reads GitHub's host key",
+                status == 200
+                and answer.get("status") == "ok"
+                and message.startswith(f"Reached {PUBLIC_HOST}:22; host key SHA256:")
+                and str((answer.get("details") or {}).get("host_key", "")).startswith(
+                    f"{PUBLIC_HOST} "
+                ),
+                f"HTTP {status} {answer.get('status')!r}: {message[:240]}",
+            )
+        else:
+            self.report.note(
+                f"public: SSH Test of {PUBLIC_SSH_REPOSITORY} skipped: the "
+                f"orchestrator has no route to {PUBLIC_HOST}:22 (no internet on "
+                "this cluster, or port 22 blocked)"
+            )
+        if reach.get("https"):
+            token = secret(f"ghp_srwgate{secrets.token_hex(14)}")  # unknown to GitHub
+            status, answer = self.tested(
+                "public-token",
+                {
+                    "type": "repository",
+                    "connection_url": PUBLIC_REPOSITORY,
+                    "config": {"forge": "github"},
+                    "credentials": {"auth_method": "token", "token": token},
+                },
+            )
+            message = str(answer.get("message", ""))
+            self.report.check(
+                f"public: Test of {PUBLIC_REPOSITORY} reaches GitHub's API and "
+                "reads its answer to an unknown token",
+                status == 200
+                and answer.get("status") == "error"
+                and message.startswith(PUBLIC_TOKEN_ANSWERS),
+                f"HTTP {status} {answer.get('status')!r}: {message[:240]}",
+            )
+        else:
+            self.report.note(
+                f"public: token Test of {PUBLIC_REPOSITORY} skipped: the "
+                f"orchestrator has no route to {PUBLIC_HOST}:443 (no internet "
+                "on this cluster)"
+            )
 
     def attach_setup(self) -> None:
         bodies = {
@@ -2552,8 +2783,11 @@ class ConnectorDriversGate:
         try:
             self.preflight()
             self.fixture()
+            self.gitea_listed()
             self.lifecycle()
             self.refusals()
+            self.egress()
+            self.public()
             self.attach_setup()
             self.job_run()
             self.session()
