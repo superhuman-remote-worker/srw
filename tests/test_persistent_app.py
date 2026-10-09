@@ -4714,10 +4714,13 @@ class TestHandleWorkspaceUpgradeVm:
     @pytest.mark.asyncio
     async def test_the_backend_swap_waits_for_a_live_connector_change(self):
         """live_connector_add_clones_on_the_event_loop: a live change clones
-        its checkouts off the event loop onto the current backend; the swap
-        (which re-delivers the applied connectors) waits for it to apply."""
+        its checkouts off the event loop onto the current backend; the seed
+        (a clone landing during it would reach the new workspace half done)
+        and the swap (which re-delivers the applied connectors) wait for it
+        to apply."""
         import asyncio
         import sys
+        import threading
 
         ws = AsyncMock()
         client = AsyncMock()
@@ -4746,16 +4749,22 @@ class TestHandleWorkspaceUpgradeVm:
             patch.dict(
                 sys.modules, {"shared.runtime.core.backends.remote": mock_remote_mod}
             ),
-            patch("agent.core.backends.seed.seed_workspace", return_value=0),
+            patch(
+                "agent.core.backends.seed.seed_workspace",
+                side_effect=lambda src, dst: seeded.set() or 0,
+            ),
         ):
+            seeded = threading.Event()
             await sess._live_connector_lock.acquire()  # a live change applies
             upgrade = asyncio.create_task(
                 _handle_workspace_upgrade(ws, target_tier="vm")
             )
             await asyncio.sleep(0.2)
-            assert not swapped.is_set()
+            assert not seeded.is_set() and not swapped.is_set()
             sess._live_connector_lock.release()
             await asyncio.wait_for(upgrade, 10)
+            # The seed and the swap ran under the lock, then let it go.
+            assert seeded.is_set() and not sess._live_connector_lock.locked()
         sess.swap_backend.assert_called_once()
 
 

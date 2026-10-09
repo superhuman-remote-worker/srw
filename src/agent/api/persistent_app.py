@@ -11478,29 +11478,34 @@ async def _handle_workspace_upgrade(
             # backing+runtime fence used on a cold attach protects hot upgrades.
             await asyncio.to_thread(new_backend.claim_shell_owner)
 
-        # 5. Seed the new workspace from the live virtual prefix (S3a). Pure
-        #    in-process copy (the agent holds the object-store creds). Run off
-        #    the event loop — SFTP writes are blocking.
-        seeded = 0
-        if src_backend is not None:
-            from agent.core.backends.seed import seed_workspace
-
-            seeded = await asyncio.to_thread(seed_workspace, src_backend, new_backend)
-            logger.info(
-                f"Seeded {seeded} file(s) into upgraded workspace for {_session_identity.thread_id}"
-            )
-
-        # 6. Hot-swap + re-derive the toolset (S1) so shell/git/file tools
-        #    appear on the next turn (get_current_tools re-reads per turn).
-        #    Never in the middle of a live connector change: its checkouts
-        #    clone off the event loop onto the current backend, and the swap
-        #    re-delivers the connectors that change has applied.
+        # 5-6 run outside any live connector change: its checkouts clone off
+        # the event loop onto the current backend, so one landing during the
+        # seed would reach the new workspace half done, and the swap
+        # re-delivers the connectors that change has applied. A change that
+        # arrives meanwhile waits for the swap (it never waits on us: neither
+        # step takes anything a live change holds).
         live_change = getattr(_session, "_live_connector_lock", None)
         async with (
             live_change
             if isinstance(live_change, asyncio.Lock)
             else contextlib.nullcontext()
         ):
+            # 5. Seed the new workspace from the live virtual prefix (S3a).
+            #    Pure in-process copy (the agent holds the object-store creds).
+            #    Run off the event loop — SFTP writes are blocking.
+            seeded = 0
+            if src_backend is not None:
+                from agent.core.backends.seed import seed_workspace
+
+                seeded = await asyncio.to_thread(
+                    seed_workspace, src_backend, new_backend
+                )
+                logger.info(
+                    f"Seeded {seeded} file(s) into upgraded workspace for {_session_identity.thread_id}"
+                )
+
+            # 6. Hot-swap + re-derive the toolset (S1) so shell/git/file tools
+            #    appear on the next turn (get_current_tools re-reads per turn).
             _session.swap_backend(new_backend)
 
         # 6a. Re-establish the OpenCloud cloud mount on the NEW backend. The
