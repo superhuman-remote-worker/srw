@@ -34,6 +34,12 @@ connector, so every call is held to the same rules:
   holds one of those threads, never one of the process's shared executor,
   and with every thread busy a call fails at once.
 
+A connector's Test reaches user-chosen hosts from this process too, and is
+held to the same rules: a repository's forge API goes through
+:func:`provider_request`, and its SSH endpoint dials an address
+:func:`checked_addresses` passed (``workspace_ssh_connector``), on the tier
+:func:`tier_allows_private` reads.
+
 Tests replace the client factory and the network (resolver) with
 :func:`configure_provider_http` and :func:`configure_provider_network`.
 """
@@ -47,7 +53,7 @@ import logging
 import socket
 import ssl
 import threading
-from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -59,7 +65,9 @@ from orchestrator.services.connector_egress import (
     DEFAULT_CLUSTER_CIDRS,
     DEFAULT_PRIVATE_TIERS,
     EgressPolicy,
+    IPAddress,
     Resolver,
+    private_addresses_allowed,
     refusal,
 )
 
@@ -191,8 +199,12 @@ class ProviderNetwork:
     def listed(self, url: httpx.URL) -> bool:
         """Whether the operator listed this host (``host``, or ``host:port``
         with the port the call uses)."""
-        host = (url.host or "").lower()
         port = url.port or (443 if url.scheme == "https" else 80)
+        return self.lists(url.host or "", port)
+
+    def lists(self, host: str, port: int) -> bool:
+        """Whether the operator listed ``host`` (alone, or with ``port``)."""
+        host = host.lower()
         return host in self.private_hosts or f"{host}:{port}" in self.private_hosts
 
     def policy(self, *, listed: bool, allow_private: bool) -> EgressPolicy:
@@ -239,6 +251,32 @@ def provider_network() -> ProviderNetwork:
     return _state["network"]
 
 
+async def tier_allows_private(store: Any, connector_id: Any) -> bool:
+    """Whether a connector's projects may reach private addresses, read on
+    ``store`` (their network tier, as a driver pod's egress and a mint
+    decide). ``False`` without a store or an answer: a Test that cannot
+    read the tier reaches public addresses only."""
+    if store is None or not connector_id:
+        return False
+    try:
+        async with store.acquire() as conn:
+            return bool(
+                await private_addresses_allowed(
+                    conn,
+                    str(connector_id),
+                    private_tiers=provider_network().private_tiers,
+                )
+            )
+    except Exception:
+        logger.warning(
+            "Connector %s's network tier could not be read; private addresses "
+            "are refused",
+            clean(connector_id, 64),
+            exc_info=True,
+        )
+        return False
+
+
 def tls_context(ca_pem: str | None) -> ssl.SSLContext:
     """Verify against ``ca_pem`` only when given, else the public roots;
     ``ProviderError`` (final) for certificates that do not load."""
@@ -259,10 +297,12 @@ def clean(text: Any, limit: int = 200) -> str:
 
 @dataclass(frozen=True)
 class ProviderAnswer:
-    """A provider's status and (capped) body."""
+    """A provider's status, (capped) body and headers (by lower-case name;
+    a repeated header's values joined by commas)."""
 
     status: int
     body: bytes = field(repr=False)
+    headers: Mapping[str, str] = field(default_factory=dict, repr=False)
 
     def json(self) -> Any:
         """The body as JSON; ``ValueError`` when it is not."""
@@ -299,15 +339,18 @@ def parse_time(value: Any) -> datetime:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-async def _targets(
-    url: httpx.URL, *, who: str, allow_private: bool, sni_hostname: str | None
-) -> list[tuple[httpx.URL, dict[str, str], dict[str, Any]]]:
-    """The checked addresses to dial in turn, with the headers and the TLS
-    name each needs."""
+async def checked_addresses(
+    host: str, port: int, *, who: str, allow_private: bool
+) -> tuple[list[IPAddress], bool]:
+    """``host`` resolved once, every answer checked: ``(addresses, literal)``,
+    the addresses to dial in turn (``literal``: ``host`` was one). A
+    :class:`ProviderError` (``does_not_resolve`` or ``address_refused``)
+    otherwise, before anything connects."""
     network = provider_network()
-    host = url.host
-    netloc = url.netloc.decode("ascii")
-    policy = network.policy(listed=network.listed(url), allow_private=allow_private)
+    label = clean(f"{host}:{port}", 300)
+    policy = network.policy(
+        listed=network.lists(host, port), allow_private=allow_private
+    )
     try:
         addresses: Iterable[Any] = [ipaddress.ip_address(host)]
         literal = True
@@ -316,7 +359,7 @@ async def _targets(
         try:
             answers = await network.resolver(host, network.ipv6)
         except (OSError, UnicodeError) as exc:
-            logger.info("Provider host %s does not resolve: %s", netloc, clean(exc))
+            logger.info("Provider host %s does not resolve: %s", label, clean(exc))
             raise failure(
                 "does_not_resolve", who, transient=True, reached=False
             ) from None
@@ -332,10 +375,22 @@ async def _targets(
     for address in addresses:
         reason = refusal(address, policy)
         if reason is not None:
-            logger.warning(
-                "Provider call to %s refused: %s %s", netloc, address, reason
-            )
+            logger.warning("Provider call to %s refused: %s %s", label, address, reason)
             raise failure("address_refused", who, transient=False, reached=False)
+    return addresses, literal
+
+
+async def _targets(
+    url: httpx.URL, *, who: str, allow_private: bool, sni_hostname: str | None
+) -> list[tuple[httpx.URL, dict[str, str], dict[str, Any]]]:
+    """The checked addresses to dial in turn, with the headers and the TLS
+    name each needs."""
+    host = url.host
+    netloc = url.netloc.decode("ascii")
+    port = url.port or (443 if url.scheme == "https" else 80)
+    addresses, literal = await checked_addresses(
+        host, port, who=who, allow_private=allow_private
+    )
     extensions: dict[str, Any] = {"sni_hostname": sni_hostname} if sni_hostname else {}
     # No content coding: SRW never decodes one (see the module docstring).
     plain = {"Connection": "close", "Accept-Encoding": "identity"}
@@ -385,7 +440,11 @@ async def _exchange(
                     MAX_BODY_BYTES,
                 )
                 raise failure("too_large", who, transient=False)
-        return ProviderAnswer(response.status_code, bytes(body))
+        return ProviderAnswer(
+            response.status_code,
+            bytes(body),
+            {name.lower(): value for name, value in response.headers.items()},
+        )
 
 
 async def _raw(response: httpx.Response) -> AsyncIterator[bytes]:
@@ -475,6 +534,7 @@ __all__ = [
     "ProviderError",
     "ProviderNetwork",
     "UnrevokedToken",
+    "checked_addresses",
     "clean",
     "configure_provider_http",
     "configure_provider_network",
@@ -485,6 +545,7 @@ __all__ = [
     "provider_resolver",
     "status_class",
     "status_transient",
+    "tier_allows_private",
     "tls_context",
     "transport_error",
 ]

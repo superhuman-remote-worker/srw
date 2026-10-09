@@ -1110,7 +1110,9 @@ def test_no_lease_is_picked_by_the_stored_rows_driver():
 class TestCheck:
     @pytest.mark.asyncio
     async def test_test_says_how_the_token_is_delivered(self, monkeypatch):
-        async def probe(ds, url, creds):
+        async def probe(ds, url, creds, *, allow_private):
+            # No store to read the tier on: public addresses only.
+            assert allow_private is False
             return {"status": "ok", "message": "Authenticated as octo"}
 
         async def report(row, *, token=None):

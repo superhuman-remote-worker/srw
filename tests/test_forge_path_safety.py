@@ -28,6 +28,7 @@ from shared.runtime.services.forge import (
     ForgePathError,
     ForgeRepo,
     GitHubClient,
+    ProbeAnswer,
     get_pull_request_status,
     open_pull_request,
     parse_owner_repo,
@@ -117,6 +118,18 @@ def wire(monkeypatch):
 
     monkeypatch.setattr(forge, "_transport", httpx.MockTransport(handler))
     return seen
+
+
+async def _wire_fetch(url: str, headers: dict[str, str]) -> ProbeAnswer:
+    """The repository probe's GET over the recording wire (the module's
+    transport, which ``wire`` replaces)."""
+    async with httpx.AsyncClient(transport=forge._transport) as client:
+        response = await client.get(url, headers=headers)
+    return ProbeAnswer(
+        response.status_code,
+        {name.lower(): value for name, value in response.headers.items()},
+        response.content,
+    )
 
 
 def _wire_path(request: httpx.Request) -> bytes:
@@ -261,7 +274,7 @@ class TestNothingIsSent:
         with pytest.raises(ForgeError):
             await get_pull_request_status(target, 7)
         with pytest.raises(ForgeError):
-            await probe_repository_access(target)
+            await probe_repository_access(target, fetch=_wire_fetch)
         assert wire == []
 
     @pytest.mark.asyncio
@@ -316,5 +329,7 @@ class TestValidValuesLeaveEncoded:
 
     @pytest.mark.asyncio
     async def test_dotfile_owner_repo_reaches_the_wire_unchanged(self, wire):
-        await probe_repository_access(_repo("github", repo=".github"))
+        await probe_repository_access(
+            _repo("github", repo=".github"), fetch=_wire_fetch
+        )
         assert _wire_path(wire[-1]) == b"/repos/acme/.github"

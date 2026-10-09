@@ -859,7 +859,34 @@ def _ssh_key_row(config: dict) -> dict:
     }
 
 
+#: What the fake resolver answers for the probe's names (documentation range).
+_SSH_ADDRESSES = {
+    "bastion.example.com": ("203.0.113.30",),
+    "new-bastion.example.com": ("203.0.113.31",),
+}
+
+
+def _ssh_network(monkeypatch, addresses=None, *, private_hosts=()) -> None:
+    """Resolve the probe's names from ``addresses`` (never the system
+    resolver), with ``private_hosts`` listed by the operator."""
+    from orchestrator.services.connector_drivers import provider_http
+    from tests._provider_fakes import fake_resolver
+
+    monkeypatch.setitem(
+        provider_http._state,
+        "network",
+        provider_http.ProviderNetwork(
+            resolver=fake_resolver(_SSH_ADDRESSES if addresses is None else addresses),
+            private_hosts=frozenset(private_hosts),
+        ),
+    )
+
+
 class TestProbe:
+    @pytest.fixture(autouse=True)
+    def _network(self, monkeypatch):
+        _ssh_network(monkeypatch)
+
     @pytest.mark.asyncio
     async def test_fetches_the_real_host_key_without_authenticating(self):
         import asyncssh
@@ -971,7 +998,8 @@ class TestProbe:
         result = await route(
             object(), row["id"], body=edited, dependencies=_route_deps(row)
         )
-        assert reached == [("new-bastion.example.com", 2200)]
+        # The edited host, at the address it resolved to and was checked as.
+        assert reached == [("203.0.113.31", 2200)]
         assert result["details"]["host_key"].startswith(
             "[new-bastion.example.com]:2200 "
         )
@@ -997,3 +1025,247 @@ class TestProbe:
             )
             is None
         )
+
+
+_SSH_REFUSED = (
+    "SSH host {endpoint}'s address is not one this connector's projects may "
+    "reach (an operator may allow a private host in "
+    "connectors.providerMinting.privateHosts)"
+)
+
+
+class TestProbeEgress:
+    """Test reads a host key only at an address the connector's projects may
+    reach: resolved once, checked, and dialled as checked."""
+
+    @pytest.fixture
+    def reached(self, monkeypatch) -> list:
+        from orchestrator.services import workspace_ssh_connector
+
+        reached: list = []
+
+        async def fetch(host, port):
+            reached.append((host, port))
+            return _host_key()
+
+        monkeypatch.setattr(workspace_ssh_connector, "fetch_ssh_host_key", fetch)
+        return reached
+
+    @staticmethod
+    async def _probe(config: dict, **kwargs):
+        from orchestrator.services import workspace_ssh_connector
+
+        return await workspace_ssh_connector.probe_workspace_ssh_connector(
+            _ssh_key_row(config), **kwargs
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "10.0.0.5",
+            "192.168.1.10",
+            "127.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "169.254.169.254",
+            "fe80::1",
+            "10.43.0.10",
+            "10.42.3.4",
+        ],
+    )
+    async def test_a_refused_address_opens_no_connection(
+        self, monkeypatch, reached, host
+    ):
+        _ssh_network(monkeypatch, {})
+        result = await self._probe({"host": host})
+
+        normalized = normalize_ssh_host(host)
+        assert result == {
+            "status": "error",
+            "message": _SSH_REFUSED.format(endpoint=f"{normalized}:22"),
+        }
+        assert reached == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "answers", [("10.43.0.10",), ("203.0.113.9", "10.0.0.5"), ("127.0.0.1",)]
+    )
+    async def test_a_name_that_resolves_to_a_refused_address(
+        self, monkeypatch, reached, answers
+    ):
+        _ssh_network(monkeypatch, {"git.internal": answers})
+        result = await self._probe({"host": "git.internal", "port": 2222})
+
+        assert result["message"] == _SSH_REFUSED.format(endpoint="git.internal:2222")
+        assert reached == []
+
+    @pytest.mark.asyncio
+    async def test_the_checked_addresses_are_dialled_in_turn(
+        self, monkeypatch, reached
+    ):
+        from orchestrator.services import workspace_ssh_connector
+
+        _ssh_network(monkeypatch, {"git.example.com": ("203.0.113.40", "203.0.113.41")})
+        presented = _host_key()
+
+        async def fetch(host, port):
+            reached.append((host, port))
+            if host == "203.0.113.40":
+                raise ConnectionRefusedError("refused")
+            return presented
+
+        monkeypatch.setattr(workspace_ssh_connector, "fetch_ssh_host_key", fetch)
+        result = await self._probe({"host": "git.example.com"})
+
+        assert reached == [("203.0.113.40", 22), ("203.0.113.41", 22)]
+        assert result["status"] == "ok"
+        # The pin names the host, never the address it was read at.
+        assert result["details"]["host_key"] == f"git.example.com {presented}"
+
+    @pytest.mark.asyncio
+    async def test_a_tier_that_allows_private_addresses(self, monkeypatch, reached):
+        _ssh_network(monkeypatch, {"git.lan": ("192.168.1.10",)})
+        result = await self._probe({"host": "git.lan"}, allow_private=True)
+
+        assert result["status"] == "ok"
+        assert reached == [("192.168.1.10", 22)]
+
+        # Never the cluster, loopback or metadata, whatever the tier.
+        for host in ("10.43.0.10", "127.0.0.1", "169.254.169.254"):
+            refused = await self._probe({"host": host}, allow_private=True)
+            assert refused["message"] == _SSH_REFUSED.format(endpoint=f"{host}:22")
+        assert reached == [("192.168.1.10", 22)]
+
+    @pytest.mark.asyncio
+    async def test_an_operator_listed_host_may_be_in_the_cluster(
+        self, monkeypatch, reached
+    ):
+        _ssh_network(
+            monkeypatch,
+            {"srw-gitea": ("10.43.0.7",)},
+            private_hosts=("srw-gitea:2222",),
+        )
+        result = await self._probe({"host": "srw-gitea", "port": 2222})
+        assert result["status"] == "ok"
+        assert reached == [("10.43.0.7", 2222)]
+
+        # The listing names its port.
+        refused = await self._probe({"host": "srw-gitea", "port": 22})
+        assert refused["message"] == _SSH_REFUSED.format(endpoint="srw-gitea:22")
+        assert reached == [("10.43.0.7", 2222)]
+
+    @pytest.mark.asyncio
+    async def test_a_name_that_does_not_resolve_is_unreachable(
+        self, monkeypatch, reached
+    ):
+        _ssh_network(monkeypatch, {})
+        result = await self._probe({"host": "nowhere.example.com"})
+
+        assert result == {
+            "status": "error",
+            "message": "Could not reach SSH host nowhere.example.com:22",
+        }
+        assert reached == []
+
+    @pytest.mark.asyncio
+    async def test_a_repository_on_a_cluster_address_is_refused(
+        self, monkeypatch, reached
+    ):
+        from orchestrator.services.connector_drivers.repository import (
+            probe_repository,
+        )
+
+        _ssh_network(monkeypatch, {"srw-orchestrator.srw.svc": ("10.43.0.10",)})
+        url = "ssh://git@srw-orchestrator.srw.svc:8085/a/b"
+        key = generate_ed25519_keypair().private_key
+        result = await probe_repository(
+            {
+                "id": "77777777-7777-4777-8777-777777777777",
+                "type": "repository",
+                "connection_url": url,
+            },
+            url,
+            {"auth_method": "ssh", "ssh_key": key},
+        )
+
+        assert result["message"] == _SSH_REFUSED.format(
+            endpoint="srw-orchestrator.srw.svc:8085"
+        )
+        assert reached == []
+
+    @pytest.mark.asyncio
+    async def test_the_ssh_key_driver_reads_the_tier_on_the_store(
+        self, monkeypatch, reached
+    ):
+        from orchestrator.services.connector_drivers.base import CheckContext
+        from orchestrator.services.connector_drivers.ssh_key import SshKeyDriver
+        from tests.test_repository_probe import _TierStore
+
+        _ssh_network(monkeypatch, {"git.lan": ("192.168.1.10",)})
+        row = _ssh_key_row({"host": "git.lan"})
+        for allowed in (False, True):
+            store = _TierStore(allowed=allowed)
+            result = await SshKeyDriver().check(
+                row, row["credentials"], ctx=CheckContext(None, store=store)
+            )
+            assert store.asked, "the tier was not read"
+            assert (result["status"] == "ok") is allowed
+        assert reached == [("192.168.1.10", 22)]
+
+    @pytest.mark.asyncio
+    async def test_a_real_loopback_server_is_never_connected_to(self, monkeypatch):
+        """No socket: a listening server on 127.0.0.1 sees no connection,
+        even with the operator listing it (loopback never)."""
+        import asyncssh
+
+        connections: list = []
+
+        class Counting(asyncssh.SSHServer):
+            def connection_made(self, conn):
+                connections.append(conn)
+
+        server = await asyncssh.create_server(
+            Counting,
+            "127.0.0.1",
+            0,
+            server_host_keys=[asyncssh.generate_private_key("ssh-ed25519")],
+        )
+        try:
+            port = server.sockets[0].getsockname()[1]
+            _ssh_network(monkeypatch, {}, private_hosts=("127.0.0.1",))
+            result = await self._probe({"host": "127.0.0.1", "port": port})
+        finally:
+            server.close()
+            await server.wait_closed()
+
+        assert result["message"] == _SSH_REFUSED.format(endpoint=f"127.0.0.1:{port}")
+        assert connections == []
+
+    @pytest.mark.asyncio
+    async def test_the_host_key_fetch_reads_no_ssh_client_config(
+        self, monkeypatch, tmp_path
+    ):
+        """A ``HostName`` in an OpenSSH client config cannot send the probe
+        away from the address it was given."""
+        import asyncssh
+
+        from orchestrator.services.workspace_ssh_connector import fetch_ssh_host_key
+
+        (tmp_path / ".ssh").mkdir()
+        (tmp_path / ".ssh" / "config").write_text(
+            "Host *\n  HostName 192.0.2.1\n  Port 1\n"
+        )
+        monkeypatch.setenv("HOME", str(tmp_path))
+        host_key = asyncssh.generate_private_key("ssh-ed25519")
+        server = await asyncssh.create_server(
+            asyncssh.SSHServer, "127.0.0.1", 0, server_host_keys=[host_key]
+        )
+        try:
+            port = server.sockets[0].getsockname()[1]
+            fetched = await fetch_ssh_host_key("127.0.0.1", port)
+        finally:
+            server.close()
+            await server.wait_closed()
+        expected = host_key.export_public_key("openssh").decode().split()[:2]
+        assert fetched == " ".join(expected)

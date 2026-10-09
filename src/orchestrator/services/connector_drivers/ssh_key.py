@@ -91,8 +91,18 @@ class SshKeyDriver(WorkspaceSshDriver):
     async def check(
         self, row: Mapping[str, Any], credentials: dict[str, Any], *, ctx: CheckContext
     ) -> dict[str, Any]:
-        # Only a declared host has an endpoint to test.
-        probed = await probe_workspace_ssh_connector(row)
+        from orchestrator.services.connector_drivers.provider_http import (
+            tier_allows_private,
+        )
+
+        # Only a declared host has an endpoint to test, at an address the
+        # connector's projects may reach.
+        probed = await probe_workspace_ssh_connector(
+            row,
+            allow_private=await tier_allows_private(
+                getattr(ctx, "store", None), row.get("id")
+            ),
+        )
         if probed is not None:
             return probed
         return unsupported_check(

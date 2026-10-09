@@ -150,6 +150,10 @@ class CheckContext:
     #: The user running Test (a probe that mints at a provider limits how
     #: often one user may, C5).
     requester: str | None = None
+    #: The application's database: a probe of a user-chosen host reads the
+    #: connector's project tier on it (``provider_http.tier_allows_private``);
+    #: ``None`` reaches public addresses only.
+    store: Any = None
 
 
 @dataclass(frozen=True)

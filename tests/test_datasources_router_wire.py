@@ -584,16 +584,26 @@ def test_probe_of_an_mcp_connector_is_403_when_the_deployment_disables_them():
 
 
 def test_probe_of_an_ssh_repository_connector_reports_its_host_key(monkeypatch):
-    """C1: no forge API takes a deploy key; Test reaches the SSH endpoint."""
+    """C1: no forge API takes a deploy key; Test reaches the SSH endpoint, at
+    the address its name resolved to."""
     from orchestrator.services import workspace_ssh_connector
+    from orchestrator.services.connector_drivers import provider_http
     from shared.runtime.utils.ssh_key import generate_ed25519_keypair
+    from tests._provider_fakes import fake_resolver
 
     host_key = " ".join(generate_ed25519_keypair().public_key.split()[:2])
 
     async def fetch(host, port):
-        assert (host, port) == ("github.com", 22)
+        assert (host, port) == ("203.0.113.22", 22)
         return host_key
 
+    monkeypatch.setitem(
+        provider_http._state,
+        "network",
+        provider_http.ProviderNetwork(
+            resolver=fake_resolver({"github.com": ("203.0.113.22",)})
+        ),
+    )
     monkeypatch.setattr(workspace_ssh_connector, "fetch_ssh_host_key", fetch)
     row = dict(
         SECRET_ROW,

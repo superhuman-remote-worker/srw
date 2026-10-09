@@ -8,10 +8,12 @@ A per-repository token is the universal credential here — every forge
 supports one, unlike GitHub Apps which are GitHub-only.
 """
 
+import json
 import logging
 import os
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -750,12 +752,79 @@ def _probe_requests_for(
     return (f"{target.api_base}/user", headers), (repo_url, headers)
 
 
-async def probe_repository_access(target: ForgeRepo, *, timeout: float = 10.0) -> dict:
+@dataclass(frozen=True)
+class ProbeAnswer:
+    """One forge answer as :func:`probe_repository_access` reads it: the
+    status, the headers by lower-case name and the (capped) body."""
+
+    status: int
+    headers: Mapping[str, str] = field(default_factory=dict)
+    body: bytes = field(default=b"", repr=False)
+
+    def json(self) -> Any:
+        """The body as JSON; ``ValueError`` when it is not."""
+        return json.loads(self.body.decode("utf-8"))
+
+
+#: One GET of a probe: ``(url, headers) -> ProbeAnswer``. It raises
+#: :class:`ForgeError` with a fixed text when no answer came (the forge did
+#: not resolve or answer, its address was refused, its certificate did not
+#: verify); never the exception's or the forge's own words.
+ProbeFetch = Callable[[str, dict[str, str]], Awaitable[ProbeAnswer]]
+
+
+def _probe_detail(answer: ProbeAnswer) -> str:
+    """A refusal's ``message`` for the server log only: printable, capped."""
+    try:
+        data = answer.json()
+    except ValueError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    text = str(data.get("message") or data.get("error") or "")
+    return " ".join("".join(ch if ch.isprintable() else " " for ch in text).split())[
+        :200
+    ]
+
+
+def _probe_refusal(target: ForgeRepo, step: str, answer: ProbeAnswer) -> ForgeError:
+    """A probe answer SRW did not expect, named by its status only: the
+    forge's own words go to the log (they may be anything an address
+    answers)."""
+    logger.info(
+        "Repository probe: %s answered the %s with HTTP %d: %s",
+        target.forge,
+        step,
+        answer.status,
+        _probe_detail(answer),
+    )
+    if 300 <= answer.status < 400:
+        return ForgeError(
+            f"{target.forge} answered the {step} with a redirect "
+            f"(HTTP {answer.status}), which SRW does not follow"
+        )
+    if step == "token check":
+        return ForgeError(
+            f"{target.forge} could not identify the token (HTTP {answer.status})"
+        )
+    return ForgeError(
+        f"{target.forge} refused the repository read (HTTP {answer.status})"
+    )
+
+
+async def probe_repository_access(target: ForgeRepo, *, fetch: ProbeFetch) -> dict:
     """Authenticate the connector token and report who it is and what it may do.
 
     Two reads, nothing written: the token's own principal (``/user``) and the
     repository's permission view. Raises :class:`ForgeError` when the token
-    is rejected, the repository is invisible, or the forge is unreachable.
+    is rejected, the repository is invisible, or the forge is unreachable;
+    its text is fixed (an HTTP status at most), never the forge's own words.
+
+    ``fetch`` makes each GET. The forge's address comes from a connector, so
+    the caller decides where it may go: the orchestrator's Test passes one
+    that checks and pins the address
+    (``orchestrator.services.connector_drivers.repository``). There is no
+    default, so no caller probes an address unchecked by accident.
 
     The facts exist so an operator can verify a connector without ever
     reading the token: which account the agent will act as, whether that
@@ -771,38 +840,26 @@ async def probe_repository_access(target: ForgeRepo, *, timeout: float = 10.0) -
         raise ForgeError("Repository connector has no token to probe")
 
     (user_url, user_headers), (repo_url, repo_headers) = _probe_requests_for(target)
-    try:
-        async with httpx.AsyncClient(timeout=timeout, transport=_transport) as client:
-            user_resp = await client.get(user_url, headers=user_headers)
-            if user_resp.status_code == 401:
-                raise ForgeError(f"{target.forge} rejected the token (HTTP 401)")
-            if user_resp.status_code != 200:
-                detail = _response_error_detail(user_resp)
-                raise ForgeError(
-                    f"{target.forge} could not identify the token "
-                    f"(HTTP {user_resp.status_code}){': ' + detail if detail else ''}"
-                )
-            repo_resp = await client.get(repo_url, headers=repo_headers)
-    except httpx.HTTPError as exc:
-        raise ForgeError(f"Could not reach {target.forge}: {exc}") from exc
-
-    if repo_resp.status_code == 404:
+    user_resp = await fetch(user_url, user_headers)
+    if user_resp.status == 401:
+        raise ForgeError(f"{target.forge} rejected the token (HTTP 401)")
+    if user_resp.status != 200:
+        raise _probe_refusal(target, "token check", user_resp)
+    repo_resp = await fetch(repo_url, repo_headers)
+    if repo_resp.status == 404:
         raise ForgeError(
             f"{target.owner}/{target.repo} not found on {target.forge}, or the "
             "token cannot see it (HTTP 404)"
         )
-    if repo_resp.status_code != 200:
-        detail = _response_error_detail(repo_resp)
-        raise ForgeError(
-            f"{target.forge} refused the repository read "
-            f"(HTTP {repo_resp.status_code}){': ' + detail if detail else ''}"
-        )
+    if repo_resp.status != 200:
+        raise _probe_refusal(target, "repository read", repo_resp)
 
     try:
         user = user_resp.json()
         repo = repo_resp.json()
-    except ValueError as exc:
-        raise ForgeError(f"{target.forge} returned a non-JSON probe response") from exc
+    except ValueError:
+        # Never chained: a JSONDecodeError carries the whole body.
+        raise ForgeError(f"{target.forge} returned a non-JSON probe response") from None
     if not isinstance(user, dict) or not isinstance(repo, dict):
         raise ForgeError(f"{target.forge} returned an unexpected probe response shape")
 

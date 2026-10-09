@@ -993,6 +993,7 @@ async def test_datasource(
             ctx=CheckContext(
                 environment,
                 requester=str(user.get("id")) if isinstance(user, dict) else None,
+                store=dependencies.store,
             ),
         )
 

@@ -12,8 +12,10 @@ existing tests use (``tests/test_codeql_error_disclosure.py``,
   modules, replaced in ``sys.modules`` (they are imported inside the probe);
 * email: ``imaplib``/``smtplib`` classes, or ``probe_email_connection`` for the
   outer timeout and crash classes;
-* repository: ``shared.runtime.services.forge._transport``; an SSH-key
-  repository's host-key exchange: ``asyncssh.get_server_host_key``;
+* repository: the provider calls' client factory and resolver
+  (``provider_http``: the forge is asked at the address its name resolved
+  to, with the name in ``Host``); an SSH-key repository's host-key exchange:
+  ``asyncssh.get_server_host_key``, at the resolved address;
 * KB: ``orchestrator.services.kb_datasources.kb_source_from_datasource``;
 * MCP: the SDK's transport clients and ``ClientSession``.
 
@@ -237,16 +239,45 @@ def mail_probe_raises(error: Exception) -> Scenario:
     return install
 
 
+#: What the probes' names resolve to (documentation range: public, so the
+#: address check passes on any project tier).
+PROBE_ADDRESSES = {
+    "api.github.com": ("203.0.113.20",),
+    "git.example.test": ("203.0.113.21",),
+}
+
+
+def _probe_network(monkeypatch, handler=None) -> None:
+    """Route the Test probes' provider calls (``provider_http``) to
+    ``handler`` and resolve their names from :data:`PROBE_ADDRESSES`."""
+    from orchestrator.services.connector_drivers import provider_http
+    from tests._provider_fakes import fake_resolver
+
+    monkeypatch.setitem(
+        provider_http._state,
+        "network",
+        provider_http.ProviderNetwork(resolver=fake_resolver(PROBE_ADDRESSES)),
+    )
+    if handler is not None:
+        transport = httpx.MockTransport(handler)
+
+        def make(*, verify=True, timeout=10.0) -> httpx.AsyncClient:
+            return httpx.AsyncClient(
+                transport=transport, timeout=timeout, follow_redirects=False
+            )
+
+        monkeypatch.setitem(provider_http._state, "factory", make)
+
+
 def forge(
     *, user: dict | int, repo: dict | int, user_headers: dict | None = None
 ) -> Scenario:
     def install(monkeypatch, calls):
-        from shared.runtime.services import forge as forge_module
-
         def handler(request: httpx.Request) -> httpx.Response:
             calls.append(
                 {
                     "request": f"{request.method} {request.url}",
+                    "host": request.headers.get("host"),
                     "authorization": bool(request.headers.get("authorization")),
                 }
             )
@@ -258,7 +289,7 @@ def forge(
                 return httpx.Response(repo, json={"message": "Not Found"})
             return httpx.Response(200, json=repo)
 
-        monkeypatch.setattr(forge_module, "_transport", httpx.MockTransport(handler))
+        _probe_network(monkeypatch, handler)
 
     return install
 
@@ -287,12 +318,13 @@ def ssh_host_key(*, error: Exception | None = None) -> Scenario:
                 calls.append({"export_public_key": fmt})
                 return (GITEA_HOST_KEY + " host\n").encode()
 
-        async def get_server_host_key(host, port):
-            calls.append({"asyncssh.get_server_host_key": [host, port]})
+        async def get_server_host_key(host, port, **options):
+            calls.append({"asyncssh.get_server_host_key": [host, port, options]})
             if error is not None:
                 raise error
             return Key()
 
+        _probe_network(monkeypatch)
         monkeypatch.setattr(asyncssh, "get_server_host_key", get_server_host_key)
 
     return install
@@ -300,13 +332,11 @@ def ssh_host_key(*, error: Exception | None = None) -> Scenario:
 
 def forge_unreachable() -> Scenario:
     def install(monkeypatch, calls):
-        from shared.runtime.services import forge as forge_module
-
         def handler(request: httpx.Request) -> httpx.Response:
             calls.append({"request": f"{request.method} {request.url}"})
             raise httpx.ConnectError("connection refused", request=request)
 
-        monkeypatch.setattr(forge_module, "_transport", httpx.MockTransport(handler))
+        _probe_network(monkeypatch, handler)
 
     return install
 

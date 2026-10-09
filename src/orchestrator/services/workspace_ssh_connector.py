@@ -22,8 +22,8 @@ over unchanged:
   stored row, so a row that predates the validation degrades to an
   unavailable connector instead of reaching a workspace's SSH config.
 * :func:`probe_workspace_ssh_connector` is Test connection: it reaches the
-  connector's host and reports the host key, which the connector form offers
-  to pin.
+  connector's host, at an address checked against the connector's project
+  tier, and reports the host key, which the connector form offers to pin.
 
 Errors are :class:`WorkspaceSshConnectorError` (a ``ValueError``) whose message
 is the API's 400 detail; it never echoes key material.
@@ -489,7 +489,9 @@ async def fetch_ssh_host_key(host: str, port: int) -> str:
     """Return the ``"<type> <base64>"`` host key ``host:port`` presents.
 
     Only the key exchange runs; nothing authenticates and no connector key
-    is offered.
+    is offered. ``host`` is dialled as given (Test passes an address it
+    checked), and no OpenSSH client config is read: a ``HostName`` or
+    ``ProxyCommand`` there could send the probe somewhere else.
     """
 
     import asyncio
@@ -497,12 +499,38 @@ async def fetch_ssh_host_key(host: str, port: int) -> str:
     import asyncssh
 
     async with asyncio.timeout(_HOST_KEY_PROBE_TIMEOUT_S):
-        key = await asyncssh.get_server_host_key(host, port)
+        key = await asyncssh.get_server_host_key(host, port, config=None)
     if key is None:
         raise ValueError("the server presented no host key")
     exported = key.export_public_key("openssh").decode("ascii").split()
     (entry,) = parse_known_hosts(" ".join(exported[:2]))
     return entry
+
+
+async def _pinned_host_key(
+    host: str, port: int, *, endpoint: str, allow_private: bool
+) -> str:
+    """``host`` resolved once and every address checked as the provider
+    calls check theirs (``provider_http.checked_addresses``), then the
+    checked addresses dialled in turn: a second lookup can never send the
+    probe elsewhere. ``ProviderError`` for a host that does not resolve or
+    an address the connector's projects may not reach, before any
+    connection."""
+
+    from orchestrator.services.connector_drivers.provider_http import (
+        checked_addresses,
+    )
+
+    addresses, _literal = await checked_addresses(
+        host, port, who=f"SSH host {endpoint}", allow_private=allow_private
+    )
+    for index, address in enumerate(addresses):
+        try:
+            return await fetch_ssh_host_key(str(address), port)
+        except OSError:
+            if index == len(addresses) - 1:
+                raise
+    raise OSError("no address to dial")  # checked_addresses returns at least one
 
 
 def apply_ssh_test_overrides(
@@ -534,7 +562,9 @@ def apply_ssh_test_overrides(
     return row
 
 
-async def probe_workspace_ssh_connector(ds: Mapping[str, Any]) -> dict[str, Any] | None:
+async def probe_workspace_ssh_connector(
+    ds: Mapping[str, Any], *, allow_private: bool = False
+) -> dict[str, Any] | None:
     """Test an SSH connector's endpoint: reach it and report its host key.
 
     ``None`` means there is no endpoint to test (an ``ssh_key`` without a
@@ -543,10 +573,20 @@ async def probe_workspace_ssh_connector(ds: Mapping[str, Any]) -> dict[str, Any]
     pin is stored in, so a pin can never silently follow a host change. A
     pinned connector whose host now presents another key fails, as its
     workspace clone would.
+
+    The host is the connector's own, so it is resolved once and refused
+    before any connection when an address is one the connector's projects
+    may not reach (``allow_private``: their tier allows private addresses;
+    ``connectors.providerMinting.privateHosts`` lists the hosts an operator
+    trusts). Every other failure is the one fixed "could not reach" answer,
+    under one deadline; the detail goes to the server log.
     """
 
+    import asyncio
     import base64
     import hashlib
+
+    from orchestrator.services.connector_drivers.provider_http import ProviderError
 
     if (
         ds.get("type") == "ssh_key"
@@ -559,16 +599,25 @@ async def probe_workspace_ssh_connector(ds: Mapping[str, Any]) -> dict[str, Any]
         return {"status": "error", "message": str(exc)}
     if identity.host is None or identity.port is None:
         return None
+    endpoint = f"{identity.host}:{identity.port}"
+    unreachable = {"status": "error", "message": f"Could not reach SSH host {endpoint}"}
     try:
-        host_key = await fetch_ssh_host_key(identity.host, identity.port)
+        async with asyncio.timeout(_HOST_KEY_PROBE_TIMEOUT_S):
+            host_key = await _pinned_host_key(
+                identity.host,
+                identity.port,
+                endpoint=endpoint,
+                allow_private=allow_private,
+            )
+    except ProviderError as exc:
+        if exc.reason == "address_refused":
+            return {"status": "error", "message": str(exc)}
+        return unreachable
     except Exception:
         logger.warning(
             "SSH host key probe failed for connector %s", ds.get("id"), exc_info=True
         )
-        return {
-            "status": "error",
-            "message": f"Could not reach SSH host {identity.host}:{identity.port}",
-        }
+        return unreachable
     digest = hashlib.sha256(base64.b64decode(host_key.split()[1])).digest()
     fingerprint = "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
     pinned = bool(identity.known_hosts)

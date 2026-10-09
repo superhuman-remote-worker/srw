@@ -556,11 +556,13 @@
     },
     "probe_calls": [
       {
-        "request": "GET https://api.github.com/user",
+        "request": "GET https://203.0.113.20/user",
+        "host": "api.github.com",
         "authorization": true
       },
       {
-        "request": "GET https://api.github.com/repos/acme/widgets",
+        "request": "GET https://203.0.113.20/repos/acme/widgets",
+        "host": "api.github.com",
         "authorization": true
       }
     ]
@@ -592,11 +594,13 @@
     },
     "probe_calls": [
       {
-        "request": "GET https://api.github.com/user",
+        "request": "GET https://203.0.113.20/user",
+        "host": "api.github.com",
         "authorization": true
       },
       {
-        "request": "GET https://api.github.com/repos/acme/widgets",
+        "request": "GET https://203.0.113.20/repos/acme/widgets",
+        "host": "api.github.com",
         "authorization": true
       }
     ]
@@ -622,11 +626,13 @@
     },
     "probe_calls": [
       {
-        "request": "GET https://api.github.com/user",
+        "request": "GET https://203.0.113.20/user",
+        "host": "api.github.com",
         "authorization": true
       },
       {
-        "request": "GET https://api.github.com/repos/acme/widgets",
+        "request": "GET https://203.0.113.20/repos/acme/widgets",
+        "host": "api.github.com",
         "authorization": true
       }
     ]
@@ -652,11 +658,13 @@
     },
     "probe_calls": [
       {
-        "request": "GET https://git.example.test/api/v1/user",
+        "request": "GET https://203.0.113.21/api/v1/user",
+        "host": "git.example.test",
         "authorization": true
       },
       {
-        "request": "GET https://git.example.test/api/v1/repos/acme/widgets",
+        "request": "GET https://203.0.113.21/api/v1/repos/acme/widgets",
+        "host": "git.example.test",
         "authorization": true
       }
     ]
@@ -669,7 +677,8 @@
     },
     "probe_calls": [
       {
-        "request": "GET https://api.github.com/user",
+        "request": "GET https://203.0.113.20/user",
+        "host": "api.github.com",
         "authorization": true
       }
     ]
@@ -682,11 +691,13 @@
     },
     "probe_calls": [
       {
-        "request": "GET https://api.github.com/user",
+        "request": "GET https://203.0.113.20/user",
+        "host": "api.github.com",
         "authorization": true
       },
       {
-        "request": "GET https://api.github.com/repos/acme/widgets",
+        "request": "GET https://203.0.113.20/repos/acme/widgets",
+        "host": "api.github.com",
         "authorization": true
       }
     ]
@@ -695,11 +706,11 @@
     "status": 200,
     "body": {
       "status": "error",
-      "message": "Could not reach github: connection refused"
+      "message": "github could not be reached"
     },
     "probe_calls": [
       {
-        "request": "GET https://api.github.com/user"
+        "request": "GET https://203.0.113.20/user"
       }
     ]
   },
@@ -728,8 +739,11 @@
     "probe_calls": [
       {
         "asyncssh.get_server_host_key": [
-          "git.example.test",
-          2222
+          "203.0.113.21",
+          2222,
+          {
+            "config": null
+          }
         ]
       },
       {
@@ -754,8 +768,11 @@
     "probe_calls": [
       {
         "asyncssh.get_server_host_key": [
-          "git.example.test",
-          2222
+          "203.0.113.21",
+          2222,
+          {
+            "config": null
+          }
         ]
       },
       {
@@ -780,8 +797,11 @@
     "probe_calls": [
       {
         "asyncssh.get_server_host_key": [
-          "git.example.test",
-          2222
+          "203.0.113.21",
+          2222,
+          {
+            "config": null
+          }
         ]
       },
       {
@@ -798,8 +818,11 @@
     "probe_calls": [
       {
         "asyncssh.get_server_host_key": [
-          "git.example.test",
-          2222
+          "203.0.113.21",
+          2222,
+          {
+            "config": null
+          }
         ]
       }
     ]
@@ -841,11 +864,13 @@
     },
     "probe_calls": [
       {
-        "request": "GET https://api.github.com/user",
+        "request": "GET https://203.0.113.20/user",
+        "host": "api.github.com",
         "authorization": true
       },
       {
-        "request": "GET https://api.github.com/repos/acme/widgets",
+        "request": "GET https://203.0.113.20/repos/acme/widgets",
+        "host": "api.github.com",
         "authorization": true
       }
     ]

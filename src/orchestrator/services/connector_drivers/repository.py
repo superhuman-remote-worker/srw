@@ -11,13 +11,19 @@ the forge (inferred for github.com and gitlab.com, declared otherwise) and,
 for an SSH-key repository, pinned ``known_hosts``.
 
 Test asks the forge API what a token may do, or reaches the SSH endpoint and
-reports the host key the connector form offers to pin.
+reports the host key the connector form offers to pin. The address is the
+connector's own, so either probe is held to the provider calls' rules
+(``provider_http``): resolved once and checked against the project tier (a
+private address only where the tier allows one, or on a host the operator
+lists in ``connectors.providerMinting.privateHosts``), dialled at the checked
+address, under one deadline, without redirects or proxies, and refused or
+failed with a fixed reason; the raw detail goes to the server log only.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -300,8 +306,17 @@ class RepositoryDriver(WorkspaceSshDriver):
             if result.get("status") != "ok":
                 return result
         else:
+            from orchestrator.services.connector_drivers.provider_http import (
+                tier_allows_private,
+            )
+
             result = await probe_repository(
-                dict(row), row["connection_url"], credentials
+                dict(row),
+                row["connection_url"],
+                credentials,
+                allow_private=await tier_allows_private(
+                    getattr(ctx, "store", None), row.get("id")
+                ),
             )
             if not token_auth(row, credentials):
                 return result
@@ -388,8 +403,49 @@ class RepositoryDriver(WorkspaceSshDriver):
         return entry
 
 
+#: One Test's forge probe, both reads included: resolution, connections and
+#: answers.
+PROBE_DEADLINE_SECONDS = 15.0
+
+
+def _guarded_fetch(
+    forge: str, *, ca_pem: str | None, allow_private: bool
+) -> Callable[[str, dict[str, str]], Awaitable[Any]]:
+    """The probe's GET through ``provider_http``: a checked, pinned address,
+    a capped answer, no redirect or proxy, and a fixed text when no answer
+    came."""
+    from orchestrator.services.connector_drivers.provider_http import (
+        ProviderError,
+        provider_request,
+    )
+    from shared.runtime.services.forge import ForgeError, ProbeAnswer
+
+    async def fetch(url: str, headers: dict[str, str]) -> ProbeAnswer:
+        try:
+            answer = await provider_request(
+                "GET",
+                url,
+                who=forge,
+                headers=headers,
+                ca_pem=ca_pem,
+                allow_private=allow_private,
+                deadline=PROBE_DEADLINE_SECONDS,
+            )
+        except ProviderError as exc:
+            raise ForgeError(str(exc)) from None
+        return ProbeAnswer(
+            status=answer.status, headers=answer.headers, body=answer.body
+        )
+
+    return fetch
+
+
 async def probe_repository(
-    ds: dict[str, Any], url: str | None, creds: dict[str, Any]
+    ds: dict[str, Any],
+    url: str | None,
+    creds: dict[str, Any],
+    *,
+    allow_private: bool = False,
 ) -> dict[str, Any]:
     """Probe a repository connector without exposing its credential.
 
@@ -401,7 +457,13 @@ async def probe_repository(
     no API to ask: Test reaches their SSH endpoint and reports its host key
     (``workspace_ssh_connector.probe_workspace_ssh_connector``); the clone at
     job start proves the key.
+
+    The forge's address is checked before anything is sent to it
+    (``allow_private``: the connector's project tier allows private
+    addresses), and both reads run under one deadline
+    (:data:`PROBE_DEADLINE_SECONDS`).
     """
+    from orchestrator.services.connector_git_swap_delivery import upstream_ca_of
     from shared.runtime.services.forge import (  # noqa: PLC0415
         ForgeError,
         ForgeRepo,
@@ -417,7 +479,9 @@ async def probe_repository(
     if auth_method == "ssh":
         # No forge API takes a deploy key; reach the SSH endpoint and report
         # the host key the connector form offers to pin.
-        probed = await probe_workspace_ssh_connector({**ds, "credentials": creds})
+        probed = await probe_workspace_ssh_connector(
+            {**ds, "credentials": creds}, allow_private=allow_private
+        )
         if probed is not None:
             return probed
     if auth_method != "token" or not token:
@@ -445,10 +509,19 @@ async def probe_repository(
     except ForgeError as exc:
         return {"status": "error", "message": str(exc)}
 
+    fetch = _guarded_fetch(
+        forge, ca_pem=upstream_ca_of(config), allow_private=allow_private
+    )
     try:
-        facts = await asyncio.wait_for(probe_repository_access(target), timeout=15)
-    except asyncio.TimeoutError:
-        return {"status": "error", "message": "Repository probe timed out after 15s"}
+        async with asyncio.timeout(PROBE_DEADLINE_SECONDS):
+            facts = await probe_repository_access(target, fetch=fetch)
+    except TimeoutError:
+        return {
+            "status": "error",
+            "message": (
+                f"Repository probe timed out after {PROBE_DEADLINE_SECONDS:.0f}s"
+            ),
+        }
     except ForgeError as exc:
         return {"status": "error", "message": str(exc)}
 
