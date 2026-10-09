@@ -190,6 +190,10 @@ _IPV4_RE = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}\Z")
 DEFAULT_PRIVATE_URL = (
     "https://traefik.kube-system.svc.cluster.local/srw-gate/private.git"
 )
+#: The fallback's reason for a host the driver's egress refuses, one of the
+#: fixed reasons the README and Test show
+#: (connector_git_swap_delivery.REASONS["egress_refused"]).
+EGRESS_REFUSED = "the driver's egress policy refuses the upstream's address"
 #: Seconds from a connector's first binding to its serving pod the gate
 #: accepts (the agent's first clone waits for at most ~195 s).
 COLD_START_BUDGET = 120
@@ -772,9 +776,15 @@ def pod_ready(pod: dict) -> bool:
 
 
 def swap_pod_problems(
-    pod: dict, secret_doc: dict, swap_image: str, tokens: list[str]
+    pod: dict,
+    secret_doc: dict,
+    swap_image: str,
+    tokens: list[str],
+    upstream_ca: str | None = None,
 ) -> list[str]:
-    """How a swap pod and its Secret differ from what C3 requires."""
+    """How a swap pod and its Secret differ from what C3 requires: its
+    config is the clean upstream and its host, and the connector's upstream
+    CA exactly when the connector names one (the self-hosted upstream's)."""
     problems: list[str] = []
     spec = pod.get("spec") or {}
     containers = spec.get("containers") or []
@@ -809,10 +819,13 @@ def swap_pod_problems(
     if request.get("credentials") != {}:
         problems.append("the request file carries credentials")
     config = (request.get("connector") or {}).get("config") or {}
-    if set(config) != {"upstream", "host"} or not _UPSTREAM_RE.fullmatch(
+    expected = {"upstream", "host"} | ({"upstream_ca"} if upstream_ca else set())
+    if set(config) != expected or not _UPSTREAM_RE.fullmatch(
         str(config.get("upstream"))
     ):
-        problems.append(f"the pod's config is {sorted(config)}")
+        problems.append(f"the pod's config is {sorted(config)}, not {sorted(expected)}")
+    elif upstream_ca and str(config.get("upstream_ca")).strip() != upstream_ca.strip():
+        problems.append("the pod's upstream CA is not the connector's")
     if request.get("tls") != {
         "cert_file": "/run/srw/tls.crt",
         "key_file": "/run/srw/tls.key",
@@ -846,12 +859,23 @@ def config_problems(config: str, *, clean_url: str, tokens: list[str]) -> list[s
         problems.append("a token or lease is in .git/config")
     if "oauth2:" in config or re.search(r"https://[^/\s]*@", config):
         problems.append("credentials are in a URL")
-    if (
-        "credentialsInUrl = die" not in config
-        and "credentialsinurl = die" not in config.lower()
-    ):
-        problems.append("transfer.credentialsInUrl is not die")
+    if not refuses_credentials_in_urls(config):
+        problems.append(
+            "transfer.credentialsInUrl is not die (the checkout's [transfer] "
+            f"section: {transfer_section(config)!r})"
+        )
     return problems
+
+
+def refuses_credentials_in_urls(config: str) -> bool:
+    """Whether a .git/config sets ``transfer.credentialsInUrl = die``."""
+    return "credentialsinurl = die" in config.lower()
+
+
+def transfer_section(config: str) -> str:
+    """A .git/config's ``[transfer]`` section, for a failure's detail."""
+    found = re.search(r"^\[transfer\][^\[]*", config, re.MULTILINE)
+    return " ".join(found.group(0).split()) if found else "none"
 
 
 def push_refused(output: str, reason: str) -> bool:
@@ -2385,11 +2409,12 @@ class GitSwapGate:
                 secret_doc,
                 self.swap_image,
                 [self.token, *self.lease_tokens.values()],
+                upstream_ca=self.connector_config(label).get("upstream_ca"),
             )
             self.report.check(
                 f"startup: {label}'s pod runs the pinned swap image unprivileged; "
-                "its Secret holds its TLS certificate and the clean upstream, no "
-                "token",
+                "its Secret holds its TLS certificate and the clean upstream (and "
+                "the connector's upstream CA, if it names one), no token",
                 not problems,
                 "; ".join(problems),
             )
@@ -2714,12 +2739,15 @@ class GitSwapGate:
         line = next(
             (row for row in readme.splitlines() if self.name("private") in row), ""
         )
+        # Its clone fails (the host serves no such repository, and the
+        # workspace may not reach the cluster's service range either): what
+        # counts is how it was to be reached, and why.
         self.report.check(
             "fallback: a private-host token repository gets no lease, and session "
             "two's README says it is NOT reached through the driver, and why",
             lease is None
             and "NOT through SRW's git swap driver" in line
-            and "may not reach the upstream" in line,
+            and EGRESS_REFUSED in line,
             line[-300:] or "no README line",
         )
         status, result = self.owner.call(
@@ -2731,7 +2759,7 @@ class GitSwapGate:
             "the clone URL, not through the driver, and why",
             status == 200
             and delivery.get("mode") == "token-in-url"
-            and "may not reach the upstream" in (delivery.get("reason") or "")
+            and delivery.get("reason") == EGRESS_REFUSED
             and "NOT through SRW's git swap driver" in str(result.get("message")),
             json.dumps(delivery)[:300],
         )
@@ -2763,6 +2791,22 @@ class GitSwapGate:
             )
         except GateError:
             config = ""
+        if config:
+            # The attach resets the origin, then sets the flag: a read
+            # between the two commands sees only the first.
+            def refused() -> str | None:
+                _rc, text = self.ws("two", f"cat {repo}/.git/config\n")
+                return text if refuses_credentials_in_urls(text) else None
+
+            try:
+                config = wait_for(
+                    "the reused checkout refuses credentials in URLs",
+                    refused,
+                    timeout=60,
+                    interval=5,
+                )
+            except GateError:
+                _rc, config = self.ws("two", f"cat {repo}/.git/config\n")
         problems = (
             config_problems(
                 config,
@@ -2772,6 +2816,13 @@ class GitSwapGate:
             if config
             else ["the oauth2: origin stayed"]
         )
+        if problems:
+            # Why the attach left it so: the agent says it on the README.
+            _rc, readme = self.ws("two", "cat ~/workspace/README.md 2>/dev/null\n")
+            line = next(
+                (row for row in readme.splitlines() if self.name("rw") in row), ""
+            )
+            problems.append(f"README: {line[-240:] or 'no line'}")
         self.report.check(
             "reused: a pre-C3 checkout loses its oauth2:<token>@ origin on the "
             "next attach and refuses credentials in URLs again",

@@ -268,7 +268,7 @@ def _authority():
     )
 
 
-def _swap_pod():
+def _swap_pod(config=None):
     """A swap pod and its Secret as the launch builder makes them, as the
     API shows them."""
     from orchestrator.services.connector_egress import EgressPins, PinnedHost
@@ -291,7 +291,7 @@ def _swap_pod():
         image=f"srw-registry:5000/srw-driver-git-swap@{DIGEST}",
         entrypoint=["/srw-git-swap"],
         cmd=["serve"],
-        config={"upstream": UPSTREAM, "host": "github.com"},
+        config=config or {"upstream": UPSTREAM, "host": "github.com"},
         credentials={"token": TOKEN},
         identity_token="sdi_" + "A" * 49,
         pins=EgressPins(
@@ -371,6 +371,49 @@ def test_the_config_evaluator():
     assert any("token or lease" in p for p in problems)
     no_die = clean.replace("[transfer]\n\tcredentialsInUrl = die\n", "")
     assert gate.config_problems(no_die, clean_url=UPSTREAM, tokens=[TOKEN])
+    # A failure says what the checkout's [transfer] section holds.
+    warn = clean.replace("credentialsInUrl = die", "credentialsInUrl = warn")
+    (problem,) = gate.config_problems(warn, clean_url=UPSTREAM, tokens=[TOKEN])
+    assert "[transfer] credentialsInUrl = warn" in problem
+    assert (
+        "section: 'none'"
+        in gate.config_problems(no_die, clean_url=UPSTREAM, tokens=[TOKEN])[0]
+    )
+    assert gate.refuses_credentials_in_urls(
+        clean.replace("credentialsInUrl", "credentialsinurl")
+    )
+
+
+def test_a_pods_upstream_ca_is_expected_exactly_when_its_connector_names_one():
+    """The live gate's first failure: the self-hosted upstream's connectors
+    carry the gate's CA, and their pods' config holds it; a connector
+    without one has none."""
+    ca, _cert, _key = gate.make_gate_ca("h.example")
+    config = {"upstream": UPSTREAM, "host": "github.com", "upstream_ca": ca}
+    pod, secret_doc = _swap_pod(config)
+    assert gate.swap_pod_problems(pod, secret_doc, SWAP_IMAGE, [TOKEN], ca) == []
+    # Expected but missing, or there but not expected, or another CA.
+    problems = gate.swap_pod_problems(pod, secret_doc, SWAP_IMAGE, [TOKEN])
+    assert any("upstream_ca" in p for p in problems)
+    plain, plain_secret = _swap_pod()
+    problems = gate.swap_pod_problems(plain, plain_secret, SWAP_IMAGE, [TOKEN], ca)
+    assert any("upstream_ca" in p for p in problems)
+    other, _cert, _key = gate.make_gate_ca("other.example")
+    problems = gate.swap_pod_problems(pod, secret_doc, SWAP_IMAGE, [TOKEN], other)
+    assert problems == ["the pod's upstream CA is not the connector's"]
+
+
+def test_the_fallback_reason_is_the_deliverys_fixed_one():
+    """The live gate's second failure: the fallback's reason is one of the
+    fixed reasons the README and Test show (C3 re-review B2/S5)."""
+    from orchestrator.services.connector_git_swap_delivery import REASONS
+
+    assert gate.EGRESS_REFUSED == REASONS["egress_refused"]
+    source = (ROOT / "scripts/k3d-git-swap-gate.py").read_text()
+    fallback = source[source.index("    def fallback_checks(self)") :]
+    fallback = fallback[: fallback.index("    def reused_checks(self)")]
+    assert "may not reach the upstream" not in fallback
+    assert fallback.count("EGRESS_REFUSED") == 2
 
 
 def test_the_push_refusal_evaluator():
