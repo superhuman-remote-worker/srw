@@ -427,7 +427,7 @@ class TestCalls:
 
 
 def _ctx():
-    gates = DeploymentGates(lambda: True, lambda: True)
+    gates = DeploymentGates(lambda: True)
     return SimpleNamespace(
         environment=SimpleNamespace(gates=gates), can_autonomous_send=AsyncMock()
     )
@@ -649,7 +649,7 @@ class TestDriver:
     def test_a_minting_connector_binds_without_its_kubeconfig(self):
         driver = KubeconfigDriver()
         ctx = BindContext(
-            gates=DeploymentGates(lambda: True, lambda: True),
+            gates=DeploymentGates(lambda: True),
             logger=logging.getLogger("test"),
             default_known_hosts="",
         )

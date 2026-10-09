@@ -562,7 +562,6 @@ def minting_inputs_changed(
     return (
         normalized.config is not None
         or normalized.credentials is not None
-        or normalized.connection_url_set
         or normalized.connection_url is not None
     )
 

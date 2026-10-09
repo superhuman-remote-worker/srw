@@ -247,7 +247,7 @@ def _kube_entry(connector: str) -> dict:
         ]
     }
     ctx = BindContext(
-        gates=DeploymentGates(lambda: True, lambda: True),
+        gates=DeploymentGates(lambda: True),
         logger=logging.getLogger("test"),
         default_known_hosts="",
     )
@@ -764,7 +764,6 @@ async def _api_update(db, user, connector: str, **body) -> None:
             vector_db=MagicMock(),
             knowledge_index=MagicMock(),
             mcp_datasources_enabled=lambda: True,
-            mcp_stdio_enabled=lambda: True,
             validate_mcp_datasource=lambda _url, _creds: None,
             connector_drivers=builtin_connector_drivers(),
         ),

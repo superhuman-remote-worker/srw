@@ -435,7 +435,7 @@ def _draft(**over):
 
 def _ctx():
     return SimpleNamespace(
-        environment=SimpleNamespace(gates=DeploymentGates(lambda: True, lambda: True)),
+        environment=SimpleNamespace(gates=DeploymentGates(lambda: True)),
         can_autonomous_send=AsyncMock(),
     )
 
@@ -626,7 +626,7 @@ class TestRepositoryDriver:
             **over,
         }
         ctx = BindContext(
-            gates=DeploymentGates(lambda: True, lambda: True),
+            gates=DeploymentGates(lambda: True),
             logger=logging.getLogger("test"),
             default_known_hosts="",
             git_swap=None,
@@ -713,7 +713,7 @@ class TestRepositoryDriver:
             "config": {"forge": "github", "github_app": APP},
         }
         ctx = BindContext(
-            gates=DeploymentGates(lambda: True, lambda: True),
+            gates=DeploymentGates(lambda: True),
             logger=logging.getLogger("test"),
             default_known_hosts="",
             git_swap=git_swap,

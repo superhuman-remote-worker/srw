@@ -253,7 +253,6 @@ def _dependencies(db) -> datasource_operations.DatasourceDependencies:
         vector_db=None,
         knowledge_index=None,
         mcp_datasources_enabled=lambda: False,
-        mcp_stdio_enabled=lambda: False,
         validate_mcp_datasource=lambda _url, _creds: None,
         connector_drivers=REGISTRY,
     )
