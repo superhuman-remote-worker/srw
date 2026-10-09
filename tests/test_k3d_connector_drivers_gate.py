@@ -8,6 +8,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -412,7 +413,9 @@ def test_session_tool_use_reads_the_ai_role_and_the_exact_tool_name(monkeypatch)
     assert "'\"webdav_list\"'" in query
 
 
-def _session(monkeypatch, tools, probe, tool_use=lambda tool, text: (1, 1)):
+def _session(
+    monkeypatch, tools, probe, tool_use=lambda tool, text, thread=None: (1, 1)
+):
     runner = _runner()
     runner.thread = "00000000-0000-4000-8000-000000000001"
     runner.project = "00000000-0000-4000-8000-0000000000bb"
@@ -434,7 +437,17 @@ def _session(monkeypatch, tools, probe, tool_use=lambda tool, text: (1, 1)):
     )
     monkeypatch.setattr(runner, "tool_use", tool_use)
     turns: list[int] = []
-    monkeypatch.setattr(runner, "turn", lambda text, step: turns.append(step))
+    monkeypatch.setattr(
+        runner, "turn", lambda text, step, thread=None: turns.append(step)
+    )
+    shell_session = {"id": "00000000-0000-4000-8000-0000000000ee"}
+    monkeypatch.setattr(
+        runner,
+        "api",
+        MagicMock(ok=MagicMock(return_value=shell_session)),
+        raising=False,
+    )
+    monkeypatch.setattr(runner, "delete_thread", lambda thread: True)
     runner.session_checks()
     return runner, requests, turns
 
@@ -463,7 +476,7 @@ def test_write_tools_or_a_written_probe_fail_the_session(monkeypatch, tools, pro
 
 
 def test_no_shell_call_fails_the_session(monkeypatch):
-    def tool_use(tool, text):
+    def tool_use(tool, text, thread=None):
         return (0, 1) if tool in {"run_command", "shell_execute"} else (1, 1)
 
     runner, _requests, _turns = _session(
@@ -474,7 +487,7 @@ def test_no_shell_call_fails_the_session(monkeypatch):
 
 @pytest.mark.parametrize("missing", ["(fetch)", "(push)"])
 def test_a_dropped_git_remote_line_fails_the_session(monkeypatch, missing):
-    def tool_use(tool, text):
+    def tool_use(tool, text, thread=None):
         return (1, 0) if text.endswith(missing) else (1, 1)
 
     runner, _requests, _turns = _session(

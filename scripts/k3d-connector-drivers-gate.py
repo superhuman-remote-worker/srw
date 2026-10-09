@@ -1029,15 +1029,16 @@ class ConnectorDriversGate:
             raise GateError("the session unit parked")
         return state, int(input_seq), int(consumed_seq)
 
-    def turn(self, text: str, step: int) -> None:
-        before = self.queue(self.thread)
+    def turn(self, text: str, step: int, thread: str | None = None) -> None:
+        thread = thread or self.thread
+        before = self.queue(thread)
         previous = before[1] if before else 0
         self.api.ok(
-            "POST", f"/api/persistent/threads/{self.thread}/input", {"content": text}
+            "POST", f"/api/persistent/threads/{thread}/input", {"content": text}
         )
 
         def answered() -> bool:
-            current = self.queue(self.thread)
+            current = self.queue(thread)
             return bool(
                 current
                 and current[0] == "done"
@@ -1774,21 +1775,39 @@ class ConnectorDriversGate:
         Every line ``git remote -v`` prints contains "git", the command's first
         word, which the remote shell once took for the command's echo and
         dropped (vault issue remote_shell_echo_filter_drops_output_lines).
+        Shell tools are opt-in per expert, so a short session of the bundled
+        developer expert runs it.
         """
+        body: dict[str, Any] = {
+            "title": f"D1a shell output gate {self.gate_id}",
+            "permission_mode": "autonomous",
+            "project_id": self.project,
+            "datasource_ids": [],
+            "expert": "developer",
+            "config_override": {"workspace": {"backend": "sandbox"}},
+            "model": self.args.model,
+        }
+        created = self.api.ok("POST", "/api/persistent/threads", body)
+        thread = str(created.get("thread_id") or created["id"])
+        print(f"shell session {thread}", flush=True)
         repo = f"srw-echo-{self.gate_id}"
         url = f"https://git.example.invalid/acme/{self.gate_id}.git"
-        # The model family decides the shell mode: run_command (stateless) or
-        # shell_execute (persistent); both run through the remote shell.
-        self.turn(
-            "Use your shell tool (run_command or shell_execute, whichever you "
-            "have) to run exactly this command, unchanged, then reply with its "
-            "output verbatim:\n"
-            f"git init -q {repo} && git -C {repo} remote add origin {url} && "
-            f"git -C {repo} remote -v",
-            3,
-        )
-        stateless, fetch = self.tool_use("run_command", f"{url} (fetch)")
-        persistent, push = self.tool_use("shell_execute", f"{url} (push)")
+        try:
+            # The model family decides the shell mode: run_command (stateless)
+            # or shell_execute (persistent); both run through the remote shell.
+            self.turn(
+                "Use your shell tool (run_command or shell_execute, whichever "
+                "you have) to run exactly this command, unchanged, then reply "
+                "with its output verbatim:\n"
+                f"git init -q {repo} && git -C {repo} remote add origin {url} && "
+                f"git -C {repo} remote -v",
+                3,
+                thread,
+            )
+            stateless, fetch = self.tool_use("run_command", f"{url} (fetch)", thread)
+            persistent, push = self.tool_use("shell_execute", f"{url} (push)", thread)
+        finally:
+            deleted = self.delete_thread(thread)
         self.report.check(
             "session agent: the shell tool returns git remote -v's lines, which "
             "contain the command's first word",
@@ -1796,15 +1815,19 @@ class ConnectorDriversGate:
             f"{stateless} run_command and {persistent} shell_execute calls, "
             f"{fetch}/{push} tool results with the fetch/push line",
         )
+        self.report.check("session: the shell session ended and deleted", deleted)
 
-    def tool_use(self, tool: str, text: str) -> tuple[int, int]:
+    def tool_use(
+        self, tool: str, text: str, thread: str | None = None
+    ) -> tuple[int, int]:
         """Session tool calls of ``tool`` and tool results holding ``text``."""
+        thread = thread or self.thread
         called, returned = sql(
             "SELECT (SELECT count(*) FROM thread_messages WHERE thread_id = "
-            f"{lit(self.thread)} AND role IN ('ai', 'assistant') AND "
+            f"{lit(thread)} AND role IN ('ai', 'assistant') AND "
             f"position({lit(chr(34) + tool + chr(34))} in "
             "coalesce(tool_calls::text, '')) > 0) || ' ' || (SELECT count(*) "
-            f"FROM thread_messages WHERE thread_id = {lit(self.thread)} AND "
+            f"FROM thread_messages WHERE thread_id = {lit(thread)} AND "
             f"role = 'tool' AND position({lit(text)} in coalesce(content, '')) > 0)"
         ).split()
         return int(called), int(returned)
