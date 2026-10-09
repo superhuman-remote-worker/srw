@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import re
 import shlex
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -876,6 +876,84 @@ def _key(delivery: Delivery) -> str:
     return f"{delivery.entry.get('type')}:{delivery.entry.get('name')}"
 
 
+def _live_changes(
+    old: Sequence[Delivery], new: Sequence[Delivery]
+) -> Tuple[List[Delivery], set[str]]:
+    """A live change's added deliveries (payload order) and removed keys."""
+    old_keys = {_key(delivery) for delivery in old}
+    new_keys = {_key(delivery) for delivery in new}
+    added = [delivery for delivery in new if _key(delivery) not in old_keys]
+    return added, old_keys - new_keys
+
+
+def _clone_names_of(old: Sequence[Delivery], removed: set[str]) -> List[str]:
+    """The clone names the removed repositories were registered under,
+    resolved over the OLD full list as attach resolved them."""
+    if not removed:
+        return []
+    names = resolve_repo_clone_names([delivery.entry for delivery in old])
+    return [
+        clone_name
+        for delivery, clone_name in zip(old, names)
+        if _key(delivery) in removed
+    ]
+
+
+#: The workspace manager attribute where a live add's tokens wait for
+#: redaction until its checkouts are swapped in
+#: (``agent.core.tool_output_redaction`` reads it with ``source_repo_meta``):
+#: a token-in-URL clone has its token on the workspace from the clone on,
+#: while a turn's tools may read the workspace. Replaced whole, never
+#: mutated.
+PENDING_META = "source_repo_pending_meta"
+
+
+class _StagedCheckouts:
+    """What a live add clones through, off the event loop.
+
+    The workspace manager's backend and path, so the clones land where
+    they belong, but registries of its own that no tool reads: a turn in
+    flight never sees a checkout that is still being cloned, or one whose
+    origin or branch is still being set. :meth:`swap_into` moves the result
+    into the workspace manager, on the event loop, in one step.
+    """
+
+    def __init__(self, workspace_manager: Any) -> None:
+        self.backend = getattr(workspace_manager, "backend", None)
+        self.path = workspace_manager.path
+        self.source_repos: Dict[str, Any] = {}
+        self.source_repo_meta: Dict[str, Dict[str, Any]] = {}
+        self.source_repo_skipped: Dict[str, str] = {}
+
+    def swap_into(self, workspace_manager: Any) -> None:
+        """Register what was cloned and record why the rest was not.
+
+        Metadata first: a reader that finds a checkout finds its metadata
+        (the repo tools refuse a write without it; redaction reads its
+        token). Each update is one C-level dict operation, so a reader in
+        another thread (a synchronous git tool) sees a checkout whole or
+        not at all.
+        """
+        workspace_manager.source_repo_meta.update(self.source_repo_meta)
+        workspace_manager.source_repos.update(self.source_repos)
+        skipped = getattr(workspace_manager, "source_repo_skipped", None)
+        if isinstance(skipped, dict):
+            for clone_name in self.source_repos:
+                skipped.pop(clone_name, None)
+        for clone_name, reason in self.source_repo_skipped.items():
+            _note_skipped(workspace_manager, clone_name, reason)
+
+
+def _pending_meta(entries: Sequence[Dict[str, Any]]) -> tuple[Dict[str, str], ...]:
+    """The tokens of a live add's repositories, as redaction reads them."""
+    pending = []
+    for ds in entries:
+        token = (ds.get("credentials") or {}).get("token")
+        if isinstance(token, str) and token:
+            pending.append({"token": token})
+    return tuple(pending)
+
+
 class CheckoutMaterializer:
     form = "checkout"
 
@@ -900,32 +978,81 @@ class CheckoutMaterializer:
         new: Sequence[Delivery],
         rt: RuntimeContext,
     ) -> None:
-        """Clone added repositories; unregister removed ones.
+        """Clone added repositories; unregister removed ones (the three steps
+        of a staged change, :meth:`begin_replace`, :meth:`stage_replace` and
+        its swap-in, in one call)."""
+        self.begin_replace(old, new, rt)
+        self.stage_replace(old, new, rt)()
 
-        A removed repository keeps its clone on the workspace (cheap honesty:
-        scrubbing is not a security boundary) but loses its ``source_repos``
-        registration and its forge metadata, which holds its token, and a
-        git swap binding loses its wiring (its lease was revoked with the
-        detach). An added repository's clone name is resolved over the full
-        new list: the name a resume resolves and the README lists. A
-        checkout already there whose origin is another repository (an order
-        that changed) is never re-pointed: that one repository is skipped
-        and the README says why.
+    def begin_replace(
+        self,
+        old: Sequence[Delivery],
+        new: Sequence[Delivery],
+        rt: RuntimeContext,
+    ) -> None:
+        """On the event loop, before any clone: a removed repository loses
+        its registration and its forge metadata at once, so a turn never
+        uses a detached connector's checkout or token while another
+        repository clones; an added repository's token is redacted from tool
+        output from now on (:data:`PENDING_META`), before its clone puts it
+        on the workspace.
+
+        A removed repository keeps its clone on the workspace (cheap
+        honesty: scrubbing is not a security boundary). Its clone name is
+        resolved over the OLD full list (payload order), so collision
+        suffixes match what attach actually registered.
         """
-        old_keys = {_key(delivery) for delivery in old}
-        new_keys = {_key(delivery) for delivery in new}
-        added = [delivery for delivery in new if _key(delivery) not in old_keys]
-        removed = old_keys - new_keys
+        added, removed = _live_changes(old, new)
         workspace_manager = rt.workspace_manager
+        if not workspace_manager:
+            return
+        for clone_name in _clone_names_of(old, removed):
+            # Repository first, then its metadata, which holds its plaintext
+            # token; leaving that behind keeps a detached credential live on
+            # the workspace manager for the rest of the session.
+            workspace_manager.source_repos.pop(clone_name, None)
+            workspace_manager.source_repo_meta.pop(clone_name, None)
+        if added:
+            # Replaced whole: a reader holds the old tuple or this one.
+            setattr(
+                workspace_manager,
+                PENDING_META,
+                _pending_meta([delivery.entry for delivery in added]),
+            )
+
+    def stage_replace(
+        self,
+        old: Sequence[Delivery],
+        new: Sequence[Delivery],
+        rt: RuntimeContext,
+    ) -> Callable[[], None]:
+        """Clone added repositories and drop a detached one's wiring (the
+        slow step, for a worker thread, after :meth:`begin_replace`);
+        returns the swap-in (for the event loop), which registers the added
+        checkouts.
+
+        The clone fills a staging registry (:class:`_StagedCheckouts`), not
+        the workspace manager's, so a turn in flight never reads a checkout
+        half made. A detached git swap binding loses its wiring (its lease
+        was revoked with the detach). An added repository's clone name is
+        resolved over the full new list: the name a resume resolves and the
+        README lists. A checkout already there whose origin is another
+        repository (an order that changed) is never re-pointed: that one
+        repository is skipped and the README says why.
+        """
+        added, removed = _live_changes(old, new)
+        workspace_manager = rt.workspace_manager
+        staged: Optional[_StagedCheckouts] = None
         if added and workspace_manager:
             names = resolve_repo_clone_names([delivery.entry for delivery in new])
             named = {
                 id(delivery): name for delivery, name in zip(new, names, strict=True)
             }
+            staged = _StagedCheckouts(workspace_manager)
             try:
                 clone_repository_datasources(
                     [delivery.entry for delivery in added],
-                    workspace_manager,
+                    staged,
                     ssh_identity_status=rt.ssh_identity_status,
                     # Only the added ones: another repository's key file is
                     # not this batch's to sweep.
@@ -935,16 +1062,6 @@ class CheckoutMaterializer:
             except Exception as e:
                 logger.warning("Live repository clone failed: %s", e)
         if removed and workspace_manager:
-            # Resolve clone names over the OLD full repo list (payload order)
-            # so collision suffixes match what attach actually registered.
-            old_repos = [delivery.entry for delivery in old]
-            for delivery, clone_name in zip(old, resolve_repo_clone_names(old_repos)):
-                if _key(delivery) in removed:
-                    workspace_manager.source_repos.pop(clone_name, None)
-                    # source_repo_meta holds the repository's plaintext token;
-                    # leaving it behind keeps a detached credential live on
-                    # the workspace manager for the rest of the session.
-                    workspace_manager.source_repo_meta.pop(clone_name, None)
             # A detached swap repository's wiring goes too (housekeeping: its
             # lease is already revoked). The clean remote stays.
             detached = [
@@ -963,6 +1080,16 @@ class CheckoutMaterializer:
                         "Could not remove a detached repository's git swap wiring: %s",
                         type(e).__name__,
                     )
+
+        def swap_in() -> None:
+            if staged is None or not workspace_manager:
+                return
+            # After the removals (begin_replace): an added repository that
+            # took a removed one's clone name (and its checkout) stays.
+            staged.swap_into(workspace_manager)
+            setattr(workspace_manager, PENDING_META, ())
+
+        return swap_in
 
     def on_backend_swap(self, deliveries: Sequence[Delivery], backend: Any) -> None:
         """The git swap wiring lives under ``~/.srw-credentials``, which no

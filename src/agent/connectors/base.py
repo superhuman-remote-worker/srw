@@ -19,7 +19,7 @@ contract" (Runtime) and lane 1 §3.4.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 
@@ -161,6 +161,29 @@ class SupportsReplace(Protocol):
         new: Sequence[Delivery],
         rt: RuntimeContext,
     ) -> None: ...
+
+
+@runtime_checkable
+class SupportsStagedReplace(Protocol):
+    """A form whose live change is slow and read by a turn in flight (the
+    checkouts), in three steps: ``begin_replace`` on the event loop (fast:
+    what a removal takes away goes at once), ``stage_replace`` in a worker
+    thread (slow: changes nothing a reader sees), and the callable it
+    returns, which swaps the result in on the event loop in one step."""
+
+    def begin_replace(
+        self,
+        old: Sequence[Delivery],
+        new: Sequence[Delivery],
+        rt: RuntimeContext,
+    ) -> None: ...
+
+    def stage_replace(
+        self,
+        old: Sequence[Delivery],
+        new: Sequence[Delivery],
+        rt: RuntimeContext,
+    ) -> Callable[[], None]: ...
 
 
 @runtime_checkable

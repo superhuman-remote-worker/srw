@@ -28,6 +28,10 @@ Blocking steps that the async entry points ran off the event loop still do
 (``offload``); the rest run inline, as they did. The checkouts run off it
 too where an execution is set up (worker setup, session attach): a first
 clone through the git swap driver waits for a starting pod for minutes (C3).
+A live update clones off it as well, without racing a turn in flight that
+reads the checkouts: the clone fills a staging registry in a worker thread,
+and the result is swapped in on the event loop in one step
+(``SupportsStagedReplace``).
 """
 
 from __future__ import annotations
@@ -48,6 +52,7 @@ from agent.connectors.base import (
     SupportsReady,
     SupportsRelease,
     SupportsReplace,
+    SupportsStagedReplace,
     declared_read_only_note,
 )
 from agent.connectors.checkout import CheckoutMaterializer
@@ -107,10 +112,15 @@ _SESSION_OFFLOAD = frozenset(
 #: clone waits up to its binding's ``wait_seconds`` (minutes) for a starting
 #: driver pod (C3). Inline, that wait held the event loop: a stateless
 #: worker's run-queue lease (60 s) lapsed and the unit was parked as
-#: outcome-unknown, and the pod failed its liveness probe. A live update keeps
-#: its checkout inline, as before: a turn may be in flight, reading the
-#: checkouts the step replaces.
+#: outcome-unknown, and the pod failed its liveness probe.
 _SETUP_OFFLOAD = frozenset({"checkout"})
+#: The checkout in a live update: a turn may be in flight, reading the
+#: checkouts the step replaces, so a removal applies on the event loop at
+#: once (``begin_replace``), the clone is staged (``stage_replace``, in a
+#: worker thread, changes nothing a reader sees) and the result is swapped
+#: in on the event loop. A form without staging keeps its ``replace``
+#: inline.
+_LIVE_STAGED = frozenset({"checkout"})
 
 
 def routed(deliveries: Iterable[Delivery], form: str) -> list[Delivery]:
@@ -238,6 +248,14 @@ class ConnectorRegistry:
                     await materializer.ready(fresh)
                 if form == LIVE_HARNESS_FORMS[-1]:
                     on_harness_replaced(fresh.connections, fresh.clients)
+                continue
+            if form in _LIVE_STAGED and isinstance(materializer, SupportsStagedReplace):
+                removed_from, added_to = routed(old, form), routed(new, form)
+                materializer.begin_replace(removed_from, added_to, rt)
+                swap_in = await asyncio.to_thread(
+                    materializer.stage_replace, removed_from, added_to, rt
+                )
+                swap_in()
                 continue
             if not isinstance(materializer, SupportsReplace):
                 continue

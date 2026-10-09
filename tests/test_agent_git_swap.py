@@ -1357,6 +1357,258 @@ class TestCheckoutNames:
         assert _other_repository(_reused_checkout(None), expected) is None
 
 
+class _NoopForm:
+    """Every live form but the checkout, doing nothing."""
+
+    def __init__(self, form: str) -> None:
+        self.form = form
+
+    def materialize(self, deliveries, rt):
+        pass
+
+    def replace(self, old, new, rt):
+        pass
+
+    def facts(self, deliveries, rt):
+        return []
+
+
+def _checkout_only_registry():
+    from agent.connectors.registry import ConnectorRegistry
+
+    others = (
+        "env_file",
+        "lease_token",
+        "credential_file",
+        "ssh_identity",
+        "managed_connection",
+        "mcp_client",
+        "knowledge_index",
+    )
+    return ConnectorRegistry([CheckoutMaterializer(), *map(_NoopForm, others)])
+
+
+class _WriteOrder(dict):
+    """A registry dict that records, in a shared log, each write to it."""
+
+    def __init__(self, name: str, log: list, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._name, self._log = name, log
+
+    def __setitem__(self, key, value):
+        self._log.append((self._name, "set", key))
+        super().__setitem__(key, value)
+
+    def update(self, *args, **kwargs):
+        added = dict(*args, **kwargs)
+        self._log.extend((self._name, "set", key) for key in added)
+        super().update(added)
+
+    def pop(self, key, *default):
+        if key in self:
+            self._log.append((self._name, "pop", key))
+        return super().pop(key, *default)
+
+
+class TestLiveAddOffTheLoop:
+    """live_connector_add_clones_on_the_event_loop: a repository added to a
+    running session clones in a worker thread, into a staging registry, and
+    is swapped in on the event loop once cloned; a removed one goes at once,
+    before the clone."""
+
+    @pytest.mark.asyncio
+    async def test_a_slow_clone_leaves_the_loop_running_and_lands_whole(self):
+        import asyncio
+        import threading
+        import time
+
+        from agent.core.tool_output_redaction import workspace_secrets
+
+        ws = _workspace()
+        ws.source_repo_skipped = {}
+        ws.source_repo_pending_meta = ()
+        kept = MagicMock(name="a checkout the turn is using")
+        ws.source_repos["kept"] = kept
+        ws.source_repo_meta["kept"] = {"token": "kept-token-0123456789"}
+        # A repository this change removes (a token-in-URL one).
+        gone = {
+            "type": "repository",
+            "name": "Gone",
+            "connection_url": "https://github.com/o/gone.git",
+            "credentials": {"token": "gone-token-0123456789"},
+        }
+        ws.source_repos["gone"] = MagicMock(name="the removed checkout")
+        ws.source_repo_meta["gone"] = {"token": "gone-token-0123456789"}
+        cloned = MagicMock(name="the added checkout")
+        loop_thread = threading.get_ident()
+        clone_threads: list[int] = []
+        cloning = threading.Event()
+        cloned_once = threading.Event()
+
+        def slow_clone(url, target, **kwargs):
+            clone_threads.append(threading.get_ident())
+            cloning.set()
+            time.sleep(1.0)  # a first clone that takes its time
+            cloned_once.set()
+            return cloned
+
+        stop = threading.Event()
+        half_seen: list[str] = []
+
+        def git_tool_in_a_thread():
+            # A synchronous git tool reads the registry from a worker thread:
+            # it finds the added checkout whole (with its metadata) or not at
+            # all, and listing never trips over a registry being changed.
+            while not stop.is_set():
+                repos = ws.source_repos
+                if "r" in repos:
+                    meta = ws.source_repo_meta.get("r") or {}
+                    if repos["r"] is not cloned or meta.get("token") != TOKEN:
+                        half_seen.append("thread")
+                sorted(repos)
+                time.sleep(0.001)
+
+        ticks = 0
+        during: list[tuple[bool, bool, bool]] = []
+
+        async def turn():
+            # A turn in flight: the loop keeps running it while the clone
+            # runs (and only then is it observed: the swap-in follows it).
+            nonlocal ticks
+            while not stop.is_set():
+                ticks += 1
+                if cloning.is_set() and not cloned_once.is_set():
+                    secrets = workspace_secrets(SimpleNamespace(workspace_manager=ws))
+                    during.append(
+                        (
+                            "r" in ws.source_repos,
+                            TOKEN in secrets,
+                            "gone" in ws.source_repos or "gone" in ws.source_repo_meta,
+                        )
+                    )
+                assert ws.source_repos["kept"] is kept
+                await asyncio.sleep(0.01)
+
+        reader = threading.Thread(target=git_tool_in_a_thread)
+        reader.start()
+        turn_task = asyncio.create_task(turn())
+        rt = RuntimeContext(execution="session", workspace_manager=ws)
+        try:
+            with patch(
+                "agent.managers.git_manager.GitManager.clone", side_effect=slow_clone
+            ):
+                await _checkout_only_registry().replace_live(
+                    deliveries_from_payload([gone]),
+                    deliveries_from_payload([_entry()]),
+                    rt,
+                    on_harness_replaced=lambda connections, clients: None,
+                )
+        finally:
+            stop.set()
+            reader.join(5)
+            await turn_task
+
+        # The clone ran in a worker thread while the loop ran the turn.
+        assert clone_threads and clone_threads[0] != loop_thread
+        assert ticks >= 20
+        assert len(during) >= 10
+        # While it cloned: not registered yet, its token already redacted,
+        # and the removed repository (and its token) already gone.
+        assert not any(registered for registered, _, _ in during)
+        assert all(redacted for _, redacted, _ in during)
+        assert not any(removed_left for _, _, removed_left in during)
+        # Swapped in whole once cloned; the turn's own checkout untouched.
+        assert ws.source_repos == {"kept": kept, "r": cloned}
+        assert ws.source_repo_meta["r"]["token"] == TOKEN
+        assert ws.source_repo_meta["kept"] == {"token": "kept-token-0123456789"}
+        assert "gone" not in ws.source_repo_meta
+        assert ws.source_repo_pending_meta == ()
+        assert half_seen == []
+
+    def test_the_writes_keep_a_checkout_whole_for_any_reader(self):
+        """A removal drops the checkout before its metadata; the swap-in
+        adds the metadata before the checkout, then stops redacting the
+        pending token (which the metadata now carries). A reader in another
+        thread that reads the registry first, then the metadata, never
+        finds a checkout without its metadata."""
+        log: list = []
+
+        class Workspace:
+            """A workspace manager whose registry writes are logged."""
+
+            def __setattr__(self, name, value):
+                if name == "source_repo_pending_meta":
+                    log.append(("pending", "set", value))
+                object.__setattr__(self, name, value)
+
+        ws = Workspace()
+        ws.backend = _workspace().backend
+        ws.path = Path("/tmp/ws")
+        ws.source_repos = _WriteOrder("repos", log, {"gone": MagicMock()})
+        ws.source_repo_meta = _WriteOrder("meta", log, {"gone": {"token": "t" * 20}})
+        ws.source_repo_skipped = {}
+        gone = {
+            "type": "repository",
+            "name": "Gone",
+            "connection_url": "https://github.com/o/gone.git",
+        }
+        rt = RuntimeContext(execution="session", workspace_manager=ws)
+        with patch(
+            "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
+        ):
+            CheckoutMaterializer().replace(
+                deliveries_from_payload([gone]), deliveries_from_payload([_entry()]), rt
+            )
+        assert log == [
+            ("repos", "pop", "gone"),
+            ("meta", "pop", "gone"),
+            ("pending", "set", ({"token": TOKEN},)),
+            ("meta", "set", "r"),
+            ("repos", "set", "r"),
+            ("pending", "set", ()),
+        ]
+
+    def test_a_repository_that_takes_a_removed_ones_checkout_stays(self):
+        """Removals apply before the added checkouts are swapped in: an added
+        connector of the same repository, under the removed one's clone
+        name, stays registered."""
+        ws = _workspace(exists=True)
+        ws.source_repo_skipped = {}
+        removed_checkout = MagicMock(name="the removed connector's checkout")
+        ws.source_repos["r"] = removed_checkout
+        ws.source_repo_meta["r"] = {"token": "removed-token"}
+        old = _entry()
+        new = _entry(connector=OTHER, origin=OTHER_ORIGIN)
+        new["name"] = "Other"
+        reused = _reused_checkout("https://github.com/o/r.git")
+        rt = RuntimeContext(execution="session", workspace_manager=ws)
+        with patch("agent.managers.git_manager.GitManager", return_value=reused):
+            CheckoutMaterializer().replace(
+                deliveries_from_payload([old]), deliveries_from_payload([new]), rt
+            )
+        assert ws.source_repos == {"r": reused}
+        assert ws.source_repo_meta["r"]["token"] == TOKEN
+
+    def test_why_an_added_repository_was_not_cloned_lands_with_it(self):
+        ws = _workspace(
+            shell_outputs=(
+                "Exit code: 128\nfatal: The requested URL returned error: 502",
+            )
+        )
+        ws.source_repo_skipped = {}
+        rt = RuntimeContext(execution="session", workspace_manager=ws)
+        added = deliveries_from_payload([_entry()])
+        materializer = CheckoutMaterializer()
+        materializer.begin_replace([], added, rt)
+        assert ws.source_repo_pending_meta == ({"token": TOKEN},)
+        swap_in = materializer.stage_replace([], added, rt)
+        # Staged: nothing a reader sees has changed yet.
+        assert ws.source_repo_skipped == {} and ws.source_repos == {}
+        swap_in()
+        assert "did not serve the repository" in ws.source_repo_skipped["r"]
+        assert ws.source_repos == {} and ws.source_repo_pending_meta == ()
+
+
 class TestLiveChanges:
     def test_a_detached_swap_repository_loses_its_wiring(self):
         ws = _workspace()

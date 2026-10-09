@@ -1131,15 +1131,22 @@ class TestResetupDatasources:
         ):
             await session.resetup_datasources([repo_new])
 
+        [staged] = [call.args[1] for call in clone.call_args_list]
         clone.assert_called_once_with(
             [repo_new],
-            session.workspace_manager,
+            staged,
             ssh_identity_status=session.workspace_ssh_identity_status,
             # A live add sees only the added repositories: no key sweep.
             legacy_key_files="own",
             # Named over the full new list (C3 re-review S4).
             clone_names=["new-repo"],
         )
+        # It clones onto the session's workspace, into a staging registry
+        # that is swapped in once cloned (live_connector_add_clones_on_the_
+        # event_loop).
+        assert staged is not session.workspace_manager
+        assert staged.backend is session.workspace_manager.backend
+        assert staged.path is session.workspace_manager.path
         # Removal keeps the clone on disk (documented) but drops the
         # session-side registration.
         assert "old-repo" not in session.workspace_manager.source_repos

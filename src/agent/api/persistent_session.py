@@ -353,6 +353,11 @@ class PersistentSession:
     # (live_session_settings.md Slice B). Set at attach; replaced by
     # resetup_datasources().
     datasource_configs: List[Dict[str, Any]] = field(default_factory=list)
+    # One live datasource change at a time: its checkouts clone off the event
+    # loop (minutes for a git swap repository's first clone, C3), and the next
+    # change must diff against what the last one applied. A backend swap (the
+    # VM upgrade) takes it too: it re-delivers the applied connectors.
+    _live_connector_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     # ``{authority_id: status}`` of the connector SSH identities loaded into
     # workspace ssh-agents (C1); credential-free. Set at setup, updated live.
     workspace_ssh_identity_status: Dict[str, str] = field(default_factory=dict)
@@ -3048,6 +3053,24 @@ class PersistentSession:
         )
 
     async def resetup_datasources(
+        self,
+        new_datasources: List[Dict[str, Any]],
+        workspace_ssh_identities: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Apply a live datasource selection change, one at a time
+        (:meth:`_resetup_datasources`).
+
+        The event loop keeps running meanwhile (the checkouts clone in a
+        worker thread), so a second change could otherwise start before the
+        first one has applied: it waits, then diffs against what the first
+        applied.
+        """
+        async with self._live_connector_lock:
+            return await self._resetup_datasources(
+                new_datasources, workspace_ssh_identities
+            )
+
+    async def _resetup_datasources(
         self,
         new_datasources: List[Dict[str, Any]],
         workspace_ssh_identities: Optional[List[Dict[str, Any]]] = None,

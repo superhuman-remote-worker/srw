@@ -100,8 +100,23 @@ class _KnowledgeRecorder(_Recorder):
         return []
 
 
+class _StagedRecorder(_Recorder):
+    """The checkout's live change: begun, staged, then swapped in (recorded
+    as its ``replace`` at the moment it takes effect)."""
+
+    def begin_replace(self, old, new, rt):
+        pass
+
+    def stage_replace(self, old, new, rt):
+        return lambda: self.replace(old, new, rt)
+
+
 def _recording_registry(log: list) -> ConnectorRegistry:
-    kinds = {"mcp_client": _ReadyRecorder, "knowledge_index": _KnowledgeRecorder}
+    kinds = {
+        "mcp_client": _ReadyRecorder,
+        "knowledge_index": _KnowledgeRecorder,
+        "checkout": _StagedRecorder,
+    }
     return ConnectorRegistry(
         kinds.get(form, _Recorder)(form, log) for form in AGENT_FORMS
     )
@@ -493,22 +508,99 @@ async def test_live_update_swaps_the_harness_before_the_checkouts(log):
 @pytest.mark.asyncio
 async def test_live_update_offloads_the_workspace_round_trips(log, monkeypatch):
     """The workspace round trips run in worker threads: the environment
-    and identity steps as before, and the credential files."""
+    and identity steps as before, the checkouts' staging and the credential
+    files; the checkouts' swap-in runs on the loop."""
     offloaded = []
     real_to_thread = asyncio.to_thread
+    loop_thread = threading.get_ident()
 
     async def to_thread(func, *args, **kwargs):
         offloaded.append(getattr(func, "__self__", None).form)
         return await real_to_thread(func, *args, **kwargs)
 
+    swapped_in_on = []
+    original = _StagedRecorder.replace
+
+    def replace(self, old, new, rt):
+        swapped_in_on.append(threading.get_ident())
+        original(self, old, new, rt)
+
     monkeypatch.setattr(registry_module.asyncio, "to_thread", to_thread)
+    monkeypatch.setattr(_StagedRecorder, "replace", replace)
     await registry_module.connector_registry().replace_live(
         [],
         deliveries_from_payload(PAYLOAD),
         RuntimeContext(execution="session"),
         on_harness_replaced=lambda connections, clients: None,
     )
-    assert offloaded == ["env_file", "lease_token", "ssh_identity", "credential_file"]
+    assert offloaded == [
+        "env_file",
+        "lease_token",
+        "ssh_identity",
+        "checkout",
+        "credential_file",
+    ]
+    assert swapped_in_on == [loop_thread]
+
+
+@pytest.mark.asyncio
+async def test_a_waiting_live_checkout_leaves_the_event_loop_running():
+    """live_connector_add_clones_on_the_event_loop: a repository added to a
+    running session clones (its git swap driver's pod may still be
+    starting) while the loop runs on."""
+    loop = asyncio.get_running_loop()
+    loop_ran = threading.Event()
+
+    class WaitingCheckout(_Recorder):
+        def begin_replace(self, old, new, rt):
+            pass
+
+        def stage_replace(self, old, new, rt):
+            loop.call_soon_threadsafe(loop_ran.set)
+            waited = loop_ran.wait(timeout=5)
+            return lambda: self.log.append((self.form, "replace", waited))
+
+    calls: list = []
+    registry = ConnectorRegistry(
+        (WaitingCheckout if form == "checkout" else _Recorder)(form, calls)
+        for form in AGENT_FORMS
+    )
+    await registry.replace_live(
+        [],
+        deliveries_from_payload(PAYLOAD),
+        RuntimeContext(execution="session"),
+        on_harness_replaced=lambda connections, clients: None,
+    )
+    assert ("checkout", "replace", True) in calls
+
+
+@pytest.mark.asyncio
+async def test_live_updates_apply_one_at_a_time(monkeypatch):
+    """A second change waits for the first (whose checkout may clone for
+    minutes off the loop), then diffs against what the first applied."""
+    session = _live_session([])
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    seen: list[tuple[list, list]] = []
+
+    async def replace_live(self, old, new, rt, *, on_harness_replaced):
+        seen.append(([d.name for d in old], [d.name for d in new]))
+        if len(seen) == 1:
+            first_started.set()
+            await release_first.wait()
+
+    monkeypatch.setattr(registry_module.ConnectorRegistry, "replace_live", replace_live)
+    repo = dict(PAYLOAD[3])
+    with patch("agent.core.datasource_setup.inject_workspace_facts"):
+        first = asyncio.create_task(session.resetup_datasources([repo]))
+        await first_started.wait()
+        second = asyncio.create_task(session.resetup_datasources([]))
+        await asyncio.sleep(0.05)
+        assert len(seen) == 1  # the second waits
+        release_first.set()
+        await asyncio.gather(first, second)
+    assert seen == [([], ["Repo"]), (["Repo"], [])]
+    assert session.datasource_configs == []
 
 
 # =============================================================================

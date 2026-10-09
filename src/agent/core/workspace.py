@@ -384,6 +384,12 @@ class WorkspaceManager:
         # (the README says so instead of "cloned")
         self.source_repo_skipped: dict[str, str] = {}
 
+        # The forge metadata (tokens) of repositories a live add is cloning,
+        # redacted from tool output until their checkouts are registered
+        # (agent.connectors.checkout.PENDING_META). Replaced whole, never
+        # mutated: a reader holds one tuple or the other.
+        self.source_repo_pending_meta: tuple[dict, ...] = ()
+
     @property
     def backend(self) -> "WorkspaceBackend":
         """Get the workspace backend."""

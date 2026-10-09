@@ -44,11 +44,12 @@ def workspace_secrets(tool_context: Optional[Any]) -> List[str]:
     """The credential values this agent put into its own workspace.
 
     Repository-datasource tokens (the clone URL embeds them as
-    ``oauth2:<token>@``), the credentials of a credential-bearing workspace
-    remote, and whatever the context inherited (``ToolContext.
-    redaction_secrets`` — a worktree child builds a fresh workspace that knows
-    none of its parent's tokens). Each token also goes in as ``user:token``,
-    whose base64 is the HTTP Basic header ``curl -v -u`` prints.
+    ``oauth2:<token>@``; a live add's from before its clone), the
+    credentials of a credential-bearing workspace remote, and whatever the
+    context inherited (``ToolContext.redaction_secrets`` — a worktree child
+    builds a fresh workspace that knows none of its parent's tokens). Each
+    token also goes in as ``user:token``, whose base64 is the HTTP Basic
+    header ``curl -v -u`` prints.
 
     Best-effort by design: a context without a workspace, or a half-built one,
     contributes nothing rather than failing the tool call being cleaned.
@@ -61,7 +62,14 @@ def workspace_secrets(tool_context: Optional[Any]) -> List[str]:
     if workspace is None:
         return secrets
     try:
-        for meta in (getattr(workspace, "source_repo_meta", None) or {}).values():
+        # The tokens of a live add still cloning first, then a snapshot of
+        # the registered metadata (one C-level copy): the swap-in writes the
+        # metadata before it clears the pending tokens, so a reader in a
+        # worker thread holds a token in one or the other.
+        pending = getattr(workspace, "source_repo_pending_meta", None)
+        metas = list(pending) if isinstance(pending, tuple) else []
+        metas.extend((getattr(workspace, "source_repo_meta", None) or {}).values())
+        for meta in metas:
             token = meta.get("token") if isinstance(meta, dict) else None
             if isinstance(token, str) and token:
                 # Either username a token-in-URL clone uses (a GitHub App

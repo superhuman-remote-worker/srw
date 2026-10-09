@@ -11492,7 +11492,16 @@ async def _handle_workspace_upgrade(
 
         # 6. Hot-swap + re-derive the toolset (S1) so shell/git/file tools
         #    appear on the next turn (get_current_tools re-reads per turn).
-        _session.swap_backend(new_backend)
+        #    Never in the middle of a live connector change: its checkouts
+        #    clone off the event loop onto the current backend, and the swap
+        #    re-delivers the connectors that change has applied.
+        live_change = getattr(_session, "_live_connector_lock", None)
+        async with (
+            live_change
+            if isinstance(live_change, asyncio.Lock)
+            else contextlib.nullcontext()
+        ):
+            _session.swap_backend(new_backend)
 
         # 6a. Re-establish the OpenCloud cloud mount on the NEW backend. The
         #     mount is a per-host rclone process, so it does NOT follow the
