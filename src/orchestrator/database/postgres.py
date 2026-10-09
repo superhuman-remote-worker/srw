@@ -2255,8 +2255,32 @@ def _pinned_retirement_local_quiescence_matches(
 
     vm_creation_source = initial_vm_creation_retirement_source(context)
     vm_creation_zero = vm_creation_source is not None
+    # A published pre-registration Agent Pod can be stopped before VM
+    # admission. The database independently requires no VM source, retry,
+    # waiter, or other VM authority before accepting this receipt.
+    pre_registration_vm_without_vm = bool(
+        backend == "vm"
+        and context.get("entry_status") == "created"
+        and agent_pod
+        and not agent
+        and context.get("agent_id") is None
+        and context.get("control_admission_agent_id") is None
+        and context.get("runtime_attach_token") is None
+        and context.get("vm") is None
+        and context.get("vm_creation_source") is None
+        and not provision_intent
+        and not binding
+        and not (set(workspace) - {"repo_name", "git_remote_url"})
+        and not workspace_provision_intent
+        and not workspace_claim
+    )
     workspace_create_pending = bool(workspace_provision_intent)
-    if pre_provision_intent_zero or workspace_create_pending or vm_creation_zero:
+    if (
+        pre_provision_intent_zero
+        or workspace_create_pending
+        or vm_creation_zero
+        or pre_registration_vm_without_vm
+    ):
         expected_protocol = "agent_runtime_zero_v1"
     elif backend == "sandbox":
         if (
@@ -2281,7 +2305,10 @@ def _pinned_retirement_local_quiescence_matches(
         expected_protocol = None
     expected_workspace_generation = (
         None
-        if pre_provision_intent_zero or workspace_create_pending or vm_creation_zero
+        if pre_provision_intent_zero
+        or workspace_create_pending
+        or vm_creation_zero
+        or pre_registration_vm_without_vm
         else vm.get("provision_generation")
         if backend in {"vm", "remote"}
         else sandbox_generation
@@ -2290,7 +2317,10 @@ def _pinned_retirement_local_quiescence_matches(
     )
     expected_workspace_runtime = (
         None
-        if pre_provision_intent_zero or workspace_create_pending or vm_creation_zero
+        if pre_provision_intent_zero
+        or workspace_create_pending
+        or vm_creation_zero
+        or pre_registration_vm_without_vm
         else vm.get("vm_uid")
         if backend in {"vm", "remote"}
         else sandbox_runtime
@@ -2300,6 +2330,7 @@ def _pinned_retirement_local_quiescence_matches(
     if (
         not pre_provision_intent_zero
         and not vm_creation_zero
+        and not pre_registration_vm_without_vm
         and backend in {"vm", "remote"}
         and (not expected_workspace_generation or not expected_workspace_runtime)
     ):
@@ -2324,6 +2355,13 @@ def _pinned_retirement_local_quiescence_matches(
                 == vm_creation_source["request_id"]
                 and receipt.get("vm_creation_provision_generation")
                 == vm_creation_source["provision_generation"]
+            )
+        )
+        and (
+            not pre_registration_vm_without_vm
+            or (
+                receipt.get("vm_creation_request_id") is None
+                and receipt.get("vm_creation_provision_generation") is None
             )
         )
         and str(receipt.get("settle_status") or "") == final_status

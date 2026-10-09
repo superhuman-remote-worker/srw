@@ -3527,6 +3527,211 @@ async def test_pre_registration_pod_recovery_reaps_exact_offline_orphan(db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("permanent", [False, True])
+async def test_vm_pre_registration_pod_zero_settles_before_any_vm_was_issued(
+    db, permanent
+):
+    """A VM Session may End or Delete after Pod zero before VM admission."""
+    import orchestrator.main as orch_main
+
+    ids = await _seed(
+        db,
+        bind_agent=False,
+        protected_agent_pod=True,
+        workspace_claim=False,
+    )
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT metadata FROM threads WHERE id=$1::uuid FOR UPDATE",
+            UUID(ids["thread"]),
+        )
+        metadata = _json(row["metadata"])
+        metadata["config_override"]["officer"]["enabled"] = False
+        metadata["config_override"]["workspace"]["backend"] = "vm"
+        metadata["workspace_container"] = {
+            "repo_name": "regression",
+            "git_remote_url": "https://example.test/repo.git",
+        }
+        await conn.execute(
+            "UPDATE threads SET status='created', metadata=$2::jsonb WHERE id=$1",
+            UUID(ids["thread"]),
+            json.dumps(metadata),
+        )
+    retirement = await db.begin_pinned_thread_retirement(
+        ids["thread"], permanent=permanent
+    )
+    assert retirement is not None
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    context = retirement["context"]
+    assert context["workspace_backend"] == "vm"
+    assert context["agent_id"] is None
+    assert context["runtime_attach_token"] is None
+    assert context.get("vm_creation_source") is None
+    assert (context.get("vm") or {}).get("vm_uid") is None
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM vm_creation_retries WHERE thread_id=$1::uuid",
+                UUID(ids["thread"]),
+            )
+            == 0
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM vm_resource_reservations r "
+                "JOIN vm_creation_retries c ON c.request_id=r.request_id "
+                "WHERE c.owner_kind='thread' AND c.thread_id=$1::uuid",
+                UUID(ids["thread"]),
+            )
+            == 0
+        )
+
+    if not permanent:
+        # A direct writer cannot relabel an Agent-only stop as an issued VM
+        # creation receipt. Each forged audit field is refused independently.
+        pod = context["agent_pod"]
+        plain_receipt = {
+            "version": 1,
+            "runtime_generation": retirement["generation"],
+            "retirement_token": retirement["token"],
+            "agent_id": None,
+            "runtime_attach_token": None,
+            "settle_status": "ended",
+            "quiescence_protocol": "agent_runtime_zero_v1",
+            "quiescence_actor": "orchestrator",
+            "workspace_generation": None,
+            "workspace_runtime_incarnation": None,
+            "agent_pod_name": pod["pod_name"],
+            "agent_pod_uid": pod["pod_uid"],
+        }
+        for field in ("vm_creation_request_id", "vm_creation_provision_generation"):
+            forged = {**plain_receipt, field: str(uuid4())}
+            async with db.acquire() as conn:
+                with pytest.raises(asyncpg.CheckViolationError) as refused:
+                    await conn.execute(
+                        "UPDATE threads SET runtime_retirement_local_quiescence=$2::jsonb, "
+                        "metadata=metadata-'agent_pod' WHERE id=$1::uuid",
+                        UUID(ids["thread"]),
+                        json.dumps(forged),
+                    )
+            assert (
+                refused.value.constraint_name
+                == "threads_runtime_retirement_local_quiescence_identity"
+            )
+        unchanged = await db.get_thread(ids["thread"])
+        assert unchanged["runtime_retirement_local_quiescence"] is None
+        assert _json(unchanged["metadata"])["agent_pod"] == pod
+
+    provisioner = MagicMock()
+    provisioner.is_available = True
+    provisioner.delete_agent_pod_exact = AsyncMock(return_value=True)
+    provisioner.agent_pod_authority = AsyncMock(
+        side_effect=["exact_terminal", "exact_absent"]
+    )
+    provisioner.release_agent_pod_finalizer_exact = AsyncMock(return_value=True)
+    with (
+        patch.object(orch_main.app.state.resources, "postgres_db", db),
+        patch.object(agent_provisioner_module, "agent_provisioner", provisioner),
+    ):
+        current = await db.get_thread(ids["thread"])
+        assert current is not None
+        assert await controls_composition.pinned_retirement_operations(
+            orch_main.app.state.resources
+        ).recover_pre_registration_agent_pod_zero(retirement, current)
+
+    recorded = await db.get_thread(ids["thread"])
+    receipt = _json(recorded["runtime_retirement_local_quiescence"])
+    assert receipt["quiescence_protocol"] == "agent_runtime_zero_v1"
+    assert receipt["agent_pod_uid"] == "old-pod"
+    assert receipt["workspace_generation"] is None
+    assert receipt["workspace_runtime_incarnation"] is None
+    if permanent:
+        assert await db.clear_pinned_retirement_physical_runtime_endpoint(
+            ids["thread"],
+            runtime_generation=retirement["generation"],
+            retirement_token=retirement["token"],
+        )
+        await db.delete_thread(
+            ids["thread"],
+            expected_runtime_retirement_token=retirement["token"],
+            expected_runtime_generation=retirement["generation"],
+        )
+        assert await db.get_thread(ids["thread"]) is None
+    else:
+        assert await db.settle_pinned_thread_retirement(
+            ids["thread"],
+            token=retirement["token"],
+            generation=retirement["generation"],
+            final_status="ended",
+        )
+        ended = await db.get_thread(ids["thread"])
+        assert ended["status"] == "ended"
+        assert ended["runtime_retirement_local_quiescence"] is None
+
+
+@pytest.mark.asyncio
+async def test_vm_pre_registration_agent_zero_refuses_existing_creation_authority(db):
+    """An owned VM audit row prevents a false never-issued Pod-zero proof."""
+
+    ids = await _seed(
+        db,
+        bind_agent=False,
+        protected_agent_pod=True,
+        workspace_claim=False,
+    )
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT metadata FROM threads WHERE id=$1::uuid FOR UPDATE",
+            UUID(ids["thread"]),
+        )
+        metadata = _json(row["metadata"])
+        metadata["config_override"]["officer"]["enabled"] = False
+        metadata["config_override"]["workspace"]["backend"] = "vm"
+        await conn.execute(
+            "UPDATE threads SET status='created', metadata=$2::jsonb WHERE id=$1",
+            UUID(ids["thread"]),
+            json.dumps(metadata),
+        )
+        await conn.execute(
+            "INSERT INTO vm_thread_creation_owners(thread_id,live_thread_id) "
+            "VALUES ($1::uuid,$1::uuid)",
+            UUID(ids["thread"]),
+        )
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
+    assert retirement is not None
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    async with db.acquire() as conn:
+        assert not await conn.fetchval(
+            "SELECT public.pinned_vm_pre_registration_no_vm_source($1,$2,$3)",
+            UUID(ids["thread"]),
+            UUID(retirement["generation"]),
+            UUID(retirement["token"]),
+        )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.acknowledge_pinned_thread_pre_registration_pod_zero(
+            ids["thread"],
+            expected_runtime_generation=retirement["generation"],
+            expected_retirement_token=retirement["token"],
+            expected_pod_name=f"persistent-{ids['thread'][:12]}",
+            expected_pod_uid="old-pod",
+            expected_workspace_generation=None,
+            expected_workspace_runtime_incarnation=None,
+        )
+    unchanged = await db.get_thread(ids["thread"])
+    assert unchanged["runtime_retirement_local_quiescence"] is None
+
+
+@pytest.mark.asyncio
 async def test_pre_registration_recovery_proves_physical_workspace_zero(db):
     """Agent-orphan zero alone cannot authorize a captured sandbox cleanup."""
     import orchestrator.main as orch_main
