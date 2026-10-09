@@ -2251,6 +2251,7 @@ def _pinned_retirement_local_quiescence_matches(
     )
     from shared.pinned_vm_creation_retirement import (
         initial_vm_creation_retirement_source,
+        pre_registration_vm_agent_zero_source,
     )
 
     vm_creation_source = initial_vm_creation_retirement_source(context)
@@ -2258,22 +2259,7 @@ def _pinned_retirement_local_quiescence_matches(
     # A published pre-registration Agent Pod can be stopped before VM
     # admission. The database independently requires no VM source, retry,
     # waiter, or other VM authority before accepting this receipt.
-    pre_registration_vm_without_vm = bool(
-        backend == "vm"
-        and context.get("entry_status") == "created"
-        and agent_pod
-        and not agent
-        and context.get("agent_id") is None
-        and context.get("control_admission_agent_id") is None
-        and context.get("runtime_attach_token") is None
-        and context.get("vm") is None
-        and context.get("vm_creation_source") is None
-        and not provision_intent
-        and not binding
-        and not (set(workspace) - {"repo_name", "git_remote_url"})
-        and not workspace_provision_intent
-        and not workspace_claim
-    )
+    pre_registration_vm_without_vm = pre_registration_vm_agent_zero_source(context)
     workspace_create_pending = bool(workspace_provision_intent)
     if (
         pre_provision_intent_zero

@@ -3675,6 +3675,124 @@ async def test_vm_pre_registration_pod_zero_settles_before_any_vm_was_issued(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("permanent", [False, True])
+@pytest.mark.parametrize("background_first", [False, True])
+async def test_vm_pre_registration_claimed_pod_end_has_exact_pvc_disposition(
+    db, permanent, background_first
+):
+    """An already-authorized no-VM End retains or fences its exact Agent PVC."""
+    import orchestrator.main as orch_main
+
+    ids = await _seed(
+        db,
+        bind_agent=False,
+        protected_agent_pod=True,
+        workspace_claim=True,
+        pod_provisioner="agent",
+    )
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT metadata FROM threads WHERE id=$1::uuid FOR UPDATE",
+            UUID(ids["thread"]),
+        )
+        metadata = _json(row["metadata"])
+        metadata["config_override"]["officer"]["enabled"] = False
+        metadata["config_override"]["workspace"]["backend"] = "vm"
+        metadata["workspace_container"] = {
+            "repo_name": "regression",
+            "git_remote_url": "https://example.test/repo.git",
+        }
+        await conn.execute(
+            "UPDATE threads SET status='created',metadata=$2::jsonb WHERE id=$1",
+            UUID(ids["thread"]),
+            json.dumps(metadata),
+        )
+    retirement = await db.begin_pinned_thread_retirement(
+        ids["thread"], permanent=permanent
+    )
+    assert retirement is not None
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    claim = retirement["context"]["agent_workspace_claim"]
+    pod = retirement["context"]["agent_pod"]
+    assert claim["status"] == "ready"
+    assert claim["claim_id"] == ids["workspace_claim_id"]
+    assert claim["create_attempt"] == pod["provision_attempt"]
+    assert retirement["context"]["vm_creation_source"] is None
+    assert retirement["context"]["vm"] is None
+
+    provisioner = MagicMock()
+    provisioner.is_available = True
+    provisioner.delete_agent_pod_exact = AsyncMock(return_value=True)
+    provisioner.agent_pod_authority = AsyncMock(
+        side_effect=["exact_terminal", "exact_absent"]
+    )
+    provisioner.release_agent_pod_finalizer_exact = AsyncMock(return_value=True)
+    provisioner.ensure_agent_workspace_claim = AsyncMock(return_value=claim["pvc_uid"])
+    provisioner.fence_agent_workspace_claim = AsyncMock(
+        return_value={"state": "exact_fence", "pvc_uid": "fence-pvc-uid"}
+    )
+    provisioner.agent_workspace_claim_authority = AsyncMock()
+    with (
+        patch.object(orch_main.app.state.resources, "postgres_db", db),
+        patch.object(agent_provisioner_module, "agent_provisioner", provisioner),
+        patch.object(
+            orch_main.app.state.resources.session_router,
+            "teardown_route",
+            AsyncMock(return_value=True),
+        ),
+        patch.object(
+            officer_conference_module,
+            "conclude_conference_if_any",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(
+            thread_retirement_module,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
+        ),
+        patch.object(
+            thread_retirement_module,
+            "revoke_and_delete_managed_repository",
+            AsyncMock(return_value=True),
+        ),
+    ):
+        if background_first:
+            assert await controls_composition.pinned_retirement_operations(
+                orch_main.app.state.resources
+            ).recover_captured_process_zero(retirement)
+        current = await db.get_thread(ids["thread"])
+        result = await controls_composition.thread_retirement_operations(
+            orch_main.app.state.resources
+        ).end_thread_flow(ids["thread"], current, permanent=permanent, force=False)
+
+    assert result == {"status": "deleted" if permanent else "ended"}
+    ended = await db.get_thread(ids["thread"])
+    if permanent:
+        assert ended is None
+    else:
+        assert ended["status"] == "ended"
+        assert ended["runtime_retirement_local_quiescence"] is None
+    async with db.acquire() as conn:
+        retained = await conn.fetchrow(
+            "SELECT status,pvc_uid FROM thread_agent_workspace_claims "
+            "WHERE claim_id=$1::uuid",
+            UUID(ids["workspace_claim_id"]),
+        )
+    assert retained["status"] == ("fenced" if permanent else "ready")
+    assert retained["pvc_uid"] == ("fence-pvc-uid" if permanent else claim["pvc_uid"])
+    if permanent:
+        provisioner.fence_agent_workspace_claim.assert_awaited_once()
+        provisioner.ensure_agent_workspace_claim.assert_not_awaited()
+    else:
+        provisioner.ensure_agent_workspace_claim.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_vm_pre_registration_agent_zero_refuses_existing_creation_authority(db):
     """An owned VM audit row prevents a false never-issued Pod-zero proof."""
 
@@ -3729,6 +3847,223 @@ async def test_vm_pre_registration_agent_zero_refuses_existing_creation_authorit
         )
     unchanged = await db.get_thread(ids["thread"])
     assert unchanged["runtime_retirement_local_quiescence"] is None
+
+    import orchestrator.main as orch_main
+
+    provisioner = MagicMock()
+    provisioner.is_available = True
+    provisioner.delete_agent_pod_exact = AsyncMock(return_value=True)
+    with (
+        patch.object(orch_main.app.state.resources, "postgres_db", db),
+        patch.object(agent_provisioner_module, "agent_provisioner", provisioner),
+    ):
+        assert not await controls_composition.pinned_retirement_operations(
+            orch_main.app.state.resources
+        ).recover_captured_process_zero(retirement)
+    provisioner.delete_agent_pod_exact.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_vm_pre_registration_end_reuses_ready_claim_from_prior_generation(db):
+    """The ready Agent PVC may outlive the Pod attempt that created it."""
+    import orchestrator.main as orch_main
+
+    ids = await _seed(
+        db,
+        bind_agent=False,
+        protected_agent_pod=True,
+        workspace_claim=True,
+        pod_provisioner="agent",
+    )
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT metadata FROM threads WHERE id=$1::uuid FOR UPDATE",
+            UUID(ids["thread"]),
+        )
+        metadata = _json(row["metadata"])
+        metadata["config_override"]["officer"]["enabled"] = False
+        metadata["config_override"]["workspace"]["backend"] = "vm"
+        await conn.execute(
+            "UPDATE threads SET status='created',metadata=$2::jsonb WHERE id=$1",
+            UUID(ids["thread"]),
+            json.dumps(metadata),
+        )
+
+    original = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
+    assert original is not None
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=original["token"],
+        generation=original["generation"],
+        settle_status="ended",
+    )
+    provisioner = MagicMock()
+    provisioner.is_available = True
+    provisioner.delete_agent_pod_exact = AsyncMock(return_value=True)
+    provisioner.agent_pod_authority = AsyncMock(
+        side_effect=["exact_terminal", "exact_absent"]
+    )
+    provisioner.release_agent_pod_finalizer_exact = AsyncMock(return_value=True)
+    with (
+        patch.object(orch_main.app.state.resources, "postgres_db", db),
+        patch.object(agent_provisioner_module, "agent_provisioner", provisioner),
+    ):
+        assert await controls_composition.pinned_retirement_operations(
+            orch_main.app.state.resources
+        ).recover_captured_process_zero(original)
+    assert await db.settle_pinned_thread_retirement(
+        ids["thread"],
+        token=original["token"],
+        generation=original["generation"],
+        final_status="ended",
+    )
+    assert await db.resume_thread(ids["thread"])
+    current = await db.get_thread(ids["thread"])
+    next_generation = str(current["runtime_generation"])
+    next_attempt = str(uuid4())
+    claim_name = original["context"]["agent_workspace_claim"]["pvc_name"]
+    reserved = await db.reserve_pinned_agent_pod_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=next_generation,
+        attempt_id=next_attempt,
+        pod_name=f"persistent-{ids['thread'][:12]}",
+        provisioner="agent",
+        namespace="agents-a",
+        pvc_name=claim_name,
+    )
+    assert reserved is not None
+    assert str(reserved["workspace_claim"]["claim_id"]) == ids["workspace_claim_id"]
+    assert (
+        str(reserved["workspace_claim"]["created_runtime_generation"])
+        == original["generation"]
+    )
+    assert (
+        str(reserved["workspace_claim"]["create_attempt"]) == ids["provision_attempt"]
+    )
+    assert await db.publish_pinned_agent_pod_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=next_generation,
+        attempt_id=next_attempt,
+        pod_name=f"persistent-{ids['thread'][:12]}",
+        pod_uid="next-pod",
+        namespace="agents-a",
+    )
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
+    assert retirement is not None
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    context = retirement["context"]
+    assert context["agent_workspace_claim"]["claim_id"] == ids["workspace_claim_id"]
+    assert (
+        context["agent_workspace_claim"]["create_attempt"] == ids["provision_attempt"]
+    )
+    assert context["agent_pod"]["provision_attempt"] == next_attempt
+    async with db.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT public.pinned_vm_pre_registration_no_vm_source($1,$2,$3)",
+            UUID(ids["thread"]),
+            UUID(retirement["generation"]),
+            UUID(retirement["token"]),
+        )
+    assert await db.acknowledge_pinned_thread_pre_registration_pod_zero(
+        ids["thread"],
+        expected_runtime_generation=next_generation,
+        expected_retirement_token=retirement["token"],
+        expected_pod_name=f"persistent-{ids['thread'][:12]}",
+        expected_pod_uid="next-pod",
+        expected_workspace_generation=None,
+        expected_workspace_runtime_incarnation=None,
+    )
+    assert await db.settle_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        final_status="ended",
+    )
+    async with db.acquire() as conn:
+        retained = await conn.fetchrow(
+            "SELECT status,pvc_uid FROM thread_agent_workspace_claims WHERE claim_id=$1::uuid",
+            UUID(ids["workspace_claim_id"]),
+        )
+    assert retained["status"] == "ready"
+    assert (
+        retained["pvc_uid"] == original["context"]["agent_workspace_claim"]["pvc_uid"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_vm_pre_registration_zero_refuses_durable_claim_drift_before_pod_stop(db):
+    """A captured ready claim cannot authorize a later revoking PVC row."""
+    import orchestrator.main as orch_main
+
+    ids = await _seed(
+        db,
+        bind_agent=False,
+        protected_agent_pod=True,
+        workspace_claim=True,
+        pod_provisioner="agent",
+    )
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT metadata FROM threads WHERE id=$1::uuid FOR UPDATE",
+            UUID(ids["thread"]),
+        )
+        metadata = _json(row["metadata"])
+        metadata["config_override"]["workspace"]["backend"] = "vm"
+        await conn.execute(
+            "UPDATE threads SET status='created',metadata=$2::jsonb WHERE id=$1",
+            UUID(ids["thread"]),
+            json.dumps(metadata),
+        )
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert retirement is not None
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    claim = retirement["context"]["agent_workspace_claim"]
+    assert claim["status"] == "ready"
+    assert await db.revoke_pinned_agent_workspace_claim(
+        ids["thread"],
+        expected_runtime_generation=retirement["generation"],
+        expected_retirement_token=retirement["token"],
+        expected_claim_id=ids["workspace_claim_id"],
+        expected_pvc_name=claim["pvc_name"],
+    )
+    async with db.acquire() as conn:
+        assert not await conn.fetchval(
+            "SELECT public.pinned_vm_pre_registration_no_vm_source($1,$2,$3)",
+            UUID(ids["thread"]),
+            UUID(retirement["generation"]),
+            UUID(retirement["token"]),
+        )
+    provisioner = MagicMock()
+    provisioner.is_available = True
+    provisioner.delete_agent_pod_exact = AsyncMock(return_value=True)
+    with (
+        patch.object(orch_main.app.state.resources, "postgres_db", db),
+        patch.object(agent_provisioner_module, "agent_provisioner", provisioner),
+    ):
+        assert not await controls_composition.pinned_retirement_operations(
+            orch_main.app.state.resources
+        ).recover_captured_process_zero(retirement)
+    provisioner.delete_agent_pod_exact.assert_not_awaited()
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.acknowledge_pinned_thread_pre_registration_pod_zero(
+            ids["thread"],
+            expected_runtime_generation=retirement["generation"],
+            expected_retirement_token=retirement["token"],
+            expected_pod_name=f"persistent-{ids['thread'][:12]}",
+            expected_pod_uid="old-pod",
+            expected_workspace_generation=None,
+            expected_workspace_runtime_incarnation=None,
+        )
 
 
 @pytest.mark.asyncio

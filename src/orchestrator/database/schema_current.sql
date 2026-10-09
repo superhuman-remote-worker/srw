@@ -15135,15 +15135,71 @@ CREATE FUNCTION public.pinned_vm_pre_registration_no_vm_source(p_thread uuid, p_
                     AND (t.runtime_retirement_context->'workspace_container')
                         - 'repo_name' - 'git_remote_url'='{}'::jsonb))
            AND t.runtime_retirement_context->'workspace_provision_intent'='null'::jsonb
-           AND t.runtime_retirement_context->'agent_workspace_claim'='null'::jsonb
+           AND (
+               (t.runtime_retirement_context->'agent_workspace_claim'='null'::jsonb
+                AND NOT EXISTS (
+                    SELECT 1 FROM public.thread_agent_workspace_claims c
+                     WHERE c.thread_id=t.id AND c.status IN ('planned','ready','revoking')))
+               OR
+               (jsonb_typeof(t.runtime_retirement_context->'agent_workspace_claim')='object'
+                AND t.runtime_retirement_context->'agent_workspace_claim'->>'status'='ready'
+                AND t.runtime_retirement_context->'agent_workspace_claim'->>'thread_id'=t.id::text
+                AND t.runtime_retirement_context->'agent_pod'->>'runtime_generation'=t.runtime_generation::text
+                AND EXISTS (
+                    SELECT 1 FROM public.thread_agent_workspace_claims c
+                    JOIN public.thread_agent_pod_provision_intents p
+                      ON p.workspace_claim_id=c.claim_id
+                     WHERE c.thread_id=t.id
+                       AND c.claim_id::text=t.runtime_retirement_context->'agent_workspace_claim'->>'claim_id'
+                       AND c.created_runtime_generation::text=
+                           t.runtime_retirement_context->'agent_workspace_claim'->>'created_runtime_generation'
+                       AND c.create_attempt::text=t.runtime_retirement_context->'agent_workspace_claim'->>'create_attempt'
+                       AND c.provisioner::text=t.runtime_retirement_context->'agent_workspace_claim'->>'provisioner'
+                       AND c.provisioner IN ('agent','persistent')
+                       AND c.pvc_name=t.runtime_retirement_context->'agent_workspace_claim'->>'pvc_name'
+                       AND (
+                           (c.status='ready'
+                            AND c.pvc_uid=t.runtime_retirement_context->'agent_workspace_claim'->>'pvc_uid'
+                            AND c.fenced_at IS NULL AND c.gc_after IS NULL)
+                           OR
+                           (t.runtime_retirement_permanent IS TRUE
+                            AND c.status IN ('fenced','reclaimed')
+                            AND c.fenced_at IS NOT NULL
+                            AND c.pvc_uid IS DISTINCT FROM
+                                t.runtime_retirement_context->'agent_workspace_claim'->>'pvc_uid'
+                            AND t.runtime_retirement_local_quiescence->>'quiescence_protocol'='agent_runtime_zero_v1'
+                            AND t.runtime_retirement_local_quiescence->>'agent_pod_uid'=
+                                t.runtime_retirement_context->'agent_pod'->>'pod_uid')
+                       )
+                       AND NULLIF(c.pvc_uid,'') IS NOT NULL
+                       AND c.namespace=t.runtime_retirement_context->'agent_workspace_claim'->>'namespace'
+                       AND c.namespace=t.runtime_retirement_context->'agent_pod'->>'namespace'
+                       AND c.protection_protocol='finalizer_v1'
+                       AND c.protection_protocol=t.runtime_retirement_context->'agent_workspace_claim'->>'protection_protocol'
+                       AND c.protection_protocol=t.runtime_retirement_context->'agent_pod'->>'protection_protocol'
+                       AND p.thread_id=t.id
+                       AND p.runtime_generation=t.runtime_generation
+                       AND p.attempt_id::text=t.runtime_retirement_context->'agent_pod'->>'provision_attempt'
+                       AND p.status='published'
+                       AND p.pod_name=t.runtime_retirement_context->'agent_pod'->>'pod_name'
+                       AND p.pod_uid=t.runtime_retirement_context->'agent_pod'->>'pod_uid'
+                       AND p.namespace=c.namespace
+                       AND p.provisioner=c.provisioner
+                       AND p.protection_protocol='finalizer_v1'
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM public.thread_agent_workspace_claims other
+                     WHERE other.thread_id=t.id
+                       AND other.status IN ('planned','ready','revoking')
+                       AND other.claim_id::text IS DISTINCT FROM
+                           t.runtime_retirement_context->'agent_workspace_claim'->>'claim_id'))
+           )
            AND NOT EXISTS (SELECT 1 FROM public.agents a
                             WHERE a.thread_id=t.id
                                OR a.hostname=t.runtime_retirement_context->'agent_pod'->>'pod_name'
                                OR a.pod_uid=t.runtime_retirement_context->'agent_pod'->>'pod_uid')
            AND NOT EXISTS (SELECT 1 FROM public.thread_agent_pod_provision_intents p
                             WHERE p.thread_id=t.id AND p.status IN ('planned','revoking'))
-           AND NOT EXISTS (SELECT 1 FROM public.thread_agent_workspace_claims c
-                            WHERE c.thread_id=t.id AND c.status IN ('planned','ready','revoking'))
            AND NOT EXISTS (SELECT 1 FROM public.thread_workspace_provision_intents p
                             WHERE p.thread_id=t.id AND p.status IN ('planned','revoking'))
            AND NOT EXISTS (SELECT 1 FROM public.vm_creation_retries r

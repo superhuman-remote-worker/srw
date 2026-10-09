@@ -36,7 +36,10 @@ from orchestrator.services.vm_workspace_recovery_store import (
     complete_vm_cleanup_permit,
 )
 from shared.pinned_workspace_evidence import has_pinned_physical_workspace_evidence
-from shared.pinned_vm_creation_retirement import initial_vm_creation_retirement_source
+from shared.pinned_vm_creation_retirement import (
+    initial_vm_creation_retirement_source,
+    pre_registration_vm_agent_zero_source,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -597,8 +600,14 @@ class PinnedRetirementOperations:
         )
         vm_creation_source = initial_vm_creation_retirement_source(context)
         vm_creation_zero = vm_creation_source is not None
+        pre_registration_vm_without_vm = pre_registration_vm_agent_zero_source(context)
         workspace_create_pending = bool(workspace_provision_intent)
-        if pre_provision_intent_zero or workspace_create_pending or vm_creation_zero:
+        if (
+            pre_provision_intent_zero
+            or workspace_create_pending
+            or vm_creation_zero
+            or pre_registration_vm_without_vm
+        ):
             expected_protocol = "agent_runtime_zero_v1"
         elif backend == "sandbox":
             if (
@@ -623,7 +632,10 @@ class PinnedRetirementOperations:
             expected_protocol = None
         expected_workspace_generation = (
             None
-            if pre_provision_intent_zero or workspace_create_pending or vm_creation_zero
+            if pre_provision_intent_zero
+            or workspace_create_pending
+            or vm_creation_zero
+            or pre_registration_vm_without_vm
             else sandbox_generation
             if backend == "sandbox"
             else vm.get("provision_generation")
@@ -632,7 +644,10 @@ class PinnedRetirementOperations:
         )
         expected_workspace_runtime = (
             None
-            if pre_provision_intent_zero or workspace_create_pending or vm_creation_zero
+            if pre_provision_intent_zero
+            or workspace_create_pending
+            or vm_creation_zero
+            or pre_registration_vm_without_vm
             else sandbox_runtime
             if backend == "sandbox"
             else vm.get("vm_uid")
@@ -661,6 +676,13 @@ class PinnedRetirementOperations:
                     == vm_creation_source["request_id"]
                     and receipt.get("vm_creation_provision_generation")
                     == vm_creation_source["provision_generation"]
+                )
+            )
+            and (
+                not pre_registration_vm_without_vm
+                or (
+                    receipt.get("vm_creation_request_id") is None
+                    and receipt.get("vm_creation_provision_generation") is None
                 )
             )
             and str(receipt.get("settle_status") or "")
@@ -1960,6 +1982,47 @@ class PinnedRetirementOperations:
                 return bool(
                     current
                     and await self._recover_agent_pod_provision_intent_zero(
+                        retirement, current
+                    )
+                )
+
+        # A created VM Session can expose its Agent Pod before any VM request
+        # exists. The general backend guard below correctly refuses incomplete
+        # VM authority, but this exact never-issued life has an Agent-only
+        # process-zero actuator. Recheck both the immutable context and Pod
+        # marker under the registration/admission advisory lock before stop.
+        if pre_registration_vm_agent_zero_source(
+            context
+        ) and self._pre_registration_agent_pod_zero_candidate(retirement, current):
+            async with self.dependencies.store.try_thread_advisory_lock(
+                thread_id
+            ) as lock_owner:
+                if not lock_owner:
+                    return False
+                current = await self.dependencies.store.get_thread(thread_id)
+                current_context = (current or {}).get("runtime_retirement_context")
+                if isinstance(current_context, str):
+                    try:
+                        current_context = json.loads(current_context)
+                    except (TypeError, ValueError):
+                        return False
+                return bool(
+                    current
+                    and current_context == context
+                    and current.get("runtime_retirement_authorized_at") is not None
+                    and bool(current.get("runtime_retirement_permanent")) == permanent
+                    and pre_registration_vm_agent_zero_source(current_context)
+                    and self._pre_registration_agent_pod_zero_candidate(
+                        retirement, current
+                    )
+                    and await self.dependencies.store.fetchval(
+                        "SELECT public.pinned_vm_pre_registration_no_vm_source("
+                        "$1::uuid,$2::uuid,$3::uuid)",
+                        thread_id,
+                        str(retirement.get("generation") or ""),
+                        str(retirement.get("token") or ""),
+                    )
+                    and await self._recover_pre_registration_agent_pod_zero(
                         retirement, current
                     )
                 )
