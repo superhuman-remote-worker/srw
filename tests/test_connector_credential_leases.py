@@ -64,6 +64,7 @@ from shared.connectors.leases import (
     token_digest,
     token_shape_valid,
 )
+from tests._route_inventory import mounted_route_objects
 
 CONNECTOR = "00000000-0000-4000-8000-0000000000c3"
 
@@ -491,7 +492,7 @@ class TestExchangePort:
     def test_the_port_serves_nothing_else(self, exchange_client):
         client, _ = exchange_client
         app = client.app
-        paths = {getattr(route, "path", None) for route in app.routes}
+        paths = {route.path for route in mounted_route_objects(app)}
         # The exchange, introspection, and the result route bind-time driver
         # pods post to (D6).
         assert paths == {EXCHANGE_PATH, INTROSPECT_PATH, RESULT_PATH}
@@ -502,7 +503,7 @@ class TestExchangePort:
         from orchestrator.application import create_app
 
         app = create_app()
-        paths = {getattr(route, "path", "") for route in app.routes}
+        paths = {route.path for route in mounted_route_objects(app)}
         assert EXCHANGE_PATH not in paths and INTROSPECT_PATH not in paths
         assert RESULT_PATH not in paths
         assert not any("connector-lease" in path for path in paths)
