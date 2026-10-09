@@ -70,7 +70,9 @@ def test_the_route_is_the_one_the_agent_asks():
     [route] = routes.router.routes
     assert route.path == DRIVER_STATE_PATH
     assert route.methods == {"POST"}
-    # Under /api/agents: the ingress strips it, a PAT is refused.
+    # Under /api/agents: a PAT is refused there. The internal key is the
+    # guard (the ingress blocks the prefix only with the opt-in
+    # ingress.internalPathBlock.enabled).
     assert DRIVER_STATE_PATH.startswith("/api/agents/")
 
 

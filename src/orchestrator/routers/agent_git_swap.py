@@ -7,8 +7,10 @@ open), the agent asks here between its tries
 (``shared.connectors.git_swap.DRIVER_STATE_PATH``) and stops waiting with
 the refusal's fixed reason instead of running out the wait.
 
-**Internal** (``X-Internal-Key``, as every agent route; the ingress strips
-``/api/agents``). The binding's own lease token, in the body, is the
+**Internal**: the ``X-Internal-Key`` check is the guard, as on every agent
+route (the ingress blocks ``/api/agents`` only where
+``ingress.internalPathBlock.enabled`` is set, which is opt-in). The
+binding's own lease token, in the body, is the
 authority for the answer: an execution learns about the bindings it holds a
 lease for and nothing else, and the answer is a fixed reason, never the
 reconciler's or the upstream's words. Nothing here logs the token.
