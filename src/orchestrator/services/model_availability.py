@@ -26,7 +26,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from shared.runtime.core.loader import INHERIT_MODEL, ROSTER_INHERIT_MARKER
 from shared.runtime.core.model_registry import UnknownModelError
 
 logger = logging.getLogger(__name__)
@@ -70,6 +69,10 @@ def model_slots(config: dict[str, Any] | None) -> list[ModelSlot]:
     returned too (callers that inject credentials need it), so check
     :func:`slot_model` before treating a slot as a model.
     """
+    # Lazy: the preferences router imports this module and must stay inert
+    # without the agent config loader (test_preferences_dependency_isolation).
+    from shared.runtime.core.loader import ROSTER_INHERIT_MARKER
+
     if not isinstance(config, dict):
         return []
     out: list[ModelSlot] = []
@@ -113,6 +116,8 @@ def model_slots(config: dict[str, Any] | None) -> list[ModelSlot]:
 def slot_model(slot: ModelSlot) -> str | None:
     """The slot's model id, or ``None`` for no model / the bare ``inherit``
     sentinel (a model-less parent, not a model)."""
+    from shared.runtime.core.loader import INHERIT_MODEL
+
     model = slot.section.get("model")
     if not model or model == INHERIT_MODEL:
         return None
