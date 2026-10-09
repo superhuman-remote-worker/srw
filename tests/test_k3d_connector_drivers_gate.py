@@ -78,7 +78,8 @@ def test_dry_run_prints_the_plan_and_touches_nothing(no_cluster, capsys):
         "cleanup",
         "live (D1b)",
         "pinned",
-        "listed",
+        "trusted",
+        "NOT in",
         "egress",
         "169.254.169.254",
         "srw-orchestrator.srw.svc:8085",
@@ -636,7 +637,7 @@ def test_skip_live_runs_the_d1a_gate_alone(monkeypatch):
         for phase in (
             "preflight",
             "fixture",
-            "gitea_listed",
+            "gitea_trusted",
             "lifecycle",
             "refusals",
             "egress",
@@ -775,7 +776,7 @@ def test_a_live_failure_never_skips_the_later_checks(monkeypatch):
     for phase in (
         "preflight",
         "fixture",
-        "gitea_listed",
+        "gitea_trusted",
         "lifecycle",
         "refusals",
         "egress",
@@ -1170,21 +1171,93 @@ def test_public_is_only_noted_without_internet(monkeypatch):
     assert all("no route to github.com" in note for note in runner.report.notes)
 
 
+# -- trusted: SRW's own Gitea needs no operator listing ---------------------------
+
+
+def _trusted_answers(runner, *, token=None, ssh=None, other=None) -> dict:
+    owner, repo = runner.gitea["owner"], runner.repo
+    return {
+        "trusted-repository-token": token
+        or {
+            "status": "ok",
+            "message": f"Authenticated as srw (token); write access to {owner}/{repo}",
+        },
+        "trusted-repository-ssh": ssh
+        or {
+            "status": "ok",
+            "message": "Reached srw-gitea-ssh:2222; host key SHA256:abc is not pinned",
+        },
+        "trusted-other-port": other
+        or {
+            "status": "error",
+            "message": gate.ADDRESS_REFUSED.format(who="gitea")
+            + "; delivered with the token in its clone URL",
+        },
+    }
+
+
 @pytest.mark.parametrize(
-    ("private_hosts", "ok"),
-    [
-        ("kubernetes.default.svc,srw-gitea:3000,srw-gitea-ssh:2222", True),
-        ("srw-gitea,srw-gitea-ssh", True),
-        ("kubernetes.default.svc,srw-gitea:3000", False),
-        ("srw-gitea:443,srw-gitea-ssh:22", False),
-        ("", False),
-    ],
+    "private_hosts", ["", "kubernetes.default.svc", "srw-gitea:443,srw-gitea-ssh:22"]
 )
-def test_the_gitea_endpoints_must_be_listed_for_test(monkeypatch, private_hosts, ok):
+def test_trusted_passes_when_test_reaches_unlisted_gitea(monkeypatch, private_hosts):
     runner = _runner()
     _reach(monkeypatch, ssh=False, https=False, private_hosts=private_hosts)
-    runner.gitea_listed()
+    created = _tests_answer(monkeypatch, runner, _trusted_answers(runner))
+    runner.gitea_trusted()
 
-    assert runner.report.passed is ok
-    if not ok:
-        assert "connectors.providerMinting.privateHosts" in runner.report.results[0][2]
+    assert runner.report.passed, runner.report.results
+    assert len(runner.report.results) == 4
+    owner, repo = runner.gitea["owner"], runner.repo
+    assert created == {
+        "trusted-repository-token": f"http://srw-gitea:3000/{owner}/{repo}.git",
+        "trusted-repository-ssh": f"ssh://git@srw-gitea-ssh:2222/{owner}/{repo}.git",
+        "trusted-other-port": f"http://srw-gitea:8085/{owner}/{repo}.git",
+    }
+    assert set(runner.connectors) == set(created)
+
+
+@pytest.mark.parametrize(
+    "private_hosts",
+    ["srw-gitea:3000", "kubernetes.default.svc,srw-gitea-ssh", "srw-gitea"],
+)
+def test_trusted_needs_gitea_unlisted(monkeypatch, private_hosts):
+    """A listed Gitea would prove nothing: the phase stops before Test."""
+    runner = _runner()
+    _reach(monkeypatch, ssh=False, https=False, private_hosts=private_hosts)
+    monkeypatch.setattr(
+        runner.api, "call", lambda *a, **k: pytest.fail("no Test with Gitea listed")
+    )
+    runner.gitea_trusted()
+
+    assert not runner.report.passed
+    assert len(runner.report.results) == 1
+    assert "remove" in runner.report.results[0][2]
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        {
+            "token": {
+                "status": "error",
+                "message": gate.ADDRESS_REFUSED.format(who="gitea"),
+            }
+        },
+        {
+            "ssh": {
+                "status": "error",
+                "message": gate.ADDRESS_REFUSED.format(
+                    who="SSH host srw-gitea-ssh:2222"
+                ),
+            }
+        },
+        {"other": {"status": "error", "message": "gitea could not be reached"}},
+        {"other": {"status": "ok", "message": "Authenticated as srw (token)"}},
+    ],
+)
+def test_trusted_fails_when_gitea_is_refused_or_another_port_is_not(monkeypatch, fault):
+    runner = _runner()
+    _reach(monkeypatch, ssh=False, https=False)
+    _tests_answer(monkeypatch, runner, _trusted_answers(runner, **fault))
+    runner.gitea_trusted()
+    assert not runner.report.passed

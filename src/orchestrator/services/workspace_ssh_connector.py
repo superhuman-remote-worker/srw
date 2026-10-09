@@ -583,7 +583,8 @@ async def probe_workspace_ssh_connector(
     before any connection when an address is one the connector's projects
     may not reach (``allow_private``: their tier allows private addresses;
     ``connectors.providerMinting.privateHosts`` lists the hosts an operator
-    trusts). Every other failure is the one fixed "could not reach" answer,
+    trusts, and SRW's own Gitea SSH endpoints are trusted as configured).
+    Every other failure is the one fixed "could not reach" answer,
     under one deadline; the detail goes to the server log.
     """
 

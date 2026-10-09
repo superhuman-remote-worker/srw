@@ -336,9 +336,10 @@ connectors:
     # or cluster address, for every project, e.g. kubernetes.default.svc for
     # the cluster SRW runs in. Link-local and metadata addresses never.
     # A connector's Test reaches its host from the orchestrator under the
-    # same rule (a repository's forge API and SSH endpoint): list SRW's own
-    # in-cluster Gitea here (e.g. srw-gitea:3000 and srw-gitea:2222) for
-    # Test to reach repositories on it by its service address.
+    # same rule (a repository's forge API and SSH endpoint). SRW's own Gitea
+    # needs no entry: Test trusts the endpoints the chart configures for it
+    # (its internal and public API URLs and SSH endpoints, each with its
+    # port only), never for a mint.
     privateHosts: []
   drivers:
     # -- Repositories whose driver images are trusted (D6), matched on a

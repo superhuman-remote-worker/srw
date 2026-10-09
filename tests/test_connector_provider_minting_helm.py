@@ -50,6 +50,36 @@ def test_a_private_host_is_a_host_or_host_and_port(host):
         render(f"connectors.providerMinting.privateHosts={{{host}}}")
 
 
+def test_test_trusts_the_gitea_the_chart_configures_on_its_ports_only():
+    """A connector's Test trusts SRW's own Gitea at the endpoints the chart
+    gives the orchestrator (its ConfigMap's GITEA_* values), with no
+    privateHosts entry; every endpoint names its port."""
+    from orchestrator.application.settings import parse_gitea_endpoints
+
+    docs = render()
+    data: dict[str, str] = {}
+    for doc in docs:
+        if doc["kind"] == "ConfigMap" and "GITEA_INTERNAL_URL" in (
+            doc.get("data") or {}
+        ):
+            data = doc["data"]
+    assert data, "no ConfigMap carries GITEA_INTERNAL_URL"
+    endpoints = parse_gitea_endpoints(data)
+    assert endpoints
+    assert all(entry.rsplit(":", 1)[1].isdigit() for entry in endpoints)
+    internal = data["GITEA_INTERNAL_URL"]
+    if internal:
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(internal)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        assert f"{parsed.hostname}:{port}" in endpoints
+    if data.get("GITEA_SSH_INTERNAL_PORT", "0") != "0":
+        assert any(
+            entry.endswith(f":{data['GITEA_SSH_INTERNAL_PORT']}") for entry in endpoints
+        )
+
+
 def test_the_settings_read_the_environment(monkeypatch):
     monkeypatch.setenv("CONNECTOR_PROVIDER_MINTING_ENABLED", "false")
     monkeypatch.setenv(

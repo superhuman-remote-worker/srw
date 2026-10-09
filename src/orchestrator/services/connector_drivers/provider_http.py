@@ -41,7 +41,10 @@ held to the same rules: a repository's forge API goes through
 :func:`tier_allows_private` reads. Its lookups run on resolver threads of
 their own (:data:`LANE_TEST`): Tests any user may start never hold the
 threads a mint needs. On an IPv4-only installation an IPv6 address is
-refused, as a driver pod's egress refuses it.
+refused, as a driver pod's egress refuses it. SRW's own Gitea, at exactly
+the endpoints its settings name (:attr:`ProviderNetwork.test_hosts`), is
+trusted for a Test as a listed host is, with no listing; a mint never is
+(its provider is a Kubernetes API server or GitHub, never SRW's Gitea).
 
 Tests replace the client factory and the network (resolver) with
 :func:`configure_provider_http` and :func:`configure_provider_network`.
@@ -223,6 +226,10 @@ class ProviderNetwork:
     ipv6: bool = False
     private_hosts: frozenset[str] = frozenset()
     resolver: Resolver = field(default=provider_resolver, repr=False)
+    #: ``host:port`` endpoints a connector's Test may reach at a private or
+    #: cluster address with no listing: SRW's own Gitea, as its settings name
+    #: it (API and SSH). Host and port both; never for a provider call.
+    test_hosts: frozenset[str] = frozenset()
 
     def listed(self, url: httpx.URL) -> bool:
         """Whether the operator listed this host (``host``, or ``host:port``
@@ -234,6 +241,14 @@ class ProviderNetwork:
         """Whether the operator listed ``host`` (alone, or with ``port``)."""
         host = host.lower()
         return host in self.private_hosts or f"{host}:{port}" in self.private_hosts
+
+    def trusts(self, host: str, port: int, *, lane: str) -> bool:
+        """Whether ``host:port`` may be private or in the cluster's ranges
+        (never loopback, link-local or metadata): the operator listed it, or
+        a connector's Test asks SRW's own Gitea at one of its endpoints."""
+        if self.lists(host, port):
+            return True
+        return lane == LANE_TEST and f"{host.lower()}:{port}" in self.test_hosts
 
     def resolver_for(self, lane: str) -> Resolver:
         """The resolver a lane's lookups run on: a Test's on threads of its
@@ -390,7 +405,7 @@ async def checked_addresses(
     network = provider_network()
     label = clean(f"{host}:{port}", 300)
     policy = network.policy(
-        listed=network.lists(host, port), allow_private=allow_private
+        listed=network.trusts(host, port, lane=lane), allow_private=allow_private
     )
     try:
         addresses: Iterable[Any] = [ipaddress.ip_address(host)]

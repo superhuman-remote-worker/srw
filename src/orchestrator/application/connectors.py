@@ -245,6 +245,8 @@ def configure_provider_minting(resources: ApplicationResources) -> None:
             private_tiers=frozenset(settings.connector_service_private_tiers),
             ipv6=settings.connector_service_ipv6,
             private_hosts=frozenset(settings.connector_provider_minting_private_hosts),
+            # SRW's own Gitea, for a connector's Test only (never a mint).
+            test_hosts=frozenset(settings.connector_test_gitea_endpoints),
         )
     )
     enabled = settings.connector_provider_minting_enabled

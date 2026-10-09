@@ -35,10 +35,11 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
              deliberate changes: kubeconfig, generic_file and a host-less
              ssh_key answer ``unsupported``. WebDAV's Test answer is printed
              as a NOTE: the orchestrator image has no webdav client
-  listed     the lifecycle's repository Tests reach SRW's Gitea at its
-             service address, which the orchestrator reaches for a Test only
-             where the operator lists it: its API and SSH host:port must be in
-             connectors.providerMinting.privateHosts (values-local.yaml)
+  trusted    SRW's own Gitea needs no operator listing: with its API and SSH
+             host:port NOT in connectors.providerMinting.privateHosts, Test of
+             the fixture's in-cluster Gitea repositories (token and SSH, at
+             Gitea's service address) answers ok, and a token repository on
+             Gitea's host at another port is refused
   kb         index status and reindex answer; the index reaches ``ready``
   refusals   a repository without a URL is refused (400); with
              MCP_DATASOURCES_ENABLED off an MCP create is refused (403)
@@ -852,9 +853,10 @@ PLAN = [
     "credentials, kubeconfig, generic_file, host-less ssh_key",
     "lifecycle: kubeconfig, generic_file and a host-less ssh_key Test as "
     "unsupported; WebDAV Test reported as a NOTE",
-    "listed: SRW's Gitea API and SSH host:port are in "
-    "connectors.providerMinting.privateHosts (the repository Tests reach it "
-    "at its service address)",
+    "trusted: SRW's Gitea API and SSH host:port are NOT in "
+    "connectors.providerMinting.privateHosts, and Test of the in-cluster "
+    "Gitea repositories (token, SSH) still answers ok; Gitea's host on "
+    "another port is refused",
     "kb: index status and reindex answer; the index reaches ready",
     "refusals: repository without URL (400); MCP create with the gate off (403)",
     "egress: Test of a repository at https://srw-orchestrator.srw.svc:8085/, "
@@ -1570,10 +1572,12 @@ class ConnectorDriversGate:
             f"HTTP {status}: {str(body)[:160]}",
         )
 
-    def gitea_listed(self) -> None:
-        """The lifecycle's repository Tests reach SRW's Gitea at its service
-        address (the cluster's service range): only a host the operator lists
-        in ``connectors.providerMinting.privateHosts`` may be reached there."""
+    def gitea_trusted(self) -> None:
+        """SRW's own Gitea needs no operator listing: Test trusts the
+        endpoints its settings name (host and port both). With neither of
+        the fixture's endpoints in ``connectors.providerMinting.privateHosts``,
+        Test of its in-cluster token and SSH repositories answers ok, and the
+        same host on another port is refused."""
         found = in_orchestrator(_REACH_PROGRAM, {"reach": {}})
         hosts = {
             entry.strip().lower()
@@ -1581,25 +1585,57 @@ class ConnectorDriversGate:
             if entry.strip()
         }
         api = urlsplit(str(self.gitea["url"]))
-        wanted = (
-            (api.hostname or "", api.port or (443 if api.scheme == "https" else 80)),
+        api_host = api.hostname or ""
+        api_port = api.port or (443 if api.scheme == "https" else 80)
+        endpoints = (
+            (api_host, api_port),
             (str(self.gitea["ssh_host"]), int(self.gitea["ssh_port"])),
         )
-        missing = [
+        listed = [
             f"{host}:{port}"
-            for host, port in wanted
-            if not host_listed(hosts, host, port)
+            for host, port in endpoints
+            if host_listed(hosts, host, port)
         ]
-        self.report.check(
-            "listed: SRW's Gitea API and SSH endpoints are in "
-            "connectors.providerMinting.privateHosts, so Test reaches them",
-            not missing,
+        if not self.report.check(
+            "trusted: SRW's Gitea API and SSH endpoints are NOT in "
+            "connectors.providerMinting.privateHosts (Test must trust them "
+            "unlisted)",
+            not listed,
             (
-                f"add {' and '.join(missing)} to connectors.providerMinting."
+                f"remove {' and '.join(listed)} from connectors.providerMinting."
                 "privateHosts in deployment/values-local.yaml"
-                if missing
-                else ", ".join(sorted(hosts))
+                if listed
+                else ", ".join(sorted(hosts)) or "privateHosts is empty"
             ),
+        ):
+            return
+        cases = {case.label: case for case in self.type_cases()}
+        for source in ("repository-token", "repository-ssh"):
+            case = cases[source]
+            status, answer = self.tested(f"trusted-{source}", case.body)
+            message = str(answer.get("message", ""))
+            self.report.check(
+                f"trusted: Test of the in-cluster Gitea {source} answers ok "
+                "with Gitea unlisted",
+                status == 200
+                and answer.get("status") == "ok"
+                and all(text in message for text in case.expect_text),
+                f"HTTP {status} {answer.get('status')!r}: {message[:240]}",
+            )
+        other = 8085 if api_port != 8085 else 8086
+        url = f"{api.scheme}://{api_host}:{other}/{self.gitea['owner']}/{self.repo}.git"
+        status, answer = self.tested(
+            "trusted-other-port",
+            {**cases["repository-token"].body, "connection_url": url},
+        )
+        message = str(answer.get("message", ""))
+        self.report.check(
+            f"trusted: a token repository on Gitea's host at another port "
+            f"({api_host}:{other}) is refused",
+            status == 200
+            and answer.get("status") == "error"
+            and message.startswith(ADDRESS_REFUSED.format(who="gitea")),
+            f"HTTP {status} {answer.get('status')!r}: {message[:240]}",
         )
 
     def tested(self, label: str, body: dict[str, Any]) -> tuple[int, dict]:
@@ -2783,7 +2819,7 @@ class ConnectorDriversGate:
         try:
             self.preflight()
             self.fixture()
-            self.gitea_listed()
+            self.gitea_trusted()
             self.lifecycle()
             self.refusals()
             self.egress()

@@ -14,8 +14,9 @@ Test asks the forge API what a token may do, or reaches the SSH endpoint and
 reports the host key the connector form offers to pin. The address is the
 connector's own, so either probe is held to the provider calls' rules
 (``provider_http``): resolved once and checked against the project tier (a
-private address only where the tier allows one, or on a host the operator
-lists in ``connectors.providerMinting.privateHosts``), dialled at the checked
+private address only where the tier allows one, on a host the operator
+lists in ``connectors.providerMinting.privateHosts``, or at one of SRW's own
+Gitea endpoints as its settings name them), dialled at the checked
 address, under one deadline, without redirects or proxies, and refused or
 failed with a fixed reason; the raw detail goes to the server log only.
 """

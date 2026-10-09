@@ -153,10 +153,12 @@ def _forge(
     *,
     addresses: dict[str, tuple[str, ...]] | None = None,
     private_hosts: tuple[str, ...] = (),
+    test_hosts: tuple[str, ...] = (),
 ) -> list[httpx.Request]:
     """Send Test's forge calls (``provider_http``) to ``handler`` (sync or
     async), resolving names from ``addresses`` (default: api.github.com is
-    public); returns the requests it saw."""
+    public), with SRW's own Gitea at ``test_hosts``; returns the requests it
+    saw."""
     seen: list[httpx.Request] = []
 
     async def record(request: httpx.Request) -> httpx.Response:
@@ -182,6 +184,7 @@ def _forge(
                 {"api.github.com": (PUBLIC,)} if addresses is None else addresses
             ),
             private_hosts=frozenset(private_hosts),
+            test_hosts=frozenset(test_hosts),
         ),
     )
     return seen
@@ -982,3 +985,202 @@ class TestRepositoryTestEgress:
         assert verified and all(
             context.cert_store_stats()["x509_ca"] == 1 for context in verified
         )
+
+
+#: SRW's own Gitea as the chart configures it on k3d.
+_SRW_GITEA_ENV = {
+    "GITEA_URL": "https://git.localhost",
+    "GITEA_INTERNAL_URL": "http://srw-gitea:3000",
+    "GITEA_SSH_INTERNAL_HOST": "srw-gitea",
+    "GITEA_SSH_INTERNAL_PORT": "2222",
+    "GITEA_SSH_EXTERNAL_HOST": "",
+    "GITEA_SSH_EXTERNAL_PORT": "0",
+}
+_SRW_GITEA = ("srw-gitea:3000", "srw-gitea:2222", "git.localhost:443")
+
+
+class TestSrwGiteaIsTrustedForTest:
+    """SRW's own Gitea, at exactly the endpoints its settings name, is
+    reached by a connector's Test with no operator listing; nothing else in
+    the cluster is, nor the same host on another port, nor by a mint."""
+
+    @pytest.mark.parametrize(
+        ("env", "expected"),
+        [
+            (_SRW_GITEA_ENV, set(_SRW_GITEA)),
+            (
+                {
+                    "GITEA_URL": "https://example.com/git",  # single origin
+                    "GITEA_INTERNAL_URL": "http://SRW-Gitea:3000/",
+                    "GITEA_SSH_INTERNAL_HOST": "",  # the API's host
+                    "GITEA_SSH_INTERNAL_PORT": "2222",
+                    "GITEA_SSH_EXTERNAL_HOST": "git.example.com",
+                    "GITEA_SSH_EXTERNAL_PORT": "2022",
+                },
+                {
+                    "example.com:443",
+                    "srw-gitea:3000",
+                    "srw-gitea:2222",
+                    "git.example.com:2022",
+                },
+            ),
+            (
+                {
+                    "GITEA_URL": "https://git.example.com:8443",
+                    "GITEA_SSH_INTERNAL_HOST": "",  # SSH off: port 0
+                    "GITEA_SSH_INTERNAL_PORT": "0",
+                    "GITEA_SSH_EXTERNAL_HOST": "ssh.example.com",
+                    "GITEA_SSH_EXTERNAL_PORT": "not-a-port",
+                },
+                {"git.example.com:8443"},
+            ),
+            ({}, set()),
+            ({"GITEA_URL": "not a url", "GITEA_INTERNAL_URL": "http://[::1"}, set()),
+        ],
+    )
+    def test_the_endpoints_come_from_the_gitea_settings(self, env, expected):
+        from orchestrator.application.settings import parse_gitea_endpoints
+
+        assert parse_gitea_endpoints(env) == expected
+
+    def test_the_settings_read_them_from_the_environment(self, monkeypatch):
+        from orchestrator.application.settings import DeploymentSettings
+
+        for name, value in _SRW_GITEA_ENV.items():
+            monkeypatch.setenv(name, value)
+        settings = DeploymentSettings.from_environment()
+        assert settings.connector_test_gitea_endpoints == frozenset(_SRW_GITEA)
+
+    def test_the_application_installs_them_for_test_only(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from orchestrator.application.connectors import configure_provider_minting
+        from orchestrator.application.settings import DeploymentSettings
+        from orchestrator.services import connector_minted_credentials as minted
+
+        monkeypatch.setitem(provider_http._state, "network", ProviderNetwork())
+        monkeypatch.setitem(minted._state, "runtime", None)
+        monkeypatch.setitem(minted._state, "enabled", True)
+        # configure_minted_credentials clears these: the test's own.
+        monkeypatch.setattr(minted, "_prepared", {})
+        monkeypatch.setattr(minted, "_test_mints", {})
+        from dataclasses import replace
+
+        settings = replace(
+            DeploymentSettings.from_environment(),
+            connector_test_gitea_endpoints=frozenset(_SRW_GITEA),
+            connector_provider_minting_private_hosts=frozenset(
+                {"kubernetes.default.svc"}
+            ),
+        )
+        configure_provider_minting(SimpleNamespace(settings=settings, postgres_db=None))
+        network = provider_http.provider_network()
+        assert network.test_hosts == frozenset(_SRW_GITEA)
+        assert network.private_hosts == frozenset({"kubernetes.default.svc"})
+        assert network.trusts("srw-gitea", 3000, lane=provider_http.LANE_TEST)
+        assert not network.trusts("srw-gitea", 3000, lane=provider_http.LANE_PROVIDER)
+
+    @pytest.mark.asyncio
+    async def test_a_configured_gitea_endpoint_is_tested_without_listing(
+        self, monkeypatch
+    ):
+        seen = _forge(
+            monkeypatch,
+            _ok(),
+            addresses={"srw-gitea": ("10.43.0.7",)},
+            test_hosts=_SRW_GITEA,
+        )
+        result = await _test(_repository("http://srw-gitea:3000/acme/widgets.git"))
+
+        assert result["status"] == "ok", result
+        assert [str(request.url.host) for request in seen] == ["10.43.0.7"] * 2
+        assert seen[0].headers["host"] == "srw-gitea:3000"
+
+    @pytest.mark.asyncio
+    async def test_a_public_gitea_name_on_a_node_address_is_tested(self, monkeypatch):
+        """Gitea's public name may resolve to a node or load balancer from
+        inside the cluster: refused for any other host, on any tier."""
+        seen = _forge(
+            monkeypatch,
+            _ok(),
+            addresses={"git.localhost": ("172.18.0.3",)},
+            test_hosts=_SRW_GITEA,
+        )
+        monkeypatch.setitem(
+            provider_http._state,
+            "network",
+            ProviderNetwork(
+                resolver=fake_resolver({"git.localhost": ("172.18.0.3",)}),
+                refused_cidrs=("172.16.0.0/12",),
+                test_hosts=frozenset(_SRW_GITEA),
+            ),
+        )
+        result = await _test(_repository("https://git.localhost/acme/widgets.git"))
+        assert result["status"] == "ok", result
+        assert len(seen) == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://srw-gitea:8085/acme/widgets.git",  # Gitea's host, another port
+            "http://srw-gitea:22/acme/widgets.git",
+            "https://srw-gitea/acme/widgets.git",  # 443: not configured
+            "https://srw-orchestrator.srw.svc:8085/acme/widgets.git",  # not Gitea
+        ],
+    )
+    async def test_anything_else_in_the_cluster_is_still_refused(
+        self, monkeypatch, url
+    ):
+        seen = _forge(
+            monkeypatch,
+            _ok(),
+            addresses={
+                "srw-gitea": ("10.43.0.7",),
+                "srw-orchestrator.srw.svc": ("10.43.0.10",),
+            },
+            test_hosts=_SRW_GITEA,
+        )
+        result = await _test(_repository(url))
+
+        assert result == {"status": "error", "message": REFUSED.format(forge="gitea")}
+        assert seen == []
+
+    @pytest.mark.asyncio
+    async def test_a_bare_host_entry_trusts_no_port(self, monkeypatch):
+        seen = _forge(
+            monkeypatch,
+            _ok(),
+            addresses={"srw-gitea": ("10.43.0.7",)},
+            test_hosts=("srw-gitea",),
+        )
+        result = await _test(_repository("http://srw-gitea:3000/acme/widgets.git"))
+        assert result["message"] == REFUSED.format(forge="gitea")
+        assert seen == []
+
+    @pytest.mark.asyncio
+    async def test_metadata_stays_refused_at_a_gitea_endpoint(self, monkeypatch):
+        seen = _forge(
+            monkeypatch,
+            _ok(),
+            addresses={"git.localhost": ("169.254.169.254",)},
+            test_hosts=_SRW_GITEA,
+        )
+        result = await _test(_repository("https://git.localhost/acme/widgets.git"))
+        assert result["message"] == REFUSED.format(forge="gitea")
+        assert seen == []
+
+    @pytest.mark.asyncio
+    async def test_a_mint_never_trusts_srw_gitea(self, monkeypatch):
+        seen = _forge(
+            monkeypatch,
+            _ok(),
+            addresses={"srw-gitea": ("10.43.0.7",)},
+            test_hosts=_SRW_GITEA,
+        )
+        with pytest.raises(provider_http.ProviderError) as refused:
+            await provider_http.provider_request(
+                "GET", "http://srw-gitea:3000/api/v1/user", who="x", headers={}
+            )
+        assert refused.value.reason == "address_refused"
+        assert seen == []

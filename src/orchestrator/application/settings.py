@@ -15,8 +15,10 @@ import ipaddress
 import json
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from orchestrator.services.connector_drivers.workspace_ssh import (
     WORKSPACE_SSH_KNOWN_HOSTS_ENV,
@@ -129,6 +131,52 @@ def parse_json_object(name: str, raw: str | None) -> dict[str, Any]:
 def parse_name_list(raw: str | None) -> frozenset[str]:
     """A comma-separated list of names (hosts, CIDRs); blanks are dropped."""
     return frozenset(item.strip() for item in (raw or "").split(",") if item.strip())
+
+
+def _port(raw: Any) -> int | None:
+    try:
+        port = int(str(raw).strip())
+    except ValueError:
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def parse_gitea_endpoints(environ: Mapping[str, str]) -> frozenset[str]:
+    """SRW's own Gitea as ``host:port`` endpoints, from the variables the
+    chart sets for it: the in-cluster and browser-facing API URLs
+    (``GITEA_INTERNAL_URL``, ``GITEA_URL``) and the internal and external
+    SSH endpoints (``GITEA_SSH_INTERNAL_HOST``/``_PORT``, the host defaulting
+    to the API's as the Gitea client's does, and ``GITEA_SSH_EXTERNAL_HOST``/
+    ``_PORT``). A connector's Test may reach exactly these at a private or
+    cluster address, each with its port. Unset, empty, port ``0`` (SSH off)
+    or unparsable adds nothing."""
+    endpoints: set[str] = set()
+
+    def add(host: str | None, port: int | None) -> None:
+        host = (host or "").strip().lower().rstrip(".")
+        if host and port is not None:
+            endpoints.add(f"{host}:{port}")
+
+    api_hosts: list[str] = []
+    for name in ("GITEA_INTERNAL_URL", "GITEA_URL"):
+        try:
+            parsed = urlsplit(environ.get(name, "").strip())
+            port = parsed.port or {"https": 443, "http": 80}.get(parsed.scheme)
+        except ValueError:
+            continue
+        if parsed.hostname:
+            api_hosts.append(parsed.hostname)
+        add(parsed.hostname, port)
+    add(
+        environ.get("GITEA_SSH_INTERNAL_HOST", "").strip()
+        or (api_hosts[0] if api_hosts else None),
+        _port(environ.get("GITEA_SSH_INTERNAL_PORT", "2222")),
+    )
+    add(
+        environ.get("GITEA_SSH_EXTERNAL_HOST", ""),
+        _port(environ.get("GITEA_SSH_EXTERNAL_PORT", "22")),
+    )
+    return frozenset(endpoints)
 
 
 #: The longest a delivery waits for a bind: under the agent's 30 s request
@@ -346,6 +394,10 @@ class DeploymentSettings:
     #: cluster address, e.g. ``kubernetes.default.svc``.
     connector_provider_minting_enabled: bool = True
     connector_provider_minting_private_hosts: frozenset[str] = frozenset()
+    #: SRW's own Gitea (``host:port``, :func:`parse_gitea_endpoints`): a
+    #: connector's Test reaches these at a private or cluster address with
+    #: no operator listing, exactly these ports; a mint never does.
+    connector_test_gitea_endpoints: frozenset[str] = frozenset()
     #: Where service pods run and how the leader reconciles them
     #: (``connectors.servicePods``): the driver and release namespaces, the
     #: installation cap, the idle and start timeouts, the pass interval, the
@@ -524,6 +576,7 @@ class DeploymentSettings:
                     os.environ.get("CONNECTOR_PROVIDER_MINTING_PRIVATE_HOSTS")
                 )
             ),
+            connector_test_gitea_endpoints=parse_gitea_endpoints(os.environ),
             connector_service_namespace=os.environ.get(
                 "CONNECTOR_SERVICE_NAMESPACE", ""
             ).strip(),

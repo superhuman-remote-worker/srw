@@ -866,9 +866,12 @@ _SSH_ADDRESSES = {
 }
 
 
-def _ssh_network(monkeypatch, addresses=None, *, private_hosts=()) -> None:
+def _ssh_network(
+    monkeypatch, addresses=None, *, private_hosts=(), test_hosts=()
+) -> None:
     """Resolve the probe's names from ``addresses`` (never the system
-    resolver), with ``private_hosts`` listed by the operator."""
+    resolver), with ``private_hosts`` listed by the operator and SRW's own
+    Gitea at ``test_hosts``."""
     from orchestrator.services.connector_drivers import provider_http
     from tests._provider_fakes import fake_resolver
 
@@ -878,6 +881,7 @@ def _ssh_network(monkeypatch, addresses=None, *, private_hosts=()) -> None:
         provider_http.ProviderNetwork(
             resolver=fake_resolver(_SSH_ADDRESSES if addresses is None else addresses),
             private_hosts=frozenset(private_hosts),
+            test_hosts=frozenset(test_hosts),
         ),
     )
 
@@ -1153,6 +1157,27 @@ class TestProbeEgress:
         # The listing names its port.
         refused = await self._probe({"host": "srw-gitea", "port": 22})
         assert refused["message"] == _SSH_REFUSED.format(endpoint="srw-gitea:22")
+        assert reached == [("10.43.0.7", 2222)]
+
+    @pytest.mark.asyncio
+    async def test_srw_gitea_ssh_is_tested_without_listing_on_its_port_only(
+        self, monkeypatch, reached
+    ):
+        """SRW's own Gitea SSH endpoint, as its settings name it, needs no
+        operator listing (C1 pins its host key through Test); the same host
+        on another port, or another cluster host, is still refused."""
+        _ssh_network(
+            monkeypatch,
+            {"srw-gitea": ("10.43.0.7",), "srw-other": ("10.43.0.8",)},
+            test_hosts=("srw-gitea:3000", "srw-gitea:2222"),
+        )
+        result = await self._probe({"host": "srw-gitea", "port": 2222})
+        assert result["status"] == "ok", result
+        assert reached == [("10.43.0.7", 2222)]
+
+        for host, port in (("srw-gitea", 22), ("srw-other", 2222)):
+            refused = await self._probe({"host": host, "port": port})
+            assert refused["message"] == _SSH_REFUSED.format(endpoint=f"{host}:{port}")
         assert reached == [("10.43.0.7", 2222)]
 
     @pytest.mark.asyncio

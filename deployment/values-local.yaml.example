@@ -318,13 +318,8 @@ connectors:
   # Provider-minted credentials (C5): the cluster SRW runs in is a provider
   # the operator trusts, so a kubeconfig connector's TokenRequest may reach
   # its API server at its service address (scripts/k3d-provider-minted-gate.py).
-  # A connector's Test is held to the same list: SRW's own Gitea (API on
-  # 3000, SSH on 2222) is listed so repository connectors on it can be
-  # tested at its service address (scripts/k3d-connector-drivers-gate.py and
-  # scripts/k3d-ssh-agent-connectors-gate.py); every other cluster address
-  # is refused.
   providerMinting:
-    privateHosts: ["kubernetes.default.svc", "srw-gitea:3000", "srw-gitea:2222"]
+    privateHosts: ["kubernetes.default.svc"]
   drivers:
     registry:
       # The k3d registry Tilt pushes driver images to; the orchestrator pod
