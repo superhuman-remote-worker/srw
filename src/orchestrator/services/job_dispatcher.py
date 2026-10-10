@@ -1336,6 +1336,11 @@ async def _match_jobs(
     # processing: until its claim resolves (a refused start fails it through
     # the completion ledger; a lost delivery waits for its lease) it is not
     # pending, so it must not provision an agent or preempt a running job.
+    # Deliberately not behind the completion-commands flag: in both modes no
+    # claimed row comes back to pending within the pass (with the flag off a
+    # refused start is already failed), so an agent provisioned or a job
+    # preempted for it was always wasted. Every claim path was checked for a
+    # regression and none was found (connector drivers decision 34 review).
     claimed_job_ids = set()
 
     agents_iter = iter(available_agents)
