@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -66,6 +66,7 @@ class FakeHeldController:
         self.released = False
         self.lost_once = set()
         self.bad_once = set()
+        self.wrong_once = set()
 
     async def request(self, payload):
         self.actions.append(payload)
@@ -83,6 +84,14 @@ class FakeHeldController:
             if "inspect" in self.lost_once:
                 self.lost_once.remove("inspect")
                 return None
+            if "inspect" in self.wrong_once:
+                self.wrong_once.remove("inspect")
+                return {
+                    "status": "candidate",
+                    "frozen": {**self.state["frozen"], "vm_uid": str(uuid4())},
+                    "retention_preflight": self.state["preflight"],
+                    "_identity_authenticated": True,
+                }
             return {
                 "status": "candidate",
                 "frozen": self.state["frozen"],
@@ -99,6 +108,9 @@ class FakeHeldController:
                 return None
             evidence = terminal_proof(payload["frozen"], payload["frozen_digest"])
             evidence["kind"] = "vm_job_never_app_ready_retained_positive_stop_v1"
+            if "stop" in self.wrong_once:
+                self.wrong_once.remove("stop")
+                evidence["vm_uid"] = str(uuid4())
             if "stop" in self.bad_once:
                 self.bad_once.remove("stop")
                 return {
@@ -275,6 +287,48 @@ async def test_unauthenticated_stop_reply_holds_proof_and_capacity(db, monkeypat
         parent_cleanup=state["parent"],
     )
     assert result == VMTeardownResult("process_zero_unproven", False)
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_pre_ssh_stop_proofs WHERE job_id=$1",
+            UUID(state["job_id"]),
+        )
+        == 0
+    )
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE id=$1",
+            UUID(state["reservation_id"]),
+        )
+        == "teardown"
+    )
+    assert not controller.released
+    retire.assert_not_awaited()
+    delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrong", ["inspect", "stop"])
+async def test_foreign_candidate_or_proof_holds_without_capacity_release(
+    db, monkeypatch, wrong
+):
+    state = await held_state(db, zero=True)
+    controller = FakeHeldController(state)
+    controller.wrong_once.add(wrong)
+    provisioner, retire, delete = configured_provisioner(
+        db, state, controller, monkeypatch
+    )
+    assert await provisioner.release_vm_captured(
+        state["job_id"],
+        state["identity"],
+        purge_disk=False,
+        capture_snapshot=False,
+        parent_cleanup=state["parent"],
+    ) == VMTeardownResult("process_zero_unproven", False)
+    assert [item["action"] for item in controller.actions] == (
+        ["inspect_never_app_ready_retained"]
+        if wrong == "inspect"
+        else ["inspect_never_app_ready_retained", "stop"]
+    )
     assert (
         await db.fetchval(
             "SELECT count(*) FROM vm_pre_ssh_stop_proofs WHERE job_id=$1",
