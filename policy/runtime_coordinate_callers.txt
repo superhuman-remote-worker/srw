@@ -16,7 +16,7 @@
 src/orchestrator/routers/ssh_access.py  internal_ssh_native_first_use  http  client.post  f7f27122753e  #1  exact-runtime-recipient
 src/orchestrator/routers/thread_files.py  upload_files_to_thread  remote-effect  upload_files_to_attested_vm_workspace  8f1a01b30667  #1  fresh-k8s-attestation
 src/orchestrator/services/agent_cloud_mounts.py  _build_agent_cloud_mount  remote-effect  _legacy_live_mount_set  f789fbd8b82c  #1  local-only
-src/orchestrator/services/agent_cloud_mounts.py  _build_agent_cloud_mount  remote-effect  _resolve_live_mount_set  27dd312482ee  #1  local-only
+src/orchestrator/services/agent_cloud_mounts.py  _build_agent_cloud_mount  remote-effect  _resolve_live_mount_set  c849a47451d1  #1  local-only
 src/orchestrator/services/agent_registration.py  get_agent_system_info  http  client.get  7e0ff1b83a17  #1  read-only-probe
 src/orchestrator/services/agent_toolset_probe.py  agent_toolset_from_status  http  client.get  8d7b711c0959  #1  read-only-probe
 src/orchestrator/services/agent_toolset_probe.py  agent_toolset_probe  http  client.get  8d7b711c0959  #1  read-only-probe

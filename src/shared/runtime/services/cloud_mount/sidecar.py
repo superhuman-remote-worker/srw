@@ -92,6 +92,21 @@ REASON_TEXT = {
         "this workspace can't mount cloud folders, so they aren't delivered here"
     ),
 }
+#: Plainer words where a reason's detail says more: a folder this workspace
+#: never gets, though the next one does.
+DETAIL_TEXT = {
+    ("mount_unsupported", "needs_new_pod"): (
+        "it is mounted only when the session's workspace starts again"
+    ),
+    ("mount_unsupported", "plan_failed"): (
+        "its mount could not be set up when the workspace started; it is "
+        "tried again when the session's workspace starts again"
+    ),
+    ("mount_unsupported", "next_start"): (
+        "it was attached while the workspace ran; it is mounted when the "
+        "session's workspace starts again"
+    ),
+}
 
 #: What each kind of mounted folder is, for the agent's prompt.
 FOLDER_KIND_TEXT = {
@@ -139,13 +154,16 @@ def excluded_row(entry: dict[str, Any]) -> dict[str, str]:
     closed ``reason`` and its ``text``."""
     reason = str(entry.get("reason") or "")
     name = str(entry.get("name") or "")
+    text = DETAIL_TEXT.get((reason, str(entry.get("detail") or ""))) or (
+        REASON_TEXT.get(reason, REASON_TEXT["unbuildable"])
+    )
     return {
         "name": name,
         "path": f"workspace/cloud/{name}" if name else "",
         "title": str(entry.get("title") or ""),
         "kind": str(entry.get("mount_kind") or ""),
         "reason": reason,
-        "text": REASON_TEXT.get(reason, REASON_TEXT["unbuildable"]),
+        "text": text,
     }
 
 
@@ -797,6 +815,7 @@ class SidecarMountWatcher:
 
 
 __all__ = [
+    "DETAIL_TEXT",
     "REASON_TEXT",
     "SUPERVISOR_REASONS",
     "SidecarMountError",

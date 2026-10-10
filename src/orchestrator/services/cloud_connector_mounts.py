@@ -25,6 +25,11 @@ The metadata it keeps on a session:
   rebuilds byte for byte to adopt them.
 * ``cloud_outbox`` (:data:`CLOUD_OUTBOX_KEY`): the session's outbox
   folder, ``{connector_id, state, reason?, share_retry_at?}``.
+* ``datasource_selection.attached_live`` (:data:`ATTACHED_LIVE_KEY`): each
+  cloud connector a live edit attached while the session's workspace ran,
+  with that workspace's runtime. Its driver attaches nothing live
+  (``live_attach=False``): the running workspace never gets it
+  (``mount_unsupported``, ``next_start``), the next one mounts it.
 
 Design: knowledge-base/knowledge/features/main_cloud_as_connectors.md,
 "Slice 3 plan (2026-10-10)" 3.5 and "Overnight run: slices 3 to 8".
@@ -85,7 +90,11 @@ OUTBOX_FAILURE_REASONS: tuple[str, ...] = (
 #: cloud folder of a deployment that syncs files instead of mounting them
 #: (``CLOUD_WORKSPACE_DRIVER=sync``), which delivers no cloud folder, and
 #: ``mount_unsupported`` for one of a workspace that can mount none
-#: (``detail``: ``container_mounts_disabled``, ``fuse_denied``).
+#: (``detail``: ``container_mounts_disabled``, ``fuse_denied``), or that
+#: never gets this one: a Pod of the in-pod plane created without a plan,
+#: which never gets a folder its sidecars would have held the password of
+#: (``needs_new_pod``, ``plan_failed``), and a folder attached while the
+#: workspace ran (``next_start``).
 EXCLUSION_REASONS: tuple[str, ...] = (
     "access_unavailable",
     "config_invalid",
@@ -150,6 +159,77 @@ def cloud_mount_driver(
     delivered otherwise."""
     spec = spec_for_row(row)
     return _DRIVERS.get(spec.name) if spec is not None else None
+
+
+#: The ``datasource_selection`` key of the cloud connectors attached live.
+ATTACHED_LIVE_KEY = "attached_live"
+
+
+def workspace_runtime_identity(metadata: Mapping[str, Any] | None) -> str | None:
+    """The session's current workspace runtime: its ready VM's, else its
+    container Pod's UID; ``None`` with neither. A new Pod or VM is a new
+    runtime."""
+    if not isinstance(metadata, Mapping):
+        return None
+    vm = metadata.get("vm")
+    if isinstance(vm, Mapping) and vm.get("status") == "ready" and vm.get("ssh_host"):
+        incarnation = vm.get("_runtime_incarnation") or vm.get("vm_uid")
+        return f"vm:{incarnation}" if incarnation else None
+    workspace = metadata.get("workspace_container")
+    if isinstance(workspace, Mapping) and workspace.get("_runtime_incarnation"):
+        return f"pod:{workspace['_runtime_incarnation']}"
+    return None
+
+
+def _attached_live_record(metadata: Mapping[str, Any] | None) -> dict[str, str]:
+    selection = (
+        metadata.get("datasource_selection") if isinstance(metadata, Mapping) else None
+    )
+    record = (
+        selection.get(ATTACHED_LIVE_KEY) if isinstance(selection, Mapping) else None
+    )
+    if not isinstance(record, Mapping):
+        return {}
+    return {str(cid): str(runtime) for cid, runtime in record.items() if runtime}
+
+
+def attached_live(metadata: Mapping[str, Any] | None) -> frozenset[str]:
+    """The cloud connectors attached while the current workspace ran: it
+    never gets them."""
+    runtime = workspace_runtime_identity(metadata)
+    if runtime is None:
+        return frozenset()
+    return frozenset(
+        cid
+        for cid, attached_on in _attached_live_record(metadata).items()
+        if attached_on == runtime
+    )
+
+
+def attached_live_after_edit(
+    metadata: Mapping[str, Any] | None,
+    *,
+    previous_ids: set[str],
+    selected_rows: list[Mapping[str, Any]],
+) -> dict[str, str]:
+    """``attached_live`` after a live edit to ``selected_rows`` (the new
+    selection's connectors): what the running workspace already withholds
+    and still has attached, and each cloud connector the edit adds. Empty
+    while no workspace runs, whose next one mounts them all."""
+    runtime = workspace_runtime_identity(metadata)
+    if runtime is None:
+        return {}
+    selected = {str(row.get("id") or "") for row in selected_rows}
+    record = {
+        cid: attached_on
+        for cid, attached_on in _attached_live_record(metadata).items()
+        if attached_on == runtime and cid in selected
+    }
+    for row in selected_rows:
+        cid = str(row.get("id") or "")
+        if cid and cid not in previous_ids and cloud_mount_driver(row) is not None:
+            record[cid] = runtime
+    return record
 
 
 @dataclass(frozen=True)
@@ -489,6 +569,7 @@ __all__ = [
     "CLOUD_MOUNT_RULE_KEY",
     "CLOUD_OUTBOX_KEY",
     "CONNECTOR_RULE",
+    "ATTACHED_LIVE_KEY",
     "EXCLUSION_REASONS",
     "FOLDER_KIND_BINDERS",
     "OUTBOX_FAILURE_REASONS",
@@ -496,6 +577,8 @@ __all__ = [
     "FolderBinder",
     "FolderBinding",
     "SelectedCloudConnector",
+    "attached_live",
+    "attached_live_after_edit",
     "bind_project_folder",
     "bind_user_root_folder",
     "cloud_mount_driver",
@@ -505,4 +588,5 @@ __all__ = [
     "selected_cloud_connectors",
     "selected_ids",
     "uses_connector_rule",
+    "workspace_runtime_identity",
 ]

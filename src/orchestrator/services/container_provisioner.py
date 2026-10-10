@@ -74,6 +74,8 @@ from orchestrator.services.cloud_mount_plan import CloudMountPlan, plan_annotati
 from orchestrator.services.cloud_mount_sidecar import (
     PLAN_ANNOTATION,
     PLAN_CONTEXT_KEY,
+    PLANLESS_CONTEXT_KEY,
+    planless_record,
     recorded_plan_from_annotations,
 )
 from orchestrator.services.in_pod_mount import (
@@ -826,6 +828,11 @@ class ContainerProvisioner:
             Callable[..., Awaitable[CloudMountPlan | None]] | None
         ) = None
         self._cloud_mount_grant_waiter: Callable[[str], Awaitable[None]] | None = None
+        # Sessions whose latest planning raised, so the Pod created without a
+        # plan records why (``plan_failed``) when it is published. Only the
+        # detail rides on it: attach withholds the sidecars' credentials from
+        # any planless Pod's workspace whatever it says.
+        self._cloud_plan_failed: set[str] = set()
 
     @property
     def is_available(self) -> bool:
@@ -880,8 +887,14 @@ class ContainerProvisioner:
         self, owner: WorkspaceOwner, *, wait_for_grant: bool = True
     ) -> CloudMountPlan | None:
         """A new session Pod's cloud mounts from the in-pod plane, or ``None``
-        for the in-workspace path (the plane off, a job, an opted-out session,
-        or a planning error: today's behaviour is the safe fallback).
+        for a Pod without a plan (the plane off, a job, an opted-out session,
+        or a planning error).
+
+        A planning error fails closed for the cloud folders the sidecars
+        would have mounted: the Pod records ``plan_failed``
+        (:meth:`_publish_cloud_mount_plan`) and attach never delivers their
+        credentials into its workspace (``agent_cloud_mounts``); the next Pod
+        plans them again.
 
         ``wait_for_grant`` is False under the thread's advisory lock: a
         protected session's engage takes that lock, so the plan then only
@@ -893,16 +906,19 @@ class ContainerProvisioner:
         ):
             return None
         try:
-            return await self._cloud_mount_planner(
+            plan = await self._cloud_mount_planner(
                 owner.id, wait_for_grant=wait_for_grant
             )
         except Exception:
             logger.exception(
-                "Could not plan the cloud mounts of session %s; it keeps the "
-                "in-workspace mount path",
+                "Could not plan the cloud mounts of session %s; its Pod gets "
+                "none of them",
                 owner.id,
             )
+            self._cloud_plan_failed.add(owner.id)
             return None
+        self._cloud_plan_failed.discard(owner.id)
+        return plan
 
     async def await_cloud_mount_grant(self, thread_id: str) -> None:
         """Let a protected session's in-flight reader grant land before a
@@ -1214,12 +1230,15 @@ class ContainerProvisioner:
     ) -> bool:
         """Record the Pod's own plan (its annotation) on the session, tied to
         the Pod's UID, before it is published Ready; a Pod without one clears
-        any earlier Pod's plan, so attach never mistakes the delivery."""
+        any earlier Pod's plan, so attach never mistakes the delivery, and
+        records why it has none (``planless_record``)."""
         if owner.kind != "session":
             return True
         recorded = recorded_plan_from_annotations(
             getattr(getattr(pod, "metadata", None), "annotations", None)
         )
+        plan_failed = owner.id in self._cloud_plan_failed
+        self._cloud_plan_failed.discard(owner.id)
         if recorded is None and self._in_pod_plane is None:
             # The plane is off: nothing to record, nothing earlier to clear
             # (a stale plan never matches this Pod's UID anyway).
@@ -1229,7 +1248,14 @@ class ContainerProvisioner:
             if recorded is not None
             else None
         )
-        if not await self._set_context(owner, {PLAN_CONTEXT_KEY: value}):
+        planless = (
+            planless_record(runtime_incarnation, plan_failed=plan_failed)
+            if recorded is None
+            else None
+        )
+        if not await self._set_context(
+            owner, {PLAN_CONTEXT_KEY: value, PLANLESS_CONTEXT_KEY: planless}
+        ):
             return False
         try:
             # Every planned mount starts pending, every row the plan left out

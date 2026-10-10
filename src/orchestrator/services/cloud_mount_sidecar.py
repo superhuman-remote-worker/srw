@@ -27,6 +27,14 @@ PLAN_VERSION = 1
 PLAN_ANNOTATION = "srw.io/cloud-mount-plan"
 #: The recorded plan's key in a thread's ``workspace_container``.
 PLAN_CONTEXT_KEY = "cloud_mount_plan"
+#: Its counterpart for a Pod created with the plane on but no plan: tied to
+#: the Pod's UID, it says why (:data:`PLANLESS_DETAILS`).
+PLANLESS_CONTEXT_KEY = "cloud_mount_planless"
+#: Why such a Pod has no plan: it had nothing to mount when it was created
+#: (``needs_new_pod``), or its planning failed (``plan_failed``). Either way
+#: its workspace never gets a folder whose credential the sidecars would
+#: have held; the next Pod plans it.
+PLANLESS_DETAILS = ("needs_new_pod", "plan_failed")
 #: How long the agent waits at attach for each mount to settle.
 ATTACH_WAIT_SECONDS = 30
 #: The header an agent that attaches to sidecar mounts sends with its
@@ -115,6 +123,34 @@ def recorded_sidecar_plan(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
     return dict(plan)
 
 
+def planless_record(runtime_incarnation: str, *, plan_failed: bool) -> dict[str, str]:
+    """What a Pod created with the plane on but no plan records of it."""
+    return {
+        "runtime_incarnation": str(runtime_incarnation),
+        "detail": PLANLESS_DETAILS[1] if plan_failed else PLANLESS_DETAILS[0],
+    }
+
+
+def planless_pod_detail(metadata: Mapping[str, Any]) -> str:
+    """Why the thread's current workspace Pod has no recorded plan, one of
+    :data:`PLANLESS_DETAILS`: ``plan_failed`` only when that very Pod (its
+    UID) recorded a failed planning, else ``needs_new_pod`` (nothing was
+    planned for it, or it is from before the plane)."""
+    workspace = metadata.get("workspace_container")
+    if not isinstance(workspace, Mapping):
+        return PLANLESS_DETAILS[0]
+    record = workspace.get(PLANLESS_CONTEXT_KEY)
+    incarnation = workspace.get("_runtime_incarnation")
+    if (
+        isinstance(record, Mapping)
+        and incarnation
+        and record.get("runtime_incarnation") == incarnation
+        and record.get("detail") in PLANLESS_DETAILS
+    ):
+        return str(record["detail"])
+    return PLANLESS_DETAILS[0]
+
+
 def status_settled(recorded: Mapping[str, Any], status: Any) -> bool:
     """Whether the thread's record of this Pod (same plan and UID) already
     has every planned mount settled: mounted or unavailable, not pending."""
@@ -184,9 +220,13 @@ __all__ = [
     "DELIVERY_HEADER",
     "PLAN_ANNOTATION",
     "PLAN_CONTEXT_KEY",
+    "PLANLESS_CONTEXT_KEY",
+    "PLANLESS_DETAILS",
     "UNAVAILABLE_REASONS",
     "agent_payload",
     "plan_fingerprint",
+    "planless_pod_detail",
+    "planless_record",
     "recorded_plan_from_annotations",
     "recorded_sidecar_plan",
     "status_settled",

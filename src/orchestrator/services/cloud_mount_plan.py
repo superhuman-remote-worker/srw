@@ -23,7 +23,11 @@ returns ``None`` (the old path, unchanged) when the plane is off, for an
 officer, for a malformed protected marker, and when any mount of the set
 needs more than a static password: OpenCloud's bearer tokens are refreshed
 by the agent into the workspace and stay there until the sidecar has a
-token helper. VM, lite-tier and job workspaces never reach this module.
+token helper. A static password never takes the old path: a mount whose
+flags or name the sidecars refuse is left out (``unbuildable``,
+``sidecar_unsupported``), and attach never delivers one into the workspace
+of a Pod the plane created without a plan (``agent_cloud_mounts``). VM,
+lite-tier and job workspaces never reach this module.
 
 A protected session gets the plane only for its read-only lower layer, and
 only when this runtime's reader grant is active when the Pod is created:
@@ -460,6 +464,29 @@ def _sidecar_mount(
     return mount, password
 
 
+def _static_password(entry: Mapping[str, Any]) -> bool:
+    """Whether a built mount's credential is a static password (Nextcloud's
+    basic auth): one the sidecars hold, never the workspace of a Pod the
+    plane serves."""
+    auth = entry.get("auth")
+    return isinstance(auth, Mapping) and auth.get("type") == "basic"
+
+
+def _sidecar_refusal(entry: Mapping[str, Any]) -> dict[str, str]:
+    """A mount the sidecars cannot carry (a flag or a name the supervisor
+    refuses), named instead of mounted."""
+    refusal = {
+        "source_ref": str(entry.get("source_ref") or entry.get("mount_id") or ""),
+        "mount_kind": str(entry.get("mount_kind") or "project"),
+        "reason": "unbuildable",
+        "detail": "sidecar_unsupported",
+        "name": str(entry.get("workspace_name") or ""),
+    }
+    if entry.get("access"):
+        refusal["level"] = str(entry["access"])
+    return refusal
+
+
 #: The free disk every rclone keeps on the node (--vfs-cache-min-free-space).
 CACHE_MIN_FREE_SPACE = "2G"
 
@@ -553,9 +580,18 @@ async def resolve_cloud_mount_plan(
     cache_bytes = _quantity_bytes(settings.cache_size) // max(1, len(kept))
     mounts: list[SidecarMount] = []
     passwords: dict[int, str] = {}
-    for index, entry in enumerate(kept):
+    for entry in kept:
+        index = len(mounts)
         built = _sidecar_mount(index, entry, cache_bytes=cache_bytes)
+        if built is None and _static_password(entry):
+            # A password the sidecars cannot carry never goes to the
+            # workspace instead: the folder is left out, the rest still
+            # mount from the sidecars.
+            excluded.append(_sidecar_refusal(entry))
+            continue
         if built is None:
+            # A bearer-token mount (OpenCloud) stays in the workspace, its
+            # whole set with it (decision 39).
             return None
         mounts.append(built[0])
         passwords[index] = built[1]

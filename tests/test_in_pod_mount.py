@@ -31,6 +31,8 @@ from orchestrator.services.cloud_mount_plan import (
 from orchestrator.services.cloud_mount_sidecar import (
     PLAN_ANNOTATION,
     PLAN_CONTEXT_KEY,
+    PLANLESS_CONTEXT_KEY,
+    planless_pod_detail,
     recorded_plan_from_annotations,
 )
 from orchestrator.services.container_provisioner import ContainerProvisioner
@@ -776,22 +778,79 @@ async def test_the_pods_plan_is_recorded_tied_to_its_uid(plane_on):
         **PLAN.recorded(),
         "runtime_incarnation": POD_UID,
     }
+    assert update[PLANLESS_CONTEXT_KEY] is None
     (status,) = statuses
     assert status["fingerprint"] == PLAN.recorded()["fingerprint"]
     assert {name: entry["state"] for name, entry in status["mounts"].items()} == {
         "project": "pending",
         "reference": "pending",
     }
-    # An in-workspace Pod clears an earlier Pod's plan and state.
+    # A Pod without a plan clears an earlier Pod's plan and state, and says
+    # why it has none, tied to its UID.
     store.merge_thread_workspace_context.reset_mock()
     statuses.clear()
     assert await plane_on._publish_cloud_mount_plan(
         owner, _pod(build(plane_on)), POD_UID
     )
     assert store.merge_thread_workspace_context.await_args[0][1] == {
-        PLAN_CONTEXT_KEY: None
+        PLAN_CONTEXT_KEY: None,
+        PLANLESS_CONTEXT_KEY: {
+            "runtime_incarnation": POD_UID,
+            "detail": "needs_new_pod",
+        },
     }
     assert statuses == [None]
+
+
+@pytest.mark.asyncio
+async def test_a_pod_whose_planning_failed_records_it(plane_on, caplog):
+    """A planning error fails closed: the Pod records ``plan_failed``, which
+    attach names its folders with, and the next planning clears it."""
+    store = SimpleNamespace(merge_thread_workspace_context=AsyncMock(return_value=True))
+    plane_on._db = store
+    owner = WorkspaceOwner.session(THREAD_ID)
+    plane_on._cloud_mount_planner = AsyncMock(side_effect=RuntimeError("boom"))
+    with caplog.at_level(logging.ERROR):
+        assert await plane_on._cloud_mount_plan_for(owner) is None
+    assert await plane_on._publish_cloud_mount_plan(
+        owner, _pod(build(plane_on)), POD_UID
+    )
+    update = store.merge_thread_workspace_context.await_args[0][1]
+    assert update[PLANLESS_CONTEXT_KEY] == {
+        "runtime_incarnation": POD_UID,
+        "detail": "plan_failed",
+    }
+    assert (
+        planless_pod_detail(
+            {
+                "workspace_container": {
+                    "_runtime_incarnation": POD_UID,
+                    PLANLESS_CONTEXT_KEY: update[PLANLESS_CONTEXT_KEY],
+                }
+            }
+        )
+        == "plan_failed"
+    )
+    # Another Pod's record never speaks for this one.
+    assert (
+        planless_pod_detail(
+            {
+                "workspace_container": {
+                    "_runtime_incarnation": "another-pod",
+                    PLANLESS_CONTEXT_KEY: update[PLANLESS_CONTEXT_KEY],
+                }
+            }
+        )
+        == "needs_new_pod"
+    )
+    # Read once: the next Pod of a planning that worked records no failure.
+    plane_on._cloud_mount_planner = AsyncMock(return_value=None)
+    assert await plane_on._cloud_mount_plan_for(owner) is None
+    assert await plane_on._publish_cloud_mount_plan(
+        owner, _pod(build(plane_on)), POD_UID
+    )
+    update = store.merge_thread_workspace_context.await_args[0][1]
+    assert update[PLANLESS_CONTEXT_KEY]["detail"] == "needs_new_pod"
 
 
 @pytest.mark.asyncio
@@ -805,9 +864,7 @@ async def test_with_the_plane_off_a_pod_writes_nothing_new():
 
 
 @pytest.mark.asyncio
-async def test_planning_is_for_sessions_and_its_failure_keeps_the_old_path(
-    plane_on, caplog
-):
+async def test_planning_is_for_sessions_and_its_failure_plans_nothing(plane_on, caplog):
     plane_on._cloud_mount_planner = AsyncMock(return_value=PLAN)
     assert await plane_on._cloud_mount_plan_for(WorkspaceOwner.job(THREAD_ID)) is None
     assert (
@@ -819,7 +876,8 @@ async def test_planning_is_for_sessions_and_its_failure_keeps_the_old_path(
             await plane_on._cloud_mount_plan_for(WorkspaceOwner.session(THREAD_ID))
             is None
         )
-    assert "in-workspace mount path" in caplog.text
+    assert "its Pod gets none of them" in caplog.text
+    assert THREAD_ID in plane_on._cloud_plan_failed
 
 
 @pytest.mark.asyncio

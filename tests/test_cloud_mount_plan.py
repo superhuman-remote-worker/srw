@@ -254,11 +254,17 @@ async def test_containers_without_rclone_keep_the_old_path(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_bearer_token_mount_keeps_the_whole_pod_on_the_old_path(monkeypatch):
+    # OpenCloud: a bearer token the agent refreshes, not a password
+    # (decision 39).
+    bearer = {"auth": {"type": "keycloak_client_credentials", "client_secret": "x"}}
+    assert await _resolve(monkeypatch, [_entry("ok"), _entry("bad", **bearer)]) is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "broken",
     [
-        # OpenCloud: a bearer token the agent refreshes, not a password.
-        {"auth": {"type": "keycloak_client_credentials", "client_secret": "x"}},
         {"auth": {"type": "basic", "password": ""}},
         {"auth": {"type": "basic", "password": "line\nbreak"}},
         {"source": {"type": "s3", "config": {"url": "http://x"}}},
@@ -277,10 +283,34 @@ async def test_containers_without_rclone_keep_the_old_path(monkeypatch):
         {"workspace_name": "a:ro"},
     ],
 )
-async def test_a_mount_needing_more_than_a_password_keeps_the_whole_pod_on_the_old_path(
+async def test_a_password_the_sidecars_cannot_carry_is_left_out_never_put_in_the_workspace(
     monkeypatch, broken
 ):
-    assert await _resolve(monkeypatch, [_entry("ok"), _entry("bad", **broken)]) is None
+    """A static password never takes the old in-workspace path: the folder
+    is named, the others still mount from the sidecars."""
+    plan = await _resolve(monkeypatch, [_entry("ok"), _entry("bad", **broken)])
+    assert plan is not None
+    assert [mount.name for mount in plan.mounts] == ["ok"]
+    assert [mount.index for mount in plan.mounts] == [0]
+    assert list(plan.passwords) == [0]
+    (refused,) = plan.excluded
+    assert refused["source_ref"] == "project-bad"
+    assert refused["reason"] == "unbuildable"
+    assert refused["detail"] == "sidecar_unsupported"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_password_ahead_of_the_rest_keeps_their_indexes_dense(
+    monkeypatch,
+):
+    plan = await _resolve(
+        monkeypatch,
+        [_entry("bad", provider_flags=["--config=/x"]), _entry("a"), _entry("b")],
+    )
+    assert [(mount.index, mount.name) for mount in plan.mounts] == [(0, "a"), (1, "b")]
+    assert sorted(plan.passwords) == [0, 1]
+    sections = re.findall(r"^\[(m\d+)\]$", plan.rclone_config(), flags=re.M)
+    assert sections == ["m0", "m1"]
 
 
 @pytest.mark.asyncio

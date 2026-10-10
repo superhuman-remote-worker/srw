@@ -764,6 +764,223 @@ async def test_the_in_workspace_payload_names_what_it_left_out(denied, monkeypat
     assert payload["fallback"] is False and payload["outbox_shared"] is False
 
 
+POD = "55555555-5555-4555-8555-555555555555"
+
+
+@pytest.fixture
+def plane_on(monkeypatch):
+    monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
+    monkeypatch.setenv("CONNECTOR_IN_POD_OPENER_IMAGE", "registry.example/opener:1")
+    monkeypatch.setenv("CONNECTOR_IN_POD_RCLONE_IMAGE", "registry.example/rclone:1")
+
+
+def _planless_pod(**workspace):
+    return {
+        "workspace_container": {
+            "status": "ready",
+            "pod_ip": "10.42.0.10",
+            "provisioner": "k8s",
+            "_runtime_incarnation": POD,
+            **workspace,
+        }
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("record", "detail"),
+    [
+        (None, "needs_new_pod"),
+        ({"runtime_incarnation": POD, "detail": "plan_failed"}, "plan_failed"),
+        # Another Pod's failure never speaks for this one.
+        ({"runtime_incarnation": "old-pod", "detail": "plan_failed"}, "needs_new_pod"),
+    ],
+)
+async def test_a_plane_pod_without_a_plan_never_gets_a_password_in_its_workspace(
+    denied, plane_on, record, detail
+):
+    """With the in-pod plane on, a session Pod created without a plan (it
+    had nothing to mount then, its planning failed, it predates the plane)
+    never gets a folder's static password in its workspace: the outbox's
+    service account, a project folder's own account. Each is named with
+    where and at what level it would have mounted."""
+    store = Store([_folder_row(), _outbox_row()])
+    backend = Backend()
+    thread = _thread([FOLDER, OUTBOX])
+    extra = {"cloud_mount_planless": record} if record else {}
+    payload = await mounts._build_agent_cloud_mount(
+        thread,
+        mount_rows=[],
+        metadata={**thread["metadata"], **_planless_pod(**extra)},
+        dependencies=_deps(store, backend=backend),
+    )
+    assert payload["mounts"] == []
+    assert "agent-pass" not in repr(payload)
+    assert [
+        (e["source_ref"], e["reason"], e["detail"], e["name"], e["level"])
+        for e in payload["excluded"]
+    ] == [
+        (OUTBOX, "mount_unsupported", detail, "outbox", "read_write"),
+        (FOLDER, "mount_unsupported", detail, "acme_launch", "read_write"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_in_workspace_paths_the_plane_does_not_serve_still_mount(
+    denied, plane_on, monkeypatch
+):
+    """A VM mounts its own folders; a workspace outside Kubernetes (the
+    static pool) has no sidecars; a plane-off deployment keeps the in-pod
+    path; and a bearer-token mount (OpenCloud, decision 39) never held a
+    password at all."""
+    store = Store([_folder_row(), _outbox_row()])
+    thread = _thread([FOLDER, OUTBOX])
+    deps = _deps(store)
+
+    async def mounted(metadata):
+        payload = await mounts._build_agent_cloud_mount(
+            thread,
+            mount_rows=[],
+            metadata={**thread["metadata"], **metadata},
+            dependencies=deps,
+        )
+        return sorted(m["mount_id"] for m in payload["mounts"])
+
+    vm = {**_planless_pod(), "vm": {"status": "ready", "ssh_host": "vm-1"}}
+    assert await mounted(vm) == [FOLDER]  # a VM is offered no outbox
+    assert await mounted(_planless_pod(provisioner="docker")) == sorted(
+        [FOLDER, OUTBOX]
+    )
+    monkeypatch.delenv("CONNECTOR_IN_POD_OPENER_IMAGE")
+    assert await mounted(_planless_pod()) == sorted([FOLDER, OUTBOX])
+
+
+@pytest.mark.asyncio
+async def test_a_bearer_token_mount_still_mounts_in_a_planless_plane_pod(
+    denied, plane_on
+):
+    class BearerBackend(Backend):
+        async def build_rclone_mount_spec(self, **kwargs):
+            await super().build_rclone_mount_spec(**kwargs)
+            return RcloneMountSpec(
+                source_type="webdav",
+                source_config={"url": "https://oc/dav/spaces/x/", "vendor": "owncloud"},
+                auth={"type": "keycloak_client_credentials", "client_id": "srw"},
+            )
+
+    store = Store([_folder_row()])
+    thread = _thread([FOLDER])
+    payload = await mounts._build_agent_cloud_mount(
+        thread,
+        mount_rows=[],
+        metadata={**thread["metadata"], **_planless_pod()},
+        dependencies=_deps(store, backend=BearerBackend()),
+    )
+    assert [m["mount_id"] for m in payload["mounts"]] == [FOLDER]
+
+
+@pytest.mark.asyncio
+async def test_a_planless_plane_pod_mints_no_grant_it_never_gets(
+    denied, plane_on, monkeypatch
+):
+    from orchestrator.services.cloud import folder_grants
+
+    calls = []
+
+    async def ensure(store, router, target, *, user_id, kind):
+        calls.append(kind)
+
+    monkeypatch.setattr(folder_grants, "ensure_folder_grant", ensure)
+    thread = _thread([FOLDER])
+    store = GrantStore([_folder_row()], threads={THREAD: thread})
+    store.list_thread_mounts = AsyncMock(return_value=[])
+    deps = _deps(store, backend=GrantBackend())
+    thread["metadata"] = {**thread["metadata"], **_planless_pod()}
+    await mounts.prepare_thread_folder_grants(THREAD, dependencies=deps)
+    assert calls == []
+    # Off the plane the same session's workspace mounts it: its writer.
+    monkeypatch.delenv("CONNECTOR_IN_POD_OPENER_IMAGE")
+    await mounts.prepare_thread_folder_grants(THREAD, dependencies=deps)
+    assert calls == ["writer"]
+
+
+@pytest.mark.asyncio
+async def test_a_folder_attached_while_the_workspace_runs_waits_for_the_next(
+    denied, monkeypatch
+):
+    """live_attach=False: the running workspace never gets a cloud folder
+    attached while it ran (next_start), nor is its grant minted; a new Pod
+    (another runtime) mounts it."""
+    monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
+    store = Store([_folder_row(), _outbox_row()])
+    thread = _thread(
+        [FOLDER, OUTBOX],
+        metadata={"datasource_selection": {"attached_live": {FOLDER: f"pod:{POD}"}}},
+    )
+    workspace = _planless_pod(provisioner="docker")
+    payload = await mounts._build_agent_cloud_mount(
+        thread,
+        mount_rows=[],
+        metadata={**thread["metadata"], **workspace},
+        dependencies=_deps(store),
+    )
+    assert [m["mount_id"] for m in payload["mounts"]] == [OUTBOX]
+    assert [
+        (e["source_ref"], e["reason"], e["detail"]) for e in payload["excluded"]
+    ] == [(FOLDER, "mount_unsupported", "next_start")]
+    later = _planless_pod(provisioner="docker", _runtime_incarnation="next-pod")
+    payload = await mounts._build_agent_cloud_mount(
+        thread,
+        mount_rows=[],
+        metadata={**thread["metadata"], **later},
+        dependencies=_deps(store),
+    )
+    assert sorted(m["mount_id"] for m in payload["mounts"]) == sorted([FOLDER, OUTBOX])
+    # A new Pod's planner is no attach: it plans the folder.
+    live, _ = await _live(
+        {**thread, "metadata": {**thread["metadata"], **workspace}}, store
+    )
+    assert sorted(m["mount_id"] for m in live.mounts) == sorted([FOLDER, OUTBOX])
+
+
+@pytest.mark.parametrize("detail", ["needs_new_pod", "plan_failed", "next_start"])
+def test_the_prompt_says_a_withheld_folder_mounts_when_the_workspace_starts_again(
+    detail,
+):
+    from shared.runtime.services.cloud_mount.sidecar import excluded_row
+
+    row = excluded_row({"reason": "mount_unsupported", "detail": detail, "name": "d"})
+    assert "starts again" in row["text"] and row["reason"] == "mount_unsupported"
+    plain = excluded_row({"reason": "mount_unsupported", "detail": "fuse_denied"})
+    assert plain["text"].startswith("this workspace can't mount")
+
+
+def test_attached_live_after_an_edit_keeps_only_this_runtimes_folders():
+    metadata = {
+        **_planless_pod(),
+        "datasource_selection": {
+            "attached_live": {
+                FOLDER: f"pod:{POD}",
+                FOLDER_2: "pod:old",
+                OUTBOX: f"pod:{POD}",
+            }
+        },
+    }
+    rows = [_folder_row(), _folder_row(FOLDER_2), {"id": "pg", "type": "postgresql"}]
+    assert rule.attached_live_after_edit(
+        metadata, previous_ids={FOLDER, FOLDER_2, OUTBOX}, selected_rows=rows
+    ) == {FOLDER: f"pod:{POD}"}
+    # Newly added: the cloud folder waits, the database does not.
+    assert rule.attached_live_after_edit(
+        {**_planless_pod()}, previous_ids=set(), selected_rows=rows
+    ) == {FOLDER: f"pod:{POD}", FOLDER_2: f"pod:{POD}"}
+    assert (
+        rule.attached_live_after_edit({}, previous_ids=set(), selected_rows=rows) == {}
+    )
+    vm = {"vm": {"status": "ready", "ssh_host": "vm-1", "_runtime_incarnation": "v1"}}
+    assert rule.workspace_runtime_identity({**_planless_pod(), **vm}) == "vm:v1"
+
+
 @pytest.mark.asyncio
 async def test_an_in_workspace_set_that_mounts_nothing_still_names_each_folder(
     denied, monkeypatch

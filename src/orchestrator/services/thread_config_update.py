@@ -66,6 +66,10 @@ from orchestrator.schemas.thread_config import (
 )
 from orchestrator.security.access import redact_config_override
 from orchestrator.services import connector_bind_time, connector_credential_leases
+from orchestrator.services.cloud_connector_mounts import (
+    ATTACHED_LIVE_KEY,
+    attached_live_after_edit,
+)
 from orchestrator.services.config_overrides import deep_merge_dicts
 from orchestrator.services.manifest_runtime_ownership import require_srw_runtime
 from orchestrator.services.model_availability import (
@@ -692,6 +696,16 @@ async def apply_thread_config_update_locked(
         )
         if access_origins:
             datasource_selection_provenance["access"] = access_origins
+        # A cloud folder attaches nothing live (live_attach=False): one added
+        # while the workspace runs is kept for the next one, never mounted
+        # into the running workspace.
+        attached_live = attached_live_after_edit(
+            current_metadata,
+            previous_ids=previous_ds_ids,
+            selected_rows=resolved_ds,
+        )
+        if attached_live:
+            datasource_selection_provenance[ATTACHED_LIVE_KEY] = attached_live
 
     # Layer 2 (fail loud): a runtime config change must also fit the owner's
     # grants — reject a denied permission_mode/model with 422 instead of

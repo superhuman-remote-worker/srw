@@ -1161,6 +1161,47 @@ class TestDatasourceSelection:
         # The selected ids are authorization's answer, not the request.
         assert result[1] == [DS_B]
 
+    async def test_a_cloud_folder_attached_while_the_workspace_runs_waits_for_the_next(
+        self, apply, fakes
+    ):
+        """live_attach=False for cloud connectors: the selection is accepted,
+        and each cloud folder it adds is recorded against the running
+        workspace, which never mounts it; a kept one stays recorded, a
+        detached one goes."""
+        fakes.results["datasource_selection_provenance"] = {"origin": "explicit"}
+        fakes.results["store.resolve_datasources_for_thread"] = [
+            {"id": DS_A, "type": "postgresql", "name": "PG"},
+            {"id": DS_B, "type": "cloud_folder", "name": "Folder"},
+            {"id": DS_C, "type": "cloud_outbox", "name": "Outbox"},
+        ]
+        row = with_selection(pinned_row(user_id=uuid.UUID(OWNER)), [DS_A, DS_C])
+        row["metadata"]["workspace_container"] = {"_runtime_incarnation": "pod-1"}
+        row["metadata"]["datasource_selection"] = {
+            "attached_live": {DS_C: "pod:pod-1", DS_A: "pod:pod-0"}
+        }
+        await apply(THREAD, row, {}, [DS_A, DS_B, DS_C], request=REQUEST, actor=ACTOR)
+        _, kwargs = fakes.only("store.set_thread_datasource_ids")
+        assert kwargs["datasource_selection_provenance"]["attached_live"] == {
+            DS_B: "pod:pod-1",
+            DS_C: "pod:pod-1",
+        }
+
+    async def test_with_no_workspace_running_nothing_waits(self, apply, fakes):
+        fakes.results["datasource_selection_provenance"] = {"origin": "explicit"}
+        fakes.results["store.resolve_datasources_for_thread"] = [
+            {"id": DS_B, "type": "cloud_folder", "name": "Folder"}
+        ]
+        await apply(
+            THREAD,
+            pinned_row(user_id=uuid.UUID(OWNER)),
+            {},
+            [DS_B],
+            request=REQUEST,
+            actor=ACTOR,
+        )
+        _, kwargs = fakes.only("store.set_thread_datasource_ids")
+        assert "attached_live" not in kwargs["datasource_selection_provenance"]
+
     async def test_ownerless_provenance_has_no_effective_owner(self, apply, fakes):
         row = with_selection(pinned_row(user_id=None), [DS_A])
         await apply(THREAD, row, {}, [DS_A], request=REQUEST, actor=None)

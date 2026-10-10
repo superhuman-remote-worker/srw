@@ -16,6 +16,12 @@ properties are load-bearing and moved unchanged:
   that cannot be mounted is named with a closed reason and nothing takes its
   place (``cloud_connector_mounts``). Only End's reconstruction of a session
   the old rule mounted still builds the old set, to adopt its residents.
+* **A static password stays with the sidecars.** On a deployment with the
+  in-pod plane, a session container Pod's workspace never gets a folder
+  credential its sidecars would have held: a Pod created without a plan
+  names those folders ``mount_unsupported`` instead
+  (:class:`InWorkspaceWithholding`), and a folder attached while the
+  workspace ran waits for the next one (``live_attach=False``).
 
 Collaborators arrive through :class:`AgentCloudMountDependencies`, rebuilt per
 invocation by the application rather than captured at import: the main-cloud
@@ -54,6 +60,7 @@ from orchestrator.services.cloud_connector_mounts import (
     FOLDER_KIND_BINDERS,
     FolderBindRequest,
     SelectedCloudConnector,
+    attached_live,
     excluded_entry,
     outbox_attached,
     outbox_record,
@@ -63,8 +70,10 @@ from orchestrator.services.cloud_connector_mounts import (
 )
 from orchestrator.services.cloud_mount_sidecar import (
     agent_payload,
+    planless_pod_detail,
     recorded_sidecar_plan,
 )
+from orchestrator.services.in_pod_mount import InPodPlaneSettings
 from orchestrator.services.connector_drivers.cloud_folder import (
     CloudFolderMount,
     CloudFolderUnavailable,
@@ -605,6 +614,50 @@ class LiveMountSet:
     fallback: bool = False
 
 
+#: ``mount_unsupported`` detail of a folder attached while the workspace ran.
+NEXT_START = "next_start"
+
+
+@dataclass(frozen=True)
+class InWorkspaceWithholding:
+    """What an attach leaves out of a workspace that mounts its own folders.
+
+    ``static_password`` is set for a session container Pod of a deployment
+    with the in-pod plane on (connector drivers D7) that recorded no plan:
+    every folder whose credential is a static password (Nextcloud's: a
+    folder writer, a reader, a user's app token, the outbox's service
+    account) is named ``mount_unsupported`` with it as the detail
+    (``needs_new_pod``, ``plan_failed``) and never reaches the workspace's
+    rclone config; the sidecars of the next Pod hold it. Bearer-token mounts
+    (OpenCloud, decision 39) still mount there. ``attached_live`` are the
+    connectors a live edit attached while this workspace ran
+    (``next_start``)."""
+
+    static_password: str | None = None
+    attached_live: frozenset[str] = frozenset()
+
+
+def in_workspace_withholding(metadata: dict[str, Any]) -> InWorkspaceWithholding:
+    """The withholding of the session's current workspace runtime."""
+    static = None
+    workspace = metadata.get("workspace_container")
+    if (
+        InPodPlaneSettings.from_env() is not None
+        and not _vm_runtime_ready(metadata)
+        and isinstance(workspace, dict)
+        and workspace.get("provisioner") == "k8s"
+    ):
+        static = planless_pod_detail(metadata)
+    return InWorkspaceWithholding(
+        static_password=static, attached_live=attached_live(metadata)
+    )
+
+
+def _static_password(mount: dict[str, Any]) -> bool:
+    auth = mount.get("auth")
+    return isinstance(auth, dict) and auth.get("type") == "basic"
+
+
 def _unique_name(base: str, used: set[str]) -> str:
     name = base
     suffix = 2
@@ -629,6 +682,7 @@ async def _resolve_live_mount_set(
     mount_rows: list[dict[str, Any]] | None,
     runtime_is_vm: bool,
     dependencies: AgentCloudMountDependencies,
+    withholding: InWorkspaceWithholding | None = None,
 ) -> LiveMountSet:
     """Each cloud connector the thread has attached, bound on its own.
 
@@ -637,6 +691,8 @@ async def _resolve_live_mount_set(
     gives a legacy multi-project session its project scope; no row is
     mounted from them any more. A selection that cannot be read mounts
     nothing, as a mount that fails never holds the session back.
+    ``withholding`` is an attach's (:func:`in_workspace_withholding`); a new
+    Pod's planner passes none.
     """
     try:
         selected = await selected_cloud_connectors(
@@ -654,7 +710,11 @@ async def _resolve_live_mount_set(
         )
         return LiveMountSet(mounts=[])
     return await _bind_cloud_connectors(
-        thread, selected, runtime_is_vm=runtime_is_vm, dependencies=dependencies
+        thread,
+        selected,
+        runtime_is_vm=runtime_is_vm,
+        dependencies=dependencies,
+        withholding=withholding,
     )
 
 
@@ -677,10 +737,12 @@ async def _bind_cloud_connectors(
     *,
     runtime_is_vm: bool,
     dependencies: AgentCloudMountDependencies,
+    withholding: InWorkspaceWithholding | None = None,
 ) -> LiveMountSet:
     """``selected`` mounted one by one; the outbox first, so it keeps
     ``cloud/outbox`` whatever a project is called."""
     ctx = _access_context(thread, runtime_is_vm=runtime_is_vm)
+    withholding = withholding or InWorkspaceWithholding()
     used: set[str] = set()
     mounts: list[dict[str, Any]] = []
     excluded: list[dict[str, Any]] = []
@@ -695,6 +757,8 @@ async def _bind_cloud_connectors(
                 "not_eligible",
                 detail="This session's owner may no longer attach this folder",
             )
+        elif connector.connector_id in withholding.attached_live:
+            built = excluded_entry(connector, "mount_unsupported", detail=NEXT_START)
         elif isinstance(connector.driver, CloudOutboxDriver):
             built = await _bind_outbox(
                 thread, connector, ctx=ctx, used=used, dependencies=dependencies
@@ -707,6 +771,19 @@ async def _bind_cloud_connectors(
                 used=used,
                 runtime_is_vm=runtime_is_vm,
                 dependencies=dependencies,
+            )
+        if (
+            "mount_id" in built
+            and withholding.static_password
+            and _static_password(built)
+        ):
+            # Built, never delivered: the password stays out of the workspace.
+            built = excluded_entry(
+                connector,
+                "mount_unsupported",
+                name=str(built.get("workspace_name") or ""),
+                detail=withholding.static_password,
+                level=str(built.get("access") or "") or None,
             )
         if "mount_id" in built:
             mounts.append(built)
@@ -901,6 +978,7 @@ async def prepare_folder_grants(
     runtime_is_vm: bool,
     dependencies: AgentCloudMountDependencies,
     timeout_s: float = GRANT_PREPARE_SECONDS,
+    withholding: InWorkspaceWithholding | None = None,
 ) -> None:
     """Mint the per-folder grants a session's project folders are mounted
     with, before the mount is built (never under the thread's advisory
@@ -908,9 +986,15 @@ async def prepare_folder_grants(
     project folder at the level it binds at on this tier, for the
     session's owner; one already active is only looked up. Bounded and
     best effort: a grant that is not ready leaves its folder out, with the
-    reason, and the next preparation tries again. Never raises."""
+    reason, and the next preparation tries again. Never raises.
+
+    An attach passes its ``withholding``: a workspace that never gets a
+    grant's password, or a folder it never gets, mints nothing."""
     metadata = thread_metadata_object(thread)
     if protected_cloud_marker_state(metadata) != "off" or not thread.get("user_id"):
+        return
+    withholding = withholding or InWorkspaceWithholding()
+    if withholding.static_password:
         return
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
@@ -923,8 +1007,10 @@ async def prepare_folder_grants(
         )
         ctx = _access_context(thread, runtime_is_vm=runtime_is_vm)
         for connector in selected:
-            if not connector.eligible or isinstance(
-                connector.driver, CloudOutboxDriver
+            if (
+                not connector.eligible
+                or isinstance(connector.driver, CloudOutboxDriver)
+                or connector.connector_id in withholding.attached_live
             ):
                 continue
             binding = _folder_binding(connector, ctx=ctx)
@@ -998,7 +1084,8 @@ async def prepare_thread_folder_grants(
     workspace mounts itself (a VM, an officer, a Pod without the in-pod
     plane): the attach path's preparation, before its locked response. A
     Pod whose sidecars mount its folders needs none here (its planner
-    prepared them). Never raises."""
+    prepared them), nor one that never gets their passwords
+    (:class:`InWorkspaceWithholding`). Never raises."""
     try:
         thread = await dependencies.store.get_thread(thread_id)
         if not thread:
@@ -1012,6 +1099,7 @@ async def prepare_thread_folder_grants(
             mount_rows=await dependencies.store.list_thread_mounts(thread_id),
             runtime_is_vm=runtime_is_vm,
             dependencies=dependencies,
+            withholding=in_workspace_withholding(metadata),
         )
     except Exception:
         logger.warning(
@@ -1658,6 +1746,11 @@ async def _build_agent_cloud_mount(
             mount_rows=mount_rows,
             runtime_is_vm=runtime_is_vm,
             dependencies=dependencies,
+            withholding=(
+                in_workspace_withholding(metadata)
+                if terminal_retirement_token is None
+                else None
+            ),
         )
     if not live.mounts and (
         legacy or terminal_retirement_token is not None or not live.excluded

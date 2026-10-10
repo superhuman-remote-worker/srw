@@ -219,6 +219,7 @@ same.
 | the session has more cloud folders than a workspace mounts | `too_many_mounts` | Detach some; the limit is `connectors.inPodPlane.maxMounts`. |
 | this deployment syncs files instead of mounting them; cloud folders aren't delivered here | `delivery_unsupported` | The deployment syncs instead of mounting; see [below](#known-limitation-sync-instead-of-mount). |
 | this workspace can't mount cloud folders; they aren't delivered here | `mount_unsupported` | The workspace refuses mounts (`cloud.rcloneMount.allowContainer: false`, or FUSE denied); see [below](#known-limitation-sync-instead-of-mount). |
+| it is mounted only when the session's workspace starts again | `mount_unsupported` (`needs_new_pod`, `plan_failed`, `next_start`) | The folder was attached while the workspace ran, or the workspace started without the mount service planning it. Its credential never goes into a running workspace: it mounts in the next one (start a new Session, or resume one whose workspace was released). |
 | it could not be prepared for this session | `unbuildable` | The cloud could not build this mount; start a new Session, and tell your operator if it persists. |
 
 A folder that was attached but did not come up (the cloud refused its
