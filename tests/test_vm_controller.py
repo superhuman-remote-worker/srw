@@ -5412,6 +5412,22 @@ class TestWorkspaceRecoveryControllerEvidence:
         controller.core_api.patch_namespaced_pod.assert_not_called()
         controller.k8s_client.patch_namespaced_custom_object.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_policy1_inspection_holds_kubevirt_ready_late_boot(self, controller):
+        vm, _ = self.wire_pre_ssh_stop(controller)
+        vm["status"]["conditions"] = [{"type": "Ready", "status": "True"}]
+
+        candidate = await controller._do_inspect_pre_ssh_stop(
+            SAMPLE_JOB_CONFIG["job_id"],
+            provision_generation=PROVISION_GENERATION,
+            expected_vm_uid=self.VM_UID,
+            expected_pvc_uid=self.PVC_UID,
+        )
+
+        assert candidate is None
+        controller.core_api.patch_namespaced_pod.assert_not_called()
+        controller.k8s_client.patch_namespaced_custom_object.assert_not_called()
+
     def wire_sdk_pre_ssh_stop(self, controller):
         vm, pod = self.wire_pre_ssh_stop(controller)
         for owner in pod["metadata"]["ownerReferences"]:

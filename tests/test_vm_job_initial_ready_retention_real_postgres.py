@@ -138,6 +138,36 @@ async def test_initial_ready_cancel_admits_only_signed_false_keep(db, status):
 
 
 @pytest.mark.asyncio
+async def test_initial_ready_retention_does_not_select_policy1_stop(db):
+    from orchestrator.services.vm_job_cancel_retention import (
+        current_policy1_retention_parent,
+    )
+
+    state = await ready_root(db)
+    provisioner = SimpleNamespace(
+        qualify_retained_ready_stop=AsyncMock(side_effect=ready_root_witness)
+    )
+    permit = await acquire_retained_terminal_cleanup(
+        state["recovery"],
+        provisioner,
+        job_id=state["job_id"],
+        identity=state["identity"],
+    )
+    assert permit is not None and permit.allowed
+    assert (
+        await current_policy1_retention_parent(
+            db,
+            permit.parent_cleanup,
+            job_id=state["job_id"],
+            generation=state["generation"],
+            vm_uid=state["frozen"]["vm_uid"],
+            pvc_uid=state["frozen"]["pvc_uid"],
+        )
+        == "other"
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("gate", ["false", "true"])
 async def test_initial_ready_without_proof_never_falls_through_to_purge(
     db, monkeypatch, gate

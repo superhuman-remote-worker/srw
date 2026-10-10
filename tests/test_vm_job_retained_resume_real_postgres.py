@@ -854,6 +854,21 @@ async def test_ready_continuation_stores_exact_proof_and_rechecks_before_effect(
         authority["policy_version"] == 2
         and authority["job_retained_resume_id"] == state["resume"]["id"]
     )
+    from orchestrator.services.vm_job_cancel_retention import (
+        current_policy1_retention_parent,
+    )
+
+    assert (
+        await current_policy1_retention_parent(
+            db,
+            permit.parent_cleanup,
+            job_id=state["job_id"],
+            generation=state["identity"].provision_generation,
+            vm_uid=state["identity"].vm_uid,
+            pvc_uid=state["identity"].rootdisk_pvc_uid,
+        )
+        == "other"
+    )
     with pytest.raises(asyncpg.CheckViolationError):
         await db.execute(
             "UPDATE vm_job_cancel_retention_authorities SET ready_retention_preflight=NULL WHERE cleanup_admission_id=$1",

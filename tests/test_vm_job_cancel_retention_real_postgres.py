@@ -385,6 +385,410 @@ async def test_fresh_cancel_retention_admits_false_parent(db):
 
 
 @pytest.mark.asyncio
+async def test_reachable_ssh_policy1_retention_uses_typed_positive_stop(
+    db, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from orchestrator.services import vm_provisioner as module
+    from orchestrator.services.vm_provisioner import (
+        VMProvisioner,
+        VMTeardownIdentity,
+        VMTeardownResult,
+        _VMTeardownProbe,
+    )
+
+    state = await cancelled(db, old=False)
+    permit = await acquire(state)
+    assert permit.allowed
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    provisioner = VMProvisioner()
+    provisioner._db = db
+    provisioner._snapshot_service = None
+    identity = VMTeardownIdentity(
+        state["generation"],
+        state["frozen"]["vm_uid"],
+        state["frozen"]["pvc_uid"],
+        ssh_host="100.64.1.9",
+        ssh_port=22,
+        ssh_host_key_fingerprint="SHA256:retained-test-key",
+    )
+    provisioner._probe_vm_teardown_identity = AsyncMock(
+        return_value=_VMTeardownProbe(
+            "present",
+            VMTeardownIdentity(
+                state["generation"],
+                state["frozen"]["vm_uid"],
+                state["frozen"]["pvc_uid"],
+                credential_runtime_started=True,
+            ),
+            rootdisk_identity_known=True,
+        )
+    )
+    retire = AsyncMock(return_value=True)
+    monkeypatch.setattr(module, "retire_managed_repository_processes", retire)
+    qualification = preflight(state)
+
+    async def controller_stop(payload):
+        if payload["action"] == "inspect":
+            return {
+                "status": "candidate",
+                "frozen": state["frozen"],
+                "retention_preflight": qualification,
+                "_identity_authenticated": True,
+            }
+        if payload["action"] == "stop":
+            return {
+                "status": "positive_terminal_proof",
+                "terminal_evidence": terminal_proof(
+                    state["frozen"], payload["frozen_digest"]
+                ),
+                "_identity_authenticated": True,
+            }
+        assert payload["action"] == "release"
+        return {"status": "finalizer_released", "_identity_authenticated": True}
+
+    provisioner._request_pre_ssh_stop = AsyncMock(side_effect=controller_stop)
+
+    async def delete_after_proof(*_args, **_kwargs):
+        assert (
+            await db.fetchval(
+                "SELECT count(*) FROM vm_pre_ssh_stop_proofs WHERE job_id=$1",
+                UUID(state["job_id"]),
+            )
+            == 1
+        )
+        return VMTeardownResult("completed", True)
+
+    provisioner.delete_vm_captured = AsyncMock(side_effect=delete_after_proof)
+    result = await provisioner.release_vm_captured(
+        state["job_id"],
+        identity,
+        purge_disk=False,
+        capture_snapshot=False,
+        parent_cleanup=permit.parent_cleanup,
+    )
+    assert result == VMTeardownResult("completed", True)
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_pre_ssh_stop_intents WHERE job_id=$1",
+            UUID(state["job_id"]),
+        )
+        == 1
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_pre_ssh_stop_proofs WHERE job_id=$1",
+            UUID(state["job_id"]),
+        )
+        == 1
+    )
+    retire.assert_not_awaited()
+
+
+def _policy1_release_fixture(db, state, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from orchestrator.services import vm_provisioner as module
+    from orchestrator.services.vm_provisioner import (
+        VMProvisioner,
+        VMTeardownIdentity,
+        _VMTeardownProbe,
+    )
+
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    provisioner = VMProvisioner()
+    provisioner._db = db
+    provisioner._snapshot_service = None
+    identity = VMTeardownIdentity(
+        state["generation"],
+        state["frozen"]["vm_uid"],
+        state["frozen"]["pvc_uid"],
+        ssh_host="100.64.1.9",
+        ssh_port=22,
+        ssh_host_key_fingerprint="SHA256:retained-test-key",
+    )
+    provisioner._probe_vm_teardown_identity = AsyncMock(
+        return_value=_VMTeardownProbe(
+            "present",
+            VMTeardownIdentity(
+                state["generation"],
+                state["frozen"]["vm_uid"],
+                state["frozen"]["pvc_uid"],
+                credential_runtime_started=True,
+            ),
+            rootdisk_identity_known=True,
+        )
+    )
+    retire = AsyncMock(return_value=True)
+    monkeypatch.setattr(module, "retire_managed_repository_processes", retire)
+    return provisioner, identity, retire
+
+
+@pytest.mark.asyncio
+async def test_policy1_pending_positive_proof_replays_without_generic_zero(
+    db, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from orchestrator.services.vm_provisioner import VMTeardownResult
+
+    state = await cancelled(db, old=False)
+    permit = await acquire(state)
+    provisioner, identity, retire = _policy1_release_fixture(db, state, monkeypatch)
+    qualification = preflight(state)
+    stopped = False
+    actions = []
+
+    async def controller_stop(payload):
+        nonlocal stopped
+        actions.append(payload["action"])
+        if payload["action"] == "inspect":
+            return {
+                "status": "candidate",
+                "frozen": state["frozen"],
+                "retention_preflight": qualification,
+                "_identity_authenticated": True,
+            }
+        if payload["action"] == "stop":
+            return (
+                {
+                    "status": "positive_terminal_proof",
+                    "terminal_evidence": terminal_proof(
+                        state["frozen"], payload["frozen_digest"]
+                    ),
+                    "_identity_authenticated": True,
+                }
+                if stopped
+                else {
+                    "status": "pending_terminal_proof",
+                    "_identity_authenticated": True,
+                }
+            )
+        assert payload["action"] == "release"
+        return {"status": "finalizer_released", "_identity_authenticated": True}
+
+    provisioner._request_pre_ssh_stop = AsyncMock(side_effect=controller_stop)
+    provisioner.delete_vm_captured = AsyncMock(
+        return_value=VMTeardownResult("completed", True)
+    )
+    kwargs = {
+        "purge_disk": False,
+        "capture_snapshot": False,
+        "parent_cleanup": permit.parent_cleanup,
+    }
+    first = await provisioner.release_vm_captured(state["job_id"], identity, **kwargs)
+    assert first == VMTeardownResult("process_zero_unproven", False)
+    assert actions == ["inspect", "stop"]
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_pre_ssh_stop_intents WHERE job_id=$1",
+            UUID(state["job_id"]),
+        )
+        == 1
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM managed_repository_process_zero_receipts "
+            "WHERE owner_kind='job' AND owner_id=$1 AND scope='vm'",
+            UUID(state["job_id"]),
+        )
+        == 0
+    )
+    provisioner.delete_vm_captured.assert_not_awaited()
+    stopped = True
+    second = await provisioner.release_vm_captured(state["job_id"], identity, **kwargs)
+    assert second == VMTeardownResult("completed", True)
+    assert actions == ["inspect", "stop", "stop", "release"]
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_pre_ssh_stop_proofs WHERE job_id=$1",
+            UUID(state["job_id"]),
+        )
+        == 1
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM managed_repository_process_zero_receipts "
+            "WHERE owner_kind='job' AND owner_id=$1 AND scope='vm'",
+            UUID(state["job_id"]),
+        )
+        == 1
+    )
+    retire.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_policy1_preexisting_generic_zero_without_intent_stays_held(
+    db, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from orchestrator.services.vm_provisioner import VMTeardownResult
+
+    state = await cancelled(db, old=False)
+    permit = await acquire(state)
+    await db.execute(
+        "INSERT INTO managed_repository_process_zero_receipts "
+        "(owner_kind,owner_id,scope,provisioner,runtime_incarnation) "
+        "VALUES('job',$1,'vm','vm',$2)",
+        UUID(state["job_id"]),
+        state["generation"],
+    )
+    provisioner, identity, retire = _policy1_release_fixture(db, state, monkeypatch)
+    provisioner._request_pre_ssh_stop = AsyncMock()
+    provisioner.delete_vm_captured = AsyncMock()
+    result = await provisioner.release_vm_captured(
+        state["job_id"],
+        identity,
+        purge_disk=False,
+        capture_snapshot=False,
+        parent_cleanup=permit.parent_cleanup,
+    )
+    assert result == VMTeardownResult("process_zero_unproven", False)
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_pre_ssh_stop_intents WHERE job_id=$1",
+            UUID(state["job_id"]),
+        )
+        == 0
+    )
+    provisioner._request_pre_ssh_stop.assert_not_awaited()
+    provisioner.delete_vm_captured.assert_not_awaited()
+    retire.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_nonretained_generic_zero_keeps_existing_delete_path(db, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from orchestrator.services.vm_provisioner import VMTeardownResult
+
+    state = await cancelled(db, old=False)
+    await db.execute(
+        "INSERT INTO managed_repository_process_zero_receipts "
+        "(owner_kind,owner_id,scope,provisioner,runtime_incarnation) "
+        "VALUES('job',$1,'vm','vm',$2)",
+        UUID(state["job_id"]),
+        state["generation"],
+    )
+    provisioner, identity, retire = _policy1_release_fixture(db, state, monkeypatch)
+    provisioner._request_pre_ssh_stop = AsyncMock()
+    provisioner.delete_vm_captured = AsyncMock(
+        return_value=VMTeardownResult("completed", True)
+    )
+    result = await provisioner.release_vm_captured(
+        state["job_id"],
+        identity,
+        purge_disk=False,
+        capture_snapshot=False,
+    )
+    assert result == VMTeardownResult("completed", True)
+    provisioner._request_pre_ssh_stop.assert_not_awaited()
+    provisioner.delete_vm_captured.assert_awaited_once()
+    retire.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["missing_parent", "wrong_source", "wrong_admission"])
+async def test_policy1_unproven_parent_holds_before_any_effect(db, monkeypatch, fault):
+    from unittest.mock import AsyncMock
+
+    from orchestrator.services.vm_provisioner import VMTeardownResult
+
+    state = await cancelled(db, old=False)
+    permit = await acquire(state)
+    provisioner, identity, retire = _policy1_release_fixture(db, state, monkeypatch)
+    parent = deepcopy(permit.parent_cleanup)
+    if fault == "missing_parent":
+        parent = None
+    elif fault == "wrong_source":
+        parent["intent"]["source"] = "different_source"
+    else:
+        parent["admission_id"] = str(uuid4())
+    provisioner._request_pre_ssh_stop = AsyncMock()
+    provisioner.delete_vm_captured = AsyncMock()
+    result = await provisioner.release_vm_captured(
+        state["job_id"],
+        identity,
+        purge_disk=False,
+        capture_snapshot=False,
+        parent_cleanup=parent,
+    )
+    assert result == VMTeardownResult("retention_preflight_unproven", False)
+    provisioner._request_pre_ssh_stop.assert_not_awaited()
+    provisioner.delete_vm_captured.assert_not_awaited()
+    retire.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_policy1_selector_distinguishes_absent_and_exact_authority(db):
+    from orchestrator.services.vm_job_cancel_retention import (
+        current_policy1_retention_parent,
+    )
+
+    state = await cancelled(db, old=False)
+    args = dict(
+        job_id=state["job_id"],
+        generation=state["generation"],
+        vm_uid=state["frozen"]["vm_uid"],
+        pvc_uid=state["frozen"]["pvc_uid"],
+    )
+    assert await current_policy1_retention_parent(db, None, **args) == "other"
+    permit = await acquire(state)
+    assert (
+        await current_policy1_retention_parent(db, permit.parent_cleanup, **args)
+        == "open"
+    )
+    assert (
+        await current_policy1_retention_parent(
+            db, permit.parent_cleanup, **{**args, "vm_uid": str(uuid4())}
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent_committed", [False, True])
+async def test_policy1_stop_holds_inside_outer_transaction(
+    db, monkeypatch, parent_committed
+):
+    from unittest.mock import AsyncMock
+
+    from orchestrator.services.vm_provisioner import VMTeardownResult
+
+    state = await cancelled(db, old=False)
+    permit = await acquire(state) if parent_committed else None
+    provisioner, identity, retire = _policy1_release_fixture(db, state, monkeypatch)
+    provisioner._request_pre_ssh_stop = AsyncMock()
+    provisioner.delete_vm_captured = AsyncMock()
+    with pytest.raises(RuntimeError, match="roll back"):
+        async with db.transaction_scope():
+            if permit is None:
+                permit = await acquire(state)
+            assert permit.allowed
+            result = await provisioner.release_vm_captured(
+                state["job_id"],
+                identity,
+                purge_disk=False,
+                capture_snapshot=False,
+                parent_cleanup=permit.parent_cleanup,
+            )
+            assert result == VMTeardownResult("retention_preflight_unproven", False)
+            raise RuntimeError("roll back")
+    provisioner._request_pre_ssh_stop.assert_not_awaited()
+    provisioner.delete_vm_captured.assert_not_awaited()
+    retire.assert_not_awaited()
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_pre_ssh_stop_intents WHERE job_id=$1",
+            UUID(state["job_id"]),
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
 async def test_existing_purge_parent_gets_linked_retention_successor(db):
     state = await cancelled(db)
     old = dict(
@@ -1210,6 +1614,26 @@ async def test_completed_replay_uses_released_charge_without_new_admission(
     permit = await acquire(state)
     assert permit.allowed and permit.completed_outcome == "completed"
     assert permit.admission_id == state["retention"].admission_id
+    from orchestrator.services.vm_workspace_recovery_store import (
+        completed_cleanup_outcome,
+    )
+
+    assert completed_cleanup_outcome(permit) == "completed"
+    from orchestrator.services.vm_job_cancel_retention import (
+        current_policy1_retention_parent,
+    )
+
+    assert (
+        await current_policy1_retention_parent(
+            db,
+            permit.parent_cleanup,
+            job_id=state["job_id"],
+            generation=state["generation"],
+            vm_uid=state["frozen"]["vm_uid"],
+            pvc_uid=state["frozen"]["pvc_uid"],
+        )
+        == "settled"
+    )
     assert (
         await db.fetchval("SELECT count(*) FROM vm_job_cancel_retention_authorities")
         == 1
@@ -1221,6 +1645,61 @@ async def test_completed_replay_uses_released_charge_without_new_admission(
         )
         is True
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("physical_runtime_present", [False, True])
+async def test_settled_policy1_release_replays_only_when_compute_is_absent(
+    db, monkeypatch, physical_runtime_present
+):
+    from unittest.mock import AsyncMock
+
+    from orchestrator.services.vm_provisioner import (
+        VMProvisioner,
+        VMTeardownIdentity,
+        VMTeardownResult,
+        _VMTeardownProbe,
+    )
+
+    state = await positive_retention(db)
+    await settle_sql(db, state)
+    permit = await acquire(state)
+    assert permit.completed_outcome == "completed"
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    provisioner = VMProvisioner()
+    provisioner._db = db
+    provisioner._snapshot_service = None
+    observed = VMTeardownIdentity(
+        state["generation"],
+        state["frozen"]["vm_uid"] if physical_runtime_present else None,
+        state["frozen"]["pvc_uid"],
+    )
+    provisioner._probe_vm_teardown_identity = AsyncMock(
+        return_value=_VMTeardownProbe(
+            "present" if physical_runtime_present else "absent",
+            observed,
+            rootdisk_identity_known=True,
+            runtime_absence_known=not physical_runtime_present,
+            vmi_absent=not physical_runtime_present,
+            launcher_absent=not physical_runtime_present,
+        )
+    )
+    provisioner._request_pre_ssh_stop = AsyncMock()
+    provisioner.delete_vm_captured = AsyncMock()
+    result = await provisioner.release_vm_captured(
+        state["job_id"],
+        state["identity"],
+        purge_disk=False,
+        capture_snapshot=False,
+        parent_cleanup=permit.parent_cleanup,
+    )
+    assert result == (
+        VMTeardownResult("retention_preflight_unproven", False)
+        if physical_runtime_present
+        else VMTeardownResult("completed", True)
+    )
+    provisioner._request_pre_ssh_stop.assert_not_awaited()
+    provisioner.delete_vm_captured.assert_not_awaited()
 
 
 @pytest.mark.asyncio

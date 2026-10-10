@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from typing import Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from shared.vm_resource_admission import ResourceAdmissionError
@@ -229,6 +231,80 @@ async def retention_for_admission_on_conn(conn, admission_id: UUID):
         admission_id,
     )
     return dict(row) if row else None
+
+
+async def current_policy1_retention_parent(
+    db, parent_cleanup, *, job_id, generation, vm_uid, pvc_uid
+) -> Literal["other", "open", "settled"] | None:
+    """Select only the immutable never-Ready retaining parent for positive stop.
+
+    Other means this Job has no policy-1 authority. None means an existing
+    authority or supplied parent cannot be proven current. The stop store
+    rechecks open authority under locks before issuing any effect.
+    """
+    try:
+        owner = _uuid(job_id)
+        incarnation = _uuid(generation)
+        expected_vm = _uuid(vm_uid)
+        expected_pvc = _uuid(pvc_uid)
+        async with db.acquire() as conn:
+            if not await _installed(conn):
+                return None
+            row = await conn.fetchrow(
+                "SELECT a.*,c.completed_at FROM vm_job_cancel_retention_authorities a "
+                "JOIN vm_workspace_cleanup_admissions c ON c.id=a.cleanup_admission_id "
+                "WHERE a.job_id=$1 AND a.provision_generation=$2",
+                owner,
+                incarnation,
+            )
+            if row is None:
+                return (
+                    None
+                    if await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_job_cancel_retention_authorities "
+                        "WHERE job_id=$1)",
+                        owner,
+                    )
+                    else "other"
+                )
+            if row["policy_version"] != 1:
+                return "other"
+            # An outer transaction makes a newly admitted stop intent
+            # savepoint-local. Refuse policy-1 physical effects in that scope.
+            if conn.is_in_transaction():
+                return None
+            if not isinstance(parent_cleanup, Mapping):
+                return None
+            expected = bind_vm_cleanup_permit(
+                CleanupPermit(allowed=True, admission_id=row["cleanup_admission_id"]),
+                request_id=row["cleanup_request_id"],
+                intent=_json(row["retaining_intent"]),
+            ).parent_cleanup
+            if (
+                row["vm_uid"] != expected_vm
+                or row["pvc_uid"] != expected_pvc
+                or dict(parent_cleanup) != expected
+            ):
+                return None
+            if row["completed_at"] is not None:
+                return (
+                    "settled"
+                    if await conn.fetchval(
+                        "SELECT public.vm_job_cancel_retention_settled($1)",
+                        row["cleanup_admission_id"],
+                    )
+                    else None
+                )
+            return (
+                "open"
+                if await conn.fetchval(
+                    "SELECT public.validate_vm_job_cancel_retention($1,false)",
+                    row["cleanup_admission_id"],
+                )
+                else None
+            )
+    except Exception:
+        return None
 
 
 @dataclass(frozen=True)
