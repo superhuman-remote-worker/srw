@@ -130,7 +130,6 @@ def _deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         prefetch_roster_refs=AsyncMock(return_value=None),
         resolve_thread_execution_lane=MagicMock(return_value="pinned"),
         build_thread_mount_rows=AsyncMock(return_value=[]),
-        should_skip_session_folder=MagicMock(return_value=False),
         enforce_session_create_grants=AsyncMock(),
         check_vm_permission=AsyncMock(),
         resolve_cloud_session_url=MagicMock(return_value=None),
@@ -577,6 +576,14 @@ class TestCreationPlan:
         assert plan.lite_session is False and plan.vm_session is False
         assert plan.create_kwargs["config_name"] == "session_base"
         assert plan.create_kwargs["permission_mode"] == "supervised"
+
+    @pytest.mark.asyncio
+    async def test_a_new_session_follows_the_connector_rule_from_birth(self):
+        """Main cloud slice 3: its cloud folders are its attached connectors,
+        so it never converts and End rebuilds that rule."""
+        plan = await _plan(ThreadCreateRequest(), _deps())
+        metadata = plan.create_kwargs["initial_metadata"]
+        assert metadata["cloud_mount_rule"] == "connectors"
 
     @pytest.mark.asyncio
     async def test_protected_cloud_requires_the_container_tier(self):

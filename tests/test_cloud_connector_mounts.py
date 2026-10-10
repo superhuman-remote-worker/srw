@@ -1,0 +1,1067 @@
+"""A session's cloud folders are its attached cloud connectors (main cloud 3.5).
+
+Pinned here: each attached ``cloud_folder`` / ``cloud_outbox`` connector is
+bound on its own (mount id = connector id, the project's folder under the
+project's name, the outbox at ``cloud/outbox``); one that cannot be mounted
+is excluded with a closed reason and nothing takes its place; an explicit
+empty selection mounts nothing; a protected session names the others
+``beside_protected``; End rebuilds the old rule only for a session the old
+rule mounted (R1); a session created before the rule converts once; and the
+outbox's folder is created, recorded and its share retried.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from orchestrator.services import agent_cloud_mounts as mounts
+from orchestrator.services import cloud_connector_mounts as rule
+from orchestrator.services import session_cloud_preparation as prep
+from orchestrator.services.cloud import RcloneMountSpec
+from orchestrator.services.cloud.retry import BucketFull
+
+USER = "00000000-0000-4000-8000-0000000000a1"
+OTHER = "00000000-0000-4000-8000-0000000000a2"
+PROJECT = "00000000-0000-4000-8000-0000000000b1"
+OTHER_PROJECT = "00000000-0000-4000-8000-0000000000b2"
+INSTANCE = "00000000-0000-4000-8000-00000000c10d"
+FOLDER = "00000000-0000-4000-8000-0000000000f1"
+FOLDER_2 = "00000000-0000-4000-8000-0000000000f3"
+OUTBOX = "00000000-0000-4000-8000-0000000000f2"
+THREAD = "00000000-0000-4000-8000-0000000000d1"
+GENERATION = "22222222-2222-4222-8222-222222222222"
+
+
+def _folder_row(
+    cid=FOLDER, project=PROJECT, *, name="Acme Launch cloud folder", **over
+):
+    row = {
+        "id": cid,
+        "type": "cloud_folder",
+        "name": name,
+        "config": {
+            "folder_kind": "project",
+            "project_id": project,
+            "backend_id": "nextcloud",
+            "backend_instance_id": INSTANCE,
+            "folder_handle": "stale-handle",
+        },
+        "managed_key": f"project-cloud:{project}",
+        "read_only": None,
+        "project_read_only": None,
+    }
+    row.update(over)
+    return row
+
+
+def _outbox_row(owner=USER, **over):
+    row = {
+        "id": OUTBOX,
+        "type": "cloud_outbox",
+        "name": "Session outbox",
+        "config": {},
+        "managed_key": f"cloud-outbox:{owner}",
+        "created_by": owner,
+        "read_only": None,
+        "project_read_only": None,
+    }
+    row.update(over)
+    return row
+
+
+class Store:
+    """The reads the mount rule makes, and the writes conversion makes."""
+
+    def __init__(self, rows=(), projects=None, threads=None):
+        self.rows = {row["id"]: dict(row) for row in rows}
+        self.projects = (
+            projects
+            if projects is not None
+            else {PROJECT: _project(PROJECT, "Acme Launch")}
+        )
+        self.threads = threads or {}
+        self.resolved: list[list[str]] = []
+        self.selections: list[tuple[str, list[str], dict]] = []
+        self.metadata: list[tuple[str, dict]] = []
+        self.main_cloud: list[dict] = []
+
+    async def resolve_datasources_for_thread(self, *, datasource_ids, project_ids):
+        self.resolved.append(list(datasource_ids))
+        # Like the real resolver: no managed key, and its own order.
+        return [
+            {k: v for k, v in self.rows[cid].items() if k != "managed_key"}
+            for cid in sorted(datasource_ids)
+            if cid in self.rows
+        ]
+
+    async def get_datasource(self, cid):
+        row = self.rows.get(cid)
+        return (
+            {k: v for k, v in row.items() if k != "project_read_only"} if row else None
+        )
+
+    async def get_datasource_by_managed_key(self, key):
+        return next(
+            (dict(r) for r in self.rows.values() if r.get("managed_key") == key), None
+        )
+
+    async def get_project(self, project_id):
+        return self.projects.get(project_id)
+
+    async def get_user(self, user_id):
+        return {"id": user_id, "email": "u@example.com", "display_name": "U"}
+
+    async def set_thread_datasource_ids(self, thread_id, ids, **kwargs):
+        self.selections.append((thread_id, list(ids), kwargs))
+        thread = self.threads.setdefault(thread_id, {"id": thread_id, "metadata": {}})
+        thread["metadata"] = {**thread["metadata"], "datasource_ids": list(ids)}
+        return True
+
+    async def merge_thread_cloud_metadata(self, thread_id, patch):
+        self.metadata.append((thread_id, dict(patch)))
+        thread = self.threads.setdefault(thread_id, {"id": thread_id, "metadata": {}})
+        thread["metadata"] = {**thread["metadata"], **patch}
+        return True
+
+    async def get_thread(self, thread_id):
+        thread = self.threads.get(thread_id)
+        return dict(thread) if thread else None
+
+    async def update_thread_main_cloud(self, thread_id, **kwargs):
+        self.main_cloud.append({"thread_id": thread_id, **kwargs})
+        thread = self.threads.setdefault(thread_id, {"id": thread_id, "metadata": {}})
+        thread["main_cloud_session_handle"] = kwargs["session_handle"]
+        thread["main_cloud_share_handle"] = kwargs.get("share_handle")
+        return True
+
+
+def _project(pid, name, handle="project-handle", instance=INSTANCE):
+    return {
+        "id": pid,
+        "name": name,
+        "main_cloud_backend": "nextcloud",
+        "main_cloud_backend_instance_id": instance,
+        "main_cloud_folder_handle": handle,
+    }
+
+
+class Backend:
+    backend_id = "nextcloud"
+    backend_instance_id = INSTANCE
+    is_initialized = True
+    is_configured = True
+
+    def __init__(self):
+        self.specs: list[dict[str, Any]] = []
+
+    async def build_rclone_mount_spec(
+        self,
+        *,
+        handle,
+        mount_kind,
+        target_path,
+        access,
+        subject=None,
+        prefer_public_url=False,
+    ):
+        self.specs.append(
+            {
+                "handle": handle.native_id,
+                "mount_kind": mount_kind,
+                "target_path": target_path,
+                "access": access,
+                "prefer_public_url": prefer_public_url,
+            }
+        )
+        return RcloneMountSpec(
+            source_type="webdav",
+            source_config={
+                "url": f"http://srw-nextcloud/dav/{handle.native_id}/",
+                "vendor": "nextcloud",
+                "user": "agent-service",
+            },
+            auth={"type": "basic", "password": "agent-pass"},
+        )
+
+
+def _router(backend, *, instances=(INSTANCE,)):
+    def for_backend_instance(instance_id, *, expected_backend_id):
+        if instance_id not in instances:
+            raise RuntimeError("not cached")
+        return backend
+
+    return SimpleNamespace(
+        for_thread_optional=lambda thread: backend
+        if thread.get("main_cloud_backend")
+        else None,
+        for_backend_instance=for_backend_instance,
+        active_instance_id=INSTANCE,
+        for_owner=lambda owner: backend,
+    )
+
+
+def _deps(store, backend=None, **router_kw):
+    backend = backend or Backend()
+    return mounts.AgentCloudMountDependencies(
+        store=store,
+        cloud_router=_router(backend, **router_kw),
+        cloud_tasks=SimpleNamespace(protected_engage_get=lambda key: None),
+        is_protected_cloud_mode_enabled=lambda: True,
+        cloud_workspace_driver=lambda: "rclone_mount",
+        slugify_mount_name=lambda name: "".join(
+            ch.lower() if ch.isalnum() else "_" for ch in name
+        ).strip("_")
+        or "project",
+    )
+
+
+def _thread(ids, **over):
+    thread = {
+        "id": THREAD,
+        "user_id": USER,
+        "project_id": PROJECT,
+        "main_cloud_backend": "nextcloud",
+        "main_cloud_backend_instance_id": INSTANCE,
+        "main_cloud_session_handle": "sessions/00000000",
+        "main_cloud_share_handle": "17",
+        "metadata": {
+            "cloud_mount_rule": "connectors",
+            "cloud_outbox": {"connector_id": OUTBOX, "state": "ready"},
+            "datasource_ids": list(ids),
+        },
+    }
+    metadata = over.pop("metadata", None)
+    thread.update(over)
+    if metadata is not None:
+        thread["metadata"] = {**thread["metadata"], **metadata}
+    return thread
+
+
+@pytest.fixture
+def denied(monkeypatch):
+    """Which connectors the owner may no longer attach (the policy itself is
+    pinned in tests/test_datasource_policy.py)."""
+    refused: set[str] = set()
+
+    async def fake(thread, connector_ids, project_ids, store):
+        return {cid for cid in connector_ids if cid in refused}
+
+    monkeypatch.setattr(rule, "_denied", fake)
+    return refused
+
+
+async def _live(thread, store, *, vm=False, **deps_kw):
+    deps = _deps(store, **deps_kw)
+    live = await mounts._resolve_live_mount_set(
+        thread, mount_rows=[], runtime_is_vm=vm, dependencies=deps
+    )
+    return live, deps
+
+
+# --------------------------------------------------------------------------- #
+# Each connector on its own
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_the_project_folder_and_the_outbox_mount_each_under_their_own_name(
+    denied,
+):
+    store = Store([_folder_row(), _outbox_row()])
+    backend = Backend()
+    live, _ = await _live(_thread([FOLDER, OUTBOX]), store, backend=backend)
+    assert live.excluded == [] and live.fallback is False
+    by_id = {mount["mount_id"]: mount for mount in live.mounts}
+    assert set(by_id) == {FOLDER, OUTBOX}
+    project, outbox = by_id[FOLDER], by_id[OUTBOX]
+    assert (project["workspace_name"], project["target_path"]) == (
+        "acme_launch",
+        "/cloud/acme_launch",
+    )
+    assert (project["mount_kind"], project["access"], project["source_ref"]) == (
+        "project",
+        "read_write",
+        FOLDER,
+    )
+    assert (outbox["workspace_name"], outbox["target_path"]) == (
+        "outbox",
+        "/cloud/outbox",
+    )
+    assert (outbox["mount_kind"], outbox["access"]) == ("cloud_outbox", "read_write")
+    # The project's current folder, not the connector's stale copy of it; the
+    # outbox is the session's own folder.
+    handles = {spec["target_path"]: spec["handle"] for spec in backend.specs}
+    assert handles == {
+        "/cloud/acme_launch": "project-handle",
+        "/cloud/outbox": "sessions/00000000",
+    }
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_empty_selection_mounts_nothing_and_reads_nothing(denied):
+    store = Store([_folder_row(), _outbox_row()])
+    live, _ = await _live(_thread([]), store)
+    assert live.mounts == [] and live.excluded == []
+    assert store.resolved == []
+
+
+@pytest.mark.asyncio
+async def test_without_the_project_chip_nothing_takes_its_place(denied):
+    store = Store([_folder_row(), _outbox_row()])
+    live, _ = await _live(_thread([OUTBOX]), store)
+    assert [m["mount_id"] for m in live.mounts] == [OUTBOX]
+    assert live.excluded == []
+
+
+@pytest.mark.asyncio
+async def test_a_broken_folder_is_named_and_the_others_still_mount(denied):
+    gone = {PROJECT: _project(PROJECT, "Acme Launch", instance="not-cached")}
+    store = Store([_folder_row(), _outbox_row()], projects=gone)
+    live, _ = await _live(_thread([FOLDER, OUTBOX]), store)
+    assert [m["mount_id"] for m in live.mounts] == [OUTBOX]
+    assert live.excluded == [
+        {
+            "source_ref": FOLDER,
+            "mount_kind": "project",
+            "reason": "unbuildable",
+            "name": "acme_launch",
+            "detail": "backend_unavailable",
+            "title": "Acme Launch cloud folder",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_project_that_names_no_folder_now_mounts_nothing(denied):
+    store = Store(
+        [_folder_row()],
+        projects={PROJECT: _project(PROJECT, "Acme Launch", handle=None)},
+    )
+    live, _ = await _live(_thread([FOLDER]), store)
+    assert live.mounts == []
+    assert (live.excluded[0]["reason"], live.excluded[0]["detail"]) == (
+        "unbuildable",
+        "no_transport",
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_root_vm_gets_neither_folder(denied):
+    store = Store([_folder_row(), _outbox_row()])
+    live, _ = await _live(_thread([FOLDER, OUTBOX]), store, vm=True)
+    assert live.mounts == []
+    assert {(e["source_ref"], e["reason"]) for e in live.excluded} == {
+        (FOLDER, "access_unavailable"),
+        (OUTBOX, "access_unavailable"),
+    }
+    assert all(e.get("detail") for e in live.excluded)
+
+
+@pytest.mark.asyncio
+async def test_a_connector_the_owner_may_no_longer_attach_is_not_eligible(denied):
+    denied.add(FOLDER)
+    store = Store([_folder_row(), _outbox_row()])
+    live, _ = await _live(_thread([FOLDER, OUTBOX]), store)
+    assert [m["mount_id"] for m in live.mounts] == [OUTBOX]
+    assert [(e["source_ref"], e["reason"]) for e in live.excluded] == [
+        (FOLDER, "not_eligible")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("rows", "projects", "reason"),
+    [
+        ([_folder_row(managed_key=None)], None, "config_invalid"),
+        ([_folder_row()], {}, "not_eligible"),
+        ([_outbox_row(owner=OTHER)], None, "not_eligible"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_why_a_connector_mounts_nothing(denied, rows, projects, reason):
+    store = Store(rows, projects=projects)
+    live, _ = await _live(_thread([rows[0]["id"]]), store)
+    assert live.mounts == []
+    assert [e["reason"] for e in live.excluded] == [reason]
+
+
+@pytest.mark.asyncio
+async def test_an_outbox_srw_has_not_created_says_why(denied):
+    store = Store([_outbox_row()])
+    thread = _thread(
+        [OUTBOX],
+        main_cloud_session_handle=None,
+        metadata={
+            "cloud_outbox": {
+                "connector_id": OUTBOX,
+                "state": "unavailable",
+                "reason": "create_failed",
+            }
+        },
+    )
+    live, _ = await _live(thread, store)
+    assert live.mounts == []
+    assert live.excluded == [
+        {
+            "source_ref": OUTBOX,
+            "mount_kind": "cloud_outbox",
+            "reason": "no_session_folder",
+            "name": "outbox",
+            "detail": "create_failed",
+            "title": "Session outbox",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_names_never_collide_and_the_outbox_keeps_its_own(denied):
+    projects = {
+        PROJECT: _project(PROJECT, "Outbox"),
+        OTHER_PROJECT: _project(OTHER_PROJECT, "outbox"),
+    }
+    store = Store(
+        [_folder_row(), _folder_row(FOLDER_2, OTHER_PROJECT), _outbox_row()],
+        projects=projects,
+    )
+    live, _ = await _live(_thread([FOLDER, FOLDER_2, OUTBOX]), store)
+    names = {m["mount_id"]: m["workspace_name"] for m in live.mounts}
+    assert names == {OUTBOX: "outbox", FOLDER: "outbox-2", FOLDER_2: "outbox-3"}
+
+
+@pytest.mark.asyncio
+async def test_a_user_root_waits_for_its_package_through_its_own_hook(
+    denied, monkeypatch
+):
+    row = _folder_row(
+        config={
+            "folder_kind": "user_root",
+            "backend_id": "nextcloud",
+            "backend_instance_id": INSTANCE,
+            "folder_handle": "home",
+        },
+        managed_key=f"user-cloud-root:{USER}",
+    )
+    store = Store([row])
+    live, _ = await _live(_thread([FOLDER]), store)
+    # Nextcloud's user root is planned (slice 4): not offered.
+    assert [e["reason"] for e in live.excluded] == ["access_unavailable"]
+
+    # Once offered, the kind's binder decides; until the user-root package
+    # replaces it, the hook says it is not mounted yet.
+    from orchestrator.services.connector_drivers.cloud_folder import CloudFolderDriver
+
+    monkeypatch.setattr(
+        CloudFolderDriver, "offered_access", lambda self, row, ctx: ("read_write",)
+    )
+    live, _ = await _live(_thread([FOLDER]), store)
+    assert [(e["reason"], e["detail"]) for e in live.excluded] == [
+        ("access_unavailable", "SRW does not mount a personal cloud folder yet")
+    ]
+    calls = []
+
+    async def user_root(request):
+        calls.append(request.binding.folder_kind)
+        return rule.FolderBinding(
+            row={**request.binding.mount_row(), "cloud_handle": "home"},
+            name="my_cloud",
+        )
+
+    monkeypatch.setitem(rule.FOLDER_KIND_BINDERS, "user_root", user_root)
+    live, _ = await _live(_thread([FOLDER]), store)
+    assert calls == ["user_root"]
+    assert [(m["workspace_name"], m["mount_kind"]) for m in live.mounts] == [
+        ("my_cloud", "user_root")
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# The payloads
+# --------------------------------------------------------------------------- #
+
+
+def _ready():
+    return {"workspace_container": {"status": "ready", "pod_ip": "10.42.0.10"}}
+
+
+@pytest.mark.asyncio
+async def test_the_in_workspace_payload_names_what_it_left_out(denied, monkeypatch):
+    monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
+    store = Store([_folder_row(), _outbox_row()], projects={})
+    thread = _thread([FOLDER, OUTBOX], main_cloud_share_handle=None)
+    payload = await mounts._build_agent_cloud_mount(
+        thread,
+        mount_rows=[],
+        metadata={**thread["metadata"], **_ready()},
+        dependencies=_deps(store),
+    )
+    assert [m["mount_id"] for m in payload["mounts"]] == [OUTBOX]
+    assert [e["reason"] for e in payload["excluded"]] == ["not_eligible"]
+    assert payload["fallback"] is False and payload["outbox_shared"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_protected_session_names_its_other_folders_beside_it(
+    denied, monkeypatch
+):
+    row = {
+        "status": "active",
+        "backend": "nextcloud",
+        "webdav_url": "https://nc/remote.php/dav/files/reader/P/",
+        "reader_id": "reader",
+        "credentials": "reader-secret",
+        "runtime_generation": GENERATION,
+    }
+
+    async def grant(*args, **kwargs):
+        return row
+
+    monkeypatch.setattr(mounts, "_resolve_protected_grant", grant)
+    monkeypatch.setattr(
+        mounts,
+        "_build_protected_cloud_mount",
+        lambda r, *, thread_id: {"protected": True, "mounts": [{"mount_id": "p"}]},
+    )
+    store = Store([_folder_row(), _outbox_row()])
+    thread = _thread([FOLDER, OUTBOX], runtime_generation=GENERATION)
+    protected_rows = [
+        {
+            "mount_kind": "project",
+            "source_ref": PROJECT,
+            "backend_id": "nextcloud",
+            "cloud_handle": "h",
+        }
+    ]
+    payload = await mounts._build_agent_cloud_mount(
+        thread,
+        mount_rows=protected_rows,
+        metadata={**thread["metadata"], "protected_cloud": True, **_ready()},
+        dependencies=_deps(store),
+    )
+    # The project's own folder is the protected one; the outbox is beside it.
+    assert payload["excluded"] == [
+        {
+            "source_ref": OUTBOX,
+            "mount_kind": "cloud_outbox",
+            "reason": "beside_protected",
+            "name": "",
+            "title": "Session outbox",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cloud_sync_sends_the_session_folder_only_with_the_outbox(denied):
+    backend = SimpleNamespace(
+        backend_id="nextcloud",
+        is_initialized=True,
+        get_session_folder_webdav_url=lambda handle: "https://nc/s/",
+        cloud_sync_config=lambda url, target_user_sub=None: {"webdav_url": url},
+    )
+    deps = dataclasses.replace(
+        _deps(Store()),
+        cloud_router=SimpleNamespace(for_thread_optional=lambda t: backend),
+    )
+    with_outbox = mounts._build_agent_cloud_sync(_thread([OUTBOX]), dependencies=deps)
+    assert with_outbox["session_folder"] == {"webdav_url": "https://nc/s/"}
+    assert mounts._build_agent_cloud_sync(_thread([]), dependencies=deps) is None
+    legacy = {"main_cloud_session_handle": "sessions/x", "metadata": {}}
+    assert mounts._build_agent_cloud_sync(legacy, dependencies=deps)["session_folder"]
+
+
+# --------------------------------------------------------------------------- #
+# End's reconstruction (R1)
+# --------------------------------------------------------------------------- #
+
+
+def _terminal_thread(metadata):
+    runtime = "33333333-3333-4333-8333-333333333333"
+    fingerprint = "SHA256:" + ("A" * 43)
+    metadata = {
+        **metadata,
+        "workspace_container": {
+            "status": "retiring_process_zero",
+            "provisioner": "k8s",
+            "pod_ip": "10.42.0.10",
+            "port": 30022,
+            "_canvas_workspace_generation": GENERATION,
+            "_runtime_incarnation": runtime,
+        },
+        "_workspace_binding": {
+            "generation": GENERATION,
+            "kind": "remote",
+            "backing_id": "k8s-pvc:agent-workspaces:pvc-uid",
+            "ssh_host_key_fingerprint": fingerprint,
+        },
+        "_stateless_workspace_retirement_pending": True,
+        "_stateless_claim_retirement": {
+            "terminal_token": 8,
+            "claimant_quiesced": True,
+            "shell_retirement_required": True,
+            "resident_cleanup_required": True,
+            "residents_retired": False,
+            "remote_retired": False,
+            "permanent": True,
+            "workspace_absence_proven": False,
+            "workspace_generation": GENERATION,
+            "endpoint_generation": GENERATION,
+            "runtime_incarnation": runtime,
+            "host_key_fingerprint": fingerprint,
+        },
+    }
+    thread = _thread([], status="ended", execution_lane="stateless")
+    thread["metadata"] = metadata
+    return thread, metadata
+
+
+@pytest.mark.asyncio
+async def test_end_rebuilds_the_old_rule_only_for_a_session_it_mounted(
+    denied, monkeypatch
+):
+    monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
+    store = Store([_folder_row(), _outbox_row()])
+    legacy_rows = [
+        {
+            "id": "row-1",
+            "mount_kind": "project",
+            "source_ref": PROJECT,
+            "target_path": "projects/acme_launch",
+            "backend_id": "nextcloud",
+            "backend_instance_id": INSTANCE,
+            "cloud_handle": "project-handle",
+        }
+    ]
+    # No stamp: its residents were mounted by the old rule, from its rows.
+    thread, metadata = _terminal_thread({"datasource_ids": [FOLDER, OUTBOX]})
+    payload = await mounts._build_agent_cloud_mount(
+        thread,
+        mount_rows=legacy_rows,
+        metadata=metadata,
+        terminal_retirement_token=8,
+        dependencies=_deps(store),
+    )
+    assert [(m["mount_id"], m["workspace_name"]) for m in payload["mounts"]] == [
+        ("row-1", "acme_launch")
+    ]
+    assert "excluded" not in payload
+    assert store.metadata == [] and store.selections == []
+
+    # Stamped: delivered under the connector rule, so End rebuilds that.
+    thread, metadata = _terminal_thread(
+        {
+            "cloud_mount_rule": "connectors",
+            "cloud_outbox": {"connector_id": OUTBOX, "state": "ready"},
+            "datasource_ids": [FOLDER, OUTBOX],
+        }
+    )
+    payload = await mounts._build_agent_cloud_mount(
+        thread,
+        mount_rows=legacy_rows,
+        metadata=metadata,
+        terminal_retirement_token=8,
+        dependencies=_deps(store),
+    )
+    assert {m["mount_id"] for m in payload["mounts"]} == {FOLDER, OUTBOX}
+
+
+# --------------------------------------------------------------------------- #
+# The one-time conversion
+# --------------------------------------------------------------------------- #
+
+
+def _old_thread(**over):
+    thread = {
+        "id": THREAD,
+        "user_id": USER,
+        "project_id": PROJECT,
+        "main_cloud_backend": "nextcloud",
+        "main_cloud_backend_instance_id": INSTANCE,
+        "main_cloud_session_handle": "sessions/00000000",
+        "main_cloud_share_handle": "17",
+        "metadata": {"datasource_ids": ["kb-1"]},
+    }
+    thread.update(over)
+    return thread
+
+
+_PROJECT_ROW = [{"mount_kind": "project", "source_ref": PROJECT}]
+
+
+@pytest.fixture
+def authorize(monkeypatch):
+    calls: list[list[str]] = []
+    refuse = {"value": False}
+
+    async def fake(store, owner, owner_id, ids, project_ids, backend, **kwargs):
+        from orchestrator.services.datasource_policy import DatasourceUnavailableError
+
+        calls.append(list(ids))
+        if refuse["value"]:
+            raise DatasourceUnavailableError()
+        return list(ids), {cid: 1 for cid in ids}
+
+    monkeypatch.setattr(
+        "orchestrator.services.datasource_policy.authorize_datasource_selection", fake
+    )
+    return SimpleNamespace(calls=calls, refuse=refuse)
+
+
+@pytest.mark.asyncio
+async def test_an_old_session_converts_once_to_what_it_mounted(denied, authorize):
+    thread = _old_thread()
+    store = Store([_folder_row(), _outbox_row()], threads={THREAD: dict(thread)})
+    converted = await prep.convert_to_connector_rule(
+        thread, mount_rows=_PROJECT_ROW, store=store
+    )
+    assert store.selections[0][1] == ["kb-1", FOLDER, OUTBOX]
+    assert store.selections[0][2]["datasource_policy_revisions"] == {
+        "kb-1": 1,
+        FOLDER: 1,
+        OUTBOX: 1,
+    }
+    metadata = converted["metadata"]
+    assert metadata["cloud_mount_rule"] == "connectors"
+    assert metadata["cloud_outbox"] == {"connector_id": OUTBOX, "state": "ready"}
+    # Never again.
+    assert (
+        await prep.convert_to_connector_rule(
+            converted, mount_rows=_PROJECT_ROW, store=store
+        )
+        is None
+    )
+    assert len(store.selections) == 1
+
+
+@pytest.mark.asyncio
+async def test_conversion_adds_only_what_is_missing_and_allowed(denied, authorize):
+    denied.add(OUTBOX)
+    thread = _old_thread(metadata={"datasource_ids": [FOLDER]})
+    store = Store([_folder_row(), _outbox_row()], threads={THREAD: dict(thread)})
+    converted = await prep.convert_to_connector_rule(
+        thread, mount_rows=_PROJECT_ROW, store=store
+    )
+    # The folder is attached already, the outbox is refused: no write but the
+    # stamp.
+    assert store.selections == []
+    assert converted["metadata"]["cloud_mount_rule"] == "connectors"
+
+
+@pytest.mark.asyncio
+async def test_without_a_session_folder_no_outbox_is_added(denied, authorize):
+    thread = _old_thread(main_cloud_session_handle=None)
+    store = Store([_folder_row(), _outbox_row()], threads={THREAD: dict(thread)})
+    converted = await prep.convert_to_connector_rule(thread, mount_rows=[], store=store)
+    assert store.selections == []
+    assert "cloud_outbox" not in converted["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_a_selection_that_no_longer_authorises_converts_later(denied, authorize):
+    authorize.refuse["value"] = True
+    thread = _old_thread()
+    store = Store([_folder_row(), _outbox_row()], threads={THREAD: dict(thread)})
+    assert (
+        await prep.convert_to_connector_rule(
+            thread, mount_rows=_PROJECT_ROW, store=store
+        )
+        is None
+    )
+    assert store.selections == [] and store.metadata == []
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"protected_cloud": True},
+        {"config_override": {"officer": {"enabled": True}}},
+        {"cloud_mount_rule": "connectors"},
+    ],
+)
+@pytest.mark.asyncio
+async def test_protected_officer_and_new_sessions_never_convert(
+    denied, authorize, metadata
+):
+    thread = _old_thread(metadata={"datasource_ids": [], **metadata})
+    store = Store([_folder_row(), _outbox_row()])
+    assert (
+        await prep.convert_to_connector_rule(
+            thread, mount_rows=_PROJECT_ROW, store=store
+        )
+        is None
+    )
+    assert store.selections == [] and store.metadata == []
+
+
+@pytest.mark.asyncio
+async def test_an_old_session_converts_at_its_first_in_workspace_delivery(
+    denied, authorize, monkeypatch
+):
+    monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
+    thread = _old_thread()
+    store = Store([_folder_row(), _outbox_row()], threads={THREAD: dict(thread)})
+    payload = await mounts._build_agent_cloud_mount(
+        thread,
+        mount_rows=_PROJECT_ROW,
+        metadata={**thread["metadata"], **_ready()},
+        dependencies=_deps(store),
+    )
+    assert {m["mount_id"] for m in payload["mounts"]} == {FOLDER, OUTBOX}
+
+
+# --------------------------------------------------------------------------- #
+# The outbox folder
+# --------------------------------------------------------------------------- #
+
+
+class CloudBackend(Backend):
+    def __init__(self, *, share=True, full=False, fail=False):
+        super().__init__()
+        self.share_ok, self.full, self.fail = share, full, fail
+        self.folders: list[str] = []
+        self.shares: list[str] = []
+
+    async def ensure_session_folder(self, *, session_id):
+        from orchestrator.services.cloud import (
+            CloudBackendError,
+            CloudBackendErrorKind,
+            SessionFolderHandle,
+        )
+
+        if self.fail:
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNAVAILABLE, "down", backend="nextcloud"
+            )
+        self.folders.append(session_id)
+        return SessionFolderHandle(
+            backend="nextcloud", native_id=f"sessions/{session_id}"
+        )
+
+    async def ensure_user(self, **kwargs):
+        return "cloud-user"
+
+    async def resolve_user_identity(self, email, name):
+        return "cloud-user"
+
+    async def share_session_folder(self, handle, user_id):
+        from orchestrator.services.cloud import ShareHandle
+
+        if self.full:
+            raise BucketFull(120.0)
+        if not self.share_ok:
+            return None
+        self.shares.append(handle.native_id)
+        return ShareHandle(backend="nextcloud", native_id="99")
+
+
+class IdentityStore(Store):
+    async def get_user_cloud_identity(self, user_id):
+        return {}
+
+    async def merge_user_cloud_identity(self, *args):
+        return True
+
+
+@pytest.mark.asyncio
+async def test_admission_creates_shares_and_records_the_outbox():
+    store = IdentityStore()
+    backend = CloudBackend()
+    assert await prep.create_session_outbox(
+        THREAD, {"id": USER}, connector_id=OUTBOX, backend=backend, store=store
+    )
+    assert backend.folders == [THREAD[:8]] and backend.shares
+    assert store.main_cloud[0]["share_handle"]
+    assert store.metadata == [
+        (THREAD, {"cloud_outbox": {"connector_id": OUTBOX, "state": "ready"}})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_folder_srw_could_not_create_is_recorded_and_nothing_raises():
+    store = IdentityStore()
+    assert not await prep.create_session_outbox(
+        THREAD,
+        {"id": USER},
+        connector_id=OUTBOX,
+        backend=CloudBackend(fail=True),
+        store=store,
+    )
+    assert store.main_cloud == []
+    assert store.metadata[0][1]["cloud_outbox"] == {
+        "connector_id": OUTBOX,
+        "state": "unavailable",
+        "reason": "create_failed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_full_share_limit_never_blocks_admission():
+    store = IdentityStore()
+    assert await prep.create_session_outbox(
+        THREAD,
+        {"id": USER},
+        connector_id=OUTBOX,
+        backend=CloudBackend(full=True),
+        store=store,
+    )
+    assert store.main_cloud[0]["share_handle"] is None
+    record = store.metadata[0][1]["cloud_outbox"]
+    assert record["state"] == "ready" and record["share_retry_at"]
+
+
+def _attached(**over):
+    return _thread([OUTBOX], **over)
+
+
+@pytest.mark.asyncio
+async def test_the_pre_plan_step_retries_a_share_that_never_landed():
+    store = IdentityStore([_outbox_row()])
+    backend = CloudBackend()
+    await prep.prepare_session_outbox(
+        _attached(main_cloud_share_handle=None),
+        store=store,
+        cloud_router=_router(backend),
+    )
+    assert backend.shares == ["sessions/00000000"]
+    assert store.main_cloud[0]["share_handle"]
+    assert "share_retry_at" not in store.metadata[-1][1]["cloud_outbox"]
+
+
+@pytest.mark.asyncio
+async def test_the_share_retry_is_throttled_and_a_full_limit_waits_for_later():
+    store = IdentityStore([_outbox_row()])
+    backend = CloudBackend(full=True)
+    now = datetime(2026, 10, 10, 22, 0, tzinfo=timezone.utc)
+    await prep.prepare_session_outbox(
+        _attached(main_cloud_share_handle=None),
+        store=store,
+        cloud_router=_router(backend),
+        now=now,
+    )
+    retry_at = datetime.fromisoformat(
+        store.metadata[-1][1]["cloud_outbox"]["share_retry_at"]
+    )
+    assert retry_at == now + timedelta(seconds=prep.SHARE_RETRY_SECONDS)
+    # Before then nothing is tried.
+    backend.full = False
+    thread = _attached(
+        main_cloud_share_handle=None,
+        metadata={"cloud_outbox": store.metadata[-1][1]["cloud_outbox"]},
+    )
+    await prep.prepare_session_outbox(
+        thread, store=store, cloud_router=_router(backend), now=now
+    )
+    assert backend.shares == []
+    await prep.prepare_session_outbox(
+        thread, store=store, cloud_router=_router(backend), now=retry_at
+    )
+    assert backend.shares == ["sessions/00000000"]
+
+
+@pytest.mark.asyncio
+async def test_the_pre_plan_step_creates_a_missing_folder_and_leaves_others_alone():
+    store = IdentityStore([_outbox_row()])
+    backend = CloudBackend()
+    await prep.prepare_session_outbox(
+        _attached(main_cloud_session_handle=None, main_cloud_share_handle=None),
+        store=store,
+        cloud_router=_router(backend),
+    )
+    assert backend.folders == [THREAD[:8]]
+    # Shared already, no outbox attached, or protected: nothing to do.
+    for thread in (
+        _attached(),
+        _thread([]),
+        _attached(main_cloud_share_handle=None, metadata={"protected_cloud": True}),
+    ):
+        backend = CloudBackend()
+        await prep.prepare_session_outbox(
+            thread, store=store, cloud_router=_router(backend)
+        )
+        assert backend.folders == [] and backend.shares == []
+
+
+# --------------------------------------------------------------------------- #
+# Admission: a session folder only for an attached outbox
+# --------------------------------------------------------------------------- #
+
+
+def _admission(store, backend, *, active=INSTANCE):
+    return SimpleNamespace(
+        store=store,
+        main_cloud_router=SimpleNamespace(
+            active_instance_id=active, for_owner=lambda user: backend
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("ids", "tier", "created"),
+    [
+        ([OUTBOX], "sandbox", True),
+        ([OUTBOX, FOLDER], None, True),
+        ([], "sandbox", False),
+        ([FOLDER], "sandbox", False),
+        # The outbox is never mounted on a root VM: no folder for it.
+        ([OUTBOX], "vm", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_admission_creates_a_session_folder_only_for_the_outbox(
+    ids, tier, created
+):
+    from orchestrator.services import thread_admission as ta
+
+    store = IdentityStore([_outbox_row(), _folder_row()])
+    backend = CloudBackend()
+    await ta.setup_thread_main_cloud(
+        THREAD,
+        {"id": USER},
+        datasource_ids=ids,
+        workspace_backend=tier,
+        dependencies=_admission(store, backend),
+    )
+    assert bool(backend.folders) is created
+    assert bool(store.main_cloud) is created
+    if created:
+        assert store.metadata[-1][1]["cloud_outbox"]["connector_id"] == OUTBOX
+
+
+@pytest.mark.asyncio
+async def test_admission_records_an_outbox_the_main_cloud_could_not_serve():
+    from orchestrator.services import thread_admission as ta
+
+    store = IdentityStore([_outbox_row()])
+    backend = CloudBackend()
+    backend.is_initialized = False
+    backend.is_configured = False
+    await ta.setup_thread_main_cloud(
+        THREAD,
+        {"id": USER},
+        datasource_ids=[OUTBOX],
+        dependencies=_admission(store, backend),
+    )
+    assert backend.folders == []
+    assert store.metadata == [
+        (
+            THREAD,
+            {
+                "cloud_outbox": {
+                    "connector_id": OUTBOX,
+                    "state": "unavailable",
+                    "reason": "backend_unavailable",
+                }
+            },
+        )
+    ]
+    # Without a main cloud at all nothing is recorded.
+    store = IdentityStore([_outbox_row()])
+    await ta.setup_thread_main_cloud(
+        THREAD,
+        {"id": USER},
+        datasource_ids=[OUTBOX],
+        dependencies=_admission(store, CloudBackend(), active=None),
+    )
+    assert store.metadata == []

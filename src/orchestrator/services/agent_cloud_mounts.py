@@ -11,10 +11,11 @@ properties are load-bearing and moved unchanged:
   cloud mode is *enabled* only decides between "no mount" and "a protected
   mount"; it can never route a protected-marked thread into the live builders,
   which would hand it agent-service credentials.
-* **All-or-fallback.** ``_build_agent_cloud_mount`` mounts every requested
-  ``thread_mounts`` row or none of them; a partial set falls back to the
-  legacy session folder so a default user-home row cannot silently degrade
-  into the eager clone path.
+* **Per connector, never all-or-fallback** (main cloud slice 3). A
+  session mounts the cloud connectors it has attached, each on its own; one
+  that cannot be mounted is named with a closed reason and nothing takes its
+  place (``cloud_connector_mounts``). Only End's reconstruction of a session
+  the old rule mounted still builds the old set, to adopt its residents.
 
 Collaborators arrive through :class:`AgentCloudMountDependencies`, rebuilt per
 invocation by the application rather than captured at import: the main-cloud
@@ -27,7 +28,7 @@ import asyncio
 import logging
 import os
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from orchestrator.services.cloud import (
@@ -41,9 +42,31 @@ from orchestrator.services.cloud import (
     provider_adapter,
     provider_offers,
 )
+from orchestrator.services.cloud_connector_mounts import (
+    FOLDER_KIND_BINDERS,
+    FolderBindRequest,
+    SelectedCloudConnector,
+    excluded_entry,
+    outbox_attached,
+    outbox_record,
+    selected_cloud_connectors,
+    selected_ids,
+    uses_connector_rule,
+)
 from orchestrator.services.cloud_mount_sidecar import (
     agent_payload,
     recorded_sidecar_plan,
+)
+from orchestrator.services.connector_drivers.cloud_folder import (
+    CloudFolderUnavailable,
+)
+from orchestrator.services.connector_drivers.cloud_outbox import (
+    WORKSPACE_NAME as OUTBOX_WORKSPACE_NAME,
+)
+from orchestrator.services.connector_drivers.cloud_outbox import (
+    CloudOutboxDriver,
+    CloudOutboxMount,
+    CloudOutboxUnavailable,
 )
 from orchestrator.services.sandbox_workspace_settings import container_denies_fuse
 from orchestrator.services.session_runtime_admission import (
@@ -51,6 +74,8 @@ from orchestrator.services.session_runtime_admission import (
     thread_runtime_authority,
 )
 from orchestrator.services.stateless_workspace_gate import thread_metadata_object
+from shared.connectors.contract import AccessContext
+from shared.connectors.platform import native_project
 
 logger = logging.getLogger(__name__)
 
@@ -83,55 +108,30 @@ def _resolve_cloud_session_url(
     *,
     dependencies: AgentCloudMountDependencies,
 ) -> Optional[str]:
-    """Compute a backend-agnostic browser URL for a thread's cloud folder.
+    """A browser URL for a thread's session outbox folder, or ``None``.
 
-    Looks at the legacy session-folder handle first (Phase 1 and earlier).
-    When that's empty — as happens for Phase 2 default-project threads
-    where the session folder is intentionally skipped in favor of the
-    user-home mount — fall back to the first ``project_default`` mount
-    row's cloud handle. The Cockpit's "Cloud" button (sessions-page line
-    179: ``thread.cloud_session_url || thread.nc_session_folder``) depends
-    on this; without the fallback, default-project threads show no
-    button even though sync is working fine.
+    The Cockpit's "Cloud" button (``thread.cloud_session_url ||
+    thread.nc_session_folder``) opens it. A session has one only while its
+    outbox is attached (``outbox_attached``; a session under the old rule
+    whenever it has a session folder). No other folder stands in for it:
+    the old ``project_default`` fallback went with the user-home rows
+    (main cloud slices 3 and 4). ``mount_rows`` is accepted for the callers
+    that still pass it.
     """
+    del mount_rows
     handle_str = thread.get("main_cloud_session_handle") or thread.get(
         "nc_session_folder"
     )
-    if handle_str:
-        backend = dependencies.cloud_router.for_thread_optional(thread)
-        if backend is None or not backend.is_initialized:
-            return None
-        try:
-            handle = SessionFolderHandle.from_db(handle_str, backend=backend.backend_id)
-            return backend.get_session_folder_browser_url(handle)
-        except Exception:
-            return None
-
-    # No legacy folder — try the project_default mount.
-    for m in mount_rows or []:
-        if m.get("mount_kind") != "project_default":
-            continue
-        row_backend_id = m.get("backend_id")
-        row_handle_str = m.get("cloud_handle")
-        if not row_backend_id or not row_handle_str:
-            continue
-        try:
-            backend = dependencies.cloud_router.for_backend_instance(
-                str(m.get("backend_instance_id") or ""),
-                expected_backend_id=str(row_backend_id),
-            )
-        except Exception:
-            continue
-        if not backend.is_initialized:
-            continue
-        try:
-            handle = ProjectFolderHandle.from_db(
-                row_handle_str, backend=backend.backend_id
-            )
-            return backend.get_project_folder_browser_url(handle)
-        except Exception:
-            continue
-    return None
+    if not handle_str or not outbox_attached(thread_metadata_object(thread)):
+        return None
+    backend = dependencies.cloud_router.for_thread_optional(thread)
+    if backend is None or not backend.is_initialized:
+        return None
+    try:
+        handle = SessionFolderHandle.from_db(handle_str, backend=backend.backend_id)
+        return backend.get_session_folder_browser_url(handle)
+    except Exception:
+        return None
 
 
 def _backend_cloud_cfg(
@@ -174,18 +174,19 @@ def _build_agent_cloud_sync(
           ],
         }
 
-    ``session_folder`` is the legacy per-thread session folder cfg (kept in
-    parallel for back-compat until Phase 4). ``mounts`` are the project /
-    user-home / repo mounts derived from ``thread_mounts``. Returns ``None``
-    when neither a session folder nor any mount could be resolved — in that
-    case there's nothing for the agent to sync. Never logs auth payloads.
+    ``session_folder`` is the session's outbox folder, sent only while the
+    outbox is attached (``outbox_attached``; a session under the old rule
+    whenever it has one). ``mounts`` are the project / user-home / repo
+    mounts derived from ``thread_mounts``. Returns ``None`` when neither a
+    session folder nor any mount could be resolved — in that case there's
+    nothing for the agent to sync. Never logs auth payloads.
     """
-    # ---- legacy session folder (still provisioned in v1)
+    # ---- the session's outbox folder
     session_folder_cfg: Optional[dict[str, Any]] = None
     handle_str = thread.get("main_cloud_session_handle") or thread.get(
         "nc_session_folder"
     )
-    if handle_str:
+    if handle_str and outbox_attached(thread_metadata_object(thread)):
         backend = dependencies.cloud_router.for_thread_optional(thread)
         if backend is not None and backend.is_initialized:
             try:
@@ -350,12 +351,16 @@ async def _build_rclone_mount_from_row(
     *,
     workspace_name: str,
     runtime_is_vm: bool = False,
+    access: str | None = None,
     dependencies: AgentCloudMountDependencies,
     failures: list[str] | None = None,
 ) -> Optional[dict[str, Any]]:
     """One row's rclone mount, or ``None``; ``failures`` gets why, as a
     closed code (``no_transport``, ``backend_unavailable``, a
-    ``CloudBackendErrorKind`` value, or ``error``), never the error text."""
+    ``CloudBackendErrorKind`` value, or ``error``), never the error text.
+
+    ``access`` is the level a connector's driver resolved; without one (a
+    ``thread_mounts`` row of the old rule) the tier decides, as it did."""
 
     def refused(reason: str) -> None:
         if failures is not None:
@@ -387,7 +392,8 @@ async def _build_rclone_mount_from_row(
         # vm tier = root → read-only by default (root + FUSE over the whole
         # Space is a real blast radius); see
         # knowledge-base/knowledge/issues/workspace_upgrade_drops_cloud_mount.md § Security.
-        access = "read_only" if runtime_is_vm else "read_write"
+        if access is None:
+            access = "read_only" if runtime_is_vm else "read_write"
         spec = await backend.build_rclone_mount_spec(
             handle=handle,
             mount_kind=str(row.get("mount_kind") or "project"),
@@ -425,12 +431,19 @@ async def _build_rclone_mount_from_row(
     }
 
 
-async def _build_rclone_session_mount(
+async def _legacy_session_folder_mount(
     thread: dict[str, Any],
     *,
     runtime_is_vm: bool = False,
     dependencies: AgentCloudMountDependencies,
 ) -> Optional[dict[str, Any]]:
+    """The old rule's substitute: the session folder as ``cloud/home``.
+
+    Only End's reconstruction of a session the old rule mounted builds it
+    (:func:`_legacy_live_mount_set`), byte for byte as that rule did, so the
+    resident rclone process can be adopted and removed. No delivery mounts
+    it any more: the session folder is the outbox connector's.
+    """
     handle_str = thread.get("main_cloud_session_handle") or thread.get(
         "nc_session_folder"
     )
@@ -543,15 +556,34 @@ def _build_protected_cloud_mount(
 class LiveMountSet:
     """The ordinary (non-protected) mounts a thread gets, credentials included.
 
-    ``excluded`` names every ``thread_mounts`` row the all-or-fallback rule
-    left out, with a closed reason: ``unbuildable`` (``detail`` says why) for
-    the row that could not be built, ``set_fallback`` for the rows dropped
-    with it. Main-cloud slice 3 replaces the rule with per-connector binding.
+    ``excluded`` names every attached cloud connector that mounts nothing,
+    with a closed reason (``cloud_connector_mounts.EXCLUSION_REASONS``) and
+    the connector's ``title``; nothing took its place. ``fallback`` is the
+    old rule's, set only by End's reconstruction of a session it mounted
+    (:func:`_legacy_live_mount_set`).
     """
 
     mounts: list[dict[str, Any]]
-    fallback: bool
-    excluded: list[dict[str, Any]]
+    excluded: list[dict[str, Any]] = field(default_factory=list)
+    fallback: bool = False
+
+
+def _unique_name(base: str, used: set[str]) -> str:
+    name = base
+    suffix = 2
+    while name in used:
+        name = f"{base}-{suffix}"
+        suffix += 1
+    used.add(name)
+    return name
+
+
+def _project_scope(
+    thread: dict[str, Any], mount_rows: list[dict[str, Any]] | None
+) -> list[str]:
+    from orchestrator.services.thread_mount_rows import durable_project_ids
+
+    return durable_project_ids(thread, legacy_mounts=mount_rows)
 
 
 async def _resolve_live_mount_set(
@@ -561,7 +593,344 @@ async def _resolve_live_mount_set(
     runtime_is_vm: bool,
     dependencies: AgentCloudMountDependencies,
 ) -> LiveMountSet:
-    """Every requested ``thread_mounts`` row, or the session folder instead."""
+    """Each cloud connector the thread has attached, bound on its own.
+
+    The selection is the thread's (``metadata.datasource_ids``); a connector
+    its owner may no longer attach is ``not_eligible``. ``mount_rows`` only
+    gives a legacy multi-project session its project scope; no row is
+    mounted from them any more. A selection that cannot be read mounts
+    nothing, as a mount that fails never holds the session back.
+    """
+    try:
+        selected = await selected_cloud_connectors(
+            thread,
+            datasource_ids=selected_ids(thread_metadata_object(thread)),
+            project_ids=_project_scope(thread, mount_rows),
+            store=dependencies.store,
+        )
+    except Exception:
+        logger.warning(
+            "Thread %s: could not read its cloud connectors; no cloud folder "
+            "is mounted now",
+            thread.get("id"),
+            exc_info=True,
+        )
+        return LiveMountSet(mounts=[])
+    return await _bind_cloud_connectors(
+        thread, selected, runtime_is_vm=runtime_is_vm, dependencies=dependencies
+    )
+
+
+def _access_context(
+    thread: dict[str, Any],
+    *,
+    runtime_is_vm: bool,
+    dependencies: AgentCloudMountDependencies,
+) -> AccessContext:
+    return AccessContext(
+        workspace_backend="vm" if runtime_is_vm else "sandbox",
+        protected_mode_enabled=dependencies.is_protected_cloud_mode_enabled(),
+        execution="session",
+        main_cloud_backend=str(thread.get("main_cloud_backend") or "") or None,
+    )
+
+
+async def _bind_cloud_connectors(
+    thread: dict[str, Any],
+    selected: list[SelectedCloudConnector],
+    *,
+    runtime_is_vm: bool,
+    dependencies: AgentCloudMountDependencies,
+) -> LiveMountSet:
+    """``selected`` mounted one by one; the outbox first, so it keeps
+    ``cloud/outbox`` whatever a project is called."""
+    ctx = _access_context(
+        thread, runtime_is_vm=runtime_is_vm, dependencies=dependencies
+    )
+    used: set[str] = set()
+    mounts: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+    ordered = sorted(
+        selected,
+        key=lambda connector: not isinstance(connector.driver, CloudOutboxDriver),
+    )
+    for connector in ordered:
+        if not connector.eligible:
+            built: dict[str, Any] = excluded_entry(
+                connector,
+                "not_eligible",
+                detail="This session's owner may no longer attach this folder",
+            )
+        elif isinstance(connector.driver, CloudOutboxDriver):
+            built = await _bind_outbox(
+                thread, connector, ctx=ctx, used=used, dependencies=dependencies
+            )
+        else:
+            built = await _bind_folder(
+                thread,
+                connector,
+                ctx=ctx,
+                used=used,
+                runtime_is_vm=runtime_is_vm,
+                dependencies=dependencies,
+            )
+        if "mount_id" in built:
+            mounts.append(built)
+        else:
+            excluded.append({**built, "title": str(connector.row.get("name") or "")})
+    return LiveMountSet(mounts=mounts, excluded=excluded)
+
+
+async def _bind_folder(
+    thread: dict[str, Any],
+    connector: SelectedCloudConnector,
+    *,
+    ctx: AccessContext,
+    used: set[str],
+    runtime_is_vm: bool,
+    dependencies: AgentCloudMountDependencies,
+) -> dict[str, Any]:
+    """A ``cloud_folder`` connector's mount, or its exclusion."""
+    binding = connector.driver.mount_binding(connector.row, ctx=ctx)
+    if isinstance(binding, CloudFolderUnavailable):
+        return excluded_entry(connector, binding.reason, detail=binding.detail)
+    binder = FOLDER_KIND_BINDERS.get(binding.folder_kind)
+    if binder is None:
+        return excluded_entry(
+            connector, "config_invalid", detail="SRW mounts no folder of this kind"
+        )
+    bound = await binder(
+        FolderBindRequest(
+            thread=thread,
+            row=connector.row,
+            binding=binding,
+            store=dependencies.store,
+            slugify=dependencies.slugify_mount_name,
+        )
+    )
+    if isinstance(bound, CloudFolderUnavailable):
+        return excluded_entry(connector, bound.reason, detail=bound.detail)
+    name = _unique_name(bound.name, used)
+    failures: list[str] = []
+    built = await _build_rclone_mount_from_row(
+        bound.row,
+        workspace_name=name,
+        runtime_is_vm=runtime_is_vm,
+        access=binding.access,
+        dependencies=dependencies,
+        failures=failures,
+    )
+    if built is None:
+        return excluded_entry(
+            connector,
+            "unbuildable",
+            name=name,
+            detail=failures[-1] if failures else "error",
+        )
+    return built
+
+
+async def _bind_outbox(
+    thread: dict[str, Any],
+    connector: SelectedCloudConnector,
+    *,
+    ctx: AccessContext,
+    used: set[str],
+    dependencies: AgentCloudMountDependencies,
+) -> dict[str, Any]:
+    """The session's outbox mount at ``cloud/outbox``, or its exclusion.
+
+    The folder is the one SRW created for the session
+    (``main_cloud_session_handle``), on the main cloud stamped on it; a
+    session whose folder SRW could not create says why
+    (``cloud_outbox.reason``)."""
+    binding = connector.driver.mount_binding(
+        connector.row,
+        ctx=ctx,
+        owner_id=str(thread["user_id"]) if thread.get("user_id") else None,
+        session_folder=thread.get("main_cloud_session_handle")
+        or thread.get("nc_session_folder"),
+        backend_instance_id=(
+            str(thread["main_cloud_backend_instance_id"])
+            if thread.get("main_cloud_backend_instance_id")
+            else None
+        ),
+        shared=bool(thread.get("main_cloud_share_handle")),
+    )
+    if isinstance(binding, CloudOutboxUnavailable):
+        detail = binding.detail
+        if binding.reason == "no_session_folder":
+            recorded = outbox_record(thread_metadata_object(thread)).get("reason")
+            detail = str(recorded) if recorded else "not_created"
+        return excluded_entry(
+            connector,
+            binding.reason,
+            name=OUTBOX_WORKSPACE_NAME,
+            detail=detail,
+        )
+    name = _unique_name(binding.name, used)
+    failures: list[str] = []
+    built = await _build_rclone_outbox_mount(
+        thread,
+        binding,
+        workspace_name=name,
+        dependencies=dependencies,
+        failures=failures,
+    )
+    if built is None:
+        return excluded_entry(
+            connector,
+            "unbuildable",
+            name=name,
+            detail=failures[-1] if failures else "error",
+        )
+    return built
+
+
+async def _build_rclone_outbox_mount(
+    thread: dict[str, Any],
+    outbox: CloudOutboxMount,
+    *,
+    workspace_name: str,
+    dependencies: AgentCloudMountDependencies,
+    failures: list[str],
+) -> Optional[dict[str, Any]]:
+    """The outbox's rclone mount, or ``None`` with a closed code in
+    ``failures``, as :func:`_build_rclone_mount_from_row` reports one."""
+    backend = dependencies.cloud_router.for_thread_optional(thread)
+    if (
+        backend is None
+        or not backend.is_initialized
+        or not isinstance(backend, SupportsRcloneMount)
+        or backend.backend_id != outbox.backend_id
+    ):
+        failures.append("backend_unavailable")
+        return None
+    target_path = f"/cloud/{workspace_name}"
+    try:
+        handle = SessionFolderHandle.from_db(
+            outbox.folder_handle, backend=backend.backend_id
+        )
+        spec = await backend.build_rclone_mount_spec(
+            handle=handle,
+            mount_kind="session_folder",
+            target_path=target_path,
+            access=outbox.access,
+            subject=None,
+            prefer_public_url=False,
+        )
+    except CloudBackendError as e:
+        logger.info(
+            "Thread %s: its outbox cannot use rclone (%s)",
+            thread.get("id"),
+            e.kind.value,
+        )
+        failures.append(str(e.kind.value))
+        return None
+    except Exception as e:
+        logger.warning(
+            "Thread %s: failed to build its outbox's rclone spec: %s",
+            thread.get("id"),
+            e,
+        )
+        failures.append("error")
+        return None
+    return {
+        "mount_id": outbox.connector_id,
+        "mount_kind": "cloud_outbox",
+        "backend": backend.backend_id,
+        "target_path": target_path,
+        "workspace_name": workspace_name,
+        "access": outbox.access,
+        "source_ref": outbox.connector_id,
+        **spec.to_payload(),
+    }
+
+
+async def _convert_once(
+    thread: dict[str, Any],
+    *,
+    mount_rows: list[dict[str, Any]] | None,
+    dependencies: AgentCloudMountDependencies,
+) -> dict[str, Any] | None:
+    """A session created before cloud connectors, converted at its first
+    in-workspace delivery (a workspace without a recorded plan; a new Pod
+    converts in its planner). Never fails the delivery."""
+    from orchestrator.services.session_cloud_preparation import (
+        convert_to_connector_rule,
+    )
+
+    try:
+        return await convert_to_connector_rule(
+            thread, mount_rows=mount_rows, store=dependencies.store
+        )
+    except Exception:
+        logger.warning(
+            "Thread %s: its cloud folders did not convert; the next delivery "
+            "retries it",
+            thread.get("id"),
+            exc_info=True,
+        )
+        return None
+
+
+async def beside_protected_exclusions(
+    thread: dict[str, Any],
+    *,
+    mount_rows: list[dict[str, Any]] | None,
+    dependencies: AgentCloudMountDependencies,
+) -> list[dict[str, str]]:
+    """Every attached cloud connector a protected session leaves out.
+
+    A protected session mounts its protected folder alone (its project's
+    folder, chosen from ``thread_mounts`` until slice 5); every other cloud
+    connector it has attached, its outbox included, is named
+    ``beside_protected`` rather than dropped silently.
+    """
+    from orchestrator.services.cloud_staging import select_protected_mount
+
+    protected = select_protected_mount(mount_rows or []) or {}
+    protected_project = str(protected.get("source_ref") or "")
+    try:
+        selected = await selected_cloud_connectors(
+            thread,
+            datasource_ids=selected_ids(thread_metadata_object(thread)),
+            project_ids=_project_scope(thread, mount_rows),
+            store=dependencies.store,
+        )
+    except Exception:
+        # Naming them is the report; it never holds the protected mount up.
+        logger.warning(
+            "Thread %s: could not list the cloud folders beside its protected one",
+            thread.get("id"),
+            exc_info=True,
+        )
+        return []
+    return [
+        {
+            **excluded_entry(connector, "beside_protected"),
+            "title": str(connector.row.get("name") or ""),
+        }
+        for connector in selected
+        if not protected_project or native_project(connector.row) != protected_project
+    ]
+
+
+async def _legacy_live_mount_set(
+    thread: dict[str, Any],
+    *,
+    mount_rows: list[dict[str, Any]] | None,
+    runtime_is_vm: bool,
+    dependencies: AgentCloudMountDependencies,
+) -> LiveMountSet:
+    """The old rule, for End's reconstruction only: every requested
+    ``thread_mounts`` row, or the session folder instead.
+
+    A session the old rule mounted in its workspace (no recorded plan, no
+    ``cloud_mount_rule`` stamp) has resident rclone processes whose
+    non-secret spec End must rebuild byte for byte to adopt and remove them
+    (``_runtime_supports_terminal_rclone_retirement``). No delivery uses it.
+    """
     rows = [
         row
         for row in (mount_rows or [])
@@ -590,7 +959,7 @@ async def _resolve_live_mount_set(
     mounts_out = mounted_rows
     excluded: list[dict[str, Any]] = []
     if not mounts_out or len(mounts_out) != len(rows):
-        session_mount = await _build_rclone_session_mount(
+        session_mount = await _legacy_session_folder_mount(
             thread, runtime_is_vm=runtime_is_vm, dependencies=dependencies
         )
         if session_mount:
@@ -719,12 +1088,15 @@ async def _build_agent_cloud_mount(
 ) -> Optional[dict[str, Any]]:
     """Build the rclone ``cloud_mount`` payload for capable runtimes.
 
-    v1 is all-or-fallback: if every requested thread_mount can be represented
-    safely, mount those. If any requested mount is unsupported, mount the
-    regular session folder instead when it exists. This prevents a default
-    user-home row from falling back to the eager clone path. A terminal token
-    selects the narrower End-only reconstruction gate; it does not widen
-    normal runtime delivery.
+    Each attached cloud connector mounts on its own
+    (:func:`_resolve_live_mount_set`); the ones that cannot are named in
+    ``excluded``. A session created before the connector rule converts once
+    here (``session_cloud_preparation.convert_to_connector_rule``) when its
+    workspace has no recorded plan. A terminal token selects the narrower
+    End-only reconstruction gate; it does not widen normal runtime delivery,
+    and for a session the old rule mounted (no ``cloud_mount_rule`` stamp)
+    End rebuilds the old rule's set (:func:`_legacy_live_mount_set`), which
+    its resident processes were mounted from.
 
     A Pod created with the in-pod plane (connector drivers D7) records its
     plan; its mounts come from its sidecars, so this returns the sidecar
@@ -750,7 +1122,16 @@ async def _build_agent_cloud_mount(
             )
         if not ready:
             return None
-        return agent_payload(sidecar_plan, status=metadata.get("cloud_mount_status"))
+        payload = agent_payload(sidecar_plan, status=metadata.get("cloud_mount_status"))
+        if not payload.get("protected") and any(
+            mount.get("mount_kind") == "cloud_outbox"
+            for mount in payload.get("mounts") or []
+        ):
+            # Whether the user sees the outbox yet: the share may land after
+            # the Pod was planned (an unprotected payload is no attach
+            # identity, so it may change between attaches).
+            payload["outbox_shared"] = bool(thread.get("main_cloud_share_handle"))
+        return payload
     if terminal_retirement_token is None:
         runtime_supported = _runtime_supports_rclone_mount(
             metadata, dependencies=dependencies
@@ -775,29 +1156,55 @@ async def _build_agent_cloud_mount(
     # agent-service credentials (B8 review finding; violates the fail-closed
     # invariant). Flag off => protected threads get NO cloud, not live cloud.
     if protected_cloud_marker_state(metadata) != "off":
-        return await _resolve_protected_mount(
+        payload = await _resolve_protected_mount(
             thread,
             metadata=metadata,
             terminal_retirement_token=terminal_retirement_token,
             dependencies=dependencies,
         )
+        if payload is not None and terminal_retirement_token is None:
+            # Its other folders are named, not dropped (the agent ignores
+            # the key when it validates the protected contract).
+            payload["excluded"] = await beside_protected_exclusions(
+                {**thread, "metadata": metadata},
+                mount_rows=mount_rows,
+                dependencies=dependencies,
+            )
+        return payload
 
     # A cross-cluster VM runtime needs the public WebDAV URL (it can't reach the
-    # internal service DNS) and defaults to a read-only mount (root tier). A
-    # same-cluster workspace pod keeps the internal URL + read-write.
+    # internal service DNS). A connector's driver decides its level per tier.
     vm_ctx = metadata.get("vm") or {}
     runtime_is_vm = vm_ctx.get("status") == "ready" and bool(vm_ctx.get("ssh_host"))
 
-    live = await _resolve_live_mount_set(
-        thread,
-        mount_rows=mount_rows,
-        runtime_is_vm=runtime_is_vm,
-        dependencies=dependencies,
-    )
+    legacy = terminal_retirement_token is not None and not uses_connector_rule(metadata)
+    if legacy:
+        live = await _legacy_live_mount_set(
+            thread,
+            mount_rows=mount_rows,
+            runtime_is_vm=runtime_is_vm,
+            dependencies=dependencies,
+        )
+    else:
+        if terminal_retirement_token is None and not uses_connector_rule(metadata):
+            converted = await _convert_once(
+                {**thread, "metadata": metadata},
+                mount_rows=mount_rows,
+                dependencies=dependencies,
+            )
+            if converted is not None:
+                thread = converted
+                metadata = thread_metadata_object(converted)
+        live = await _resolve_live_mount_set(
+            {**thread, "metadata": metadata},
+            mount_rows=mount_rows,
+            runtime_is_vm=runtime_is_vm,
+            dependencies=dependencies,
+        )
     if not live.mounts:
         return None
 
-    return {
+    payload: dict[str, Any] = {
         "version": 1,
         "driver": "rclone",
         "cloud_root": "/cloud",
@@ -806,3 +1213,10 @@ async def _build_agent_cloud_mount(
         "required": False,
         "mounts": live.mounts,
     }
+    if legacy:
+        # The old rule's payload, exactly as it was delivered.
+        return payload
+    payload["excluded"] = live.excluded
+    if any(mount.get("mount_kind") == "cloud_outbox" for mount in live.mounts):
+        payload["outbox_shared"] = bool(thread.get("main_cloud_share_handle"))
+    return payload

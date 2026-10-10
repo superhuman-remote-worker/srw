@@ -98,7 +98,7 @@ def _thread(**metadata) -> dict:
 
 async def _resolve(monkeypatch, entries, excluded=(), thread=None, **kw):
     live = agent_cloud_mounts.LiveMountSet(
-        mounts=list(entries), fallback=bool(excluded), excluded=list(excluded)
+        mounts=list(entries), excluded=list(excluded)
     )
     monkeypatch.setattr(
         agent_cloud_mounts,
@@ -166,29 +166,26 @@ async def test_nothing_to_mount_keeps_todays_path(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("thread", "detail"),
-    [
-        (_thread(), "no_session_folder"),
-        ({**_thread(), "nc_session_folder": "nextcloud:x"}, "spec_failed"),
-    ],
+    "thread", [_thread(), {**_thread(), "nc_session_folder": "nextcloud:x"}]
 )
-async def test_a_session_folder_the_main_cloud_failed_to_make_is_named(
-    monkeypatch, thread, detail
-):
+async def test_nothing_takes_a_missing_folders_place(monkeypatch, thread):
+    """Main cloud slice 3: no session folder stands in when nothing mounts.
+    A session with nothing attached keeps today's path; an attached folder
+    that cannot be mounted is named, and the plan mounts nothing."""
     up = _with_cloud(is_initialized=True, static_mount_credentials=True)
-    plan = await _resolve(monkeypatch, [], thread=thread, dependencies=up)
-    assert plan.mounts == ()
-    assert plan.excluded == (
-        {
-            "source_ref": "session-folder",
-            "mount_kind": "session_folder",
-            "reason": "unbuildable",
-            "detail": detail,
-        },
+    assert await _resolve(monkeypatch, [], thread=thread, dependencies=up) is None
+    missing = {
+        "source_ref": "outbox-1",
+        "mount_kind": "cloud_outbox",
+        "reason": "no_session_folder",
+        "name": "outbox",
+        "detail": "create_failed",
+    }
+    plan = await _resolve(
+        monkeypatch, [], excluded=[missing], thread=thread, dependencies=up
     )
-    # A provider whose mounts need bearer tokens keeps the old path anyway.
-    bearer = _with_cloud(is_initialized=True, static_mount_credentials=False)
-    assert await _resolve(monkeypatch, [], thread=thread, dependencies=bearer) is None
+    assert plan.mounts == ()
+    assert plan.excluded == (missing,)
 
 
 @pytest.mark.asyncio
@@ -294,8 +291,16 @@ async def test_left_out_rows_are_named_and_extra_mounts_capped(monkeypatch):
             "mount_kind": "project",
             "reason": "unbuildable",
             "detail": "not_supported",
+            "name": "a",
+            "title": "A",
         },
-        {"source_ref": "row-b", "mount_kind": "project", "reason": "set_fallback"},
+        {
+            "source_ref": "row-b",
+            "mount_kind": "cloud_outbox",
+            "reason": "no_session_folder",
+            "name": "outbox",
+            "title": "Session outbox",
+        },
     ]
     settings = InPodPlaneSettings(
         opener_image=SETTINGS.opener_image,
@@ -315,6 +320,7 @@ async def test_left_out_rows_are_named_and_extra_mounts_capped(monkeypatch):
             "source_ref": "project-c",
             "mount_kind": "project",
             "reason": "too_many_mounts",
+            "name": "c",
         },
     ]
 
@@ -732,7 +738,9 @@ def test_the_awk_compiler_matches_the_supervisors_vectors(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_the_set_rule_names_every_row_it_left_out(monkeypatch):
+async def test_ends_legacy_set_rule_names_every_row_it_left_out(monkeypatch):
+    """The old all-or-fallback rule survives only for End's reconstruction of
+    a session it mounted (R1): byte for byte, session folder and all."""
     rows = [
         {
             "id": f"row-{x}",
@@ -753,10 +761,10 @@ async def test_the_set_rule_names_every_row_it_left_out(monkeypatch):
     monkeypatch.setattr(agent_cloud_mounts, "_build_rclone_mount_from_row", build)
     monkeypatch.setattr(
         agent_cloud_mounts,
-        "_build_rclone_session_mount",
+        "_legacy_session_folder_mount",
         AsyncMock(return_value=_entry("home", mount_kind="session_folder")),
     )
-    live = await agent_cloud_mounts._resolve_live_mount_set(
+    live = await agent_cloud_mounts._legacy_live_mount_set(
         {"id": THREAD_ID}, mount_rows=rows, runtime_is_vm=False, dependencies=_deps()
     )
     assert [m["workspace_name"] for m in live.mounts] == ["home"] and live.fallback

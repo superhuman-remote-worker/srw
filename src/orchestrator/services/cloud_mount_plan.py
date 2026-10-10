@@ -34,11 +34,13 @@ attempt, reader; never the credential), and attach refuses the Pod when the
 thread's grant is no longer that one. A slow or refused engage keeps the
 in-workspace path.
 
-Which folders a session gets is still today's rule (``_resolve_live_mount_set``:
-every ``thread_mounts`` row, or the session folder when one cannot be
-built); main-cloud slice 3 replaces it with per-connector binding. What D7
-adds is that the rows the rule left out are named, with a closed reason,
-instead of disappearing.
+Which folders a session gets is its attached cloud connectors, each bound
+on its own (``_resolve_live_mount_set``, main cloud slice 3): a project's
+folder, the session's outbox. The ones that mount nothing are named in the
+plan's ``excluded``, with a closed reason
+(``cloud_connector_mounts.EXCLUSION_REASONS``); nothing takes their place.
+A protected session mounts its protected folder alone and names every other
+attached cloud connector ``beside_protected``.
 
 Design: knowledge-base/knowledge/features/connector_drivers.md (D7, decisions
 23 and 18) and main_cloud_as_connectors.md.
@@ -497,11 +499,12 @@ async def resolve_cloud_mount_plan(
     """The plan for a new session container Pod, or ``None`` for the old path.
 
     A Pod with nothing to mount keeps today's path (decision 43): no plan
-    when there is no mount and nothing was left out, e.g. with the main
-    cloud off. When the main cloud is up but its session folder could not be
-    built, the plan has no mount and names the folder as ``unbuildable``,
-    so the user is told. ``wait_for_grant`` is False under the thread's
-    advisory lock (see :func:`await_protected_grant`).
+    when there is no mount and nothing was left out, e.g. a session with no
+    cloud connector attached. A connector that cannot be mounted is named in
+    ``excluded``, so the user is told, even when nothing else mounts.
+    ``wait_for_grant`` is False under the thread's advisory lock (see
+    :func:`await_protected_grant`); the planner only reads either way (the
+    session's cloud is prepared before, ``session_cloud_preparation``).
     """
     if settings is None or dependencies.cloud_workspace_driver() != "rclone_mount":
         return None
@@ -534,10 +537,7 @@ async def resolve_cloud_mount_plan(
         {key: str(value) for key, value in entry.items()} for entry in live.excluded
     ]
     if not kept and not excluded:
-        missing = _missing_session_folder(thread, dependencies)
-        if missing is None:
-            return None
-        excluded.append(missing)
+        return None
     for entry in live.mounts[settings.max_mounts :]:
         excluded.append(
             {
@@ -546,6 +546,7 @@ async def resolve_cloud_mount_plan(
                 ),
                 "mount_kind": str(entry.get("mount_kind") or "project"),
                 "reason": "too_many_mounts",
+                "name": str(entry.get("workspace_name") or ""),
             }
         )
     cache_bytes = _quantity_bytes(settings.cache_size) // max(1, len(kept))
@@ -564,35 +565,6 @@ async def resolve_cloud_mount_plan(
         cache_size=settings.cache_size,
         passwords=passwords,
     )
-
-
-def _missing_session_folder(
-    thread: dict[str, Any],
-    dependencies: agent_cloud_mounts.AgentCloudMountDependencies,
-) -> dict[str, str] | None:
-    """The exclusion naming a session folder the plane would have mounted
-    but could not build, or ``None`` when there is genuinely nothing to
-    mount (the main cloud off, or a provider whose mounts need more than a
-    static password, which keeps the old path anyway)."""
-    try:
-        backend = dependencies.cloud_router.for_thread_optional(thread)
-    except Exception:
-        return None
-    if (
-        backend is None
-        or not getattr(backend, "is_initialized", False)
-        or getattr(backend, "static_mount_credentials", False) is not True
-    ):
-        return None
-    has_handle = bool(
-        thread.get("main_cloud_session_handle") or thread.get("nc_session_folder")
-    )
-    return {
-        "source_ref": "session-folder",
-        "mount_kind": "session_folder",
-        "reason": "unbuildable",
-        "detail": "spec_failed" if has_handle else "no_session_folder",
-    }
 
 
 async def await_protected_grant(
@@ -703,9 +675,14 @@ async def _protected_plan(
     if built is None or built[0].access != "read_only":
         return None
     mount, password = built
+    beside = await agent_cloud_mounts.beside_protected_exclusions(
+        thread, mount_rows=mount_rows, dependencies=dependencies
+    )
     return CloudMountPlan(
         mounts=(mount,),
-        excluded=(),
+        excluded=tuple(
+            {key: str(value) for key, value in entry.items()} for entry in beside
+        ),
         drain_seconds=settings.drain_seconds,
         cache_size=settings.cache_size,
         passwords={0: password},

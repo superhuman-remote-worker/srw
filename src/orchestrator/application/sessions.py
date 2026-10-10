@@ -580,11 +580,6 @@ def thread_admission_dependencies(
                 ),
             )
         ),
-        should_skip_session_folder=bound(
-            thread_mount_rows.should_skip_session_folder,
-            preparation_composition.thread_mount_dependencies,
-            resources,
-        ),
         enforce_session_create_grants=bound(
             grant_enforcement.enforce_session_create_grants,
             preparation_composition.grant_enforcement_dependencies,

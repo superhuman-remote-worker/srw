@@ -244,7 +244,6 @@ async def resume_case(database, case, actor):
         officer_conference_service=SimpleNamespace(
             thread_is_conference=lambda _: False
         ),
-        should_skip_session_folder=lambda _: True,
         schedule_stateless_workspace_ensure=lambda _: None,
         logger=logging.getLogger(__name__),
     )

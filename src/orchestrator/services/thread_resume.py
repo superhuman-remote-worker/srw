@@ -18,6 +18,12 @@ from orchestrator.schemas.thread_lifecycle import (
 )
 from orchestrator.services.cloud import SessionFolderHandle
 from orchestrator.services.cloud.identity import resolve_user_identity_cached
+from orchestrator.services.cloud_connector_mounts import (
+    CLOUD_OUTBOX_KEY,
+    outbox_attached,
+    selected_ids,
+    uses_connector_rule,
+)
 from orchestrator.services.config_drift import (
     DriftItem,
     acknowledged_drift_ids,
@@ -28,6 +34,7 @@ from orchestrator.services.datasource_policy import classify_datasource_selectio
 from orchestrator.services.grant_enforcement import GrantDenied
 from orchestrator.services.model_availability import ModelUnavailable
 from orchestrator.services.manifest_runtime_ownership import require_srw_runtime
+from orchestrator.services.session_cloud_preparation import outbox_selected
 from orchestrator.services.session_provisioner import ensure_session_workspace
 from orchestrator.services.session_runtime_admission import (
     protected_cloud_marker_state,
@@ -63,7 +70,6 @@ class ThreadResumeDependencies:
     hold_officer_for_conference: Callable[..., Awaitable[None]]
     is_protected_cloud_mode_enabled: Callable[[], bool]
     schedule_protected_engage: Callable[..., Any]
-    should_skip_session_folder: Callable[[list[dict[str, Any]]], bool]
     await_protected_cloud_runtime_ready: Callable[[str], Awaitable[bool]]
     find_idle_persistent_agent: Callable[[], Awaitable[Any]]
     thread_has_knowledge_scope: Callable[..., Awaitable[bool]]
@@ -296,7 +302,6 @@ async def resume_thread(
     _hold_officer_for_conference = dependencies.hold_officer_for_conference
     _is_protected_cloud_mode_enabled = dependencies.is_protected_cloud_mode_enabled
     _schedule_protected_engage = dependencies.schedule_protected_engage
-    _should_skip_session_folder = dependencies.should_skip_session_folder
     _register_late_cloud_setup = partial(
         register_late_cloud_setup, dependencies=dependencies
     )
@@ -333,7 +338,9 @@ async def resume_thread(
             detail="Session execution lane does not support resume",
         )
     if execution_lane == LANE_PINNED and thread.get("status") in {
-        "awaiting_user", "suspended", "created",
+        "awaiting_user",
+        "suspended",
+        "created",
     }:
         from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
 
@@ -341,19 +348,23 @@ async def resume_thread(
         open_idle = await idle.get_open_for_thread(thread_id)
         continuation = await idle.get_pending_access_continuation(thread_id)
         if (
-            open_idle is not None or continuation is not None
+            open_idle is not None
+            or continuation is not None
             or thread.get("status") == "suspended"
         ):
             wake = await idle.request_thread_wake(
-                thread_id, execution_requested=True,
+                thread_id,
+                execution_requested=True,
             )
             if wake is None and open_idle is not None:
                 raise HTTPException(
-                    status_code=409, detail={"code": "session_idle_wake_held"},
+                    status_code=409,
+                    detail={"code": "session_idle_wake_held"},
                 )
             if wake is not None:
                 return {
-                    "status": "resuming", "wake_id": str(wake["wake_id"]),
+                    "status": "resuming",
+                    "wake_id": str(wake["wake_id"]),
                 }
     if thread.get("status") != "ended":
         if (
@@ -622,37 +633,35 @@ async def resume_thread(
                 runtime_generation=resume_runtime_authority.generation,
             )
 
-    # Provision cloud session folder if missing (e.g. session was created
-    # before the cloud backend was initialized), or retry the share alone
-    # if the folder exists but no share_handle was recorded — this unstucks
-    # threads where folder creation raced the user's first browser login.
+    # Provision the session's outbox folder if missing (e.g. session was
+    # created before the cloud backend was initialized), or retry the share
+    # alone if the folder exists but no share_handle was recorded — this
+    # unstucks threads where folder creation raced the user's first browser
+    # login. Only while the outbox is attached (main cloud slice 6.1): a
+    # session without it has no session folder at all, and nothing takes
+    # its place.
     existing_session_handle = thread.get("main_cloud_session_handle") or thread.get(
         "nc_session_folder"
     )
-    needs_share_only = bool(existing_session_handle) and not thread.get(
-        "main_cloud_share_handle"
+    needs_share_only = (
+        bool(existing_session_handle)
+        and not thread.get("main_cloud_share_handle")
+        and outbox_attached(metadata)
     )
-    # Phase 4: if the thread already has a working mount, skip the
-    # late-provision branch — the mount is the user-visible cloud surface
-    # and a session folder on top would be redundant. The share-retry
-    # branch is untouched: it only fires on existing folders, so it
-    # remains the recovery path for old session folders that lost their
-    # share record.
-    try:
-        existing_mounts = await postgres_db.list_thread_mounts(thread_id)
-    except Exception as e:
-        existing_mounts = []
-        logger.warning(
-            "Thread %s: failed to read thread_mounts during resume late-provision "
-            "check (%s); proceeding with default policy.",
-            thread_id,
-            e,
-        )
-    needs_full_provision = (
-        not existing_session_handle
-        and not thread.get("nc_session_folder")
-        and not _should_skip_session_folder(existing_mounts)
-    )
+    outbox_id: str | None = None
+    if not existing_session_handle and uses_connector_rule(metadata):
+        try:
+            outbox_id = await outbox_selected(
+                postgres_db, thread.get("user_id"), selected_ids(metadata)
+            )
+        except Exception as e:
+            logger.warning(
+                "Thread %s: failed to read its outbox during resume (%s); "
+                "its folder is not provisioned now.",
+                thread_id,
+                e,
+            )
+    needs_full_provision = outbox_id is not None
     if protected_cloud_marker_state(metadata) == "on":
         # Protected sessions use the project reader + overlay exclusively.
         # Never provision/share the legacy live session folder on resume.
@@ -714,6 +723,16 @@ async def resume_thread(
                     expected_runtime_generation=resume_runtime_authority.generation,
                 ):
                     return
+                if outbox_id is not None:
+                    await postgres_db.merge_thread_cloud_metadata(
+                        tid,
+                        {
+                            CLOUD_OUTBOX_KEY: {
+                                "connector_id": outbox_id,
+                                "state": "ready",
+                            }
+                        },
+                    )
                 logger.info(
                     "Thread %s: %s cloud session folder",
                     tid,

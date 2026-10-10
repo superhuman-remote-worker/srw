@@ -73,7 +73,13 @@ from orchestrator.database.postgres import (
 from orchestrator.schemas.inline_expert import InlineExpertSelection
 from orchestrator.schemas.thread_admission import ThreadCreateRequest
 from orchestrator.security.access import redact_config_override
+from orchestrator.services.cloud_connector_mounts import (
+    CLOUD_MOUNT_RULE_KEY,
+    CLOUD_OUTBOX_KEY,
+    CONNECTOR_RULE,
+)
 from orchestrator.services.config_overrides import validated_config_name
+from orchestrator.services.connector_drivers.cloud_outbox import CloudOutboxDriver
 from orchestrator.services.connector_refs import (
     refuse_connector_selector_conflict,
     resolve_execution_connectors,
@@ -110,6 +116,10 @@ from orchestrator.services.session_create_overrides import (
     validated_reasoning_level,
     validated_session_officer_override,
 )
+from orchestrator.services.session_cloud_preparation import (
+    create_session_outbox,
+    outbox_selected,
+)
 from orchestrator.services.session_runtime_admission import thread_runtime_authority
 from orchestrator.services.session_tool_policy import validated_tool_overrides
 from orchestrator.services.session_workspace_policy import (
@@ -123,6 +133,7 @@ from orchestrator.services.workspace_binding import (
     ensure_virtual_thread_workspace_binding,
 )
 from orchestrator.services.workspace_tier_policy import backend_from_override
+from shared.connectors.contract import AccessContext
 from shared.backend_kinds import LITE_BACKENDS
 from shared.expert_reference import ExpertReferenceConflict, resolve_expert_selection
 from shared.runtime.core.loader import canonical_config_name
@@ -199,8 +210,8 @@ class ThreadAdmissionDependencies:
     a dependency argument this module has no business building:
     ``resolve_session_account_defaults``, ``prefetch_roster_refs``,
     ``resolve_thread_execution_lane``, ``build_thread_mount_rows``,
-    ``should_skip_session_folder``, ``enforce_session_create_grants``,
-    ``check_vm_permission``, ``resolve_cloud_session_url``.
+    ``enforce_session_create_grants``, ``check_vm_permission``,
+    ``resolve_cloud_session_url``.
 
     *Sibling admission policy*, injected rather than called directly so a test
     that rebinds it on main still steers this path:
@@ -237,7 +248,6 @@ class ThreadAdmissionDependencies:
     prefetch_roster_refs: Callable[..., Awaitable[Any]]
     resolve_thread_execution_lane: Callable[..., str]
     build_thread_mount_rows: Callable[..., Awaitable[list[dict[str, Any]]]]
-    should_skip_session_folder: Callable[[list[dict[str, Any]]], bool]
     enforce_session_create_grants: Callable[..., Awaitable[Any]]
     check_vm_permission: Callable[..., Awaitable[Any]]
     resolve_cloud_session_url: Callable[..., str | None]
@@ -939,6 +949,9 @@ async def resolve_thread_creation_plan(
             metadata_patch["expert_based_on"] = request_body.expert_based_on
     if request_body.protected_cloud:
         metadata_patch["protected_cloud"] = True
+    # Its cloud folders are its attached cloud connectors from birth (main
+    # cloud slice 3): it never converts, and End rebuilds that rule.
+    metadata_patch[CLOUD_MOUNT_RULE_KEY] = CONNECTOR_RULE
     trusted_seed = request_body._trusted_seed
     if trusted_seed is not None:
         # Keep this narrow and auditable. A future server-owned seed needs
@@ -1365,9 +1378,20 @@ async def setup_thread_main_cloud(
     thread_id: str,
     user: dict[str, Any],
     *,
+    datasource_ids: list[str] | None = None,
+    workspace_backend: str | None = None,
     dependencies: ThreadAdmissionDependencies,
 ) -> None:
-    """Provision (or deliberately skip) the legacy main-cloud session folder."""
+    """Create a new session's outbox folder, when its outbox is attached.
+
+    The session folder is the outbox connector's (main cloud slice 6.1): a
+    session without the owner's outbox in ``datasource_ids`` (an explicit
+    ``[]`` included) gets no folder at all, and nothing else stands in. Nor
+    does a tier the outbox is not offered on (a root VM): its folder would
+    never be mounted. A failure is recorded on the session
+    (``cloud_outbox.state: "unavailable"`` with a closed reason) and the
+    session starts anyway; the share is retried before its next Pod.
+    """
     # Fresh session folder for a new thread — resolve via the owner
     # seam (active today). The thread row is stamped with this
     # backend's id below, so resume/delete later dispatch via
@@ -1376,75 +1400,67 @@ async def setup_thread_main_cloud(
     # fails closed when no durable active-instance authority exists,
     # because callers that intend a cloud effect must never fall back
     # to an unattested adapter.  Thread creation itself is not such an
-    # effect: in a no-cloud deployment it must continue without the
-    # legacy session folder.
+    # effect: in a no-cloud deployment it must continue without a
+    # session folder.
     store = dependencies.store
     main_cloud_router = dependencies.main_cloud_router
     if main_cloud_router.active_instance_id is None:
         return
+    try:
+        connector_id = await outbox_selected(store, user.get("id"), datasource_ids)
+    except Exception as e:
+        logger.warning(
+            "Thread %s: could not read its outbox selection (%s); no session "
+            "folder is created",
+            thread_id,
+            e,
+        )
+        return
+    if connector_id is None:
+        return
     backend = main_cloud_router.for_owner(user)
-    if not backend.is_initialized and backend.is_configured:
-        await backend.ensure_initialized()
-    if not backend.is_initialized:
-        return
-
-    # Phase 4 (cloud_collaboration_model.md §9): if the thread
-    # already has any mount with a working webdav_url — project,
-    # project_default, or repo — the legacy session folder would
-    # be a redundant second sync target. Skip provisioning it.
-    # The gate is observable-state: failed mount resolution
-    # leaves no usable row, the legacy folder is still
-    # provisioned as fallback, the thread never ends up with
-    # zero cloud surfaces.
-    try:
-        existing_mounts = await store.list_thread_mounts(thread_id)
-    except Exception as e:
-        existing_mounts = []
-        logger.warning(
-            "Thread %s: failed to read thread_mounts before session "
-            "folder provisioning (%s); proceeding with legacy folder.",
-            thread_id,
-            e,
-        )
-    if dependencies.should_skip_session_folder(existing_mounts):
+    tier = AccessContext(
+        workspace_backend=workspace_backend,
+        execution="session",
+        main_cloud_backend=getattr(backend, "backend_id", None),
+    )
+    if not CloudOutboxDriver().offered_access({"config": {}}, tier):
         logger.info(
-            "Thread %s: skipping legacy session folder — at least "
-            "one mount with a working webdav_url is observable.",
+            "Thread %s: its outbox is not offered on the %s tier; no session "
+            "folder is created",
             thread_id,
+            workspace_backend,
         )
         return
-
     try:
-        session_handle = await backend.ensure_session_folder(session_id=thread_id[:8])
-        share_handle = None
-        # ensure_user (not just resolve_user_identity) so we synchronously
-        # provision the cloud user record here — otherwise we race the
-        # fire-and-forget JIT task from auth.get_current_user and the
-        # share gets skipped on a user's very first session.
-        resolved_user_id = await backend.ensure_user(
-            sub=user.get("keycloak_sub") or "",
-            issuer=getattr(backend, "_keycloak_issuer", "") or "",
-            email=user.get("email"),
-            display_name=user.get("display_name"),
-            preferred_username=user.get("preferred_username"),
-        )
-        if resolved_user_id:
-            share_handle = await backend.share_session_folder(
-                session_handle, resolved_user_id
-            )
-        await store.update_thread_main_cloud(
-            thread_id,
-            backend_id=backend.backend_id,
-            backend_instance_id=str(backend.backend_instance_id),
-            session_handle=session_handle.to_db(),
-            share_handle=share_handle.to_db() if share_handle else None,
-        )
+        if not backend.is_initialized and backend.is_configured:
+            await backend.ensure_initialized()
     except Exception as e:
         logger.warning(
-            "Failed to provision main-cloud session folder for thread %s: %s",
+            "Thread %s: the main cloud did not initialize for its outbox: %s",
             thread_id,
             e,
         )
+    if not backend.is_initialized:
+        try:
+            await store.merge_thread_cloud_metadata(
+                thread_id,
+                {
+                    CLOUD_OUTBOX_KEY: {
+                        "connector_id": connector_id,
+                        "state": "unavailable",
+                        "reason": "backend_unavailable",
+                    }
+                },
+            )
+        except Exception:
+            logger.warning(
+                "Thread %s: its outbox state was not recorded", thread_id, exc_info=True
+            )
+        return
+    await create_session_outbox(
+        thread_id, user, connector_id=connector_id, backend=backend, store=store
+    )
 
 
 async def _assign_pool_agent(
@@ -1596,7 +1612,13 @@ async def create_thread(
             # A sidecar Pod's cloud folders are fixed when the Pod is created
             # (connector drivers D7), so its session folder must exist
             # first; the Pod then starts a Nextcloud folder-create later.
-            await setup_thread_main_cloud(thread_id, user, dependencies=dependencies)
+            await setup_thread_main_cloud(
+                thread_id,
+                user,
+                datasource_ids=plan.selected_datasource_ids,
+                workspace_backend=plan.thread_backend,
+                dependencies=dependencies,
+            )
 
         await provision_thread_workspace(plan, thread_id, dependencies=dependencies)
 
@@ -1620,7 +1642,13 @@ async def create_thread(
                 ()
                 if main_cloud_first
                 else (
-                    setup_thread_main_cloud(thread_id, user, dependencies=dependencies),
+                    setup_thread_main_cloud(
+                        thread_id,
+                        user,
+                        datasource_ids=plan.selected_datasource_ids,
+                        workspace_backend=plan.thread_backend,
+                        dependencies=dependencies,
+                    ),
                 )
             ),
         )

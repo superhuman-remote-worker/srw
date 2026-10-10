@@ -15319,6 +15319,38 @@ class PostgresDB:
             result = await conn.execute(query, *args)
         return result == "UPDATE 1"
 
+    #: The ``threads.metadata`` keys :meth:`merge_thread_cloud_metadata` may
+    #: write (``services/cloud_connector_mounts``): which rule a session's
+    #: cloud folders follow, and its outbox folder's record.
+    _THREAD_CLOUD_METADATA_KEYS = frozenset({"cloud_mount_rule", "cloud_outbox"})
+
+    async def merge_thread_cloud_metadata(
+        self, thread_id: str, patch: Dict[str, Any]
+    ) -> bool:
+        """Set top-level ``threads.metadata`` keys of a session's cloud
+        folders (main cloud slices 3 and 6.1): ``cloud_mount_rule`` and
+        ``cloud_outbox``, each replaced whole. Any other key is refused.
+
+        Returns True if the thread was updated, False if not found.
+        """
+        import json as json_module
+
+        unknown = sorted(set(patch) - self._THREAD_CLOUD_METADATA_KEYS)
+        if unknown:
+            raise ValueError(f"Not a cloud metadata key: {', '.join(unknown)}")
+        try:
+            uuid_val = UUID(thread_id)
+        except ValueError:
+            return False
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE threads SET metadata = COALESCE(metadata, '{}'::jsonb) "
+                "|| $2::jsonb WHERE id = $1",
+                uuid_val,
+                json_module.dumps(patch),
+            )
+        return result == "UPDATE 1"
+
     async def merge_thread_cloud_mount_status(
         self,
         thread_id: str,

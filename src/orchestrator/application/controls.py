@@ -675,11 +675,6 @@ def thread_resume_operations(
                 workspace_composition.protected_cloud_engage_dependencies,
                 resources,
             ),
-            should_skip_session_folder=bound(
-                thread_mount_rows.should_skip_session_folder,
-                preparation_composition.thread_mount_dependencies,
-                resources,
-            ),
             await_protected_cloud_runtime_ready=bound(
                 protected_cloud_engage._await_protected_cloud_runtime_ready,
                 workspace_composition.protected_cloud_engage_dependencies,

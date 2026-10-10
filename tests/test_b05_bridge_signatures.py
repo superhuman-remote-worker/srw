@@ -285,11 +285,6 @@ BRIDGES: dict[str, tuple[ModuleType, str, Callable[[ApplicationResources], Any]]
         "thread_project_ids",
         preparation.thread_mount_dependencies,
     ),
-    "_should_skip_session_folder": (
-        thread_mount_rows,
-        "should_skip_session_folder",
-        preparation.thread_mount_dependencies,
-    ),
     "_resolve_thread_datasources": (
         thread_mount_rows,
         "resolve_thread_datasources",

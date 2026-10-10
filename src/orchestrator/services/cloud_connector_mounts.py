@@ -1,0 +1,402 @@
+"""Which cloud folders a session mounts: its attached cloud connectors.
+
+Main cloud slice 3 (and 6.1 for the outbox). A session's cloud folders come
+from the cloud connectors in its selection (``metadata.datasource_ids``),
+each bound on its own: a project's folder (``cloud_folder``, folder kind
+``project``), the owner's session outbox (``cloud_outbox``) and, from slice
+4, the owner's personal root (``cloud_folder``, folder kind ``user_root``).
+A connector that cannot be mounted is an exclusion with a closed reason;
+nothing takes its place, and the others mount anyway. This replaces the
+all-or-fallback rule over ``thread_mounts`` rows, which a protected session
+still reads (slice 5 moves it).
+
+This module answers *what*: the selection's cloud connectors, whether each
+is still authorised for the session's owner, and per folder kind the
+``thread_mounts``-shaped row the rclone builder reads
+(:data:`FOLDER_KIND_BINDERS`). ``agent_cloud_mounts`` builds the mounts.
+
+The metadata it keeps on a session:
+
+* ``cloud_mount_rule: "connectors"`` (:data:`CLOUD_MOUNT_RULE_KEY`): the
+  session's folders come from its connectors. Admission writes it on every
+  new session; an older one gets it from its one-time conversion. End's
+  terminal reconstruction of an in-workspace mount reads it: without it the
+  resident rclone processes were mounted by the old rule, which End then
+  rebuilds byte for byte to adopt them.
+* ``cloud_outbox`` (:data:`CLOUD_OUTBOX_KEY`): the session's outbox
+  folder, ``{connector_id, state, reason?, share_retry_at?}``.
+
+Design: knowledge-base/knowledge/features/main_cloud_as_connectors.md,
+"Slice 3 plan (2026-10-10)" 3.5 and "Overnight run: slices 3 to 8".
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from typing import Any
+
+from orchestrator.services.connector_drivers.cloud_folder import (
+    CloudFolderDriver,
+    CloudFolderMount,
+    CloudFolderUnavailable,
+)
+from orchestrator.services.connector_drivers.cloud_outbox import CloudOutboxDriver
+from shared.connectors.builtin import (
+    CLOUD_FOLDER_SPEC,
+    CLOUD_OUTBOX_SPEC,
+    spec_for_row,
+)
+
+logger = logging.getLogger(__name__)
+
+#: The metadata key saying which rule a session's cloud folders follow.
+CLOUD_MOUNT_RULE_KEY = "cloud_mount_rule"
+#: Its one value: each attached cloud connector on its own.
+CONNECTOR_RULE = "connectors"
+#: The metadata key of a session's outbox folder.
+CLOUD_OUTBOX_KEY = "cloud_outbox"
+#: What a session's outbox folder may record as ``cloud_outbox.reason``
+#: when SRW could not create it: no main cloud served the session, the
+#: provider refused the folder, or something else failed.
+OUTBOX_FAILURE_REASONS: tuple[str, ...] = (
+    "backend_unavailable",
+    "create_failed",
+    "error",
+)
+
+#: Why an attached cloud connector mounts nothing, as closed codes. The
+#: drivers' own (``access_unavailable``, ``config_invalid``, ``not_eligible``,
+#: ``no_session_folder``, ``backend_unavailable``), ``unbuildable`` for a
+#: mount the provider could not build (``detail`` says why, a closed code),
+#: ``beside_protected`` beside a protected session's folder, and
+#: ``too_many_mounts`` past the workspace's limit.
+EXCLUSION_REASONS: tuple[str, ...] = (
+    "access_unavailable",
+    "config_invalid",
+    "not_eligible",
+    "no_session_folder",
+    "backend_unavailable",
+    "unbuildable",
+    "beside_protected",
+    "too_many_mounts",
+)
+
+_DRIVERS: dict[str, CloudFolderDriver | CloudOutboxDriver] = {
+    CLOUD_FOLDER_SPEC.name: CloudFolderDriver(),
+    CLOUD_OUTBOX_SPEC.name: CloudOutboxDriver(),
+}
+
+
+def uses_connector_rule(metadata: Mapping[str, Any] | None) -> bool:
+    """Whether a session's cloud folders come from its connectors."""
+    return isinstance(metadata, Mapping) and (
+        metadata.get(CLOUD_MOUNT_RULE_KEY) == CONNECTOR_RULE
+    )
+
+
+def outbox_record(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    """A session's ``cloud_outbox`` record (empty without one)."""
+    value = metadata.get(CLOUD_OUTBOX_KEY) if isinstance(metadata, Mapping) else None
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def selected_ids(metadata: Mapping[str, Any] | None) -> list[str]:
+    """A session's connector selection, in order, once each."""
+    values = metadata.get("datasource_ids") if isinstance(metadata, Mapping) else None
+    if not isinstance(values, list):
+        return []
+    return list(dict.fromkeys(str(value) for value in values if value))
+
+
+def outbox_attached(metadata: Mapping[str, Any] | None) -> bool:
+    """Whether the session's selection holds the outbox its folder is for.
+
+    Read without the database: the outbox's connector id is recorded with
+    its folder (``cloud_outbox.connector_id``). A session under the old
+    rule keeps its session folder as before (``True`` when it has one).
+    """
+    if not uses_connector_rule(metadata):
+        return True
+    connector_id = outbox_record(metadata).get("connector_id")
+    return bool(connector_id) and str(connector_id) in selected_ids(metadata)
+
+
+def cloud_mount_driver(
+    row: Mapping[str, Any] | None,
+) -> CloudFolderDriver | CloudOutboxDriver | None:
+    """The driver of a connector the workspace mounts, or ``None`` for one
+    delivered otherwise."""
+    spec = spec_for_row(row)
+    return _DRIVERS.get(spec.name) if spec is not None else None
+
+
+@dataclass(frozen=True)
+class SelectedCloudConnector:
+    """One cloud connector of a session's selection.
+
+    ``row`` is the connector as stored, with its managed key and its project
+    link's ``project_read_only``. ``eligible`` is False when the owner may
+    no longer attach it (a revoked link or membership, a deleted project).
+    """
+
+    row: dict[str, Any]
+    driver: CloudFolderDriver | CloudOutboxDriver
+    eligible: bool
+
+    @property
+    def connector_id(self) -> str:
+        return str(self.row.get("id") or "")
+
+    @property
+    def folder_kind(self) -> str:
+        """The mount kind an exclusion names: the folder's kind, or
+        ``cloud_outbox``."""
+        if isinstance(self.driver, CloudOutboxDriver):
+            return "cloud_outbox"
+        config = self.row.get("config")
+        kind = config.get("folder_kind") if isinstance(config, Mapping) else None
+        return str(kind or "project")
+
+
+async def selected_cloud_connectors(
+    thread: Mapping[str, Any],
+    *,
+    datasource_ids: list[str],
+    project_ids: list[str],
+    store: Any,
+) -> list[SelectedCloudConnector]:
+    """The cloud connectors of ``datasource_ids``, in selection order.
+
+    A deleted connector is simply not there. Each one is classified for the
+    session's owner as attach does (``classify_datasource_selection``),
+    per connector: one that is no longer authorised is reported, never
+    allowed to fail the others.
+    """
+    if not datasource_ids:
+        return []
+    rows = await store.resolve_datasources_for_thread(
+        datasource_ids=datasource_ids, project_ids=project_ids
+    )
+    found: dict[str, tuple[dict[str, Any], CloudFolderDriver | CloudOutboxDriver]] = {}
+    for row in rows:
+        driver = cloud_mount_driver(row)
+        if driver is None:
+            continue
+        connector_id = str(row.get("id") or "")
+        if "managed_key" not in row:
+            # The thread resolver does not read the key; the driver binds
+            # only a row SRW created, which the key says.
+            full = await store.get_datasource(connector_id)
+            if full is None:
+                continue
+            row = {**full, "project_read_only": row.get("project_read_only")}
+        found[connector_id] = (dict(row), driver)
+    if not found:
+        return []
+    denied = await _denied(thread, list(found), project_ids, store)
+    return [
+        SelectedCloudConnector(row=row, driver=driver, eligible=cid not in denied)
+        for cid in datasource_ids
+        if cid in found
+        for row, driver in (found[cid],)
+    ]
+
+
+async def _denied(
+    thread: Mapping[str, Any],
+    connector_ids: list[str],
+    project_ids: list[str],
+    store: Any,
+) -> set[str]:
+    """The connectors the session's owner may no longer attach."""
+    from orchestrator.services.datasource_policy import (
+        DatasourceUnavailableError,
+        classify_datasource_selection,
+    )
+
+    owner_id = thread.get("user_id")
+    try:
+        if not owner_id:
+            verdicts, _ = await classify_datasource_selection(
+                store,
+                None,
+                None,
+                connector_ids,
+                project_ids,
+                None,
+                trusted_system_inheritance=True,
+            )
+        else:
+            owner = await store.get_user(str(owner_id))
+            if owner is None:
+                return set(connector_ids)
+            verdicts, _ = await classify_datasource_selection(
+                store,
+                owner,
+                str(owner_id),
+                connector_ids,
+                project_ids,
+                None,
+                allow_admin_explicit_override=True,
+            )
+    except DatasourceUnavailableError:
+        return set(connector_ids)
+    return {str(verdict.datasource_id) for verdict in verdicts if verdict.denied}
+
+
+def excluded_entry(
+    connector: SelectedCloudConnector,
+    reason: str,
+    *,
+    name: str = "",
+    detail: str | None = None,
+) -> dict[str, str]:
+    """An exclusion of the plan: which connector, what it was, why, and the
+    name it would have been mounted under (empty when it never got one)."""
+    entry = {
+        "source_ref": connector.connector_id,
+        "mount_kind": connector.folder_kind,
+        "reason": reason,
+        "name": name,
+    }
+    if detail:
+        entry["detail"] = detail
+    return entry
+
+
+# --------------------------------------------------------------------------- #
+# One folder kind each
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class FolderBindRequest:
+    """What a folder kind's binder gets for one attached ``cloud_folder``
+    connector: the session, the connector row, and the driver's binding (its
+    level resolved, its key checked). ``store`` is the application's."""
+
+    thread: Mapping[str, Any]
+    row: Mapping[str, Any]
+    binding: CloudFolderMount
+    store: Any
+    slugify: Callable[[str], str]
+
+
+@dataclass(frozen=True)
+class FolderBinding:
+    """A folder ready for the rclone builder: ``row`` in the shape of a
+    ``thread_mounts`` row (``CloudFolderMount.mount_row``; ``target_user_sub``
+    or any other subject field the builder reads may be added), and the
+    workspace ``name`` it asks for, which the caller suffixes on a clash."""
+
+    row: dict[str, Any]
+    name: str
+
+
+FolderBinder = Callable[
+    [FolderBindRequest], Awaitable[FolderBinding | CloudFolderUnavailable]
+]
+
+
+async def bind_project_folder(
+    request: FolderBindRequest,
+) -> FolderBinding | CloudFolderUnavailable:
+    """A project's folder, mounted under the project's name.
+
+    The project's own columns name the folder: the connector's config is
+    SRW's copy of them, which the project's provisioning pass repoints when
+    the project's folder or installation is repaired. A copy behind the
+    project would otherwise mount a folder the project no longer names, or
+    exclude the project's folder until the next pass; the key names the
+    project, so its current folder is the connector's. A project that names
+    no folder now mounts nothing (``unbuildable``, ``no_transport``): the
+    stale copy is never used in its place.
+    """
+    binding = request.binding
+    project = (
+        await request.store.get_project(binding.project_id)
+        if binding.project_id
+        else None
+    )
+    if not project:
+        return CloudFolderUnavailable(
+            binding.connector_id,
+            "not_eligible",
+            "The project of this cloud folder no longer exists",
+        )
+    current = {
+        "backend_id": project.get("main_cloud_backend"),
+        "backend_instance_id": (
+            str(project["main_cloud_backend_instance_id"])
+            if project.get("main_cloud_backend_instance_id")
+            else None
+        ),
+        "cloud_handle": project.get("main_cloud_folder_handle"),
+    }
+    row = binding.mount_row()
+    if (
+        current["backend_id"],
+        current["backend_instance_id"],
+        current["cloud_handle"],
+    ) != (
+        binding.backend_id,
+        binding.backend_instance_id,
+        binding.folder_handle,
+    ):
+        logger.info(
+            "Cloud folder connector %s: its project's folder moved; mounting the "
+            "project's current folder",
+            binding.connector_id,
+        )
+    row.update(current)
+    return FolderBinding(row=row, name=request.slugify(str(project.get("name") or "")))
+
+
+async def bind_user_root_folder(
+    request: FolderBindRequest,
+) -> FolderBinding | CloudFolderUnavailable:
+    """A user's personal root: not mounted before slice 4.
+
+    The user-root package replaces this entry of :data:`FOLDER_KIND_BINDERS`
+    with its own binder (owner only, the user's own credential, connect
+    state), returning a :class:`FolderBinding` whose row carries the user's
+    home handle, or an exclusion (``cloud_not_connected``, ...).
+    """
+    return CloudFolderUnavailable(
+        request.binding.connector_id,
+        "access_unavailable",
+        "SRW does not mount a personal cloud folder yet",
+    )
+
+
+#: The binder of each ``cloud_folder`` kind. A kind without one mounts
+#: nothing (``config_invalid``).
+FOLDER_KIND_BINDERS: dict[str, FolderBinder] = {
+    "project": bind_project_folder,
+    "user_root": bind_user_root_folder,
+}
+
+
+__all__ = [
+    "CLOUD_MOUNT_RULE_KEY",
+    "CLOUD_OUTBOX_KEY",
+    "CONNECTOR_RULE",
+    "EXCLUSION_REASONS",
+    "FOLDER_KIND_BINDERS",
+    "OUTBOX_FAILURE_REASONS",
+    "FolderBindRequest",
+    "FolderBinder",
+    "FolderBinding",
+    "SelectedCloudConnector",
+    "bind_project_folder",
+    "bind_user_root_folder",
+    "cloud_mount_driver",
+    "excluded_entry",
+    "outbox_attached",
+    "outbox_record",
+    "selected_cloud_connectors",
+    "selected_ids",
+    "uses_connector_rule",
+]

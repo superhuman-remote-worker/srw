@@ -4,17 +4,17 @@ Extracted verbatim from ``orchestrator.main`` (R1.B05, root lane). This is the
 leaf of B05's session half: it answers "which projects is this thread attached
 to, and what cloud surface does each one expose", and it is called from both
 directions — session configuration resolution reads
-:func:`thread_project_ids`, and thread workspace delivery builds the mount rows
-an agent receives.
+:func:`thread_project_ids`, and admission writes the rows. Since main cloud
+slice 3 an ordinary session mounts its attached cloud connectors instead
+(``cloud_connector_mounts``); the rows still choose a protected session's
+folder (until slice 5) and give a legacy multi-project session its scope.
 
 Three properties are load-bearing and moved unchanged:
 
 * **A missing cloud transport is a missing row, never a partial one.** Every
   resolution failure here — no owner, an owner who has never completed an SSO
   login, an unresolvable installation authority, a backend that is down —
-  returns ``None`` for that project so the caller falls back to the legacy
-  session folder. A thread must never end up with zero cloud surfaces because a
-  transient failure was treated as an answer.
+  returns ``None`` for that project rather than a half-built row.
 * **Connector authorization does not depend on mount rows.**
   :func:`thread_project_ids` answers from ``threads.project_id``, the one
   project a Session belongs to (single_project_sessions.md), so the project
@@ -75,37 +75,6 @@ def slugify_mount_name(name: str) -> str:
     """Workspace-safe slug for a mount's target_path."""
     out = "".join(ch.lower() if ch.isalnum() else "_" for ch in name).strip("_")
     return out or "project"
-
-
-def should_skip_session_folder(
-    mounts: list[dict[str, Any]], *, dependencies: ThreadMountDependencies
-) -> bool:
-    """Phase 4 (cloud_collaboration_model.md §9): is the legacy per-session
-    cloud folder redundant for this thread?
-
-    If at least one ``thread_mounts`` row has a working ``webdav_url`` —
-    any kind (``project``, ``project_default``, ``repo``) — the thread
-    already has a user-visible cloud surface. Provisioning a per-session
-    folder on top would create a parallel sync target the user has no
-    reason to use.
-
-    Returns False when no mount can be observed (no rows, or every row
-    failed to resolve a transport). That falls through to legacy
-    session-folder provisioning so the thread never ends up with zero
-    cloud surfaces — important for unattached sessions and for transient
-    backend failures during mount resolution.
-    """
-    if dependencies.cloud_workspace_driver() == "rclone_mount":
-        # The rclone driver falls back to mounting the regular session folder
-        # when a user-home/project mount cannot be represented safely. Keep that
-        # fallback provisioned instead of treating a WebDAV URL as proof that
-        # the runtime can mount the surface.
-        return False
-
-    for m in mounts:
-        if m.get("webdav_url"):
-            return True
-    return False
 
 
 def project_ids_from_mounts(mounts: list[dict[str, Any]]) -> list[str]:
@@ -562,7 +531,6 @@ __all__ = [
     "resolve_thread_datasource_delivery",
     "resolve_thread_datasources",
     "resolve_thread_repositories",
-    "should_skip_session_folder",
     "slugify_mount_name",
     "thread_project_ids",
     "transport_is_complete",

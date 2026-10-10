@@ -116,7 +116,6 @@ def _admission_deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         prefetch_roster_refs=AsyncMock(return_value=None),
         resolve_thread_execution_lane=MagicMock(return_value="pinned"),
         build_thread_mount_rows=AsyncMock(return_value=[]),
-        should_skip_session_folder=MagicMock(return_value=False),
         enforce_session_create_grants=AsyncMock(),
         check_vm_permission=AsyncMock(),
         resolve_cloud_session_url=MagicMock(return_value=None),

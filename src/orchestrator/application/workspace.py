@@ -55,6 +55,7 @@ from orchestrator.services import (
     project_loop_advance as project_loop_advance_service,
     protected_cloud_engage,
     session_class_policy,
+    session_cloud_preparation,
     session_provisioner,
     snapshot_service as snapshot_service_module,
     subjob_output as subjob_output_operations,
@@ -299,6 +300,34 @@ def agent_cloud_mount_dependencies(
     )
 
 
+async def _prepare_session_cloud(
+    resources: ApplicationResources,
+    thread: dict[str, Any],
+    mount_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """What a session's cloud folders need before its Pod is planned (main
+    cloud slices 3 and 6.1): the one-time conversion of a session created
+    before cloud connectors, then its outbox folder ensured and its share
+    retried. The thread as it now is. Never raises."""
+    store = resources.postgres_db
+    try:
+        converted = await session_cloud_preparation.convert_to_connector_rule(
+            thread, mount_rows=mount_rows, store=store
+        )
+    except Exception:
+        logger.warning(
+            "Session %s: its cloud folders did not convert; the next Pod retries it",
+            thread.get("id"),
+            exc_info=True,
+        )
+        converted = None
+    thread = converted or thread
+    await session_cloud_preparation.prepare_session_outbox(
+        thread, store=store, cloud_router=resources.main_cloud_router
+    )
+    return await store.get_thread(str(thread["id"])) or thread
+
+
 def cloud_mount_planner(
     resources: ApplicationResources,
 ) -> Callable[..., Awaitable[cloud_mount_plan.CloudMountPlan | None]]:
@@ -306,7 +335,11 @@ def cloud_mount_planner(
     mounts (connector drivers D7). It reads the thread and its mount rows at
     call time and builds the cloud payload's collaborators per call, as
     every other cloud build does; the in-pod plane's settings are read from
-    the environment each time too."""
+    the environment each time too.
+
+    Outside the thread's advisory lock (``wait_for_grant``) it prepares the
+    session's cloud first, as :func:`cloud_mount_grant_waiter` does; under
+    the lock it only reads."""
 
     async def plan(
         thread_id: str, *, wait_for_grant: bool = True
@@ -315,9 +348,12 @@ def cloud_mount_planner(
         thread = await store.get_thread(thread_id)
         if not thread:
             return None
+        mount_rows = await store.list_thread_mounts(thread_id)
+        if wait_for_grant:
+            thread = await _prepare_session_cloud(resources, thread, mount_rows)
         return await cloud_mount_plan.resolve_cloud_mount_plan(
             thread,
-            mount_rows=await store.list_thread_mounts(thread_id),
+            mount_rows=mount_rows,
             settings=InPodPlaneSettings.from_env(),
             dependencies=agent_cloud_mount_dependencies(resources),
             wait_for_grant=wait_for_grant,
@@ -329,16 +365,22 @@ def cloud_mount_planner(
 def cloud_mount_grant_waiter(
     resources: ApplicationResources,
 ) -> Callable[[str], Awaitable[None]]:
-    """Awaits a protected session's in-flight reader grant for the
-    provisioner, before it takes the thread's advisory lock (connector
-    drivers D7)."""
+    """The provisioner's pre-plan step, before it takes the thread's
+    advisory lock: a session's cloud prepared (its one-time conversion, its
+    outbox folder and share; main cloud slices 3 and 6.1), then a protected
+    session's in-flight reader grant awaited (connector drivers D7)."""
 
     async def wait(thread_id: str) -> None:
-        thread = await resources.postgres_db.get_thread(thread_id)
-        if thread:
-            await cloud_mount_plan.await_protected_grant(
-                thread, dependencies=agent_cloud_mount_dependencies(resources)
-            )
+        store = resources.postgres_db
+        thread = await store.get_thread(thread_id)
+        if not thread:
+            return
+        thread = await _prepare_session_cloud(
+            resources, thread, await store.list_thread_mounts(thread_id)
+        )
+        await cloud_mount_plan.await_protected_grant(
+            thread, dependencies=agent_cloud_mount_dependencies(resources)
+        )
 
     return wait
 

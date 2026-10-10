@@ -411,33 +411,55 @@ def test_session_url_is_none_when_the_thread_backend_is_uninitialized():
     )
 
 
-def test_session_url_falls_back_to_the_project_default_mount():
+def test_session_url_is_the_outbox_and_nothing_stands_in_for_it():
+    """Main cloud slices 3/6.1: the Cloud button opens the session's outbox
+    folder while the outbox is attached; no project_default row stands in."""
     backend = SimpleNamespace(
         is_initialized=True,
         backend_id="nextcloud",
+        get_session_folder_browser_url=lambda h: f"https://cloud/s/{h.native_id}",
         get_project_folder_browser_url=lambda _h: "https://cloud/f/9",
     )
     router = SimpleNamespace(
-        for_thread_optional=lambda _t: None,
+        for_thread_optional=lambda _t: backend,
         for_backend_instance=lambda _id, *, expected_backend_id: backend,
     )
     dependencies = _deps(cloud_router=router)
-
-    url = mounts._resolve_cloud_session_url(
-        {},
-        [
-            {"mount_kind": "project", "backend_id": "nextcloud", "cloud_handle": "x"},
-            {
-                "mount_kind": "project_default",
-                "backend_id": "nextcloud",
-                "backend_instance_id": "i1",
-                "cloud_handle": '{"backend":"nextcloud","native_id":"9"}',
-            },
-        ],
-        dependencies=dependencies,
+    home = [
+        {
+            "mount_kind": "project_default",
+            "backend_id": "nextcloud",
+            "backend_instance_id": "i1",
+            "cloud_handle": '{"backend":"nextcloud","native_id":"9"}',
+        }
+    ]
+    assert (
+        mounts._resolve_cloud_session_url({}, home, dependencies=dependencies) is None
     )
 
-    assert url == "https://cloud/f/9"
+    def thread(datasource_ids):
+        return {
+            "main_cloud_session_handle": "sessions/abcd1234",
+            "metadata": {
+                "cloud_mount_rule": "connectors",
+                "cloud_outbox": {"connector_id": "ob-1", "state": "ready"},
+                "datasource_ids": datasource_ids,
+            },
+        }
+
+    assert (
+        mounts._resolve_cloud_session_url(thread(["ob-1"]), dependencies=dependencies)
+        == "https://cloud/s/sessions/abcd1234"
+    )
+    # The outbox was removed: its folder is no longer the session's surface.
+    assert (
+        mounts._resolve_cloud_session_url(thread([]), dependencies=dependencies) is None
+    )
+    # A session of the old rule keeps its session folder's button.
+    legacy = {"main_cloud_session_handle": "sessions/abcd1234"}
+    assert mounts._resolve_cloud_session_url(legacy, dependencies=dependencies) == (
+        "https://cloud/s/sessions/abcd1234"
+    )
 
 
 def test_cloud_sync_is_none_when_nothing_resolves():
