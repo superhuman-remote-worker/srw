@@ -95,6 +95,8 @@ class _Workspace:
             return "SRW_LINKS_OK\n"
         if "__SRW_SIDECAR_RCLONE_ZERO__" in command:
             return "__SRW_SIDECAR_RCLONE_ZERO__\n"
+        if "SRW_UNLINK_OK" in command:
+            return "SRW_UNLINK_OK\n"
         parts = []
         for index, _name in enumerate(self.names):
             parts.append(f"==/srw/cloud-status/{index}.json")
@@ -356,6 +358,8 @@ async def test_the_session_attaches_to_sidecar_folders_and_keeps_why_for_the_pro
         shell_owner_token=None,
         config=SimpleNamespace(extra={}),
         cloud_mount_manager=None,
+        sidecar_mount_watcher=None,
+        protected_cloud_unavailable=None,
         cloud_mount_error=None,
     )
     with patch(
@@ -549,8 +553,8 @@ def _protected_session(workspace: _Workspace, *, required: bool = True):
         _finish_protected_cloud=AsyncMock(),
     )
     session._run_protected_without_cloud = (
-        lambda watcher, reason: PersistentSession._run_protected_without_cloud(
-            session, watcher, reason
+        lambda watcher, reason, overlay: PersistentSession._run_protected_without_cloud(
+            session, watcher, reason, overlay
         )
     )
     return session
@@ -813,3 +817,51 @@ def test_the_stale_identity_cleanup_removes_only_identities_and_refuses_a_live_r
         live.kill()
         live.wait()
     assert refused.returncode == 85
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stateless", [False, True])
+async def test_without_its_cloud_a_protected_session_keeps_no_link_to_a_dead_overlay(
+    stateless,
+):
+    """A workspace/cloud link to /cloud/merged from an earlier protected
+    attach would send writes into the sidecars' 1 MiB memory volume, lost
+    silently: decision 42 unmounts a leftover overlay (strictly on a
+    stateless claim) and removes that link."""
+    from shared.runtime.services.cloud_overlay import OverlayMountManager
+
+    workspace = _Workspace(["lower"])
+    workspace.status[0] = {"state": "unavailable", "reason": "unreachable"}
+    session = _protected_session(workspace)
+    session.shell_owner_token = 7 if stateless else None
+    unmounts: list[dict] = []
+
+    def unmount(self, **kwargs):
+        unmounts.append({"merged": self.merged, **kwargs})
+
+    with (
+        patch(
+            "shared.runtime.services.cloud_mount.sidecar.SidecarMountWatcher._start_sync",
+            lambda self: (self.read_states(), setattr(self, "_settled", True)),
+        ),
+        patch.object(OverlayMountManager, "unmount", unmount),
+    ):
+        await PersistentSession._setup_sidecar_cloud_mount(session, _protected_cfg())
+    assert unmounts == [{"merged": "/cloud/merged", "strict": stateless}]
+    unlink = next(c for c in workspace.commands if "SRW_UNLINK_OK" in c)
+    assert "/cloud/merged" in unlink and "readlink" in unlink and "rm -f" in unlink
+    # The error says what the user sees, never a workspace/cloud path.
+    assert session.cloud_mount_error.startswith("Protected cloud unavailable")
+    assert "workspace/cloud:" not in session.cloud_mount_error
+
+
+def test_a_drain_that_gave_uploads_up_for_good_says_so(caplog):
+    import logging
+
+    workspace = _Workspace(["project"])
+    workspace.status[0] = {"state": "unavailable", "reason": "not_found"}
+    workspace.drain_answer = {"state": "drained", "pending": 0, "lost": 2}
+    watcher = _watcher(workspace, _cfg("project"), terminal=True)
+    with caplog.at_level(logging.WARNING):
+        assert watcher.request_drain() == (True, 0)
+    assert "2 upload(s) were lost" in caplog.text

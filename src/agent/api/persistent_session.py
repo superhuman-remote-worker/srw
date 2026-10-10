@@ -1333,12 +1333,19 @@ class PersistentSession:
                     )
                     reason = "protected_unavailable"
             if reason is not None:
-                self._run_protected_without_cloud(watcher, reason)
+                await self._run_protected_without_cloud(
+                    watcher, reason, cloud_mount_cfg["overlay"]
+                )
         unavailable = watcher.unavailable()
         if unavailable:
-            self.cloud_mount_error = "; ".join(
-                f"{row['path'] or 'a folder'}: {row['text']}" for row in unavailable
-            )
+            if self.protected_cloud_unavailable is not None:
+                # No workspace/cloud exists in this state: say what the user
+                # sees, never a path.
+                self.cloud_mount_error = watcher.status()
+            else:
+                self.cloud_mount_error = "; ".join(
+                    f"{row['path'] or 'a folder'}: {row['text']}" for row in unavailable
+                )
             if _dc_is_dataclass(self.config) and hasattr(self.config, "extra"):
                 # A copy, never an in-place write: the config may be the
                 # pod-wide singleton a later session reuses.
@@ -1355,14 +1362,49 @@ class PersistentSession:
             len(unavailable),
         )
 
-    def _run_protected_without_cloud(self, watcher: Any, reason: str) -> None:
+    async def _run_protected_without_cloud(
+        self, watcher: Any, reason: str, overlay_cfg: Dict[str, Any]
+    ) -> None:
         """Decision 42: a protected session whose cloud layer did not come up
         starts with no cloud folder at all, so nothing reaches the cloud
         unreviewed, and says why (the closed ``reason``) in its state, its
-        prompt and the cockpit, rather than failing the attach."""
+        prompt and the cockpit, rather than failing the attach.
+
+        No cloud folder at all means: a capture overlay an earlier attach or
+        claim left (its lower now dead, or this attach's own failed one) is
+        unmounted, the upper with the captured changes staying for the next
+        attach; and a workspace/cloud link to its merged view is removed,
+        or writes would land in the sidecars' small memory volume and be
+        lost. Decision 42 covers the in-pod plane only: the in-workspace
+        protected path (_setup_cloud_mount) and a delivery-level
+        engage_refused keep failing closed, as before D7."""
         logger.warning(
             "Protected session %s runs without its cloud: %s", self.thread_id, reason
         )
+        from shared.runtime.services.cloud_overlay import OverlayMountManager
+
+        try:
+            leftover = OverlayMountManager(
+                thread_id=self.thread_id,
+                overlay_cfg=dict(overlay_cfg),
+                workspace_backend=self.workspace_manager.backend,
+                workspace_root=self.workspace_manager.path,
+            )
+            # A stateless claim proves the mount gone (strict), as End does.
+            await asyncio.to_thread(
+                leftover.unmount, strict=self.shell_owner_token is not None
+            )
+        except Exception as exc:
+            logger.warning(
+                "A leftover capture overlay did not unmount: %s", type(exc).__name__
+            )
+        try:
+            await asyncio.to_thread(watcher.remove_link_to, str(overlay_cfg["merged"]))
+        except Exception as exc:
+            logger.warning(
+                "Could not remove the workspace/cloud link to the capture overlay: %s",
+                type(exc).__name__,
+            )
         watcher.mark_unavailable(reason)
         self.protected_cloud_unavailable = reason
         self.cloud_mount_manager = None

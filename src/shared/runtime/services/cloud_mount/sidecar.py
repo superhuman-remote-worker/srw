@@ -450,6 +450,27 @@ class SidecarMountWatcher:
                 "could not link the cloud folders into the workspace"
             )
 
+    def remove_link_to(self, target: str) -> None:
+        """Remove ``workspace/cloud`` when it is a link to ``target`` (a
+        protected session that runs without its cloud must not keep a link
+        to a capture overlay that is gone)."""
+        script = "\n".join(
+            [
+                f"entry={shlex.quote(self.workspace_root)}/cloud",
+                f"target={shlex.quote(target)}",
+                'if [ -L "${entry}" ] && [ "$(readlink "${entry}")" = "${target}" ]; '
+                'then rm -f -- "${entry}"; fi',
+                "echo SRW_UNLINK_OK",
+            ]
+        )
+        output = self._exec(
+            "sh -c " + shlex.quote(script),
+            timeout=30,
+            operation="remove the capture overlay link",
+        )
+        if "SRW_UNLINK_OK" not in output:
+            raise SidecarMountError("could not remove the workspace/cloud link")
+
     # ------------------------------------------------------------- requests
 
     def _request(self, command: str) -> str:
