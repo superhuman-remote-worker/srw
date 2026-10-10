@@ -17,7 +17,10 @@ from uuid import UUID
 import pytest
 
 from orchestrator.services import cloud_user_root
-from orchestrator.services.datasource_policy import default_datasource_selection
+from orchestrator.services.datasource_policy import (
+    classify_datasource_selection,
+    default_datasource_selection,
+)
 from tests import test_manifest_native_full_schema as full_schema
 from tests.test_cloud_user_root import TOKEN, FakeCloud, FakeRouter
 from tests.test_native_cloud_connectors_real_postgres import _instance
@@ -87,6 +90,23 @@ async def test_the_root_is_its_owners_alone_and_a_default_only_at_home(database)
             database, user["id"], [personal], "sandbox", execution_kind="session"
         )
         assert root not in selected
+
+    # A member forcing the root's id is refused, as is an administrator's
+    # override.
+    for user, kwargs in (
+        (member, {}),
+        (admin, {"allow_admin_explicit_override": True}),
+    ):
+        verdicts, _ = await classify_datasource_selection(
+            database,
+            await database.get_user(user["id"]),
+            user["id"],
+            [root],
+            [personal],
+            "sandbox",
+            **kwargs,
+        )
+        assert [v.denied for v in verdicts] == [True]
 
     ids, _ = await _session_selection(database, owner, personal)
     assert root in ids
