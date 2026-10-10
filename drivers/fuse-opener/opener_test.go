@@ -162,9 +162,10 @@ type fakeMounter struct {
 	mounted  []mountSpec
 	uids     []int
 	reader   *os.File
-	stale    bool  // a dead mount sits at the target until detached
-	failWith error // Detach refuses (a foreign mount at the target)
-	checkErr error // Check refuses even a live target
+	stale    bool     // a dead mount sits at the target until detached
+	failWith error    // Detach refuses (a foreign mount at the target)
+	checkErr error    // Check refuses even a live target
+	at       []string // the target of each detach and mount, as "op target"
 }
 
 func (f *fakeMounter) Stale(string) bool {
@@ -173,10 +174,11 @@ func (f *fakeMounter) Stale(string) bool {
 	return f.stale
 }
 
-func (f *fakeMounter) Detach(string) (int, error) {
+func (f *fakeMounter) Detach(target string) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "detach")
+	f.at = append(f.at, "detach "+target)
 	if f.failWith != nil {
 		return 0, f.failWith
 	}
@@ -198,6 +200,7 @@ func (f *fakeMounter) Mount(target string, spec mountSpec, p policy, uid, gid in
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "mount")
+	f.at = append(f.at, "mount "+target)
 	f.mounted = append(f.mounted, spec)
 	f.uids = append(f.uids, uid)
 	reader, writer, err := os.Pipe()
@@ -230,7 +233,8 @@ func (f *fakeMounter) count(call string) int {
 
 func newServer(fake *fakeMounter, peerUID int) *server {
 	return &server{
-		target:    "/srw/cloud/root",
+		targets:   []string{"/srw/cloud/root"},
+		readOnly:  map[string]bool{"/srw/cloud/root": false},
 		policy:    policy{ReadOnly: true, AllowOther: true, Source: "srw-cloud", Subtype: "rclone"},
 		clientUID: 65534,
 		mounter:   fake,
@@ -444,7 +448,7 @@ func TestStartRetriesInsteadOfExitingAndStillStops(t *testing.T) {
 	fake := &fakeMounter{checkErr: errors.New("not a directory")}
 	var logged bytes.Buffer
 	s := newServer(fake, 65534)
-	s.target = filepath.Join(t.TempDir(), "root")
+	s.targets = []string{filepath.Join(t.TempDir(), "root")}
 	s.logger = log.New(&logged, "", 0)
 	stop := make(chan os.Signal, 1)
 	result := make(chan *net.UnixListener, 1)

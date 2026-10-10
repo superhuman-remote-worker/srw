@@ -1,20 +1,23 @@
-// Command srw-fuse-opener is the D7 spike prototype of the in-pod plane's
-// privileged half (connector drivers, "Three planes", In-pod). It is not a
-// product component yet.
+// Command srw-fuse-opener is the in-pod plane's privileged half (connector
+// drivers, "Three planes", In-pod; slice D7): the only privileged code of a
+// workspace Pod's cloud mounts.
 //
 // One binary, three roles:
 //
-//	srw-fuse-opener serve --socket S --target DIR --client-uid N [--read-only]
-//	    The privileged native sidecar. It owns one FUSE mountpoint, DIR, in an
-//	    emptyDir it mounts with Bidirectional propagation; on start it detaches
-//	    a dead mount it finds there. For each request on the unix socket S (a
-//	    volume the rclone sidecar mounts read-only) from uid N it detaches a
-//	    stale mount at DIR, opens /dev/fuse, mounts it on DIR through an
-//	    O_PATH|O_NOFOLLOW descriptor with options it chooses (nosuid, nodev,
-//	    default_permissions, allow_other, ro when --read-only), and passes the
-//	    descriptor back over SCM_RIGHTS. It opens no network listener and never
-//	    reads what the filesystem serves. It retries rather than exits when it
-//	    cannot serve yet, and on SIGTERM it unmounts DIR.
+//	srw-fuse-opener serve --socket S --target DIR[:ro]... [--dir D]... --client-uid N [--read-only]
+//	    The privileged native sidecar. It owns the FUSE mountpoints DIR (one
+//	    --target each, read-only when suffixed :ro or with --read-only) in an
+//	    emptyDir it mounts with Bidirectional propagation, and creates each
+//	    plain directory D there without ever mounting on it; on start it
+//	    detaches a dead mount it finds at a target. For each request on the
+//	    unix socket S (a volume the rclone sidecar mounts read-only) from uid
+//	    N it detaches a stale mount at the named target, opens /dev/fuse,
+//	    mounts it there through an O_PATH|O_NOFOLLOW descriptor with options
+//	    it chooses (nosuid, nodev, default_permissions, allow_other, ro for a
+//	    read-only target), and passes the descriptor back over SCM_RIGHTS. It
+//	    opens no network listener and never reads what the filesystem serves.
+//	    It retries rather than exits when it cannot serve yet, and on SIGTERM
+//	    it unmounts every target.
 //
 //	fusermount3 [-u] [-z] [-q] [-o OPTS] MOUNTPOINT   (argv[0] or subcommand)
 //	    The client in the unprivileged rclone sidecar, installed ahead of the

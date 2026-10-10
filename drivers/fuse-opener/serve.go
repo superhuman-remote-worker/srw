@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -34,14 +35,48 @@ type mounter interface {
 }
 
 type server struct {
-	target    string
-	policy    policy
+	// targets are the mountpoints this opener owns, in the order given;
+	// readOnly says which of them it mounts read-only whatever the client
+	// asks. dirs are plain directories it only creates: a mountpoint the
+	// workspace itself uses, such as the protected overlay's merged view.
+	targets   []string
+	readOnly  map[string]bool
+	dirs      []string
+	policy    policy // the base policy; its ReadOnly forces every target
 	clientUID int
 	mounter   mounter
 	peer      func(*net.UnixConn) (uid, gid int, err error)
 	logger    *log.Logger
 	mu        sync.Mutex // one mount operation at a time
 	stopping  bool       // under mu: the shutdown detach ran; mount nothing more
+}
+
+// targetFor names the target a request is for. A client that sends no
+// mountpoint (the exec client) gets the only target, if there is one.
+func (s *server) targetFor(mountpoint string) (string, error) {
+	if mountpoint == "" {
+		if len(s.targets) == 1 {
+			return s.targets[0], nil
+		}
+		return "", errors.New("name the mountpoint: this opener owns several")
+	}
+	clean := filepath.Clean(mountpoint)
+	for _, target := range s.targets {
+		if clean == target {
+			return target, nil
+		}
+	}
+	if len(s.targets) == 1 {
+		return "", fmt.Errorf("only %s may be mounted", s.targets[0])
+	}
+	return "", fmt.Errorf("%s is not one of this opener's mountpoints", clean)
+}
+
+// policyFor is the base policy, read-only where the target is.
+func (s *server) policyFor(target string) policy {
+	p := s.policy
+	p.ReadOnly = p.ReadOnly || s.readOnly[target]
+	return p
 }
 
 const (
@@ -117,9 +152,10 @@ func (s *server) handle(conn *net.UnixConn) {
 		answer(fmt.Errorf("uid %d may only ping", uid), -1)
 		return
 	}
-	if req.Mountpoint != "" && filepath.Clean(req.Mountpoint) != s.target {
-		s.logger.Printf("refused: %s for %q, not the target", req.Op, req.Mountpoint)
-		answer(fmt.Errorf("only %s may be mounted", s.target), -1)
+	target, err := s.targetFor(req.Mountpoint)
+	if err != nil {
+		s.logger.Printf("refused: %s for %q: %v", req.Op, req.Mountpoint, err)
+		answer(err, -1)
 		return
 	}
 	s.mu.Lock()
@@ -130,33 +166,34 @@ func (s *server) handle(conn *net.UnixConn) {
 	}
 	switch req.Op {
 	case "unmount":
-		detached, err := s.mounter.Detach(s.target)
-		s.logger.Printf("unmount %s: %d detached, %s", s.target, detached, errString(err))
+		detached, err := s.mounter.Detach(target)
+		s.logger.Printf("unmount %s: %d detached, %s", target, detached, errString(err))
 		answer(err, -1)
 	case "mount":
-		spec, err := planMount(s.policy, req.Options)
+		p := s.policyFor(target)
+		spec, err := planMount(p, req.Options)
 		if err != nil {
 			s.logger.Printf("refused mount: %v", err)
 			answer(err, -1)
 			return
 		}
 		// A restarted daemon finds its predecessor's dead mount here.
-		detached, err := s.mounter.Detach(s.target)
+		detached, err := s.mounter.Detach(target)
 		if err != nil {
 			s.logger.Printf("refused mount: stale mount: %v", err)
 			answer(err, -1)
 			return
 		}
 		if detached > 0 {
-			s.logger.Printf("detached %d stale mount(s) at %s", detached, s.target)
+			s.logger.Printf("detached %d stale mount(s) at %s", detached, target)
 		}
-		fd, err := s.mounter.Mount(s.target, spec, s.policy, uid, gid)
+		fd, err := s.mounter.Mount(target, spec, p, uid, gid)
 		if err != nil {
-			s.logger.Printf("mount %s failed: %v", s.target, err)
+			s.logger.Printf("mount %s failed: %v", target, err)
 			answer(err, -1)
 			return
 		}
-		s.logger.Printf("mounted %s (%s, flags %#x) for uid %d", s.target, spec.FSType, spec.Flags, uid)
+		s.logger.Printf("mounted %s (%s, flags %#x) for uid %d", target, spec.FSType, spec.Flags, uid)
 		answer(nil, fd)
 		// The client holds its copy now; the opener keeps none.
 		closeFD(fd)
@@ -192,6 +229,37 @@ func prepareTarget(m mounter, target string) (int, error) {
 		return detached, err
 	}
 	return detached, m.Check(target)
+}
+
+// prepareDir creates a plain directory the opener never mounts on, and
+// refuses one a symlink stands in for.
+func prepareDir(m mounter, dir string) error {
+	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+		return err
+	}
+	if err := os.Mkdir(dir, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
+		return err
+	}
+	return m.Check(dir)
+}
+
+// prepare readies every target and directory and says how many dead mounts
+// it detached.
+func (s *server) prepare() (int, error) {
+	detached := 0
+	for _, target := range s.targets {
+		n, err := prepareTarget(s.mounter, target)
+		detached += n
+		if err != nil {
+			return detached, err
+		}
+	}
+	for _, dir := range s.dirs {
+		if err := prepareDir(s.mounter, dir); err != nil {
+			return detached, err
+		}
+	}
+	return detached, nil
 }
 
 // listen creates the socket for the client's uid alone. The client mounts
@@ -244,10 +312,12 @@ func (s *server) serve(listener *net.UnixListener, stop <-chan os.Signal) {
 // so the kubelet can tear the emptyDir down; nothing mounts after it.
 func (s *server) shutdown() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.stopping = true
-	detached, err := s.mounter.Detach(s.target)
-	s.mu.Unlock()
-	s.logger.Printf("stopping: unmount %s: %d detached, %s", s.target, detached, errString(err))
+	for _, target := range s.targets {
+		detached, err := s.mounter.Detach(target)
+		s.logger.Printf("stopping: unmount %s: %d detached, %s", target, detached, errString(err))
+	}
 }
 
 // start prepares the target and the socket, retrying instead of exiting: a
@@ -255,9 +325,9 @@ func (s *server) shutdown() {
 // deletion. It returns nil once stop arrives first.
 func (s *server) start(socketPath string, stop <-chan os.Signal) *net.UnixListener {
 	for {
-		detached, err := prepareTarget(s.mounter, s.target)
+		detached, err := s.prepare()
 		if detached > 0 {
-			s.logger.Printf("detached %d dead mount(s) at %s on start", detached, s.target)
+			s.logger.Printf("detached %d dead mount(s) on start", detached)
 		}
 		if err == nil {
 			var listener *net.UnixListener
@@ -274,26 +344,78 @@ func (s *server) start(socketPath string, stop <-chan os.Signal) *net.UnixListen
 	}
 }
 
+// targetFlag collects repeated --target PATH[:ro] arguments.
+type targetFlag struct {
+	paths    []string
+	readOnly map[string]bool
+}
+
+func (f *targetFlag) String() string { return strings.Join(f.paths, ",") }
+
+func (f *targetFlag) Set(value string) error {
+	path, ro := strings.CutSuffix(value, ":ro")
+	if !cleanAbsolute(path) {
+		return fmt.Errorf("target %q must be a clean absolute path", value)
+	}
+	if _, seen := f.readOnly[path]; seen {
+		return fmt.Errorf("target %s given twice", path)
+	}
+	if f.readOnly == nil {
+		f.readOnly = map[string]bool{}
+	}
+	f.paths = append(f.paths, path)
+	f.readOnly[path] = ro
+	return nil
+}
+
+// dirFlag collects repeated --dir PATH arguments.
+type dirFlag []string
+
+func (f *dirFlag) String() string { return strings.Join(*f, ",") }
+
+func (f *dirFlag) Set(value string) error {
+	if !cleanAbsolute(value) {
+		return fmt.Errorf("dir %q must be a clean absolute path", value)
+	}
+	*f = append(*f, value)
+	return nil
+}
+
+func cleanAbsolute(path string) bool {
+	return filepath.IsAbs(path) && filepath.Clean(path) == path && path != "/"
+}
+
 func serveMain(args []string, stderr io.Writer) int {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	socketPath := flags.String("socket", "", "unix socket the client reaches")
-	target := flags.String("target", "", "the one mountpoint this opener owns")
+	var targets targetFlag
+	flags.Var(&targets, "target", "a mountpoint this opener owns, PATH or PATH:ro (repeatable)")
+	var dirs dirFlag
+	flags.Var(&dirs, "dir", "a plain directory to create, never mounted on (repeatable)")
 	clientUID := flags.Int("client-uid", -1, "the only uid that may ask")
-	readOnly := flags.Bool("read-only", false, "force a read-only mount")
+	readOnly := flags.Bool("read-only", false, "force every mount read-only")
 	allowOther := flags.Bool("allow-other", true, "let other users enter the mount")
 	source := flags.String("source", "srw-cloud", "the mount's source")
 	subtype := flags.String("subtype", "rclone", "the mount's type is fuse.<subtype>")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
-	if *socketPath == "" || *target == "" || *clientUID <= 0 {
-		fmt.Fprintln(stderr, "serve needs --socket, --target and a non-root --client-uid")
+	if *socketPath == "" || len(targets.paths) == 0 || *clientUID <= 0 {
+		fmt.Fprintln(stderr, "serve needs --socket, at least one --target and a non-root --client-uid")
 		return 2
+	}
+	for _, dir := range dirs {
+		if _, isTarget := targets.readOnly[dir]; isTarget {
+			fmt.Fprintf(stderr, "%s is both a --target and a --dir\n", dir)
+			return 2
+		}
 	}
 	logger := log.New(stderr, "srw-fuse-opener: ", log.LstdFlags|log.LUTC)
 	s := &server{
-		target:    filepath.Clean(*target),
+		targets:   targets.paths,
+		readOnly:  targets.readOnly,
+		dirs:      dirs,
 		policy:    policy{ReadOnly: *readOnly, AllowOther: *allowOther, Source: *source, Subtype: *subtype},
 		clientUID: *clientUID,
 		mounter:   systemMounter{},
@@ -303,7 +425,9 @@ func serveMain(args []string, stderr io.Writer) int {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
 	if listener := s.start(*socketPath, stop); listener != nil {
-		logger.Printf("serving %s for uid %d (read-only %v)", s.target, s.clientUID, s.policy.ReadOnly)
+		for _, target := range s.targets {
+			logger.Printf("serving %s for uid %d (read-only %v)", target, s.clientUID, s.policyFor(target).ReadOnly)
+		}
 		s.serve(listener, stop)
 	}
 	s.shutdown()
