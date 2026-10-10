@@ -753,9 +753,6 @@ data:
   VIRTUAL_WORKSPACE_S3_ENDPOINT: {{ include "srw.effectiveVwEndpoint" . | quote }}
   VIRTUAL_WORKSPACE_S3_REGION: {{ .Values.virtualWorkspace.s3.region | default "us-east-1" | quote }}
   VIRTUAL_WORKSPACE_S3_PROVIDER: {{ include "srw.effectiveVwProvider" . | quote }}
-  {{- if .Values.cloud.nextcloudRcloneUserHomeUsername }}
-  NEXTCLOUD_RCLONE_USER_HOME_USERNAME: {{ .Values.cloud.nextcloudRcloneUserHomeUsername | quote }}
-  {{- end }}
 
   # Cloud backend — opencloud (bundled), nextcloud (bundled), external, or unset
   {{- if .Values.opencloud.enabled }}

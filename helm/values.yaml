@@ -3123,9 +3123,6 @@ cloud:
   rcloneMount:
     # -- Treat SSH workspace containers as rclone/FUSE-capable runtimes.
     allowContainer: true
-  # -- Optional explicit Nextcloud username for rclone user-home mounts.
-  # Pair with Secret key NEXTCLOUD_RCLONE_USER_HOME_PASSWORD.
-  nextcloudRcloneUserHomeUsername: ""
   # -- The main cloud is configured here only; the admin Main cloud page is
   # read-only. At startup the orchestrator adopts a change to these values
   # on its own only where its attestation proves it: the same installation

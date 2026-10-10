@@ -1000,18 +1000,6 @@ spec:
                   key: NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY
                   optional: false
             {{- end }}
-            - name: NEXTCLOUD_RCLONE_USER_HOME_USERNAME
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: NEXTCLOUD_RCLONE_USER_HOME_USERNAME
-                  optional: true
-            - name: NEXTCLOUD_RCLONE_USER_HOME_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: NEXTCLOUD_RCLONE_USER_HOME_PASSWORD
-                  optional: true
             {{- end }}
             # Default WebDAV datasource (optional)
             - name: DEFAULT_DS_WEBDAV_URL
