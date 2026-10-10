@@ -168,19 +168,9 @@ class ThreadAdmissionStore(Protocol):
         self, project_id: str, thread_id: str, **kwargs: Any
     ) -> Any: ...
 
-    async def replace_thread_mounts(
-        self, thread_id: str, rows: list[dict[str, Any]]
-    ) -> Any: ...
-
-    async def list_thread_mounts(self, thread_id: str) -> list[dict[str, Any]]: ...
-
     async def list_protected_selection_rows(
         self, thread_id: str
     ) -> list[dict[str, Any]]: ...
-
-    async def list_thread_mounts_bulk(
-        self, thread_ids: list[str]
-    ) -> dict[str, list[dict[str, Any]]]: ...
 
     async def list_threads(self, **kwargs: Any) -> list[dict[str, Any]]: ...
 
@@ -221,9 +211,8 @@ class ThreadAdmissionDependencies:
     *B05 policy reached through main's dependency objects* — the service needs
     a dependency argument this module has no business building:
     ``resolve_session_account_defaults``, ``prefetch_roster_refs``,
-    ``resolve_thread_execution_lane``, ``build_thread_mount_rows``,
-    ``enforce_session_create_grants``, ``check_vm_permission``,
-    ``resolve_cloud_session_url``.
+    ``resolve_thread_execution_lane``, ``enforce_session_create_grants``,
+    ``check_vm_permission``, ``resolve_cloud_session_url``.
 
     *Sibling admission policy*, injected rather than called directly so a test
     that rebinds it on main still steers this path:
@@ -259,7 +248,6 @@ class ThreadAdmissionDependencies:
     resolve_session_account_defaults: Callable[..., Awaitable[dict[str, Any]]]
     prefetch_roster_refs: Callable[..., Awaitable[Any]]
     resolve_thread_execution_lane: Callable[..., str]
-    build_thread_mount_rows: Callable[..., Awaitable[list[dict[str, Any]]]]
     enforce_session_create_grants: Callable[..., Awaitable[Any]]
     check_vm_permission: Callable[..., Awaitable[Any]]
     resolve_cloud_session_url: Callable[..., str | None]
@@ -1156,9 +1144,9 @@ async def resolve_thread_creation_plan(
         execution_lane = "pinned"
 
     # Store config_override + datasource ids in thread metadata. Project
-    # attachment is the canonical concern of ``thread_mounts`` (Phase 1
-    # of cloud_collaboration_model.md §9) — the legacy
-    # ``metadata.project_ids`` JSONB key is no longer written.
+    # attachment is ``threads.project_id`` (single_project_sessions.md) — the
+    # legacy ``metadata.project_ids`` JSONB key is no longer written, and
+    # neither is a ``thread_mounts`` row (main cloud slice 8).
     metadata_patch = {}
     if config_override:
         # This is the explicit per-session layer only. Account fallback and
@@ -1368,17 +1356,6 @@ async def commit_thread_creation(
     # read it.
     if backend_from_override(config_override) == "virtual":
         await ensure_virtual_thread_workspace_binding(store, thread_id)
-
-    # Seed thread_mounts for the attached projects.
-    if plan.effective_project_ids:
-        try:
-            mount_rows = await dependencies.build_thread_mount_rows(
-                plan.effective_project_ids
-            )
-            if mount_rows:
-                await store.replace_thread_mounts(thread_id, mount_rows)
-        except Exception as e:
-            logger.warning("Thread %s: failed to seed thread_mounts: %s", thread_id, e)
 
     # Engage protected cloud mode ONCE at create (design §3.3/§11.4), fire-
     # and-forget so create latency is unaffected — mirrors
@@ -1947,16 +1924,10 @@ async def list_threads(
             project_id=project_id,
             status=status,
         )
-        # Phase 2: default-project threads have no legacy session folder, so the
-        # cloud-button URL comes from the project_default mount row. Fetch every
-        # thread's mounts in one query (was a per-thread N+1).
-        mounts_by_thread = await dependencies.store.list_thread_mounts_bulk(
-            [str(t["id"]) for t in threads]
-        )
+        # The cloud button opens the session's outbox folder; no mount row
+        # stands in for it (main cloud slices 3 and 4).
         for t in threads:
-            t["cloud_session_url"] = dependencies.resolve_cloud_session_url(
-                t, mounts_by_thread.get(str(t["id"]), [])
-            )
+            t["cloud_session_url"] = dependencies.resolve_cloud_session_url(t)
         if getattr(dependencies.store, "supports_vm_creation_retry", False):
             from orchestrator.services.vm_creation_owner_view import (
                 thread_creation_views,

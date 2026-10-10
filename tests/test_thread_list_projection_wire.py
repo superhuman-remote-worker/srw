@@ -47,13 +47,12 @@ def test_list_projects_settled_permanent_cleanup_without_failing_other_rows(
     }
     store = SimpleNamespace(
         list_threads=AsyncMock(return_value=[owner, malformed]),
-        list_thread_mounts_bulk=AsyncMock(return_value={}),
         container_workspace_creation_views=AsyncMock(return_value={}),
     )
     dependencies = SimpleNamespace(
         store=store,
         require_approved_user=AsyncMock(return_value={"id": "owner-1"}),
-        resolve_cloud_session_url=lambda _thread, _mounts: None,
+        resolve_cloud_session_url=lambda _thread: None,
         redact_thread_metadata=redact_thread_metadata,
     )
     monkeypatch.setattr(

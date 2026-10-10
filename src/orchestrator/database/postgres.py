@@ -48558,52 +48558,11 @@ class PostgresDB:
         return result == "UPDATE 1"
 
     # --------------------------------------------------------------- thread_mounts
-    # Canonical store for which cloud surfaces are attached to a thread.
-    # Replaces the legacy ``threads.metadata.project_ids`` JSONB key as
-    # source of truth for project attachment (Phase 1 of
-    # knowledge-base/knowledge/features/cloud_collaboration_model.md). The runtime
-    # ``project_ids: list[str]`` contract for downstream consumers is
-    # derived from these rows at payload-build time.
-
-    async def add_thread_mount(
-        self,
-        thread_id: str,
-        *,
-        mount_kind: str,
-        target_path: str,
-        source_kind: str,
-        source_ref: str | None = None,
-        backend_id: str | None = None,
-        backend_instance_id: str | None = None,
-        cloud_handle: str | None = None,
-        webdav_url: str | None = None,
-        target_user_sub: str | None = None,
-    ) -> str:
-        """Insert one mount row and return its UUID."""
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO thread_mounts (
-                    thread_id, mount_kind, target_path,
-                    source_kind, source_ref,
-                    backend_id, backend_instance_id, cloud_handle, webdav_url,
-                    target_user_sub
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                RETURNING id
-                """,
-                UUID(thread_id),
-                mount_kind,
-                target_path,
-                source_kind,
-                UUID(source_ref) if source_ref else None,
-                backend_id,
-                UUID(backend_instance_id) if backend_instance_id else None,
-                cloud_handle,
-                webdav_url,
-                target_user_sub,
-            )
-        return str(row["id"])
+    # Read-only legacy: which cloud surfaces a thread created before main
+    # cloud slice 8 was attached to. Nothing writes a row any more (a
+    # session's cloud folders are its connectors, its project scope is
+    # ``threads.project_id``); the table goes next release
+    # (main_cloud_as_connectors.md, "Next release: drops").
 
     async def list_protected_selection_rows(
         self, thread_id: str
@@ -48667,102 +48626,6 @@ class PostgresDB:
                 UUID(thread_id),
             )
         return [dict(row) for row in rows]
-
-    async def list_thread_mounts_bulk(
-        self, thread_ids: list[str]
-    ) -> Dict[str, list[Dict[str, Any]]]:
-        """All mounts for each thread, in ONE query, ordered by ``target_path``.
-
-        Batched form of :meth:`list_thread_mounts` for the thread-list endpoint
-        — replaces the per-thread N+1 with a single ``thread_id = ANY($1)``
-        fetch. Returns ``{thread_id: [mount_row, ...]}``; threads with no mounts
-        are absent. Invalid UUIDs are skipped.
-        """
-        valid: list[UUID] = []
-        for t in thread_ids:
-            try:
-                valid.append(UUID(str(t)))
-            except (ValueError, TypeError):
-                continue
-        if not valid:
-            return {}
-
-        async with self.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, thread_id, mount_kind, target_path,
-                       source_kind, source_ref,
-                       backend_id, backend_instance_id, cloud_handle, webdav_url,
-                       target_user_sub, created_at
-                FROM thread_mounts
-                WHERE thread_id = ANY($1::uuid[])
-                ORDER BY thread_id, target_path
-                """,
-                valid,
-            )
-        out: Dict[str, list[Dict[str, Any]]] = {}
-        for row in rows:
-            out.setdefault(str(row["thread_id"]), []).append(dict(row))
-        return out
-
-    async def remove_thread_mount(self, mount_id: str) -> bool:
-        """Delete a single mount by id. Returns True if a row was removed."""
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                "DELETE FROM thread_mounts WHERE id = $1",
-                UUID(mount_id),
-            )
-        return result.endswith(" 1")
-
-    async def replace_thread_mounts(
-        self,
-        thread_id: str,
-        mounts: list[Dict[str, Any]],
-    ) -> list[str]:
-        """Atomically replace a thread's mount set.
-
-        Each entry in ``mounts`` must carry ``mount_kind``, ``target_path``,
-        ``source_kind``; ``source_ref`` / ``backend_id`` / ``cloud_handle``
-        / ``webdav_url`` are optional. Returns the list of new mount IDs in
-        the order they were inserted.
-        """
-        new_ids: list[str] = []
-        async with self.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute(
-                    "DELETE FROM thread_mounts WHERE thread_id = $1",
-                    UUID(thread_id),
-                )
-                for entry in mounts:
-                    src_ref = entry.get("source_ref")
-                    row = await conn.fetchrow(
-                        """
-                        INSERT INTO thread_mounts (
-                            thread_id, mount_kind, target_path,
-                            source_kind, source_ref,
-                            backend_id, backend_instance_id, cloud_handle, webdav_url,
-                            target_user_sub
-                        )
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                        RETURNING id
-                        """,
-                        UUID(thread_id),
-                        entry["mount_kind"],
-                        entry["target_path"],
-                        entry["source_kind"],
-                        UUID(src_ref) if src_ref else None,
-                        entry.get("backend_id"),
-                        (
-                            UUID(str(entry["backend_instance_id"]))
-                            if entry.get("backend_instance_id")
-                            else None
-                        ),
-                        entry.get("cloud_handle"),
-                        entry.get("webdav_url"),
-                        entry.get("target_user_sub"),
-                    )
-                    new_ids.append(str(row["id"]))
-        return new_ids
 
     async def mark_orphaned_threads_ended(self) -> list[Dict[str, Any]]:
         """Select live pinned runtimes whose exact agent is offline.

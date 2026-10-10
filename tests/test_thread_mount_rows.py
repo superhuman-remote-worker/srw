@@ -1,12 +1,13 @@
-"""Unit tests for the thread-mount-row builders (``thread_mount_rows``).
+"""Unit tests for the legacy thread mount rows (``thread_mount_rows``).
 
 Phase 2 of ``knowledge-base/knowledge/features/cloud_collaboration_model.md``
 §9 introduced the ``project_default`` row shape (a default project mounting
 its owner's cloud home); main cloud slice 4 replaced it with the user-root
 connector, so a default project writes no row any more, while rows written
-before still count for the project scope. These tests cover the builder
-helpers (``build_thread_mount_rows``, ``build_project_mount_row``) directly so
-the wiring is exercised without standing up the full thread-create path.
+before still count for the project scope. Since slice 8 nothing writes a
+row; these tests cover what still reads them (the project scope, End's
+terminal reconstruction, the protected payload) without standing up the full
+thread-create path.
 """
 
 from __future__ import annotations
@@ -14,9 +15,6 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-import orchestrator.main as orch_main
-from orchestrator.services import thread_mount_rows as thread_mount_rows_service
 
 import orchestrator.main
 from orchestrator.application import preparation as preparation_composition
@@ -28,22 +26,6 @@ from orchestrator.services import thread_mount_rows as thread_mount_rows_module
 _BACKEND_INSTANCE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 _THREAD_ID = "11111111-1111-4111-8111-111111111111"
 _RUNTIME_GENERATION = "22222222-2222-4222-8222-222222222222"
-
-
-def _project(
-    *, project_id: str, is_default: bool = False, name: str = "Project"
-) -> dict:
-    """Shape a project row the way ``get_project`` returns it."""
-    return {
-        "id": project_id,
-        "name": name,
-        "is_default": is_default,
-        "main_cloud_backend": "opencloud",
-        "main_cloud_backend_instance_id": _BACKEND_INSTANCE_ID,
-        "main_cloud_folder_handle": (
-            "opencloud:drive-abc:" if not is_default else None
-        ),
-    }
 
 
 def _user_home(webdav_url: str = "https://oc.test/dav/spaces/drive-xyz/"):
@@ -68,24 +50,6 @@ def _backend(*, initialized: bool = True, backend_id: str = "opencloud"):
     return backend
 
 
-def _owner_member(
-    *,
-    user_id: str = "owner-uuid",
-    email: str = "alice@example.com",
-    display_name: str = "Alice",
-) -> dict:
-    return {
-        "role": "owner",
-        "user_id": user_id,
-        "email": email,
-        "display_name": display_name,
-    }
-
-
-def _owner_user_record(*, keycloak_sub: str = "alice-keycloak-sub") -> dict:
-    return {"id": "owner-uuid", "keycloak_sub": keycloak_sub}
-
-
 def _fake_db() -> MagicMock:
     """Base postgres_db stand-in. The identity-cache methods always exist on
     the real Database (services/cloud/identity.py reads them on every
@@ -95,67 +59,6 @@ def _fake_db() -> MagicMock:
     db.get_user_cloud_identity = AsyncMock(return_value={})
     db.merge_user_cloud_identity = AsyncMock(return_value=True)
     return db
-
-
-@pytest.mark.asyncio
-async def test_build_thread_mount_rows_writes_no_row_for_a_default_project():
-    """One default project + one non-default project → one ``project`` row
-    under ``projects/<slug>/``. A default project's cloud is its owner's own
-    root, the user-root connector (main cloud slice 4): no row, and its
-    owner is not even resolved on the cloud.
-    """
-    from orchestrator.services.thread_mount_rows import build_thread_mount_rows
-
-    default_project = _project(project_id="p-default", is_default=True, name="My Home")
-    other_project = _project(project_id="p-other", is_default=False, name="Alpha")
-    fake_db = _fake_db()
-
-    async def get_project(pid: str):
-        return {"p-default": default_project, "p-other": other_project}.get(pid)
-
-    fake_db.get_project = AsyncMock(side_effect=get_project)
-    fake_db.get_project_members = AsyncMock(
-        return_value=[_owner_member(email="carol@example.com", display_name="Carol")]
-    )
-    fake_db.get_user = AsyncMock(
-        return_value=_owner_user_record(keycloak_sub="carol-sub")
-    )
-    backend = _backend()
-    router = MagicMock()
-    router.for_project.return_value = backend
-    router.for_project_optional.return_value = backend
-    router.for_backend.return_value = backend
-
-    with (
-        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
-        patch("orchestrator.main.app.state.resources.main_cloud_router", router),
-    ):
-        rows = await build_thread_mount_rows(
-            ["p-default", "p-other"],
-            dependencies=preparation_composition.thread_mount_dependencies(
-                orch_main.app.state.resources
-            ),
-        )
-
-    assert [(r["mount_kind"], r["target_path"], r["source_ref"]) for r in rows] == [
-        ("project", "projects/alpha", "p-other")
-    ]
-    backend.resolve_user_identity.assert_not_awaited()
-    backend.get_user_home.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_build_project_mount_row_is_none_for_a_default_project():
-    from orchestrator.services.thread_mount_rows import build_project_mount_row
-
-    assert (
-        await build_project_mount_row(
-            "p-default",
-            _project(project_id="p-default", is_default=True),
-            dependencies=MagicMock(),
-        )
-        is None
-    )
 
 
 @pytest.mark.asyncio
@@ -174,8 +77,9 @@ async def test_project_ids_from_mounts_includes_project_default():
 
 
 @pytest.mark.asyncio
-async def test_thread_project_ids_preserves_scope_when_default_mount_is_unavailable():
-    """Logical connector scope must survive a failed cloud-home mount build."""
+async def test_thread_project_ids_answers_from_the_column_and_writes_no_row():
+    """A session without rows keeps its scope, and none is written for it: its
+    cloud folders are its connectors (main cloud slice 8)."""
     fake_db = _fake_db()
     fake_db.list_thread_mounts = AsyncMock(return_value=[])
     fake_db.get_thread = AsyncMock(
@@ -187,14 +91,7 @@ async def test_thread_project_ids_preserves_scope_when_default_mount_is_unavaila
     )
     fake_db.replace_thread_mounts = AsyncMock()
 
-    with (
-        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
-        patch.object(
-            thread_mount_rows_service,
-            "build_thread_mount_rows",
-            AsyncMock(return_value=[]),
-        ),
-    ):
+    with patch("orchestrator.main.app.state.resources.postgres_db", fake_db):
         project_ids = await thread_mount_rows_module.thread_project_ids(
             "thread-1",
             dependencies=preparation_composition.thread_mount_dependencies(
@@ -362,249 +259,6 @@ async def test_build_agent_cloud_mount_container_runtime_can_be_disabled(monkeyp
     )
 
     assert payload is None
-
-
-# ---------------------------------------------------------------------------
-# Phase 3a — multi-project mount path collision handling
-# ---------------------------------------------------------------------------
-
-
-def _multi_project_db(projects: list[dict]) -> MagicMock:
-    """Build a fake postgres_db that resolves each project_id to a row."""
-    fake_db = _fake_db()
-    table = {p["id"]: p for p in projects}
-
-    async def get_project(pid: str):
-        return table.get(pid)
-
-    fake_db.get_project = AsyncMock(side_effect=get_project)
-    fake_db.get_project_members = AsyncMock(return_value=[_owner_member()])
-    fake_db.get_user = AsyncMock(return_value=_owner_user_record())
-    return fake_db
-
-
-def _router_for_backend(backend: MagicMock) -> MagicMock:
-    router = MagicMock()
-    router.for_project.return_value = backend
-    router.for_project_optional.return_value = backend
-    router.for_backend.return_value = backend
-    return router
-
-
-@pytest.mark.asyncio
-async def test_collision_two_same_named_projects_get_distinct_paths():
-    """Two non-default projects with the same name → first wins ``projects/alpha``,
-    second gets ``projects/alpha-2``. UNIQUE (thread_id, target_path) at
-    persistence time always holds.
-    """
-    from orchestrator.services.thread_mount_rows import build_thread_mount_rows
-
-    fake_db = _multi_project_db(
-        [
-            _project(project_id="p-1", name="Alpha"),
-            _project(project_id="p-2", name="Alpha"),
-        ]
-    )
-    backend = _backend()
-
-    with (
-        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
-        patch(
-            "orchestrator.main.app.state.resources.main_cloud_router",
-            _router_for_backend(backend),
-        ),
-    ):
-        rows = await build_thread_mount_rows(
-            ["p-1", "p-2"],
-            dependencies=preparation_composition.thread_mount_dependencies(
-                orch_main.app.state.resources
-            ),
-        )
-
-    assert len(rows) == 2
-    assert [r["target_path"] for r in rows] == [
-        "projects/alpha",
-        "projects/alpha-2",
-    ]
-    assert [r["source_ref"] for r in rows] == ["p-1", "p-2"]
-
-
-@pytest.mark.asyncio
-async def test_collision_case_insensitive():
-    """``_slugify_mount_name`` lowercases, so "Alpha" and "alpha" produce
-    the same slug. Collision logic must still dedup the second one.
-    """
-    from orchestrator.services.thread_mount_rows import build_thread_mount_rows
-
-    fake_db = _multi_project_db(
-        [
-            _project(project_id="p-1", name="Alpha"),
-            _project(project_id="p-2", name="alpha"),
-        ]
-    )
-    backend = _backend()
-
-    with (
-        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
-        patch(
-            "orchestrator.main.app.state.resources.main_cloud_router",
-            _router_for_backend(backend),
-        ),
-    ):
-        rows = await build_thread_mount_rows(
-            ["p-1", "p-2"],
-            dependencies=preparation_composition.thread_mount_dependencies(
-                orch_main.app.state.resources
-            ),
-        )
-
-    assert [r["target_path"] for r in rows] == [
-        "projects/alpha",
-        "projects/alpha-2",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_collision_three_same_named_projects():
-    """Three same-named → ``alpha``, ``alpha-2``, ``alpha-3``. The suffix
-    counter walks forward and doesn't reuse freed-up indices (none get
-    freed in this scenario anyway).
-    """
-    from orchestrator.services.thread_mount_rows import build_thread_mount_rows
-
-    fake_db = _multi_project_db(
-        [
-            _project(project_id="p-1", name="Alpha"),
-            _project(project_id="p-2", name="Alpha"),
-            _project(project_id="p-3", name="Alpha"),
-        ]
-    )
-    backend = _backend()
-
-    with (
-        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
-        patch(
-            "orchestrator.main.app.state.resources.main_cloud_router",
-            _router_for_backend(backend),
-        ),
-    ):
-        rows = await build_thread_mount_rows(
-            ["p-1", "p-2", "p-3"],
-            dependencies=preparation_composition.thread_mount_dependencies(
-                orch_main.app.state.resources
-            ),
-        )
-
-    assert [r["target_path"] for r in rows] == [
-        "projects/alpha",
-        "projects/alpha-2",
-        "projects/alpha-3",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_no_collision_unique_names_unaffected():
-    """Sanity check: unique names don't acquire suffixes (regression guard
-    in case the suffix loop is ever rewritten with an off-by-one).
-    """
-    from orchestrator.services.thread_mount_rows import build_thread_mount_rows
-
-    fake_db = _multi_project_db(
-        [
-            _project(project_id="p-1", name="Alpha"),
-            _project(project_id="p-2", name="Beta"),
-            _project(project_id="p-3", name="Gamma"),
-        ]
-    )
-    backend = _backend()
-
-    with (
-        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
-        patch(
-            "orchestrator.main.app.state.resources.main_cloud_router",
-            _router_for_backend(backend),
-        ),
-    ):
-        rows = await build_thread_mount_rows(
-            ["p-1", "p-2", "p-3"],
-            dependencies=preparation_composition.thread_mount_dependencies(
-                orch_main.app.state.resources
-            ),
-        )
-
-    assert [r["target_path"] for r in rows] == [
-        "projects/alpha",
-        "projects/beta",
-        "projects/gamma",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_dedupe_repeated_project_id():
-    """Same UUID twice in project_ids → one row, not two — and definitely
-    not a row at ``projects/alpha`` plus a phantom ``projects/alpha-2``
-    pointing at the same source_ref.
-    """
-    from orchestrator.services.thread_mount_rows import build_thread_mount_rows
-
-    fake_db = _multi_project_db(
-        [
-            _project(project_id="p-1", name="Alpha"),
-        ]
-    )
-    backend = _backend()
-
-    with (
-        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
-        patch(
-            "orchestrator.main.app.state.resources.main_cloud_router",
-            _router_for_backend(backend),
-        ),
-    ):
-        rows = await build_thread_mount_rows(
-            ["p-1", "p-1", "p-1"],
-            dependencies=preparation_composition.thread_mount_dependencies(
-                orch_main.app.state.resources
-            ),
-        )
-
-    assert len(rows) == 1
-    assert rows[0]["target_path"] == "projects/alpha"
-    assert rows[0]["source_ref"] == "p-1"
-
-
-@pytest.mark.asyncio
-async def test_collision_with_default_project_present():
-    """A default project (no row) + two collision-named non-default
-    projects: the suffix logic fires between the non-defaults only."""
-    from orchestrator.services.thread_mount_rows import build_thread_mount_rows
-
-    fake_db = _multi_project_db(
-        [
-            _project(project_id="p-default", is_default=True, name="My Home"),
-            _project(project_id="p-1", name="Alpha"),
-            _project(project_id="p-2", name="Alpha"),
-        ]
-    )
-    backend = _backend()
-
-    with (
-        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
-        patch(
-            "orchestrator.main.app.state.resources.main_cloud_router",
-            _router_for_backend(backend),
-        ),
-    ):
-        rows = await build_thread_mount_rows(
-            ["p-default", "p-1", "p-2"],
-            dependencies=preparation_composition.thread_mount_dependencies(
-                orch_main.app.state.resources
-            ),
-        )
-
-    assert [r["target_path"] for r in rows] == ["projects/alpha", "projects/alpha-2"]
-    # source_refs preserved in input order
-    assert [r["source_ref"] for r in rows] == ["p-1", "p-2"]
 
 
 def test_protected_cloud_mount_payload_is_ro_lower_plus_overlay():

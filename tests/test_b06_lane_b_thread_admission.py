@@ -86,9 +86,7 @@ def _deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         get_officer_thread_for_project=AsyncMock(return_value=None),
         register_project_officer_thread=AsyncMock(return_value={}),
         decommission_project_officer=AsyncMock(),
-        replace_thread_mounts=AsyncMock(),
         list_thread_mounts=AsyncMock(return_value=[]),
-        list_thread_mounts_bulk=AsyncMock(return_value={}),
         list_threads=AsyncMock(return_value=[]),
         merge_thread_workspace_context=AsyncMock(),
         bind_thread_managed_repository=AsyncMock(return_value=True),
@@ -137,7 +135,6 @@ def _deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         ),
         prefetch_roster_refs=AsyncMock(return_value=None),
         resolve_thread_execution_lane=MagicMock(return_value="pinned"),
-        build_thread_mount_rows=AsyncMock(return_value=[]),
         enforce_session_create_grants=AsyncMock(),
         check_vm_permission=AsyncMock(),
         resolve_cloud_session_url=MagicMock(return_value=None),
@@ -549,12 +546,13 @@ class TestCreationPlan:
         deps.store.create_thread.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_one_project_is_the_primary_and_the_only_mount_source(self):
-        """A one-project Session gets that project as threads.project_id and
-        mounts exactly it: the server adds no personal project beside it."""
+    async def test_one_project_is_the_primary_and_writes_no_mount_row(self):
+        """A one-project Session gets that project as threads.project_id: the
+        server adds no personal project beside it. Its cloud folders are its
+        connectors, so no thread_mounts row is written (main cloud slice 8):
+        this store has no writer to call."""
         body = ThreadCreateRequest(project_ids=[OTHER_PROJECT])
-        rows = [{"mount_kind": "project", "source_ref": OTHER_PROJECT}]
-        deps = _deps(build_thread_mount_rows=AsyncMock(return_value=rows))
+        deps = _deps()
 
         plan = await _plan(body, deps)
         await ta.commit_thread_creation(plan, body, USER, dependencies=deps)
@@ -562,8 +560,8 @@ class TestCreationPlan:
         assert plan.effective_project_ids == [OTHER_PROJECT]
         assert plan.primary_project_id == OTHER_PROJECT
         assert plan.create_kwargs["project_id"] == OTHER_PROJECT
-        deps.build_thread_mount_rows.assert_awaited_once_with([OTHER_PROJECT])
-        deps.store.replace_thread_mounts.assert_awaited_once_with(THREAD, rows)
+        assert not hasattr(deps, "build_thread_mount_rows")
+        assert not hasattr(deps.store, "replace_thread_mounts")
 
     @pytest.mark.asyncio
     async def test_scope_is_authorized_before_any_account_work(self):
@@ -1120,21 +1118,6 @@ class TestCommit:
         assert exc.value.detail["access"] == "protected"
         deps.schedule_protected_engage.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_a_mount_seeding_failure_never_fails_the_create(self):
-        deps = _deps(
-            authorize_thread_project_ids=AsyncMock(
-                side_effect=lambda _u, ids: list(ids)
-            ),
-            build_thread_mount_rows=AsyncMock(side_effect=RuntimeError("gitea down")),
-        )
-        plan = await _plan(ThreadCreateRequest(project_id=PROJECT), deps)
-        thread_id, authority = await ta.commit_thread_creation(
-            plan, ThreadCreateRequest(project_id=PROJECT), USER, dependencies=deps
-        )
-        assert thread_id == THREAD
-        assert authority.generation == GENERATION
-
 
 # =============================================================================
 # The whole operation
@@ -1393,24 +1376,21 @@ class TestWorkspaceActuation:
 
 class TestListThreads:
     @pytest.mark.asyncio
-    async def test_mounts_are_fetched_in_one_query_and_metadata_is_redacted(self):
+    async def test_each_thread_gets_its_outbox_url_and_metadata_is_redacted(self):
+        """The cloud button is the outbox folder's URL, from the thread alone:
+        no mount row is read (main cloud slice 8)."""
         rows = [{"id": THREAD}, {"id": OTHER_PROJECT}]
         deps = _deps(
-            store={
-                "list_threads": AsyncMock(return_value=rows),
-                "list_thread_mounts_bulk": AsyncMock(
-                    return_value={THREAD: [{"webdav_url": "https://c/x"}]}
-                ),
-            },
+            store={"list_threads": AsyncMock(return_value=rows)},
             resolve_cloud_session_url=MagicMock(return_value="https://c/x"),
             redact_thread_metadata=MagicMock(
                 side_effect=lambda t: {**t, "redacted": True}
             ),
         )
         result = await ta.list_threads(MagicMock(), dependencies=deps)
-        deps.store.list_thread_mounts_bulk.assert_awaited_once_with(
-            [THREAD, OTHER_PROJECT]
-        )
+        calls = deps.resolve_cloud_session_url.call_args_list
+        assert [call.args[0]["id"] for call in calls] == [THREAD, OTHER_PROJECT]
+        assert all(len(call.args) == 1 and not call.kwargs for call in calls)
         assert all(t["redacted"] for t in result["threads"])
         assert result["threads"][0]["cloud_session_url"] == "https://c/x"
 

@@ -571,15 +571,6 @@ def thread_admission_dependencies(
                 )
             )
         ),
-        build_thread_mount_rows=(
-            lambda *args, **kwargs: thread_mount_rows.build_thread_mount_rows(
-                *args,
-                **kwargs,
-                dependencies=preparation_composition.thread_mount_dependencies(
-                    resources
-                ),
-            )
-        ),
         enforce_session_create_grants=bound(
             grant_enforcement.enforce_session_create_grants,
             preparation_composition.grant_enforcement_dependencies,

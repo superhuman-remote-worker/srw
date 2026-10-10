@@ -83,7 +83,6 @@ class _Store:
         self.thread = thread
         self.mounts = list(mounts)
         self.rows = _policy_rows()
-        self.replace_thread_mounts = AsyncMock()
 
     async def get_thread(self, thread_id: str):
         return self.thread if thread_id == self.thread["id"] else None
@@ -174,12 +173,7 @@ class TestDurableProjectIds:
 
 class TestThreadProjectIds:
     @pytest.mark.asyncio
-    async def test_a_project_session_answers_the_same_without_its_mount_rows(
-        self, monkeypatch
-    ):
-        monkeypatch.setattr(
-            thread_mount_rows, "build_thread_mount_rows", AsyncMock(return_value=[])
-        )
+    async def test_a_project_session_answers_the_same_without_its_mount_rows(self):
         with_rows = _Store(_thread(P), [_mount(P)])
         emptied = _Store(_thread(P), [])
         scope = partial(thread_mount_rows.thread_project_ids, THREAD)
@@ -196,39 +190,16 @@ class TestThreadProjectIds:
         ) == [P, Q]
 
     @pytest.mark.asyncio
-    async def test_the_delivery_backfill_runs_but_never_answers(self, monkeypatch):
-        """Rebuilt rows feed workspace delivery only; the scope is the column."""
-        build = AsyncMock(return_value=[_mount(Q)])
-        monkeypatch.setattr(thread_mount_rows, "build_thread_mount_rows", build)
+    async def test_a_session_without_rows_gets_none_written(self):
+        """No backfill writes rows for a scope without them any more (main
+        cloud slice 8): the store here has no writer to call, and the scope is
+        the column."""
         store = _Store(_thread(P), [])
         assert await thread_mount_rows.thread_project_ids(
             THREAD, dependencies=_mount_dependencies(store)
         ) == [P]
-        assert build.await_args.args[0] == [P]
-        store.replace_thread_mounts.assert_awaited_once_with(THREAD, [_mount(Q)])
-
-    @pytest.mark.asyncio
-    async def test_a_failed_backfill_leaves_the_scope_alone(self, monkeypatch):
-        monkeypatch.setattr(
-            thread_mount_rows,
-            "build_thread_mount_rows",
-            AsyncMock(side_effect=RuntimeError("cloud is down")),
-        )
-        store = _Store(_thread(P), [])
-        assert await thread_mount_rows.thread_project_ids(
-            THREAD, dependencies=_mount_dependencies(store)
-        ) == [P]
-        store.replace_thread_mounts.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_existing_rows_are_not_rebuilt(self, monkeypatch):
-        build = AsyncMock()
-        monkeypatch.setattr(thread_mount_rows, "build_thread_mount_rows", build)
-        store = _Store(_thread(P), [_mount(P)])
-        await thread_mount_rows.thread_project_ids(
-            THREAD, dependencies=_mount_dependencies(store)
-        )
-        build.assert_not_awaited()
+        assert not hasattr(store, "replace_thread_mounts")
+        assert not hasattr(thread_mount_rows, "build_thread_mount_rows")
 
     @pytest.mark.asyncio
     async def test_a_missing_thread_has_no_scope(self):
@@ -244,12 +215,6 @@ class TestThreadProjectIds:
 
 class TestConnectorEligibilityWithoutMountRows:
     """The slice 1 gate: eligibility is unchanged with ``thread_mounts`` emptied."""
-
-    @pytest.fixture(autouse=True)
-    def _no_cloud(self, monkeypatch):
-        monkeypatch.setattr(
-            thread_mount_rows, "build_thread_mount_rows", AsyncMock(return_value=[])
-        )
 
     @pytest.mark.asyncio
     async def test_a_project_session(self):

@@ -43,7 +43,6 @@ class ProjectionStore:
             "resume_blocked": True,
         }
         self.list_thread_mounts = AsyncMock(return_value=[])
-        self.list_thread_mounts_bulk = AsyncMock(return_value={})
         self.list_threads = AsyncMock(side_effect=lambda **_: [dict(self.row)])
         self.container_workspace_creation_views = AsyncMock(return_value={})
 

@@ -772,7 +772,6 @@ def session_create_env(monkeypatch):
         acquire=MagicMock(return_value=acquire_cm),
         merge_thread_workspace_context=AsyncMock(return_value=True),
         list_thread_mounts=AsyncMock(return_value=[]),
-        replace_thread_mounts=AsyncMock(),
         # An omitted connector list attaches the session's own connectors:
         # the policy reads behind it, for an approved owner with none.
         get_user=AsyncMock(return_value={"id": SESSION_USER_ID, "is_approved": True}),
@@ -1248,11 +1247,6 @@ class TestSessionCreateBoundary:
             )
             monkeypatch.setattr(
                 officer_conference_module, "hold_officer_for_conference", AsyncMock()
-            )
-            monkeypatch.setattr(
-                thread_mount_rows_module,
-                "build_thread_mount_rows",
-                AsyncMock(return_value=[]),
             )
         monkeypatch.setattr(
             main.app.state.resources.settings, "stateless_session_enabled", True

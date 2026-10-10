@@ -73,9 +73,7 @@ def _admission_deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         get_officer_thread_for_project=AsyncMock(return_value=None),
         register_project_officer_thread=AsyncMock(return_value={}),
         decommission_project_officer=AsyncMock(),
-        replace_thread_mounts=AsyncMock(),
         list_thread_mounts=AsyncMock(return_value=[]),
-        list_thread_mounts_bulk=AsyncMock(return_value={}),
         list_threads=AsyncMock(return_value=[]),
         container_workspace_creation_views=AsyncMock(return_value={}),
         merge_thread_workspace_context=AsyncMock(),
@@ -118,7 +116,6 @@ def _admission_deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         resolve_session_account_defaults=AsyncMock(return_value={}),
         prefetch_roster_refs=AsyncMock(return_value=None),
         resolve_thread_execution_lane=MagicMock(return_value="pinned"),
-        build_thread_mount_rows=AsyncMock(return_value=[]),
         enforce_session_create_grants=AsyncMock(),
         check_vm_permission=AsyncMock(),
         resolve_cloud_session_url=MagicMock(return_value=None),
@@ -341,7 +338,6 @@ class TestCreationPreview:
             ),
         }
         deps.store.create_thread.assert_not_awaited()
-        deps.store.replace_thread_mounts.assert_not_awaited()
         deps.provision_or_assign.assert_not_awaited()
         deps.send_session_attach.assert_not_awaited()
         deps.schedule_stateless_workspace_ensure.assert_not_called()
