@@ -248,46 +248,65 @@ def bind(request):
 
 ### What a binding may hold
 
-A binding follows the same rules as SRW's own environment and credential-file
-connectors, no more and no less: credential connectors can't execute commands
-in the workspace. (Anything more is for the workspace SSH access a driver will
-declare, a later feature.)
+A binding follows the delivery rules of SRW's own environment and
+credential-file connectors: credential connectors can't execute commands in
+the workspace. (Anything more is for the workspace SSH access a driver will
+declare, a later feature.) On top of them, a driver declares every variable it
+sets in `env_names`, so the names are shown before anyone attaches its
+connector, and a binding is checked as a whole: at most 100 entries, each
+path at most 255 characters and written once, each name set once.
 
 - `env_file` entries: `{"name": ..., "value": ...}`. The name is one your spec
   declares in `env_names`, at most 128 characters. Compared in any case, SRW
-  refuses:
+  refuses only names that make a tool run code or load a config or code
+  file:
   - the names it reserves: `PATH`, `HOME`, the shell's own (`SHELL`, `ENV`,
-    `BASH_ENV`, `IFS`, `PROMPT_COMMAND`…), the `SRW_*`, `LD_*`, `DYLD_*` and
-    `PYTHON*` families, and `KUBECONFIG` (SRW's kubeconfig connectors merge
-    into it);
-  - the known variables that make a tool run code: commands and code
-    (`GIT_SSH_COMMAND`, `EDITOR`, `VISUAL`, `PAGER`, `SSH_ASKPASS`, `CC`,
-    every `*_COMMAND`, `*ASKPASS`, `*PAGER`, `*EDITOR`, `*BROWSER`), runtime
-    options and flags (`NODE_OPTIONS`, `JAVA_TOOL_OPTIONS`, `RUBYOPT`, every
-    `*_OPTS`, `*_OPTIONS`, `*FLAGS`, `*_ARGS`), the files and directories a
-    tool reads config, start-up code or plugins from (`GIT_CONFIG_*`,
-    `GIT_EXEC_PATH`, the rc files such as `INPUTRC`, `PSQLRC` and `WGETRC`,
-    `XDG_*`, `DOCKER_CONFIG`, `NODE_PATH`, every `*_CONFIG`, `*_CONFIG_FILE`,
-    `*_CONFIG_PATH`, `*_CONFIG_DIR`, `*RCPATH` and `*_HOME`), where the next
-    install fetches code (`GOPROXY`, `GOTOOLCHAIN`), and the settings of the
-    common runtimes, build tools and package managers as whole families
-    (`GIT_*`, `SSH_*`, `NODE_*`, `NPM_CONFIG_*`, `PIP_*`, `UV_*`, `CARGO_*`,
-    `GRADLE_*`, `MAVEN_*`, `YARN_*`, `COREPACK_*`, `ERL_*`, `ELIXIR_*`,
-    `CMAKE_*`, `TF_*`, `ANSIBLE_*`, `CLOUDSDK_*`, `JULIA_*`, `JUPYTER_*`,
-    `DENO_*`, `BASH_*`, `PERL5*`, `RUBY*`, `DOTNET_*`, `BUN_*`…).
+    `BASH_ENV`, `IFS`, `PROMPT_COMMAND`…), tmux's, `DEBIAN_FRONTEND`, the
+    `SRW_*`, `LD_*`, `DYLD_*` and `PYTHON*` families, and `KUBECONFIG`
+    (SRW's kubeconfig connectors merge into it);
+  - the known code hooks: commands and code (`GIT_SSH_COMMAND`, `EDITOR`,
+    `VISUAL`, `PAGER`, `SSH_ASKPASS`, `CC`, `MAKE`, `KUBECTL_EXTERNAL_DIFF`,
+    `MAILPATH`, every `*_COMMAND`, `*ASKPASS`, `*PAGER`, `*EDITOR`,
+    `*BROWSER`), runtime and build options (`NODE_OPTIONS`,
+    `JAVA_TOOL_OPTIONS`, `RUBYOPT`, `PYTEST_ADDOPTS`, every `*_OPTS`,
+    `*_OPTIONS` and `*_ARGS`, and `CFLAGS`, `MAKEFLAGS`, `RUSTFLAGS`: not
+    `FEATURE_FLAGS`), profilers and start-up hooks (`DOTNET_STARTUP_HOOKS`,
+    `CORECLR_PROFILER`), the files and directories a tool reads config,
+    start-up code or plugins from (`GIT_CONFIG_*`, `GIT_EXEC_PATH`, the rc
+    files such as `INPUTRC`, `PSQLRC` and `WGETRC`, `XDG_CONFIG_HOME`,
+    `DOCKER_CONFIG`, `NODE_PATH`, `BOTO_CONFIG`, every `*_CONFIG_FILE`,
+    `*_CONFIG_PATH`, `*_CONFIG_DIR`, `*_CONFIG_HOME` and `*RCPATH`, and tool
+    homes such as `GEM_HOME`, `CARGO_HOME`, `RUSTUP_HOME`, `GOROOT` and
+    `JAVA_HOME`; not `APP_CONFIG` or `PROJECT_HOME`), and where and how the
+    next install fetches code (`PIP_INDEX_URL`, npm's and uv's registries,
+    `GOPROXY`, `GOTOOLCHAIN`, `GOSUMDB`, `GONOSUMDB`, `GOINSECURE`);
+  - whole families only where a tool maps its whole configuration, or a
+    runtime its settings, onto the environment: `GIT_*`, `NPM_CONFIG_*`,
+    `PIP_*`, `UV_*`, `CARGO_*`, `BUNDLE_*`, `YARN_*`, `POETRY_*`, `PIPENV_*`,
+    `COMPOSER_*`, `CONDA_*`, `ANSIBLE_*`, `CMAKE_*`, `COREPACK_*`,
+    `BUN_CONFIG_*`, `DOTNET_*` (with `CORECLR_*` and `COMPlus_*`), `PERL5*`
+    and `BASH_*`. Elsewhere only the hooks are refused: `NODE_OPTIONS` but
+    not `NODE_ENV`, `TF_CLI_ARGS*` but not `TF_VAR_*` or `TF_TOKEN_*`,
+    `CLOUDSDK_PYTHON*` but not `CLOUDSDK_CORE_PROJECT`, OpenSSH's variables
+    but not your own `SSH_HOST` or `SSH_PRIVATE_KEY`.
 
-  Within those prefix families a credential-shaped name, one ending in
-  `_TOKEN`, `_API_KEY`, `_PASSWORD`, `_SECRET`, `_ACCESS_KEY` or
-  `_SECRET_KEY` (`NODE_AUTH_TOKEN`, `CARGO_REGISTRY_TOKEN`,
-  `UV_PUBLISH_TOKEN`, `GEM_HOST_API_KEY`), is yours to set; a name the list
-  spells out, `GIT_CONFIG_*` and the reserved families never are. Yours to
-  set too, because they change where a tool connects and what it trusts,
-  never what it runs: every proxy (`*_PROXY`, `NO_PROXY`), CA bundles and
-  TLS checks (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`,
-  `GIT_SSL_CAINFO`, `PGSSLMODE`…), name resolution (`HOSTALIASES`,
-  `RES_OPTIONS`), `DOCKER_HOST`, and Go's private-module and checksum
-  settings (`GOPRIVATE`, `GONOSUMDB`…); a variable that names a credential
-  file the file rule accepts anyway (`AWS_CONFIG_FILE`,
+  Within those families a credential-shaped name is yours to set: one
+  ending in `_TOKEN`, `_TOKENS`, `_AUTH`, `_AUTH_IDENT`, `_USERNAME`,
+  `_USER`, `_KEY`, `_PASSWORD` or `_SECRET` (`NPM_CONFIG__AUTH`,
+  `CARGO_REGISTRY_TOKEN`, `YARN_NPM_AUTH_IDENT`, `COMPOSER_AUTH`), Poetry's
+  `POETRY_PYPI_TOKEN_<repository>`, and Bundler's `BUNDLE_<HOST>__<TLD>`; so
+  are a few settings that run nothing (`DOTNET_ENVIRONMENT`,
+  `CARGO_TERM_COLOR`, `CMAKE_BUILD_TYPE`, `CONDA_DEFAULT_ENV`,
+  `ANSIBLE_HOST_KEY_CHECKING`…). A name the list spells out, `GIT_CONFIG_*`
+  and the reserved families never are. Yours to set too, because they change
+  where a tool connects and what it trusts, never what it runs: every proxy
+  (`*_PROXY`, `NO_PROXY`), CA bundles and TLS checks (`SSL_CERT_FILE`,
+  `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`,
+  `PGSSLMODE`…), name resolution (`HOSTALIASES`, `RES_OPTIONS`),
+  `DOCKER_HOST`, and `GOPRIVATE` and `GONOPROXY`, which private Go modules
+  need (a proxy with a CA bundle can redirect a fetch too; the rule accepts
+  that, since it allows proxies); a variable that names a credential file
+  the file rule accepts anyway (`AWS_CONFIG_FILE`,
   `AWS_SHARED_CREDENTIALS_FILE`, `NETRC`, `PGPASSFILE`,
   `GOOGLE_APPLICATION_CREDENTIALS`); git's commit identity
   (`GIT_AUTHOR_NAME`, `GIT_COMMITTER_EMAIL`…); and every other name, such as
@@ -308,10 +327,12 @@ declare, a later feature.)
   `sops`, `~/.srw-files/`, `~/.netrc` and `~/.pgpass`; never `~/.ssh/` or
   `~/.srw-credentials/`. It is at most 255 characters, and one binding
   writes each path once. A file is never executable. SRW does not read what
-  a file says: a kubeconfig's `exec` or an AWS `credential_process` runs a
-  command when that CLI is used, which is part of what your driver is
-  trusted with. `env_var`, when set, names the file in the environment and
-  follows the variable rules.
+  a file says: a kubeconfig's `exec`, an AWS `credential_process` or a
+  `.netrc` `macdef` runs a command when that tool is used, which is part of
+  what your driver is trusted with. A file at `~/.kube/config` stays yours:
+  SRW's merged kubeconfig is listed after it in `KUBECONFIG`. `env_var`,
+  when set, names the file in the environment and follows the variable
+  rules.
 - Every entry's `recipient` is `workspace`.
 
 A variable two connectors of one Job or Session would set is never

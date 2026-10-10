@@ -39,7 +39,153 @@ RESERVED = [
     "DYLD_INSERT_LIBRARIES",
     "PYTHONPATH",
     "PYTHONSTARTUP",
+    "PYTHONHOME",
     "PYTHON_TOKEN",
+    "TMUX_TMPDIR",
+    "DEBIAN_FRONTEND",
+]
+
+#: The review's over-blocking (the rule refuses only what runs code or loads
+#: a config or code file): documented credentials, their username halves,
+#: and settings of no hook at all.
+RUNS_NO_CODE = [
+    # Credentials, in a refused family or out of one.
+    "TF_TOKEN_app_terraform_io",
+    "TF_VAR_region",
+    "DENO_AUTH_TOKENS",
+    "COMPOSER_AUTH",
+    "BUNDLE_HOST__COM",
+    "BUNDLE_GEMS__CONTRIBSYS__COM",
+    "POETRY_PYPI_TOKEN_PYPI",
+    "YARN_NPM_AUTH_IDENT",
+    "NPM_CONFIG__AUTH",
+    "npm_config__auth",
+    "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE",
+    # The username halves.
+    "POETRY_HTTP_BASIC_PYPI_USERNAME",
+    "UV_INDEX_PRIVATE_USERNAME",
+    "NPM_CONFIG_USERNAME",
+    "COREPACK_NPM_USERNAME",
+    # Settings that run nothing.
+    "NODE_ENV",
+    "NODE_DEBUG",
+    "TF_LOG",
+    "TF_WORKSPACE",
+    "CLOUDSDK_CORE_PROJECT",
+    "SSH_HOST",
+    "SSH_USER",
+    "SSH_PORT",
+    "SSH_PRIVATE_KEY",
+    "SSH_KEY",
+    "DOTNET_CLI_TELEMETRY_OPTOUT",
+    "DOTNET_NOLOGO",
+    "DOTNET_ENVIRONMENT",
+    "FEATURE_FLAGS",
+    "AWS_SDK_LOAD_CONFIG",
+    "FIREBASE_CONFIG",
+    "APP_CONFIG",
+    "CARGO_TERM_COLOR",
+    "CMAKE_BUILD_TYPE",
+    "RUBY_ENV",
+    "CONDA_DEFAULT_ENV",
+    "ANSIBLE_HOST_KEY_CHECKING",
+    "PROJECT_HOME",
+    # Private Go modules need these (the coordinator's call).
+    "GOPRIVATE",
+    "GONOPROXY",
+]
+
+#: The hooks the narrowed families and suffixes still refuse, and the review's
+#: additions.
+NARROWED_HOOKS = [
+    # NODE_*, TF_*, CLOUDSDK_* are no longer families: their hooks are named.
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "NODE_REPL_EXTERNAL_MODULE",
+    "NODE_COMPILE_CACHE",
+    "TF_CLI_ARGS",
+    "TF_CLI_ARGS_plan",
+    "TF_CLI_CONFIG_FILE",
+    "TF_DATA_DIR",
+    "TF_PLUGIN_CACHE_DIR",
+    "CLOUDSDK_PYTHON",
+    "CLOUDSDK_PYTHON_ARGS",
+    "CLOUDSDK_PYTHON_SITEPACKAGES",
+    "CLOUDSDK_CONFIG",
+    "CLOUDSDK_COMPONENT_MANAGER_SNAPSHOT_URL",
+    # A bare _CONFIG is data; the files it names are spelled out.
+    "BOTO_CONFIG",
+    "KRB5_CONFIG",
+    "RCLONE_CONFIG",
+    "STARSHIP_CONFIG",
+    "CABAL_CONFIG",
+    "MAVEN_CONFIG",
+    "HELM_CONFIG_HOME",
+    # FLAGS not after an underscore.
+    "CFLAGS",
+    "LDFLAGS",
+    "MAKEFLAGS",
+    "RUSTFLAGS",
+    "CGO_CFLAGS",
+    # A bare _HOME is data; the real tool homes are spelled out.
+    "GEM_HOME",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "GOROOT",
+    "JAVA_HOME",
+    "XDG_CONFIG_HOME",
+    "GRADLE_USER_HOME",
+    "HELM_DATA_HOME",
+    # The shell checks mail at its prompt: MAILPATH's command substitution.
+    "MAIL",
+    "MAILPATH",
+    "MAILCHECK",
+    # Missed hooks.
+    "PYTEST_ADDOPTS",
+    "PYTEST_PLUGINS",
+    "KUBECTL_EXTERNAL_DIFF",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "CORECLR_ENABLE_PROFILING",
+    "CORECLR_PROFILER",
+    "CORECLR_PROFILER_PATH",
+    "COMPlus_EnableDiagnostics",
+    "RSYNC_CONNECT_PROG",
+    "SVN_MERGE",
+    "CCACHE_PREFIX",
+    "AS",
+    "NM",
+    "RANLIB",
+    "STRIP",
+    "OBJCOPY",
+    "FC",
+    "MAKE",
+    # Go's checksum switches on fetched code.
+    "GOSUMDB",
+    "GONOSUMDB",
+    "GONOSUMCHECK",
+    "GOINSECURE",
+    # Variants of one hook.
+    "LUA_PATH_5_4",
+    "LUA_INIT",
+    "BUN_INSTALL",
+    # Whole-config families keep everything but credentials.
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "YARN_YARN_PATH",
+    "ANSIBLE_LIBRARY",
+    "DOTNET_ROOT",
+    "CMAKE_TOOLCHAIN_FILE",
+    "CONDA_CHANNELS",
+    "POETRY_REPOSITORIES_X_URL",
+    "PIPENV_PYPI_MIRROR",
+    "COMPOSER_HOME",
+    "COREPACK_NPM_REGISTRY",
+    "BUN_CONFIG_REGISTRY",
+    "PERL5OPT",
+    "BASH_LOADABLES_PATH",
+    # Bundler's dotted settings that are no gem server's credentials.
+    "BUNDLE_MIRROR__ALL",
+    "BUNDLE_BUILD__NOKOGIRI",
+    "BUNDLE_LOCAL__RACK",
 ]
 
 #: Code hooks, by the family the module docstring explains.
@@ -195,6 +341,16 @@ class TestTheRule:
         assert problem is not None
         assert "reserved" in problem or "connector may set" in problem
 
+    @pytest.mark.parametrize("name", RUNS_NO_CODE)
+    def test_a_name_that_runs_no_code_is_allowed(self, name):
+        assert connector_env_problem(name) is None
+
+    @pytest.mark.parametrize("name", NARROWED_HOOKS)
+    def test_the_hooks_stay_refused(self, name):
+        problem = connector_env_problem(name)
+        assert problem is not None
+        assert "connector may set" in problem
+
     @pytest.mark.parametrize("name", PROXIES_AND_CA_BUNDLES)
     def test_proxies_ca_bundles_and_tls_checks_are_allowed(self, name):
         assert connector_env_problem(name) is None
@@ -298,7 +454,16 @@ class TestEveryConnectorFollowsIt:
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
     @pytest.mark.parametrize(
-        "name", ["HTTPS_PROXY", "SSL_CERT_FILE", "NODE_AUTH_TOKEN", "AWS_CONFIG_FILE"]
+        "name",
+        [
+            "HTTPS_PROXY",
+            "SSL_CERT_FILE",
+            "NODE_AUTH_TOKEN",
+            "AWS_CONFIG_FILE",
+            "NODE_ENV",
+            "SSH_PRIVATE_KEY",
+            "TF_VAR_region",
+        ],
     )
     def test_each_allows_what_the_rule_allows(self, consumer, name):
         assert CONSUMERS[consumer](name) is None

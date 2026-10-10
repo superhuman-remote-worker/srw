@@ -443,7 +443,7 @@ ALLOWED_FOR_EVERYONE = [
     "DOCKER_TLS_VERIFY",
     "DOCKER_CERT_PATH",
     "GOPRIVATE",
-    "GONOSUMDB",
+    "GONOPROXY",
     "AWS_CONFIG_FILE",
     "AWS_SHARED_CREDENTIALS_FILE",
     "NETRC",
@@ -793,11 +793,10 @@ REREVIEW_DENIED = [
     "INPUTRC",
     "WGETRC",
     "ACME_RCPATH",
-    "ACME_CONFIG",
+    "ACME_CONFIG_HOME",
     "ACME_CONFIG_FILE",
     "ACME_CONFIG_PATH",
     "ACME_CONFIG_DIR",
-    "ACME_HOME",
 ]
 #: Credential-shaped names stay a driver's to set.
 CREDENTIAL_SHAPED = [
@@ -862,9 +861,12 @@ class TestTheOneEnvironmentList:
         assert env_names.CODE_ENV <= env_names.CODE_HOOK_NAMES
         for name in ("NODE_OPTIONS", "PYTHONPATH", "GIT_SSH_COMMAND", "PIP_INDEX_URL"):
             assert mcp.code_env(name)
-        for name in ("NODE_ENV", "JAVA_HOME", "DATA_HOME", "FEATURE_FLAGS"):
+        for name in ("JAVA_HOME", "CARGO_HOME", "TF_CLI_ARGS", "PYTEST_ADDOPTS"):
             assert not mcp.code_env(name)
             assert connector_env_problem(name) is not None
+        for name in ("NODE_ENV", "DATA_HOME", "FEATURE_FLAGS"):
+            assert not mcp.code_env(name)
+            assert connector_env_problem(name) is None
         for name in CREDENTIAL_SHAPED:
             assert not mcp.code_env(name)
 

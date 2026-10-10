@@ -6,40 +6,73 @@ decisions 26, 27 and 36). That is one small rule for every connector, SRW's
 own and a registered image driver's alike: SRW's connectors are trusted for
 being reputable and open source, not held to other rules.
 :func:`connector_env_problem` says whether a connector may set a name. It
-refuses:
+refuses only names that make a tool run code or load a config or code file:
 
 * **SRW's reserved names** (decision 24): ``PATH``, ``HOME``, the shell's
   own variables (``SHELL``, ``ENV``, ``BASH_ENV``, ``IFS``,
-  ``PROMPT_COMMAND``...), the ``SRW_``, ``LD_``, ``DYLD_`` and ``PYTHON``
-  families, and ``KUBECONFIG``, which names the kubeconfig SRW's kubeconfig
-  connectors merge into.
-* **Code hooks**, the known variables that make a tool run code: a command
-  or code it runs (``GIT_SSH_COMMAND``, ``EDITOR``, ``VISUAL``, ``PAGER``,
-  ``SSH_ASKPASS``, ``CC``, every ``*_COMMAND``), options or flags it hands a
-  runtime (``NODE_OPTIONS``, ``JAVA_TOOL_OPTIONS``, ``RUBYOPT``, every
-  ``*_OPTS``, ``*_OPTIONS``, ``*FLAGS``, ``*_ARGS``), a file or directory it
-  reads config, start-up code, plugins or modules from (``GIT_CONFIG_*``,
-  ``GIT_EXEC_PATH``, the rc files, ``XDG_CONFIG_HOME``, ``NODE_PATH``, every
-  ``*_CONFIG`` and ``*_HOME``), or where its next install fetches code
-  (``PIP_INDEX_URL``, ``GOPROXY``, ``GOTOOLCHAIN``). The settings of the
-  common runtimes, build tools and package managers are refused as whole
-  families (``NODE_*``, ``CARGO_*``, ``NPM_CONFIG_*``, ``PIP_*``...).
+  ``PROMPT_COMMAND``...), tmux's (``TMUX``, ``TMUX_PANE``, ``TMUX_TMPDIR``),
+  ``DEBIAN_FRONTEND`` (SRW's shells are non-interactive), the ``SRW_``,
+  ``LD_``, ``DYLD_`` and ``PYTHON`` families, and ``KUBECONFIG``, which names
+  the kubeconfig SRW's kubeconfig connectors merge into.
+* **Code hooks**, the known variables that make a tool run code. A name a
+  tool reads as a command or code to run (``GIT_SSH_COMMAND``, ``EDITOR``,
+  ``VISUAL``, ``PAGER``, ``SSH_ASKPASS``, ``CC``, ``MAKE``,
+  ``KUBECTL_EXTERNAL_DIFF``, every ``*_COMMAND``, ``*ASKPASS``, ``*PAGER``,
+  ``*EDITOR`` and ``*BROWSER``); as options or flags it hands a runtime or a
+  build (``NODE_OPTIONS``, ``JAVA_TOOL_OPTIONS``, ``RUBYOPT``,
+  ``PYTEST_ADDOPTS``, every ``*_OPTS``, ``*_OPTIONS`` and ``*_ARGS``, and
+  ``CFLAGS``, ``MAKEFLAGS``, ``RUSTFLAGS``: a ``FLAGS`` ending not after an
+  underscore, so ``FEATURE_FLAGS`` is data); as a profiler or start-up hook a
+  runtime loads (``DOTNET_STARTUP_HOOKS``, ``CORECLR_PROFILER``); as a file
+  or directory it reads config, start-up code, plugins or modules from
+  (``GIT_CONFIG_*``, ``GIT_EXEC_PATH``, the rc files, ``XDG_CONFIG_HOME``,
+  ``NODE_PATH``, ``BOTO_CONFIG``, every ``*_CONFIG_FILE``, ``*_CONFIG_PATH``,
+  ``*_CONFIG_DIR`` and ``*_CONFIG_HOME``, and the tool homes spelled out,
+  ``GEM_HOME``, ``CARGO_HOME``, ``RUSTUP_HOME``, ``GOROOT``, ``JAVA_HOME``...;
+  a bare ``*_CONFIG`` or ``*_HOME`` is data, ``APP_CONFIG`` or
+  ``PROJECT_HOME``); or as where and how its next install fetches code
+  (``PIP_INDEX_URL``, npm's and uv's registries, ``GOPROXY``,
+  ``GOTOOLCHAIN``, and Go's checksum switches ``GOSUMDB``, ``GONOSUMDB``,
+  ``GONOSUMCHECK`` and ``GOINSECURE``). A family is refused whole only where
+  a tool maps its entire configuration, or a runtime its settings, onto the
+  environment, so that any member may be a hook: ``GIT_*``,
+  ``NPM_CONFIG_*``, ``PIP_*``, ``UV_*``, ``CARGO_*``, ``BUNDLE_*``,
+  ``YARN_*``, ``POETRY_*``, ``PIPENV_*``, ``COMPOSER_*``, ``CONDA_*``,
+  ``ANSIBLE_*``, ``CMAKE_*``, ``COREPACK_*``, ``BUN_CONFIG_*``, ``DOTNET_*``
+  (with ``CORECLR_*`` and ``COMPlus_*``, the same runtime's), ``PERL5*`` and
+  ``BASH_*``. Elsewhere only the hooks are named: ``NODE_OPTIONS`` but not
+  ``NODE_ENV``, ``TF_CLI_ARGS*`` but not ``TF_VAR_*``, ``CLOUDSDK_PYTHON*``
+  but not ``CLOUDSDK_CORE_PROJECT``, OpenSSH's variables but not
+  ``SSH_HOST``.
 
 Allowed for everyone, because they change where a tool connects and which
-certificates or checksums it trusts, never what it runs: proxies (every
-``*_PROXY``, ``NO_PROXY`` included), CA bundles and TLS checks
-(``SSL_CERT_FILE``, ``REQUESTS_CA_BUNDLE``, ``NODE_EXTRA_CA_CERTS``,
-``GIT_SSL_CAINFO``, ``PGSSLMODE``...), name resolution (``HOSTALIASES``,
-``RES_OPTIONS``), Docker's daemon address, and Go's private-module and
-checksum settings (``GOPRIVATE``, ``GONOSUMDB``...). So are the variables
-that name a credential file whose format the file rule already accepts at
-the tool's own location (``AWS_CONFIG_FILE``, ``AWS_SHARED_CREDENTIALS_FILE``,
-``NETRC``, ``PGPASSFILE``, ``GOOGLE_APPLICATION_CREDENTIALS``; see
-:mod:`.file_targets`), and every name no list matches. Within a prefix
-family a credential-shaped name (``NODE_AUTH_TOKEN``,
-``CARGO_REGISTRY_TOKEN``: :data:`CREDENTIAL_SUFFIXES`) stays a connector's to
-set; a name the list spells out never does. Names are compared in upper
-case: a tool that reads ``https_proxy`` reads it in lower case.
+certificates it trusts, never what it runs: proxies (every ``*_PROXY``,
+``NO_PROXY`` included), CA bundles and TLS checks (``SSL_CERT_FILE``,
+``REQUESTS_CA_BUNDLE``, ``NODE_EXTRA_CA_CERTS``, ``GIT_SSL_CAINFO``,
+``PGSSLMODE``...), name resolution (``HOSTALIASES``, ``RES_OPTIONS``),
+Docker's daemon address, and ``GOPRIVATE`` and ``GONOPROXY``, which
+private-module credentials need. An allowed proxy with an allowed CA bundle
+can redirect what a tool fetches too; that residual is accepted, because the
+rule allows proxies. Allowed as well: the variables that name a credential
+file whose format the file rule already accepts at the tool's own location
+(``AWS_CONFIG_FILE``, ``AWS_SHARED_CREDENTIALS_FILE``, ``NETRC``,
+``PGPASSFILE``, ``GOOGLE_APPLICATION_CREDENTIALS``; see :mod:`.file_targets`),
+git's commit identity, the settings of a refused family that run nothing
+(``DOTNET_ENVIRONMENT``, ``CARGO_TERM_*``, ``CMAKE_BUILD_TYPE``,
+``CONDA_DEFAULT_ENV``, ``ANSIBLE_HOST_KEY_CHECKING``...), and every name no
+list matches.
+
+Within a refused family a credential-shaped name stays a connector's to set:
+one ending in ``_TOKEN``, ``_TOKENS``, ``_AUTH``, ``_AUTH_IDENT``,
+``_USERNAME``, ``_USER``, ``_KEY``, ``_PASSWORD`` or ``_SECRET``
+(:data:`CREDENTIAL_SUFFIXES`: ``NPM_CONFIG__AUTH``, ``CARGO_REGISTRY_TOKEN``,
+``YARN_NPM_AUTH_IDENT``, ``COMPOSER_AUTH``), Poetry's
+``POETRY_PYPI_TOKEN_<repository>``, and Bundler's credentials for a gem
+server, ``BUNDLE_<HOST>__<TLD>`` (but for its ``MIRROR__``, ``BUILD__``,
+``LOCAL__`` and ``GEM__`` settings). A name the list spells out, and the
+variants of one hook (``GIT_CONFIG_*``, ``TF_CLI_ARGS*``, ``LUA_PATH*``...:
+:data:`NEVER_EXEMPT_PREFIXES`), never are. Names are compared in upper case:
+a tool that reads ``https_proxy`` reads it in lower case.
 
 The two families SRW's own work runs on, name by name:
 
@@ -61,15 +94,15 @@ The two families SRW's own work runs on, name by name:
   ``GIT_AUTHOR_EMAIL``, ``GIT_AUTHOR_DATE`` and the three ``GIT_COMMITTER_``
   names), which git only records, and git's CA bundle and TLS check
   (``GIT_SSL_CAINFO``, ``GIT_SSL_CAPATH``, ``GIT_SSL_NO_VERIFY``), as for
-  every tool. ``GIT_CONFIG_*`` spares no credential-shaped name (any key is
-  config).
-* ``SSH_*`` is refused as a family, and no known member is harmless:
-  ``SSH_ASKPASS`` and ``SSH_ASKPASS_REQUIRE`` run a program,
-  ``SSH_SK_PROVIDER`` loads a library, ``SSH_AUTH_SOCK`` and
+  every tool.
+* ``SSH_*`` is not a family: OpenSSH reads only a few variables, and each is
+  refused by name. ``SSH_ASKPASS`` and ``SSH_ASKPASS_REQUIRE`` run a
+  program, ``SSH_SK_PROVIDER`` loads a library, ``SSH_AUTH_SOCK`` and
   ``SSH_AGENT_PID`` are the ssh-agent SRW's managed repositories and SSH
   identities sign with, and ``SSH_CONNECTION``, ``SSH_CLIENT``, ``SSH_TTY``
   and ``SSH_ORIGINAL_COMMAND`` belong to the session SRW reaches the
-  workspace through. (``SUDO_ASKPASS`` runs a program too.)
+  workspace through. A script's own ``SSH_HOST``, ``SSH_USER`` or
+  ``SSH_PRIVATE_KEY`` is data. (``SUDO_ASKPASS`` runs a program too.)
 
 The rule applies to an environment connector's variables
 (``shared.credential_connectors``), to a credential file's ``env_var``
@@ -79,7 +112,8 @@ attaches its connector: :mod:`.registration`). The orchestrator refuses a
 name when a connector is saved, with this module's reason. A row saved
 before the rule keeps working without it: the agent skips the refused
 variable at delivery, logs it and says why in the connector's README, as it
-skips a credential file outside the file allowlist.
+skips a credential file outside the file allowlist, and an edit of the row
+drops it.
 
 A managed MCP server's own process (D5b's templated variables, its stdio
 credential variable, a ``server.json`` import) is checked against
@@ -128,6 +162,9 @@ WORKSPACE_RESERVED_NAMES: frozenset[str] = frozenset(
         "PROMPT_COMMAND",
         "TMUX",
         "TMUX_PANE",
+        "TMUX_TMPDIR",
+        # SRW's shells are non-interactive (shell_protocol).
+        "DEBIAN_FRONTEND",
     }
 )
 #: Families the workspace reserves.
@@ -226,16 +263,25 @@ CODE_HOOK_NAMES: frozenset[str] = CODE_ENV | frozenset(
         "GIT_SSH",
         "GIT_SSH_COMMAND",
         "GIT_TEMPLATE_DIR",
-        # ssh: a program, a library, SRW's ssh-agent.
+        # OpenSSH: a program, a library, SRW's ssh-agent, the session's own.
+        "SSH_AGENT_PID",
         "SSH_ASKPASS_REQUIRE",
         "SSH_AUTH_SOCK",
+        "SSH_CLIENT",
+        "SSH_CONNECTION",
+        "SSH_ORIGINAL_COMMAND",
         "SSH_SK_PROVIDER",
-        # A shell's prompts expand commands; its start-up and function
-        # files, history, editor and own settings.
+        "SSH_TTY",
+        # A shell's prompts and mail checks expand commands (MAILPATH's at
+        # every prompt of SRW's interactive shell); its start-up and
+        # function files, history, editor and own settings.
         "FCEDIT",
         "FPATH",
         "GLOBIGNORE",
         "HISTFILE",
+        "MAIL",
+        "MAILCHECK",
+        "MAILPATH",
         "PROMPT",
         "PS0",
         "PS1",
@@ -274,8 +320,11 @@ CODE_HOOK_NAMES: frozenset[str] = CODE_ENV | frozenset(
         "TIGRC_SYSTEM",
         "TIGRC_USER",
         "WGETRC",
-        # Config files and directories whose keys run a command, or which
-        # turn one on.
+        # Config files and directories whose keys run a command or load a
+        # plugin, or which turn one on.
+        "BOTO_CONFIG",
+        "CABAL_CONFIG",
+        "CLOUDSDK_CONFIG",
         "COMPOSER",
         "CONFIG_SHELL",
         "CONFIG_SITE",
@@ -285,39 +334,120 @@ CODE_HOOK_NAMES: frozenset[str] = CODE_ENV | frozenset(
         "GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES",
         "HELM_PLUGINS",
         "IPYTHONDIR",
-        # Runtimes: start-up code, search paths, homes and debug switches.
-        "GODEBUG",
+        "JUPYTER_DATA_DIR",
+        "JUPYTER_PATH",
+        "JUPYTER_RUNTIME_DIR",
+        "KRB5_CONFIG",
+        "MAVEN_CONFIG",
+        "RCLONE_CONFIG",
+        "STARSHIP_CONFIG",
+        "TF_CLI_CONFIG_FILE",
+        "TF_DATA_DIR",
+        "TF_PLUGIN_CACHE_DIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_DIRS",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_DIRS",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+        "XDG_STATE_HOME",
+        # Tool homes: where a runtime, toolchain or version manager keeps
+        # the code it runs and its plugins.
+        "ANDROID_HOME",
+        "ANDROID_SDK_ROOT",
+        "CARGO_HOME",
+        "DENO_DIR",
+        "DENO_INSTALL_ROOT",
+        "GOMODCACHE",
+        "GOPATH",
+        "GOROOT",
+        "GRADLE_USER_HOME",
+        "HELM_DATA_HOME",
         "JAVA_HOME",
+        "M2_HOME",
+        "MAVEN_HOME",
+        "MIX_HOME",
+        "NVM_DIR",
+        "PNPM_HOME",
+        "PYENV_ROOT",
+        "RBENV_ROOT",
+        "RUSTUP_HOME",
+        "VOLTA_HOME",
+        # Runtimes: code, search paths, options, profilers, debug switches.
+        "CORECLR_ENABLE_PROFILING",
+        "CORECLR_PROFILER",
+        "CORECLR_PROFILER_PATH",
+        "DENO_V8_FLAGS",
+        "ERL_AFLAGS",
+        "ERL_FLAGS",
+        "ERL_LIBS",
+        "ERL_ZFLAGS",
+        "GODEBUG",
+        "JULIA_BINDIR",
+        "JULIA_DEPOT_PATH",
+        "JULIA_LOAD_PATH",
+        "JULIA_PROJECT",
+        "NODE_COMPILE_CACHE",
+        "PERL_CPANM_OPT",
+        "PERL_LOCAL_LIB_ROOT",
+        "PERL_MB_OPT",
+        "PERL_MM_OPT",
         "PHPRC",
         "PHP_INI_SCAN_DIR",
         "PIPX_DEFAULT_PYTHON",
+        "PYTEST_ADDOPTS",
+        "PYTEST_PLUGINS",
         "R_ENVIRON",
         "R_ENVIRON_USER",
         "R_LIBS",
         "R_LIBS_USER",
         "R_PROFILE",
         "R_PROFILE_USER",
+        "RUBYPATH",
+        "RUBYSHELL",
         "TCLLIBPATH",
-        # Toolchains and the commands a build runs.
+        # Toolchains and the commands a build or a tool runs.
         "AR",
-        "CARGO_HOME",
+        "AS",
         "CC",
+        "CCACHE_PREFIX",
         "CPP",
         "CXX",
+        "FC",
         "GOFLAGS",
-        "GOTOOLCHAIN",
+        "KUBECTL_EXTERNAL_DIFF",
         "LD",
+        "MAKE",
         "MAKEFILES",
+        "NM",
+        "OBJCOPY",
+        "RANLIB",
         "RUSTC",
+        "RUSTC_WORKSPACE_WRAPPER",
         "RUSTC_WRAPPER",
         "RUSTDOC",
-        # A remote shell or merge tool another tool starts.
+        "STRIP",
+        # A remote shell, connection program or merge tool another tool
+        # starts.
         "CVS_RSH",
         "HGMERGE",
+        "RSYNC_CONNECT_PROG",
         "RSYNC_RSH",
+        "SVN_MERGE",
         "SVN_SSH",
-        # Where the next install fetches code from.
+        # Where and how the next install fetches code: its source, its
+        # toolchain, and the checksum checks on what it fetched.
+        "GOINSECURE",
+        "GONOSUMCHECK",
+        "GONOSUMDB",
         "GOPROXY",
+        "GOSUMDB",
+        "GOTOOLCHAIN",
+        "JULIA_PKG_SERVER",
+        "RUSTUP_DIST_ROOT",
+        "RUSTUP_DIST_SERVER",
+        "RUSTUP_TOOLCHAIN",
+        "RUSTUP_UPDATE_ROOT",
         # OpenSSL's engines, and the locale, message catalogue and terminal
         # data libraries load at start-up (their parsers have run code from
         # crafted files).
@@ -329,61 +459,48 @@ CODE_HOOK_NAMES: frozenset[str] = CODE_ENV | frozenset(
         # Where tools write the files they then run (build trees, scripts).
         "TEMP",
         "TMP",
-        # Where every config is looked for.
-        "XDG_CONFIG_DIRS",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_DIRS",
-        "XDG_DATA_HOME",
     }
 )
-#: Whole families: git's (but for :data:`ALLOWED_NAMES`) and ssh's, the XDG
-#: directories, and every runtime's, build tool's and package manager's
-#: settings.
+#: Whole families: a tool maps its entire configuration, or a runtime its
+#: settings, onto them, so any member may be a hook. Elsewhere only the hooks
+#: are named (``NODE_OPTIONS``, not ``NODE_ENV``).
 CODE_HOOK_PREFIXES: tuple[str, ...] = CODE_ENV_PREFIXES + (
-    "SSH_",
-    "XDG_",
-    "PERL5",
-    "PERL_",
-    "RUBY",
-    "GEM_",
-    "BUNDLE_",
-    "DOTNET_",
-    "BUN_",
-    "CARGO_",
-    "RUSTUP_",
-    "LUA_",
-    "JAVA_TOOL",
-    "JDK_JAVA",
-    "_JAVA",
-    "ERL_",
-    "ELIXIR_",
-    "GRADLE_",
-    "MAVEN_",
-    "YARN_",
-    "COREPACK_",
-    "CLOUDSDK_",
     "ANSIBLE_",
-    "TF_",
-    "CMAKE_",
-    "JULIA_",
-    "JUPYTER_",
     "BASH_",
-    "NODE_",
-    "DENO_",
-    "POETRY_",
-    "PIPENV_",
+    "BUNDLE_",
+    "BUN_CONFIG_",
+    "CARGO_",
+    "CMAKE_",
+    "COMPLUS_",
     "COMPOSER_",
     "CONDA_",
+    "COREPACK_",
+    "CORECLR_",
+    "DOTNET_",
+    "PERL5",
+    "PIPENV_",
+    "POETRY_",
+    "YARN_",
 )
-#: Families no credential-shaped name escapes: git's config entries (any
-#: key is config).
-NEVER_EXEMPT_PREFIXES: tuple[str, ...] = ("GIT_CONFIG_",)
+#: The variants of one hook, and git's config entries (any key is config):
+#: no credential-shaped name escapes them.
+NEVER_EXEMPT_PREFIXES: tuple[str, ...] = (
+    "BUN_INSTALL",
+    "CLOUDSDK_COMPONENT_MANAGER_",
+    "CLOUDSDK_PYTHON",
+    "GIT_CONFIG_",
+    "LUA_CPATH",
+    "LUA_INIT",
+    "LUA_PATH",
+    "TF_CLI_ARGS",
+)
 #: Suffixes that name a password prompt, a pager, an editor, a browser,
-#: options or flags handed to a program, a command, a config file or
-#: directory, or a tool's home, in any tool (``GH_PAGER``, ``MAVEN_OPTS``,
-#: ``CFLAGS``, ``FZF_DEFAULT_COMMAND``, ``HGRCPATH``, ``BOTO_CONFIG``,
-#: ``GH_CONFIG_DIR``, ``HELM_DATA_HOME``...). An rc file is named, never
-#: matched by ``RC`` (``DATA_SRC`` is data).
+#: options handed to a program, a command, or a config file or directory, in
+#: any tool (``GH_PAGER``, ``MAVEN_OPTS``, ``FZF_DEFAULT_COMMAND``,
+#: ``HGRCPATH``, ``GH_CONFIG_DIR``, ``HELM_CONFIG_HOME``...). A bare
+#: ``_CONFIG`` or ``_HOME`` is not one (``APP_CONFIG``, ``PROJECT_HOME``: the
+#: real ones are named), nor is an rc file matched by ``RC`` (``DATA_SRC`` is
+#: data).
 CODE_HOOK_SUFFIXES: tuple[str, ...] = (
     "ASKPASS",
     "PAGER",
@@ -391,28 +508,46 @@ CODE_HOOK_SUFFIXES: tuple[str, ...] = (
     "BROWSER",
     "_OPTS",
     "_OPTIONS",
-    "FLAGS",
     "_COMMAND",
     "_ARGS",
     "RCPATH",
-    "_CONFIG",
     "_CONFIG_FILE",
     "_CONFIG_PATH",
     "_CONFIG_DIR",
-    "_HOME",
+    "_CONFIG_HOME",
 )
-#: A credential's name: within a prefix family (``NODE_*``, ``CARGO_*``,
-#: ``UV_*``...), a name ending so is the credential a tool sends upstream
-#: (``NODE_AUTH_TOKEN``, ``CARGO_REGISTRY_TOKEN``, ``UV_PUBLISH_TOKEN``,
-#: ``GEM_HOST_API_KEY``), never a hook: a connector may set it. A name the
-#: list spells out is refused whatever it ends with.
+#: Compiler and build flags end so, not after an underscore: ``CFLAGS``,
+#: ``LDFLAGS``, ``MAKEFLAGS``, ``RUSTFLAGS``, ``CGO_CFLAGS``, but never
+#: ``FEATURE_FLAGS``.
+FLAGS_SUFFIX = "FLAGS"
+#: A credential's name: within a refused family, a name ending so is the
+#: credential a tool sends upstream (``NPM_CONFIG__AUTH``,
+#: ``CARGO_REGISTRY_TOKEN``, ``YARN_NPM_AUTH_IDENT``,
+#: ``POETRY_HTTP_BASIC_PYPI_USERNAME``, ``COMPOSER_AUTH``), never a hook: a
+#: connector may set it. A name the list spells out is refused whatever it
+#: ends with.
 CREDENTIAL_SUFFIXES: tuple[str, ...] = (
     "_TOKEN",
-    "_API_KEY",
+    "_TOKENS",
+    "_AUTH",
+    "_AUTH_IDENT",
+    "_USERNAME",
+    "_USER",
+    "_KEY",
     "_PASSWORD",
     "_SECRET",
-    "_ACCESS_KEY",
-    "_SECRET_KEY",
+)
+#: Credentials named by a prefix: Poetry's API token for a repository.
+CREDENTIAL_PREFIXES: tuple[str, ...] = ("POETRY_PYPI_TOKEN_",)
+#: Bundler names a gem server's credentials after its host, its dots as
+#: ``__`` (``BUNDLE_GEMS__EXAMPLE__COM``); these dotted settings are not
+#: credentials: a mirror (a fetch source), a gem's build options, a local
+#: override of a gem's code, the gem generator's.
+BUNDLE_SETTINGS: tuple[str, ...] = (
+    "BUNDLE_BUILD__",
+    "BUNDLE_GEM__",
+    "BUNDLE_LOCAL__",
+    "BUNDLE_MIRROR__",
 )
 
 # ---------------------------------------------------------------------------
@@ -448,19 +583,16 @@ ALLOWED_NAMES: frozenset[str] = frozenset(
         "GIT_SSL_NO_VERIFY",
         "NODE_TLS_REJECT_UNAUTHORIZED",
         "PGSSLMODE",
-        # Where traffic goes: name resolution and Docker's daemon.
+        # Where traffic goes: name resolution, Docker's daemon, and the Go
+        # modules fetched straight from their repositories (private-module
+        # credentials need it).
         "DOCKER_CONTEXT",
         "DOCKER_HOST",
+        "GONOPROXY",
+        "GOPRIVATE",
         "HOSTALIASES",
         "LOCALDOMAIN",
         "RES_OPTIONS",
-        # Go's private modules and checksum database.
-        "GOINSECURE",
-        "GONOPROXY",
-        "GONOSUMCHECK",
-        "GONOSUMDB",
-        "GOPRIVATE",
-        "GOSUMDB",
         # A credential file in a format the file rule accepts at the tool's
         # own location (~/.aws/, ~/.netrc, ~/.pgpass, ~/.config/gcloud/).
         "AWS_CONFIG_FILE",
@@ -475,24 +607,53 @@ ALLOWED_NAMES: frozenset[str] = frozenset(
         "GIT_COMMITTER_DATE",
         "GIT_COMMITTER_EMAIL",
         "GIT_COMMITTER_NAME",
+        # Settings of a refused family that run nothing: an environment's
+        # name, telemetry and banners, a build type, host key checking.
+        "ANSIBLE_HOST_KEY_CHECKING",
+        "CMAKE_BUILD_PARALLEL_LEVEL",
+        "CMAKE_BUILD_TYPE",
+        "CMAKE_COLOR_DIAGNOSTICS",
+        "CMAKE_EXPORT_COMPILE_COMMANDS",
+        "CMAKE_GENERATOR",
+        "CONDA_DEFAULT_ENV",
+        "DOTNET_CLI_TELEMETRY_OPTOUT",
+        "DOTNET_ENVIRONMENT",
+        "DOTNET_NOLOGO",
     }
 )
+#: Allowed prefixes within a refused family: cargo's terminal output.
+ALLOWED_PREFIXES: tuple[str, ...] = ("CARGO_TERM_",)
 #: The suffix of every proxy variable (``HTTPS_PROXY``, ``no_proxy``,
 #: ``npm_config_https_proxy``...).
 PROXY_SUFFIX = "_PROXY"
+
+
+def _credential_shaped(upper: str) -> bool:
+    """Whether the upper-cased name, in a refused family, is a credential."""
+    if upper.endswith(CREDENTIAL_SUFFIXES) or upper.startswith(CREDENTIAL_PREFIXES):
+        return True
+    return (
+        upper.startswith("BUNDLE_")
+        and "__" in upper[len("BUNDLE_") :]
+        and not upper.startswith(BUNDLE_SETTINGS)
+    )
 
 
 def _code_hook(upper: str) -> bool:
     """Whether the upper-cased name is a known code hook."""
     if upper in CODE_HOOK_NAMES or upper.startswith(NEVER_EXEMPT_PREFIXES):
         return True
-    if upper in ALLOWED_NAMES or upper.endswith(PROXY_SUFFIX):
+    if (
+        upper in ALLOWED_NAMES
+        or upper.endswith(PROXY_SUFFIX)
+        or upper.startswith(ALLOWED_PREFIXES)
+    ):
         return False
-    if upper.endswith(CODE_HOOK_SUFFIXES):
+    if upper.endswith(CODE_HOOK_SUFFIXES) or (
+        upper.endswith(FLAGS_SUFFIX) and not upper.endswith("_" + FLAGS_SUFFIX)
+    ):
         return True
-    return upper.startswith(CODE_HOOK_PREFIXES) and not upper.endswith(
-        CREDENTIAL_SUFFIXES
-    )
+    return upper.startswith(CODE_HOOK_PREFIXES) and not _credential_shaped(upper)
 
 
 def connector_env_problem(name: object) -> str | None:
@@ -530,13 +691,17 @@ def env_value_problem(name: str, value: object) -> str | None:
 
 __all__ = [
     "ALLOWED_NAMES",
+    "ALLOWED_PREFIXES",
+    "BUNDLE_SETTINGS",
     "CODE_ENV",
     "CODE_ENV_PREFIXES",
     "CODE_HOOK_NAMES",
     "CODE_HOOK_PREFIXES",
     "CODE_HOOK_SUFFIXES",
+    "CREDENTIAL_PREFIXES",
     "CREDENTIAL_SUFFIXES",
     "ENV_NAME",
+    "FLAGS_SUFFIX",
     "KUBECONFIG",
     "MAX_ENV_NAME",
     "MAX_ENV_VALUE_BYTES",
