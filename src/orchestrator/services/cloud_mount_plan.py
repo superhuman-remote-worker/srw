@@ -369,8 +369,11 @@ def _cache_flags(cache: Mapping[str, Any], max_size_bytes: int) -> list[str] | N
             return None
         flags += [flag, value]
     # Every mount's cache shares one emptyDir (no sizeLimit, which would
-    # evict the whole Pod); together they stay under cacheSize, softly.
+    # evict the whole Pod); together they stay under cacheSize, softly, and
+    # rclone stops caching before the node's disk runs low, so a big read
+    # cannot push the node into DiskPressure.
     flags += ["--vfs-cache-max-size", f"{max(1, max_size_bytes // 1024**2)}M"]
+    flags += ["--vfs-cache-min-free-space", CACHE_MIN_FREE_SPACE]
     return flags
 
 
@@ -452,6 +455,9 @@ def _sidecar_mount(
     )
     return mount, password
 
+
+#: The free disk every rclone keeps on the node (--vfs-cache-min-free-space).
+CACHE_MIN_FREE_SPACE = "2G"
 
 #: How long the planner awaits this runtime's in-flight engage, as attach
 #: does.

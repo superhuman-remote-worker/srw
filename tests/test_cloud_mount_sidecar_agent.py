@@ -406,9 +406,9 @@ async def test_stateless_end_flushes_sidecar_folders_and_proves_no_workspace_rcl
     assert any("/srw/cloud-control/drain" in c for c in workspace.terminal)
     assert not any(_runs_rclone(c) for c in workspace.terminal)
     # A session from before the deploy may keep in-workspace rclone
-    # identities in its home: End proves no rclone runs and clears them.
+    # state in its home: End proves no rclone runs and removes its directory.
     cleanup = next(c for c in workspace.terminal if "__SRW_SIDECAR_RCLONE_ZERO__" in c)
-    assert "resident.identity" in cleanup and "exit 85" in cleanup
+    assert 'rm -rf -- "$_srw_rclone_base"' in cleanup and "exit 85" in cleanup
     # Only the general resident zero proof: no per-mount rclone re-proof.
     assert workspace.verify_terminal_claim_resources_retired.call_count == 1
     workspace.drain_answer = {"state": "incomplete", "pending": 4}
@@ -780,7 +780,7 @@ def test_a_protected_sidecar_shape_needs_the_marker():
     )
 
 
-def test_the_stale_identity_cleanup_removes_only_identities_and_refuses_a_live_rclone(
+def test_the_stale_rclone_cleanup_removes_the_directory_and_refuses_a_live_rclone(
     tmp_path,
 ):
     import os
@@ -792,7 +792,8 @@ def test_the_stale_identity_cleanup_removes_only_identities_and_refuses_a_live_r
     base = tmp_path / ".cache/srw/rclone" / thread / "m0"
     base.mkdir(parents=True)
     (base / "resident.identity").write_text("old\n")
-    (base / "keep.txt").write_text("not an identity\n")
+    (base / "rclone.conf").write_text("[m0]\npass = obscured\n")
+    (base / "vfs-cache").mkdir()
     script = retirement._sidecar_stale_rclone_cleanup_command(thread)
     env = {**os.environ, "HOME": str(tmp_path)}
     done = subprocess.run(
@@ -800,8 +801,10 @@ def test_the_stale_identity_cleanup_removes_only_identities_and_refuses_a_live_r
     )
     assert done.returncode == 0, done.stderr
     assert retirement.SIDECAR_RCLONE_ZERO_MARKER in done.stdout
-    assert not (base / "resident.identity").exists()
-    assert (base / "keep.txt").exists()
+    # Identities and the old rclone.conf (an obscured password) alike.
+    assert not (tmp_path / ".cache/srw/rclone" / thread).exists()
+    assert (tmp_path / ".cache/srw/rclone").is_dir()
+    base.mkdir(parents=True)
     # A process of the thread's rclone is a refusal, never cleaned up.
     import sys
 

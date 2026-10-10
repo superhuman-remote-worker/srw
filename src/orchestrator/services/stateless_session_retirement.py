@@ -307,7 +307,8 @@ SIDECAR_RCLONE_ZERO_MARKER = "__SRW_SIDECAR_RCLONE_ZERO__"
 def _sidecar_stale_rclone_cleanup_command(thread_id: str) -> str:
     """For a Pod whose folders its sidecars own (D7): prove no rclone of the
     thread runs in the workspace, then remove the thread's in-workspace
-    rclone identities. A session from before the deploy, restored onto such
+    rclone directory (identities, and the old rclone.conf with its obscured
+    password). A session from before the deploy, restored onto such
     a Pod, still has them in its persistent home; the resident zero proof
     reads one as a live rclone and End would answer 503 forever. Nothing in
     a sidecar Pod's workspace starts an rclone (an unprotected one has no
@@ -329,9 +330,9 @@ for _srw_cmdline in /proc/[0-9]*/cmdline; do
   _srw_args=$(tr '\\0' '\\n' < "$_srw_cmdline" 2>/dev/null || true)
   if printf '%s\n' "$_srw_args" | grep -F -- "$_srw_rclone_base/" >/dev/null; then exit 85; fi
 done
-if [ -d "$_srw_rclone_base" ]; then
-  find "$_srw_rclone_base" -name resident.identity -type f -exec rm -f -- {{}} +
-fi
+# Proven unused: the whole directory goes, its identities and the old
+# rclone.conf with the obscured password included.
+rm -rf -- "$_srw_rclone_base"
 echo '{SIDECAR_RCLONE_ZERO_MARKER}'
 """
 
@@ -455,11 +456,11 @@ async def retire_stateless_workspace_residents(
                     backend.exec_terminal_claim_resource,
                     _sidecar_stale_rclone_cleanup_command(authority.thread_id),
                     30,
-                    operation="stale in-workspace rclone identity cleanup",
+                    operation="stale in-workspace rclone state cleanup",
                 )
                 if SIDECAR_RCLONE_ZERO_MARKER not in str(cleared or ""):
                     raise ShellRetirementUnavailable(
-                        "stale in-workspace rclone identities were not cleared"
+                        "stale in-workspace rclone state was not cleared"
                     )
             else:
                 mount_manager = RcloneMountManager(

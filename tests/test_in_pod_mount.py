@@ -189,6 +189,16 @@ def test_the_supervisor_memory_scales_with_the_mounts_unless_set(monkeypatch):
     manifest = build(ContainerProvisioner(), PLAN)
     supervisor = init(manifest, RCLONE_CONTAINER)
     assert supervisor["resources"]["limits"]["memory"] == "640Mi"
+    # The caches' disk is requested for scheduling, never limited (a limit
+    # evicts the Pod).
+    assert supervisor["resources"]["requests"]["ephemeral-storage"] == "10Gi"
+    assert "ephemeral-storage" not in supervisor["resources"]["limits"]
+    # The chart's K is rclone's spelling; a Pod only takes k.
+    monkeypatch.setenv("CONNECTOR_IN_POD_CACHE_SIZE", "900K")
+    monkeypatch.setenv("CONNECTOR_IN_POD_SUPERVISOR_MEMORY", "700K")
+    kilo = init(build(ContainerProvisioner(), PLAN), RCLONE_CONTAINER)
+    assert kilo["resources"]["requests"]["ephemeral-storage"] == "900k"
+    assert kilo["resources"]["limits"]["memory"] == "700k"
     monkeypatch.setenv("CONNECTOR_IN_POD_SUPERVISOR_MEMORY", "1Gi")
     assert InPodPlaneSettings.from_env().supervisor_memory_for(8) == "1Gi"
     monkeypatch.setenv("CONNECTOR_IN_POD_SUPERVISOR_MEMORY", "plenty")
@@ -981,11 +991,19 @@ async def test_a_continued_or_recovered_pod_gets_its_objects_and_record(plane_on
         assert await provisioner._settle_cloud_mount_plan(owner, pod, POD_UID)
         provisioner._k8s_available = True
         provisioner._core_api.read_namespaced_pod = lambda name, namespace: pod
-        assert await provisioner.recover_cloud_mount_plan(owner, POD_UID)
-        # Another Pod's UID recovers nothing.
-        assert not await provisioner.recover_cloud_mount_plan(
-            owner, "00000000-0000-4000-8000-0000000000aa"
+        assert await provisioner.recover_cloud_mount_plan(owner, POD_UID) is True
+        # Another Pod's UID recovers nothing, and says nothing of this Pod.
+        assert (
+            await provisioner.recover_cloud_mount_plan(
+                owner, "00000000-0000-4000-8000-0000000000aa"
+            )
+            is None
         )
+        # This very Pod recording no plan (from before the plane) is a
+        # definite answer, which attach remembers.
+        bare = SimpleNamespace(metadata=SimpleNamespace(uid=POD_UID, annotations={}))
+        provisioner._core_api.read_namespaced_pod = lambda name, namespace: bare
+        assert await provisioner.recover_cloud_mount_plan(owner, POD_UID) is False
     assert [kind for kind, _ in api.created] == ["ConfigMap", "Secret"] * 2
     written = store.merge_thread_workspace_context.await_args[0][1][PLAN_CONTEXT_KEY]
     assert written["fingerprint"] == PLAN.recorded()["fingerprint"]

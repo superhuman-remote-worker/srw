@@ -292,6 +292,8 @@ async def test_the_shared_cache_keeps_every_mount_under_its_share(monkeypatch):
     flags = list(plan.mounts[0].flags)
     # 10Gi / 2 mounts = 5120 MiB each, whatever the spec asked for.
     assert flags[flags.index("--vfs-cache-max-size") + 1] == "5120M"
+    # And never at the node's last free disk.
+    assert flags[flags.index("--vfs-cache-min-free-space") + 1] == "2G"
     assert flags[flags.index("--vfs-cache-mode") + 1] == "full"
     assert "10G" not in flags
 

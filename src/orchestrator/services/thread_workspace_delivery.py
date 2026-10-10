@@ -38,6 +38,7 @@ import functools
 import json
 import logging
 import os  # noqa: F401  (used by the moved bodies)
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Optional  # noqa: F401  (used by the moved bodies)
@@ -506,16 +507,35 @@ async def prepare_agent_thread_workspace(
     await connector_credential_leases.prepare_thread_lease_delivery(
         dependencies.store, thread_id
     )
-    await _recover_cloud_mount_plan(thread_id, dependencies=dependencies)
+    await _settle_cloud_mount_record(thread_id, dependencies=dependencies)
 
 
-async def _recover_cloud_mount_plan(
+#: Pod UIDs known to record no cloud mount plan (from before the plane), so
+#: their polls cost no Pod read each. Bounded; oldest forgotten first.
+_PODS_WITHOUT_PLAN: "OrderedDict[str, None]" = OrderedDict()
+_PODS_WITHOUT_PLAN_MAX = 4096
+
+
+def _remember_pod_without_plan(uid: str) -> None:
+    _PODS_WITHOUT_PLAN[uid] = None
+    _PODS_WITHOUT_PLAN.move_to_end(uid)
+    while len(_PODS_WITHOUT_PLAN) > _PODS_WITHOUT_PLAN_MAX:
+        _PODS_WITHOUT_PLAN.popitem(last=False)
+
+
+async def _settle_cloud_mount_record(
     thread_id: str, *, dependencies: ThreadWorkspaceDeliveryDependencies
 ) -> None:
-    """A ready Pod whose plan never reached the thread (a crash between
-    creating the Pod and publishing its plan) gets it from the Pod's own
-    annotation, the plan's source of truth, before attach reads the record
-    (connector drivers D7). Never raises."""
+    """The thread's record of its Pod's cloud mounts, before attach reads it
+    (connector drivers D7). Never raises.
+
+    - A ready Pod whose plan never reached the thread (a crash between
+      creating the Pod and publishing its plan) gets it from the Pod's own
+      annotation, the plan's source of truth. A Pod that records none is
+      remembered, so it costs one read, not one per poll.
+    - A sandbox upgraded to a VM drops the Pod's folder state: the VM's
+      folders are its own, and the cockpit must not show the Pod's.
+    """
     if InPodPlaneSettings.from_env() is None:
         return
     try:
@@ -523,30 +543,47 @@ async def _recover_cloud_mount_plan(
         metadata = thread_metadata_object(thread)
         workspace = metadata.get("workspace_container")
         vm = metadata.get("vm") or {}
+        vm_ready = isinstance(vm, Mapping) and vm.get("status") == "ready"
+        if vm_ready:
+            if isinstance(metadata.get("cloud_mount_status"), Mapping):
+                clear = getattr(
+                    type(dependencies.store), "set_thread_cloud_mount_status", None
+                )
+                if callable(clear):
+                    await clear(dependencies.store, thread_id, None)
+            return
+        incarnation = (
+            str(workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY) or "")
+            if isinstance(workspace, Mapping)
+            else ""
+        )
         if (
-            not isinstance(workspace, Mapping)
+            not incarnation
             or PLAN_CONTEXT_KEY in workspace
             or workspace.get("status") != "ready"
             or workspace.get("provisioner") != "k8s"
-            or not workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
-            or (isinstance(vm, Mapping) and vm.get("status") == "ready")
+            or incarnation in _PODS_WITHOUT_PLAN
         ):
             return
         recover = getattr(
             dependencies.container_provisioner, "recover_cloud_mount_plan", None
         )
-        if callable(recover) and await recover(
-            WorkspaceOwner.session(thread_id),
-            str(workspace[WORKSPACE_RUNTIME_INCARNATION_KEY]),
-        ):
+        if not callable(recover):
+            return
+        recovered = await recover(WorkspaceOwner.session(thread_id), incarnation)
+        if recovered is True:
             logger.warning(
                 "Thread %s: recovered its workspace Pod's cloud mount plan from "
                 "the Pod",
                 thread_id,
             )
+        elif recovered is False:
+            _remember_pod_without_plan(incarnation)
     except Exception:
         logger.warning(
-            "Thread %s: could not recover a cloud mount plan", thread_id, exc_info=True
+            "Thread %s: could not settle its cloud mount record",
+            thread_id,
+            exc_info=True,
         )
 
 

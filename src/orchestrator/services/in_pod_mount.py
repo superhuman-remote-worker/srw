@@ -117,6 +117,12 @@ SUPERVISOR_MEMORY_CAP_MI = 2048
 _QUANTITY = re.compile(r"[0-9]+(Ki|Mi|Gi|Ti|K|M|G|T)?")
 
 
+def _kubernetes_quantity(quantity: str) -> str:
+    """``quantity`` as Kubernetes spells it: the chart accepts rclone's
+    ``K`` for kilo, which a Pod's resources only take as ``k``."""
+    return f"{quantity[:-1]}k" if quantity.endswith("K") else quantity
+
+
 @dataclass(frozen=True)
 class InPodPlaneSettings:
     """The plane's chart settings; ``None`` from :meth:`from_env` when off."""
@@ -260,7 +266,7 @@ def _opener(spec: SidecarSpec, image: str) -> dict[str, Any]:
     }
 
 
-def _supervisor(image: str, memory: str) -> dict[str, Any]:
+def _supervisor(image: str, memory: str, cache_size: str) -> dict[str, Any]:
     return {
         "name": RCLONE_CONTAINER,
         "image": image,
@@ -285,9 +291,15 @@ def _supervisor(image: str, memory: str) -> dict[str, Any]:
         # memory: the limit scales with the mounts (connectors.inPodPlane.
         # supervisorMemory overrides it). An OOM kill restarts only the
         # supervisor, never the workspace.
+        # The caches' disk is requested (never limited: a limit would evict
+        # the Pod), so the scheduler places the Pod where it fits.
         "resources": {
-            "requests": {"cpu": "20m", "memory": "64Mi"},
-            "limits": {"cpu": "1000m", "memory": memory},
+            "requests": {
+                "cpu": "20m",
+                "memory": "64Mi",
+                "ephemeral-storage": _kubernetes_quantity(cache_size),
+            },
+            "limits": {"cpu": "1000m", "memory": _kubernetes_quantity(memory)},
         },
         "securityContext": {
             "runAsUser": RCLONE_UID,
@@ -377,6 +389,7 @@ def add_cloud_mount_sidecars(
             _supervisor(
                 settings.rclone_image,
                 settings.supervisor_memory_for(len(spec.targets)),
+                settings.cache_size,
             ),
         ]
     )

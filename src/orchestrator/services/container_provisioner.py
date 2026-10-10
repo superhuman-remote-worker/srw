@@ -1063,12 +1063,14 @@ class ContainerProvisioner:
 
     async def recover_cloud_mount_plan(
         self, owner: WorkspaceOwner, runtime_incarnation: str
-    ) -> bool:
+    ) -> bool | None:
         """Record a ready Pod's plan from its annotation when the thread has
         no record of it (a crash between creating the Pod and publishing its
-        plan): attach reads the record. True when one was recovered."""
+        plan): attach reads the record. True when one was recovered, False
+        when that exact Pod records none (a Pod from before the plane, say),
+        None when it could not tell."""
         if owner.kind != "session" or not self._k8s_available:
-            return False
+            return None
         try:
             pod = await self._bounded_kubernetes_call(
                 self._core_api.read_namespaced_pod,
@@ -1076,16 +1078,18 @@ class ContainerProvisioner:
                 namespace=self._namespace,
             )
         except Exception:
-            return False
+            return None
         metadata = getattr(pod, "metadata", None)
         if str(getattr(metadata, "uid", "") or "") != str(runtime_incarnation):
-            return False
+            return None
         if (
             recorded_plan_from_annotations(getattr(metadata, "annotations", None))
             is None
         ):
             return False
-        return await self._settle_cloud_mount_plan(owner, pod, runtime_incarnation)
+        if not await self._settle_cloud_mount_plan(owner, pod, runtime_incarnation):
+            return None
+        return True
 
     async def _settle_cloud_mount_plan(
         self, owner: WorkspaceOwner, pod: Any, runtime_incarnation: str

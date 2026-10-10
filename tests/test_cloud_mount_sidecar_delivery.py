@@ -1033,3 +1033,55 @@ async def test_the_in_flight_creation_digest_reads_the_real_tables(db):
         is None
     )
     assert await db.get_in_flight_workspace_creation_digest("nope", pinned=True) is None
+
+
+@pytest.mark.asyncio
+async def test_a_pod_without_a_plan_is_read_once_and_a_vm_upgrade_drops_the_pods_state(
+    monkeypatch,
+):
+    from orchestrator.services import thread_workspace_delivery
+
+    monkeypatch.setenv("CONNECTOR_IN_POD_OPENER_IMAGE", "o:1")
+    monkeypatch.setenv("CONNECTOR_IN_POD_RCLONE_IMAGE", "r:1")
+    monkeypatch.setattr(
+        thread_workspace_delivery.connector_credential_leases,
+        "prepare_thread_lease_delivery",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(thread_workspace_delivery, "_PODS_WITHOUT_PLAN", {})
+    pod = "00000000-0000-4000-8000-0000000000bb"
+    workspace = {"status": "ready", "provisioner": "k8s", "_runtime_incarnation": pod}
+    recover = AsyncMock(return_value=False)
+    cleared: list = []
+
+    class _Store:
+        metadata: dict = {"workspace_container": workspace}
+
+        async def get_thread(self, thread_id):
+            return {"id": thread_id, "metadata": self.metadata}
+
+        async def set_thread_cloud_mount_status(self, thread_id, status):
+            cleared.append((thread_id, status))
+            return True
+
+    store = _Store()
+    dependencies = SimpleNamespace(
+        store=store,
+        container_provisioner=SimpleNamespace(recover_cloud_mount_plan=recover),
+    )
+    for _ in range(3):
+        await thread_workspace_delivery.prepare_agent_thread_workspace(
+            THREAD_ID, dependencies=dependencies
+        )
+    # A Pod from before the plane: one read, then remembered.
+    assert recover.await_count == 1
+    # Upgraded to a VM: the sandbox Pod's folder state goes.
+    store.metadata = {
+        "workspace_container": workspace,
+        "vm": {"status": "ready", "ssh_host": "vm.example"},
+        "cloud_mount_status": {"fingerprint": "f" * 64, "mounts": {}},
+    }
+    await thread_workspace_delivery.prepare_agent_thread_workspace(
+        THREAD_ID, dependencies=dependencies
+    )
+    assert cleared == [(THREAD_ID, None)] and recover.await_count == 1
