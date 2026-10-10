@@ -239,7 +239,7 @@ describe('CloudFoldersNoticeComponent', () => {
     expect(text(rows[0])).toBe('workspace/cloud/acme · Project folder Read-only · mounted');
     expect(text(rows[1])).toBe('workspace/cloud/outbox · Session outbox Read-write · connecting…');
     expect(text(rows[2])).toBe(
-      'My cloud was not attached · no cloud account yet: connect your cloud under Settings → Connectors',
+      'My cloud was not attached · no cloud account yet: connect your cloud under Settings → Connectors Connect your cloud',
     );
     expect(rows[2].classList).toContain('cfn__folder--down');
     expect(text(root)).toContain('Some cloud folders of this session are not available');
@@ -252,6 +252,23 @@ describe('CloudFoldersNoticeComponent', () => {
     const root = await render({ problems: state.problems, folders: state.folders, agentOutdated: false });
     expect(root.querySelector('.cfn')?.classList).toContain('cfn--ok');
     expect(text(root.querySelector('.cfn__title') as HTMLElement)).toBe('Cloud folders');
+  });
+
+  it('links a root its user has not connected, or must reconnect, to Connect your cloud', async () => {
+    const state = cloudFolderStateFromStatus({
+      mounts: { acme: { mount_kind: 'project', access: 'read_write', state: 'mounted' } },
+      excluded: [
+        { source_ref: 'root-1', mount_kind: 'user_root', reason: 'cloud_not_connected' },
+        { source_ref: 'root-2', mount_kind: 'user_root', reason: 'cloud_grant_revoked' },
+      ],
+    });
+    const root = await render({ problems: state.problems, folders: state.folders, agentOutdated: false });
+    const rows = [...root.querySelectorAll<HTMLElement>('[data-cloud-folder]')];
+    expect(rows[0].querySelector('[data-connect-cloud]')).toBeNull();
+    const connect = rows[1].querySelector('[data-connect-cloud]')!;
+    expect(connect.getAttribute('routerLink')).toBe('/datasources');
+    expect(connect.textContent?.trim()).toBe(en.cloudRoot.connectLink);
+    expect(rows[2].querySelector('[data-connect-cloud]')?.textContent?.trim()).toBe(en.cloudRoot.reconnectLink);
   });
 
   it("links a protected session's folder to its review", async () => {

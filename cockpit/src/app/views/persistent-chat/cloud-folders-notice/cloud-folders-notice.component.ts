@@ -1,4 +1,5 @@
 import { ChangeDetectionStrategy, Component, input, output } from '@angular/core';
+import { RouterLink } from '@angular/router';
 import { TranslocoPipe } from '@jsverse/transloco';
 import { AppIconComponent } from '../../../ui/icon';
 import { CloudFolderBinding, CloudFolderProblem } from '../../../core/util/cloud-mount-status';
@@ -24,7 +25,7 @@ import { accessLevelLabelKey } from '../../../core/models/platform-connector';
   selector: 'app-cloud-folders-notice',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [TranslocoPipe, AppIconComponent],
+  imports: [TranslocoPipe, AppIconComponent, RouterLink],
   template: `
     @if (folders().length || problems().length || agentOutdated()) {
       <div
@@ -78,6 +79,11 @@ import { accessLevelLabelKey } from '../../../core/models/platform-connector';
                   {{ ' · ' }}
                   @if (folder.reason) {
                     <span data-reason>{{ 'chat.cloudFolders.reason.' + folder.reason | transloco }}</span>
+                    @if (connectLinkKey(folder); as linkKey) {
+                      <!-- My cloud is connected by its user, in Settings →
+                           Connectors; it mounts at the session's next start. -->
+                      {{ ' ' }}<a class="cfn__review" routerLink="/datasources" data-connect-cloud>{{ linkKey | transloco }}</a>
+                    }
                   } @else {
                     <span data-folder-state>{{ 'chat.cloudFolders.state.' + folder.state | transloco }}</span>
                   }
@@ -133,6 +139,14 @@ export class CloudFoldersNoticeComponent {
   /** What a mounted folder is ("Project folder", "My cloud"), or null. */
   kindKey(folder: CloudFolderBinding): string | null {
     return folder.kind ? `chat.cloudFolders.kind.${folder.kind}` : null;
+  }
+
+  /** "Connect your cloud" for a root left out because its user has not
+   *  connected it, or the cloud stopped accepting the connection. */
+  connectLinkKey(folder: CloudFolderBinding): string | null {
+    if (folder.reason === 'cloud_not_connected') return 'cloudRoot.connectLink';
+    if (folder.reason === 'cloud_grant_revoked') return 'cloudRoot.reconnectLink';
+    return null;
   }
 
   levelKey(folder: CloudFolderBinding): string | null {

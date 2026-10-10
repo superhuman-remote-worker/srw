@@ -22,6 +22,8 @@ import {
   isPlatformOwned,
   PlatformRow,
   platformKindLabelKey,
+  platformOwnedKind,
+  USER_CLOUD_ROOT,
 } from '../../core/models/platform-connector';
 
 /** A user's explicit picker selection, tagged with the datasource-set identity
@@ -366,7 +368,7 @@ export function allDatasourcesSelected(
                    read-write). New Session chooses it on a selected row,
                    among the levels offered here; elsewhere it is shown. -->
               @if (accessChoiceOf(ds); as access) {
-                @if (accessMode() !== 'show' && isChecked(ds)) {
+                @if (accessMode() !== 'show' && isChecked(ds) && hasLevelChoice(access)) {
                   <select
                     class="ds-access-select"
                     data-access-select
@@ -405,9 +407,15 @@ export function allDatasourcesSelected(
                     [class.ds-rw-badge]="accessLevelWritesDirect(ds)"
                     data-access-level
                     [attr.data-level]="accessLevel(ds)"
-                    [attr.title]="accessLevel(ds) === access.default ? (accessOriginKey(access) | transloco) : null"
+                    [attr.title]="isUserRoot(ds)
+                      ? ('agentSettings.datasources.access.fullAccessHint' | transloco)
+                      : accessLevel(ds) === access.default ? (accessOriginKey(access) | transloco) : null"
                   >
-                    @if (accessLevel(ds); as level) {
+                    @if (isUserRoot(ds) && accessLevel(ds)) {
+                      <!-- My cloud has one level: an app token can be limited
+                           neither to read-only nor to one folder. -->
+                      {{ 'agentSettings.datasources.access.fullAccess' | transloco }}
+                    } @else if (accessLevel(ds); as level) {
                       @if (accessLevelKey(level); as key) {
                         {{ key | transloco }}
                       } @else {
@@ -1020,6 +1028,16 @@ export class DatasourcesGroupComponent {
     if (!access || level === null) return false;
     const writes = access.levels.find((l) => l.id === level)?.writes;
     return writes ? writes === 'direct' : level === 'read_write';
+  }
+
+  /** A select only where there is a choice: one offered level is shown. */
+  hasLevelChoice(access: ConnectorAccessChoice): boolean {
+    return access.levels.filter((level) => level.offered).length > 1;
+  }
+
+  /** The user's own cloud root ("My cloud"): full access, its only level. */
+  isUserRoot(ds: Datasource): boolean {
+    return platformOwnedKind(ds) === USER_CLOUD_ROOT;
   }
 
   /** The selected row bound at `protected`, if any: a session protects one

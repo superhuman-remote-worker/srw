@@ -3851,6 +3851,8 @@
         "label": "Zugriff für {{name}}",
         "notMounted": "Hier nicht eingebunden",
         "besideProtected": "Neben einem geschützten Ordner nicht eingebunden",
+        "fullAccess": "Voller Zugriff",
+        "fullAccessHint": "Meine Cloud hat nur vollen Zugriff: Das App-Token, das deine Cloud SRW gibt, lässt sich weder auf Nur-Lesen noch auf einen Ordner beschränken.",
         "origin": {
           "projectDefault": "Projektstandard",
           "default": "Standard",

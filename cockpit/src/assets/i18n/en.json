@@ -3851,6 +3851,8 @@
         "label": "Access for {{name}}",
         "notMounted": "Not mounted here",
         "besideProtected": "Not mounted beside a protected folder",
+        "fullAccess": "Full access",
+        "fullAccessHint": "My cloud has full access only: the app token your cloud gives SRW can be limited neither to read-only nor to one folder.",
         "origin": {
           "projectDefault": "project default",
           "default": "default",

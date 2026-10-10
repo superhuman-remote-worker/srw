@@ -163,11 +163,11 @@ describe('DatasourcesGroupComponent access levels', () => {
     const c = fixture.componentInstance;
     c.toggle('viewer');
     fixture.detectChanges();
-    expect(options(select(fixture, 'viewer')!).map((o) => o.text)).toEqual([
-      `${L.read_only} · ${A.origin.loweredRole}`,
-      `${L.protected} · ${A.refused.aboveCeiling}`,
-      `${L.read_write} · ${A.refused.aboveCeiling}`,
-    ]);
+    // A viewer has one level left: shown, with why it was lowered.
+    expect(select(fixture, 'viewer')).toBeNull();
+    const badge = row(fixture, 'viewer').querySelector('[data-access-level]')!;
+    expect(badge.textContent?.trim()).toBe(L.read_only);
+    expect(badge.getAttribute('title')).toBe(A.origin.loweredRole);
     const none = options(select(fixture, 'none')!);
     expect(none[0]).toEqual({value: '', text: A.notMounted, disabled: true, selected: true});
   });
@@ -244,6 +244,32 @@ describe('DatasourcesGroupComponent access levels', () => {
     Object.defineProperty(c, 'datasources', {value: () => [...rows]});
     expect(c.accessLevel(rows[0])).toBe('read_write');
     expect(c.getSelectedDatasourceAccess()).toEqual({});
+  });
+
+  it('shows My cloud as full access, and says why there is no narrower level', () => {
+    const fixture = mount([
+      ds('root', 'cloud_folder', {
+        managed_key: 'user-cloud-root:u1',
+        access: access({
+          levels: [
+            {...LEVELS[0], offered: false, reason: 'level_not_offered'},
+            {...LEVELS[1], offered: false, reason: 'level_not_offered'},
+            LEVELS[2],
+          ],
+          default: 'read_write',
+          default_origin: 'driver_default',
+        }),
+      }),
+    ]);
+    // One level offered: no select to choose from.
+    expect(select(fixture, 'root')).toBeNull();
+    const badge = row(fixture, 'root').querySelector('[data-access-level]')!;
+    expect(badge.textContent?.trim()).toBe(A.fullAccess);
+    expect(badge.getAttribute('title')).toBe(A.fullAccessHint);
+    expect(A.fullAccessHint).toContain('read-only');
+    expect(row(fixture, 'root').querySelector('.ds-type-badge')?.textContent?.trim()).toBe(
+      en.datasources.platform.kind.userCloudRoot,
+    );
   });
 
   it('shows an unselected row its default level, not a select', () => {
