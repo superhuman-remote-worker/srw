@@ -7931,6 +7931,211 @@ async def test_held_stop_inspect_accepts_signed_http_and_nats_request(
     assert result["frozen"] == frozen
 
 
+async def _signed_held_stop_request(controller, transport, payload):
+    from vm_controller.lifecycle_auth import verify_payload
+
+    signed = sign_payload(
+        payload,
+        direction="request",
+        operation="pre-ssh-stop",
+        secret=LIFECYCLE_SECRET,
+    )
+    with patch("vm_controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+        if transport == "http":
+            response = await controller.http_pre_ssh_stop(
+                types.SimpleNamespace(json=AsyncMock(return_value=signed))
+            )
+            assert response.status == 200
+            result = json.loads(response.body)
+        else:
+            controller.nc = AsyncMock()
+            await controller.handle_pre_ssh_stop(
+                MagicMock(reply="test.reply", data=json.dumps(signed).encode())
+            )
+            controller.nc.publish.assert_awaited_once()
+            result = json.loads(controller.nc.publish.await_args.args[1])
+    assert verify_payload(
+        result,
+        direction="response",
+        operation="pre-ssh-stop",
+        secret=LIFECYCLE_SECRET,
+        expected_correlation_id=signed["_lifecycle_auth"]["request_id"],
+    )
+    return result
+
+
+def _held_stop_action(frozen, authority, parent, preflight, action, **extra):
+    return {
+        "action": action,
+        "job_id": frozen["job_id"],
+        "provision_generation": frozen["provision_generation"],
+        "frozen": frozen,
+        "frozen_digest": "sha256:" + "b" * 64,
+        "retention_preflight": preflight,
+        "held_stop_authority": authority,
+        "parent_cleanup": parent,
+        **extra,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["http", "nats"])
+async def test_held_stop_signed_mutating_transport_halts_proves_and_releases(
+    controller, transport
+):
+    from shared.vm_pre_ssh_stop import PRE_SSH_STOP_ANNOTATION, PRE_SSH_STOP_FINALIZER
+
+    vm, pod, authority, parent, frozen, preflight = await _held_stop_controller_fixture(
+        controller, ready=True
+    )
+    digest = "sha256:" + "b" * 64
+    vmi = controller.k8s_client.get_namespaced_custom_object(
+        plural="virtualmachineinstances"
+    )
+    patches = []
+
+    def patch_pod(**call):
+        tests = {p["path"]: p["value"] for p in call["body"] if p["op"] == "test"}
+        if any(p["op"] == "remove" for p in call["body"]):
+            patches.append("release")
+            assert tests["/metadata/uid"] == frozen["launcher_uid"]
+            assert tests["/metadata/resourceVersion"] == "44"
+            assert tests["/metadata/finalizers"] == [
+                "other.io/keep",
+                PRE_SSH_STOP_FINALIZER,
+            ]
+            assert (
+                tests["/metadata/annotations/srw.io~1vm-pre-ssh-stop-intent-digest"]
+                == digest
+            )
+            pod["metadata"]["finalizers"] = ["other.io/keep"]
+        else:
+            patches.append("finalizer")
+            assert tests == {
+                "/metadata/uid": frozen["launcher_uid"],
+                "/metadata/resourceVersion": "43",
+            }
+            pod["metadata"].update(
+                annotations={PRE_SSH_STOP_ANNOTATION: digest},
+                finalizers=["other.io/keep", PRE_SSH_STOP_FINALIZER],
+                resourceVersion="44",
+            )
+
+    def patch_vm(**call):
+        patches.append("Halted")
+        assert patches == ["finalizer", "Halted"]
+        tests = {p["path"]: p["value"] for p in call["body"] if p["op"] == "test"}
+        assert tests == {
+            "/metadata/uid": frozen["vm_uid"],
+            "/metadata/resourceVersion": "42",
+            "/spec/runStrategy": "RerunOnFailure",
+        }
+        vm["spec"]["runStrategy"] = "Halted"
+        vm["metadata"]["generation"] = frozen["vm_generation"] + 1
+        vmi["status"]["phase"] = "Failed"
+        pod["metadata"]["deletionGracePeriodSeconds"] = 30
+        pod["status"]["phase"] = "Failed"
+        for status in pod["status"]["containerStatuses"]:
+            status["state"] = {
+                "terminated": {
+                    "containerID": status["containerID"],
+                    "finishedAt": "2026-10-07T12:00:00Z",
+                    "reason": "Completed",
+                }
+            }
+
+    controller.core_api.patch_namespaced_pod.side_effect = patch_pod
+    controller.k8s_client.patch_namespaced_custom_object.side_effect = patch_vm
+    stopped = await _signed_held_stop_request(
+        controller,
+        transport,
+        _held_stop_action(frozen, authority, parent, preflight, "stop"),
+    )
+    assert stopped["status"] == "positive_terminal_proof"
+    assert stopped["terminal_evidence"]["kind"] == (
+        "vm_job_never_app_ready_retained_positive_stop_v1"
+    )
+    assert {c["container_id"] for c in stopped["terminal_evidence"]["containers"]} == {
+        "containerd://compute-old",
+        "containerd://console-old",
+    }
+    assert patches == ["finalizer", "Halted"]
+    released = await _signed_held_stop_request(
+        controller,
+        transport,
+        _held_stop_action(
+            frozen,
+            authority,
+            parent,
+            preflight,
+            "release",
+            terminal_evidence=stopped["terminal_evidence"],
+            process_zero_receipt_id="00000000-0000-4000-8000-000000000799",
+        ),
+    )
+    assert released["status"] == "finalizer_released"
+    assert patches == ["finalizer", "Halted", "release"]
+    assert pod["metadata"]["finalizers"] == ["other.io/keep"]
+    assert vm["spec"]["runStrategy"] == "Halted"
+    controller.core_api.delete_namespaced_persistent_volume_claim.assert_not_called()
+    controller.k8s_client.delete_namespaced_custom_object.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["http", "nats"])
+@pytest.mark.parametrize("action", ["stop", "release"])
+@pytest.mark.parametrize(
+    "fault",
+    ["missing_authority", "foreign_authority", "missing_parent", "foreign_parent"],
+)
+async def test_held_stop_signed_mutating_transport_refuses_unbound_authority(
+    controller, transport, action, fault
+):
+    from tests.test_vm_pre_ssh_stop_protocol import proof
+
+    vm, _, authority, parent, frozen, preflight = await _held_stop_controller_fixture(
+        controller, ready=True
+    )
+    observed = proof(frozen)
+    observed.update(
+        kind="vm_job_never_app_ready_retained_positive_stop_v1",
+        frozen_digest="sha256:" + "b" * 64,
+        pod_intent_digest="sha256:" + "b" * 64,
+    )
+    payload = _held_stop_action(
+        frozen,
+        authority,
+        parent,
+        preflight,
+        action,
+        terminal_evidence=observed,
+        process_zero_receipt_id="00000000-0000-4000-8000-000000000799",
+    )
+    if action == "release":
+        vm["spec"]["runStrategy"] = "Halted"
+        vm["metadata"]["generation"] = frozen["vm_generation"] + 1
+    if fault == "missing_authority":
+        payload.pop("held_stop_authority")
+    elif fault == "foreign_authority":
+        payload["held_stop_authority"] = {
+            **authority,
+            "vm_uid": "00000000-0000-4000-8000-000000000799",
+        }
+    elif fault == "missing_parent":
+        payload.pop("parent_cleanup")
+    else:
+        payload["parent_cleanup"] = {
+            **parent,
+            "request_id": "00000000-0000-4000-8000-000000000799",
+        }
+    controller.k8s_client.get_namespaced_custom_object.reset_mock()
+    result = await _signed_held_stop_request(controller, transport, payload)
+    assert result["status"] == "identity_refused"
+    controller.k8s_client.get_namespaced_custom_object.assert_not_called()
+    controller.core_api.patch_namespaced_pod.assert_not_called()
+    controller.k8s_client.patch_namespaced_custom_object.assert_not_called()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("race", ["pod", "vm"])
 async def test_held_stop_cas_race_keeps_vm_running_without_proof(controller, race):
