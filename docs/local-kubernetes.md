@@ -369,6 +369,25 @@ Some ConfigMap changes require an explicit workload restart. Prefer letting
 the chart or Tilt own rollouts; use a manual restart only while diagnosing a
 local change.
 
+### Reclaiming disk
+
+Every Tilt build pushes new image tags to the k3d registry and the k3d node,
+and neither removes old ones on its own. The registry can grow past 100 GB in
+a few weeks. Prune it with:
+
+```bash
+./scripts/local-dev-gc.sh --dry-run   # show what would go
+./scripts/local-dev-gc.sh
+```
+
+The script keeps every image a k3d workload still references, the newest two
+tags per repository, and anything pushed in the last 24 hours. Tune these
+limits with `KEEP_TAGS` and `KEEP_HOURS`. It stops the registry for the
+collection, usually for under a minute, and skips that step while Tilt is
+building. To run it daily, add a systemd user service whose `ExecStart` points
+at the script, plus a timer such as `OnCalendar=*-*-* 04:30` with
+`Persistent=true`.
+
 ## Teardown
 
 Choose the smallest teardown that matches what you intend to remove:
