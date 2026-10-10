@@ -12,12 +12,17 @@ import logging
 import os
 from typing import Any
 
+from orchestrator.services.legacy_cloud_datasources import (
+    retire_legacy_cloud_datasources,
+)
+
 logger = logging.getLogger(__name__)
 
 
 async def run_startup_backfills(store: Any) -> None:
-    """Encrypt legacy datasource credentials, strip stored thread secrets and,
-    on a dev cluster with ``MCP_DEV_TOKEN``, seed the admin MCP token."""
+    """Encrypt legacy datasource credentials, strip stored thread secrets,
+    retire the legacy cloud WebDAV rows and, on a dev cluster with
+    ``MCP_DEV_TOKEN``, seed the admin MCP token."""
 
     # Encrypt any legacy plaintext datasource credentials. Idempotent — once
     # all rows are v1 ciphertexts this is a fast no-op. Runs at startup
@@ -65,6 +70,15 @@ async def run_startup_backfills(store: Any) -> None:
             )
     except Exception as _e:
         logger.error("Thread config_override strip backfill failed: %s", _e)
+
+    # Retire the two WebDAV rows the old main-cloud wiring made, each holding
+    # a service account's credential to a whole cloud home (main cloud slice
+    # 8): "Cloud Storage (Personal)" and the bundled Nextcloud admin home.
+    # Idempotent; logs one count line.
+    try:
+        await retire_legacy_cloud_datasources(store)
+    except Exception as _e:
+        logger.error("Legacy cloud WebDAV connector retirement failed: %s", _e)
 
     # Dev-only: seed a fixed admin MCP token from MCP_DEV_TOKEN so a committed
     # .mcp.json works out of the box against a local cluster. Only fires when

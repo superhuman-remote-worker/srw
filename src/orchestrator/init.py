@@ -769,6 +769,9 @@ async def _seed_default_datasources(db) -> None:
     create would; a refused one is logged and not seeded.
     """
     from orchestrator.services.connector_drivers import builtin_connector_drivers
+    from orchestrator.services.legacy_cloud_datasources import (
+        is_nextcloud_admin_home_url,
+    )
 
     drivers = builtin_connector_drivers()
     seeded = 0
@@ -823,9 +826,19 @@ async def _seed_default_datasources(db) -> None:
             logger.info(f"    Seeded default datasource: mongodb ({name})")
             seeded += 1
 
-    # WebDAV datasource (Nextcloud or any WebDAV server)
+    # WebDAV datasource (an external WebDAV server, cloud.externalBackend:
+    # webdav). Never Nextcloud admin's own home: the chart's bundled-Nextcloud
+    # branch seeded that as a global row holding admin's credentials, and the
+    # startup pass retires it (main cloud slice 8), so an old ConfigMap still
+    # naming it must not seed it again.
     webdav_url = os.getenv("DEFAULT_DS_WEBDAV_URL")
-    if webdav_url:
+    if webdav_url and is_nextcloud_admin_home_url(webdav_url):
+        logger.warning(
+            "    Default datasource webdav refused: %s is Nextcloud admin's "
+            "home, which no seeded connector may reach",
+            webdav_url,
+        )
+    elif webdav_url:
         name = os.getenv("DEFAULT_DS_WEBDAV_NAME", "Default WebDAV")
         credentials = {}
         username = os.getenv("DEFAULT_DS_WEBDAV_USERNAME")
