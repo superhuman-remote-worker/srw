@@ -36,7 +36,9 @@ STATUSES: tuple[str, ...] = ("offered", "planned", "unsupported")
 
 #: Every combination the matrix answers, in the order the page lists them.
 #: ``(connector type, folder kind, access level)``; an outbox has no folder
-#: kind (SRW creates its folder per execution).
+#: kind (SRW creates its folder per execution). An outbox's tiers are where a
+#: session mounts its folder: a job's outbox is a copy SRW makes at
+#: completion, which no tier narrows (``CloudOutboxDriver.offered_access``).
 MATRIX_ROWS: tuple[tuple[str, str | None, str], ...] = (
     ("cloud_folder", "project", "read_only"),
     ("cloud_folder", "project", "read_write"),

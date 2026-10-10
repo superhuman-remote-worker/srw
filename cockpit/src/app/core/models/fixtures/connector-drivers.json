@@ -2249,6 +2249,73 @@
         "session"
       ],
       "user_creatable": false
+    },
+    {
+      "name": "srw.cloud-outbox/v1",
+      "title": "Session outbox",
+      "legacy_type": "cloud_outbox",
+      "serves_stored_type": true,
+      "protocol_version": "1.0",
+      "plane": "in_pod",
+      "delivery_forms": [
+        "cloud_mount"
+      ],
+      "supported_backends": [
+        "sandbox",
+        "vm"
+      ],
+      "workspace_requirements": "A session's workspace the folder is mounted into at cloud/outbox (the sandbox tier); a job needs only its repository, which SRW copies the deliverables from when it completes.",
+      "tool_category": null,
+      "operations": [],
+      "access_levels": [
+        {
+          "id": "read_write",
+          "rank": 10,
+          "tools": [],
+          "enforced_by": "A folder SRW creates for the execution in the main cloud's service account and shares with the execution's owner: the service account's credential writes it, and the owner sees what is written there, not the project's folders.",
+          "advisory": false,
+          "writes": "direct"
+        }
+      ],
+      "default_access": null,
+      "forced_read_only": false,
+      "holds_upstream_credentials": false,
+      "credential_slots": [],
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "legacy_connection_url": "forbidden",
+      "egress": {
+        "declared": {
+          "rules": [],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        },
+        "installation": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        }
+      },
+      "publishable": false,
+      "live_attach": false,
+      "live_detach": "next_attach",
+      "delete_while_attached": true,
+      "max_per_execution": null,
+      "needs_knowledge_profile": false,
+      "deployment_gate": null,
+      "service": null,
+      "trust": {
+        "tier": "builtin",
+        "trusted": true,
+        "image": null,
+        "claims_declared_by_author": false
+      },
+      "user_creatable": false
     }
   ]
 }

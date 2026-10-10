@@ -393,11 +393,19 @@ class AccessContext:
     ``protected_mode_enabled`` the installation's protected-cloud switch: a
     driver whose reviewed level needs the protected review lane offers it
     only where both allow it.
+
+    ``execution`` is what the connector is attached to (``job`` or
+    ``session``; ``None``: either), for a driver that delivers differently
+    to each. ``main_cloud_backend`` is the main-cloud provider the
+    execution's folders live on (``None``: any), for a connector whose
+    folder SRW creates per execution and so names no provider itself.
     """
 
     workspace_backend: str | None = None
     officer: bool = False
     protected_mode_enabled: bool = True
+    execution: ExecutionKind | None = None
+    main_cloud_backend: str | None = None
 
 
 def access_resolution(

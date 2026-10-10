@@ -413,9 +413,10 @@ class TestStrictAccess:
         assert not strict_access(GENERIC_SPEC)
         assert not strict_access(_strict_spec(access_levels=()))
 
-    def test_only_the_cloud_folder_is_strict(self):
+    def test_only_the_main_clouds_folders_are_strict(self):
         assert {spec.name for spec in BUILTIN_SPECS if strict_access(spec)} == {
-            "srw.cloud-folder/v1"
+            "srw.cloud-folder/v1",
+            "srw.cloud-outbox/v1",
         }
 
     def test_a_read_only_binding_takes_the_lowest_level_that_writes_nothing(self):

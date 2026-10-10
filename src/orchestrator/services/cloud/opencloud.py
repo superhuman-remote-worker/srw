@@ -160,7 +160,9 @@ OPENCLOUD_CAPABILITIES = ProviderCapabilities(
             None,
             "read_write",
             "offered",
-            "a folder created for the execution and shared with its owner",
+            "a folder SRW creates in its agent-home Space and shares with the "
+            "execution's owner; a session's workspace holds short-lived tokens "
+            "of the orchestrator's service account",
             frozenset({"sandbox"}),
         ),
     ),

@@ -8,6 +8,7 @@ from orchestrator.services.connector_drivers.base import (
     ManifestDeliveryDriver,
 )
 from orchestrator.services.connector_drivers.cloud_folder import CloudFolderDriver
+from orchestrator.services.connector_drivers.cloud_outbox import CloudOutboxDriver
 from orchestrator.services.connector_drivers.env import (
     CredentialsDriver,
     GenericDriver,
@@ -39,6 +40,7 @@ def drivers() -> tuple[DatasourceDriver | ManifestDeliveryDriver, ...]:
             *credential_files.drivers(),
             SshKeyDriver(),
             CloudFolderDriver(),
+            CloudOutboxDriver(),
         )
     }
     stored = [spec for spec in BUILTIN_SPECS if spec.legacy_type]

@@ -177,7 +177,10 @@ NEXTCLOUD_CAPABILITIES = ProviderCapabilities(
             None,
             "read_write",
             "offered",
-            "a folder created for the execution and shared with its owner",
+            "a folder SRW creates in the agent-service account's home and "
+            "shares with the execution's owner; a session mounts it with "
+            "agent-service's credential (which can write every project folder "
+            "until slice 7), so not on a root VM",
             frozenset({"sandbox"}),
         ),
     ),

@@ -492,7 +492,8 @@ def test_the_cockpit_picker_refuses_what_the_server_refuses_on_lite_tiers():
         )
     }
     # Credential files joined the shell drivers in D1d; the main cloud's
-    # folder mounts into a sandbox or VM workspace (main cloud slice 3).
+    # folder mounts into a sandbox or VM workspace (main cloud slice 3), and
+    # the session outbox needs a session's mount or a job's repository.
     needs_shell = {
         "repository",
         "credentials",
@@ -501,5 +502,6 @@ def test_the_cockpit_picker_refuses_what_the_server_refuses_on_lite_tiers():
         "kubeconfig",
         "generic_file",
         "cloud_folder",
+        "cloud_outbox",
     }
     assert cockpit == server == needs_shell

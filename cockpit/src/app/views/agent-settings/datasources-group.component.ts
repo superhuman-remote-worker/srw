@@ -44,6 +44,8 @@ const SHELL_WORKSPACE_TYPES = new Set([
   'generic_file',
   // Mounted into the workspace (sandbox or VM tier).
   'cloud_folder',
+  // A session's mount, or a copy from a job's repository.
+  'cloud_outbox',
 ]);
 
 /** Whether a connector type needs a shell workspace: its driver's

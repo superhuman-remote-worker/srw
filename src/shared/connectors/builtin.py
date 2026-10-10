@@ -1532,6 +1532,50 @@ CLOUD_FOLDER_SPEC = DriverSpec(
     user_creatable=False,
 )
 
+# A user's outbox (main_cloud_as_connectors.md, slice 6): one connector per
+# user, and per execution one folder SRW creates in the main cloud's service
+# account and shares with the execution's owner. A session mounts its folder
+# at cloud/outbox; a job's is a copy of its deliverables SRW makes when it
+# completes. The connector names no folder (its config is empty): the folder
+# is the execution's, recorded on it.
+#
+# Its tiers are both shell tiers, the union over executions. A session
+# mounts the folder with the service account's credential, which must not
+# reach a root VM, so the driver offers a session's binding only on the
+# tiers its provider declares (offered_access); a job's copy is SRW's, made
+# from the job's repository, so any tier with a repository serves it. The
+# lite tiers have neither a workspace nor a repository.
+CLOUD_OUTBOX_SPEC = DriverSpec(
+    name="srw.cloud-outbox/v1",
+    legacy_type="cloud_outbox",
+    title="Session outbox",
+    guide_topic="files-and-integrations",
+    plane="in_pod",
+    delivery_forms=("cloud_mount",),
+    config_schema={"type": "object", "additionalProperties": False, "properties": {}},
+    access_levels=(
+        AccessLevel(
+            "read_write",
+            10,
+            "A folder SRW creates for the execution in the main cloud's service "
+            "account and shares with the execution's owner: the service "
+            "account's credential writes it, and the owner sees what is "
+            "written there, not the project's folders.",
+            writes="direct",
+        ),
+    ),
+    supported_backends=SHELL_BACKENDS,
+    workspace_requirements=(
+        "A session's workspace the folder is mounted into at cloud/outbox "
+        "(the sandbox tier); a job needs only its repository, which SRW copies "
+        "the deliverables from when it completes."
+    ),
+    publishable=False,
+    live_attach=False,
+    live_detach="next_attach",
+    user_creatable=False,
+)
+
 # ---------------------------------------------------------------------------
 # Registered image drivers (connector drivers D6)
 #
@@ -1585,7 +1629,7 @@ TYPE_VARIANT_SPECS: tuple[DriverSpec, ...] = (MCP_REMOTE_SPEC,)
 #: Datasource drivers whose connectors only SRW creates (``user_creatable``
 #: off), for what the main cloud provisions. Their stored types resolve and
 #: the capability matrix lists them; no create form or catalogue offers them.
-PLATFORM_SPECS: tuple[DriverSpec, ...] = (CLOUD_FOLDER_SPEC,)
+PLATFORM_SPECS: tuple[DriverSpec, ...] = (CLOUD_FOLDER_SPEC, CLOUD_OUTBOX_SPEC)
 BUILTIN_SPECS: tuple[DriverSpec, ...] = (
     MANIFEST_SPECS
     + tuple(

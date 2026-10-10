@@ -169,7 +169,8 @@ class TestSpec:
         assert CLOUD_FOLDER_SPEC not in DATASOURCE_SPECS
         assert "cloud_folder" not in DATASOURCE_TYPES
         assert [(d.type_id, d.runtime_kind) for d in PLATFORM_TYPE_CATALOG] == [
-            ("cloud_folder", "cloud_mount")
+            ("cloud_folder", "cloud_mount"),
+            ("cloud_outbox", "cloud_mount"),
         ]
         assert all(spec.user_creatable for spec in DATASOURCE_SPECS)
         assert not any(spec.user_creatable for spec in PLATFORM_SPECS)
@@ -206,8 +207,12 @@ class TestSpec:
             "reviewed",
             "direct",
         ]
+        # The session outbox attaches to both, so only its creator differs.
+        outbox = rows["srw.cloud-outbox/v1"]
+        assert "executions" not in outbox
+        assert outbox["user_creatable"] is False
         for name, row in rows.items():
-            if name != "srw.cloud-folder/v1":
+            if name not in {"srw.cloud-folder/v1", "srw.cloud-outbox/v1"}:
                 assert "executions" not in row and "user_creatable" not in row
 
 
