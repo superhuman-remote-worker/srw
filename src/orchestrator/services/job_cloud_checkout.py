@@ -23,7 +23,11 @@ copy's ``cloud_baseline: seeding`` is on the row from its first instant and
 the dispatcher never starts the job before the copy lands. Work admitted
 elsewhere (automations, an officer's auto-pull) is decided at provisioning
 (:func:`provisioning_stamp`), from the rows attached to the job; it never
-gets the outbox, which is for work a user starts.
+gets the outbox, which is for work a user starts. An officer's executor
+ticket always gets its copy (the floor its deliverables need), but what
+happens to its edits is its attached checkout's bound level, link default
+and viewer ceiling included; with none bound the copy is read-only. Only an
+older job reaches the :func:`legacy_checkout` rule.
 
 Only the job's own project's checkout copies anything, and only the job
 owner's outbox delivers; a subjob gets neither (its branch already holds its
@@ -40,6 +44,7 @@ from uuid import UUID
 
 from orchestrator.services.connector_drivers.base import AccessContext
 from orchestrator.services.connector_drivers.cloud_folder_checkout import (
+    READ_ONLY,
     REVIEWED_WRITE_BACK,
     CloudFolderCheckout,
     CloudFolderCheckoutDriver,
@@ -342,6 +347,46 @@ async def admission_stamp(
     return stamp
 
 
+#: ``context.cloud_checkout.origin`` of an officer executor ticket's floor
+#: copy that no attached checkout binds a level for: read-only.
+OFFICER_FLOOR_ORIGIN = "officer_floor"
+
+
+async def _bound_checkout(
+    store: Any, *, job_row: Mapping[str, Any], project: Mapping[str, Any]
+) -> CloudFolderCheckout | None:
+    """The job's own project's checkout attached to it, at its bound level
+    (the link default, the owner's viewer ceiling); ``None`` when none binds.
+    Raises when the rows cannot be read."""
+    rows = await attached_cloud_rows(
+        store, project_id=str(project.get("id")), job_id=str(job_row["id"])
+    )
+    role = await owner_role(store, job_row.get("user_id"), str(project.get("id") or ""))
+    return resolve_checkout(rows, project=project, role=role)
+
+
+async def _officer_floor_checkout(
+    store: Any, *, job_row: Mapping[str, Any], project: Mapping[str, Any]
+) -> dict[str, Any]:
+    """``context.cloud_checkout`` for an officer's executor ticket: its copy
+    is unconditional (the floor), its write-back the attached checkout's
+    bound level, else read-only. Never the legacy heuristic, which would
+    send every edit for review whatever the level."""
+    try:
+        bound = await _bound_checkout(store, job_row=job_row, project=project)
+    except Exception:
+        logger.warning(
+            "cloud connectors: could not read job %s's attached rows; its floor "
+            "copy is read-only",
+            job_row.get("id"),
+            exc_info=True,
+        )
+        bound = None
+    if bound is not None:
+        return bound.context()
+    return {"access": READ_ONLY, "origin": OFFICER_FLOOR_ORIGIN}
+
+
 async def provisioning_stamp(
     store: Any,
     *,
@@ -352,10 +397,13 @@ async def provisioning_stamp(
     """What provisioning records for a project job admission did not decide.
 
     A loop (``loop_floor``) always gets its copy; it is told so here when
-    nothing told it yet. A root job without ``cloud_checkout`` (work
-    admitted outside admission) gets one when its own project's checkout is
-    attached to it. Returns the context keys to merge, or ``None`` when
-    there is nothing to add.
+    nothing told it yet. An officer's executor ticket (``loop_floor``
+    without a ``loop_id``) gets its copy too, and here its
+    ``cloud_checkout`` when admission recorded none: the attached checkout's
+    bound level, else read-only (:func:`_officer_floor_checkout`). A root
+    job without ``cloud_checkout`` (work admitted outside admission) gets
+    one when its own project's checkout is attached to it. Returns the
+    context keys to merge, or ``None`` when there is nothing to add.
     """
     context = job_context(job_row)
     if not project_has_folder(project):
@@ -363,31 +411,32 @@ async def provisioning_stamp(
     if loop_floor:
         if CLOUD_CONNECTORS_CONTEXT_KEY in context:
             return None
+        loop = bool(context.get("loop_id"))
         checkout = checkout_context(job_row)
+        stamp: dict[str, Any] = {}
+        if checkout is None and not loop and not job_row.get("parent_job_id"):
+            checkout = await _officer_floor_checkout(
+                store, job_row=job_row, project=project
+            )
+            stamp[CHECKOUT_CONTEXT_KEY] = checkout
         access = checkout.get("access") if checkout else None
         name = str(project.get("name") or "project")
         from orchestrator.services.job_cloud_baseline import slugify_project_name
 
-        return {
-            CLOUD_CONNECTORS_CONTEXT_KEY: [
-                checkout_entry(
-                    project_slug=slugify_project_name(name),
-                    folder=name,
-                    edits=checkout_edits(access, loop=bool(context.get("loop_id"))),
-                    access=access,
-                    datasource_id=(checkout or {}).get("datasource_id"),
-                )
-            ]
-        }
+        stamp[CLOUD_CONNECTORS_CONTEXT_KEY] = [
+            checkout_entry(
+                project_slug=slugify_project_name(name),
+                folder=name,
+                edits=checkout_edits(access, loop=loop),
+                access=access,
+                datasource_id=(checkout or {}).get("datasource_id"),
+            )
+        ]
+        return stamp
     if CHECKOUT_CONTEXT_KEY in context or job_row.get("parent_job_id"):
         return None
     try:
-        rows = await attached_cloud_rows(
-            store, project_id=str(project.get("id")), job_id=str(job_row["id"])
-        )
-        role = await owner_role(
-            store, job_row.get("user_id"), str(project.get("id") or "")
-        )
+        checkout = await _bound_checkout(store, job_row=job_row, project=project)
     except Exception:
         logger.warning(
             "cloud connectors: could not read job %s's attached rows; no copy",
@@ -395,7 +444,6 @@ async def provisioning_stamp(
             exc_info=True,
         )
         return None
-    checkout = resolve_checkout(rows, project=project, role=role)
     if checkout is None:
         return None
     return {
@@ -410,6 +458,7 @@ async def provisioning_stamp(
 __all__ = [
     "CHECKOUT_CONTEXT_KEY",
     "CHECKOUT_TYPE",
+    "OFFICER_FLOOR_ORIGIN",
     "OUTBOX_CONTEXT_KEY",
     "OUTBOX_TYPE",
     "admission_stamp",

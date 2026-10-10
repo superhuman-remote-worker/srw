@@ -267,14 +267,76 @@ class TestProvisioning:
         assert "cloud_checkout" not in stamp
 
     @pytest.mark.asyncio
-    async def test_an_officer_executor_without_a_checkout_keeps_review(self):
+    @pytest.mark.parametrize(
+        ("row", "role", "access"),
+        [
+            ({}, "owner", "reviewed_write_back"),
+            ({"project_access": "read_only"}, "owner", "read_only"),
+            ({}, "viewer", "read_only"),
+        ],
+        ids=["provider-default", "link-default-read-only", "viewer-ceiling"],
+    )
+    async def test_an_officer_executor_follows_its_checkouts_bound_level(
+        self, row, role, access
+    ):
+        """An auto-pulled executor ticket is never decided at admission: its
+        floor copy's write-back is the attached checkout's bound level, so a
+        read-only link or a viewer owner is never sent for review."""
+        store, _conn = _store([_checkout_row(**row)], role=role)
         stamp = await checkout.provisioning_stamp(
-            MagicMock(),
-            job_row={"id": JOB_ID, "context": {}},
+            store,
+            job_row={"id": JOB_ID, "user_id": USER_ID, "context": {}},
             project=PROJECT,
             loop_floor=True,
         )
-        assert stamp["cloud_connectors"][0]["edits"] == "reviewed"
+        assert stamp["cloud_checkout"] == {
+            "datasource_id": CHECKOUT_ID,
+            "access": access,
+        }
+        expected_edits = "reviewed" if access == "reviewed_write_back" else "discarded"
+        assert stamp["cloud_connectors"][0]["edits"] == expected_edits
+        assert checkout.capture_applies(
+            {"context": stamp, "cloud_diff_baseline_commit": "b"}
+        ) is (access == "reviewed_write_back")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", [False, True], ids=["none-attached", "unread"])
+    async def test_an_officer_executor_without_a_bound_checkout_copies_read_only(
+        self, failure
+    ):
+        """Its copy is the floor its deliverables need; without a checkout
+        level nothing is written back (an explicit [] included)."""
+        store, conn = _store([])
+        if failure:
+            conn.fetch.side_effect = RuntimeError("db down")
+        stamp = await checkout.provisioning_stamp(
+            store,
+            job_row={"id": JOB_ID, "user_id": USER_ID, "context": {}},
+            project=PROJECT,
+            loop_floor=True,
+        )
+        assert stamp["cloud_checkout"] == {
+            "access": "read_only",
+            "origin": checkout.OFFICER_FLOOR_ORIGIN,
+        }
+        assert stamp["cloud_connectors"][0]["edits"] == "discarded"
+        assert not checkout.capture_applies(
+            {"context": stamp, "cloud_diff_baseline_commit": "b"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_officer_executor_admission_decided_is_left_alone(self):
+        store, conn = _store([_checkout_row()])
+        admitted = {"cloud_checkout": {"access": "read_only"}}
+        stamp = await checkout.provisioning_stamp(
+            store,
+            job_row={"id": JOB_ID, "context": admitted},
+            project=PROJECT,
+            loop_floor=True,
+        )
+        assert "cloud_checkout" not in stamp
+        assert stamp["cloud_connectors"][0]["edits"] == "discarded"
+        conn.fetch.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_told_loop_is_not_told_again(self):
