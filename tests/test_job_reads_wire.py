@@ -180,6 +180,9 @@ async def test_project_array_keeps_children_change_record_fields_and_distinct_sq
         change_record_type="delivered",
         existing_extension={"nullable": None, "id": UUID(CHILD), "at": STAMP},
     )
+    for row in reads_wire.state.rows:
+        # Older jobs whose project-folder copy was implicit (see the detail case).
+        row.update(cloud_diff_baseline_commit="synthetic-baseline", cloud_checkout=None)
     params = {"limit": "17"}
     if status:
         params["status"] = status
@@ -200,11 +203,15 @@ async def test_project_array_keeps_children_change_record_fields_and_distinct_sq
     }
     assert all(job["cloud_review_mode"] == "diff" for job in jobs)
     assert all("project_has_cloud_folder" not in job for job in jobs)
+    assert all("cloud_checkout" not in job for job in jobs)
     query, *args = reads_wire.conn.fetch.call_args.args
     expected = (
         "SELECT js.*, jcr.delivery_status, jcr.delivery_ref, "
-        "jcr.delivery_sha, jcr.record_type AS change_record_type "
-        "FROM job_summary js LEFT JOIN job_change_records jcr ON jcr.job_id = js.id "
+        "jcr.delivery_sha, jcr.record_type AS change_record_type, "
+        "j.diff_status, j.cloud_diff_baseline_commit, "
+        "j.context->'cloud_checkout' AS cloud_checkout "
+        "FROM job_summary js JOIN jobs j ON j.id = js.id "
+        "LEFT JOIN job_change_records jcr ON jcr.job_id = js.id "
         "WHERE js.project_id = $1"
         + predicate
         + " ORDER BY js.created_at DESC LIMIT $"
@@ -258,6 +265,9 @@ async def test_detail_audit_and_private_projection_preserve_jsonb_and_extensions
         config_override=json.dumps(config) if as_text else config,
         existing_extension={"id": UUID(CHILD), "nullable": None},
         project_has_cloud_folder=True,
+        # An older job whose project-folder copy was implicit: no checkout
+        # key, a baseline, a project with a folder.
+        cloud_diff_baseline_commit="synthetic-baseline",
     )
     reads_wire.audit.is_available = available
     reads_wire.audit.get_audit_count.return_value = count
