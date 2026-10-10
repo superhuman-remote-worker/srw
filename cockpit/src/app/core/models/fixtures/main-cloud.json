@@ -164,11 +164,11 @@
       {
         "connector_type": "cloud_folder_checkout",
         "folder_kind": "project",
-        "access": "reviewed_write_back",
+        "access": "read_only",
         "cells": {
           "nextcloud": {
             "status": "offered",
-            "note": "the folder is copied into the job's repository; changes are written back only when the reviewer accepts the diff",
+            "note": "the folder is copied into the job's repository before it starts; SRW never applies the copy's changes",
             "workspace_backends": [
               "sandbox",
               "vm"
@@ -177,12 +177,37 @@
           },
           "opencloud": {
             "status": "offered",
-            "note": "the folder is copied into the job's repository; changes are written back only when the reviewer accepts the diff",
+            "note": "the folder is copied into the job's repository before it starts; SRW never applies the copy's changes",
             "workspace_backends": [
               "sandbox",
               "vm"
             ],
             "slice": null
+          }
+        }
+      },
+      {
+        "connector_type": "cloud_folder_checkout",
+        "folder_kind": "project",
+        "access": "reviewed_write_back",
+        "cells": {
+          "nextcloud": {
+            "status": "planned",
+            "note": "write-back has never delivered (0 of 432 on dev); fix gated: the copy's changes would become a diff the job's owner reviews, written back only on accept",
+            "workspace_backends": [
+              "sandbox",
+              "vm"
+            ],
+            "slice": 6
+          },
+          "opencloud": {
+            "status": "planned",
+            "note": "write-back has never delivered (0 of 432 on dev); fix gated: the copy's changes would become a diff the job's owner reviews, written back only on accept",
+            "workspace_backends": [
+              "sandbox",
+              "vm"
+            ],
+            "slice": 6
           }
         }
       },

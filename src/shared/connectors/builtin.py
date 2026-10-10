@@ -1576,6 +1576,61 @@ CLOUD_OUTBOX_SPEC = DriverSpec(
     user_creatable=False,
 )
 
+# A project's folder checked out into a job (main_cloud_as_connectors.md,
+# slice 6.3, today's "Mode A"): one connector per project, jobs only. SRW
+# copies the folder into the job's repository at projects/<slug>/ before the
+# job starts; the agent works on the copy like any file. The level says what
+# happens to the copy's changes, which only SRW applies: never (read_only),
+# or as a diff the job's owner reviews and accepts (reviewed_write_back).
+# Like the folder itself, the connector holds nothing: the project row names
+# the folder, and the main cloud's credential copies it.
+CLOUD_FOLDER_CHECKOUT_SPEC = DriverSpec(
+    name="srw.cloud-folder-checkout/v1",
+    legacy_type="cloud_folder_checkout",
+    title="Project folder copy",
+    guide_topic="files-and-integrations",
+    plane="bind_time",
+    delivery_forms=("cloud_checkout",),
+    config_schema={
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["project_id"],
+        "properties": {
+            # The project whose folder is copied; the folder itself is the
+            # project row's (main_cloud_folder_handle), read when the job is
+            # provisioned.
+            "project_id": {"type": "string", "format": "uuid", "readOnly": True},
+        },
+    },
+    access_levels=(
+        AccessLevel(
+            "read_only",
+            10,
+            "SRW never applies the copy's changes: the job edits its own "
+            "repository, and nothing writes the cloud folder.",
+            writes="none",
+        ),
+        AccessLevel(
+            "reviewed_write_back",
+            20,
+            "The copy's changes become a diff the job's owner reviews; SRW "
+            "writes back only a diff the owner accepts, and refuses one whose "
+            "files changed in the cloud since the copy was made.",
+            writes="reviewed",
+        ),
+    ),
+    supported_backends=SHELL_BACKENDS,
+    workspace_requirements=(
+        "A job whose workspace clones its repository: the copy is files in it, "
+        "under projects/<slug>/."
+    ),
+    publishable=False,
+    live_attach=False,
+    live_detach="next_attach",
+    executions=("job",),
+    user_creatable=False,
+)
+
 # ---------------------------------------------------------------------------
 # Registered image drivers (connector drivers D6)
 #
@@ -1629,7 +1684,11 @@ TYPE_VARIANT_SPECS: tuple[DriverSpec, ...] = (MCP_REMOTE_SPEC,)
 #: Datasource drivers whose connectors only SRW creates (``user_creatable``
 #: off), for what the main cloud provisions. Their stored types resolve and
 #: the capability matrix lists them; no create form or catalogue offers them.
-PLATFORM_SPECS: tuple[DriverSpec, ...] = (CLOUD_FOLDER_SPEC, CLOUD_OUTBOX_SPEC)
+PLATFORM_SPECS: tuple[DriverSpec, ...] = (
+    CLOUD_FOLDER_SPEC,
+    CLOUD_OUTBOX_SPEC,
+    CLOUD_FOLDER_CHECKOUT_SPEC,
+)
 BUILTIN_SPECS: tuple[DriverSpec, ...] = (
     MANIFEST_SPECS
     + tuple(

@@ -86,6 +86,7 @@ describe('MainCloudSettingsComponent', () => {
       'cloud_folder/user_root/read_write',
       'cloud_folder/user_root/read_only',
       'cloud_folder/user_root/protected',
+      'cloud_folder_checkout/project/read_only',
       'cloud_folder_checkout/project/reviewed_write_back',
       'cloud_outbox/-/read_write',
     ]);
@@ -107,6 +108,15 @@ describe('MainCloudSettingsComponent', () => {
 
     const plannedRo = cell(host, 'cloud_folder/project/read_only', 'nextcloud');
     expect(text(plannedRo)).toContain('planned (slice 5)');
+
+    // A checkout's write-back waits for its gate on both providers.
+    for (const provider of ['nextcloud', 'opencloud']) {
+      const writeBack = cell(host, 'cloud_folder_checkout/project/reviewed_write_back', provider);
+      expect(writeBack.getAttribute('data-status')).toBe('planned');
+      expect(text(writeBack)).toContain('0 of 432');
+      expect(cell(host, 'cloud_folder_checkout/project/read_only', provider)
+        .getAttribute('data-status')).toBe('offered');
+    }
   });
 
   it('marks the active provider', () => {

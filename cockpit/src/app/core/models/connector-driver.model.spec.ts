@@ -86,6 +86,7 @@ describe('the strict access rule', () => {
     expect(matrix.drivers.filter((driver) => strictAccess(driver)).map((d) => d.name)).toEqual([
       'srw.cloud-folder/v1',
       'srw.cloud-outbox/v1',
+      'srw.cloud-folder-checkout/v1',
     ]);
     const [first, ...rest] = strictDriver().access_levels;
     expect(strictAccess(strictDriver({access_levels: [{...first, writes: undefined}, ...rest]}))).toBe(false);

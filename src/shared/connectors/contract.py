@@ -42,6 +42,9 @@ DeliveryForm = Literal[
     # A folder mounted into the workspace by SRW (the in-pod mount sidecar
     # or an rclone mount): never the agent's to materialize.
     "cloud_mount",
+    # A folder SRW copies into the job's repository before it starts (the
+    # project folder's checkout): the workspace clones it like any file.
+    "cloud_checkout",
 ]
 CredentialKind = Literal[
     "secret_string", "file", "ssh_private_key", "oauth2", "kubeconfig"

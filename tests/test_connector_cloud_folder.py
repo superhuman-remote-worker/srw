@@ -171,6 +171,7 @@ class TestSpec:
         assert [(d.type_id, d.runtime_kind) for d in PLATFORM_TYPE_CATALOG] == [
             ("cloud_folder", "cloud_mount"),
             ("cloud_outbox", "cloud_mount"),
+            ("cloud_folder_checkout", "cloud_checkout"),
         ]
         assert all(spec.user_creatable for spec in DATASOURCE_SPECS)
         assert not any(spec.user_creatable for spec in PLATFORM_SPECS)
@@ -211,8 +212,17 @@ class TestSpec:
         outbox = rows["srw.cloud-outbox/v1"]
         assert "executions" not in outbox
         assert outbox["user_creatable"] is False
+        # A project folder's copy is a job's alone.
+        checkout = rows["srw.cloud-folder-checkout/v1"]
+        assert checkout["executions"] == ["job"]
+        assert checkout["user_creatable"] is False
+        platform = {
+            "srw.cloud-folder/v1",
+            "srw.cloud-outbox/v1",
+            "srw.cloud-folder-checkout/v1",
+        }
         for name, row in rows.items():
-            if name not in {"srw.cloud-folder/v1", "srw.cloud-outbox/v1"}:
+            if name not in platform:
                 assert "executions" not in row and "user_creatable" not in row
 
 

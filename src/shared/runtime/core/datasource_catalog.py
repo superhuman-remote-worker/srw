@@ -28,6 +28,7 @@ DatasourceRuntimeKind = Literal[
     "credential_file",
     "ssh_identity",
     "cloud_mount",
+    "cloud_checkout",
 ]
 
 
@@ -50,6 +51,7 @@ _RUNTIME_KIND_BY_FORM: dict[str, DatasourceRuntimeKind] = {
     "credential_file": "credential_file",
     "ssh_identity": "ssh_identity",
     "cloud_mount": "cloud_mount",
+    "cloud_checkout": "cloud_checkout",
 }
 
 

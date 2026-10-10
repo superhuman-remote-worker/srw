@@ -417,6 +417,7 @@ class TestStrictAccess:
         assert {spec.name for spec in BUILTIN_SPECS if strict_access(spec)} == {
             "srw.cloud-folder/v1",
             "srw.cloud-outbox/v1",
+            "srw.cloud-folder-checkout/v1",
         }
 
     def test_a_read_only_binding_takes_the_lowest_level_that_writes_nothing(self):

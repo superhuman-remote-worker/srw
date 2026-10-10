@@ -181,9 +181,14 @@ EXPECTED_MATRIX: dict[tuple[str, str | None, str], dict[str, str]] = {
         "nextcloud": "unsupported",
         "opencloud": "unsupported",
     },
-    ("cloud_folder_checkout", "project", "reviewed_write_back"): {
+    ("cloud_folder_checkout", "project", "read_only"): {
         "nextcloud": "offered",
         "opencloud": "offered",
+    },
+    # Offered once a gate proves write-back end to end (slice 6.3).
+    ("cloud_folder_checkout", "project", "reviewed_write_back"): {
+        "nextcloud": "planned",
+        "opencloud": "planned",
     },
     ("cloud_outbox", None, "read_write"): {
         "nextcloud": "offered",

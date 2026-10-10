@@ -52,6 +52,7 @@ from orchestrator.services.cloud.backend_instance_authority import (
     main_cloud_installation_proof_sha256,
 )
 from orchestrator.services.cloud.capabilities import (
+    CHECKOUT_WRITE_BACK_GATED,
     CloudCapability,
     ProviderCapabilities,
 )
@@ -166,11 +167,20 @@ NEXTCLOUD_CAPABILITIES = ProviderCapabilities(
         CloudCapability(
             "cloud_folder_checkout",
             "project",
-            "reviewed_write_back",
+            "read_only",
             "offered",
-            "the folder is copied into the job's repository; changes are "
-            "written back only when the reviewer accepts the diff",
+            "the folder is copied into the job's repository before it starts; "
+            "SRW never applies the copy's changes",
             frozenset({"sandbox", "vm"}),
+        ),
+        CloudCapability(
+            "cloud_folder_checkout",
+            "project",
+            "reviewed_write_back",
+            "planned",
+            CHECKOUT_WRITE_BACK_GATED,
+            frozenset({"sandbox", "vm"}),
+            slice=6,
         ),
         CloudCapability(
             "cloud_outbox",

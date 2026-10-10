@@ -46,6 +46,7 @@ MATRIX_ROWS: tuple[tuple[str, str | None, str], ...] = (
     ("cloud_folder", "user_root", "read_write"),
     ("cloud_folder", "user_root", "read_only"),
     ("cloud_folder", "user_root", "protected"),
+    ("cloud_folder_checkout", "project", "read_only"),
     ("cloud_folder_checkout", "project", "reviewed_write_back"),
     ("cloud_outbox", None, "read_write"),
 )
@@ -55,12 +56,21 @@ MATRIX_ROWS: tuple[tuple[str, str | None, str], ...] = (
 #: below ``read_write``: its writes reach the folder only after review.
 ACCESS_RANKS: dict[str, dict[str, int]] = {
     "cloud_folder": {"read_only": 10, "protected": 20, "read_write": 30},
-    "cloud_folder_checkout": {"reviewed_write_back": 10},
+    "cloud_folder_checkout": {"read_only": 10, "reviewed_write_back": 20},
     "cloud_outbox": {"read_write": 10},
 }
 
 #: The protected review lane: a project folder at the ``protected`` level.
 PROTECTED_PROJECT_FOLDER = ("cloud_folder", "project", "protected")
+
+#: Why a checkout's reviewed write-back is not offered yet, on either
+#: provider: on dev the capture-and-accept path never wrote a file back (0 of
+#: 432 Mode A jobs), and it is offered only once a gate proves it end to end.
+CHECKOUT_WRITE_BACK_GATED = (
+    "write-back has never delivered (0 of 432 on dev); fix gated: the copy's "
+    "changes would become a diff the job's owner reviews, written back only "
+    "on accept"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +223,7 @@ def _cell(cap: CloudCapability | None) -> dict[str, Any]:
 
 __all__ = [
     "ACCESS_RANKS",
+    "CHECKOUT_WRITE_BACK_GATED",
     "MATRIX_ROWS",
     "PROTECTED_PROJECT_FOLDER",
     "STATUSES",

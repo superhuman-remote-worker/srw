@@ -492,8 +492,9 @@ def test_the_cockpit_picker_refuses_what_the_server_refuses_on_lite_tiers():
         )
     }
     # Credential files joined the shell drivers in D1d; the main cloud's
-    # folder mounts into a sandbox or VM workspace (main cloud slice 3), and
-    # the session outbox needs a session's mount or a job's repository.
+    # folder mounts into a sandbox or VM workspace (main cloud slice 3), the
+    # session outbox needs a session's mount or a job's repository, and a
+    # project folder's copy is files in a job's cloned repository.
     needs_shell = {
         "repository",
         "credentials",
@@ -503,5 +504,6 @@ def test_the_cockpit_picker_refuses_what_the_server_refuses_on_lite_tiers():
         "generic_file",
         "cloud_folder",
         "cloud_outbox",
+        "cloud_folder_checkout",
     }
     assert cockpit == server == needs_shell

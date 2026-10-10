@@ -142,11 +142,13 @@ def test_every_agent_form_has_a_materializer():
     registry = ConnectorRegistry.default()
     assert set(registry.by_form) == set(AGENT_FORMS)
     # The generic-hosting forms are delivered into a pod, never by the agent,
-    # and a cloud folder is mounted into the workspace by SRW.
+    # a cloud folder is mounted into the workspace by SRW, and a project
+    # folder's checkout is copied into the job's repository by SRW.
     assert set(DELIVERY_FORMS) - set(AGENT_FORMS) == {
         "pod_env",
         "pod_file",
         "cloud_mount",
+        "cloud_checkout",
     }
 
 

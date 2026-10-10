@@ -14,9 +14,10 @@ describe('the bespoke connector form registry', () => {
       (driver) => driver.legacy_type !== null && driver.user_creatable !== false,
     );
     expect(matrix.drivers.filter((driver) => driver.user_creatable === false).map((d) => d.name))
-      .toEqual(['srw.cloud-folder/v1', 'srw.cloud-outbox/v1']);
+      .toEqual(['srw.cloud-folder/v1', 'srw.cloud-outbox/v1', 'srw.cloud-folder-checkout/v1']);
     expect(bespokeFormFor('srw.cloud-folder/v1')).toBeNull();
     expect(bespokeFormFor('srw.cloud-outbox/v1')).toBeNull();
+    expect(bespokeFormFor('srw.cloud-folder-checkout/v1')).toBeNull();
     expect(Object.keys(BESPOKE_CONNECTOR_FORMS).sort()).toEqual(
       datasourceDrivers.map((driver) => driver.name).sort(),
     );

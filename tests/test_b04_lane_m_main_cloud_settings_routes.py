@@ -310,7 +310,7 @@ def test_the_page_reports_provider_installation_health_and_matrix(monkeypatch):
         "nextcloud": False,
         "opencloud": True,
     }
-    assert len(body["matrix"]["rows"]) == 8
+    assert len(body["matrix"]["rows"]) == 9
     assert not _contains_secret(body)
 
 

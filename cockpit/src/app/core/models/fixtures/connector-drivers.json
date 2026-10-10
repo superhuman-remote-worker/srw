@@ -2316,6 +2316,93 @@
         "claims_declared_by_author": false
       },
       "user_creatable": false
+    },
+    {
+      "name": "srw.cloud-folder-checkout/v1",
+      "title": "Project folder copy",
+      "legacy_type": "cloud_folder_checkout",
+      "serves_stored_type": true,
+      "protocol_version": "1.0",
+      "plane": "bind_time",
+      "delivery_forms": [
+        "cloud_checkout"
+      ],
+      "supported_backends": [
+        "sandbox",
+        "vm"
+      ],
+      "workspace_requirements": "A job whose workspace clones its repository: the copy is files in it, under projects/<slug>/.",
+      "tool_category": null,
+      "operations": [],
+      "access_levels": [
+        {
+          "id": "read_only",
+          "rank": 10,
+          "tools": [],
+          "enforced_by": "SRW never applies the copy's changes: the job edits its own repository, and nothing writes the cloud folder.",
+          "advisory": false,
+          "writes": "none"
+        },
+        {
+          "id": "reviewed_write_back",
+          "rank": 20,
+          "tools": [],
+          "enforced_by": "The copy's changes become a diff the job's owner reviews; SRW writes back only a diff the owner accepts, and refuses one whose files changed in the cloud since the copy was made.",
+          "advisory": false,
+          "writes": "reviewed"
+        }
+      ],
+      "default_access": null,
+      "forced_read_only": false,
+      "holds_upstream_credentials": false,
+      "credential_slots": [],
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "project_id"
+        ],
+        "properties": {
+          "project_id": {
+            "type": "string",
+            "format": "uuid",
+            "readOnly": true
+          }
+        }
+      },
+      "legacy_connection_url": "forbidden",
+      "egress": {
+        "declared": {
+          "rules": [],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        },
+        "installation": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        }
+      },
+      "publishable": false,
+      "live_attach": false,
+      "live_detach": "next_attach",
+      "delete_while_attached": true,
+      "max_per_execution": null,
+      "needs_knowledge_profile": false,
+      "deployment_gate": null,
+      "service": null,
+      "trust": {
+        "tier": "builtin",
+        "trusted": true,
+        "image": null,
+        "claims_declared_by_author": false
+      },
+      "executions": [
+        "job"
+      ],
+      "user_creatable": false
     }
   ]
 }
