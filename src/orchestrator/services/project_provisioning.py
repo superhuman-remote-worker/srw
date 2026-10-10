@@ -162,6 +162,55 @@ async def sync_project_member_to_groups(
             )
 
 
+async def remove_project_member_from_backend_group(
+    project: dict[str, Any],
+    user: dict[str, Any],
+    *,
+    dependencies: ProjectProvisioningDependencies,
+) -> bool:
+    """Remove a removed member from the project's main-cloud group, best
+    effort; whether the cloud confirmed it.
+
+    The counterpart of :func:`sync_project_member_to_groups`' direct add: the
+    group (``project-<id>``) carries the folder's permissions in the cloud
+    itself, so a member left in it keeps reaching the folder with any
+    credential to their own account ("My cloud", a full-account app
+    password), whatever SRW's membership says. Keycloak's group removal does
+    not reach Nextcloud's group, which was added directly. A failure is
+    logged, never raised: the SRW removal stands.
+    """
+    project_id = str(project.get("id") or "")
+    if project.get("is_default") or not project.get("main_cloud_backend"):
+        return False
+    backend = dependencies.main_cloud_router.for_project_optional(project)
+    if backend is None or not backend.is_initialized:
+        dependencies.logger.warning(
+            "Project %s: removed member %s stays in the main cloud's project "
+            "group: no reachable backend for its installation",
+            project_id,
+            user.get("id"),
+        )
+        return False
+    group_name = f"project-{project_id}"
+    try:
+        resolved = await resolve_user_identity_cached(dependencies.store, user, backend)
+        if not resolved:
+            return False
+        await backend.remove_user_from_group(resolved, group_name)
+    except Exception:
+        dependencies.logger.warning(
+            "Project %s: could not remove member %s from the main cloud's "
+            "group %s; they may still reach the folder through their own "
+            "cloud account",
+            project_id,
+            user.get("id"),
+            group_name,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
 async def ensure_project_cloud_resources(
     project: dict[str, Any],
     *,

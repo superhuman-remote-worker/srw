@@ -233,6 +233,15 @@ guarantees it.
   never logged, revoked when the user disconnects or their account is
   deleted, and a probe before each new workspace Pod notices a revocation in
   the cloud.
+- **My cloud reaches what the user's cloud account reaches, not what SRW
+  grants.** A project's folder is shared in the cloud with the project's
+  cloud group, at full permission, and a member is added to that group
+  directly. A full-account token follows Nextcloud group membership, so an
+  SRW viewer of a project can write its folder through My cloud: SRW's
+  viewer ceiling binds only the project folder connector. Removing a member
+  from the project also removes them from the cloud group, best effort; a
+  removal the cloud refused is logged, and the member keeps the folder in
+  their own account until it is retried by hand.
 - **Only SRW creates cloud folder connectors.** A folder handle someone
   could point would mount with the main cloud's credential, so the API
   refuses the types. The older connectors that held a service account's

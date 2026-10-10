@@ -513,6 +513,143 @@ class TestHealLock:
 
 
 # =============================================================================
+# A removed member leaves the main cloud's own project group
+# =============================================================================
+
+
+class TestRemovedMemberLeavesTheCloudGroup:
+    """The group carries the folder's permissions in the cloud itself, so a
+    member left in it keeps the folder through their own cloud account ("My
+    cloud"). Removal is best effort: the SRW removal stands either way."""
+
+    PROJECT = {
+        "id": PROJECT_ID,
+        "is_default": False,
+        "main_cloud_backend": "nextcloud",
+    }
+
+    def _deps_with(self, backend):
+        return _deps(
+            main_cloud_router=SimpleNamespace(
+                for_project_optional=MagicMock(return_value=backend)
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_member_is_removed_from_the_project_group(self, monkeypatch):
+        backend = SimpleNamespace(
+            is_initialized=True, remove_user_from_group=AsyncMock()
+        )
+        monkeypatch.setattr(
+            provisioning, "resolve_user_identity_cached", AsyncMock(return_value="u-1")
+        )
+        deps = self._deps_with(backend)
+
+        removed = await provisioning.remove_project_member_from_backend_group(
+            dict(self.PROJECT), {"id": STRANGER_ID}, dependencies=deps
+        )
+
+        assert removed is True
+        backend.remove_user_from_group.assert_awaited_once_with(
+            "u-1", f"project-{PROJECT_ID}"
+        )
+        deps.main_cloud_router.for_project_optional.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_refusing_cloud_is_logged_not_raised(self, monkeypatch):
+        backend = SimpleNamespace(
+            is_initialized=True,
+            remove_user_from_group=AsyncMock(side_effect=RuntimeError("ocs 500")),
+        )
+        monkeypatch.setattr(
+            provisioning, "resolve_user_identity_cached", AsyncMock(return_value="u-1")
+        )
+        deps = self._deps_with(backend)
+
+        removed = await provisioning.remove_project_member_from_backend_group(
+            dict(self.PROJECT), {"id": STRANGER_ID}, dependencies=deps
+        )
+
+        assert removed is False
+        deps.logger.warning.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "project",
+        [
+            {**PROJECT, "is_default": True},
+            {**PROJECT, "main_cloud_backend": None},
+        ],
+        ids=["default-project", "no-cloud"],
+    )
+    async def test_a_project_without_a_cloud_group_has_nothing_to_leave(self, project):
+        backend = SimpleNamespace(
+            is_initialized=True,
+            remove_user_from_group=AsyncMock(side_effect=AssertionError("touched")),
+        )
+
+        assert (
+            await provisioning.remove_project_member_from_backend_group(
+                project, {"id": STRANGER_ID}, dependencies=self._deps_with(backend)
+            )
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_installation_is_never_guessed(self):
+        deps = self._deps_with(None)
+
+        removed = await provisioning.remove_project_member_from_backend_group(
+            dict(self.PROJECT), {"id": STRANGER_ID}, dependencies=deps
+        )
+
+        assert removed is False
+        deps.logger.warning.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_removing_a_member_removes_them_from_the_cloud_group(
+        self, monkeypatch
+    ):
+        from orchestrator.services import projects
+        from orchestrator.services.cloud import folder_grants
+
+        monkeypatch.setattr(
+            folder_grants, "revoke_folder_grants", AsyncMock(return_value=0)
+        )
+        leave = AsyncMock(return_value=True)
+        monkeypatch.setattr(
+            provisioning, "remove_project_member_from_backend_group", leave
+        )
+        member = {"id": STRANGER_ID}
+        store = SimpleNamespace(
+            get_user_role_in_project=AsyncMock(return_value="viewer"),
+            remove_project_member=AsyncMock(return_value=True),
+            get_user=AsyncMock(return_value=member),
+            get_project=AsyncMock(return_value=dict(self.PROJECT)),
+        )
+        provisioning_deps = _deps()
+        deps = projects.ProjectDependencies(
+            store=store,
+            vector_db=MagicMock(),
+            forge=SimpleNamespace(is_initialized=False),
+            keycloak_groups=SimpleNamespace(is_initialized=False),
+            main_cloud_router=MagicMock(),
+            logger=MagicMock(),
+            provisioning=provisioning_deps,
+            with_validated_tool_overrides=lambda value: value,
+        )
+
+        result = await projects.remove_project_member(
+            PROJECT_ID, STRANGER_ID, caller={"id": STRANGER_ID}, dependencies=deps
+        )
+
+        assert result == {"status": "removed"}
+        leave.assert_awaited_once_with(
+            dict(self.PROJECT), member, dependencies=provisioning_deps
+        )
+
+
+# =============================================================================
 # Member sync degrades when its optional tiers are down
 # =============================================================================
 

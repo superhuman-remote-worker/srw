@@ -1008,10 +1008,18 @@ async def remove_project_member(
         except Exception as e:
             logger.warning(f"Failed to revoke Gitea access for member {user_id}: {e}")
 
-    # Main-cloud group removal flows through Keycloak — OpenCloud reconciles
-    # LibreGraph memberships from the OIDC `groups` claim on login, so the
-    # Keycloak-side remove above is sufficient. No direct backend.remove call
-    # needed.
+    # The main cloud's own project group too: add_project_member adds the
+    # member directly (sync_project_member_to_groups), and the group carries
+    # the folder's permissions in the cloud, so a removed member's own cloud
+    # account ("My cloud") would keep reaching the folder. OpenCloud also
+    # reconciles from the Keycloak `groups` claim at the next login;
+    # Nextcloud never does. Best effort: the SRW removal stands.
+    project = await store.get_project(project_id)
+    removed_member = await store.get_user(user_id) if project else None
+    if project and removed_member:
+        await project_provisioning.remove_project_member_from_backend_group(
+            project, removed_member, dependencies=dependencies.provisioning
+        )
 
     return {"status": "removed"}
 

@@ -158,6 +158,7 @@ async def test_removing_a_member_revokes_their_grants_of_that_project(monkeypatc
         get_user_role_in_project=AsyncMock(return_value="editor"),
         remove_project_member=AsyncMock(return_value=True),
         get_user=AsyncMock(return_value=None),
+        get_project=AsyncMock(return_value=None),
     )
     deps = _project_dependencies(store)
 
