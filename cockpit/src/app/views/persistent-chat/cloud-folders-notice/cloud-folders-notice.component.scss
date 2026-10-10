@@ -1,0 +1,56 @@
+@use '../../../../styles/variables' as v;
+
+:host {
+  display: block;
+  flex-shrink: 0;
+}
+
+// Something the user asked for is missing, nothing is broken: the same
+// caution tint as the cloud review banner, without its accent rail.
+.cfn {
+  display: flex;
+  align-items: flex-start;
+  gap: v.$space-sm;
+  padding: v.$space-sm v.$space-md;
+  background: var(--warning-tint);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.cfn__icon {
+  flex: 0 0 auto;
+  color: var(--warning);
+}
+
+.cfn__body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.cfn__title {
+  margin: 0;
+  font-size: v.$font-size-sm;
+  font-weight: v.$font-weight-medium;
+  color: var(--text-primary);
+}
+
+.cfn__list {
+  margin: v.$space-xs 0 0;
+  padding-left: v.$space-md;
+  font-size: v.$font-size-sm;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.cfn__name {
+  font-family: var(--font-mono, monospace);
+}
+
+.cfn__sep {
+  margin: 0 v.$space-xs;
+}
+
+.cfn__meta {
+  margin: v.$space-xs 0 0;
+  font-size: v.$font-size-sm;
+  color: var(--text-primary);
+}

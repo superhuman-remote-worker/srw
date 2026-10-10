@@ -65,6 +65,11 @@ import {
 } from './persistent-thread-transport-bridge.service';
 import { CanvasService } from './canvas.service';
 import { CapabilitiesService } from './capabilities.service';
+import {
+  CloudFolderProblem,
+  cloudFolderProblemsFromEvent,
+  cloudFolderStateFromStatus,
+} from '../util/cloud-mount-status';
 
 /**
  * Transport architecture (post WS→SSE migration, 2026-05-13):
@@ -1220,6 +1225,10 @@ export class PersistentChatService {
   //     turn.completed — see refreshCloudDiffCount / _scheduleCloudDiffRefresh). ---
   private readonly _protectedCloud = signal(false);
   readonly protectedCloud = computed(() => this._protectedCloud());
+  /** Cloud folders of this session that are not available, and why (D7). */
+  readonly cloudFolderProblems = signal<CloudFolderProblem[]>([]);
+  /** The session's agent predates the in-pod plane: folders unmanaged. */
+  readonly cloudFoldersAgentOutdated = signal(false);
   readonly cloudChangesCount = signal(0);
   readonly protectedMountName = signal<string | null>(null);
   /** ISO timestamp the current staged diff was captured at (the summary's
@@ -2438,6 +2447,8 @@ export class PersistentChatService {
       this.citationsLoaded.set(false);
       if (!preserveReviewPlane) {
         this._protectedCloud.set(false);
+        this.cloudFolderProblems.set([]);
+        this.cloudFoldersAgentOutdated.set(false);
         this.cloudChangesCount.set(0);
         this.protectedMountName.set(null);
         this.cloudStagedAt.set(null);
@@ -3051,6 +3062,9 @@ export class PersistentChatService {
       if (!lifecycleOnly) {
         this.threadMounts.set(Array.isArray(thread.mounts) ? thread.mounts : []);
         this._protectedCloud.set(!!thread.metadata?.protected_cloud);
+        const folders = cloudFolderStateFromStatus(thread.metadata?.cloud_mount_status);
+        this.cloudFolderProblems.set(folders.problems);
+        this.cloudFoldersAgentOutdated.set(folders.agentOutdated);
         if (this._protectedCloud()) {
           void this.refreshCloudDiffCount();
           void this.resolveProtectedFolderLink();
@@ -5241,6 +5255,8 @@ export class PersistentChatService {
     this.pendingDrift.set(null);
     if (!preserveReviewPlane) {
       this._protectedCloud.set(false);
+      this.cloudFolderProblems.set([]);
+      this.cloudFoldersAgentOutdated.set(false);
       this.cloudChangesCount.set(0);
       this.protectedMountName.set(null);
       this.cloudStagedAt.set(null);
@@ -8298,6 +8314,12 @@ export class PersistentChatService {
             `Workspace sync (${op}) failed${turnLabel}. Your changes are in the workspace but not yet saved to the cloud. Will retry on next turn.`,
           );
         }
+        break;
+      }
+
+      case 'cloud_mount.status': {
+        // The agent's live view of the sidecar cloud folders (D7).
+        this.cloudFolderProblems.set(cloudFolderProblemsFromEvent(params));
         break;
       }
 

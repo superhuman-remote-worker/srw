@@ -2545,6 +2545,34 @@ describe('PersistentChatService — SSE event dispatch', () => {
     expect(service.cloudSyncDegraded()).toBe(false);
   });
 
+  it('keeps the live state of sidecar cloud folders from cloud_mount.status (D7)', async () => {
+    const { service, es } = await setup();
+    expect(service.cloudFolderProblems()).toEqual([]);
+    fireSseMessage(
+      es,
+      {
+        method: 'cloud_mount.status',
+        params: {
+          mounts: [
+            { name: 'project', state: 'unavailable', reason: 'credential_rejected' },
+            { name: 'home', state: 'mounted' },
+          ],
+          excluded: [],
+        },
+      },
+      '1:1',
+    );
+    expect(service.cloudFolderProblems()).toEqual([
+      { name: 'project', reason: 'credential_rejected' },
+    ]);
+    fireSseMessage(
+      es,
+      { method: 'cloud_mount.status', params: { mounts: [{ name: 'project', state: 'mounted' }] } },
+      '1:2',
+    );
+    expect(service.cloudFolderProblems()).toEqual([]);
+  });
+
   it('does NOT mark cloudSyncDegraded for a retryable per-turn workspace_sync.error', async () => {
     const { service, es } = await setup();
     fireSseMessage(

@@ -1925,6 +1925,25 @@
       "cloudSyncOff": "Cloud-Sync aus",
       "cloudSyncOffTooltip": "Die Cloud-Synchronisierung konnte für diese Sitzung nicht gestartet werden. Im Arbeitsbereich fehlen möglicherweise Dateien aus der Cloud, und Änderungen werden nicht zurückgespeichert."
     },
+    "cloudFolders": {
+      "regionLabel": "Cloud-Ordner",
+      "title": "Einige Cloud-Ordner dieser Sitzung sind nicht verfügbar",
+      "notAttached": "Ein Cloud-Ordner wurde nicht verbunden",
+      "agentOutdated": "Der Agent dieser Sitzung ist älter als ihr Arbeitsbereich: Die Cloud-Ordner liegen unter /cloud, werden vom Agenten aber nicht verwaltet. Starte eine neue Sitzung, um alle Cloud-Funktionen zu nutzen.",
+      "reason": {
+        "credential_rejected": "die Cloud hat die Zugangsdaten abgelehnt",
+        "not_found": "den Ordner gibt es in der Cloud nicht mehr",
+        "unreachable": "die Cloud war nicht erreichbar",
+        "timeout": "die Cloud hat nicht rechtzeitig geantwortet",
+        "mount_failed": "der Ordner konnte nicht eingebunden werden",
+        "config_missing": "die Zugangsdaten sind nie im Arbeitsbereich angekommen",
+        "sidecar_unavailable": "der Cloud-Einbindungsdienst des Arbeitsbereichs läuft nicht",
+        "unbuildable": "er konnte für diese Sitzung nicht vorbereitet werden",
+        "set_fallback": "ein anderer Ordner dieser Sitzung konnte nicht vorbereitet werden, deshalb ist stattdessen der Sitzungsordner eingebunden",
+        "too_many_mounts": "die Sitzung hat mehr Cloud-Ordner, als ein Arbeitsbereich einbindet",
+        "protected_unavailable": "die geschützte Cloud konnte nicht eingerichtet werden"
+      }
+    },
     "cloudReview": {
       "regionLabel": "Ausstehende Cloud-Prüfung",
       "title": "{{count}} Cloud-Änderungen warten auf deine Prüfung",

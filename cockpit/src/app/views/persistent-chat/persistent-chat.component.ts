@@ -85,6 +85,7 @@ import {AppBadgeComponent} from '../../ui/badge';
 import {CitationsPanelComponent} from './citations-panel/citations-panel.component';
 import {CloudReviewDialogComponent} from '../job-diff-review/cloud-review-dialog.component';
 import {CloudReviewBannerComponent} from './cloud-review-banner/cloud-review-banner.component';
+import {CloudFoldersNoticeComponent} from './cloud-folders-notice/cloud-folders-notice.component';
 import {SshConnectPanelComponent} from './ssh-connect-panel/ssh-connect-panel.component';
 import {ChatEmptyStateComponent, type DisplayedSuggestion} from './chat-empty-state/chat-empty-state.component';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
@@ -959,6 +960,7 @@ export function clearDraft(threadId: string | null): void {
         CitationsPanelComponent,
         CloudReviewDialogComponent,
         CloudReviewBannerComponent,
+    CloudFoldersNoticeComponent,
         SshConnectPanelComponent,
         ChatEmptyStateComponent,
     ],
@@ -1191,6 +1193,13 @@ export function clearDraft(threadId: string | null): void {
         [threadId]="chat.threadId()"
         (review)="chat.cloudDiffPanelOpen.set(true)"
         (recheck)="chat.refreshCloudDiffCount()"
+      />
+
+      <!-- Cloud folders that did not mount (connector drivers D7): the
+           workspace starts anyway, and this says which folder and why. -->
+      <app-cloud-folders-notice
+        [problems]="chat.cloudFolderProblems()"
+        [agentOutdated]="chat.cloudFoldersAgentOutdated()"
       />
 
       <!-- View menu: device-local display prefs (chatPrefs/localStorage).
