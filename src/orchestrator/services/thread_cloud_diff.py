@@ -4,8 +4,9 @@ Extracted verbatim from ``orchestrator.main`` (R1.B04 lane M).
 
 Five operations share one gate (``_require_protected``) and one resolver
 (``_thread_cloud_diff_source``) that builds a Task 7 ``UpperdirDiffSource``
-from the thread's ``cloud_ro_mounts`` row + selected ``thread_mounts`` row.
-See knowledge-base/knowledge/design/cloud_access_unification.md §5/§11 and
+from the thread's ``cloud_ro_mounts`` row alone: its reader grant's immutable
+plan names the folder it was minted for, never the thread's current
+selection (since main cloud slice 5 a ``thread_protected_sources`` row). See knowledge-base/knowledge/design/cloud_access_unification.md §5/§11 and
 .superpowers/sdd/task-8-brief.md for the response-shape contract Cockpit
 (Task 14) depends on.
 

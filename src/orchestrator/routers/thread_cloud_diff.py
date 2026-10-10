@@ -46,8 +46,8 @@ def get_thread_cloud_diff_dependencies(
 #
 # Three read/restage endpoints share one gate (``_require_protected``) and one
 # resolver (``_thread_cloud_diff_source``) that builds a Task 7
-# ``UpperdirDiffSource`` from the thread's ``cloud_ro_mounts`` row + selected
-# ``thread_mounts`` row. See
+# ``UpperdirDiffSource`` from the thread's ``cloud_ro_mounts`` row alone (its
+# reader grant's immutable plan, never the current selection). See
 # knowledge-base/knowledge/design/cloud_access_unification.md §5/§11 and
 # .superpowers/sdd/task-8-brief.md for the response-shape contract Cockpit
 # (Task 14) depends on.
