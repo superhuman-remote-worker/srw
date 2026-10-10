@@ -180,6 +180,12 @@ export interface ConnectorDriver {
   deployment_gate: string | null;
   service: Record<string, unknown> | null;
   trust: ConnectorDriverTrust;
+  /** What its connectors attach to; absent means jobs and sessions. */
+  executions?: Array<'job' | 'session'>;
+  /** False for a driver whose connectors only SRW creates, for what it
+   *  provisions (a project's cloud folder): no form creates one. Absent
+   *  means a user may. */
+  user_creatable?: boolean;
   /** A registered image driver's registration (D6). */
   registration?: ConnectorDriverRegistration;
 }

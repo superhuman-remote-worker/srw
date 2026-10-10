@@ -23,7 +23,12 @@ from orchestrator.services.datasource_policy import (
     LITE_WORKSPACE_BACKENDS,
     workspace_tier_refuses,
 )
-from shared.connectors.builtin import BUILTIN_SPECS, DATASOURCE_SPECS, GENERIC_SPEC
+from shared.connectors.builtin import (
+    BUILTIN_SPECS,
+    DATASOURCE_SPECS,
+    GENERIC_SPEC,
+    PLATFORM_SPECS,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "check_connector_type_branches.py"
@@ -480,13 +485,14 @@ def test_the_cockpit_picker_refuses_what_the_server_refuses_on_lite_tiers():
     cockpit = set(re.findall(r"'([a-z_]+)'", match.group(1)))
     server = {
         spec.legacy_type
-        for spec in DATASOURCE_SPECS
+        for spec in DATASOURCE_SPECS + PLATFORM_SPECS
         if any(
             workspace_tier_refuses({"type": spec.legacy_type}, backend)
             for backend in LITE_WORKSPACE_BACKENDS
         )
     }
-    # Credential files joined the shell drivers in D1d.
+    # Credential files joined the shell drivers in D1d; the main cloud's
+    # folder mounts into a sandbox or VM workspace (main cloud slice 3).
     needs_shell = {
         "repository",
         "credentials",
@@ -494,5 +500,6 @@ def test_the_cockpit_picker_refuses_what_the_server_refuses_on_lite_tiers():
         "ssh_key",
         "kubeconfig",
         "generic_file",
+        "cloud_folder",
     }
     assert cockpit == server == needs_shell

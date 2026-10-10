@@ -1,7 +1,8 @@
 """Specs of the drivers SRW ships: the 13 datasource types, the two
-generic-hosting delivery drivers, the managed MCP servers of its catalogue
-(off until an installation names their images) and the development drivers
-(the lease probe, the echo service and the MCP test servers, off unless an
+generic-hosting delivery drivers, the main cloud's folders (connectors only
+SRW creates), the managed MCP servers of its catalogue (off until an
+installation names their images) and the development drivers (the lease
+probe, the echo service and the MCP test servers, off unless an
 installation turns them on).
 
 The datasource drivers are named ``srw.<type>/v1`` and keep the stored
@@ -1445,6 +1446,93 @@ GIT_SWAP_SPEC = DriverSpec(
 OFFICIAL_SERVICE_SPECS: tuple[DriverSpec, ...] = (GIT_SWAP_SPEC,)
 
 # ---------------------------------------------------------------------------
+# The main cloud's folders (main_cloud_as_connectors.md, slice 3)
+#
+# A cloud folder connector is one folder of the main cloud, mounted into a
+# session's workspace at cloud/<name>. Only SRW creates one, for a folder the
+# main cloud provisions (a project's folder; a user's root later): its config
+# names the folder, never a credential, which SRW resolves from the main
+# cloud when it mounts the folder. It never reaches the agent as a
+# connector: the mount is the delivery.
+#
+# Its levels are the union of what any provider enforces; the driver offers
+# a connector the ones its provider's support matrix declares for the
+# folder's kind on the workspace's tier (orchestrator.services.cloud).
+# ---------------------------------------------------------------------------
+
+CLOUD_FOLDER_KINDS: tuple[str, ...] = ("project", "user_root")
+
+CLOUD_FOLDER_SPEC = DriverSpec(
+    name="srw.cloud-folder/v1",
+    legacy_type="cloud_folder",
+    title="Cloud folder",
+    guide_topic="files-and-integrations",
+    plane="in_pod",
+    delivery_forms=("cloud_mount",),
+    config_schema={
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "folder_kind",
+            "backend_id",
+            "backend_instance_id",
+            "folder_handle",
+        ],
+        "properties": {
+            "folder_kind": {"enum": list(CLOUD_FOLDER_KINDS), "readOnly": True},
+            # The project whose folder it is (a user root's: its owner's
+            # personal project).
+            "project_id": {"type": "string", "format": "uuid", "readOnly": True},
+            # The provider and its installation, as the project row pairs
+            # them (main_cloud_backend, main_cloud_backend_instance_id).
+            "backend_id": {"type": "string", "minLength": 1, "readOnly": True},
+            "backend_instance_id": {
+                "type": "string",
+                "format": "uuid",
+                "readOnly": True,
+            },
+            # The provider's opaque folder handle, verbatim as the project row
+            # stores it (main_cloud_folder_handle).
+            "folder_handle": {"type": "string", "minLength": 1, "readOnly": True},
+        },
+    },
+    access_levels=(
+        AccessLevel(
+            "read_only",
+            10,
+            "A reader account the provider grants read-only access to this one "
+            "folder: the provider refuses every write.",
+            writes="none",
+        ),
+        AccessLevel(
+            "protected",
+            20,
+            "The reader grant as a read-only lower layer: the agent's writes "
+            "stay in an overlay, and only the changes the owner approves in "
+            "review reach the folder.",
+            writes="reviewed",
+        ),
+        AccessLevel(
+            "read_write",
+            30,
+            "A credential that can write the folder: what the provider lets it "
+            "write, the agent writes.",
+            writes="direct",
+        ),
+    ),
+    supported_backends=SHELL_BACKENDS,
+    workspace_requirements=(
+        "A workspace the folder is mounted into at cloud/<name>: SRW's in-pod "
+        "mount sidecar, or an rclone mount in the workspace."
+    ),
+    publishable=False,
+    live_attach=False,
+    live_detach="next_attach",
+    executions=("session",),
+    user_creatable=False,
+)
+
+# ---------------------------------------------------------------------------
 # Registered image drivers (connector drivers D6)
 #
 # A connector of a driver someone registered (an image with its own spec) is
@@ -1494,13 +1582,21 @@ MANIFEST_SPECS: tuple[DriverSpec, ...] = (ENV_SPEC, FILES_SPEC)
 #: Drivers that serve some rows of a stored type whose catalogue entry is
 #: another driver's, each listed after that driver.
 TYPE_VARIANT_SPECS: tuple[DriverSpec, ...] = (MCP_REMOTE_SPEC,)
-BUILTIN_SPECS: tuple[DriverSpec, ...] = MANIFEST_SPECS + tuple(
-    variant
-    for spec in DATASOURCE_SPECS
-    for variant in (
-        spec,
-        *(v for v in TYPE_VARIANT_SPECS if v.legacy_type == spec.legacy_type),
+#: Datasource drivers whose connectors only SRW creates (``user_creatable``
+#: off), for what the main cloud provisions. Their stored types resolve and
+#: the capability matrix lists them; no create form or catalogue offers them.
+PLATFORM_SPECS: tuple[DriverSpec, ...] = (CLOUD_FOLDER_SPEC,)
+BUILTIN_SPECS: tuple[DriverSpec, ...] = (
+    MANIFEST_SPECS
+    + tuple(
+        variant
+        for spec in DATASOURCE_SPECS
+        for variant in (
+            spec,
+            *(v for v in TYPE_VARIANT_SPECS if v.legacy_type == spec.legacy_type),
+        )
     )
+    + PLATFORM_SPECS
 )
 #: Drivers an installation turns on for development only. Their stored types
 #: resolve (an agent must read what it is sent) but no catalogue lists them.
@@ -1518,9 +1614,17 @@ HOSTED_SPECS: tuple[DriverSpec, ...] = (IMAGE_DRIVER_SPEC,)
 
 _BY_TYPE: dict[str, DriverSpec] = {
     spec.legacy_type: spec
-    for spec in DATASOURCE_SPECS + MANAGED_MCP_SPECS + DEVELOPMENT_SPECS + HOSTED_SPECS
+    for spec in (
+        DATASOURCE_SPECS
+        + PLATFORM_SPECS
+        + MANAGED_MCP_SPECS
+        + DEVELOPMENT_SPECS
+        + HOSTED_SPECS
+    )
     if spec.legacy_type
 }
+#: Every stored type SRW's own drivers serve, created by users or by SRW.
+_STORED_SPECS: tuple[DriverSpec, ...] = DATASOURCE_SPECS + PLATFORM_SPECS
 LEGACY_TYPE_IDS: tuple[str, ...] = tuple(
     spec.legacy_type for spec in DATASOURCE_SPECS if spec.legacy_type
 )
@@ -1620,10 +1724,10 @@ def needs_knowledge_profile(row: Any) -> bool:
 
 def legacy_types_where(predicate: Callable[[DriverSpec], bool]) -> frozenset[str]:
     """Stored types whose spec satisfies ``predicate``, for SQL that filters
-    rows by type."""
+    rows by type (the ones SRW creates itself included)."""
     return frozenset(
         spec.legacy_type
-        for spec in DATASOURCE_SPECS
+        for spec in _STORED_SPECS
         if spec.legacy_type and predicate(spec)
     )
 
@@ -1639,7 +1743,7 @@ def legacy_types_with_slot(slot: str) -> frozenset[str]:
     """Stored types whose credentials have the named slot."""
     return frozenset(
         spec.legacy_type
-        for spec in DATASOURCE_SPECS
+        for spec in _STORED_SPECS
         if spec.legacy_type and any(item.name == slot for item in spec.credential_slots)
     )
 
@@ -1648,7 +1752,7 @@ def legacy_types_with_form(form: str) -> frozenset[str]:
     """Stored types whose driver delivers in ``form``."""
     return frozenset(
         spec.legacy_type
-        for spec in DATASOURCE_SPECS
+        for spec in _STORED_SPECS
         if spec.legacy_type and form in spec.delivery_forms
     )
 

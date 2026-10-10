@@ -9,7 +9,13 @@ const managed = managedFixture as unknown as ConnectorDriverMatrix;
 
 describe('the bespoke connector form registry', () => {
   it('registers every installed datasource driver by name, at its own section', () => {
-    const datasourceDrivers = matrix.drivers.filter((driver) => driver.legacy_type !== null);
+    // A connector only SRW creates (the main cloud's folder) has no form.
+    const datasourceDrivers = matrix.drivers.filter(
+      (driver) => driver.legacy_type !== null && driver.user_creatable !== false,
+    );
+    expect(matrix.drivers.filter((driver) => driver.user_creatable === false).map((d) => d.name))
+      .toEqual(['srw.cloud-folder/v1']);
+    expect(bespokeFormFor('srw.cloud-folder/v1')).toBeNull();
     expect(Object.keys(BESPOKE_CONNECTOR_FORMS).sort()).toEqual(
       datasourceDrivers.map((driver) => driver.name).sort(),
     );

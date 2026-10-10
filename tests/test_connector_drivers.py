@@ -267,9 +267,9 @@ class TestBoundAccess:
         calls = []
 
         class Narrowing(DatasourceDriver):
-            def offered_access(self, row, workspace_backend):
-                calls.append(workspace_backend)
-                return offered[workspace_backend]
+            def offered_access(self, row, ctx):
+                calls.append(ctx.workspace_backend)
+                return offered[ctx.workspace_backend]
 
         return Narrowing(spec), calls
 
@@ -278,22 +278,20 @@ class TestBoundAccess:
             SupportsOfferedAccess,
             bound_access,
         )
+        from shared.connectors.contract import AccessContext
 
+        sandbox, vm = AccessContext("sandbox"), AccessContext("vm")
         driver, calls = self._narrowing(
             {"sandbox": ("protected", "read_write"), "vm": ()}
         )
         assert isinstance(driver, SupportsOfferedAccess)
-        assert bound_access(driver, {}, workspace_backend="sandbox").level == (
-            "read_write"
+        assert bound_access(driver, {}, ctx=sandbox).level == "read_write"
+        assert bound_access(driver, {}, ctx=sandbox, requested="protected").level == (
+            "protected"
         )
-        assert bound_access(
-            driver, {}, workspace_backend="sandbox", requested="protected"
-        ).level == ("protected")
-        refused = bound_access(driver, {"read_only": True}, workspace_backend="sandbox")
+        refused = bound_access(driver, {"read_only": True}, ctx=sandbox)
         assert refused.code == "read_only_unavailable"
-        assert bound_access(driver, {}, workspace_backend="vm").code == (
-            "no_level_offered"
-        )
+        assert bound_access(driver, {}, ctx=vm).code == "no_level_offered"
         assert calls == ["sandbox", "sandbox", "sandbox", "vm"]
 
     @pytest.mark.parametrize(

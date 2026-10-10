@@ -42,6 +42,8 @@ const SHELL_WORKSPACE_TYPES = new Set([
   'ssh_key',
   'kubeconfig',
   'generic_file',
+  // Mounted into the workspace (sandbox or VM tier).
+  'cloud_folder',
 ]);
 
 /** Whether a connector type needs a shell workspace: its driver's

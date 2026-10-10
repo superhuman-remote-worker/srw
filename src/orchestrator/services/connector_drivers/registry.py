@@ -74,7 +74,8 @@ class ConnectorDriverRegistry:
     def type_ids(self) -> tuple[str, ...]:
         """Stored types a connector is created with by its type alone, in
         registration order. The type of registered image drivers'
-        connectors is not one: such a connector names its registration."""
+        connectors is not one: such a connector names its registration.
+        Nor is a type only SRW creates (``user_creatable`` off)."""
         from orchestrator.services.connector_drivers.registered import (
             SupportsDriverRegistration,
         )
@@ -83,6 +84,7 @@ class ConnectorDriverRegistry:
             type_id
             for type_id, driver in self._by_type.items()
             if not isinstance(driver, SupportsDriverRegistration)
+            and driver.spec.user_creatable
         )
 
 

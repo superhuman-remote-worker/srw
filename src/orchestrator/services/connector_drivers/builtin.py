@@ -7,6 +7,7 @@ from orchestrator.services.connector_drivers.base import (
     DatasourceDriver,
     ManifestDeliveryDriver,
 )
+from orchestrator.services.connector_drivers.cloud_folder import CloudFolderDriver
 from orchestrator.services.connector_drivers.env import (
     CredentialsDriver,
     GenericDriver,
@@ -22,7 +23,8 @@ from shared.connectors.builtin import BUILTIN_SPECS, MCP_REMOTE_SPEC
 
 def drivers() -> tuple[DatasourceDriver | ManifestDeliveryDriver, ...]:
     """Fresh instances: the generic-hosting drivers, then catalogue order
-    (a type's variant drivers right after the one that owns the type)."""
+    (a type's variant drivers right after the one that owns the type), then
+    the drivers of connectors only SRW creates."""
     own: dict[str, DatasourceDriver] = {
         driver.spec.name: driver
         for driver in (
@@ -36,6 +38,7 @@ def drivers() -> tuple[DatasourceDriver | ManifestDeliveryDriver, ...]:
             McpDriver(MCP_REMOTE_SPEC, serves_stored_type=False),
             *credential_files.drivers(),
             SshKeyDriver(),
+            CloudFolderDriver(),
         )
     }
     stored = [spec for spec in BUILTIN_SPECS if spec.legacy_type]

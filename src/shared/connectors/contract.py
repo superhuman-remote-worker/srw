@@ -39,6 +39,9 @@ DeliveryForm = Literal[
     "pod_file",
     "ssh_identity",
     "lease_token",
+    # A folder mounted into the workspace by SRW (the in-pod mount sidecar
+    # or an rclone mount): never the agent's to materialize.
+    "cloud_mount",
 ]
 CredentialKind = Literal[
     "secret_string", "file", "ssh_private_key", "oauth2", "kubeconfig"
@@ -56,6 +59,9 @@ LiveDetach = Literal["immediate", "next_attach", "refused"]
 #: (``none``), writes that land only once their owner reviewed them
 #: (``reviewed``), or writes straight through (``direct``).
 Writes = Literal["none", "reviewed", "direct"]
+#: The executions a connector can be attached to (the envelope's
+#: ``ExecutionKind``).
+ExecutionKind = Literal["job", "session"]
 Operation = Literal[
     "spec", "check", "bind", "revoke", "renew", "discover", "gc", "status", "reindex"
 ]
@@ -68,6 +74,7 @@ CREDENTIAL_UPDATES: tuple[str, ...] = get_args(CredentialUpdate)
 CREDENTIAL_DELIVERY_MODES: tuple[str, ...] = get_args(CredentialDeliveryMode)
 LIVE_DETACH: tuple[str, ...] = get_args(LiveDetach)
 WRITES: tuple[str, ...] = get_args(Writes)
+EXECUTION_KINDS: tuple[str, ...] = get_args(ExecutionKind)
 OPERATIONS: tuple[str, ...] = get_args(Operation)
 REQUIRED_OPERATIONS: frozenset[str] = frozenset({"spec", "check", "bind", "revoke"})
 OPTIONAL_OPERATIONS: frozenset[str] = frozenset(OPERATIONS) - REQUIRED_OPERATIONS
@@ -241,6 +248,12 @@ class DriverSpec:
     ``holds_upstream_credentials``.  ``service`` is set for service-plane
     drivers only.
 
+    ``executions`` names what a connector of the driver can be attached to:
+    jobs, sessions or both (a cloud folder mounts into sessions only).
+    ``user_creatable`` is ``False`` for a driver whose connectors only SRW
+    creates, for what it provisions itself (a project's cloud folder): the
+    API refuses to create one and no catalogue offers it.
+
     ``credential_delivery`` is ``lease`` for a driver whose upstream
     credential never reaches the workspace: SRW issues one lease per
     workspace-owning execution and delivers its token in the
@@ -282,6 +295,8 @@ class DriverSpec:
     service: ServiceSpec | None = None
     credential_delivery: CredentialDeliveryMode = "inline"
     harness_credentials: tuple[str, ...] = ()
+    executions: tuple[ExecutionKind, ...] = EXECUTION_KINDS
+    user_creatable: bool = True
 
     def access_level(self, level_id: str) -> AccessLevel | None:
         return next(
@@ -330,14 +345,14 @@ def strict_access(spec: DriverSpec) -> bool:
 
     Such a driver binds read-only only at a level that writes nothing, and
     never maps a level it does not offer onto another one
-    (:func:`resolve_access`).
+    (:func:`strict_access_resolution`).
     """
     return bool(spec.access_levels) and all(
         level.writes is not None for level in spec.access_levels
     )
 
 
-#: Why :func:`resolve_access` binds no level, as closed codes.
+#: Why :func:`access_resolution` binds no level, as closed codes.
 #: ``read_only_unavailable``: the binding is read-only and no offered level
 #: writes nothing; ``level_not_offered``: the level asked for (or the
 #: driver's default) is not offered; ``no_level_offered``: the driver
@@ -368,7 +383,24 @@ class AccessResolution:
         return self.code is not None
 
 
-def resolve_access(
+@dataclass(frozen=True, slots=True)
+class AccessContext:
+    """What a binding is made for, as far as a driver's offered levels
+    depend on it (``SupportsOfferedAccess`` in the orchestrator).
+
+    ``workspace_backend`` is the execution's workspace tier (``None``: any
+    tier). ``officer`` marks a project officer's session, and
+    ``protected_mode_enabled`` the installation's protected-cloud switch: a
+    driver whose reviewed level needs the protected review lane offers it
+    only where both allow it.
+    """
+
+    workspace_backend: str | None = None
+    officer: bool = False
+    protected_mode_enabled: bool = True
+
+
+def access_resolution(
     entry: Mapping[str, Any],
     spec: DriverSpec,
     *,
@@ -380,23 +412,18 @@ def resolve_access(
     The one rule for the agent (a binding's ``access``) and SRW (the level a
     credential lease is issued at, the level a cloud folder mounts at).
     ``offered`` narrows the spec's levels to the ones a driver offers this
-    connector on this workspace tier (``SupportsOfferedAccess`` in the
-    orchestrator); ``None`` offers them all. ``requested`` is a level the
-    caller asks for (a per-link or per-execution choice), in place of the
-    one the config names.
+    connector here (``SupportsOfferedAccess`` in the orchestrator); ``None``
+    offers them all, and narrowing to none is refused. ``requested`` is a
+    level the caller asks for, in place of the one the config names.
 
     A read-only entry is one whose ``project_read_only`` is set, which the
     orchestrator's payload sets to :func:`bound_read_only` of its row.
     Otherwise the level asked for, else the one the connector's config names
     (a driver whose config has an ``access`` property, such as email), else
-    the driver's default, else its highest.
-
-    * A driver that is not :func:`strict_access` clamps a read-only entry to
-      its lowest level, and fails closed to the lowest for a name it does
-      not offer.
-    * A strict driver binds a read-only entry at its lowest level that
-      writes nothing, and refuses one where none is offered; it refuses a
-      name it does not offer instead of mapping it onto another level.
+    the driver's default, else its highest. A :func:`strict_access` driver
+    takes :func:`strict_access_resolution`; any other keeps the older rule,
+    which clamps a read-only entry to the lowest level and fails closed to
+    the lowest for a name it does not offer.
     """
     levels = spec.ranked_access_ids()
     if offered is not None:
@@ -410,10 +437,31 @@ def resolve_access(
             )
     if not levels:
         return AccessResolution(None)
-    strict = strict_access(spec)
+    if strict_access(spec):
+        return strict_access_resolution(entry, spec, levels, requested=requested)
     if entry.get("project_read_only", False):
-        if not strict:
-            return AccessResolution(levels[0])
+        return AccessResolution(levels[0])
+    wanted = _wanted_level(entry, spec, levels, requested)
+    return AccessResolution(wanted if wanted in levels else levels[0])
+
+
+def strict_access_resolution(
+    entry: Mapping[str, Any],
+    spec: DriverSpec,
+    levels: tuple[str, ...],
+    *,
+    requested: str | None = None,
+) -> AccessResolution:
+    """The strict rule, over ``levels`` (the offered level ids, lowest rank
+    first; not empty).
+
+    A read-only entry binds at the lowest offered level that writes nothing,
+    and is refused where none is offered. Any other binds at the level
+    asked for, else its config's, else the driver's default, else its
+    highest offered, and is refused when that level is not offered: never
+    mapped onto another one.
+    """
+    if entry.get("project_read_only", False):
         floor = next(
             (
                 level
@@ -431,23 +479,33 @@ def resolve_access(
                 f"every level it offers ({', '.join(levels)}) lets writes through",
             )
         return AccessResolution(floor)
-    wanted = requested
-    properties = spec.config_schema.get("properties")
-    config = entry.get("config")
-    if wanted is None and isinstance(properties, Mapping) and "access" in properties:
-        wanted = config.get("access") if isinstance(config, Mapping) else None
-    if wanted is None:
-        wanted = spec.default_access or levels[-1]
+    wanted = _wanted_level(entry, spec, levels, requested)
     if wanted in levels:
         return AccessResolution(wanted)
-    if not strict:
-        return AccessResolution(levels[0])
     return AccessResolution(
         None,
         "level_not_offered",
         f"{spec.title} does not offer the access level {wanted!r} here "
         f"(offered: {', '.join(levels)})",
     )
+
+
+def _wanted_level(
+    entry: Mapping[str, Any],
+    spec: DriverSpec,
+    levels: tuple[str, ...],
+    requested: str | None,
+) -> Any:
+    """The level asked for, else the config's, else the default or the
+    highest offered (the config's only where its schema has ``access``)."""
+    wanted: Any = requested
+    properties = spec.config_schema.get("properties")
+    config = entry.get("config")
+    if wanted is None and isinstance(properties, Mapping) and "access" in properties:
+        wanted = config.get("access") if isinstance(config, Mapping) else None
+    if wanted is None:
+        wanted = spec.default_access or levels[-1]
+    return wanted
 
 
 def effective_access(
@@ -457,10 +515,10 @@ def effective_access(
     offered: Iterable[str] | None = None,
     requested: str | None = None,
 ) -> str | None:
-    """The level :func:`resolve_access` binds, or ``None``: no level, or a
-    refusal (whose reason :func:`resolve_access` carries). A caller that
-    gets ``None`` delivers nothing at a level."""
-    return resolve_access(entry, spec, offered=offered, requested=requested).level
+    """The level :func:`access_resolution` binds, or ``None``: no level, or
+    a refusal (whose reason :func:`access_resolution` carries). A caller
+    that gets ``None`` delivers nothing at a level."""
+    return access_resolution(entry, spec, offered=offered, requested=requested).level
 
 
 def protocol_major(version: str) -> int | None:
@@ -517,6 +575,19 @@ def validate_spec(spec: DriverSpec) -> list[str]:
         problems.append(f"live_detach {spec.live_detach!r} is not one of {LIVE_DETACH}")
     if spec.max_per_execution is not None and spec.max_per_execution < 1:
         problems.append("max_per_execution must be positive")
+    if (
+        not spec.executions
+        or len(set(spec.executions)) != len(spec.executions)
+        or set(spec.executions) - set(EXECUTION_KINDS)
+    ):
+        problems.append(
+            f"executions {spec.executions!r} must name each of {EXECUTION_KINDS} "
+            "at most once, and at least one"
+        )
+    if not isinstance(spec.user_creatable, bool):
+        problems.append("user_creatable is a boolean")
+    elif not spec.user_creatable and spec.legacy_type is None:
+        problems.append("only a driver with a datasource row is created by SRW alone")
     if spec.credential_delivery not in CREDENTIAL_DELIVERY_MODES:
         problems.append(
             f"credential_delivery {spec.credential_delivery!r} is not one of "

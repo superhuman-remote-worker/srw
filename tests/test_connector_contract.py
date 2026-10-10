@@ -64,8 +64,8 @@ from shared.connectors.contract import (
     DriverSpec,
     bound_read_only,
     connector_read_only,
+    access_resolution,
     effective_access,
-    resolve_access,
     strict_access,
 )
 
@@ -413,16 +413,18 @@ class TestStrictAccess:
         assert not strict_access(GENERIC_SPEC)
         assert not strict_access(_strict_spec(access_levels=()))
 
-    def test_no_builtin_driver_before_the_cloud_folder_is_strict(self):
-        assert {spec.name for spec in BUILTIN_SPECS if strict_access(spec)} == set()
+    def test_only_the_cloud_folder_is_strict(self):
+        assert {spec.name for spec in BUILTIN_SPECS if strict_access(spec)} == {
+            "srw.cloud-folder/v1"
+        }
 
     def test_a_read_only_binding_takes_the_lowest_level_that_writes_nothing(self):
-        resolved = resolve_access({"project_read_only": True}, _strict_spec())
+        resolved = access_resolution({"project_read_only": True}, _strict_spec())
         assert resolved == AccessResolution("read_only")
         assert not resolved.refused
 
     def test_a_read_only_binding_is_refused_where_every_level_writes(self):
-        resolved = resolve_access(
+        resolved = access_resolution(
             {"project_read_only": True},
             _strict_spec(),
             offered=("protected", "read_write"),
@@ -445,7 +447,7 @@ class TestStrictAccess:
 
     @pytest.mark.parametrize("requested", ["admin", "ReadWrite", ""])
     def test_a_level_it_does_not_offer_is_refused_not_floored(self, requested):
-        resolved = resolve_access({}, _strict_spec(), requested=requested)
+        resolved = access_resolution({}, _strict_spec(), requested=requested)
         assert resolved.code == "level_not_offered"
         assert resolved.reason == (
             f"Folder does not offer the access level {requested!r} here "
@@ -453,11 +455,11 @@ class TestStrictAccess:
         )
 
     def test_a_level_narrowed_away_is_refused(self):
-        resolved = resolve_access(
+        resolved = access_resolution(
             {}, _strict_spec(), offered=("read_write",), requested="protected"
         )
         assert resolved.code == "level_not_offered"
-        assert resolve_access(
+        assert access_resolution(
             {}, _strict_spec(), offered=("protected",), requested="protected"
         ) == AccessResolution("protected")
 
@@ -468,44 +470,44 @@ class TestStrictAccess:
                 "properties": {"access": {"type": "string"}},
             }
         )
-        assert resolve_access(
+        assert access_resolution(
             {"config": {"access": "protected"}}, spec
         ) == AccessResolution("protected")
-        assert resolve_access({"config": {"access": "bogus"}}, spec).code == (
+        assert access_resolution({"config": {"access": "bogus"}}, spec).code == (
             "level_not_offered"
         )
         # A caller's request wins over the stored config.
-        assert resolve_access(
+        assert access_resolution(
             {"config": {"access": "bogus"}}, spec, requested="read_only"
         ) == AccessResolution("read_only")
 
     def test_without_a_request_the_default_else_the_highest_offered_binds(self):
-        assert resolve_access({}, _strict_spec()).level == "read_write"
-        narrowed = resolve_access(
+        assert access_resolution({}, _strict_spec()).level == "read_write"
+        narrowed = access_resolution(
             {}, _strict_spec(), offered=("read_only", "protected")
         )
         assert narrowed.level == "protected"
         spec = _strict_spec(default_access="protected")
-        assert resolve_access({}, spec).level == "protected"
+        assert access_resolution({}, spec).level == "protected"
         # A default this tier does not offer is refused, never widened.
-        assert resolve_access({}, spec, offered=("read_write",)).code == (
+        assert access_resolution({}, spec, offered=("read_write",)).code == (
             "level_not_offered"
         )
 
     def test_nothing_offered_is_refused_with_its_reason(self):
-        resolved = resolve_access({}, _strict_spec(), offered=())
+        resolved = access_resolution({}, _strict_spec(), offered=())
         assert resolved.code == "no_level_offered"
         assert resolved.reason == "Folder offers this connector no access level here"
         # Unknown ids narrow nothing in.
-        assert resolve_access({}, _strict_spec(), offered=("admin",)).refused
+        assert access_resolution({}, _strict_spec(), offered=("admin",)).refused
 
     def test_a_driver_with_no_levels_has_no_level_and_no_refusal(self):
         from shared.connectors.builtin import ENV_SPEC
 
-        resolved = resolve_access({"project_read_only": True}, ENV_SPEC)
+        resolved = access_resolution({"project_read_only": True}, ENV_SPEC)
         assert resolved == AccessResolution(None)
         assert not resolved.refused
-        assert resolve_access({}, ENV_SPEC, offered=()) == AccessResolution(None)
+        assert access_resolution({}, ENV_SPEC, offered=()) == AccessResolution(None)
 
     @pytest.mark.parametrize(
         ("entry", "kwargs", "level"),
@@ -533,7 +535,7 @@ class TestStrictAccess:
     )
     def test_a_driver_without_writes_keeps_todays_rule(self, entry, kwargs, level):
         spec = spec_for_type(entry["type"])
-        resolved = resolve_access(entry, spec, **kwargs)
+        resolved = access_resolution(entry, spec, **kwargs)
         assert resolved == AccessResolution(level)
         assert effective_access(entry, spec, **kwargs) == level
 
@@ -545,7 +547,7 @@ class TestStrictAccess:
 
         for spec in (MCP_SPEC, MCP_REMOTE_SPEC):
             assert not strict_access(spec)
-            assert resolve_access({"project_read_only": True}, spec) == (
+            assert access_resolution({"project_read_only": True}, spec) == (
                 AccessResolution("ReadWrite")
             )
 

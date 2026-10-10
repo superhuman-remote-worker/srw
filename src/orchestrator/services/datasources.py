@@ -409,6 +409,17 @@ async def create_datasource(
             status_code=400,
             detail=f"Invalid type '{body.type}'. Must be one of: {', '.join(sorted(valid_types))}",
         )
+    if not driver.spec.user_creatable:
+        # A folder the main cloud provisions: SRW creates its connector, and
+        # one a user pointed elsewhere would mount with the main cloud's
+        # credential.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{driver.spec.title} connectors cannot be created here: SRW "
+                "provisions these"
+            ),
+        )
     if body.job_id is not None:
         raise HTTPException(
             status_code=400,

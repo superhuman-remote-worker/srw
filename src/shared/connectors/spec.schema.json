@@ -48,7 +48,8 @@
           "pod_env",
           "pod_file",
           "ssh_identity",
-          "lease_token"
+          "lease_token",
+          "cloud_mount"
         ]
       }
     },

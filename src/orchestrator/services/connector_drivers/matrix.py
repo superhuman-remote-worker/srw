@@ -67,6 +67,7 @@ from shared.connectors.builtin import (
     OFFICIAL_SERVICE_SPECS,
 )
 from shared.connectors.contract import (
+    EXECUTION_KINDS,
     PROTOCOL_VERSION,
     AccessLevel,
     CredentialSlot,
@@ -230,7 +231,7 @@ def driver_entry(
     enforced, installation = egress_columns(
         spec, in_process=in_process, hosting=hosting
     )
-    return {
+    entry: dict[str, Any] = {
         "name": spec.name,
         "title": spec.title,
         "legacy_type": spec.legacy_type,
@@ -279,6 +280,13 @@ def driver_entry(
             image=getattr(driver, "image_reference", None) or None,
         ),
     }
+    # Shown only where a driver departs from the default, so every other
+    # driver's row stays as it was before the flags existed.
+    if set(spec.executions) != set(EXECUTION_KINDS):
+        entry["executions"] = list(spec.executions)
+    if not spec.user_creatable:
+        entry["user_creatable"] = False
+    return entry
 
 
 def public_schema(schema: Any) -> Any:

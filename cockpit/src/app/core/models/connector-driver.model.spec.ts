@@ -82,7 +82,10 @@ function strictDriver(over: Partial<ConnectorDriver> = {}): ConnectorDriver {
 describe('the strict access rule', () => {
   it('is strict only when every level says what it lets through', () => {
     expect(strictAccess(strictDriver())).toBe(true);
-    for (const driver of matrix.drivers) expect(strictAccess(driver), driver.name).toBe(false);
+    // Only the main cloud's folder is, of the built-in drivers.
+    expect(matrix.drivers.filter((driver) => strictAccess(driver)).map((d) => d.name)).toEqual([
+      'srw.cloud-folder/v1',
+    ]);
     const [first, ...rest] = strictDriver().access_levels;
     expect(strictAccess(strictDriver({access_levels: [{...first, writes: undefined}, ...rest]}))).toBe(false);
     expect(strictAccess(null)).toBe(false);

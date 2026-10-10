@@ -2129,6 +2129,126 @@
         "image": null,
         "claims_declared_by_author": false
       }
+    },
+    {
+      "name": "srw.cloud-folder/v1",
+      "title": "Cloud folder",
+      "legacy_type": "cloud_folder",
+      "serves_stored_type": true,
+      "protocol_version": "1.0",
+      "plane": "in_pod",
+      "delivery_forms": [
+        "cloud_mount"
+      ],
+      "supported_backends": [
+        "sandbox",
+        "vm"
+      ],
+      "workspace_requirements": "A workspace the folder is mounted into at cloud/<name>: SRW's in-pod mount sidecar, or an rclone mount in the workspace.",
+      "tool_category": null,
+      "operations": [],
+      "access_levels": [
+        {
+          "id": "read_only",
+          "rank": 10,
+          "tools": [],
+          "enforced_by": "A reader account the provider grants read-only access to this one folder: the provider refuses every write.",
+          "advisory": false,
+          "writes": "none"
+        },
+        {
+          "id": "protected",
+          "rank": 20,
+          "tools": [],
+          "enforced_by": "The reader grant as a read-only lower layer: the agent's writes stay in an overlay, and only the changes the owner approves in review reach the folder.",
+          "advisory": false,
+          "writes": "reviewed"
+        },
+        {
+          "id": "read_write",
+          "rank": 30,
+          "tools": [],
+          "enforced_by": "A credential that can write the folder: what the provider lets it write, the agent writes.",
+          "advisory": false,
+          "writes": "direct"
+        }
+      ],
+      "default_access": null,
+      "forced_read_only": false,
+      "holds_upstream_credentials": false,
+      "credential_slots": [],
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "folder_kind",
+          "backend_id",
+          "backend_instance_id",
+          "folder_handle"
+        ],
+        "properties": {
+          "folder_kind": {
+            "enum": [
+              "project",
+              "user_root"
+            ],
+            "readOnly": true
+          },
+          "project_id": {
+            "type": "string",
+            "format": "uuid",
+            "readOnly": true
+          },
+          "backend_id": {
+            "type": "string",
+            "minLength": 1,
+            "readOnly": true
+          },
+          "backend_instance_id": {
+            "type": "string",
+            "format": "uuid",
+            "readOnly": true
+          },
+          "folder_handle": {
+            "type": "string",
+            "minLength": 1,
+            "readOnly": true
+          }
+        }
+      },
+      "legacy_connection_url": "forbidden",
+      "egress": {
+        "declared": {
+          "rules": [],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        },
+        "installation": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        }
+      },
+      "publishable": false,
+      "live_attach": false,
+      "live_detach": "next_attach",
+      "delete_while_attached": true,
+      "max_per_execution": null,
+      "needs_knowledge_profile": false,
+      "deployment_gate": null,
+      "service": null,
+      "trust": {
+        "tier": "builtin",
+        "trusted": true,
+        "image": null,
+        "claims_declared_by_author": false
+      },
+      "executions": [
+        "session"
+      ],
+      "user_creatable": false
     }
   ]
 }
