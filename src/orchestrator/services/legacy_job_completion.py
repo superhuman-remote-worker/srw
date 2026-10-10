@@ -2867,14 +2867,22 @@ async def complete_job_legacy(
 
         # 7. Archive workspace (snapshot to S3) and clean up VM/container.
         # A refused resume keeps the paused job's workspace (connector
-        # drivers decision 34): its claim owner says so in the report.
+        # drivers decision 34): its claim owner says so in the report, and
+        # only a report the orchestrator admitted (origin 'dispatch') counts.
         if (
             job.get("status") in ("completed", "failed")
             or (
                 job.get("status") == "cancelled"
                 and completion_outcome_kind == "blocked_undelivered"
             )
-        ) and not refused_resume_keeps_workspace(completion_result):
+        ) and not refused_resume_keeps_workspace(
+            completion_result,
+            origin=(
+                (getattr(_effect_runner, "command", None) or {}).get("origin")
+                if _effect_runner is not None
+                else None
+            ),
+        ):
             workspace_cleanup = await _run_completion_workspace_teardown(
                 job_id,
                 _effect_runner,

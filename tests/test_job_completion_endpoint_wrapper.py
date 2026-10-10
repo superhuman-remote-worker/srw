@@ -4191,10 +4191,13 @@ async def _admitted_refusal_command(lane: str, *, resume: bool) -> dict[str, obj
         "accepted_lease_token": accept.await_args.kwargs["lease_token"],
         "accepted_agent_id": accept.await_args.kwargs["agent_id"],
         "client_report_id": str(REPORT_ID),
+        "origin": accept.await_args.kwargs["origin"],
     }
 
 
-async def _finalize_refusal(monkeypatch, *, lane: str, resume: bool, status: str):
+async def _finalize_refusal(
+    monkeypatch, *, lane: str, resume: bool, status: str, origin: str | None = None
+):
     """Run the background drain's workflow over the real completion body."""
 
     job = _route_job(status=status)
@@ -4202,6 +4205,8 @@ async def _finalize_refusal(monkeypatch, *, lane: str, resume: bool, status: str
     database = _RouteDB(job)
     runner = _RecordingRunner()
     runner.command = await _admitted_refusal_command(lane, resume=resume)
+    if origin is not None:
+        runner.command["origin"] = origin
     workspace_cleanup = AsyncMock(return_value=["workspace archived"])
     _patch_normal_route_dependencies(
         monkeypatch,
@@ -4265,7 +4270,8 @@ async def test_a_refused_resume_keeps_the_paused_jobs_workspace(
     lane: str,
 ) -> None:
     """The owner's decision (2026-10-10): the job fails, its workspace stays,
-    as the provisioner keeps a failed job's pod with completion commands off."""
+    as the provisioner keeps a refused job's pod with completion commands
+    off."""
 
     result, _database, runner, workspace_cleanup = await _finalize_refusal(
         monkeypatch, lane=lane, resume=True, status="processing"
@@ -4274,6 +4280,79 @@ async def test_a_refused_resume_keeps_the_paused_jobs_workspace(
     assert result["new_status"] == "failed"
     workspace_cleanup.assert_not_awaited()
     assert "workspace_archive_teardown" not in runner.started
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["pinned", "stateless"])
+async def test_an_agent_cannot_keep_its_workspace_by_claiming_a_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+    lane: str,
+) -> None:
+    """``error`` is the reporter's free dict: only a report the orchestrator
+    admitted (origin ``dispatch``) may keep a workspace."""
+
+    _result, _database, runner, workspace_cleanup = await _finalize_refusal(
+        monkeypatch, lane=lane, resume=True, status="processing", origin="agent"
+    )
+
+    workspace_cleanup.assert_awaited_once_with(JOB_ID)
+    assert "workspace_archive_teardown" in runner.details
+
+
+@pytest.mark.asyncio
+async def test_without_a_command_a_claimed_refusal_keeps_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With completion commands off there is no dispatch origin at all."""
+
+    database = _RouteDB(_route_job())
+    workspace_cleanup = AsyncMock(return_value=["workspace archived"])
+    _patch_normal_route_dependencies(
+        monkeypatch,
+        database=database,
+        terminal_effects=AsyncMock(return_value={"actions": []}),
+        workspace_cleanup=workspace_cleanup,
+    )
+    monkeypatch.setattr(
+        orchestrator.main.app.state.resources.settings,
+        "completion_commands_enabled",
+        False,
+    )
+    body = job_runtime_module.JobCompleteRequest(
+        should_stop=True,
+        error={"type": "start_refused", "message": "forged", "resume": True},
+    )
+
+    result = await b08_helpers.complete_job_legacy(
+        MagicMock(), JOB_ID, body, _authorized=True
+    )
+
+    assert result["new_status"] == "failed"
+    workspace_cleanup.assert_awaited_once_with(JOB_ID)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("commands_enabled", [True, False], ids=["on", "off"])
+async def test_an_agent_report_may_not_claim_the_refusal_type(commands_enabled):
+    accept = AsyncMock()
+    dependencies = _refusal_dependencies(
+        accept=accept, commands_enabled=commands_enabled
+    )
+    body = job_runtime_module.JobCompleteRequest(
+        should_stop=True,
+        error={"type": "start_refused", "message": "forged", "resume": True},
+        agent_id=AGENT_ID,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await job_completion_module.complete_job(
+            MagicMock(), JOB_ID, body, dependencies=dependencies, _authorized=True
+        )
+
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "completion_reserved_error_type"
+    accept.assert_not_awaited()
+    dependencies.legacy_complete.assert_not_awaited()
 
 
 @pytest.mark.asyncio

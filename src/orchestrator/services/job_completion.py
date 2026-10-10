@@ -136,6 +136,23 @@ async def complete_job(
 
     if not _authorized:
         await dependencies.require_internal(request)
+    if (
+        isinstance(body.error, Mapping)
+        and body.error.get("type") == START_REFUSED_ERROR_TYPE
+    ):
+        # Reserved for the refusal the orchestrator admits for a claim
+        # (refuse_job_start), which never comes through this route. An
+        # agent's report must not claim it, in either mode.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "completion_reserved_error_type",
+                "message": (
+                    f"error.type {START_REFUSED_ERROR_TYPE!r} is reserved for "
+                    "the orchestrator"
+                ),
+            },
+        )
     if not dependencies.commands_enabled():
         return await dependencies.legacy_complete(
             request,

@@ -389,18 +389,31 @@ def is_teardown_infra_error(message: str | None) -> bool:
 START_REFUSED_ERROR_TYPE = "start_refused"
 
 
-def refused_resume_keeps_workspace(result: dict[str, Any]) -> bool:
+#: The completion-command origin of a report the orchestrator itself admitted
+#: for a claim (``job_completion.refuse_job_start``); an agent's is ``agent``.
+DISPATCH_COMMAND_ORIGIN = "dispatch"
+
+
+def refused_resume_keeps_workspace(
+    result: dict[str, Any], *, origin: str | None
+) -> bool:
     """True for a start refusal its claim owner reported for a resume.
 
     The owner's decision (2026-10-10): a refused resume fails the job but
-    keeps the paused job's workspace, as the provisioner keeps a failed job's
-    pod with completion commands off. A refused fresh start still tears down
-    what was provisioned for it. The claim owner states which claim it was in
-    ``error.resume``; nothing here infers it.
+    keeps the paused job's workspace, as the provisioner keeps a refused
+    job's pod with completion commands off. A refused fresh start still
+    tears down what was provisioned for it. The claim owner states which
+    claim it was in ``error.resume``; nothing here infers it.
+
+    ``origin`` is the completion command's: only a report the orchestrator
+    admitted (``dispatch``) is honoured. An agent's report, or any report
+    with completion commands off, never keeps a workspace this way, whatever
+    its error says.
     """
     error = result.get("error")
     return (
-        isinstance(error, dict)
+        origin == DISPATCH_COMMAND_ORIGIN
+        and isinstance(error, dict)
         and error.get("type") == START_REFUSED_ERROR_TYPE
         and error.get("resume") is True
     )
