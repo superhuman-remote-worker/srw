@@ -10,7 +10,7 @@ import {readConfigPath, SettingsMode, TierReachability, WORKSPACE_BACKENDS} from
 import {ExecutionGroupComponent} from './execution-group.component';
 import {ModelGroupComponent} from './model-group.component';
 import {delegationCapScopeForMode, ToolsGroupComponent} from './tools-group.component';
-import {DatasourcesGroupComponent} from './datasources-group.component';
+import {DatasourceAccessMode, DatasourcesGroupComponent} from './datasources-group.component';
 import {InstructionsTabComponent} from './instructions-tab.component';
 import {AdvancedAccordionComponent} from './advanced-accordion.component';
 import {WorkspacePickerComponent} from './workspace-picker.component';
@@ -275,6 +275,8 @@ import type {BadgeTone} from '../../ui/badge';
             [isLiteBackend]="mode() === 'live' ? liteBackend() : workspacePicker() ? isLite(pickerBackend()) : false"
             [initialSelectedIds]="mode() === 'live' || mode() === 'session' ? initialDatasourceIds() : null"
             [datasourceDefaultsEnabled]="datasourceDefaultsEnabled()"
+            [accessMode]="datasourceAccessMode()"
+            [initialAccess]="mode() === 'live' ? initialDatasourceAccess() : null"
             [lockedIds]="lockedDatasourceIds()"
             (change)="onChange()"
             (retry)="retryDatasources.emit()"
@@ -484,6 +486,9 @@ export class AgentSettingsComponent {
   /** Live mode: entries frozen at their current state (kb-type — knowledge
    *  bindings only rewire on attach). */
   lockedDatasourceIds = input<string[]>([]);
+  /** Live mode: the level each attached connector with access levels was
+   *  bound at (`metadata.datasource_access`). */
+  initialDatasourceAccess = input<Record<string, string> | null>(null);
   /** Live mode: whether the session runs a lite backend (virtual/none). */
   liteBackend = input(false);
   /** Live mode: the running session's workspace tier, and which tiers it can
@@ -798,6 +803,20 @@ export class AgentSettingsComponent {
   /** Return selected datasource IDs (not part of config_override). */
   getSelectedDatasourceIds(): string[] {
     return this.datasourcesGroup?.getSelectedIds() ?? [];
+  }
+
+  /** How a connector with access levels shows its level: a new session
+   *  chooses it, a job binds at its project link's level, and a live
+   *  session's changes only at the next start. */
+  datasourceAccessMode(): DatasourceAccessMode {
+    const mode = this.mode();
+    return mode === 'session' ? 'choose' : mode === 'live' ? 'locked' : 'show';
+  }
+
+  /** The levels the user chose for selected connectors, by id
+   *  (`datasource_access`); empty outside New Session. */
+  getSelectedDatasourceAccess(): Record<string, string> {
+    return this.datasourcesGroup?.getSelectedDatasourceAccess() ?? {};
   }
 
   /** Session mode: pin the model picker to an explicit value, the same as the

@@ -84,6 +84,8 @@ function createPane(options: {
   threadsById?: Record<string, Record<string, unknown>>;
   /** The capability matrix; null (the default) = not loaded yet. */
   drivers?: ConnectorDriver[] | null;
+  /** `metadata.datasource_access`: the levels the session bound. */
+  access?: Record<string, unknown>;
 } = {}) {
   const chat = {
     threadId: signal<string | null>('thread-1'),
@@ -112,6 +114,7 @@ function createPane(options: {
         metadata: {
           config_override: options.override ?? {},
           datasource_ids: options.attachedIds ?? [],
+          ...(options.access ? {datasource_access: options.access} : {}),
         },
         project_ids: [],
       }),
@@ -932,6 +935,19 @@ describe('SettingsPaneComponent datasources (Slice B)', () => {
       ),
     );
     expect(component.lockedDatasourceIds()).toEqual(['ds-pg', 'kb-1']);
+  });
+
+  it('shows the level each attached cloud folder was bound at', () => {
+    const FOLDER = {id: 'folder-1', type: 'cloud_folder', name: 'Project folder'};
+    const {component} = createPane({
+      attachedIds: ['folder-1'],
+      eligible: [FOLDER],
+      drivers: BUILTIN_DRIVERS,
+      access: {'folder-1': 'protected', 'bogus': 7},
+    });
+    expect(component.attachedAccess()).toEqual({'folder-1': 'protected'});
+    // Frozen: a cloud folder's level changes only at the next start.
+    expect(component.lockedDatasourceIds()).toEqual(['folder-1']);
   });
 
   it('never freezes the placeholder of an attachment that fell out of eligibility', () => {

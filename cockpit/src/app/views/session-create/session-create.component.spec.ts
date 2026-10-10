@@ -16,7 +16,6 @@ import {
   keepEligibleIds,
   mapThreadToPrefill,
   pickPrefillProject,
-  protectedCloudToggleVisible,
   SessionCreateComponent,
 } from './session-create.component';
 
@@ -58,24 +57,6 @@ function activatedRouteWithFrom(from: string) {
     snapshot: {queryParamMap: convertToParamMap({from})},
   };
 }
-
-describe('protectedCloudToggleVisible', () => {
-  it('hidden when feature off', () => {
-    expect(protectedCloudToggleVisible(false, [{ main_cloud_backend: 'nextcloud' }])).toBe(false);
-  });
-  it('hidden when only default projects selected', () => {
-    expect(protectedCloudToggleVisible(true, [{ is_default: true, main_cloud_backend: 'nextcloud' }])).toBe(false);
-  });
-  it('hidden for non-nextcloud backends', () => {
-    expect(protectedCloudToggleVisible(true, [{ main_cloud_backend: 'opencloud' }])).toBe(false);
-  });
-  it('visible for a selected non-default nextcloud project', () => {
-    expect(protectedCloudToggleVisible(true, [
-      { is_default: true, main_cloud_backend: 'nextcloud' },
-      { is_default: false, main_cloud_backend: 'nextcloud' },
-    ])).toBe(true);
-  });
-});
 
 // Task 14, item B (session_config_drift_resume.md §8.3): pure mapping/filter
 // functions behind the "Start a new session" prefill. Kept separate from
@@ -286,6 +267,55 @@ describe('SessionCreateComponent submit flow', () => {
 
     expect(navigate).toHaveBeenCalledWith(['/sessions', 'thread-xyz']);
     expect(component.createError()).toBeNull();
+  });
+
+  it('sends the level chosen for each cloud folder, and no protected flag', async () => {
+    const {fixture, http} = setup();
+    const component = fixture.componentInstance;
+    component.agentSettings = {
+      vmSizingValid: () => true,
+      delegationCapValid: () => true,
+      getOverrides: () => ({}),
+      getTaskOverrides: () => ({}),
+      getSelectedDatasourceIds: () => ['folder-1', 'kb-1'],
+      getSelectedDatasourceAccess: () => ({'folder-1': 'protected'}),
+    } as unknown as SessionCreateComponent['agentSettings'];
+    const pending = component.createSession();
+    const request = http.expectOne((r) => r.url.endsWith('/persistent/threads') && r.method === 'POST');
+    expect(request.request.body.datasource_ids).toEqual(['folder-1', 'kb-1']);
+    // Protected is the folder's level now; the old flag is never sent.
+    expect(request.request.body.datasource_access).toEqual({'folder-1': 'protected'});
+    expect(request.request.body).not.toHaveProperty('protected_cloud');
+    request.flush({thread_id: 'thread-xyz'});
+    await pending;
+  });
+
+  it('sends no datasource_access when no level was chosen', async () => {
+    const {fixture, http} = setup();
+    const pending = fixture.componentInstance.createSession();
+    const request = http.expectOne((r) => r.url.endsWith('/persistent/threads') && r.method === 'POST');
+    expect(request.request.body).not.toHaveProperty('datasource_access');
+    request.flush({thread_id: 'thread-xyz'});
+    await pending;
+  });
+
+  it('re-reads the eligible connectors for the tier the workspace moves to', () => {
+    const {fixture, http} = setup();
+    fixture.detectChanges();
+    // The first read knows no tier yet: levels on any tier.
+    const first = http.expectOne((r) => r.url.endsWith('/datasources/eligible'));
+    expect(first.request.params.has('workspace_backend')).toBe(false);
+    first.flush([]);
+    fixture.componentInstance.onWorkspaceChoice({kind: 'none'});
+    TestBed.tick();
+    const second = http.expectOne((r) => r.url.endsWith('/datasources/eligible'));
+    expect(second.request.params.get('workspace_backend')).toBe('none');
+    expect(second.request.params.get('execution')).toBe('session');
+    second.flush([]);
+    // The same tier again reads nothing new.
+    fixture.componentInstance.onWorkspaceChoice({kind: 'none'});
+    TestBed.tick();
+    http.expectNone((r) => r.url.endsWith('/datasources/eligible'));
   });
 
   it('creates with the picked template, never config_override.workspace', async () => {

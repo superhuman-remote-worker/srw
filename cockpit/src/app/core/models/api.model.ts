@@ -528,26 +528,52 @@ export interface Datasource {
   updated_at: string;
 }
 
+/** Why an execution may not choose a level, or binds a connector at none
+ *  (`shared.connectors.contract.ACCESS_REFUSALS`). */
+export type ConnectorAccessRefusal =
+  | 'read_only_unavailable'
+  | 'level_not_offered'
+  | 'no_level_offered'
+  | 'above_ceiling';
+
+/** Where an unchosen level came from (`ACCESS_ORIGINS`): the project link's
+ *  default, the connector config's, the driver's, or a default lowered to
+ *  what is allowed here (`clamped`). */
+export type ConnectorAccessOrigin =
+  | 'explicit'
+  | 'materialized'
+  | 'link_default'
+  | 'config'
+  | 'driver_default'
+  | 'clamped';
+
 /** One level of a {@link ConnectorAccessChoice}: a driver level, and
- *  whether this connector offers it here (and why not). */
+ *  whether an execution may choose it here (and, when not, why). */
 export interface ConnectorAccessChoiceLevel {
   id: string;
   rank: number;
-  writes?: 'none' | 'reviewed' | 'direct';
+  writes?: 'none' | 'reviewed' | 'direct' | null;
   enforced_by?: string;
   offered: boolean;
-  reason?: string | null;
+  /** A closed code when not offered. */
+  reason?: ConnectorAccessRefusal | string | null;
+  /** The refusal in a line a person can read (the server's words). */
+  detail?: string | null;
 }
 
-/** A strict connector's access as the eligible list offers it (a cloud
- *  folder's `read_only` / `protected` / `read_write`): its levels, the one
- *  it binds at unless the user picks another, and where that default came
- *  from. Absent until the server sends it (main_cloud_as_connectors.md,
- *  slice 5); the picker then shows no level. */
+/** A strict connector's access as the eligible list offers it
+ *  (`connector_access.access_choice`: a cloud folder's `read_only` /
+ *  `protected` / `read_write`, a folder copy's `read_only` /
+ *  `reviewed_write_back`), for the execution kind and workspace tier the
+ *  list was asked for: every level, lowest first, the level it binds at
+ *  unchosen (`default`; null mounts nothing) and where that came from, and
+ *  the owner's ceiling (a viewer of the folder's project: `read_only`). */
 export interface ConnectorAccessChoice {
   levels: ConnectorAccessChoiceLevel[];
   default: string | null;
-  default_origin?: string | null;
+  default_origin?: ConnectorAccessOrigin | string | null;
+  /** Why the default was lowered, or why there is none. */
+  default_reason?: string | null;
   ceiling?: string | null;
 }
 
@@ -663,6 +689,11 @@ export interface LinkableProjectDatasourceFilters {
 export interface ProjectDatasource extends Datasource {
   linked_at: string;
   project_read_only: boolean | null;
+  /** The link's default level, for a connector whose driver has strict
+   *  levels (a cloud folder); null = its driver's default. Such a link has
+   *  no `project_read_only`. Absent on orchestrators before main cloud
+   *  slice 5. */
+  project_access?: string | null;
   project_description: string | null;
 }
 
@@ -2044,6 +2075,14 @@ export interface ThreadMount {
   backend_id: string | null;
 }
 
+/** `Thread.protected_source`. */
+export interface ThreadProtectedSource {
+  datasource_id: string | null;
+  /** The folder's project id. */
+  source_ref: string;
+  target_path: string;
+}
+
 /**
  * Persistent agent session thread.
  */
@@ -2088,6 +2127,11 @@ export interface Thread {
   /** Attached remote folders, ordered by `target_path`. Absent on the list
    *  endpoint's projection and on older orchestrators. */
   mounts?: ThreadMount[];
+  /** A protected session's folder (main cloud slice 5): the connector it
+   *  bound at protected (null for a session protected before connectors),
+   *  the folder's project (`source_ref`) and where it is mounted. Null for
+   *  every other session; absent on older orchestrators. */
+  protected_source?: ThreadProtectedSource | null;
   /** Derived: `source_ref` of every `mount_kind === 'project'` row. */
   project_ids?: string[];
   /** Child-thread identity. All fields are absent on ordinary sessions and on

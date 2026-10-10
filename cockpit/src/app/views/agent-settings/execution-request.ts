@@ -67,7 +67,9 @@ export interface ManifestView {
   expert: string | InlineExpertSelection | {inline: Record<string, unknown>} | null;
   /** The request's `workspace` field: absent (undefined) = use defaults. */
   workspace?: unknown;
-  connectors: Array<{id: string; name: string}>;
+  /** `access`: the level chosen for a connector with access levels (a
+   *  Session's cloud folder); omitted, its project link's default. */
+  connectors: Array<{id: string; name: string; access?: string | null}>;
   /** Task- or session-level settings sent beside the execution. */
   settings?: Record<string, unknown>;
 }
@@ -83,7 +85,9 @@ export function executionManifest(view: ManifestView): Record<string, unknown> {
   if (view.workspace !== undefined) execution['workspace'] = view.workspace;
   const connectors: Record<string, unknown> = {};
   for (const c of view.connectors) {
-    connectors[slug(c.name) || c.id] = {inline: {driver: 'srw.datasource/v1', config: {datasourceId: c.id}}};
+    const entry: Record<string, unknown> = {inline: {driver: 'srw.datasource/v1', config: {datasourceId: c.id}}};
+    if (c.access) entry['access'] = c.access;
+    connectors[slug(c.name) || c.id] = entry;
   }
   execution['connectors'] = connectors;
 

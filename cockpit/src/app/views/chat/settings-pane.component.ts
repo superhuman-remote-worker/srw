@@ -58,6 +58,16 @@ const TOOL_ADDITIONS_PREFIX = 'tools+';
  *  Also debounces the per-tick temperature slider. */
 const APPLY_DEBOUNCE_MS = 400;
 
+/** `metadata.datasource_access`: the string levels by connector id. */
+function datasourceAccessOf(value: unknown): Record<string, string> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    const out: Record<string, string> = {};
+    for (const [id, level] of Object.entries(value as Record<string, unknown>)) {
+        if (typeof level === 'string' && level) out[id] = level;
+    }
+    return out;
+}
+
 /** The connector types whose driver refuses a live attach (`live_attach:
  *  false` in the capability matrix): a copy, used only until the matrix
  *  loads. A knowledge base binds when the session starts; the main cloud's
@@ -118,6 +128,7 @@ const LIVE_ATTACH_REFUSED_TYPES: ReadonlySet<string> = new Set([
             [datasourceContextKey]="'live:' + (chat.threadId() ?? '')"
             [datasourceDefaultsEnabled]="capabilities.datasourceScopeAutoAttachAvailable()"
             [initialDatasourceIds]="attachedIds()"
+            [initialDatasourceAccess]="attachedAccess()"
             [lockedDatasourceIds]="lockedDatasourceIds()"
             [liteBackend]="isLiteBackend()"
             [liveTier]="workspaceTier()"
@@ -228,6 +239,10 @@ export class SettingsPaneComponent {
     /** The session's currently attached datasource ids (durable selection;
      *  optimistically advanced when the pane dispatches a change). */
     readonly attachedIds = signal<string[]>([]);
+    /** The level each attached connector with access levels was bound at
+     *  (`metadata.datasource_access`), shown locked: a cloud folder's level
+     *  changes only at the next start. */
+    readonly attachedAccess = signal<Record<string, string>>({});
     /** The last eligible answer, with the attached ids it was read against;
      *  null while there is none. */
     private readonly eligibleAnswer = signal<{eligible: Datasource[]; attachedIds: string[]} | null>(null);
@@ -461,6 +476,7 @@ export class SettingsPaneComponent {
         this.lastApplied = null;
         this.threadOverride.set({});
         this.attachedIds.set([]);
+        this.attachedAccess.set({});
         this.eligibleAnswer.set(null);
         this.expertLabel.set('');
         this.projectLabel.set('');
@@ -495,6 +511,7 @@ export class SettingsPaneComponent {
 
             const ids = ((metadata['datasource_ids'] ?? []) as string[]).map(String);
             this.attachedIds.set(ids);
+            this.attachedAccess.set(datasourceAccessOf(metadata['datasource_access']));
 
             // Prefill the sub-groups' baselines from the effective config
             // (this also clears any pins made while the fetch was in flight —

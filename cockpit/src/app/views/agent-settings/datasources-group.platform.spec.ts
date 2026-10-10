@@ -143,6 +143,7 @@ describe("DatasourcesGroupComponent a project's own connectors", () => {
         {id: 'read_only', rank: 10, writes: 'none' as const, offered: true},
         {id: 'protected', rank: 20, writes: 'reviewed' as const, offered: true},
         {id: 'read_write', rank: 30, writes: 'direct' as const, offered: true},
+        {id: 'some_new_level', rank: 40, writes: 'direct' as const, offered: true},
       ],
       default: level,
     });

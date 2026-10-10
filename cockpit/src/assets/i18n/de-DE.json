@@ -623,9 +623,7 @@
       "expertLabel": "Experte",
       "expertLoading": "Experten werden geladen...",
       "expertSelectedPrefix": "Ausgewählt:",
-      "createSession": "Sitzung erstellen",
-      "protectedCloud": "Geschützte Cloud — Agenten-Änderungen werden zur Überprüfung bereitgestellt",
-      "protectedCloudHint": "Der Agent erhält schreibgeschützten Cloud-Zugriff; seine Änderungen warten im Prüfbereich auf Ihre Freigabe."
+      "createSession": "Sitzung erstellen"
     },
     "configDrift": {
       "title": "Ein Teil der Einrichtung dieser Sitzung ist nicht mehr vorhanden",
@@ -3740,7 +3738,25 @@
       "credentialsLocked": "Zugangsdaten bleiben für diese Sitzung verbunden",
       "credentialsUnavailable": "Dieser Zugangsdaten-Konnektor ist nicht mehr verfügbar. Beende diese Sitzung und starte eine neue, um ihre Konnektoren zu ändern.",
       "lockedNextStart": "Wirkt erst beim nächsten Start und lässt sich daher während einer Session nicht ändern",
-      "nothingAttached": "Nichts ist verbunden, auch nicht die eigenen Konnektoren dieses Projekts."
+      "nothingAttached": "Nichts ist verbunden, auch nicht die eigenen Konnektoren dieses Projekts.",
+      "access": {
+        "label": "Zugriff für {{name}}",
+        "notMounted": "Hier nicht eingebunden",
+        "besideProtected": "Neben einem geschützten Ordner nicht eingebunden",
+        "origin": {
+          "projectDefault": "Projektstandard",
+          "default": "Standard",
+          "lowered": "abgesenkt: hier nicht erlaubt",
+          "loweredRole": "abgesenkt auf das, was deine Rolle im Projekt erlaubt",
+          "chosen": "gewählt"
+        },
+        "refused": {
+          "notOffered": "hier nicht angeboten",
+          "aboveCeiling": "mehr, als deine Rolle erlaubt",
+          "readOnlyUnavailable": "hier kein Nur-Lesen",
+          "oneProtected": "nur ein Ordner kann geschützt sein"
+        }
+      }
     },
     "workspacePicker": {
       "templateLabel": "Vorlage",

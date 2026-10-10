@@ -91,4 +91,17 @@ describe('executionManifest', () => {
     const doc = executionManifest({kind: 'session', expert: null, connectors: []}) as Record<string, unknown>;
     expect(doc).toEqual({execution: {connectors: {}}});
   });
+
+  it("names a cloud folder's chosen level, and none for one left at its default", () => {
+    const doc = executionManifest({
+      kind: 'session',
+      expert: null,
+      connectors: [
+        {id: 'f-1', name: 'Acme folder', access: 'protected'},
+        {id: 'f-2', name: 'Other folder', access: null},
+      ],
+    }) as {execution: {connectors: Record<string, Record<string, unknown>>}};
+    expect(doc.execution.connectors['acme-folder']['access']).toBe('protected');
+    expect(doc.execution.connectors['other-folder']).not.toHaveProperty('access');
+  });
 });

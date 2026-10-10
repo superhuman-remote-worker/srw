@@ -10,6 +10,8 @@ import {
   publicReadWrite,
 } from '../../core/models/connector-driver.model';
 import {
+  ConnectorAccessChoice,
+  ConnectorAccessChoiceLevel,
   Datasource,
   DatasourceIndexStatus,
   DatasourceType,
@@ -69,6 +71,57 @@ export function requiresShellWorkspace(
   const driver = driverForType(drivers, (type || '').toString());
   if (driver) return LITE_BACKENDS.some((tier) => !driver.supported_backends.includes(tier));
   return SHELL_WORKSPACE_TYPES.has((type || '').toString().toLowerCase());
+}
+
+/** How the picker shows the access level of a connector with strict levels
+ *  (a cloud folder): chosen in a select on a selected row (New Session),
+ *  shown (a job binds at its project link's level), or shown in a disabled
+ *  select (a live session: the level changes only at the next start). */
+export type DatasourceAccessMode = 'choose' | 'show' | 'locked';
+
+/** The connector types a session mounts as cloud folders: one at
+ *  `protected` makes the others stay out (`beside_protected`). */
+const CLOUD_MOUNT_TYPES: ReadonlySet<string> = new Set(['cloud_folder', 'cloud_outbox']);
+
+/** A row's access choice, when the eligible list sent one with levels. */
+export function accessChoiceOf(ds: Datasource): ConnectorAccessChoice | null {
+  if (ds.unavailable) return null;
+  const access = (ds as Partial<EligibleDatasource>).access;
+  return access && Array.isArray(access.levels) && access.levels.length ? access : null;
+}
+
+/** The translation key (and params) saying where a row's unchosen level
+ *  came from: the project's default, the driver's, or a default lowered to
+ *  what is allowed (by the owner's role in the folder's project when a
+ *  ceiling is set). */
+export function accessOriginKey(access: ConnectorAccessChoice): string {
+  switch (access.default_origin) {
+    case 'link_default':
+      return 'agentSettings.datasources.access.origin.projectDefault';
+    case 'clamped':
+      return access.ceiling
+        ? 'agentSettings.datasources.access.origin.loweredRole'
+        : 'agentSettings.datasources.access.origin.lowered';
+    case 'explicit':
+    case 'materialized':
+      return 'agentSettings.datasources.access.origin.chosen';
+    default:
+      return 'agentSettings.datasources.access.origin.default';
+  }
+}
+
+const ACCESS_REFUSAL_KEYS: ReadonlyMap<string, string> = new Map([
+  ['level_not_offered', 'agentSettings.datasources.access.refused.notOffered'],
+  ['no_level_offered', 'agentSettings.datasources.access.refused.notOffered'],
+  ['above_ceiling', 'agentSettings.datasources.access.refused.aboveCeiling'],
+  ['read_only_unavailable', 'agentSettings.datasources.access.refused.readOnlyUnavailable'],
+]);
+
+/** The translation key of why a level may not be chosen, or null. */
+export function accessRefusalKey(level: ConnectorAccessChoiceLevel): string | null {
+  if (level.offered) return null;
+  return ACCESS_REFUSAL_KEYS.get(String(level.reason ?? '')) ??
+    'agentSettings.datasources.access.refused.notOffered';
 }
 
 /** Stable identity of a datasource set (order-independent). */
@@ -283,6 +336,11 @@ export function allDatasourcesSelected(
                     <code>{{ ds.driver_env_names!.join(', ') }}</code>
                   </span>
                 }
+                @if (besideProtected(ds)) {
+                  <span class="ds-desc ds-beside-protected" data-beside-protected>
+                    {{ 'agentSettings.datasources.access.besideProtected' | transloco }}
+                  </span>
+                }
                 @if (isNotReady(ds)) {
                   <span class="ds-indexing">
                     {{ 'agentSettings.datasources.notReady' | transloco }}
@@ -303,23 +361,63 @@ export function allDatasourcesSelected(
                   {{ 'datasources.table.badgeRo' | transloco }}
                 </span>
               }
-              <!-- The level the connector binds at, when the row carries one
-                   (a cloud folder's read-only / protected / read-write).
-                   Slice 5 of main_cloud_as_connectors puts the access select
-                   here, on a selected row; accessLevel() is its seam. -->
-              @if (accessLevel(ds); as level) {
-                <span
-                  class="ds-type-badge"
-                  [class.ds-rw-badge]="accessLevelWritesDirect(ds)"
-                  data-access-level
-                  [attr.data-level]="level"
-                >
-                  @if (accessLevelKey(level); as key) {
-                    {{ key | transloco }}
-                  } @else {
-                    {{ level }}
-                  }
-                </span>
+              <!-- The level the connector binds at, for one whose driver has
+                   strict levels (a cloud folder: read-only / protected /
+                   read-write). New Session chooses it on a selected row,
+                   among the levels offered here; elsewhere it is shown. -->
+              @if (accessChoiceOf(ds); as access) {
+                @if (accessMode() !== 'show' && isChecked(ds)) {
+                  <select
+                    class="ds-access-select"
+                    data-access-select
+                    [attr.data-level]="accessLevel(ds)"
+                    [disabled]="accessMode() === 'locked' || disabled() || error() || isLocked(ds)"
+                    [attr.aria-label]="'agentSettings.datasources.access.label' | transloco:{ name: ds.name }"
+                    (change)="chooseAccess(ds.id, $any($event.target).value)"
+                  >
+                    @if (accessLevel(ds) === null) {
+                      <option value="" selected disabled>{{ 'agentSettings.datasources.access.notMounted' | transloco }}</option>
+                    }
+                    @for (level of access.levels; track level.id) {
+                      <option
+                        [value]="level.id"
+                        [selected]="level.id === accessLevel(ds)"
+                        [disabled]="levelDisabled(ds, level)"
+                        [attr.title]="level.detail || null"
+                      >
+                        @if (accessLevelKey(level.id); as key) {
+                          {{ key | transloco }}
+                        } @else {
+                          {{ level.id }}
+                        }
+                        @if (level.id === access.default) {
+                          · {{ accessOriginKey(access) | transloco }}
+                        }
+                        @if (levelRefusalKey(ds, level); as refusal) {
+                          · {{ refusal | transloco }}
+                        }
+                      </option>
+                    }
+                  </select>
+                } @else {
+                  <span
+                    class="ds-type-badge"
+                    [class.ds-rw-badge]="accessLevelWritesDirect(ds)"
+                    data-access-level
+                    [attr.data-level]="accessLevel(ds)"
+                    [attr.title]="accessLevel(ds) === access.default ? (accessOriginKey(access) | transloco) : null"
+                  >
+                    @if (accessLevel(ds); as level) {
+                      @if (accessLevelKey(level); as key) {
+                        {{ key | transloco }}
+                      } @else {
+                        {{ level }}
+                      }
+                    } @else {
+                      {{ 'agentSettings.datasources.access.notMounted' | transloco }}
+                    }
+                  </span>
+                }
               }
             </label>
           }
@@ -490,6 +588,31 @@ export function allDatasourcesSelected(
       color: var(--text-muted, var(--text-muted));
       flex-shrink: 0;
     }
+    .ds-access-select {
+      flex-shrink: 0;
+      max-width: 16rem;
+      min-height: 28px;
+      padding: 2px 6px;
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-control);
+      background: var(--surface-0);
+      color: var(--text-primary);
+      font: inherit;
+      font-size: 12px;
+    }
+    .ds-access-select:focus-visible {
+      outline: none;
+      border-color: var(--accent-color);
+      box-shadow: 0 0 0 3px var(--ring);
+    }
+    .ds-access-select:disabled {
+      opacity: 0.7;
+      cursor: not-allowed;
+    }
+    .ds-beside-protected {
+      color: var(--warning, var(--text-muted));
+      white-space: normal;
+    }
     /* Public read-write chip — warning tone so attachers see write access. */
     .ds-rw-badge {
       color: var(--warning, var(--text-primary));
@@ -646,6 +769,12 @@ export class DatasourcesGroupComponent {
   /** Show the search box and the All / Attached filter — a production system
    *  accumulates far more connectors than a flat checkbox list can carry. */
   searchable = input(false);
+  /** How a connector with access levels shows its level
+   *  ({@link DatasourceAccessMode}). */
+  accessMode = input<DatasourceAccessMode>('show');
+  /** Live mode: the level each attached connector was bound at
+   *  (`metadata.datasource_access`), shown instead of a new default. */
+  initialAccess = input<Record<string, string> | null>(null);
 
   /** Search text and the Attached-only filter. Presentation only: a filtered
    *  row keeps its selection, and nothing here reaches `getSelectedIds`. */
@@ -659,6 +788,13 @@ export class DatasourcesGroupComponent {
   // rows follow the server-computed default while deliberate choices survive
   // eligibility refreshes within that context.
   private readonly selections = signal<Record<string, NonNullable<DatasourceSelection>>>({});
+  /** The levels the user chose, per execution context and connector id. */
+  private readonly accessChoices = signal<Record<string, Record<string, string>>>({});
+  private readonly accessChoice = computed<Record<string, string>>(
+    () => this.accessChoices()[this.contextKey()] ?? {},
+  );
+  readonly accessChoiceOf = accessChoiceOf;
+  readonly accessOriginKey = accessOriginKey;
   private readonly selection = computed<DatasourceSelection>(() =>
     this.selections()[this.contextKey()] ?? null,
   );
@@ -711,7 +847,7 @@ export class DatasourcesGroupComponent {
     datasourceSelectionDifferenceCount(
       this.datasources(), this.selection(), this.defaultIds(),
       this.datasourceDefaultsEnabled(),
-    ),
+    ) + Object.keys(this.getSelectedDatasourceAccessFor(this.selectedList())).length,
   );
 
   private defaultIds(): Set<string> | null {
@@ -857,11 +993,16 @@ export class DatasourcesGroupComponent {
     return platformKindLabelKey(ds) ?? 'datasources.filter.' + ds.type;
   }
 
-  /** The access level a row binds at, when it carries one; null shows no
-   *  level badge. */
+  /** The level a row binds at: the user's choice, else (live) the level the
+   *  session recorded, else the eligible list's default; null for a row
+   *  without levels, or one no level is allowed for here. */
   accessLevel(ds: Datasource): string | null {
-    if (ds.unavailable) return null;
-    return (ds as Partial<EligibleDatasource>).access?.default ?? null;
+    const access = accessChoiceOf(ds);
+    if (!access) return null;
+    const known = (level: string | undefined | null) =>
+      level && access.levels.some((l) => l.id === level) ? level : null;
+    return known(this.accessChoice()[ds.id]) ?? known(this.initialAccess()?.[ds.id]) ??
+      known(access.default);
   }
 
   accessLevelKey(level: string): string | null {
@@ -871,11 +1012,75 @@ export class DatasourcesGroupComponent {
   /** Whether the row's level writes straight through to the upstream: the
    *  badge then takes the read-write tone. */
   accessLevelWritesDirect(ds: Datasource): boolean {
-    const access = (ds as Partial<EligibleDatasource>).access;
-    const level = access?.default ?? null;
+    const access = accessChoiceOf(ds);
+    const level = this.accessLevel(ds);
     if (!access || level === null) return false;
-    const writes = access.levels?.find((l) => l.id === level)?.writes;
+    const writes = access.levels.find((l) => l.id === level)?.writes;
     return writes ? writes === 'direct' : level === 'read_write';
+  }
+
+  /** The selected row bound at `protected`, if any: a session protects one
+   *  folder at most, and mounts nothing beside it. */
+  readonly protectedRowId = computed<string | null>(() => {
+    if (this.accessMode() === 'show') return null;
+    return this.selectedList().find((ds) => this.accessLevel(ds) === 'protected')?.id ?? null;
+  });
+
+  /** A selected cloud folder that stays out because another is protected. */
+  besideProtected(ds: Datasource): boolean {
+    const protectedId = this.protectedRowId();
+    return protectedId !== null && protectedId !== ds.id && CLOUD_MOUNT_TYPES.has(ds.type) &&
+      this.isChecked(ds);
+  }
+
+  /** A level the select offers but the user may not take: not offered here,
+   *  or `protected` while another folder already is. */
+  levelDisabled(ds: Datasource, level: ConnectorAccessChoiceLevel): boolean {
+    return this.levelRefusalKey(ds, level) !== null;
+  }
+
+  levelRefusalKey(ds: Datasource, level: ConnectorAccessChoiceLevel): string | null {
+    const refused = accessRefusalKey(level);
+    if (refused) return refused;
+    const protectedId = this.protectedRowId();
+    if (level.id === 'protected' && protectedId !== null && protectedId !== ds.id) {
+      return 'agentSettings.datasources.access.refused.oneProtected';
+    }
+    return null;
+  }
+
+  chooseAccess(id: string, level: string): void {
+    const ds = this.datasources().find((item) => item.id === id);
+    const offered = ds ? accessChoiceOf(ds)?.levels.find((l) => l.id === level) : null;
+    if (!ds || !offered || this.levelDisabled(ds, offered) || this.isLocked(ds)) return;
+    const contextKey = this.contextKey();
+    this.accessChoices.update((all) => ({
+      ...all,
+      [contextKey]: {...(all[contextKey] ?? {}), [id]: level},
+    }));
+    this.change.emit();
+  }
+
+  /** The levels to send, by connector id: the ones the user chose for a
+   *  selected row (`datasource_access`). An unchosen row is left out, so
+   *  the server binds it at its default, lowered where needed. */
+  getSelectedDatasourceAccess(): Record<string, string> {
+    if (this.accessMode() !== 'choose') return {};
+    const selected = new Set(this.getSelectedIds());
+    return this.getSelectedDatasourceAccessFor(this.datasources().filter((ds) => selected.has(ds.id)));
+  }
+
+  private getSelectedDatasourceAccessFor(rows: Datasource[]): Record<string, string> {
+    const chosen = this.accessChoice();
+    const out: Record<string, string> = {};
+    for (const ds of rows) {
+      const level = chosen[ds.id];
+      const access = accessChoiceOf(ds);
+      if (level && access?.levels.some((l) => l.id === level && l.offered) && level !== access.default) {
+        out[ds.id] = level;
+      }
+    }
+    return out;
   }
 
   /**
@@ -912,6 +1117,7 @@ export class DatasourcesGroupComponent {
     // every cached context so returning to the default project cannot revive
     // an earlier touched selection.
     this.selections.set({});
+    this.accessChoices.set({});
     this.change.emit();
   }
 

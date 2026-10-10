@@ -2,7 +2,7 @@ import {workspaceCreationFields, workspacePreviewConfig} from "../agent-settings
 import {WorkspacePickerComponent} from '../agent-settings/workspace-picker.component';
 import {WorkspaceChoice} from '../../core/models/workspace-template.model';
 import {choiceBackend, choiceRequestFields} from '../workspaces/workspace-template-utils';
-import {Component, computed, effect, inject, OnInit, signal, ViewChild} from '@angular/core';
+import {Component, computed, effect, inject, OnInit, signal, untracked, ViewChild} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
 import {HttpClient, HttpParams} from '@angular/common/http';
 import {firstValueFrom} from 'rxjs';
@@ -34,21 +34,9 @@ interface Project {
   main_cloud_backend?: string | null;
 }
 
-/**
- * Whether the protected-cloud session-create checkbox should render.
- *
- * Visible only when the deployment flag is on AND at least one selected
- * project is a non-default Nextcloud project (spec §2/§4: default projects
- * excluded in v1; Nextcloud-only per design §9.2).
- */
-export function protectedCloudToggleVisible(
-  featureOn: boolean,
-  selected: Array<{ is_default?: boolean; main_cloud_backend?: string | null }>,
-): boolean {
-  return featureOn && selected.some(
-    (p) => !p.is_default && p.main_cloud_backend === 'nextcloud',
-  );
-}
+/** The workspace tiers the eligible list narrows a cloud folder's levels
+ *  for (`?workspace_backend=`). */
+const ELIGIBLE_BACKENDS: ReadonlySet<string> = new Set(['sandbox', 'vm', 'virtual', 'none']);
 
 /**
  * What "Start a new session" carries forward from a drifted session's source
@@ -234,22 +222,6 @@ interface ExpertDetail extends Expert {
             [choice]="workspaceChoice()"
             (choiceChange)="onWorkspaceChoice($event)"
           />
-
-          <!-- Protected cloud toggle: only for non-default Nextcloud projects,
-               gated on the deployment feature flag (Slice C). Unchanged until
-               the main cloud becomes connectors
-               (creation_ui_expert_workspace_connectors.md D9). -->
-          @if (protectedCloudVisible()) {
-            <div connectorsExtra class="protected-cloud">
-              <label class="protected-cloud-toggle">
-                <input type="checkbox" [checked]="protectedCloud()"
-                       [disabled]="creating()"
-                       (change)="protectedCloud.set($any($event.target).checked)" />
-                {{ 'sessions.create.protectedCloud' | transloco }}
-              </label>
-              <span class="field-hint">{{ 'sessions.create.protectedCloudHint' | transloco }}</span>
-            </div>
-          }
         </app-agent-settings>
 
         <!-- A rejected config is correctable, so the error lands here and the
@@ -338,13 +310,6 @@ interface ExpertDetail extends Expert {
       flex-direction: column;
       gap: 4px;
     }
-    .protected-cloud {
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
-      padding-top: 10px;
-      border-top: 1px solid var(--border-hairline);
-    }
     .create-error {
       display: flex;
       align-items: center;
@@ -368,14 +333,6 @@ interface ExpertDetail extends Expert {
       display: flex;
       flex-wrap: wrap;
       gap: 6px;
-    }
-    .protected-cloud-toggle {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 13px;
-      color: var(--text-primary, var(--text-primary));
-      cursor: pointer;
     }
     .manifest-view {
       display: flex;
@@ -471,10 +428,14 @@ export class SessionCreateComponent implements OnInit {
   readonly archivedSelected = computed(() =>
     this.selectedProjects().some(p => p.status === 'archived'),
   );
-  readonly protectedCloud = signal(false);
-  readonly protectedCloudVisible = computed(() =>
-    protectedCloudToggleVisible(this.capabilities.protectedCloudAvailable(), this.selectedProjects()),
-  );
+  /** The workspace tier the eligible list was last asked for: a cloud
+   *  folder's levels depend on it (protected is the container tier's). */
+  private eligibleBackendRequested: string | null | undefined = undefined;
+  /** The tier the picked workspace runs on, as the eligible list names it. */
+  readonly eligibleBackend = computed(() => {
+    const backend = this.pickerBackend();
+    return backend && ELIGIBLE_BACKENDS.has(backend) ? backend : null;
+  });
   readonly experts = signal<Expert[]>([]);
   /** "Show all experts": drop the session role filter (U1 — every expert stays
    *  usable in every role; the picker's role is pre-selected, not enforced). */
@@ -557,6 +518,16 @@ export class SessionCreateComponent implements OnInit {
     effect(() => {
       const userId = this.userService.currentUserId();
       if (userId) this.loadProjects(userId);
+    });
+    // A connector's levels depend on the tier: re-read the eligible list when
+    // the picked workspace moves to another one (never before the first read).
+    effect(() => {
+      const backend = this.eligibleBackend();
+      untracked(() => {
+        if (this.eligibleBackendRequested !== undefined && backend !== this.eligibleBackendRequested) {
+          this.loadDatasourcesList();
+        }
+      });
     });
   }
 
@@ -843,6 +814,10 @@ export class SessionCreateComponent implements OnInit {
     let params = new HttpParams();
     for (const id of this.selectedProjectIds()) params = params.append('project_id', id);
     params = params.set('execution', 'session');
+    // The levels a cloud folder offers on the picked tier.
+    const backend = this.eligibleBackend();
+    this.eligibleBackendRequested = backend;
+    if (backend) params = params.set('workspace_backend', backend);
     const url = `${environment.apiUrl}/datasources/eligible`;
     this.http.get<EligibleDatasource[]>(url, {params}).subscribe({
       next: (ds) => {
@@ -1090,10 +1065,10 @@ export class SessionCreateComponent implements OnInit {
 
     // Empty is an explicit opt-out; omission means "apply server defaults".
     body['datasource_ids'] = settings?.getSelectedDatasourceIds() ?? [];
-
-    if (this.protectedCloud() && this.protectedCloudVisible()) {
-      body['protected_cloud'] = true;
-    }
+    // The level chosen for each selected cloud folder; one at protected
+    // makes the session protected. Unchosen ones get their project default.
+    const access = settings?.getSelectedDatasourceAccess() ?? {};
+    if (Object.keys(access).length) body['datasource_access'] = access;
     return body;
   }
 
@@ -1112,6 +1087,7 @@ export class SessionCreateComponent implements OnInit {
     if (!this.manifestOpen()) return;
     const body = this.buildBody();
     const selected = new Set((body['datasource_ids'] as string[]) ?? []);
+    const access = (body['datasource_access'] as Record<string, string> | undefined) ?? {};
     const settings: Record<string, unknown> = {};
     if (body['permission_mode']) settings['permission_mode'] = body['permission_mode'];
     if (body['model']) settings['model'] = body['model'];
@@ -1120,7 +1096,9 @@ export class SessionCreateComponent implements OnInit {
       kind: 'session',
       expert: (body['expert'] as never) ?? (body['expert_id'] as string) ?? (body['config_name'] as string) ?? null,
       workspace: body['workspace'],
-      connectors: this.datasources().filter((d) => selected.has(d.id)).map((d) => ({id: d.id, name: d.name})),
+      connectors: this.datasources()
+        .filter((d) => selected.has(d.id))
+        .map((d) => ({id: d.id, name: d.name, access: access[d.id] ?? null})),
       settings,
     });
     this.manifestText.set(toYaml(doc));

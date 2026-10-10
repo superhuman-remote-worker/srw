@@ -623,9 +623,7 @@
       "expertLabel": "Expert",
       "expertLoading": "Loading experts...",
       "expertSelectedPrefix": "Selected:",
-      "createSession": "Create Session",
-      "protectedCloud": "Protected cloud — agent writes are staged for your review",
-      "protectedCloudHint": "The agent gets read-only cloud access; its changes wait for your approval in the review panel."
+      "createSession": "Create Session"
     },
     "configDrift": {
       "title": "Some of this session's setup is gone",
@@ -3740,7 +3738,25 @@
       "credentialsLocked": "Credentials stay attached for this session",
       "credentialsUnavailable": "This credential connector is no longer available. End this session and start another to change its connectors.",
       "lockedNextStart": "Takes effect only at the next start, so it can't be changed during a session",
-      "nothingAttached": "Nothing is attached, not even this project's own connectors."
+      "nothingAttached": "Nothing is attached, not even this project's own connectors.",
+      "access": {
+        "label": "Access for {{name}}",
+        "notMounted": "Not mounted here",
+        "besideProtected": "Not mounted beside a protected folder",
+        "origin": {
+          "projectDefault": "project default",
+          "default": "default",
+          "lowered": "lowered: not allowed here",
+          "loweredRole": "lowered to what your role in its project allows",
+          "chosen": "chosen"
+        },
+        "refused": {
+          "notOffered": "not offered here",
+          "aboveCeiling": "more than your role allows",
+          "readOnlyUnavailable": "no read-only here",
+          "oneProtected": "only one folder can be protected"
+        }
+      }
     },
     "workspacePicker": {
       "templateLabel": "Template",
