@@ -181,6 +181,10 @@ async def _live_selection_access(
         execution="session",
     )
     keep = {cid: level for cid, level in current.items() if cid in selected_ds_ids}
+    selection = metadata.get("datasource_selection")
+    previous_origins = (
+        selection.get("access") if isinstance(selection, Mapping) else None
+    )
     try:
         resolved = await resolve_selection_access(
             dependencies.store,
@@ -192,6 +196,11 @@ async def _live_selection_access(
             },
             ctx=ctx,
             keep=keep,
+            # A kept level keeps whether it was chosen or a default, which
+            # each attach resolves again.
+            keep_origins=(
+                previous_origins if isinstance(previous_origins, Mapping) else None
+            ),
         )
     except ConnectorAccessError as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc

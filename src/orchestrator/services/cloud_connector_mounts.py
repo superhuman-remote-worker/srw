@@ -243,7 +243,8 @@ class SelectedCloudConnector:
     link's ``project_read_only`` and ``project_access``. ``eligible`` is
     False when the owner may no longer attach it (a revoked link or
     membership, a deleted project). ``requested`` is the level the session
-    resolved for it when it was created (``metadata.datasource_access``),
+    chose for it (``metadata.datasource_access``, only where its origin was
+    a choice: a default is resolved again at each attach, ``None`` here),
     ``ceiling`` the highest level its owner may have now (the policy's
     verdict: a viewer of the folder's project, ``read_only``).
     """
@@ -331,16 +332,41 @@ async def selected_cloud_connectors(
     return selected
 
 
+#: The origins of a stored level that were a default, not a choice
+#: (``shared.connectors.contract.ACCESS_ORIGINS``): such a level is resolved
+#: again at each attach, within what the tier offers and the owner may have
+#: now, so a tier change or a demotion lowers it instead of dropping the
+#: folder.
+DEFAULT_ACCESS_ORIGINS = frozenset(
+    {"link_default", "config", "driver_default", "clamped"}
+)
+
+
 def _requested_access(thread: Mapping[str, Any]) -> dict[str, str]:
-    """The level the session resolved per connector at creation, if any."""
+    """The level the session chose per connector, to bind as asked or not at
+    all: its stored levels (``metadata.datasource_access``) except the ones
+    whose origin (``datasource_selection.access``) was a default. A level
+    of unknown origin counts as chosen."""
     from orchestrator.services.stateless_workspace_gate import (
         thread_metadata_object,
     )
 
-    stored = thread_metadata_object(thread).get("datasource_access")
+    metadata = thread_metadata_object(thread)
+    stored = metadata.get("datasource_access")
     if not isinstance(stored, Mapping):
         return {}
-    return {str(cid): str(level) for cid, level in stored.items() if level}
+    selection = metadata.get("datasource_selection")
+    origins = selection.get("access") if isinstance(selection, Mapping) else None
+    chosen: dict[str, str] = {}
+    for cid, level in stored.items():
+        if not level:
+            continue
+        record = origins.get(str(cid)) if isinstance(origins, Mapping) else None
+        origin = record.get("origin") if isinstance(record, Mapping) else None
+        if origin in DEFAULT_ACCESS_ORIGINS:
+            continue
+        chosen[str(cid)] = str(level)
+    return chosen
 
 
 async def _verdicts(

@@ -115,6 +115,7 @@ async def resolve_selection_access(
     ctx: AccessContext,
     keep: Mapping[str, str | None] | None = None,
     rows: list[dict[str, Any]] | None = None,
+    keep_origins: Mapping[str, Any] | None = None,
 ) -> SelectionAccess:
     """Resolve the level of every strict connector of an authorized
     selection, or raise :class:`ConnectorAccessError`.
@@ -124,7 +125,11 @@ async def resolve_selection_access(
     (``connector_access_not_selected``) and is bound as asked or refused
     (``connector_access_unavailable``, with the rule's closed reason).
     ``keep`` maps connectors to a level resolved before (a live edit): kept
-    as it is, not resolved again. Any other connector gets its default
+    as it is, not resolved again, with its origin record from
+    ``keep_origins`` (the session's ``datasource_selection.access``) when it
+    has one, so a kept default stays a default an attach resolves again,
+    and a kept choice a choice (``materialized`` when it is not known). Any
+    other connector gets its default
     (``resolve_access``): the project link's, lowered within what ``ctx``
     offers and the owner's ceiling (a viewer of a cloud folder's project),
     or no level at all. More than one connector at ``protected`` is refused
@@ -162,10 +167,14 @@ async def resolve_selection_access(
             and datasource_id not in requested
         ):
             result.levels[datasource_id] = keep[datasource_id]
-            result.origins[datasource_id] = {
-                "access": keep[datasource_id],
-                "origin": "materialized",
-            }
+            previous = (keep_origins or {}).get(datasource_id)
+            result.origins[datasource_id] = (
+                dict(previous)
+                if isinstance(previous, Mapping)
+                and previous.get("access") == keep[datasource_id]
+                and previous.get("origin")
+                else {"access": keep[datasource_id], "origin": "materialized"}
+            )
             continue
         driver = registry.for_type(row.get("type"))
         if driver is None:

@@ -733,10 +733,86 @@ async def test_a_viewers_ceiling_takes_write_away_at_the_next_attach(monkeypatch
 
     monkeypatch.setattr(rule, "_classified", viewer)
     store = Store([_folder_row()])
-    live, _ = await _live(_thread([FOLDER]), store)
-    # Lowered to the reader's level, never written.
+    # Admitted as an editor: its default, read_write, stored with its origin.
+    thread = _thread(
+        [FOLDER],
+        metadata={
+            "datasource_access": {FOLDER: "read_write"},
+            "datasource_selection": {
+                "access": {FOLDER: {"access": "read_write", "origin": "link_default"}}
+            },
+        },
+    )
+    live, _ = await _live(thread, store)
+    # Lowered to the reader's level, never written, and still mounted.
     assert [m["access"] for m in live.mounts] == ["read_only"]
     assert live.excluded == []
+    # A level the session chose is bound as chosen or not at all.
+    chosen = _thread(
+        [FOLDER],
+        metadata={
+            "datasource_access": {FOLDER: "read_write"},
+            "datasource_selection": {
+                "access": {FOLDER: {"access": "read_write", "origin": "explicit"}}
+            },
+        },
+    )
+    live, _ = await _live(chosen, store)
+    assert live.mounts == []
+    assert [e["reason"] for e in live.excluded] == ["access_unavailable"]
+
+
+@pytest.mark.asyncio
+async def test_a_live_edit_keeps_whether_a_level_was_chosen_or_a_default():
+    from orchestrator.services.connector_access import resolve_selection_access
+    from shared.connectors.contract import AccessContext
+
+    store = SimpleNamespace(get_user_project_roles=AsyncMock(return_value={}))
+    rows = [{**_folder_row(), "project_access": None}]
+    for previous, kept in (
+        ({"access": "read_write", "origin": "link_default"}, "link_default"),
+        ({"access": "read_write", "origin": "explicit"}, "explicit"),
+        # Not the level kept, or no record: unknown, so a choice.
+        ({"access": "read_only", "origin": "link_default"}, "materialized"),
+        (None, "materialized"),
+    ):
+        resolved = await resolve_selection_access(
+            store,
+            owner_id=USER,
+            datasource_ids=[FOLDER],
+            project_ids=[PROJECT],
+            requested={},
+            ctx=AccessContext(workspace_backend="sandbox", execution="session"),
+            keep={FOLDER: "read_write"},
+            rows=rows,
+            keep_origins={FOLDER: previous} if previous else None,
+        )
+        assert resolved.levels == {FOLDER: "read_write"}
+        assert resolved.origins[FOLDER]["origin"] == kept
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ["link_default", "driver_default", "clamped"])
+async def test_a_default_level_is_lowered_on_a_vm_never_dropped(denied, origin):
+    """A sandbox session upgraded to a VM: its folder's defaulted read_write
+    is resolved again for the VM, which offers read_only, instead of the
+    folder being left out; a stored level of unknown origin binds as stored."""
+    store = GrantStore([_folder_row()], grants=[_grant("reader", READER)])
+    thread = _thread(
+        [FOLDER],
+        metadata={
+            "datasource_access": {FOLDER: "read_write"},
+            "datasource_selection": {
+                "access": {FOLDER: {"access": "read_write", "origin": origin}}
+            },
+        },
+    )
+    live, _ = await _live(thread, store, vm=True, backend=GrantBackend())
+    assert [m["access"] for m in live.mounts] == ["read_only"]
+    unknown = _thread([FOLDER], metadata={"datasource_access": {FOLDER: "read_write"}})
+    live, _ = await _live(unknown, store, vm=True, backend=GrantBackend())
+    assert live.mounts == []
+    assert [e["reason"] for e in live.excluded] == ["access_unavailable"]
 
 
 # --------------------------------------------------------------------------- #

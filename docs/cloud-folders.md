@@ -67,13 +67,16 @@ can write.
    `{"access": "protected"}`; `null` restores the driver's default, the
    highest level offered). It is a default, not a ceiling. A default the
    Session can't have is lowered to the highest level it can, never raised,
-   and the folder is left out when there is none.
+   and the folder is left out when there is none. A default is resolved
+   again each time the workspace mounts it: after an upgrade to a VM, or
+   once its user is a viewer, it mounts read-only instead of going missing.
+   A level the Session chose is bound as chosen or not at all.
 3. **Within the member's ceiling.** A project's folder may also be attached
    to a Session of another project by a member of the folder's project,
    never as a default there. A viewer of the folder's project gets at most
    `read_only`, in that project's own Sessions too, and a viewer's Job gets a
-   `read_only` copy. Administrators reach another project's folder only as
-   members.
+   `read_only` copy. Only members reach a project's folder, administrators
+   included, in its own project's Sessions too.
 
 A Job binds at its project link's level: a Job (or a manifest execution)
 that names one is refused (422 `connector_access_unsupported`,
