@@ -281,7 +281,14 @@ async def deliver_job_outbox(
     # Fresh export folder — no project/thread row to pin to, so resolve via
     # the owner seam (returns the active backend today; per-org under
     # multi-tenancy). Issue 16, knowledge-base/knowledge/issues/main_cloud.md.
-    backend = dependencies.cloud_router.for_owner(owner)
+    try:
+        backend = dependencies.cloud_router.for_owner(owner)
+    except Exception as exc:
+        # No main cloud serves the owner (no active installation authority):
+        # a recorded refusal, never an exception past the copy's record.
+        raise JobOutboxError(
+            "backend_unavailable", 503, "Cloud backend not available."
+        ) from exc
     if not backend.is_initialized:
         raise JobOutboxError("backend_unavailable", 503, "Cloud backend not available.")
     if not dependencies.forge.is_initialized:

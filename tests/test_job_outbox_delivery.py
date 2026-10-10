@@ -179,3 +179,23 @@ async def test_a_resync_reuses_the_folder_and_its_share():
         "session_id": "report-682baab8"
     }
     backend.share_session_folder.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_no_main_cloud_for_the_owner_is_a_recorded_refusal():
+    deps, store, _ = _deps()
+
+    def refuse(_owner):
+        raise RuntimeError("no durable active backend-instance authority")
+
+    deps = job_export.JobExportDependencies(
+        store=deps.store,
+        forge=deps.forge,
+        cloud_router=SimpleNamespace(for_owner=refuse),
+        resolve_job_repo=deps.resolve_job_repo,
+    )
+
+    result = await job_export.run_job_outbox_effect(job_id=JOB_ID, dependencies=deps)
+
+    assert (result["state"], result["reason"]) == ("failed", "backend_unavailable")
+    assert _record(store)["reason"] == "backend_unavailable"
