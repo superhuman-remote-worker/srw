@@ -237,6 +237,7 @@ func newServer(fake *fakeMounter, peerUID int) *server {
 		readOnly:  map[string]bool{"/srw/cloud/root": false},
 		policy:    policy{ReadOnly: true, AllowOther: true, Source: "srw-cloud", Subtype: "rclone"},
 		clientUID: 65534,
+		dirUID:    -1,
 		mounter:   fake,
 		peer:      func(*net.UnixConn) (int, int, error) { return peerUID, peerUID, nil },
 		logger:    log.New(io.Discard, "", 0),

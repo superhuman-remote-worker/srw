@@ -51,6 +51,7 @@ from orchestrator.services.session_workspace_policy import preparation_wait_budg
 from orchestrator.security.access import externalize_gitea_url
 from orchestrator.security.access import require_internal as _require_internal
 from orchestrator.services import connector_credential_leases
+from orchestrator.services.cloud_mount_sidecar import recorded_sidecar_plan
 from orchestrator.services.container_provisioner import (
     WORKSPACE_RUNTIME_INCARNATION_KEY,
     WorkspaceRuntimeAttestation,
@@ -475,6 +476,21 @@ async def require_pinned_workspace_credential_owner(
             },
         )
     return parsed_agent_id
+
+
+def _sidecar_holds_grant(
+    metadata: Mapping[str, Any], ro_row: Mapping[str, Any] | None
+) -> bool:
+    """Whether a protected sidecar Pod's lower layer mounts with exactly this
+    reader grant: its plan recorded the grant it was made from (D7)."""
+    plan = recorded_sidecar_plan(metadata)
+    recorded = (plan or {}).get("protected_grant")
+    if not isinstance(recorded, Mapping) or not isinstance(ro_row, Mapping):
+        return False
+    return all(
+        recorded.get(key) and recorded.get(key) == str(ro_row.get(key) or "")
+        for key in ("id", "runtime_generation", "engage_attempt", "reader_id")
+    )
 
 
 async def prepare_agent_thread_workspace(
@@ -1358,7 +1374,18 @@ async def agent_get_thread_workspace_locked(
         # only the exact prepared mount may cross the response boundary.
         if prepared_protected_mount is None:
             return _protected_workspace_wait_payload(state="engaging")
-        cloud_mount_cfg = prepared_protected_mount
+        if cloud_mount_sidecar_cfg is not None:
+            # The Pod's sidecars mount the lower with the reader credential
+            # its plan was made from (D7); the credential never reaches the
+            # agent. A grant replaced since then is one the sidecar does not
+            # hold: fail closed rather than run against a dead lower.
+            if not _sidecar_holds_grant(final_metadata, prepared_ro_row):
+                return _protected_workspace_wait_payload(
+                    state="failed", error_code="engage_refused"
+                )
+            cloud_mount_cfg = None
+        else:
+            cloud_mount_cfg = prepared_protected_mount
         cloud_sync_cfg = None
         cloud_sync_degraded = False
     final_runtime_authority = thread_runtime_authority(final_thread)

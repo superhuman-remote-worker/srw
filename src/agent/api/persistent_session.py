@@ -1146,6 +1146,15 @@ class PersistentSession:
                 raise
             return
 
+        await self._finish_protected_cloud(cloud_mount_cfg)
+
+    async def _finish_protected_cloud(self, cloud_mount_cfg: Dict[str, Any]) -> None:
+        """Mount the capture overlay on the protected lower and prove both.
+
+        The lower is the in-workspace rclone's or, for a sidecar Pod (D7),
+        the sidecars'; either way the overlay runs in the workspace and the
+        session refuses to run half-protected.
+        """
         if cloud_mount_cfg.get("protected") and cloud_mount_cfg.get("overlay"):
             try:
                 from shared.runtime.services.cloud_overlay import OverlayMountManager
@@ -1316,6 +1325,21 @@ class PersistentSession:
             len(watcher.mounts),
             len(unavailable),
         )
+        if cloud_mount_cfg.get("protected") and cloud_mount_cfg.get("overlay"):
+            if not watcher.active:
+                # No lower: a protected session gets no cloud at all, never
+                # a half-protected one.
+                self.cloud_mount_manager = None
+                if self.protected_cloud_required:
+                    # The supervisor's closed reason, in plain words, so the
+                    # refusal says why.
+                    why = "; ".join(row["text"] for row in unavailable)
+                    raise WorkspaceUnavailableError(
+                        "protected-cloud lower did not mount in the workspace's "
+                        "sidecars" + (f": {why}" if why else "")
+                    )
+                return
+            await self._finish_protected_cloud(cloud_mount_cfg)
 
     @staticmethod
     def _protected_cloud_config_valid(payload: Any) -> bool:
@@ -1323,6 +1347,10 @@ class PersistentSession:
 
         if not isinstance(payload, dict):
             return False
+        if payload.get("delivery") == "sidecar":
+            from agent.api.session_workspace import protected_sidecar_mount_valid
+
+            return protected_sidecar_mount_valid(payload)
         overlay = payload.get("overlay")
         mounts = payload.get("mounts")
         if (

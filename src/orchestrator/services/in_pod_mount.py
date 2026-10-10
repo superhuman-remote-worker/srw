@@ -36,7 +36,12 @@ the node; the builder refuses such a workspace. The one exception is a
 protected Pod: its capture overlay (fuse-overlayfs) still runs in the
 workspace, so it keeps the FUSE profile, and its read-only lower layer
 rests on the reader credential (SRW assists read-only, never guarantees
-it). Design: knowledge-base/knowledge/features/connector_drivers.md ("Three
+it). The overlay mounts on ``/cloud/merged``, a plain directory the opener
+creates beside the lower and hands to agent-host, so a protected
+workspace's view of the emptyDir is writable: a non-root fusermount3 needs
+write access to its mountpoint, and a volume nested there would itself be a
+mountpoint, which the overlay's scripts read as an overlay already up.
+Design: knowledge-base/knowledge/features/connector_drivers.md ("Three
 planes", D7) and connector_drivers_research/connector_drivers_d7_in_pod_plane_spike.md.
 """
 
@@ -58,7 +63,6 @@ PLAN_VOLUME = "srw-cloud-plan"
 CREDENTIAL_VOLUME = "srw-cloud-credential"
 CACHE_VOLUME = "srw-cloud-cache"
 RCLONE_TMP_VOLUME = "srw-cloud-tmp"
-MERGED_VOLUME = "srw-cloud-merged"
 SIDECAR_VOLUMES = frozenset(
     {
         CLOUD_VOLUME,
@@ -69,7 +73,6 @@ SIDECAR_VOLUMES = frozenset(
         CREDENTIAL_VOLUME,
         CACHE_VOLUME,
         RCLONE_TMP_VOLUME,
-        MERGED_VOLUME,
     }
 )
 
@@ -149,10 +152,11 @@ class SidecarSpec:
     """What the builder needs from a cloud mount plan.
 
     ``targets`` are ``(path, read_only)`` under :data:`SIDECAR_CLOUD_ROOT`;
-    ``dirs`` are plain directories the opener creates there (the protected
-    overlay's merged mountpoint); ``objects_name`` names the plan ConfigMap
-    and the credential Secret, which the Pod owns; ``protected`` keeps the
-    workspace's FUSE profile for the overlay.
+    ``dirs`` are plain directories the opener creates there for the
+    workspace user (the protected overlay's merged mountpoint, so a protected
+    spec only); ``objects_name`` names the plan ConfigMap and the credential
+    Secret, which the Pod owns; ``protected`` keeps the workspace's FUSE
+    profile for the overlay.
     """
 
     targets: tuple[tuple[str, bool], ...]
@@ -196,6 +200,8 @@ def _opener(spec: SidecarSpec, image: str) -> dict[str, Any]:
         args += ["--target", f"{target}:ro" if read_only else target]
     for directory in spec.dirs:
         args += ["--dir", directory]
+    if spec.dirs:
+        args += ["--dir-uid", str(WORKSPACE_UID)]
     return {
         "name": OPENER_CONTAINER,
         "image": image,
@@ -307,6 +313,10 @@ def add_cloud_mount_sidecars(
         raise ValueError("a cloud mount sidecar needs at least one mount")
     if len(spec.dirs) > 1:
         raise ValueError("the cloud mount sidecars create at most one directory")
+    if spec.dirs and not spec.protected:
+        # A directory makes the workspace's view writable, which only a
+        # protected Pod (FUSE in the workspace already) may have.
+        raise ValueError("only a protected Pod's sidecars create a directory")
     if pod_spec.get("shareProcessNamespace"):
         # A shared PID namespace would show the supervisor's environment and
         # command line, and its rclone children's.
@@ -362,27 +372,21 @@ def add_cloud_mount_sidecars(
             "emptyDir": {"medium": "Memory", "sizeLimit": "64Mi"},
         },
     ]
+    cloud_view: dict[str, Any] = {
+        "name": CLOUD_VOLUME,
+        "mountPath": WORKSPACE_CLOUD_ROOT,
+        "readOnly": True,
+        "mountPropagation": "HostToContainer",
+    }
+    if spec.dirs:
+        # The protected overlay mounts on the opener's directory itself
+        # (see the module docstring); a privileged workspace was never held
+        # back by a read-only view anyway.
+        del cloud_view["readOnly"]
     workspace_mounts = [
-        {
-            "name": CLOUD_VOLUME,
-            "mountPath": WORKSPACE_CLOUD_ROOT,
-            "readOnly": True,
-            "mountPropagation": "HostToContainer",
-        },
+        cloud_view,
         {"name": STATUS_VOLUME, "mountPath": STATUS_DIR, "readOnly": True},
         {"name": CONTROL_VOLUME, "mountPath": CONTROL_DIR},
     ]
-    for directory in spec.dirs:
-        # A writable mountpoint the workspace mounts on itself (the
-        # protected overlay's merged view): the opener created it inside the
-        # read-only view, and fusermount3 needs write access to it.
-        relative = directory.removeprefix(SIDECAR_CLOUD_ROOT + "/")
-        volumes.append({"name": MERGED_VOLUME, **_memory_dir()})
-        workspace_mounts.append(
-            {
-                "name": MERGED_VOLUME,
-                "mountPath": f"{WORKSPACE_CLOUD_ROOT}/{relative}",
-            }
-        )
     pod_spec.setdefault("volumes", []).extend(volumes)
     workspace.setdefault("volumeMounts", []).extend(workspace_mounts)

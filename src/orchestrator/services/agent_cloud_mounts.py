@@ -609,6 +609,106 @@ async def _resolve_live_mount_set(
     return LiveMountSet(mounts=mounts_out, fallback=fallback, excluded=excluded)
 
 
+async def _resolve_protected_mount(
+    thread: dict[str, Any],
+    *,
+    metadata: dict[str, Any],
+    terminal_retirement_token: int | None = None,
+    dependencies: AgentCloudMountDependencies,
+) -> Optional[dict[str, Any]]:
+    """A protected-marked thread's payload (reader-grant lower + overlay), or
+    ``None``: never a live mount."""
+    row = await _resolve_protected_grant(
+        thread,
+        metadata=metadata,
+        terminal_retirement_token=terminal_retirement_token,
+        dependencies=dependencies,
+    )
+    if row is None:
+        return None
+    return _build_protected_cloud_mount(row, thread_id=str(thread.get("id")))
+
+
+async def _resolve_protected_grant(
+    thread: dict[str, Any],
+    *,
+    metadata: dict[str, Any],
+    terminal_retirement_token: int | None = None,
+    dependencies: AgentCloudMountDependencies,
+) -> Optional[dict[str, Any]]:
+    """A protected-marked thread's ``cloud_ro_mounts`` row, or ``None`` when
+    the thread may have no protected mount. Runtime readiness is the
+    caller's; the in-pod plane's planner (``cloud_mount_plan``) asks at Pod
+    creation, when the workspace is not ready yet, and awaits the same
+    engage task an attach would."""
+    protected_marker = protected_cloud_marker_state(metadata)
+    if protected_marker == "malformed":
+        logger.warning(
+            "Thread %s: malformed protected_cloud marker; refusing cloud mount.",
+            thread.get("id"),
+        )
+        return None
+    if not dependencies.is_protected_cloud_mode_enabled():
+        logger.warning(
+            "Thread %s: protected_cloud marker present but "
+            "PROTECTED_CLOUD_MODE_ENABLED is off; refusing any cloud mount.",
+            thread.get("id"),
+        )
+        return None
+    vm_ctx = metadata.get("vm") or {}
+    if vm_ctx.get("status") == "ready" and vm_ctx.get("ssh_host"):
+        logger.warning(
+            "Thread %s: protected cloud mode not supported on VM tier; no mount.",
+            thread.get("id"),
+        )
+        return None
+    tid = str(thread.get("id"))
+    if terminal_retirement_token is not None:
+        # End must never restart or wait for an engage task. It only
+        # reconstructs a grant that the exact retiring runtime could
+        # already have mounted; absent/non-active rows correctly leave no
+        # payload for the terminal zero scan to accept.
+        return await dependencies.store.get_ro_mount_by_thread(tid)
+    runtime_authority = thread_runtime_authority(thread)
+    if runtime_authority is None:
+        logger.warning(
+            "Thread %s: protected mount requested without open runtime "
+            "generation authority; refusing.",
+            tid,
+        )
+        return None
+    engage_task_key = (tid, runtime_authority.generation)
+    row = await dependencies.store.get_ro_mount_by_thread(tid)
+    if row is None:
+        # F-I1: engage-vs-attach race. Create-time engage is
+        # fire-and-forget, so an early attach (or an idle-pool resume
+        # that lands fast) can beat it here. Prefer awaiting the SAME
+        # in-flight task (bounded) over guessing with a bare poll; only
+        # fall back to polling when no task is registered for this
+        # thread (e.g. a second replica handled create — HA) AND no
+        # terminal error is already recorded (a refusal/error means the
+        # task already ran to completion with nothing to wait for).
+        task = dependencies.cloud_tasks.protected_engage_get(engage_task_key)
+        if task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=30)
+            except Exception as e:
+                logger.warning(
+                    "Thread %s: awaiting in-flight protected engage "
+                    "task failed/timed out: %s",
+                    tid,
+                    e,
+                )
+            row = await dependencies.store.get_ro_mount_by_thread(tid)
+        elif not metadata.get("protected_cloud_error"):
+            for _ in range(3):
+                await asyncio.sleep(3)
+                row = await dependencies.store.get_ro_mount_by_thread(tid)
+                if row is not None:
+                    break
+    return row
+
+
 async def _build_agent_cloud_mount(
     thread: dict[str, Any],
     *,
@@ -670,74 +770,13 @@ async def _build_agent_cloud_mount(
     # served while the flag is OFF would fall through to the LIVE builders with
     # agent-service credentials (B8 review finding; violates the fail-closed
     # invariant). Flag off => protected threads get NO cloud, not live cloud.
-    protected_marker = protected_cloud_marker_state(metadata)
-    if protected_marker != "off":
-        if protected_marker == "malformed":
-            logger.warning(
-                "Thread %s: malformed protected_cloud marker; refusing cloud mount.",
-                thread.get("id"),
-            )
-            return None
-        if not dependencies.is_protected_cloud_mode_enabled():
-            logger.warning(
-                "Thread %s: protected_cloud marker present but "
-                "PROTECTED_CLOUD_MODE_ENABLED is off; refusing any cloud mount.",
-                thread.get("id"),
-            )
-            return None
-        vm_ctx = metadata.get("vm") or {}
-        if vm_ctx.get("status") == "ready" and vm_ctx.get("ssh_host"):
-            logger.warning(
-                "Thread %s: protected cloud mode not supported on VM tier; no mount.",
-                thread.get("id"),
-            )
-            return None
-        tid = str(thread.get("id"))
-        if terminal_retirement_token is not None:
-            # End must never restart or wait for an engage task. It only
-            # reconstructs a grant that the exact retiring runtime could
-            # already have mounted; absent/non-active rows correctly leave no
-            # payload for the terminal zero scan to accept.
-            row = await dependencies.store.get_ro_mount_by_thread(tid)
-            return _build_protected_cloud_mount(row, thread_id=tid) if row else None
-        runtime_authority = thread_runtime_authority(thread)
-        if runtime_authority is None:
-            logger.warning(
-                "Thread %s: protected mount requested without open runtime "
-                "generation authority; refusing.",
-                tid,
-            )
-            return None
-        engage_task_key = (tid, runtime_authority.generation)
-        row = await dependencies.store.get_ro_mount_by_thread(tid)
-        if row is None:
-            # F-I1: engage-vs-attach race. Create-time engage is
-            # fire-and-forget, so an early attach (or an idle-pool resume
-            # that lands fast) can beat it here. Prefer awaiting the SAME
-            # in-flight task (bounded) over guessing with a bare poll; only
-            # fall back to polling when no task is registered for this
-            # thread (e.g. a second replica handled create — HA) AND no
-            # terminal error is already recorded (a refusal/error means the
-            # task already ran to completion with nothing to wait for).
-            task = dependencies.cloud_tasks.protected_engage_get(engage_task_key)
-            if task is not None:
-                try:
-                    await asyncio.wait_for(asyncio.shield(task), timeout=30)
-                except Exception as e:
-                    logger.warning(
-                        "Thread %s: awaiting in-flight protected engage "
-                        "task failed/timed out: %s",
-                        tid,
-                        e,
-                    )
-                row = await dependencies.store.get_ro_mount_by_thread(tid)
-            elif not metadata.get("protected_cloud_error"):
-                for _ in range(3):
-                    await asyncio.sleep(3)
-                    row = await dependencies.store.get_ro_mount_by_thread(tid)
-                    if row is not None:
-                        break
-        return _build_protected_cloud_mount(row, thread_id=tid) if row else None
+    if protected_cloud_marker_state(metadata) != "off":
+        return await _resolve_protected_mount(
+            thread,
+            metadata=metadata,
+            terminal_retirement_token=terminal_retirement_token,
+            dependencies=dependencies,
+        )
 
     # A cross-cluster VM runtime needs the public WebDAV URL (it can't reach the
     # internal service DNS) and defaults to a read-only mount (root tier). A

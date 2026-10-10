@@ -111,6 +111,60 @@ def validate_protected_cloud_mount(payload: Any) -> Dict[str, Any]:
     return payload
 
 
+def protected_sidecar_mount_valid(payload: Any) -> bool:
+    """Whether a protected payload of a sidecar Pod (D7) is exact: the same
+    overlay layout, one read-only lower the Pod's sidecars mount, and no
+    credential or remote at all (the reader credential stays in the Pod)."""
+
+    if not isinstance(payload, dict):
+        return False
+    overlay = payload.get("overlay")
+    mounts = payload.get("mounts")
+    if (
+        payload.get("version") != 1
+        or payload.get("delivery") != "sidecar"
+        or payload.get("protected") is not True
+        or payload.get("skip_workspace_links") is not True
+        or not isinstance(overlay, dict)
+        or overlay.get("lower") != "/cloud/lower"
+        or overlay.get("merged") != "/cloud/merged"
+        or overlay.get("upper") != "/home/agent-host/.overlay/upper"
+        or overlay.get("work") != "/home/agent-host/.overlay/work"
+        or not isinstance(overlay.get("quota_bytes"), int)
+        or isinstance(overlay.get("quota_bytes"), bool)
+        or overlay.get("quota_bytes") <= 0
+        or not isinstance(mounts, list)
+        or len(mounts) != 1
+        or not isinstance(mounts[0], dict)
+    ):
+        return False
+    lower = mounts[0]
+    return bool(
+        isinstance(lower.get("mount_id"), str)
+        and lower.get("mount_id")
+        and lower.get("mount_kind") == "protected_lower"
+        and lower.get("target_path") == "/cloud/lower"
+        and lower.get("workspace_name") == "lower"
+        and lower.get("access") == "read_only"
+        and not {"source", "auth"} & set(lower)
+    )
+
+
+def protected_mount_payload(workspace: Dict[str, Any]) -> Dict[str, Any]:
+    """The exact protected mount payload a ready workspace response carries:
+    the in-workspace lower+overlay, or a sidecar Pod's (D7). Fails closed."""
+
+    sidecar = workspace.get("cloud_mount_sidecar")
+    if sidecar is not None:
+        both = workspace.get("cloud_mount") is not None
+        if both or not protected_sidecar_mount_valid(sidecar):
+            raise ProtectedCloudUnavailable(
+                "protected-cloud sidecar mount payload is malformed"
+            )
+        return sidecar
+    return validate_protected_cloud_mount(workspace.get("cloud_mount"))
+
+
 def protected_workspace_delivery(payload: Dict[str, Any]) -> str:
     """Return ``off``, ``engaging`` or ``ready`` for a workspace response."""
 
@@ -326,7 +380,7 @@ def protected_workspace_delivery(payload: Dict[str, Any]) -> str:
         raise ProtectedCloudUnavailable(
             "protected-cloud payload exposed a legacy live-write surface"
         )
-    validate_protected_cloud_mount(payload.get("cloud_mount"))
+    protected_mount_payload(payload)
     return "ready"
 
 
@@ -356,7 +410,8 @@ def protected_workspace_identity(
         host_fingerprint=payload["workspace_ssh_host_key_fingerprint"],
         session_runtime_generation=str(UUID(payload["session_runtime_generation"])),
         cloud_mount_json=json.dumps(
-            payload["cloud_mount"],
+            # A sidecar Pod's protected payload (D7) is its mount identity.
+            payload.get("cloud_mount") or payload.get("cloud_mount_sidecar"),
             sort_keys=True,
             separators=(",", ":"),
         ),

@@ -426,3 +426,175 @@ async def test_an_older_agents_turn_is_not_refused_on_a_sidecar_pod():
         assert papp._cloud_sync_retry_pending is False
     build.assert_not_called()
     assert session.workspace_sync is None
+
+
+# --------------------------------------------------------------------------- #
+# A protected sidecar Pod (Phase B): the lower from the sidecars, the overlay
+# in the workspace
+# --------------------------------------------------------------------------- #
+
+
+def _protected_cfg() -> dict:
+    """What the orchestrator gives a protected sidecar Pod's agent."""
+    from orchestrator.services.cloud_mount_sidecar import agent_payload
+    from tests.test_cloud_mount_sidecar_delivery import _protected_plan
+
+    return agent_payload(_protected_plan().recorded())
+
+
+def _protected_ready(sidecar: dict | None = None) -> dict:
+    from tests.test_protected_workspace_delivery import _ready_payload
+
+    payload = _ready_payload()
+    payload["cloud_mount"] = None
+    payload["cloud_mount_sidecar"] = sidecar or _protected_cfg()
+    return payload
+
+
+def test_the_agent_accepts_the_orchestrators_protected_sidecar_payload():
+    from agent.api import session_workspace
+
+    payload = _protected_ready()
+    assert session_workspace.protected_workspace_delivery(payload) == "ready"
+    sidecar = payload["cloud_mount_sidecar"]
+    assert session_workspace.protected_mount_payload(payload) is sidecar
+    assert PersistentSession._protected_cloud_config_valid(_protected_cfg()) is True
+    identity = session_workspace.protected_workspace_identity(payload)
+    assert json.loads(identity.cloud_mount_json) == payload["cloud_mount_sidecar"]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda cfg: cfg.update(protected=False),
+        lambda cfg: cfg.update(skip_workspace_links=False),
+        lambda cfg: cfg["overlay"].update(merged="/tmp/merged"),
+        lambda cfg: cfg["overlay"].update(lower="/cloud/project"),
+        lambda cfg: cfg["overlay"].update(quota_bytes=True),
+        lambda cfg: cfg["mounts"][0].update(access="read_write"),
+        lambda cfg: cfg["mounts"][0].update(target_path="/cloud/merged"),
+        lambda cfg: cfg["mounts"][0].update(mount_kind="project"),
+        # A credential or a remote never crosses to the agent.
+        lambda cfg: cfg["mounts"][0].update(auth={"password": "x"}),
+        lambda cfg: cfg["mounts"][0].update(source={"type": "webdav"}),
+        lambda cfg: cfg["mounts"].append(dict(cfg["mounts"][0], index=1)),
+    ],
+)
+def test_a_protected_sidecar_payload_that_is_not_exact_fails_closed(mutate):
+    from agent.api import session_contract, session_workspace
+
+    cfg = _protected_cfg()
+    mutate(cfg)
+    with pytest.raises(session_contract.ProtectedCloudUnavailable):
+        session_workspace.protected_workspace_delivery(_protected_ready(cfg))
+    assert PersistentSession._protected_cloud_config_valid(cfg) is False
+
+
+def test_a_protected_response_with_both_deliveries_fails_closed():
+    from agent.api import session_contract, session_workspace
+    from tests.test_protected_workspace_delivery import _protected_mount
+
+    payload = _protected_ready()
+    payload["cloud_mount"] = _protected_mount()
+    with pytest.raises(session_contract.ProtectedCloudUnavailable):
+        session_workspace.protected_mount_payload(payload)
+
+
+def _protected_session(workspace: _Workspace, *, required: bool = True):
+    return SimpleNamespace(
+        thread_id="t1",
+        workspace_manager=SimpleNamespace(
+            backend=workspace, path="/home/agent-host/workspace"
+        ),
+        shell_owner_token=None,
+        protected_cloud_required=required,
+        config=SimpleNamespace(extra={}),
+        cloud_mount_manager=None,
+        cloud_mount_error=None,
+        _finish_protected_cloud=AsyncMock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_protected_session_mounts_its_overlay_on_the_sidecars_lower():
+    workspace = _Workspace(["lower"])
+    workspace.status[0] = {"state": "mounted"}
+    workspace.live = {"lower"}
+    session = _protected_session(workspace)
+    cfg = _protected_cfg()
+    with patch(
+        "shared.runtime.services.cloud_mount.sidecar.SidecarMountWatcher._start_sync",
+        lambda self: (self.read_states(), setattr(self, "_settled", True)),
+    ):
+        await PersistentSession._setup_sidecar_cloud_mount(session, cfg)
+    watcher = session.cloud_mount_manager
+    assert watcher.delivery == "sidecar" and watcher.active
+    (lower,) = watcher.mounts
+    assert (lower.mount_kind, lower.target_path) == ("protected_lower", "/cloud/lower")
+    session._finish_protected_cloud.assert_awaited_once_with(cfg)
+    # The overlay owns workspace/cloud: the watcher links nothing.
+    assert not any("ln -sfn" in command for command in workspace.commands)
+    assert not any(_runs_rclone(command) for command in workspace.commands)
+
+
+@pytest.mark.asyncio
+async def test_a_protected_session_whose_lower_did_not_mount_gets_no_cloud():
+    from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
+
+    workspace = _Workspace(["lower"])
+    workspace.status[0] = {"state": "unavailable", "reason": "credential_rejected"}
+    with patch(
+        "shared.runtime.services.cloud_mount.sidecar.SidecarMountWatcher._start_sync",
+        lambda self: (self.read_states(), setattr(self, "_settled", True)),
+    ):
+        required = _protected_session(workspace)
+        with pytest.raises(WorkspaceUnavailableError, match="refused its credential"):
+            await PersistentSession._setup_sidecar_cloud_mount(
+                required, _protected_cfg()
+            )
+        assert required.cloud_mount_manager is None
+        required._finish_protected_cloud.assert_not_awaited()
+        optional = _protected_session(workspace, required=False)
+        await PersistentSession._setup_sidecar_cloud_mount(optional, _protected_cfg())
+        assert optional.cloud_mount_manager is None
+        assert "refused its credential" in optional.cloud_mount_error
+
+
+@pytest.mark.asyncio
+async def test_stateless_end_retires_the_overlay_then_asks_the_sidecars_to_flush():
+    from orchestrator.services import stateless_session_retirement as retirement
+    from shared.runtime.services.cloud_overlay import OverlayMountManager
+    from tests.test_managed_repository_agent_lifecycle import _terminal_thread
+
+    workspace = _Workspace(["lower"])
+    workspace.status[0] = {"state": "mounted"}
+    workspace.live = {"lower"}
+    workspace.verify_terminal_claim_resources_retired = MagicMock(return_value="")
+    workspace.retire = MagicMock()
+    workspace.resolve_home_path = lambda rel: f"/home/agent-host/{rel}"
+    order: list[str] = []
+    original = SidecarMountWatcher.retire_existing
+
+    async def overlay_retired(self):
+        order.append("overlay")
+        return {"overlay_mounts": 0, "overlay_processes": 0}
+
+    async def watcher_retired(self, **kwargs):
+        order.append("sidecars")
+        return await original(self, **kwargs)
+
+    with (
+        patch.object(retirement, "_build_terminal_backend", return_value=workspace),
+        patch.object(OverlayMountManager, "retire_existing", overlay_retired),
+        patch.object(SidecarMountWatcher, "retire_existing", watcher_retired),
+    ):
+        await retirement.retire_stateless_workspace_residents(
+            _terminal_thread(), terminal_token=9, cloud_mount_cfg=_protected_cfg()
+        )
+        await retirement.verify_stateless_workspace_residents_retired(
+            _terminal_thread(), terminal_token=9, cloud_mount_cfg=_protected_cfg()
+        )
+    assert order == ["overlay", "sidecars"]
+    assert any("/srw/cloud-control/drain" in c for c in workspace.terminal)
+    # The resident zero proof and the overlay's, never an rclone re-proof.
+    assert workspace.verify_terminal_claim_resources_retired.call_count == 2

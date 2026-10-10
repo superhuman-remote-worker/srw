@@ -64,7 +64,7 @@ from agent.api.session_workspace import (
     protected_workspace_delivery,
     protected_workspace_identity,
     protected_workspace_marker,
-    validate_protected_cloud_mount,
+    protected_mount_payload,
 )
 from shared.runtime.core.loader import (
     normalize_delegation_block,
@@ -1251,8 +1251,7 @@ class SessionAttachCoordinator:
                     if protected_cloud:
                         # Latest authoritative bytes replace, rather than fill, an
                         # earlier mount so a revoked/rotated reader cannot be used.
-                        cloud_mount_cfg = ws_info.get("cloud_mount")
-                        validate_protected_cloud_mount(cloud_mount_cfg)
+                        cloud_mount_cfg = protected_mount_payload(ws_info)
                         fresh_identity = protected_workspace_identity(ws_info)
                         if fresh_identity != protected_identity:
                             raise ProtectedCloudUnavailable(
@@ -1659,8 +1658,7 @@ class SessionAttachCoordinator:
                     raise ProtectedCloudUnavailable(
                         "protected-cloud workspace is no longer ready"
                     )
-                final_mount = final_workspace.get("cloud_mount")
-                validate_protected_cloud_mount(final_mount)
+                final_mount = protected_mount_payload(final_workspace)
                 final_identity = protected_workspace_identity(final_workspace)
                 if (
                     final_identity != protected_identity
@@ -1818,8 +1816,7 @@ class SessionAttachCoordinator:
                             raise ProtectedCloudUnavailable(
                                 "protected-cloud authority changed during attach"
                             )
-                        fresh_mount = ws_info.get("cloud_mount")
-                        validate_protected_cloud_mount(fresh_mount)
+                        fresh_mount = protected_mount_payload(ws_info)
                         if (
                             fresh_mount != cloud_mount_cfg
                             or protected_workspace_identity(ws_info)

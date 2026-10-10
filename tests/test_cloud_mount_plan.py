@@ -9,6 +9,7 @@ contracts (drivers/cloud-mount, the agent's sidecar payload).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import subprocess
@@ -153,7 +154,8 @@ async def test_an_empty_set_is_still_the_plane(monkeypatch):
         ("plane off", {"settings": None}),
         ("sync driver", {"dependencies": _deps(driver="sync")}),
         ("officer", {"thread": _thread(config_override={"officer": {"post": "x"}})}),
-        ("protected", {"thread": _thread(protected_cloud=True)}),
+        # No runtime authority, so no grant of this runtime (Phase B below).
+        ("protected without a grant", {"thread": _thread(protected_cloud=True)}),
         ("malformed protected marker", {"thread": _thread(protected_cloud="yes")}),
     ],
 )
@@ -329,6 +331,180 @@ def test_the_sidecar_spec_marks_read_only_targets():
     spec = plan.sidecar_spec("ws-cloud-x")
     assert spec.targets == (("/srw/cloud/lower", True),)
     assert spec.dirs == ("/srw/cloud/merged",) and spec.protected is True
+
+
+# --------------------------------------------------------------------------- #
+# A protected session's lower layer (Phase B)
+# --------------------------------------------------------------------------- #
+
+GENERATION = "66666666-6666-4666-8666-666666666666"
+EARLIER_GENERATION = "77777777-7777-4777-8777-777777777777"
+READER_SECRET = "reader-app-password"
+
+
+def _grant(**over) -> dict:
+    """A cloud_ro_mounts row as the store returns it."""
+    row = {
+        "id": "aaaaaaaa-0000-4000-8000-000000000001",
+        "status": "active",
+        "backend": "nextcloud",
+        "webdav_url": "https://nc.internal/remote.php/dav/files/srw-reader-u/Proj/",
+        "reader_id": "srw-reader-u",
+        "credentials": READER_SECRET,
+        "runtime_generation": GENERATION,
+        "engage_attempt": "bbbbbbbb-0000-4000-8000-000000000002",
+    }
+    row.update(over)
+    return row
+
+
+def _protected_thread() -> dict:
+    return {
+        "id": THREAD_ID,
+        "status": "active",
+        "user_id": "cccccccc-0000-4000-8000-000000000003",
+        "runtime_generation": GENERATION,
+        "runtime_retirement_token": None,
+        "pinned_idle_terminal_intent_at": None,
+        "metadata": {"protected_cloud": True},
+    }
+
+
+def _protected_deps(store=None, tasks=None):
+    return agent_cloud_mounts.AgentCloudMountDependencies(
+        store=store or SimpleNamespace(),
+        cloud_router=SimpleNamespace(),
+        cloud_tasks=tasks or SimpleNamespace(protected_engage_get=lambda key: None),
+        is_protected_cloud_mode_enabled=lambda: True,
+        cloud_workspace_driver=lambda: "rclone_mount",
+        slugify_mount_name=lambda name: name,
+    )
+
+
+@pytest.fixture
+def selection(monkeypatch):
+    """The engage's own selection check, reduced to what the planner relies
+    on: an active row of this runtime."""
+    calls: list[str] = []
+
+    def matches(row, mount_rows, *, thread_id, user_id, runtime_generation):
+        calls.append(runtime_generation)
+        return bool(
+            row
+            and row.get("status") == "active"
+            and row.get("runtime_generation") == runtime_generation
+            and thread_id == THREAD_ID
+        )
+
+    monkeypatch.setattr(
+        cloud_mount_plan, "_ro_mount_matches_protected_selection", matches
+    )
+    return calls
+
+
+async def _protected(monkeypatch, grant, *, store=None, tasks=None):
+    monkeypatch.setattr(
+        agent_cloud_mounts, "_resolve_protected_grant", AsyncMock(return_value=grant)
+    )
+    return await resolve_cloud_mount_plan(
+        _protected_thread(),
+        mount_rows=[{"id": "row-1"}],
+        settings=SETTINGS,
+        dependencies=_protected_deps(store, tasks),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_protected_session_gets_the_plane_for_its_lower_with_this_runtimes_grant(
+    monkeypatch, selection
+):
+    plan = await _protected(monkeypatch, _grant())
+    assert plan.protected is True and selection == [GENERATION]
+    (lower,) = plan.mounts
+    assert (lower.mount_kind, lower.access, lower.target) == (
+        "protected_lower",
+        "read_only",
+        "/srw/cloud/lower",
+    )
+    # The reader credential, in the credential file only.
+    assert plan.passwords == {0: READER_SECRET}
+    assert "srw-reader-u" in plan.rclone_config()
+    assert plan.overlay["merged"] == "/cloud/merged"
+    assert plan.overlay["lower"] == "/cloud/lower"
+    recorded = json.dumps(plan.recorded())
+    assert READER_SECRET not in recorded
+    assert plan.recorded()["protected_grant"] == {
+        "id": "aaaaaaaa-0000-4000-8000-000000000001",
+        "runtime_generation": GENERATION,
+        "engage_attempt": "bbbbbbbb-0000-4000-8000-000000000002",
+        "reader_id": "srw-reader-u",
+    }
+    spec = plan.sidecar_spec("ws-cloud-x")
+    assert spec.targets == (("/srw/cloud/lower", True),)
+    assert spec.dirs == ("/srw/cloud/merged",) and spec.protected is True
+    payload = agent_payload(plan.recorded())
+    assert payload["protected"] is True and payload["skip_workspace_links"] is True
+    assert READER_SECRET not in json.dumps(payload)
+
+
+@pytest.mark.asyncio
+async def test_the_planner_awaits_this_runtimes_engage_when_an_earlier_grant_stands(
+    monkeypatch, selection
+):
+    rows = {"row": _grant(status="engaging", runtime_generation=EARLIER_GENERATION)}
+
+    async def engage():
+        await asyncio.sleep(0)
+        rows["row"] = _grant(engage_attempt="dddddddd-0000-4000-8000-000000000004")
+
+    task = asyncio.ensure_future(engage())
+    store = SimpleNamespace(
+        get_ro_mount_by_thread=AsyncMock(side_effect=lambda tid: rows["row"])
+    )
+    keys: list = []
+    tasks = SimpleNamespace(
+        protected_engage_get=lambda key: (keys.append(key), task)[1]
+    )
+    plan = await _protected(monkeypatch, rows["row"], store=store, tasks=tasks)
+    assert keys == [(THREAD_ID, GENERATION)]
+    assert plan.protected_grant["engage_attempt"] == (
+        "dddddddd-0000-4000-8000-000000000004"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "grant",
+    [
+        None,
+        _grant(status="engaging"),
+        _grant(status="revoked"),
+        _grant(runtime_generation=EARLIER_GENERATION),
+        # OpenCloud's bearer reader: more than a static password.
+        _grant(credentials=None),
+    ],
+)
+async def test_without_this_runtimes_active_grant_the_session_keeps_the_old_path(
+    monkeypatch, selection, grant
+):
+    store = SimpleNamespace(get_ro_mount_by_thread=AsyncMock(return_value=grant))
+    assert await _protected(monkeypatch, grant, store=store) is None
+
+
+@pytest.mark.asyncio
+async def test_a_protected_session_without_runtime_authority_keeps_the_old_path(
+    monkeypatch, selection
+):
+    resolver = AsyncMock(return_value=_grant())
+    monkeypatch.setattr(agent_cloud_mounts, "_resolve_protected_grant", resolver)
+    thread = {**_protected_thread(), "runtime_retirement_token": 3}
+    assert (
+        await resolve_cloud_mount_plan(
+            thread, mount_rows=[], settings=SETTINGS, dependencies=_protected_deps()
+        )
+        is None
+    )
+    resolver.assert_not_awaited()
 
 
 # --------------------------------------------------------------------------- #

@@ -4,11 +4,11 @@
 //
 // One binary, three roles:
 //
-//	srw-fuse-opener serve --socket S --target DIR[:ro]... [--dir D]... --client-uid N [--read-only]
+//	srw-fuse-opener serve --socket S --target DIR[:ro]... [--dir D]... [--dir-uid U] --client-uid N [--read-only]
 //	    The privileged native sidecar. It owns the FUSE mountpoints DIR (one
 //	    --target each, read-only when suffixed :ro or with --read-only) in an
 //	    emptyDir it mounts with Bidirectional propagation, and creates each
-//	    plain directory D there without ever mounting on it; on start it
+//	    plain directory D there, owned by U, without ever mounting on it; on start it
 //	    detaches a dead mount it finds at a target. For each request on the
 //	    unix socket S (a volume the rclone sidecar mounts read-only) from uid
 //	    N it detaches a stale mount at the named target, opens /dev/fuse,

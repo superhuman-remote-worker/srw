@@ -38,10 +38,13 @@ type server struct {
 	// targets are the mountpoints this opener owns, in the order given;
 	// readOnly says which of them it mounts read-only whatever the client
 	// asks. dirs are plain directories it only creates: a mountpoint the
-	// workspace itself uses, such as the protected overlay's merged view.
+	// workspace itself uses, such as the protected overlay's merged view;
+	// dirUID (-1: root keeps them) owns them, since a non-root fusermount3
+	// needs write access to its mountpoint.
 	targets   []string
 	readOnly  map[string]bool
 	dirs      []string
+	dirUID    int
 	policy    policy // the base policy; its ReadOnly forces every target
 	clientUID int
 	mounter   mounter
@@ -231,16 +234,24 @@ func prepareTarget(m mounter, target string) (int, error) {
 	return detached, m.Check(target)
 }
 
-// prepareDir creates a plain directory the opener never mounts on, and
-// refuses one a symlink stands in for.
-func prepareDir(m mounter, dir string) error {
+// prepareDir creates a plain directory the opener never mounts on, refuses
+// one a symlink stands in for, and hands it to uid (-1 leaves it to root).
+// It runs before anything else in the Pod starts; lchown never follows a
+// link all the same.
+func prepareDir(m mounter, dir string, uid int) error {
 	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
 		return err
 	}
 	if err := os.Mkdir(dir, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
 		return err
 	}
-	return m.Check(dir)
+	if err := m.Check(dir); err != nil {
+		return err
+	}
+	if uid < 0 {
+		return nil
+	}
+	return os.Lchown(dir, uid, uid)
 }
 
 // prepare readies every target and directory and says how many dead mounts
@@ -255,7 +266,7 @@ func (s *server) prepare() (int, error) {
 		}
 	}
 	for _, dir := range s.dirs {
-		if err := prepareDir(s.mounter, dir); err != nil {
+		if err := prepareDir(s.mounter, dir, s.dirUID); err != nil {
 			return detached, err
 		}
 	}
@@ -393,6 +404,7 @@ func serveMain(args []string, stderr io.Writer) int {
 	flags.Var(&targets, "target", "a mountpoint this opener owns, PATH or PATH:ro (repeatable)")
 	var dirs dirFlag
 	flags.Var(&dirs, "dir", "a plain directory to create, never mounted on (repeatable)")
+	dirUID := flags.Int("dir-uid", -1, "the uid (and gid) that owns every --dir; -1 leaves them to root")
 	clientUID := flags.Int("client-uid", -1, "the only uid that may ask")
 	readOnly := flags.Bool("read-only", false, "force every mount read-only")
 	allowOther := flags.Bool("allow-other", true, "let other users enter the mount")
@@ -403,6 +415,10 @@ func serveMain(args []string, stderr io.Writer) int {
 	}
 	if *socketPath == "" || len(targets.paths) == 0 || *clientUID <= 0 {
 		fmt.Fprintln(stderr, "serve needs --socket, at least one --target and a non-root --client-uid")
+		return 2
+	}
+	if *dirUID < -1 {
+		fmt.Fprintln(stderr, "--dir-uid must be a uid or -1")
 		return 2
 	}
 	for _, dir := range dirs {
@@ -416,6 +432,7 @@ func serveMain(args []string, stderr io.Writer) int {
 		targets:   targets.paths,
 		readOnly:  targets.readOnly,
 		dirs:      dirs,
+		dirUID:    *dirUID,
 		policy:    policy{ReadOnly: *readOnly, AllowOther: *allowOther, Source: *source, Subtype: *subtype},
 		clientUID: *clientUID,
 		mounter:   systemMounter{},

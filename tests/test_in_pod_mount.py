@@ -37,7 +37,6 @@ from orchestrator.services.in_pod_mount import (
     CLOUD_VOLUME,
     CONTROL_VOLUME,
     CREDENTIAL_VOLUME,
-    MERGED_VOLUME,
     OPENER_CONTAINER,
     PLAN_VOLUME,
     RCLONE_CONTAINER,
@@ -48,6 +47,7 @@ from orchestrator.services.in_pod_mount import (
     add_cloud_mount_sidecars,
     objects_name_for,
     objects_name_from_pod,
+    workspace_can_mount,
 )
 from orchestrator.services.sandbox_workspace_settings import SandboxPodProfile
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
@@ -335,14 +335,24 @@ def test_a_workspace_that_could_mount_is_refused_unless_protected(plane_on):
     )
     add_cloud_mount_sidecars(manifest, protected, SETTINGS)
     workspace_mounts = mounts_of(manifest["spec"]["containers"][0])
-    # The overlay mounts on a writable dir the opener made in the read-only view.
-    assert workspace_mounts[MERGED_VOLUME] == {
-        "name": MERGED_VOLUME,
-        "mountPath": "/cloud/merged",
+    # The overlay mounts on the opener's directory itself, which agent-host
+    # owns: a nested volume would be a mountpoint the overlay's scripts read
+    # as an overlay already up, and a non-root fusermount3 needs write access.
+    assert workspace_mounts[CLOUD_VOLUME] == {
+        "name": CLOUD_VOLUME,
+        "mountPath": "/cloud",
+        "mountPropagation": "HostToContainer",
     }
-    assert init(manifest, OPENER_CONTAINER)["args"][-2:] == [
+    assert [v["name"] for v in manifest["spec"]["volumes"]].count(CLOUD_VOLUME) == 1
+    assert not any(
+        m["mountPath"].startswith("/cloud/")
+        for m in manifest["spec"]["containers"][0]["volumeMounts"]
+    )
+    assert init(manifest, OPENER_CONTAINER)["args"][-4:] == [
         "--dir",
         "/srw/cloud/merged",
+        "--dir-uid",
+        "1000",
     ]
 
 
@@ -354,9 +364,15 @@ def test_a_second_directory_a_shared_pid_namespace_or_a_second_pair_is_refused(
         targets=(("/srw/cloud/a", False),),
         objects_name="x",
         dirs=("/srw/cloud/b", "/srw/cloud/c"),
+        protected=True,
     )
     with pytest.raises(ValueError, match="at most one"):
         add_cloud_mount_sidecars(manifest, two, SETTINGS)
+    unprotected = SidecarSpec(
+        targets=(("/srw/cloud/a", False),), objects_name="x", dirs=("/srw/cloud/b",)
+    )
+    with pytest.raises(ValueError, match="only a protected"):
+        add_cloud_mount_sidecars(manifest, unprotected, SETTINGS)
     manifest["spec"]["shareProcessNamespace"] = True
     with pytest.raises(ValueError, match="PID namespace"):
         add_cloud_mount_sidecars(manifest, PLAN.sidecar_spec("x"), SETTINGS)
@@ -427,6 +443,47 @@ def test_only_a_sidecar_pod_loses_fuse_and_a_protected_one_keeps_it():
         mounts=(), excluded=(), drain_seconds=60, cache_size="10Gi", protected=True
     )
     assert ContainerProvisioner._profile_for_cloud_plan(profile, protected) is profile
+
+
+def test_a_protected_pod_keeps_fuse_for_its_overlay_on_the_sidecars_lower(plane_on):
+    lower = SidecarMount(
+        index=0,
+        name="lower",
+        mount_id=f"protected-{THREAD_ID}",
+        mount_kind="protected_lower",
+        source_ref=None,
+        backend="nextcloud",
+        access="read_only",
+        source_type="webdav",
+        source_config=(("url", "https://nc/remote.php/dav/files/srw-reader-u/"),),
+        root="",
+        flags=(),
+    )
+    plan = CloudMountPlan(
+        mounts=(lower,),
+        excluded=(),
+        drain_seconds=60,
+        cache_size="10Gi",
+        passwords={0: "reader-secret"},
+        protected=True,
+        overlay={"lower": "/cloud/lower", "merged": "/cloud/merged"},
+    )
+    manifest = build(ContainerProvisioner(), plan)
+    workspace = manifest["spec"]["containers"][0]
+    # The overlay (fuse-overlayfs) still runs in the workspace.
+    assert workspace_can_mount(workspace)
+    opener = init(manifest, OPENER_CONTAINER)
+    assert opener["args"][5:] == [
+        "--target",
+        "/srw/cloud/lower:ro",
+        "--dir",
+        "/srw/cloud/merged",
+        "--dir-uid",
+        "1000",
+    ]
+    view = mounts_of(workspace)[CLOUD_VOLUME]
+    assert "readOnly" not in view and view["mountPropagation"] == "HostToContainer"
+    assert "reader-secret" not in json.dumps(manifest)
 
 
 def _fingerprint(provisioner: ContainerProvisioner, plan=None) -> str:

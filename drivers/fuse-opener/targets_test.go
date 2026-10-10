@@ -87,6 +87,8 @@ func TestPrepareCreatesEveryTargetAndDirectory(t *testing.T) {
 	s := newServer(fake, 65534)
 	s.targets = []string{filepath.Join(root, "cloud", "a"), filepath.Join(root, "cloud", "b")}
 	s.dirs = []string{filepath.Join(root, "cloud", "merged")}
+	// The only uid an unprivileged test may hand a directory to is its own.
+	s.dirUID = os.Getuid()
 	if detached, err := s.prepare(); err != nil || detached != 0 {
 		t.Fatalf("%d detached, %v", detached, err)
 	}
@@ -94,6 +96,10 @@ func TestPrepareCreatesEveryTargetAndDirectory(t *testing.T) {
 		if info, err := os.Stat(path); err != nil || !info.IsDir() {
 			t.Fatalf("%s: %v", path, err)
 		}
+	}
+	info, _ := os.Lstat(s.dirs[0])
+	if owner := info.Sys().(*syscall.Stat_t).Uid; int(owner) != s.dirUID {
+		t.Fatalf("the directory belongs to %d, not the --dir-uid", owner)
 	}
 	if fake.count("check") != 3 {
 		t.Fatalf("every path is checked: %d", fake.count("check"))
@@ -136,5 +142,10 @@ func TestServeReadsRepeatedTargetsAndDirs(t *testing.T) {
 	stderr.Reset()
 	if code := serveMain([]string{"--socket", "/tmp/x.sock", "--client-uid", "65534"}, &stderr); code != 2 {
 		t.Fatalf("no target: exit %d", code)
+	}
+	stderr.Reset()
+	code = serveMain([]string{"--socket", "/tmp/x.sock", "--client-uid", "65534", "--target", "/srw/cloud/a", "--dir", "/srw/cloud/b", "--dir-uid", "-2"}, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "--dir-uid") {
+		t.Fatalf("a negative --dir-uid: exit %d: %s", code, stderr.String())
 	}
 }

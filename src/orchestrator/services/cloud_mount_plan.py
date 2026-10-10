@@ -17,13 +17,22 @@ halves:
   workspace, never a log line here.
 
 The plan uses the in-pod plane wholesale or not at all. A Pod's ``/cloud``
-is the sidecar volume, read-only to the workspace, so the old in-workspace
-rclone cannot add a mount beside it. :func:`resolve_cloud_mount_plan`
+is the sidecar volume, read-only to an unprotected workspace, so the old
+in-workspace rclone cannot add a mount beside it. :func:`resolve_cloud_mount_plan`
 returns ``None`` (the old path, unchanged) when the plane is off, for an
 officer, for a malformed protected marker, and when any mount of the set
 needs more than a static password: OpenCloud's bearer tokens are refreshed
 by the agent into the workspace and stay there until the sidecar has a
 token helper. VM, lite-tier and job workspaces never reach this module.
+
+A protected session gets the plane only for its read-only lower layer, and
+only when this runtime's reader grant is active when the Pod is created:
+the lower is mounted by the sidecars with the reader credential, while the
+capture overlay stays in the workspace, which keeps its FUSE profile for
+it. The plan records which grant it was made from (row, runtime, engage
+attempt, reader; never the credential), and attach refuses the Pod when the
+thread's grant is no longer that one. A slow or refused engage keeps the
+in-workspace path.
 
 Which folders a session gets is still today's rule (``_resolve_live_mount_set``:
 every ``thread_mounts`` row, or the session folder when one cannot be
@@ -37,6 +46,7 @@ Design: knowledge-base/knowledge/features/connector_drivers.md (D7, decisions
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
@@ -60,8 +70,12 @@ from orchestrator.services.in_pod_mount import (
     InPodPlaneSettings,
     SidecarSpec,
 )
+from orchestrator.services.protected_cloud_engage import (
+    _ro_mount_matches_protected_selection,
+)
 from orchestrator.services.session_runtime_admission import (
     protected_cloud_marker_state,
+    thread_runtime_authority,
 )
 from orchestrator.services.stateless_workspace_gate import thread_metadata_object
 
@@ -199,6 +213,9 @@ class CloudMountPlan:
     )
     protected: bool = False
     overlay: Mapping[str, Any] | None = None
+    #: The reader grant a protected plan was made from: ``id``,
+    #: ``runtime_generation``, ``engage_attempt`` and ``reader_id``.
+    protected_grant: Mapping[str, str] | None = None
 
     def recorded(self) -> dict[str, Any]:
         """The non-secret plan, with its fingerprint."""
@@ -211,6 +228,9 @@ class CloudMountPlan:
             "cache_size": self.cache_size,
             "protected": self.protected,
             "overlay": dict(self.overlay) if self.overlay else None,
+            "protected_grant": (
+                dict(self.protected_grant) if self.protected_grant else None
+            ),
         }
         return {**body, "fingerprint": plan_fingerprint(body)}
 
@@ -371,6 +391,11 @@ def _sidecar_mount(
     return mount, password
 
 
+#: How long the planner awaits this runtime's in-flight engage, as attach
+#: does.
+PROTECTED_ENGAGE_WAIT_SECONDS = 30
+
+
 def _container_rclone_allowed() -> bool:
     allow = os.getenv("CLOUD_RCLONE_ALLOW_CONTAINER", "true").lower()
     return allow not in {"0", "false", "no", "off"}
@@ -405,8 +430,17 @@ async def resolve_cloud_mount_plan(
     metadata = thread_metadata_object(thread)
     if _officer(metadata):
         return None
-    if protected_cloud_marker_state(metadata) != "off":
+    marker = protected_cloud_marker_state(metadata)
+    if marker == "malformed":
         return None
+    if marker == "on":
+        return await _protected_plan(
+            thread,
+            metadata,
+            mount_rows=mount_rows,
+            settings=settings,
+            dependencies=dependencies,
+        )
 
     live = await agent_cloud_mounts._resolve_live_mount_set(
         thread,
@@ -446,6 +480,90 @@ async def resolve_cloud_mount_plan(
     )
 
 
+async def _protected_plan(
+    thread: dict[str, Any],
+    metadata: dict[str, Any],
+    *,
+    mount_rows: list[dict[str, Any]] | None,
+    settings: InPodPlaneSettings,
+    dependencies: agent_cloud_mounts.AgentCloudMountDependencies,
+) -> CloudMountPlan | None:
+    """A protected session's plan: its read-only lower layer from the
+    sidecars with the per-mount reader credential this runtime's engage
+    minted, the capture overlay still in the workspace, which keeps its FUSE
+    profile for it.
+
+    ``None`` (the in-workspace path, unchanged) unless this runtime's grant
+    is active now. It awaits the same engage task an attach would, also when
+    an earlier runtime's row still stands (the engage replaces it in place);
+    a slow or refused engage keeps today's behaviour, where attach may still
+    pick the grant up and protected threads otherwise get no cloud at all,
+    never a live mount.
+    """
+    authority = thread_runtime_authority(thread)
+    if authority is None:
+        return None
+    tid = str(thread.get("id"))
+
+    def current(row: Mapping[str, Any] | None) -> bool:
+        return _ro_mount_matches_protected_selection(
+            row,
+            mount_rows,
+            thread_id=tid,
+            user_id=str(thread.get("user_id") or ""),
+            runtime_generation=authority.generation,
+        )
+
+    row = await agent_cloud_mounts._resolve_protected_grant(
+        thread, metadata=metadata, dependencies=dependencies
+    )
+    granted = row is not None and current(row)
+    if row is not None and not granted:
+        task = dependencies.cloud_tasks.protected_engage_get(
+            (tid, authority.generation)
+        )
+        if task is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task), timeout=PROTECTED_ENGAGE_WAIT_SECONDS
+                )
+            except Exception:
+                pass
+            row = await dependencies.store.get_ro_mount_by_thread(tid)
+            granted = row is not None and current(row)
+    if not granted:
+        return None
+    payload = agent_cloud_mounts._build_protected_cloud_mount(row, thread_id=tid)
+    if not payload or len(payload.get("mounts") or []) != 1:
+        return None
+    overlay = payload.get("overlay")
+    if not isinstance(overlay, Mapping):
+        return None
+    cache_bytes = _quantity_bytes(settings.cache_size) // 2
+    built = _sidecar_mount(0, payload["mounts"][0], cache_bytes=cache_bytes)
+    if built is None or built[0].access != "read_only":
+        return None
+    mount, password = built
+    return CloudMountPlan(
+        mounts=(mount,),
+        excluded=(),
+        drain_seconds=settings.drain_seconds,
+        cache_size=settings.cache_size,
+        passwords={0: password},
+        protected=True,
+        overlay=dict(overlay),
+        protected_grant=protected_grant_identity(row),
+    )
+
+
+def protected_grant_identity(row: Mapping[str, Any]) -> dict[str, str]:
+    """What a protected plan records of its reader grant: no credential."""
+    return {
+        key: str(row.get(key) or "")
+        for key in ("id", "runtime_generation", "engage_attempt", "reader_id")
+    }
+
+
 def plan_annotation(plan: CloudMountPlan) -> str:
     return json.dumps(plan.recorded(), sort_keys=True, separators=(",", ":"))
 
@@ -455,6 +573,7 @@ __all__ = [
     "CloudMountPlan",
     "SidecarMount",
     "plan_annotation",
+    "protected_grant_identity",
     "rclone_obscure",
     "rclone_reveal",
     "resolve_cloud_mount_plan",

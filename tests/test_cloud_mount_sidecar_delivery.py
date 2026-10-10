@@ -181,6 +181,125 @@ async def test_end_reconstructs_the_sidecar_payload_only_for_the_exact_retiring_
 
 
 # --------------------------------------------------------------------------- #
+# A protected sidecar Pod (Phase B)
+# --------------------------------------------------------------------------- #
+
+GRANT = {
+    "id": "aaaaaaaa-0000-4000-8000-000000000001",
+    "runtime_generation": "66666666-6666-4666-8666-666666666666",
+    "engage_attempt": "bbbbbbbb-0000-4000-8000-000000000002",
+    "reader_id": "srw-reader-u",
+}
+
+
+def _protected_plan() -> CloudMountPlan:
+    mount = SidecarMount(
+        index=0,
+        name="lower",
+        mount_id=f"protected-{THREAD_ID}",
+        mount_kind="protected_lower",
+        source_ref=None,
+        backend="nextcloud",
+        access="read_only",
+        source_type="webdav",
+        source_config=(
+            ("url", "https://nc.internal/remote.php/dav/files/srw-reader-u/"),
+            ("user", "srw-reader-u"),
+        ),
+        root="",
+        flags=(),
+    )
+    return CloudMountPlan(
+        mounts=(mount,),
+        excluded=(),
+        drain_seconds=60,
+        cache_size="10Gi",
+        passwords={0: "reader-secret"},
+        protected=True,
+        overlay={
+            "lower": "/cloud/lower",
+            "upper": "/home/agent-host/.overlay/upper",
+            "work": "/home/agent-host/.overlay/work",
+            "merged": "/cloud/merged",
+            "quota_bytes": 8 * 1024**3,
+        },
+        protected_grant=GRANT,
+    )
+
+
+def _protected_metadata() -> dict:
+    return {
+        "protected_cloud": True,
+        "workspace_container": {
+            "status": "ready",
+            "pod_ip": "10.0.0.9",
+            "_runtime_incarnation": POD_UID,
+            PLAN_CONTEXT_KEY: {
+                **_protected_plan().recorded(),
+                "runtime_incarnation": POD_UID,
+            },
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_protected_sidecar_pod_gets_its_lower_and_overlay_without_a_credential(
+    monkeypatch,
+):
+    resolver = AsyncMock()
+    monkeypatch.setattr(agent_cloud_mounts, "_resolve_protected_grant", resolver)
+    payload = await agent_cloud_mounts._build_agent_cloud_mount(
+        {"id": THREAD_ID},
+        mount_rows=[],
+        metadata=_protected_metadata(),
+        dependencies=_deps(),
+    )
+    assert payload["delivery"] == "sidecar" and payload["protected"] is True
+    assert payload["skip_workspace_links"] is True
+    assert payload["overlay"]["merged"] == "/cloud/merged"
+    assert payload["mounts"] == [
+        {
+            "index": 0,
+            "mount_id": f"protected-{THREAD_ID}",
+            "mount_kind": "protected_lower",
+            "target_path": "/cloud/lower",
+            "workspace_name": "lower",
+            "access": "read_only",
+        }
+    ]
+    text = json.dumps(payload)
+    assert "reader-secret" not in text and "remote.php" not in text
+    # The Pod's plan answers; no engage or row read on this path.
+    resolver.assert_not_awaited()
+
+
+def test_attach_accepts_a_protected_sidecar_pod_only_with_the_grant_it_holds():
+    from orchestrator.services.thread_workspace_delivery import _sidecar_holds_grant
+
+    metadata = _protected_metadata()
+    row = {**GRANT, "status": "active", "credentials": "reader-secret"}
+    assert _sidecar_holds_grant(metadata, row) is True
+    # A re-engaged or re-minted grant, a later runtime, another reader: the
+    # sidecar's credential is not that grant's.
+    for key, value in (
+        ("engage_attempt", "dddddddd-0000-4000-8000-000000000004"),
+        ("runtime_generation", "77777777-7777-4777-8777-777777777777"),
+        ("id", "eeeeeeee-0000-4000-8000-000000000005"),
+        ("reader_id", "srw-reader-v"),
+    ):
+        assert _sidecar_holds_grant(metadata, {**row, key: value}) is False, key
+    assert _sidecar_holds_grant(metadata, None) is False
+    # An unprotected sidecar Pod holds no grant at all.
+    assert _sidecar_holds_grant(_metadata(), row) is False
+    # Nor does a Pod whose plan belongs to another incarnation.
+    stale = _protected_metadata()
+    stale["workspace_container"]["_runtime_incarnation"] = (
+        "00000000-0000-4000-8000-000000000000"
+    )
+    assert _sidecar_holds_grant(stale, row) is False
+
+
+# --------------------------------------------------------------------------- #
 # The workspace poll, new agent and old agent
 # --------------------------------------------------------------------------- #
 
@@ -332,6 +451,255 @@ async def test_an_older_agent_is_recorded_and_the_poll_never_fails():
     )
     assert merges[0]["notice"] == "agent_outdated" and merges[0]["mounts"] == {}
     await cloud_mount_status.record_agent_outdated(SimpleNamespace(), THREAD_ID, {})
+
+
+async def _protected_poll(*, recorded_attempt: str, header: str | None = "sidecar"):
+    """The real protected pinned delivery (the harness of
+    test_session_config_plumbing's reader-attempt fence) for a Pod whose
+    sidecars mount the lower from the grant its plan recorded."""
+    import orchestrator.main as orch_main
+    from orchestrator.services import (
+        container_provisioner as container_provisioner_module,
+        dispatch_credentials,
+        protected_cloud_engage,
+        session_config_resolution,
+        thread_mount_rows,
+        thread_project_authorization,
+        thread_workspace_delivery,
+        workspace_tier_policy,
+    )
+    from orchestrator.services.cloud.protected_reader_authority import (
+        ProtectedNextcloudReaderGrantPlan,
+    )
+    from orchestrator.services.cloud_staging.source_identity import (
+        ProtectedMountSourceIdentity,
+    )
+    from tests import _b09_control_seams as control_seams
+
+    thread_id = "00000000-0000-4000-8000-0000000000c3"
+    agent_id = "00000000-0000-4000-8000-0000000000a1"
+    generation = "00000000-0000-4000-8000-0000000000d4"
+    attach_token = "00000000-0000-4000-8000-0000000000e5"
+    attempt = "00000000-0000-4000-8000-0000000000f1"
+    backend_instance_id = "00000000-0000-4000-8000-000000000061"
+    mount_rows = [
+        {
+            "id": "00000000-0000-4000-8000-000000000071",
+            "mount_kind": "project",
+            "backend_id": "nextcloud",
+            "backend_instance_id": backend_instance_id,
+            "source_kind": "project_folder",
+            "source_ref": "00000000-0000-4000-8000-000000000062",
+            "target_path": "projects/proj",
+            "cloud_handle": (
+                '{"backend":"nextcloud","native_id":"42",'
+                '"vendor_meta":{"mountpoint":"Proj"}}'
+            ),
+        }
+    ]
+    source = ProtectedMountSourceIdentity.from_mount_row(mount_rows[0])
+    grant_plan = ProtectedNextcloudReaderGrantPlan(
+        engage_attempt=attempt,
+        backend_instance_id=backend_instance_id,
+        source=source,
+    )
+    ro_row = {
+        "id": "00000000-0000-4000-8000-000000000081",
+        "selected_mount_id": mount_rows[0]["id"],
+        "thread_id": thread_id,
+        "user_id": "user-1",
+        "backend": "nextcloud",
+        "backend_instance_id": backend_instance_id,
+        "reader_id": grant_plan.reader_id,
+        "grant_group_id": grant_plan.group_id,
+        "grant_handle": grant_plan.grant_handle,
+        "grant_handle_sha256": grant_plan.grant_handle_sha256,
+        "source_binding": source.binding,
+        "source_binding_sha256": source.sha256,
+        "credentials": "credential-a1-sentinel",
+        "webdav_url": (
+            "https://nc.internal/remote.php/dav/files/"
+            f"{grant_plan.reader_id}/{grant_plan.mountpoint}/"
+        ),
+        "auth_kind": "basic",
+        "status": "active",
+        "etag_baseline": {},
+        "runtime_generation": generation,
+        "engage_attempt": attempt,
+    }
+    plan = _protected_plan()
+    plan = CloudMountPlan(
+        **{
+            **{f: getattr(plan, f) for f in plan.__dataclass_fields__},
+            "protected_grant": {
+                "id": ro_row["id"],
+                "runtime_generation": generation,
+                "engage_attempt": recorded_attempt,
+                "reader_id": grant_plan.reader_id,
+            },
+        }
+    )
+    incarnation = "00000000-0000-4000-8000-000000000092"
+    workspace = {
+        "status": "ready",
+        "provisioner": "k8s",
+        "pod_ip": "10.42.0.10",
+        "pod_port": 30022,
+        "_canvas_workspace_generation": "00000000-0000-4000-8000-000000000091",
+        "_runtime_incarnation": incarnation,
+        PLAN_CONTEXT_KEY: {**plan.recorded(), "runtime_incarnation": incarnation},
+    }
+    attestation = container_provisioner_module.WorkspaceRuntimeAttestation(
+        backing_id="k8s-pvc:agent-workspaces:pvc-uid-a1",
+        workspace_generation=workspace["_canvas_workspace_generation"],
+        runtime_incarnation=incarnation,
+        ssh_host_key_fingerprint="SHA256:trusted-a1",
+        host="workspace-session.agent-workspaces.svc.cluster.local",
+        pod_ip=workspace["pod_ip"],
+        port=workspace["pod_port"],
+    )
+    thread = {
+        "id": thread_id,
+        "execution_lane": "pinned",
+        "status": "created",
+        "agent_id": agent_id,
+        "runtime_generation": generation,
+        "runtime_attach_token": attach_token,
+        "runtime_retirement_token": None,
+        "user_id": "user-1",
+        "project_id": None,
+        "metadata": {
+            "protected_cloud": True,
+            "config_override": {"workspace": {"backend": "sandbox"}},
+            "workspace_container": workspace,
+            "_workspace_binding": {
+                "generation": workspace["_canvas_workspace_generation"],
+                "kind": "remote",
+                "backing_id": "k8s-pvc:agent-workspaces:pvc-uid-a1",
+                "ssh_host_key_fingerprint": "SHA256:trusted-a1",
+                "runtime_incarnation": incarnation,
+            },
+        },
+    }
+    store = orch_main.app.state.resources.postgres_db
+    sidecar = agent_cloud_mounts.agent_payload(plan.recorded())
+    with (
+        patch.object(store, "get_thread", AsyncMock(return_value=thread)),
+        patch.object(
+            container_provisioner_module.container_provisioner,
+            "attest_workspace_runtime",
+            AsyncMock(return_value=attestation),
+        ),
+        patch.object(
+            store, "pinned_thread_agent_is_reciprocal", AsyncMock(return_value=True)
+        ),
+        patch.object(
+            protected_cloud_engage,
+            "_protected_cloud_delivery_state",
+            AsyncMock(return_value=("ready", None)),
+        ),
+        patch.object(store, "get_ro_mount_by_thread", AsyncMock(return_value=ro_row)),
+        patch.object(store, "list_thread_mounts", AsyncMock(return_value=mount_rows)),
+        patch.object(
+            thread_mount_rows, "thread_project_ids", AsyncMock(return_value=[])
+        ),
+        patch.object(
+            thread_project_authorization,
+            "revalidate_thread_project_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch.object(
+            thread_workspace_delivery,
+            "agent_canvas_workspace_capabilities",
+            return_value=(False, False, False),
+        ),
+        patch.object(
+            thread_mount_rows,
+            "resolve_thread_datasources",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(
+            agent_cloud_mounts,
+            "_build_agent_cloud_mount",
+            AsyncMock(return_value=sidecar),
+        ),
+        patch.object(agent_cloud_mounts, "_build_agent_cloud_sync", return_value=None),
+        patch.object(
+            dispatch_credentials,
+            "inject_thread_dispatch_credentials",
+            AsyncMock(return_value={"workspace": {"backend": "sandbox"}}),
+        ),
+        patch.object(
+            session_config_resolution,
+            "resolve_session_config",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(
+            thread_mount_rows,
+            "resolve_thread_repositories",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(
+            store,
+            "managed_repository_authorities_are_current",
+            AsyncMock(return_value=True),
+        ),
+        patch.object(
+            workspace_tier_policy,
+            "inject_lite_workspace_config",
+            side_effect=lambda value, **_kwargs: value,
+        ),
+    ):
+        return await control_seams.agent_get_thread_workspace_locked(
+            thread_id,
+            presented_agent_id=agent_id,
+            presented_runtime_generation=generation,
+            presented_attach_token=attach_token,
+            presented_cloud_mount_delivery=header,
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_protected_sidecar_pod_is_ready_without_the_reader_credential():
+    response = await _protected_poll(
+        recorded_attempt="00000000-0000-4000-8000-0000000000f1"
+    )
+    assert response["protected_cloud_state"] == "ready"
+    assert response["cloud_mount"] is None
+    assert response["cloud_sync"] is None and response["nc_session_folder"] is None
+    sidecar = response["cloud_mount_sidecar"]
+    assert sidecar["protected"] is True and sidecar["delivery"] == "sidecar"
+    assert "credential-a1-sentinel" not in json.dumps(response, default=str)
+
+
+@pytest.mark.asyncio
+async def test_a_protected_sidecar_pod_holding_a_replaced_grant_fails_closed():
+    response = await _protected_poll(
+        recorded_attempt="00000000-0000-4000-8000-0000000000f2"
+    )
+    assert response["protected_cloud_state"] == "failed"
+    assert response["protected_cloud_error_code"] == "engage_refused"
+    assert "credential-a1-sentinel" not in json.dumps(response, default=str)
+    assert response.get("cloud_mount_sidecar") is None
+
+
+@pytest.mark.asyncio
+async def test_an_older_agent_on_a_protected_sidecar_pod_fails_closed_and_says_why():
+    """An agent image from before D7 validates the protected ``cloud_mount``
+    it expects and, finding none, refuses protected cloud with
+    ProtectedCloudUnavailable (a WorkspaceNotReady): the session gets no cloud
+    rather than a half-protected one, never a crash; the poll marks the
+    agent outdated, which the state records for the cockpit."""
+    from agent.api import session_contract, session_workspace
+
+    response = await _protected_poll(
+        recorded_attempt="00000000-0000-4000-8000-0000000000f1", header=None
+    )
+    assert response["cloud_mount_agent_outdated"] is True
+    assert response["cloud_mount"] is None
+    with pytest.raises(session_contract.ProtectedCloudUnavailable):
+        # What the older agent runs on this response.
+        session_workspace.validate_protected_cloud_mount(response["cloud_mount"])
 
 
 # --------------------------------------------------------------------------- #
