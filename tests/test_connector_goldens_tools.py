@@ -32,7 +32,7 @@ from orchestrator.services.deployment_gates import (
     mcp_datasources_enabled,
 )
 from shared.datasource_policy import datasource_tool_categories
-from tests._connector_goldens import Golden, all_rows, resolved_row
+from tests._connector_goldens import KINDS, Golden, all_rows, resolved_row
 
 
 @dataclass(frozen=True)
@@ -44,6 +44,8 @@ class ToolCase:
 
 
 _SECOND_EMAIL = "d5000b0c-0000-0000-0000-000000000b0c"
+#: A user other than the connector's creator.
+_OTHER = "00000000-0000-0000-0000-0000000000c2"
 
 CASES: dict[str, ToolCase] = {
     "none_attached": ToolCase([]),
@@ -122,6 +124,43 @@ CASES: dict[str, ToolCase] = {
     "mcp_stdio_alone": ToolCase([resolved_row("mcp_stdio")]),
     "mcp_read_only_link_still_wildcard": ToolCase(
         [resolved_row("mcp_remote", project_read_only=True)]
+    ),
+    # The creator's read-only tag joins the project link (decisions 31 and
+    # 32): both sides bind the read tools whatever the link says, for the
+    # owner and every consumer alike.
+    "all_kinds_creator_read_only_link_read_write": ToolCase(
+        [resolved_row(kind, read_only=True) for kind in KINDS]
+    ),
+    "all_kinds_public_no_mode_set_consumer": ToolCase(
+        [resolved_row(kind, is_global=True, created_by=_OTHER) for kind in KINDS]
+    ),
+    # Published read-write: the link decides, as for any connector.
+    "all_kinds_public_read_write_consumer": ToolCase(
+        [
+            resolved_row(kind, read_only=False, is_global=True, created_by=_OTHER)
+            for kind in KINDS
+        ]
+    ),
+    # One tagged and one untagged connector of a type: any read-write one
+    # still grants the write tools, as with two links.
+    "postgresql_creator_read_only_and_read_write": ToolCase(
+        [
+            resolved_row("postgresql", read_only=True),
+            resolved_row(
+                "postgresql",
+                id="d5000b08-0000-0000-0000-000000000b08",
+                name="Reporting DB",
+            ),
+        ]
+    ),
+    "email_creator_read_only_floors_send": ToolCase(
+        [
+            resolved_row(
+                "email",
+                read_only=True,
+                config={"access": "send", "folders": ["INBOX"]},
+            )
+        ]
     ),
     "existing_override_is_merged": ToolCase(
         [resolved_row("neo4j"), resolved_row("webdav", project_read_only=True)],

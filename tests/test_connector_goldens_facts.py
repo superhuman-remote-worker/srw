@@ -37,11 +37,6 @@ from orchestrator.services.deployment_gates import (
 )
 from tests._connector_goldens import KINDS, PROJECT_ID, Golden, all_rows, resolved_row
 
-_DECLARED_READ_ONLY_DROPPED = (
-    "the payload never forwards the publisher's declared read_only flag, so "
-    "the README's 'declared read-only' advisory cannot render"
-)
-
 
 @dataclass(frozen=True)
 class ReadmeCase:
@@ -122,12 +117,14 @@ README_CASES: dict[str, ReadmeCase] = {
             resolved_row("generic_file", credentials={"files": []}),
         ],
     ),
-    "declared_read_only_via_payload": ReadmeCase(
+    # The creator's read-only tag reaches the agent as ``project_read_only``
+    # (decisions 31 and 32), so the README states read-only tools; the
+    # advisory ``read_only`` suffix still never renders from a payload.
+    "creator_read_only_via_payload": ReadmeCase(
         [
             resolved_row(kind, read_only=True, is_global=True)
             for kind in ("generic", "postgresql", "webdav", "email")
         ],
-        pinned_defect=_DECLARED_READ_ONLY_DROPPED,
     ),
     # Reachable only if an entry carries ``read_only``; pins the renderer's
     # own branch for the D1b materializer move.
@@ -185,6 +182,14 @@ for _kind in ("postgresql", "neo4j", "mongodb", "webdav"):
     NOTE_CASES[f"{_kind}/read_only"] = NoteCase(
         resolved_row(_kind, project_read_only=True)
     )
+    # The note states the level executions bind: the creator's tag under a
+    # read-write link, and a public connector with no mode set.
+    NOTE_CASES[f"{_kind}/creator_read_only"] = NoteCase(
+        resolved_row(_kind, read_only=True, project_read_only=False)
+    )
+NOTE_CASES["postgresql/public_no_mode_set"] = NoteCase(
+    resolved_row("postgresql", is_global=True)
+)
 NOTE_CASES.update(
     {
         "generic/credentials_stored_as_json_string": NoteCase(

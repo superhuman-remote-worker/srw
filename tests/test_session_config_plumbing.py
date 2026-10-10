@@ -1757,6 +1757,157 @@ class TestSendSessionAttachPayload:
         assert payload["datasources"][0]["datasource_id"] == current_id
         assert stale_id not in str(payload["datasources"])
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tag",
+        [
+            # Tagged read-only by its creator; the project links it read-write.
+            {"read_only": True, "is_global": False},
+            # Another user's public connector with no mode set (decision 32).
+            {"read_only": None, "is_global": True},
+        ],
+    )
+    async def test_attach_binds_a_creator_read_only_connector_read_only(self, tag):
+        """Decision 31 in a session: the creator's tag, not the read-write
+        project link, decides the tools of a connector another user owns."""
+        connector_id = "66666666-7777-4888-8999-bbbbbbbbbbbb"
+        project_id = "99999999-2222-4333-8444-555555555555"
+        thread = self._thread(
+            user_id="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            metadata={"datasource_ids": [connector_id]},
+        )
+        row = {
+            "id": connector_id,
+            "type": "postgresql",
+            "name": "Orders DB",
+            "description": None,
+            "connection_url": "postgresql://reader@db/orders",
+            "credentials": {"password": "s3cret"},
+            "config": {},
+            "created_by": "00000000-0000-0000-0000-0000000000c2",
+            "project_read_only": False,
+            "policy_revision": 2,
+            **tag,
+        }
+        _FakeAsyncClient.response_status = 500
+        with (
+            patch.object(
+                orch_main.app.state.resources.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                thread_mount_rows_module,
+                "thread_project_ids",
+                AsyncMock(return_value=[project_id]),
+            ),
+            patch.object(
+                thread_project_authorization_module,
+                "revalidate_thread_project_ids",
+                AsyncMock(return_value=[project_id]),
+            ),
+            patch.object(
+                thread_datasource_authorization,
+                "revalidate_thread_datasource_selection",
+                AsyncMock(return_value=([connector_id], {connector_id: 2})),
+            ),
+            patch.object(
+                orch_main.app.state.resources.postgres_db,
+                "resolve_datasources_for_thread",
+                AsyncMock(return_value=[row]),
+            ),
+            patch.object(
+                deployment_gates_module, "is_experts_db_enabled", return_value=False
+            ),
+            patch.object(httpx, "AsyncClient", _FakeAsyncClient),
+        ):
+            ok = await session_attach_binding_module.send_session_attach(
+                {"id": self.agent_id, "pod_ip": "10.0.0.1", "pod_port": 8001},
+                self.thread_id,
+                {},
+                [project_id],
+                config_name="persistent_defaults",
+                dependencies=sessions_composition.session_attach_binding_dependencies(
+                    orch_main.app.state.resources
+                ),
+            )
+
+        assert ok is True
+        payload = _FakeAsyncClient.calls[0]["json"]
+        (entry,) = payload["datasources"]
+        assert entry["project_read_only"] is True
+        assert payload["config_override"]["tools"]["sql"] == [
+            "sql_query",
+            "sql_schema",
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("execution_lane", ["stateless", "pinned"])
+    async def test_both_lanes_assemble_the_creators_tag_read_only(self, execution_lane):
+        """The stateless claim and the pinned attach share this assembly, so
+        a tagged connector binds read-only in either lane."""
+        thread = self._thread(
+            user_id="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            execution_lane=execution_lane,
+        )
+        row = {
+            "id": "66666666-7777-4888-8999-cccccccccccc",
+            "type": "webdav",
+            "name": "Team files",
+            "description": None,
+            "connection_url": "https://cloud.example.test/remote.php/dav",
+            "credentials": {"username": "reader", "password": "s3cret"},
+            "config": {},
+            "created_by": "00000000-0000-0000-0000-0000000000c2",
+            "read_only": True,
+            "is_global": True,
+            "project_read_only": None,
+        }
+        with (
+            patch.object(
+                orch_main.app.state.resources.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                workspace_tier_policy_module,
+                "inject_lite_workspace_config",
+                side_effect=lambda value, **_kwargs: value,
+            ),
+            patch.object(
+                thread_mount_rows_module,
+                "thread_project_ids",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                thread_project_authorization_module,
+                "revalidate_thread_project_ids",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                thread_datasource_authorization_module,
+                "resolve_authorized_thread_datasources",
+                AsyncMock(return_value=[row]),
+            ),
+            patch.object(
+                deployment_gates_module, "is_experts_db_enabled", return_value=False
+            ),
+        ):
+            payload = await session_attach_payload.assemble_session_attach_payload(
+                self.thread_id,
+                dependencies=preparation_composition.session_attach_payload_dependencies(
+                    orch_main.app.state.resources
+                ),
+            )
+
+        (entry,) = payload["datasources"]
+        assert entry["project_read_only"] is True
+        assert payload["config_override"]["tools"]["webdav"] == [
+            "webdav_list",
+            "webdav_read",
+            "webdav_info",
+        ]
+
 
 class TestColdSessionDatasourceDelivery:
     @pytest.mark.asyncio

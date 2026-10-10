@@ -154,7 +154,12 @@ from orchestrator.services.pinned_k8s_effect import (
     run_bounded_k8s_mutation,
 )
 from shared.connectors.builtin import IMAGE_DRIVER_SPEC, spec_for_row
-from shared.connectors.contract import PROTOCOL_VERSION, DriverSpec, effective_access
+from shared.connectors.contract import (
+    CONNECTOR_READ_ONLY_SQL,
+    PROTOCOL_VERSION,
+    DriverSpec,
+    effective_access,
+)
 from shared.connectors.envelope import (
     DriverError,
     DriverOutcome,
@@ -1709,8 +1714,13 @@ async def prepare_bind_time_bindings(
     )
 
 
-_JOB_TARGETS = """
-SELECT a.connector_id, COALESCE(pd.read_only, false) AS read_only, d.name
+#: Whether an execution binds ``d`` read-only, as its delivery does
+#: (``bound_read_only``): its project link (``pd``) or its creator's tag.
+_BOUND_READ_ONLY_SQL = (
+    f"(COALESCE(pd.read_only, false) OR COALESCE({CONNECTOR_READ_ONLY_SQL}, false))"
+)
+_JOB_TARGETS = f"""
+SELECT a.connector_id, {_BOUND_READ_ONLY_SQL} AS read_only, d.name
   FROM job_datasources jd
   JOIN jobs j ON j.id = jd.job_id
   JOIN datasources d ON d.id = jd.datasource_id
@@ -1719,11 +1729,12 @@ SELECT a.connector_id, COALESCE(pd.read_only, false) AS read_only, d.name
     ON pd.datasource_id = a.connector_id AND pd.project_id = j.project_id
  WHERE jd.job_id = $1
 """
-_THREAD_TARGETS = """
-SELECT a.connector_id, COALESCE(pd.read_only, false) AS read_only, NULL AS name
+_THREAD_TARGETS = f"""
+SELECT a.connector_id, {_BOUND_READ_ONLY_SQL} AS read_only, NULL AS name
   FROM threads t
   JOIN connector_driver_assignments a
     ON COALESCE(t.metadata->'datasource_ids', '[]'::jsonb) ? a.connector_id::text
+  JOIN datasources d ON d.id = a.connector_id
   LEFT JOIN project_datasources pd
     ON pd.datasource_id = a.connector_id AND pd.project_id = t.project_id
  WHERE t.id = $1
@@ -1732,8 +1743,9 @@ SELECT a.connector_id, COALESCE(pd.read_only, false) AS read_only, NULL AS name
 
 async def _targets(conn: Any, kind: str, execution_id: str) -> list[Any]:
     """The registered connectors an execution selected (``connector_id``,
-    ``read_only``: whether its project links one read-only, a multi-project
-    session's other links checked again at delivery; ``name``)."""
+    ``read_only``: whether its project links one read-only or its creator
+    tagged it so, a multi-project session's other links checked again at
+    delivery; ``name``)."""
     return await conn.fetch(
         _JOB_TARGETS if kind == "job" else _THREAD_TARGETS, UUID(execution_id)
     )
@@ -1997,7 +2009,7 @@ async def deliver_bind_time_entries(
             delivery = _decrypt(row["delivery_ciphertext"])
             stale = None
             if bool(row["read_only"]) != read_only:
-                stale = "access_changed"  # the project link's access changed
+                stale = "access_changed"  # its link or its creator changed its access
             elif not isinstance(delivery, dict):
                 stale = "delivery_unreadable"
             if stale is None:
@@ -2303,13 +2315,14 @@ _CONNECTOR_GONE = (
 #: Live executions that select a registered connector with no binding to
 #: deliver yet (a job on its parent's workspace binds as the parent, at its
 #: dispatch).
-_STARTS = """
+_STARTS = f"""
 SELECT kind, owner_id, connector_id, read_only FROM (
 SELECT 'job' AS kind, j.id AS owner_id, a.connector_id,
-       COALESCE(pd.read_only, false) AS read_only, NULL::timestamptz AS last_at
+       {_BOUND_READ_ONLY_SQL} AS read_only, NULL::timestamptz AS last_at
   FROM jobs j
   JOIN job_datasources jd ON jd.job_id = j.id
   JOIN connector_driver_assignments a ON a.connector_id = jd.datasource_id
+  JOIN datasources d ON d.id = a.connector_id
   LEFT JOIN project_datasources pd
     ON pd.datasource_id = a.connector_id AND pd.project_id = j.project_id
  WHERE j.status::text NOT IN ('completed', 'failed', 'cancelled')
@@ -2318,11 +2331,12 @@ SELECT 'job' AS kind, j.id AS owner_id, a.connector_id,
                     WHERE b.owner_kind = 'job' AND b.owner_id = j.id
                       AND b.connector_id = a.connector_id)
 UNION ALL
-SELECT 'thread', t.id, a.connector_id, COALESCE(pd.read_only, false),
+SELECT 'thread', t.id, a.connector_id, {_BOUND_READ_ONLY_SQL},
        newest.created_at
   FROM threads t
   JOIN connector_driver_assignments a
     ON COALESCE(t.metadata->'datasource_ids', '[]'::jsonb) ? a.connector_id::text
+  JOIN datasources d ON d.id = a.connector_id
   LEFT JOIN project_datasources pd
     ON pd.datasource_id = a.connector_id AND pd.project_id = t.project_id
   LEFT JOIN LATERAL (

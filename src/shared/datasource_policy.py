@@ -35,7 +35,8 @@ DATASOURCE_TOOL_MAP: Dict[str, Dict[str, Any]] = tool_map()
 
 def email_effective_access(ds: Dict[str, Any]) -> str:
     """Effective email tier: ``config.access`` (default ``draft``), clamped
-    to ``read`` by a read-only project link.
+    to ``read`` by ``project_read_only`` (a read-only project link, or the
+    creator's read-only tag the orchestrator's payload folds into it).
 
     Unknown values fail closed to ``read``. The clamp never empties
     credentials — email needs a live IMAP login at every tier
@@ -56,7 +57,9 @@ def datasource_tool_categories(
 
     - type not attached → category stripped (``[]``) so stale tools from a
       previously attached datasource never survive,
-    - ALL datasources of a type read-only → read tools,
+    - ALL datasources of a type read-only (``project_read_only``: the
+      project link or, in the orchestrator's forwarded rows and payload
+      entries, the creator's read-only tag) → read tools,
     - any read-write → write tools, backed by the real connection
       the managed-connection materializer opens for read-write connectors too,
     - tier-keyed types (email): highest effective tier across attached

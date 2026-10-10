@@ -57,7 +57,12 @@ from shared.connectors.builtin import (
     tool_categories,
     tool_map,
 )
-from shared.connectors.contract import WORKSPACE_BACKENDS
+from shared.connectors.contract import (
+    CONNECTOR_READ_ONLY_SQL,
+    WORKSPACE_BACKENDS,
+    bound_read_only,
+    connector_read_only,
+)
 
 _PACKAGE = Path(__file__).resolve().parents[1] / "src" / "shared" / "connectors"
 
@@ -314,6 +319,63 @@ class TestSpecQueries:
             "mcp",
             "repo",
         }
+
+
+class TestCreatorReadOnlyTag:
+    """Decisions 31 and 32: the creator's tag and the project link, the
+    stricter, decide the tools for everyone who uses the connector."""
+
+    @pytest.mark.parametrize(
+        ("read_only", "is_global", "tagged"),
+        [
+            (True, False, True),
+            (True, True, True),
+            (False, False, False),
+            # The creator published it read-write: their choice stands.
+            (False, True, False),
+            (None, False, False),
+            # Published with no mode set: read-only (decision 32).
+            (None, True, True),
+        ],
+    )
+    def test_the_creators_tag(self, read_only, is_global, tagged):
+        row = {"read_only": read_only, "is_global": is_global}
+        assert connector_read_only(row) is tagged
+
+    def test_a_row_without_the_fields_is_untagged(self):
+        assert connector_read_only({}) is False
+        assert bound_read_only({}) is False
+
+    @pytest.mark.parametrize("project_read_only", [True, False, None])
+    @pytest.mark.parametrize(
+        ("read_only", "is_global"),
+        [
+            (True, False),
+            (False, False),
+            (None, False),
+            (True, True),
+            (False, True),
+            (None, True),
+        ],
+    )
+    def test_the_stricter_of_the_tag_and_the_link_binds(
+        self, project_read_only, read_only, is_global
+    ):
+        row = {
+            "project_read_only": project_read_only,
+            "read_only": read_only,
+            "is_global": is_global,
+        }
+        tagged = read_only is True or (read_only is None and is_global)
+        # Neither lifts the other: a read-write or missing link keeps a
+        # tagged connector read-only, and an untagged one keeps a read-only
+        # link's level.
+        assert bound_read_only(row) is (project_read_only is True or tagged)
+
+    def test_the_sql_twin_names_the_same_rule(self):
+        assert CONNECTOR_READ_ONLY_SQL == (
+            "(d.read_only IS TRUE OR (d.is_global AND d.read_only IS NULL))"
+        )
 
 
 # =============================================================================

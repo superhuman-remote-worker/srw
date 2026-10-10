@@ -574,10 +574,17 @@ async def test_combined_visibility_change_advances_policy_revision():
         is_global=True,
     )
 
-    update_sql = conn.execute.await_args.args[0]
+    update_sql = next(
+        call.args[0]
+        for call in conn.execute.await_args_list
+        if "UPDATE datasources" in call.args[0]
+    )
     assert "is_global =" in update_sql
     assert "policy_revision = policy_revision + 1" in update_sql
     assert result["policy_revision"] == 2
+    # The notes state the bound access, which visibility decides for an
+    # untagged connector (decision 32).
+    assert "datasource_project_reconcile_queue" in conn.execute.await_args.args[0]
 
 
 @pytest.mark.asyncio

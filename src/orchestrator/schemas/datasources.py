@@ -54,9 +54,10 @@ class DatasourceCreate(BaseModel):
     read_only: bool | None = Field(
         None,
         description=(
-            "Declared read-only flag for public connectors (defaults to true "
-            "on publish; kb is always read-only). Declarative — credentials "
-            "are the enforcement boundary."
+            "The creator's read-only tag: agents get no write tools for this "
+            "connector, for everyone who uses it (defaults to true on "
+            "publish; kb is always read-only). The credential still decides "
+            "what is really allowed."
         ),
     )
     driver_registration_id: str | None = Field(
@@ -112,7 +113,10 @@ class DatasourceUpdate(BaseModel):
     )
     read_only: bool | None = Field(
         None,
-        description="Declared read-only flag (kb: always true; declarative only)",
+        description=(
+            "The creator's read-only tag: agents get no write tools for this "
+            "connector, for everyone who uses it (kb: always true)"
+        ),
     )
     scope_mode: Literal["all", "projects"] | None = Field(
         None, description="New execution availability mode"

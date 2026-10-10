@@ -18,7 +18,7 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from shared.connectors.contract import DriverSpec
+from shared.connectors.contract import DriverSpec, bound_read_only
 
 #: What each managed-connection tool does, by tool name.
 TOOL_HELP: dict[str, str] = {
@@ -55,7 +55,9 @@ def _type(row: Mapping[str, Any]) -> str:
 
 
 def _read_only(row: Mapping[str, Any]) -> bool:
-    return bool(row.get("project_read_only", False))
+    """Whether executions bind it read-only: its project link or its
+    creator's read-only tag, the stricter."""
+    return bound_read_only(row)
 
 
 def bare_note(row: Mapping[str, Any]) -> str:
@@ -179,8 +181,8 @@ def database_note(row: Mapping[str, Any], spec: DriverSpec) -> str:
     The tools come from the spec's access level. A read-only Neo4j link's
     note projected before slice D1c still lists ``cypher_execute`` (the
     tool itself was never bound read-only) until that link is projected
-    again: an edit of the connector's name, description, URL, credentials or
-    config, or a re-link, enqueues it in
+    again: an edit of the connector's name, description, URL, credentials,
+    config, visibility or read-only tag, or a re-link, enqueues it in
     ``datasource_project_reconcile_queue`` and the reconciler rewrites the
     note. No startup sweep does it: it would add a type-keyed write to every
     orchestrator start for a note the agent cannot act on.

@@ -386,7 +386,9 @@ class RepositoryDriver(WorkspaceSshDriver):
             # A GitHub App connector's read-only is enforced by the token SRW
             # mints (contents: read), so its own rule (a public one's
             # included) is the entry's: the lease, the repo tools and the
-            # minted token all bind at the same level (C5).
+            # minted token all bind at the same level (C5). The payload's
+            # forwarded rows carry every connector's own rule already
+            # (decision 31); this keeps a direct bind in step with its mint.
             read_only = bool(read_only) or connector_read_only(row)
         entry = payload_entry(
             row,

@@ -633,7 +633,55 @@
       }
     ]
   },
-  "postgresql/declared_read_only": {
+  "postgresql/creator_read_only_public": {
+    "payload": [
+      {
+        "type": "postgresql",
+        "name": "Orders DB",
+        "description": "Order history",
+        "connection_url": "postgresql://orders:pg-secret@db.example.test:5432/orders",
+        "credentials": {},
+        "project_read_only": true
+      }
+    ]
+  },
+  "postgresql/creator_read_only_link_read_write": {
+    "payload": [
+      {
+        "type": "postgresql",
+        "name": "Orders DB",
+        "description": "Order history",
+        "connection_url": "postgresql://orders:pg-secret@db.example.test:5432/orders",
+        "credentials": {},
+        "project_read_only": true
+      }
+    ]
+  },
+  "postgresql/creator_read_only_unlinked": {
+    "payload": [
+      {
+        "type": "postgresql",
+        "name": "Orders DB",
+        "description": "Order history",
+        "connection_url": "postgresql://orders:pg-secret@db.example.test:5432/orders",
+        "credentials": {},
+        "project_read_only": true
+      }
+    ]
+  },
+  "postgresql/public_no_mode_set": {
+    "payload": [
+      {
+        "type": "postgresql",
+        "name": "Orders DB",
+        "description": "Order history",
+        "connection_url": "postgresql://orders:pg-secret@db.example.test:5432/orders",
+        "credentials": {},
+        "project_read_only": true
+      }
+    ]
+  },
+  "postgresql/public_read_write_link_read_write": {
     "payload": [
       {
         "type": "postgresql",
@@ -642,6 +690,590 @@
         "connection_url": "postgresql://orders:pg-secret@db.example.test:5432/orders",
         "credentials": {},
         "project_read_only": false
+      }
+    ]
+  },
+  "postgresql/public_read_write_link_read_only": {
+    "payload": [
+      {
+        "type": "postgresql",
+        "name": "Orders DB",
+        "description": "Order history",
+        "connection_url": "postgresql://orders:pg-secret@db.example.test:5432/orders",
+        "credentials": {},
+        "project_read_only": true
+      }
+    ]
+  },
+  "postgresql/private_read_write_tag": {
+    "payload": [
+      {
+        "type": "postgresql",
+        "name": "Orders DB",
+        "description": "Order history",
+        "connection_url": "postgresql://orders:pg-secret@db.example.test:5432/orders",
+        "credentials": {},
+        "project_read_only": false
+      }
+    ]
+  },
+  "repository_token/creator_read_only": {
+    "payload": [
+      {
+        "type": "repository",
+        "name": "Widgets",
+        "description": "Widgets service",
+        "connection_url": "https://github.com/acme/widgets.git",
+        "credentials": {
+          "auth_method": "token",
+          "token": "ghp_widgets-secret"
+        },
+        "project_read_only": true,
+        "datasource_id": "d5000006-0000-0000-0000-000000000006",
+        "config": {
+          "forge": "github"
+        },
+        "default_branch": "main"
+      }
+    ]
+  },
+  "email/creator_read_only_floors_access": {
+    "payload": [
+      {
+        "type": "email",
+        "name": "Support inbox",
+        "description": "Customer support mailbox",
+        "connection_url": null,
+        "credentials": {
+          "backend": "imap_smtp",
+          "username": "support@example.test",
+          "password": "mail-secret",
+          "imap": {
+            "host": "imap.example.test",
+            "port": 993,
+            "security": "ssl"
+          },
+          "smtp": {
+            "host": "smtp.example.test",
+            "port": 465,
+            "security": "ssl"
+          }
+        },
+        "project_read_only": true,
+        "config": {
+          "access": "read",
+          "folders": [
+            "INBOX"
+          ],
+          "drafts_folder": "Drafts",
+          "from_address": null,
+          "recipient_allowlist": [],
+          "unattended_send": false
+        }
+      }
+    ]
+  },
+  "mixed/all_kinds_creator_read_only": {
+    "payload": [
+      {
+        "type": "generic",
+        "name": "Billing API",
+        "description": "Billing REST API",
+        "connection_url": "https://billing.example.test/api",
+        "credentials": {
+          "env_vars": {
+            "BILLING_TOKEN": "billing-secret"
+          }
+        },
+        "project_read_only": true,
+        "cli_hint": "curl -H \"Authorization: Bearer $BILLING_TOKEN\" $BILLING_URL"
+      },
+      {
+        "type": "credentials",
+        "name": "Vendor login",
+        "description": "Vendor portal account",
+        "connection_url": null,
+        "credentials": {
+          "env_vars": {
+            "VENDOR_USER": "alice",
+            "VENDOR_PASSWORD": "vendor-secret"
+          }
+        },
+        "project_read_only": true
+      },
+      {
+        "type": "generic_file",
+        "name": "Service account",
+        "description": "GCP service account",
+        "connection_url": null,
+        "credentials": {
+          "files": [
+            {
+              "name": "sa.json",
+              "contents": "{\"type\": \"service_account\"}",
+              "target_path": "/home/srw/.config/gcloud/sa.json",
+              "mode": "0600",
+              "env_var": "GOOGLE_APPLICATION_CREDENTIALS"
+            },
+            {
+              "name": "ca.pem",
+              "contents": "-----BEGIN CERTIFICATE-----\nZ29sZGVu\n-----END CERTIFICATE-----\n",
+              "target_path": "/home/srw/.config/gcloud/ca.pem",
+              "mode": "0644"
+            }
+          ]
+        },
+        "project_read_only": true
+      },
+      {
+        "type": "kubeconfig",
+        "name": "Staging Cluster",
+        "description": "Staging Kubernetes",
+        "connection_url": null,
+        "credentials": {
+          "files": [
+            {
+              "name": "staging-cluster.yaml",
+              "contents": "apiVersion: v1\nkind: Config\nclusters:\n- name: staging\n  cluster: {server: 'https://k8s.example.test:6443'}\ncontexts:\n- name: staging\n  context: {cluster: staging, user: ci}\ncurrent-context: staging\nusers:\n- name: ci\n  user: {token: kube-secret}\n",
+              "target_path": "/home/srw/.kube/configs/staging-cluster.yaml",
+              "mode": "0600"
+            }
+          ]
+        },
+        "project_read_only": true
+      },
+      {
+        "type": "ssh_key",
+        "name": "Deploy Key",
+        "description": "Bastion access",
+        "connection_url": null,
+        "credentials": {
+          "files": [
+            {
+              "name": "deploy-key",
+              "target_path": "/home/srw/.ssh/deploy-key",
+              "mode": "0600"
+            },
+            {
+              "name": "deploy-key.pub",
+              "target_path": "/home/srw/.ssh/deploy-key.pub",
+              "mode": "0644"
+            }
+          ]
+        },
+        "project_read_only": true,
+        "ssh_identity": {
+          "alias": "srw-repo-86349e2c62065ae297413689e29f78ee",
+          "authority_id": "86349e2c-6206-5ae2-9741-3689e29f78ee",
+          "fingerprint": "SHA256:lbmsoA0yIEcEiVDRnMWuzm+nV+3ZEEpVIURqFoeSspg",
+          "host_key_pinned": false,
+          "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAOhB7/zzhC+HXDdGOdLwJln5NYwm6UNXx3chmQSVTG4"
+        }
+      },
+      {
+        "type": "repository",
+        "name": "Widgets",
+        "description": "Widgets service",
+        "connection_url": "https://github.com/acme/widgets.git",
+        "credentials": {
+          "auth_method": "token",
+          "token": "ghp_widgets-secret"
+        },
+        "project_read_only": true,
+        "datasource_id": "d5000006-0000-0000-0000-000000000006",
+        "config": {
+          "forge": "github"
+        },
+        "default_branch": "main"
+      },
+      {
+        "type": "repository",
+        "name": "Gadgets",
+        "description": "Gadgets service",
+        "connection_url": "ssh://git@git.example.test:2222/acme/gadgets.git",
+        "credentials": {
+          "auth_method": "ssh"
+        },
+        "project_read_only": true,
+        "datasource_id": "d5000007-0000-0000-0000-000000000007",
+        "config": {
+          "forge": "gitea"
+        },
+        "default_branch": "develop",
+        "ssh_identity": {
+          "alias": "srw-repo-cd512eb253ae54ef904ea73abe12261f",
+          "authority_id": "cd512eb2-53ae-54ef-904e-a73abe12261f",
+          "fingerprint": "SHA256:lbmsoA0yIEcEiVDRnMWuzm+nV+3ZEEpVIURqFoeSspg",
+          "host_key_pinned": false,
+          "clone_url": "ssh://srw-repo-cd512eb253ae54ef904ea73abe12261f/acme/gadgets.git",
+          "host": "git.example.test",
+          "port": 2222,
+          "user": "git"
+        }
+      },
+      {
+        "type": "postgresql",
+        "name": "Orders DB",
+        "description": "Order history",
+        "connection_url": "postgresql://orders:pg-secret@db.example.test:5432/orders",
+        "credentials": {},
+        "project_read_only": true
+      },
+      {
+        "type": "neo4j",
+        "name": "Supply Graph",
+        "description": "Supplier graph",
+        "connection_url": "bolt://neo4j.example.test:7687",
+        "credentials": {
+          "username": "graph",
+          "password": "neo-secret"
+        },
+        "project_read_only": true
+      },
+      {
+        "type": "mongodb",
+        "name": "Events",
+        "description": "Event store",
+        "connection_url": "mongodb://events:mongo-secret@mongo.example.test:27017/events",
+        "credentials": {},
+        "project_read_only": true
+      },
+      {
+        "type": "webdav",
+        "name": "Team files",
+        "description": "Shared drive",
+        "connection_url": "https://cloud.example.test/remote.php/dav/files/alice",
+        "credentials": {
+          "username": "alice",
+          "password": "dav-secret"
+        },
+        "project_read_only": true
+      },
+      {
+        "type": "email",
+        "name": "Support inbox",
+        "description": "Customer support mailbox",
+        "connection_url": null,
+        "credentials": {
+          "backend": "imap_smtp",
+          "username": "support@example.test",
+          "password": "mail-secret",
+          "imap": {
+            "host": "imap.example.test",
+            "port": 993,
+            "security": "ssl"
+          },
+          "smtp": {
+            "host": "smtp.example.test",
+            "port": 465,
+            "security": "ssl"
+          }
+        },
+        "project_read_only": true,
+        "config": {
+          "access": "read",
+          "folders": [
+            "INBOX",
+            "Support"
+          ],
+          "drafts_folder": "Drafts",
+          "from_address": "support@example.test",
+          "recipient_allowlist": [],
+          "unattended_send": false
+        }
+      },
+      {
+        "type": "kb",
+        "name": "Handbook",
+        "description": "Company handbook",
+        "connection_url": null,
+        "credentials": {},
+        "project_read_only": true,
+        "datasource_id": "d500000d-0000-0000-0000-00000000000d",
+        "config": {
+          "root_path": "vault",
+          "forge": "gitea"
+        },
+        "default_branch": "main"
+      },
+      {
+        "type": "kb",
+        "name": "Project knowledge",
+        "description": "This project's own knowledge base",
+        "connection_url": null,
+        "credentials": {},
+        "project_read_only": true,
+        "datasource_id": "d500000e-0000-0000-0000-00000000000e",
+        "config": {
+          "root_path": "",
+          "native_project_id": "00000000-0000-0000-0000-0000000000b1"
+        }
+      },
+      {
+        "type": "mcp",
+        "name": "Docs MCP",
+        "description": "Documentation search",
+        "connection_url": "https://mcp.example.test/mcp",
+        "credentials": {
+          "transport": "http",
+          "auth": {
+            "type": "bearer",
+            "token": "mcp-secret"
+          }
+        },
+        "project_read_only": true
+      }
+    ]
+  },
+  "mixed/all_kinds_public_no_mode_set": {
+    "payload": [
+      {
+        "type": "generic",
+        "name": "Billing API",
+        "description": "Billing REST API",
+        "connection_url": "https://billing.example.test/api",
+        "credentials": {
+          "env_vars": {
+            "BILLING_TOKEN": "billing-secret"
+          }
+        },
+        "project_read_only": true,
+        "cli_hint": "curl -H \"Authorization: Bearer $BILLING_TOKEN\" $BILLING_URL"
+      },
+      {
+        "type": "credentials",
+        "name": "Vendor login",
+        "description": "Vendor portal account",
+        "connection_url": null,
+        "credentials": {
+          "env_vars": {
+            "VENDOR_USER": "alice",
+            "VENDOR_PASSWORD": "vendor-secret"
+          }
+        },
+        "project_read_only": true
+      },
+      {
+        "type": "generic_file",
+        "name": "Service account",
+        "description": "GCP service account",
+        "connection_url": null,
+        "credentials": {
+          "files": [
+            {
+              "name": "sa.json",
+              "contents": "{\"type\": \"service_account\"}",
+              "target_path": "/home/srw/.config/gcloud/sa.json",
+              "mode": "0600",
+              "env_var": "GOOGLE_APPLICATION_CREDENTIALS"
+            },
+            {
+              "name": "ca.pem",
+              "contents": "-----BEGIN CERTIFICATE-----\nZ29sZGVu\n-----END CERTIFICATE-----\n",
+              "target_path": "/home/srw/.config/gcloud/ca.pem",
+              "mode": "0644"
+            }
+          ]
+        },
+        "project_read_only": true
+      },
+      {
+        "type": "kubeconfig",
+        "name": "Staging Cluster",
+        "description": "Staging Kubernetes",
+        "connection_url": null,
+        "credentials": {
+          "files": [
+            {
+              "name": "staging-cluster.yaml",
+              "contents": "apiVersion: v1\nkind: Config\nclusters:\n- name: staging\n  cluster: {server: 'https://k8s.example.test:6443'}\ncontexts:\n- name: staging\n  context: {cluster: staging, user: ci}\ncurrent-context: staging\nusers:\n- name: ci\n  user: {token: kube-secret}\n",
+              "target_path": "/home/srw/.kube/configs/staging-cluster.yaml",
+              "mode": "0600"
+            }
+          ]
+        },
+        "project_read_only": true
+      },
+      {
+        "type": "ssh_key",
+        "name": "Deploy Key",
+        "description": "Bastion access",
+        "connection_url": null,
+        "credentials": {
+          "files": [
+            {
+              "name": "deploy-key",
+              "target_path": "/home/srw/.ssh/deploy-key",
+              "mode": "0600"
+            },
+            {
+              "name": "deploy-key.pub",
+              "target_path": "/home/srw/.ssh/deploy-key.pub",
+              "mode": "0644"
+            }
+          ]
+        },
+        "project_read_only": true,
+        "ssh_identity": {
+          "alias": "srw-repo-86349e2c62065ae297413689e29f78ee",
+          "authority_id": "86349e2c-6206-5ae2-9741-3689e29f78ee",
+          "fingerprint": "SHA256:lbmsoA0yIEcEiVDRnMWuzm+nV+3ZEEpVIURqFoeSspg",
+          "host_key_pinned": false,
+          "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAOhB7/zzhC+HXDdGOdLwJln5NYwm6UNXx3chmQSVTG4"
+        }
+      },
+      {
+        "type": "repository",
+        "name": "Widgets",
+        "description": "Widgets service",
+        "connection_url": "https://github.com/acme/widgets.git",
+        "credentials": {
+          "auth_method": "token",
+          "token": "ghp_widgets-secret"
+        },
+        "project_read_only": true,
+        "datasource_id": "d5000006-0000-0000-0000-000000000006",
+        "config": {
+          "forge": "github"
+        },
+        "default_branch": "main"
+      },
+      {
+        "type": "repository",
+        "name": "Gadgets",
+        "description": "Gadgets service",
+        "connection_url": "ssh://git@git.example.test:2222/acme/gadgets.git",
+        "credentials": {
+          "auth_method": "ssh"
+        },
+        "project_read_only": true,
+        "datasource_id": "d5000007-0000-0000-0000-000000000007",
+        "config": {
+          "forge": "gitea"
+        },
+        "default_branch": "develop",
+        "ssh_identity": {
+          "alias": "srw-repo-cd512eb253ae54ef904ea73abe12261f",
+          "authority_id": "cd512eb2-53ae-54ef-904e-a73abe12261f",
+          "fingerprint": "SHA256:lbmsoA0yIEcEiVDRnMWuzm+nV+3ZEEpVIURqFoeSspg",
+          "host_key_pinned": false,
+          "clone_url": "ssh://srw-repo-cd512eb253ae54ef904ea73abe12261f/acme/gadgets.git",
+          "host": "git.example.test",
+          "port": 2222,
+          "user": "git"
+        }
+      },
+      {
+        "type": "postgresql",
+        "name": "Orders DB",
+        "description": "Order history",
+        "connection_url": "postgresql://orders:pg-secret@db.example.test:5432/orders",
+        "credentials": {},
+        "project_read_only": true
+      },
+      {
+        "type": "neo4j",
+        "name": "Supply Graph",
+        "description": "Supplier graph",
+        "connection_url": "bolt://neo4j.example.test:7687",
+        "credentials": {
+          "username": "graph",
+          "password": "neo-secret"
+        },
+        "project_read_only": true
+      },
+      {
+        "type": "mongodb",
+        "name": "Events",
+        "description": "Event store",
+        "connection_url": "mongodb://events:mongo-secret@mongo.example.test:27017/events",
+        "credentials": {},
+        "project_read_only": true
+      },
+      {
+        "type": "webdav",
+        "name": "Team files",
+        "description": "Shared drive",
+        "connection_url": "https://cloud.example.test/remote.php/dav/files/alice",
+        "credentials": {
+          "username": "alice",
+          "password": "dav-secret"
+        },
+        "project_read_only": true
+      },
+      {
+        "type": "email",
+        "name": "Support inbox",
+        "description": "Customer support mailbox",
+        "connection_url": null,
+        "credentials": {
+          "backend": "imap_smtp",
+          "username": "support@example.test",
+          "password": "mail-secret",
+          "imap": {
+            "host": "imap.example.test",
+            "port": 993,
+            "security": "ssl"
+          },
+          "smtp": {
+            "host": "smtp.example.test",
+            "port": 465,
+            "security": "ssl"
+          }
+        },
+        "project_read_only": true,
+        "config": {
+          "access": "read",
+          "folders": [
+            "INBOX",
+            "Support"
+          ],
+          "drafts_folder": "Drafts",
+          "from_address": "support@example.test",
+          "recipient_allowlist": [],
+          "unattended_send": false
+        }
+      },
+      {
+        "type": "kb",
+        "name": "Handbook",
+        "description": "Company handbook",
+        "connection_url": null,
+        "credentials": {},
+        "project_read_only": true,
+        "datasource_id": "d500000d-0000-0000-0000-00000000000d",
+        "config": {
+          "root_path": "vault",
+          "forge": "gitea"
+        },
+        "default_branch": "main"
+      },
+      {
+        "type": "kb",
+        "name": "Project knowledge",
+        "description": "This project's own knowledge base",
+        "connection_url": null,
+        "credentials": {},
+        "project_read_only": true,
+        "datasource_id": "d500000e-0000-0000-0000-00000000000e",
+        "config": {
+          "root_path": "",
+          "native_project_id": "00000000-0000-0000-0000-0000000000b1"
+        }
+      },
+      {
+        "type": "mcp",
+        "name": "Docs MCP",
+        "description": "Documentation search",
+        "connection_url": "https://mcp.example.test/mcp",
+        "credentials": {
+          "transport": "http",
+          "auth": {
+            "type": "bearer",
+            "token": "mcp-secret"
+          }
+        },
+        "project_read_only": true
       }
     ]
   },
@@ -707,6 +1339,21 @@
     ]
   },
   "webdav/cloud_storage_override_cannot_lift_read_only": {
+    "payload": [
+      {
+        "type": "webdav",
+        "name": "Team files",
+        "description": "Shared drive",
+        "connection_url": "https://cloud.example.test/remote.php/dav/files/alice",
+        "credentials": {
+          "username": "alice",
+          "password": "dav-secret"
+        },
+        "project_read_only": true
+      }
+    ]
+  },
+  "webdav/cloud_storage_override_cannot_lift_creator_read_only": {
     "payload": [
       {
         "type": "webdav",

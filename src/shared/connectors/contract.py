@@ -282,15 +282,46 @@ class DriverSpec:
         )
 
 
+def connector_read_only(row: Mapping[str, Any]) -> bool:
+    """The read-only tag the connector's creator set on it (decisions 31, 32).
+
+    Its ``read_only`` when set; a public connector whose creator never chose
+    a mode is read-only. The tag only decides which tools SRW gives the
+    agent: what the credential allows is still the credential's business.
+    """
+    read_only = row.get("read_only")
+    if read_only is None:
+        return bool(row.get("is_global"))
+    return read_only is True
+
+
+#: :func:`connector_read_only` in SQL, on ``d`` (a ``datasources`` row).
+CONNECTOR_READ_ONLY_SQL = (
+    "(d.read_only IS TRUE OR (d.is_global AND d.read_only IS NULL))"
+)
+
+
+def bound_read_only(row: Mapping[str, Any]) -> bool:
+    """Whether an execution binds a resolved connector row read-only.
+
+    The stricter of the row's project link (``project_read_only``) and its
+    creator's tag (:func:`connector_read_only`): neither lifts the other,
+    for the owner and every other user of the connector alike. The agent
+    then gets the read-only tools only; no per-run choice widens it.
+    """
+    return bool(row.get("project_read_only")) or connector_read_only(row)
+
+
 def effective_access(entry: Mapping[str, Any], spec: DriverSpec) -> str | None:
     """The access level a delivered entry binds at, from the driver's levels.
 
     The one rule for the agent (a binding's ``access``) and SRW (the level a
-    credential lease is issued at). A read-only project link clamps to the
-    lowest level. Otherwise the level the connector's config names (a driver
-    whose config has an ``access`` property, such as email), else the
-    driver's default, else its highest; a name the driver does not offer
-    fails closed to the lowest.
+    credential lease is issued at). A read-only entry clamps to the lowest
+    level: its ``project_read_only``, which the orchestrator's payload sets
+    to :func:`bound_read_only` of its row. Otherwise the level the
+    connector's config names (a driver whose config has an ``access``
+    property, such as email), else the driver's default, else its highest;
+    a name the driver does not offer fails closed to the lowest.
     """
     levels = spec.ranked_access_ids()
     if not levels:

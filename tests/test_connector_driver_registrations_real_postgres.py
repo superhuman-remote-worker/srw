@@ -1041,6 +1041,42 @@ class TestBinding:
         assert (await _binding(db, access="ReadOnly"))["status"] == "bound"
         assert operations.calls[-1]["request"].access == "ReadOnly"
 
+    async def test_the_creators_read_only_tag_binds_every_execution_read_only(
+        self, db, registry
+    ):
+        """Decision 31: the pre-binds read the creator's tag with the project
+        link, as the delivery's entry does, so the delivery finds its binding
+        at its level instead of revoking it as ``access_changed``: a session's
+        attach, a job's dispatch gate and the reconciler's start alike."""
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        await db.execute(
+            "UPDATE datasources SET read_only = true WHERE id = $1", UUID(connector)
+        )
+        operations = FakeOperations({"bind": _bound(ENV)})
+        runtime = _runtime(db, operations)
+        thread = await _thread(db, user, connectors=[connector])
+        await bind_time.prepare_thread_bindings(db, thread)
+        assert (await _binding(db, owner_id=thread))["access"] == "ReadOnly"
+        entries = [_entry(connector, read_only=True)]
+        assert await _deliver(db, entries, LeaseOwner.thread(thread)) == 1
+        job = await _job(db, "created", connector=connector)
+        assert await bind_time.job_bind_gate({"id": job}) == ("wait", None)
+        await _settled()
+        assert await bind_time.job_bind_gate({"id": job}) == ("dispatch", None)
+        assert (await _binding(db, owner_id=job))["access"] == "ReadOnly"
+        idle = await _thread(db, user, connectors=[connector])
+        with mock.patch.object(bind_time, "_sweep", return_value=0):
+            await bind_time.reconcile_bind_time_once(runtime, object())
+        await _settled()
+        assert (await _binding(db, owner_id=idle))["access"] == "ReadOnly"
+        assert [call["request"].access for call in operations.calls] == ["ReadOnly"] * 3
+        assert not await db.fetch(
+            "SELECT 1 FROM connector_bind_time_bindings "
+            "WHERE revoke_reason = 'access_changed'"
+        )
+
     async def test_without_driver_pods_a_job_is_refused_and_a_session_noticed(
         self, db, registry
     ):

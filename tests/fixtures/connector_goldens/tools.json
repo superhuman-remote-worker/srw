@@ -599,6 +599,304 @@
       ]
     }
   },
+  "all_kinds_creator_read_only_link_read_write": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [
+          "cypher_query",
+          "get_database_schema"
+        ],
+        "sql": [
+          "sql_query",
+          "sql_schema"
+        ],
+        "mongodb": [
+          "mongo_query",
+          "mongo_aggregate",
+          "mongo_schema"
+        ],
+        "webdav": [
+          "webdav_list",
+          "webdav_read",
+          "webdav_info"
+        ],
+        "repo": [
+          "repo_pull",
+          "repo_pr_status"
+        ],
+        "email": [
+          "email_list_folders",
+          "email_list",
+          "email_search",
+          "email_read"
+        ],
+        "mcp": [
+          "*"
+        ]
+      }
+    },
+    "agent_session_categories": {
+      "graph": [
+        "cypher_query",
+        "get_database_schema"
+      ],
+      "sql": [
+        "sql_query",
+        "sql_schema"
+      ],
+      "mongodb": [
+        "mongo_query",
+        "mongo_aggregate",
+        "mongo_schema"
+      ],
+      "webdav": [
+        "webdav_list",
+        "webdav_read",
+        "webdav_info"
+      ],
+      "repo": [
+        "repo_pull",
+        "repo_pr_status"
+      ],
+      "email": [
+        "email_list_folders",
+        "email_list",
+        "email_search",
+        "email_read"
+      ],
+      "mcp": [
+        "*"
+      ]
+    }
+  },
+  "all_kinds_public_no_mode_set_consumer": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [
+          "cypher_query",
+          "get_database_schema"
+        ],
+        "sql": [
+          "sql_query",
+          "sql_schema"
+        ],
+        "mongodb": [
+          "mongo_query",
+          "mongo_aggregate",
+          "mongo_schema"
+        ],
+        "webdav": [
+          "webdav_list",
+          "webdav_read",
+          "webdav_info"
+        ],
+        "repo": [
+          "repo_pull",
+          "repo_pr_status"
+        ],
+        "email": [
+          "email_list_folders",
+          "email_list",
+          "email_search",
+          "email_read"
+        ],
+        "mcp": [
+          "*"
+        ]
+      }
+    },
+    "agent_session_categories": {
+      "graph": [
+        "cypher_query",
+        "get_database_schema"
+      ],
+      "sql": [
+        "sql_query",
+        "sql_schema"
+      ],
+      "mongodb": [
+        "mongo_query",
+        "mongo_aggregate",
+        "mongo_schema"
+      ],
+      "webdav": [
+        "webdav_list",
+        "webdav_read",
+        "webdav_info"
+      ],
+      "repo": [
+        "repo_pull",
+        "repo_pr_status"
+      ],
+      "email": [
+        "email_list_folders",
+        "email_list",
+        "email_search",
+        "email_read"
+      ],
+      "mcp": [
+        "*"
+      ]
+    }
+  },
+  "all_kinds_public_read_write_consumer": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [
+          "cypher_query",
+          "cypher_execute",
+          "get_database_schema"
+        ],
+        "sql": [
+          "sql_query",
+          "sql_schema",
+          "sql_execute"
+        ],
+        "mongodb": [
+          "mongo_query",
+          "mongo_aggregate",
+          "mongo_schema",
+          "mongo_insert",
+          "mongo_update"
+        ],
+        "webdav": [
+          "webdav_list",
+          "webdav_read",
+          "webdav_info",
+          "webdav_write",
+          "webdav_delete"
+        ],
+        "repo": [
+          "repo_checkout",
+          "repo_commit",
+          "repo_push",
+          "repo_pull",
+          "repo_open_pr",
+          "repo_pr_status"
+        ],
+        "email": [
+          "email_list_folders",
+          "email_list",
+          "email_search",
+          "email_read",
+          "email_move",
+          "email_flag",
+          "email_draft"
+        ],
+        "mcp": [
+          "*"
+        ]
+      }
+    },
+    "agent_session_categories": {
+      "graph": [
+        "cypher_query",
+        "cypher_execute",
+        "get_database_schema"
+      ],
+      "sql": [
+        "sql_query",
+        "sql_schema",
+        "sql_execute"
+      ],
+      "mongodb": [
+        "mongo_query",
+        "mongo_aggregate",
+        "mongo_schema",
+        "mongo_insert",
+        "mongo_update"
+      ],
+      "webdav": [
+        "webdav_list",
+        "webdav_read",
+        "webdav_info",
+        "webdav_write",
+        "webdav_delete"
+      ],
+      "repo": [
+        "repo_checkout",
+        "repo_commit",
+        "repo_push",
+        "repo_pull",
+        "repo_open_pr",
+        "repo_pr_status"
+      ],
+      "email": [
+        "email_list_folders",
+        "email_list",
+        "email_search",
+        "email_read",
+        "email_move",
+        "email_flag",
+        "email_draft"
+      ],
+      "mcp": [
+        "*"
+      ]
+    }
+  },
+  "postgresql_creator_read_only_and_read_write": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [],
+        "sql": [
+          "sql_query",
+          "sql_schema",
+          "sql_execute"
+        ],
+        "mongodb": [],
+        "webdav": [],
+        "repo": [],
+        "email": [],
+        "mcp": []
+      }
+    },
+    "agent_session_categories": {
+      "graph": [],
+      "sql": [
+        "sql_query",
+        "sql_schema",
+        "sql_execute"
+      ],
+      "mongodb": [],
+      "webdav": [],
+      "repo": [],
+      "email": [],
+      "mcp": []
+    }
+  },
+  "email_creator_read_only_floors_send": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [],
+        "sql": [],
+        "mongodb": [],
+        "webdav": [],
+        "repo": [],
+        "email": [
+          "email_list_folders",
+          "email_list",
+          "email_search",
+          "email_read"
+        ],
+        "mcp": []
+      }
+    },
+    "agent_session_categories": {
+      "graph": [],
+      "sql": [],
+      "mongodb": [],
+      "webdav": [],
+      "repo": [],
+      "email": [
+        "email_list_folders",
+        "email_list",
+        "email_search",
+        "email_read"
+      ],
+      "mcp": []
+    }
+  },
   "existing_override_is_merged": {
     "orchestrator_override": {
       "llm": {

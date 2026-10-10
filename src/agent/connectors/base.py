@@ -246,11 +246,12 @@ class ConnectionFactory(Protocol):
 
 
 def declared_read_only_note(entry: Mapping[str, Any]) -> str:
-    """Advisory suffix for publisher-declared read-only datasources.
+    """Advisory suffix for an entry that carries the creator's ``read_only``.
 
-    Declarative only (knowledge-base/knowledge/features/public_datasources.md):
-    credentials are the enforcement boundary; this just tells the agent the
-    intent. Distinct from ``project_read_only`` (per-link connector mode),
-    which switches the tool surface.
+    The orchestrator folds the creator's read-only tag into the entry's
+    ``project_read_only``, which switches the tool surface; its payload does
+    not forward ``read_only`` itself, so only an in-process caller that hands
+    over a resolved row reaches this. Credentials stay what decides what is
+    really allowed; this just tells the agent the intent.
     """
     return " (declared read-only — treat as no-write)" if entry.get("read_only") else ""

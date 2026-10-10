@@ -182,22 +182,21 @@
       ""
     ]
   },
-  "readme/declared_read_only_via_payload": {
+  "readme/creator_read_only_via_payload": {
     "lines": [
       "## Connectors",
       "",
       "### Databases",
-      "- **Orders DB** (postgresql, read-write) — query + write tools",
+      "- **Orders DB** (postgresql, read-only) — query tools",
       "",
       "### Other",
       "- **Billing API** (generic) — curl -H \"Authorization: Bearer $BILLING_TOKEN\" $BILLING_URL",
       "  Environment: `BILLING_TOKEN`",
       "  Read values with os.environ in workspace scripts. For login forms, use browser_type(ref=..., env_var=\"VARIABLE_NAME\"). Avoid printing credentials or writing literal values into scripts.",
-      "- **Team files** (webdav, read-write tools)",
-      "- **Support inbox** (email, support@example.test, tier `draft`) — folders: `INBOX`, `Support`",
+      "- **Team files** (webdav, read-only tools)",
+      "- **Support inbox** (email, support@example.test, tier `read`) — folders: `INBOX`, `Support`",
       ""
-    ],
-    "pinned_defect": "the payload never forwards the publisher's declared read_only flag, so the README's 'declared read-only' advisory cannot render"
+    ]
   },
   "readme/declared_read_only_renderer": {
     "lines": [
@@ -628,7 +627,61 @@
       "What databases are available?"
     ]
   },
+  "kb_note/postgresql/creator_read_only": {
+    "note_id": "ds-d5000008",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Orders DB (postgresql)",
+    "tags": [
+      "datasource",
+      "postgresql"
+    ],
+    "content": [
+      "## Connector: Orders DB",
+      "**Type:** postgresql | **Access:** read-only (tools)",
+      "",
+      "Order history",
+      "",
+      "### Available Tools",
+      "- `sql_query` — execute SELECT queries",
+      "- `sql_schema` — inspect tables, columns, types, constraints",
+      "",
+      "No CLI access or write operations available."
+    ],
+    "retrieval_messages": [
+      "Orders DB database connection",
+      "postgresql access",
+      "How do I connect to Orders DB?",
+      "What databases are available?"
+    ]
+  },
   "kb_note/neo4j/read_only": {
+    "note_id": "ds-d5000009",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Supply Graph (neo4j)",
+    "tags": [
+      "datasource",
+      "neo4j"
+    ],
+    "content": [
+      "## Connector: Supply Graph",
+      "**Type:** neo4j | **Access:** read-only (tools)",
+      "",
+      "Supplier graph",
+      "",
+      "### Available Tools",
+      "- `cypher_query` — execute read-only Cypher queries",
+      "- `get_database_schema` — inspect labels, relationships, properties",
+      "",
+      "No CLI access or write operations available."
+    ],
+    "retrieval_messages": [
+      "Supply Graph database connection",
+      "neo4j access",
+      "How do I connect to Supply Graph?",
+      "What databases are available?"
+    ]
+  },
+  "kb_note/neo4j/creator_read_only": {
     "note_id": "ds-d5000009",
     "project_id": "00000000-0000-0000-0000-0000000000b1",
     "title": "Connector: Supply Graph (neo4j)",
@@ -683,6 +736,34 @@
       "What databases are available?"
     ]
   },
+  "kb_note/mongodb/creator_read_only": {
+    "note_id": "ds-d500000a",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Events (mongodb)",
+    "tags": [
+      "datasource",
+      "mongodb"
+    ],
+    "content": [
+      "## Connector: Events",
+      "**Type:** mongodb | **Access:** read-only (tools)",
+      "",
+      "Event store",
+      "",
+      "### Available Tools",
+      "- `mongo_query` — document queries with filters",
+      "- `mongo_aggregate` — aggregation pipelines",
+      "- `mongo_schema` — collections, fields, indexes",
+      "",
+      "No CLI access or write operations available."
+    ],
+    "retrieval_messages": [
+      "Events database connection",
+      "mongodb access",
+      "How do I connect to Events?",
+      "What databases are available?"
+    ]
+  },
   "kb_note/webdav/read_only": {
     "note_id": "ds-d500000b",
     "project_id": "00000000-0000-0000-0000-0000000000b1",
@@ -706,6 +787,59 @@
       "Team files database connection",
       "webdav access",
       "How do I connect to Team files?",
+      "What databases are available?"
+    ]
+  },
+  "kb_note/webdav/creator_read_only": {
+    "note_id": "ds-d500000b",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Team files (webdav)",
+    "tags": [
+      "datasource",
+      "webdav"
+    ],
+    "content": [
+      "## Connector: Team files",
+      "**Type:** webdav | **Access:** read-only",
+      "",
+      "Shared drive",
+      "",
+      "### Available Tools",
+      "- `webdav_list` — list files and directories",
+      "- `webdav_read` — read file contents",
+      "- `webdav_info` — get file metadata"
+    ],
+    "retrieval_messages": [
+      "Team files database connection",
+      "webdav access",
+      "How do I connect to Team files?",
+      "What databases are available?"
+    ]
+  },
+  "kb_note/postgresql/public_no_mode_set": {
+    "note_id": "ds-d5000008",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Orders DB (postgresql)",
+    "tags": [
+      "datasource",
+      "postgresql"
+    ],
+    "content": [
+      "## Connector: Orders DB",
+      "**Type:** postgresql | **Access:** read-only (tools)",
+      "",
+      "Order history",
+      "",
+      "### Available Tools",
+      "- `sql_query` — execute SELECT queries",
+      "- `sql_schema` — inspect tables, columns, types, constraints",
+      "",
+      "No CLI access or write operations available."
+    ],
+    "retrieval_messages": [
+      "Orders DB database connection",
+      "postgresql access",
+      "How do I connect to Orders DB?",
       "What databases are available?"
     ]
   },

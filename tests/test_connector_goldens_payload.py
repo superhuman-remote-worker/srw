@@ -36,6 +36,10 @@ from tests._connector_goldens import (
     resolved_row,
 )
 
+#: A user other than the connector's creator: a consumer of a public or
+#: shared connector.
+OTHER = "00000000-0000-0000-0000-0000000000c2"
+
 
 @dataclass(frozen=True)
 class PayloadCase:
@@ -60,10 +64,63 @@ CASES.update(
         "postgresql/unlinked": PayloadCase(
             [resolved_row("postgresql", project_read_only=None)]
         ),
-        # The publisher's declared ``read_only`` flag is not forwarded; only
-        # the per-link ``project_read_only`` is.
-        "postgresql/declared_read_only": PayloadCase(
-            [resolved_row("postgresql", read_only=True, is_global=True)]
+        # The creator's read-only tag is not forwarded as such: it joins the
+        # project link in ``project_read_only``, the stricter of the two
+        # (decisions 31 and 32), for the owner and every consumer alike.
+        "postgresql/creator_read_only_public": PayloadCase(
+            [
+                resolved_row(
+                    "postgresql", read_only=True, is_global=True, created_by=OTHER
+                )
+            ]
+        ),
+        # A read-write project link cannot lift the creator's tag ...
+        "postgresql/creator_read_only_link_read_write": PayloadCase(
+            [resolved_row("postgresql", read_only=True, project_read_only=False)]
+        ),
+        # ... and neither can a missing one.
+        "postgresql/creator_read_only_unlinked": PayloadCase(
+            [resolved_row("postgresql", read_only=True, project_read_only=None)]
+        ),
+        # A public connector whose creator never chose a mode is read-only.
+        "postgresql/public_no_mode_set": PayloadCase(
+            [resolved_row("postgresql", is_global=True, created_by=OTHER)]
+        ),
+        # A creator who published it read-write leaves the link to decide.
+        "postgresql/public_read_write_link_read_write": PayloadCase(
+            [resolved_row("postgresql", read_only=False, is_global=True)]
+        ),
+        "postgresql/public_read_write_link_read_only": PayloadCase(
+            [
+                resolved_row(
+                    "postgresql",
+                    read_only=False,
+                    is_global=True,
+                    project_read_only=True,
+                )
+            ]
+        ),
+        # An explicit read-write tag on a private connector changes nothing.
+        "postgresql/private_read_write_tag": PayloadCase(
+            [resolved_row("postgresql", read_only=False)]
+        ),
+        "repository_token/creator_read_only": PayloadCase(
+            [resolved_row("repository_token", read_only=True)]
+        ),
+        "email/creator_read_only_floors_access": PayloadCase(
+            [
+                resolved_row(
+                    "email",
+                    read_only=True,
+                    config={"access": "send", "folders": ["INBOX"]},
+                )
+            ]
+        ),
+        "mixed/all_kinds_creator_read_only": PayloadCase(
+            [resolved_row(kind, read_only=True) for kind in KINDS]
+        ),
+        "mixed/all_kinds_public_no_mode_set": PayloadCase(
+            [resolved_row(kind, is_global=True, created_by=OTHER) for kind in KINDS]
         ),
         "generic/credentials_stored_as_json_string": PayloadCase(
             [
@@ -83,9 +140,14 @@ CASES.update(
             [resolved_row("webdav")],
             job_context={"cloud_storage_read_only": True},
         ),
-        # The job's override only tightens: it cannot lift a read-only link.
+        # The job's override only tightens: it cannot lift a read-only link,
         "webdav/cloud_storage_override_cannot_lift_read_only": PayloadCase(
             [resolved_row("webdav", project_read_only=True)],
+            job_context={"cloud_storage_read_only": False},
+        ),
+        # nor the creator's read-only tag under a read-write link.
+        "webdav/cloud_storage_override_cannot_lift_creator_read_only": PayloadCase(
+            [resolved_row("webdav", read_only=True, project_read_only=False)],
             job_context={"cloud_storage_read_only": False},
         ),
         # The override touches webdav rows only.

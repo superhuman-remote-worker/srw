@@ -133,7 +133,11 @@ from shared.connectors.builtin import (
     driver_spec_for_row,
     git_swap_entry,
 )
-from shared.connectors.contract import effective_access
+from shared.connectors.contract import (
+    CONNECTOR_READ_ONLY_SQL,
+    connector_read_only,
+    effective_access,
+)
 from shared.connectors.github_app import (
     CONFIG_KEY as GITHUB_APP_KEY,
     TOKEN_USERNAME,
@@ -326,20 +330,6 @@ def github_app_marker(row: Mapping[str, Any]) -> dict[str, Any]:
         "connector_id": str(row.get("id") or ""),
         "read_only": connector_read_only(row),
     }
-
-
-def connector_read_only(row: Mapping[str, Any]) -> bool:
-    """The connector's own read-only rule: its ``read_only`` when set (a
-    public connector's owner may publish it read-write), and a public one
-    whose flag was never set is read-only."""
-    read_only = row.get("read_only")
-    if read_only is None:
-        return bool(row.get("is_global"))
-    return read_only is True
-
-
-#: The same rule in SQL, on ``d`` (a ``datasources`` row).
-_OWN_READ_ONLY_SQL = "(d.read_only IS TRUE OR (d.is_global AND d.read_only IS NULL))"
 
 
 def clamped_access(access: str, *, read_only: bool) -> str:
@@ -1312,7 +1302,7 @@ SELECT EXISTS (
 
 _THREAD_TARGETS = f"""
 SELECT d.id,
-       COALESCE({_OWN_READ_ONLY_SQL}, false)
+       COALESCE({CONNECTOR_READ_ONLY_SQL}, false)
        OR COALESCE((SELECT BOOL_OR(pd.read_only) FROM project_datasources AS pd
                      WHERE pd.datasource_id = d.id
                        AND pd.project_id = ANY($2::uuid[])), false) AS read_only
@@ -1324,7 +1314,7 @@ SELECT d.id,
 #: (``resolve_datasources_for_job``: its selection, its project's link).
 _JOB_TARGETS = f"""
 SELECT d.id, d.name,
-       COALESCE({_OWN_READ_ONLY_SQL}, false)
+       COALESCE({CONNECTOR_READ_ONLY_SQL}, false)
        OR COALESCE(pd.read_only, false) AS read_only
   FROM job_datasources AS jd
   JOIN datasources AS d ON d.id = jd.datasource_id

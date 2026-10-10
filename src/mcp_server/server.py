@@ -1844,7 +1844,9 @@ async def create_datasource(
             access/folders/drafts_folder/from_address/recipient_allowlist/
             unattended_send; and repository options. MCP connectors reject it.
         is_global: Publish to all users (capability-gated; default false)
-        read_only: Declarative read-only setting (public defaults true; kb always true)
+        read_only: Creator's read-only tag: agents get no write tools for this
+            connector, for everyone who uses it (public defaults true; kb always
+            true). The credential still decides what is really allowed.
         scope_mode: Availability scope. ``all`` allows every otherwise-authorized
             work context; ``projects`` restricts use to project_ids.
         project_ids: Full initial project scope. Omit for all scope; projects
@@ -1905,7 +1907,8 @@ async def update_datasource(
         default_branch: New default branch (optional)
         config: New non-secret type-specific config (optional)
         is_global: Publish/unpublish. Publishing is capability-gated (optional)
-        read_only: New declarative read-only setting (optional)
+        read_only: New read-only tag: true gives agents no write tools for
+            this connector, for everyone who uses it (optional)
         scope_mode: New availability scope; omit to preserve it.
         project_ids: Desired full project set. Omit to preserve links; pass []
             to remove all links (valid only with resulting all scope).

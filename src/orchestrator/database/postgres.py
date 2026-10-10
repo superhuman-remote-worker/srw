@@ -50517,7 +50517,7 @@ class PostgresDB:
             default_branch: Branch to clone (repository type)
             created_by: Owner user UUID
             is_global: Whether this datasource is visible to all users
-            read_only: Declared read-only flag for public datasources
+            read_only: The creator's read-only tag (no write tools for anyone)
                        (None = not applicable; declarative only)
             config: Non-secret type-specific configuration
             scope_mode: Availability upper bound (``all`` or ``projects``)
@@ -50667,7 +50667,7 @@ class PostgresDB:
             default_branch: New default branch
             config: New non-secret type-specific configuration
             is_global: Publish (True) / unpublish (False); None = unchanged
-            read_only: Declared read-only flag; None = unchanged
+            read_only: The creator's read-only tag; None = unchanged
 
         Returns:
             True if updated, False if not found
@@ -50763,6 +50763,9 @@ class PostgresDB:
                 cli_hint,
                 default_branch,
                 config,
+                # The bound access the note states (bound_read_only).
+                is_global,
+                read_only,
             )
         )
 
@@ -51108,6 +51111,9 @@ class PostgresDB:
                         cli_hint,
                         default_branch,
                         config,
+                        # The bound access the note states (bound_read_only).
+                        is_global,
+                        read_only,
                     )
                 )
                 if note_content_changed:

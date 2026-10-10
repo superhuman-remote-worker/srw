@@ -2825,7 +2825,7 @@ class AsyncCockpitClient:
             default_branch: New default branch
             config: New non-secret type-specific configuration
             is_global: Publish/unpublish (publication is capability-gated)
-            read_only: New declarative read-only hint
+            read_only: New read-only tag (agents get no write tools for it)
             scope_mode: New availability scope. Omit to preserve it.
             project_ids: Desired full project set. Omit to preserve existing
                 links; pass [] to remove all links (valid only with all scope).

@@ -14,6 +14,12 @@ What one row becomes is its connector driver's ``bind``
 applies the drivers' deployment gates and per-execution limits, and keeps
 the wire format.
 
+It is also where a connector creator's read-only tag joins the project link
+(connector drivers decisions 31 and 32): every forwarded row carries the
+stricter of the two as ``project_read_only``, so the drivers, the tool
+categories, the credential leases and the agent all bind it at one level.
+The wire key keeps its name, since agent images roll independently.
+
 What is deliberately NOT here: connector authorization. ``datasource_policy``
 remains the authority for whether a selection may be attached at all, and the
 job-side reauthorization lives in ``job_datasource_selection``. This module
@@ -47,6 +53,7 @@ from orchestrator.services.connector_drivers.workspace_ssh import (
     WorkspaceSshConnectorError,
 )
 from shared.connectors.builtin import GIT_SWAP_SPEC
+from shared.connectors.contract import bound_read_only
 from shared.connectors.git_swap import FALLBACK_TOKEN_IN_URL
 from shared.datasource_policy import datasource_tool_categories
 
@@ -94,6 +101,10 @@ def forwarded_datasources(
     payload and the tool categories are built from this, so a tool tier is
     only granted for a connector that is delivered. A stored type no driver
     serves is forwarded as stored.
+
+    A row its creator tagged read-only is forwarded as a copy whose
+    ``project_read_only`` is set (:func:`bound_read_only`): a read-write or
+    missing project link never lifts the tag, for whoever runs it.
     """
     gates = dependencies.deployment_gates()
     forwarded: list[dict[str, Any]] = []
@@ -119,6 +130,8 @@ def forwarded_datasources(
                         )
                     continue
                 bound_per_driver[driver.spec.name] = bound + 1
+        if bound_read_only(ds) and not ds.get("project_read_only"):
+            ds = {**ds, "project_read_only": True}
         forwarded.append(ds)
     return forwarded
 
@@ -150,7 +163,8 @@ def build_datasource_tool_override(
     # tier-keyed inside the shared map (EMAIL_TIER_TOOLS keyed by
     # config.access, clamped by project_read_only). The categories come from
     # the rows the agent actually receives, so a second mailbox the payload
-    # leaves out cannot raise the email tier of the one it forwards.
+    # leaves out cannot raise the email tier of the one it forwards, and a
+    # creator's read-only tag clamps them as it clamps the payload.
     forwarded = forwarded_datasources(datasources, dependencies=dependencies)
     tools_override.update(datasource_tool_categories(forwarded))
     override["tools"] = tools_override
@@ -164,8 +178,9 @@ def apply_cloud_storage_override(
 
     The key is the job creator's, unchecked at admission, so it can only
     tighten: a WebDAV connector is read-only when its project link is or the
-    job asks for it. A job cannot lift a read-only link the project owner set.
-    Mutates resolved_ds in place.
+    job asks for it. A job cannot lift a read-only link the project owner set,
+    nor the connector creator's read-only tag, which the payload applies
+    after this (:func:`forwarded_datasources`). Mutates resolved_ds in place.
     """
     override = job_context.get("cloud_storage_read_only")
     if override is None:

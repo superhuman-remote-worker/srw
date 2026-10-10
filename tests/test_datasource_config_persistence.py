@@ -143,9 +143,31 @@ async def test_update_datasource_visibility_advances_policy_revision():
 
     assert await db.update_datasource(DATASOURCE_ID, is_global=False)
 
-    sql = conn.execute.await_args.args[0]
+    sql = conn.execute.await_args_list[0].args[0]
     assert "is_global = $1" in sql
     assert "policy_revision = policy_revision + 1" in sql
+    # Visibility decides an untagged connector's bound access, which its
+    # project notes state (decision 32), so they are projected again.
+    assert (
+        "datasource_project_reconcile_queue" in conn.execute.await_args_list[1].args[0]
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_datasource_read_only_tag_reprojects_the_notes():
+    """The creator's read-only tag changes what the notes say an execution
+    binds (decision 31)."""
+    conn = AsyncMock()
+    conn.execute.return_value = "UPDATE 1"
+    db = _make_db(conn)
+
+    assert await db.update_datasource(DATASOURCE_ID, read_only=True)
+
+    sql = conn.execute.await_args_list[0].args[0]
+    assert "read_only = $1" in sql
+    assert (
+        "datasource_project_reconcile_queue" in conn.execute.await_args_list[1].args[0]
+    )
 
 
 @pytest.mark.asyncio

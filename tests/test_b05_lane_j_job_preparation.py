@@ -1087,6 +1087,85 @@ class TestDatasourcePayload:
         agent_datasource_payload_module.apply_cloud_storage_override(theirs, context)
         assert mine == theirs
 
+    @pytest.mark.parametrize("link_read_only", [True, False, None])
+    @pytest.mark.parametrize(
+        ("read_only", "is_global", "tagged"),
+        [
+            (True, False, True),
+            (False, False, False),
+            (None, False, False),
+            (True, True, True),
+            (False, True, False),
+            # Published with no mode set (decision 32).
+            (None, True, True),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "created_by",
+        [
+            # The owner's own run, and a consumer's run of a shared or
+            # public connector: the rule is the connector's, not the user's.
+            "00000000-0000-0000-0000-0000000000c1",
+            "00000000-0000-0000-0000-0000000000c2",
+        ],
+    )
+    def test_the_creators_read_only_tag_and_the_link_bind_the_stricter(
+        self, link_read_only, read_only, is_global, tagged, created_by
+    ):
+        """Decision 31: a read-write or missing project link never lifts the
+        creator's tag, and the tag never lifts a read-only link. The payload
+        entry and the tool categories agree."""
+        rows = [
+            _ds(
+                project_read_only=link_read_only,
+                read_only=read_only,
+                is_global=is_global,
+                created_by=created_by,
+            )
+        ]
+        deps = _datasource_payload_deps()
+        override = agent_datasource_payload.build_datasource_tool_override(
+            rows, None, dependencies=deps
+        )
+        (entry,) = agent_datasource_payload.build_datasources_payload(
+            rows, dependencies=deps
+        )
+        bound = link_read_only is True or tagged
+        assert bool(entry["project_read_only"]) is bound
+        assert ("sql_execute" in override["tools"]["sql"]) is not bound
+        assert "sql_query" in override["tools"]["sql"]
+        # The caller's resolved row keeps the project link as it was.
+        assert rows[0]["project_read_only"] is link_read_only
+
+    def test_a_job_cannot_lift_the_creators_tag_with_its_cloud_override(self):
+        rows = [
+            _ds(type="webdav", name="cloud", read_only=True, project_read_only=False)
+        ]
+        agent_datasource_payload.apply_cloud_storage_override(
+            rows, {"cloud_storage_read_only": False}
+        )
+        deps = _datasource_payload_deps()
+        override = agent_datasource_payload.build_datasource_tool_override(
+            rows, None, dependencies=deps
+        )
+        (entry,) = agent_datasource_payload.build_datasources_payload(
+            rows, dependencies=deps
+        )
+        assert entry["project_read_only"] is True
+        assert "webdav_write" not in override["tools"]["webdav"]
+        assert "webdav_read" in override["tools"]["webdav"]
+
+    def test_the_creators_tag_parity(self):
+        rows = [_ds(read_only=True), _ds(type="webdav", name="cloud", is_global=True)]
+        assert agent_datasource_payload.build_datasources_payload(
+            rows, dependencies=_datasource_payload_deps()
+        ) == agent_datasource_payload_module.build_datasources_payload(
+            rows,
+            dependencies=preparation_composition.datasource_payload_dependencies(
+                main.app.state.resources
+            ),
+        )
+
 
 # =============================================================================
 # 4. Workspace tier predicates and the stateless admission gate
@@ -2484,6 +2563,41 @@ class TestJobStartBundle:
             "Connectors that need a shell (repositories, credential and generic "
             "environments, SSH keys) require a sandbox or VM workspace" in message
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tag",
+        [
+            # Tagged read-only by its creator, linked read-write.
+            {"read_only": True, "is_global": False},
+            # Someone else's public connector with no mode set (decision 32).
+            {"read_only": None, "is_global": True},
+        ],
+    )
+    async def test_a_job_binds_a_creator_read_only_connector_read_only(
+        self, bundle_env, monkeypatch, tag
+    ):
+        monkeypatch.setattr(
+            job_datasource_selection_module,
+            "resolve_authorized_job_datasources",
+            AsyncMock(
+                return_value=[
+                    _ds(
+                        project_read_only=False,
+                        created_by="00000000-0000-0000-0000-0000000000c2",
+                        **tag,
+                    )
+                ]
+            ),
+        )
+        bundle = await job_start_bundle.build_job_start_request(
+            _bundle_job(), dependencies=_start_bundle_deps()
+        )
+        assert bundle is not None
+        (entry,) = bundle.datasources
+        assert entry["project_read_only"] is True
+        assert entry["credentials"] == {}  # a read-only Postgres entry's rule
+        assert bundle.config_override["tools"]["sql"] == ["sql_query", "sql_schema"]
 
     @pytest.mark.asyncio
     async def test_a_lite_config_error_fails_the_job(self, bundle_env, monkeypatch):
