@@ -15,7 +15,12 @@ from typing import Any, Iterable, Literal, Mapping
 from uuid import UUID
 
 from shared.connectors.builtin import spec_for_row
-from shared.connectors.platform import native_project, native_user
+from shared.connectors.platform import (
+    CLOUD_OUTBOX,
+    managed_kind,
+    native_project,
+    native_user,
+)
 
 LITE_WORKSPACE_BACKENDS = frozenset({"virtual", "none"})
 GENERIC_UNAVAILABLE_DETAIL = "One or more selected connectors are unavailable"
@@ -406,6 +411,7 @@ async def default_datasource_selection(
     *,
     execution_kind: Literal["session", "job"],
     native_only: bool = False,
+    unattended: bool = False,
 ) -> tuple[list[str], dict[str, int]]:
     """Return default IDs and the policy revisions used to select them.
 
@@ -422,7 +428,9 @@ async def default_datasource_selection(
     (``workspace_tier_refuses``), or this kind of execution cannot attach
     (``execution_kind_refuses``: a cloud folder is a session's), are silently
     omitted because this is an implicit default rather than an explicit user
-    requirement.
+    requirement. ``unattended`` work (a loop's iteration, an automation's
+    fire, an officer's auto-pulled ticket) leaves the owner's outbox out:
+    nobody started it to receive its deliverables in a shared folder.
 
     The revision snapshot comes from the exact candidate rows used for the
     decision. Callers pass both values to the atomic creation API, which locks
@@ -459,6 +467,8 @@ async def default_datasource_selection(
         if workspace_tier_refuses(row, workspace_backend):
             continue
         if execution_kind_refuses(row, execution_kind):
+            continue
+        if unattended and managed_kind(row) == CLOUD_OUTBOX:
             continue
         try:
             datasource_id = str(UUID(str(row["id"])))

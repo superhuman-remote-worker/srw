@@ -987,6 +987,7 @@ async def _dispatch_one(
                 target_project_ids,
                 _slot_workspace_backend(prepared_config),
                 execution_kind="job",
+                unattended=True,
             )
         except DatasourceUnavailableError as exc:
             # A revoked owner, membership or connector. Skip the tick rather

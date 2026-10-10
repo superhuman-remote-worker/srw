@@ -1268,6 +1268,7 @@ async def create_loop_job(
             target_project_ids,
             str(workspace_backend) if workspace_backend else None,
             execution_kind="job",
+            unattended=True,
         )
         datasource_origin = "default"
     else:

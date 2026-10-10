@@ -172,6 +172,8 @@ class TestCreateJobFromAutomation:
             [project_id],
             "sandbox",
             execution_kind="job",
+            # An automation's fire is unattended: no outbox by default.
+            unattended=True,
         )
         kwargs = db.create_job.await_args.kwargs
         assert kwargs["datasource_ids"] == selected
@@ -206,6 +208,7 @@ class TestCreateJobFromAutomation:
             [],
             "virtual",
             execution_kind="job",
+            unattended=True,
         )
 
     @pytest.mark.asyncio

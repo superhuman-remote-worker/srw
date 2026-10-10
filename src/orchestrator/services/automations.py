@@ -329,6 +329,7 @@ async def create_job_from_automation(
         target_project_ids,
         workspace_backend,
         execution_kind="job",
+        unattended=True,
     )
 
     job = await db.create_job(

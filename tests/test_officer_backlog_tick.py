@@ -905,8 +905,10 @@ class TestTickOfficer:
         assert db.created["datasource_policy_revisions"] == {KB_DS: 2, REPO_DS: 4}
         # A dispatched worker is a job: a session-only connector (a cloud
         # folder) is never among its defaults.
+        # An auto-pulled ticket is unattended work: no outbox by default.
         assert mod.default_datasource_selection.await_args.kwargs == {
-            "execution_kind": "job"
+            "execution_kind": "job",
+            "unattended": True,
         }
         provenance = db.created["datasource_selection_provenance"]
         assert provenance["origin"] == "default"

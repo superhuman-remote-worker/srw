@@ -599,6 +599,28 @@ async def test_default_selection_returns_revisions_from_decision_rows():
 
 
 @pytest.mark.asyncio
+async def test_unattended_work_leaves_the_owners_outbox_out():
+    outbox = _row(
+        DS_NATIVE,
+        automatic=True,
+        ds_type="cloud_outbox",
+        managed_key=f"cloud-outbox:{OWNER}",
+    )
+    db = _db([outbox, _row(DS_OWNED, automatic=True)])
+
+    attended, _ = await default_datasource_selection(
+        db, OWNER, [], "sandbox", execution_kind="job"
+    )
+    unattended, revisions = await default_datasource_selection(
+        db, OWNER, [], "sandbox", execution_kind="job", unattended=True
+    )
+
+    assert attended == [DS_NATIVE, DS_OWNED]
+    assert unattended == [DS_OWNED]
+    assert revisions == {DS_OWNED: 1}
+
+
+@pytest.mark.asyncio
 async def test_named_owner_membership_loss_fails_closed():
     db = _db([_row(DS_OWNED, automatic=True)], member=False)
 

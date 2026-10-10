@@ -132,6 +132,8 @@ async def test_loop_materializes_only_live_owner_defaults(_empty_datasource_sele
         [project_id],
         "virtual",
         execution_kind="job",
+        # A loop's iteration is unattended: no outbox by default.
+        unattended=True,
     )
     kwargs = db.create_job.await_args.kwargs
     assert kwargs["datasource_ids"] == selected
