@@ -152,23 +152,11 @@ class VMPreSSHStopStore:
 
         authority = await retention_for_admission_on_conn(conn, cleanup_id)
         ready_stop = authority is not None and authority.get("policy_version") == 3
-        held_stop = (
-            authority is not None
-            and authority.get("policy_version") == 1
-            and (
-                frozen is not None
-                and frozen.get("kind")
-                == "vm_job_never_app_ready_retained_stop_candidate_v1"
-                or frozen is None
-                and await conn.fetchval(
-                    "SELECT frozen->>'kind'='vm_job_never_app_ready_retained_stop_candidate_v1' "
-                    "FROM vm_pre_ssh_stop_intents WHERE cleanup_admission_id=$1",
-                    cleanup_id,
-                )
-                is True
-            )
-        )
-        if ready_stop or held_stop:
+        policy1_stop = authority is not None and authority.get("policy_version") == 1
+        # Take the canonical locks before looking for a typed intent. An intent
+        # can commit between two reads; obtaining them only on the second read
+        # would invert owner/PVC versus Job/cleanup/charge lock order.
+        if ready_stop or policy1_stop:
             for key in (
                 f"workspace-recovery:job:{job_id}",
                 f"workspace-recovery-pvc:{authority['pvc_uid']}",
@@ -179,6 +167,18 @@ class VMPreSSHStopStore:
             await conn.fetchrow(
                 "SELECT unit_id FROM run_queue WHERE unit_id=$1 FOR UPDATE", job_id
             )
+        held_stop = policy1_stop and (
+            frozen is not None
+            and frozen.get("kind")
+            == "vm_job_never_app_ready_retained_stop_candidate_v1"
+            or frozen is None
+            and await conn.fetchval(
+                "SELECT frozen->>'kind'='vm_job_never_app_ready_retained_stop_candidate_v1' "
+                "FROM vm_pre_ssh_stop_intents WHERE cleanup_admission_id=$1",
+                cleanup_id,
+            )
+            is True
+        )
         job = await conn.fetchrow(
             "SELECT id,status,execution_lane,assigned_agent_id,context "
             "FROM jobs WHERE id=$1 FOR UPDATE",

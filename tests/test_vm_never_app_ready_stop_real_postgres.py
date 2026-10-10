@@ -388,6 +388,55 @@ class SameConnectionDB:
 
 
 @pytest.mark.asyncio
+async def test_no_intent_to_committed_intent_keeps_owner_before_job_lock(db, pg_dsn):  # noqa: F811
+    state = await held_state(db)
+    reader_conn = await asyncpg.connect(pg_dsn)
+    reader = None
+    try:
+        async with db.acquire() as writer:
+            async with writer.transaction():
+                await writer.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                    f"workspace-recovery:job:{state['job_id']}",
+                )
+                reader = asyncio.create_task(
+                    VMPreSSHStopStore(SameConnectionDB(reader_conn)).current_intent(
+                        state["job_id"], state["generation"], state["parent"]
+                    )
+                )
+                # Confirm that the independent reader is waiting on the owner
+                # advisory lock before attempting the Job row lock.
+                for _ in range(40):
+                    waiting = await writer.fetchval(
+                        "SELECT count(*) FROM pg_stat_activity "
+                        "WHERE wait_event='advisory' AND datname=current_database()"
+                    )
+                    if waiting:
+                        break
+                    await asyncio.sleep(0.025)
+                assert waiting, "reader did not wait on the owner advisory lock"
+                await writer.fetchrow(
+                    "SELECT id FROM jobs WHERE id=$1 FOR UPDATE NOWAIT",
+                    UUID(state["job_id"]),
+                )
+                await VMPreSSHStopStore(SameConnectionDB(writer)).admit_intent(
+                    state["job_id"],
+                    state["generation"],
+                    state["parent"],
+                    state["frozen"],
+                    retention_preflight=state["preflight"],
+                    prior_zero_receipt_id=str(state["zero"]["id"]),
+                )
+        intent = await asyncio.wait_for(reader, 5)
+        assert intent["frozen"] == state["frozen"]
+    finally:
+        if reader is not None and not reader.done():
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+        await reader_conn.close()
+
+
+@pytest.mark.asyncio
 async def test_savepoint_release_cannot_publish_uncommitted_held_intent(db):
     state = await held_state(db)
     with pytest.raises(RuntimeError, match="roll back outer"):
