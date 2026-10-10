@@ -11,7 +11,8 @@ envelope: dry-run by default, the exact k3d-srw/srw context, passwords only on
 check by gate id.
 
 Slice 1 gate: "a session's connector eligibility is unchanged with
-thread_mounts emptied". Slice 2 gate: "the page shows the table on a
+thread_mounts emptied"; since slice 8 a new session has no row at all, so the
+gate proves it holds without one. Slice 2 gate: "the page shows the table on a
 bundled-Nextcloud (and a bundled-OpenCloud) k3d, and no code outside the
 adapters branches on backend_id". This gate proves the second half for the
 Python sources only (the ratchet's scope): the cockpit still holds two
@@ -59,7 +60,8 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               of the orchestrator's environment appears in the response
   retired     GET/PUT/DELETE /api/admin/system-settings/main_cloud and POST
               .../test and .../reload answer 410 with the Helm detail as the
-              owner and leave the active-instance pointer unchanged; the
+              owner and leave the active-instance pointer unchanged; POST
+              .../repair-thread-mounts?apply=true answers 410 (slice 8); the
               second account gets 403 from the page and every retired route
   cockpit     Playwright: Settings -> Main cloud (/admin/cloud) renders one
               row per matrix row and one cell per provider with the API's
@@ -69,12 +71,11 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               verdicts and attach-time resolution for the gate's session,
               read in the orchestrator pod over a read-only connection: the
               scope is [home]; linked, own and the knowledge base are
-              eligible, elsewhere is out of scope; then the session's
-              thread_mounts rows (at least one, else the check is vacuous and
-              fails) are deleted and every answer is the same; the rows are
-              restored. The live protected-lane query agrees with the page:
-              the session's project mount is the protected one exactly when
-              its provider offers ``protected``
+              eligible, elsewhere is out of scope; and the session has no
+              thread_mounts row at all (slice 8: nothing writes one), so
+              every answer holds without one. The live provider capability
+              agrees with the page's protected cell, and the unprotected
+              session selects no protected folder
   cleanup     nothing this run created is left: the session titled with the
               gate id (and its pods), connectors, projects, the disposable
               account (app row, then Keycloak user), the OAuth client
@@ -207,6 +208,10 @@ RETIRED = (
 PAGE = "/api/admin/main-cloud"
 #: The start of the 410 body (``routers.main_cloud_settings.RETIRED_DETAIL``).
 RETIRED_PREFIX = "The main cloud is configured by Helm only"
+#: The thread-mount transport repair, retired by slice 8 (asked to write).
+REPAIR = ("POST", "/api/admin/system-settings/main_cloud/repair-thread-mounts", None)
+#: The start of its 410 body (``REPAIR_RETIRED_DETAIL``).
+REPAIR_PREFIX = "A session's cloud folders are its attached cloud connectors"
 ACCOUNT_DOMAIN = "example.invalid"
 #: The second account's session: the most an ungranted user may pick.
 SESSION_PERMISSION_MODE = "auto_accept"
@@ -396,9 +401,6 @@ from orchestrator.services.thread_datasource_authorization import (
 )
 cap_memory()
 request = json.loads(sys.stdin.readline())
-async def _no_rows(*_args, **_kwargs):
-    return []
-thread_mount_rows.build_thread_mount_rows = _no_rows
 async def main():
     db = PostgresDB(
         min_connections=1, max_connections=2,
@@ -430,20 +432,20 @@ async def main():
             thread, request["selected"], dependencies=auth
         )
         mounts = await db.list_thread_mounts(request["thread"])
-        protected = select_protected_mount(mounts)
+        protected = select_protected_mount(
+            await db.list_protected_selection_rows(request["thread"])
+        )
+        project = await db.get_project(str(thread["project_id"]))
+        provider = str((project or {}).get("main_cloud_backend") or "")
         print(json.dumps({
             "scope": scope,
             "actor_scope": await actor_scope(db, thread),
             "verdicts": {v.datasource_id: v.reason or "eligible" for v in verdicts},
             "resolved": sorted(str(row["id"]) for row in rows),
             "mounts": len(mounts),
-            "mount_providers": sorted({str(m.get("backend_id")) for m in mounts}),
             "protected_mount": bool(protected),
             "offers_protected": {
-                str(m.get("backend_id")): provider_offers(
-                    m.get("backend_id"), PROTECTED_PROJECT_FOLDER
-                )
-                for m in mounts
+                provider: provider_offers(provider, PROTECTED_PROJECT_FOLDER)
             },
         }))
     finally:
@@ -726,15 +728,6 @@ def offered(matrix: dict[str, Any], provider: str, key: tuple) -> bool:
     return False
 
 
-def same_scope(a: dict[str, Any], b: dict[str, Any]) -> list[str]:
-    """How two scope readings differ (scope, actor scope, verdicts, resolved)."""
-    return [
-        f"{key}: {a.get(key)!r} != {b.get(key)!r}"[:300]
-        for key in ("scope", "actor_scope", "verdicts", "resolved")
-        if a.get(key) != b.get(key)
-    ]
-
-
 # ---------------------------------------------------------------------------
 # The gate
 # ---------------------------------------------------------------------------
@@ -778,8 +771,9 @@ PLAN = [
     "matching values, and the design table; no secret of the orchestrator's "
     "environment is in it",
     "retired: the connection form's GET/PUT/DELETE/test/reload answer 410 and "
-    "leave the active-instance pointer unchanged; the second account gets 403 "
-    "from the page and every retired route",
+    "leave the active-instance pointer unchanged; the thread-mount transport "
+    "repair answers 410; the second account gets 403 from the page and every "
+    "retired route",
     "cockpit (Playwright): /admin/cloud shows the table cell for cell as the "
     "API answers, the installation id, no form field, and no sideways scroll "
     "at phone width",
@@ -789,9 +783,9 @@ PLAN = [
     "sandbox session in home selecting linked (and home's knowledge base)",
     "scope: in the orchestrator pod over a read-only connection, the deployed "
     "thread_project_ids, runtime-actor scope, policy verdicts and attach-time "
-    "resolution of the session; its thread_mounts rows are deleted and every "
-    "answer is the same, then the rows are restored; the protected-lane "
-    "query agrees with the page's protected cell",
+    "resolution of the session, which has no thread_mounts row; the live "
+    "provider capability agrees with the page's protected cell, and the "
+    "unprotected session selects no protected folder",
     "cleanup: the session (and its pods), connectors, projects, the disposable "
     "account (app row, then Keycloak user), the OAuth client; residue check "
     "by gate id",
@@ -820,8 +814,6 @@ class MainCloudGate:
         self.connector_api: dict[str, str] = {}  # label -> "owner" | "other"
         self.kb: str | None = None
         self.thread: str | None = None
-        self.mount_snapshot: list[dict[str, Any]] | None = None
-        self.mounts_deleted = False
         self.page: dict[str, Any] = {}
         self.provider = ""
 
@@ -1068,6 +1060,17 @@ class MainCloudGate:
                 else ""
             )
             answers.append((method, path, status, detail.startswith(RETIRED_PREFIX)))
+        method, path, body = REPAIR
+        status, parsed = self.owner.call(method, f"{path}?apply=true", body)
+        detail = (
+            str((parsed or {}).get("detail", "")) if isinstance(parsed, dict) else ""
+        )
+        self.report.check(
+            "retired: the thread-mount transport repair answers 410 and writes "
+            "nothing (main cloud slice 8)",
+            status == 410 and detail.startswith(REPAIR_PREFIX),
+            f"{method} {path.rsplit('/', 1)[-1]} {status}",
+        )
         after = self.active_pointer()
         self.report.check(
             "retired: the connection form's API answers 410 with the Helm detail",
@@ -1080,7 +1083,7 @@ class MainCloudGate:
             f"{before} -> {after}",
         )
         refused = []
-        for method, path, body in (("GET", PAGE, None),) + RETIRED:
+        for method, path, body in (("GET", PAGE, None),) + RETIRED + (REPAIR,):
             status, _parsed = self.other.call(method, path, body)
             refused.append((method, path, status))
         self.report.check(
@@ -1289,51 +1292,21 @@ class MainCloudGate:
             json.dumps(before)[:400],
         )
         self.report.check(
-            "scope: the session has thread_mounts rows to empty",
-            int(before.get("mounts") or 0) > 0,
-            f"{before.get('mounts')} rows (none means the project has no "
-            "main-cloud folder, and the next check would prove nothing)",
+            "scope: the new session wrote no thread_mounts row, and the answers "
+            "above hold without one (main cloud slice 8)",
+            int(before.get("mounts") or 0) == 0,
+            f"{before.get('mounts')} rows",
         )
-        self.mount_snapshot = (
-            sql_json(
-                "SELECT coalesce(json_agg(m), '[]'::json) FROM thread_mounts m WHERE "
-                f"thread_id = {lit(self.thread)}"
-            )
-            or []
-        )
-        sql(f"DELETE FROM thread_mounts WHERE thread_id = {lit(self.thread)}")
-        self.mounts_deleted = True
-        after = self.scope()
-        differences = same_scope(before, after)
-        self.report.check(
-            "scope: with the session's thread_mounts emptied, its scope, the "
-            "runtime actor's, every verdict and the attach-time resolution are "
-            "unchanged",
-            not differences and int(after.get("mounts") or 0) == 0,
-            "; ".join(differences[:4]),
-        )
-        self.restore_mounts()
         offers = offered(self.page.get("matrix") or {}, self.provider, PROTECTED)
         self.report.check(
-            "scope: the protected-lane query agrees with the page (the project "
-            "mount is the protected one exactly when the provider offers it)",
-            before.get("protected_mount") == offers
-            and before.get("offers_protected", {}).get(self.provider) == offers,
-            f"page offers={offers}, live={before.get('protected_mount')}, "
-            f"{before.get('offers_protected')}",
+            "scope: the live provider capability agrees with the page's "
+            "protected cell, and the unprotected session selects no protected "
+            "folder",
+            before.get("offers_protected") == {self.provider: offers}
+            and before.get("protected_mount") is False,
+            f"page offers={offers}, live={before.get('offers_protected')}, "
+            f"selected={before.get('protected_mount')}",
         )
-
-    def restore_mounts(self) -> bool:
-        if not self.mounts_deleted:
-            return True
-        rows = json.dumps(self.mount_snapshot or [])
-        sql_script(
-            "INSERT INTO thread_mounts SELECT * FROM "
-            f"json_populate_recordset(NULL::thread_mounts, {lit(rows)}::json) "
-            "ON CONFLICT DO NOTHING;\n"
-        )
-        self.mounts_deleted = False
-        return True
 
     def delete_thread(self, thread: str) -> bool:
         def gone() -> bool:
@@ -1361,8 +1334,6 @@ class MainCloudGate:
             except GateError as exc:
                 problems.append(f"{label} ({exc})")
 
-        if self.mounts_deleted:
-            step("restore the session's thread_mounts rows", self.restore_mounts)
         threads = ([self.thread] if self.thread else []) + self.titled_threads()
         for thread in dict.fromkeys(threads):
             step(f"delete session {thread}", lambda t=thread: self.delete_thread(t))

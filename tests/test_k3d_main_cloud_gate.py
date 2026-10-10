@@ -157,23 +157,11 @@ def test_offered_reads_one_cell():
     assert gate.offered(matrix, "opencloud", gate.PROTECTED) is False
 
 
-def test_scope_readings_compare_everything_the_slice_promises():
-    reading = {
-        "scope": ["p"],
-        "actor_scope": ["p"],
-        "verdicts": {"a": "eligible"},
-        "resolved": ["a"],
-        "mounts": 1,
-    }
-    assert gate.same_scope(reading, {**reading, "mounts": 0}) == []
-    for key in ("scope", "actor_scope", "verdicts", "resolved"):
-        assert gate.same_scope(reading, {**reading, key: None}), key
-
-
 def test_the_retired_routes_are_the_removed_api():
     from orchestrator.routers import main_cloud_settings as routes
 
     assert routes.RETIRED_DETAIL.startswith(gate.RETIRED_PREFIX)
+    assert routes.REPAIR_RETIRED_DETAIL.startswith(gate.REPAIR_PREFIX)
     retired = {(method, path) for method, path, _body in gate.RETIRED}
     declared = {
         (method, route.path)
@@ -182,6 +170,12 @@ def test_the_retired_routes_are_the_removed_api():
         if route.endpoint.__name__.endswith("main_cloud_settings")
     }
     assert retired == declared
+    method, path, _body = gate.REPAIR
+    assert (method, path) in {
+        (method, route.path)
+        for route in routes.router.routes
+        for method in route.methods
+    }
     assert gate.PAGE in {route.path for route in routes.router.routes}
 
 
@@ -206,16 +200,6 @@ def test_run_cleans_up_and_checks_residue_after_a_failure(monkeypatch):
     assert calls == ["cleanup", "residue"]
     names = [name for name, _ok, _detail in runner.report.results]
     assert names == ["gate infrastructure", "cleanup: nothing this run created is left"]
-
-
-def test_emptied_mount_rows_are_restored_first_in_cleanup(monkeypatch):
-    runner = _runner()
-    runner.mounts_deleted = True
-    order = []
-    monkeypatch.setattr(runner, "restore_mounts", lambda: order.append("restore"))
-    monkeypatch.setattr(runner, "titled_threads", lambda: [])
-    assert runner.cleanup() == []
-    assert order == ["restore"]
 
 
 def test_nothing_this_run_did_not_create_is_cleaned_up(monkeypatch):
