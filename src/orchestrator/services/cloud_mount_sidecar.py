@@ -115,14 +115,46 @@ def recorded_sidecar_plan(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
     return dict(plan)
 
 
-def agent_payload(recorded: Mapping[str, Any]) -> dict[str, Any]:
+def status_settled(recorded: Mapping[str, Any], status: Any) -> bool:
+    """Whether the thread's record of this Pod (same plan and UID) already
+    has every planned mount settled: mounted or unavailable, not pending."""
+    if not isinstance(status, Mapping):
+        return False
+    if status.get("fingerprint") != recorded.get("fingerprint") or status.get(
+        "runtime_incarnation"
+    ) != recorded.get("runtime_incarnation"):
+        return False
+    entries = status.get("mounts")
+    if not isinstance(entries, Mapping):
+        return False
+    names = [str(mount.get("name")) for mount in recorded.get("mounts") or []]
+    return all(
+        isinstance(entries.get(name), Mapping)
+        and entries[name].get("state") in {"mounted", "unavailable"}
+        for name in names
+    )
+
+
+def agent_payload(recorded: Mapping[str, Any], *, status: Any = None) -> dict[str, Any]:
     """The ``cloud_mount_sidecar`` an agent attaches with: no credential and
-    no remote, only where each mount is and how to learn its state."""
+    no remote, only where each mount is and how to learn its state.
+
+    ``runtime_incarnation`` (the Pod's UID) goes back with the agent's
+    report, so only this Pod's record takes it. ``settled`` (unprotected
+    Pods only, whose payload is not part of an attach identity) tells a
+    re-attaching agent its folders already settled once, so it need not wait
+    for them again."""
     overlay = recorded.get("overlay")
+    protected = bool(recorded.get("protected"))
+    extra: dict[str, Any] = {}
+    if not protected:
+        extra["settled"] = status_settled(recorded, status)
     return {
+        **extra,
         "version": PLAN_VERSION,
         "delivery": "sidecar",
         "fingerprint": recorded.get("fingerprint"),
+        "runtime_incarnation": recorded.get("runtime_incarnation"),
         "cloud_root": WORKSPACE_CLOUD_ROOT,
         "workspace_entry": "cloud",
         "status_dir": STATUS_DIR,
@@ -157,4 +189,5 @@ __all__ = [
     "plan_fingerprint",
     "recorded_plan_from_annotations",
     "recorded_sidecar_plan",
+    "status_settled",
 ]

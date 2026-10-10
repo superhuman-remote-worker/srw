@@ -149,8 +149,11 @@ async def record_report(
     thread_id: str,
     *,
     fingerprint: str,
+    runtime_incarnation: str,
     entries: Mapping[str, Mapping[str, Any]],
 ) -> bool:
+    """Merge an up-to-date agent's report into its own Pod's record; it also
+    clears an ``agent_outdated`` notice an older agent left."""
     merge = getattr(type(store), "merge_thread_cloud_mount_status", None)
     if not callable(merge):
         return False
@@ -159,9 +162,11 @@ async def record_report(
             store,
             thread_id,
             fingerprint=fingerprint,
+            runtime_incarnation=runtime_incarnation,
             mounts=dict(entries),
             notice=None,
             updated_at=_now(),
+            clear_notice=True,
         )
     )
 
@@ -171,14 +176,20 @@ async def record_agent_outdated(
 ) -> None:
     """Best effort, never raises: the poll it rides on must not fail."""
     fingerprint = sidecar_payload.get("fingerprint")
+    incarnation = sidecar_payload.get("runtime_incarnation")
     merge = getattr(type(store), "merge_thread_cloud_mount_status", None)
-    if not isinstance(fingerprint, str) or not callable(merge):
+    if (
+        not isinstance(fingerprint, str)
+        or not isinstance(incarnation, str)
+        or not callable(merge)
+    ):
         return
     try:
         await merge(
             store,
             thread_id,
             fingerprint=fingerprint,
+            runtime_incarnation=incarnation,
             mounts={},
             notice="agent_outdated",
             updated_at=_now(),

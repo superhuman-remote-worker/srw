@@ -435,6 +435,9 @@ async def bind_services(resources: ApplicationResources) -> None:
         db=resources.postgres_db,
         snapshot_service=snapshot_service_module.snapshot_service,
         cloud_mount_planner=workspace_composition.cloud_mount_planner(resources),
+        cloud_mount_grant_waiter=workspace_composition.cloud_mount_grant_waiter(
+            resources
+        ),
     )
 
     # Initialize Docker Compose provisioner (static workspace pool, used when k8s unavailable)

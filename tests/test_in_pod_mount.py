@@ -16,14 +16,16 @@ from __future__ import annotations
 import json
 import logging
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from kubernetes.client import ApiClient
 
+from orchestrator.services import cloud_mount_status
 from orchestrator.services.cloud_mount_plan import (
     CloudMountPlan,
     SidecarMount,
+    plan_annotation,
     rclone_reveal,
 )
 from orchestrator.services.cloud_mount_sidecar import (
@@ -505,7 +507,7 @@ def test_a_protected_pod_keeps_fuse_for_its_overlay_on_the_sidecars_lower(plane_
     assert "reader-secret" not in json.dumps(manifest)
 
 
-def _fingerprint(provisioner: ContainerProvisioner, plan=None) -> str:
+def _fingerprint(provisioner: ContainerProvisioner, plan=None, *, profile=None) -> str:
     owner = WorkspaceOwner.session(THREAD_ID)
     return provisioner._pinned_workspace_provision_fingerprint(
         owner=owner,
@@ -522,7 +524,7 @@ def _fingerprint(provisioner: ContainerProvisioner, plan=None) -> str:
         seed_files={},
         seed_extensions={},
         seed_needs_state=False,
-        profile=_profile(),
+        profile=profile or _profile(),
         cloud_plan=plan,
     )
 
@@ -566,9 +568,19 @@ def _pod(manifest: dict, uid: str = POD_UID):
 
 
 class _CoreApi:
-    def __init__(self, fail_with: int | None = None) -> None:
+    def __init__(
+        self, fail_with: int | None = None, configmaps: set[str] | None = None
+    ) -> None:
         self.created: list[tuple[str, dict]] = []
         self.fail_with = fail_with
+        self.configmaps = configmaps or set()
+
+    def read_namespaced_config_map(self, name, namespace):
+        if name not in self.configmaps:
+            error = RuntimeError("not found")
+            error.status = 404
+            raise error
+        return SimpleNamespace(metadata=SimpleNamespace(name=name))
 
     def _create(self, kind, namespace, body):
         if self.fail_with is not None:
@@ -592,6 +604,7 @@ def _with_api(provisioner: ContainerProvisioner, api: _CoreApi) -> ContainerProv
         return call(**kwargs)
 
     provisioner._bounded_kubernetes_mutation = mutation
+    provisioner._bounded_kubernetes_call = mutation
     return provisioner
 
 
@@ -643,24 +656,73 @@ async def test_an_earlier_create_of_the_same_attempt_is_fine_any_other_error_is_
 
 
 @pytest.mark.asyncio
-async def test_no_objects_without_mounts_or_for_a_pod_of_another_plan(plane_on):
+async def test_no_objects_for_a_pod_without_mounts(plane_on):
     api = _CoreApi()
     provisioner = _with_api(plane_on, api)
     owner = WorkspaceOwner.session(THREAD_ID)
     assert await provisioner._ensure_cloud_mount_objects(
         _pod(build(provisioner, EMPTY_PLAN)), EMPTY_PLAN, owner=owner
     )
-    other = CloudMountPlan(
-        mounts=(_mount(0, "other"),),
+    assert await provisioner._ensure_cloud_mount_objects(
+        _pod(build(provisioner)), PLAN, owner=owner
+    )
+    assert api.created == []
+
+
+@pytest.mark.asyncio
+async def test_an_adopted_pod_of_another_plan_gets_its_own_plans_objects(plane_on):
+    """A Pod adopted from another plan (a retry after the plan's inputs
+    moved) must not wait in ContainerCreating for objects nobody makes: its
+    own plan's objects are rebuilt with today's passwords by mount id."""
+    api = _CoreApi()
+    provisioner = _with_api(plane_on, api)
+    owner = WorkspaceOwner.session(THREAD_ID)
+    earlier = CloudMountPlan(
+        mounts=(_mount(0, "project"),),
+        excluded=(),
+        drain_seconds=30,
+        cache_size="10Gi",
+        passwords={0: "an-earlier-password"},
+    )
+    pod = _pod(build(provisioner, earlier))
+    assert await provisioner._ensure_cloud_mount_objects(pod, PLAN, owner=owner)
+    (_, configmap), (_, secret) = api.created
+    assert json.loads(configmap["data"]["plan.json"]) == earlier.supervisor_plan()
+    (password_line,) = [
+        line
+        for line in secret["stringData"]["rclone.conf"].splitlines()
+        if line.startswith("pass = ")
+    ]
+    # Today's password for the same mount id.
+    assert rclone_reveal(password_line.split(" = ", 1)[1]) == PASSWORD
+
+
+@pytest.mark.asyncio
+async def test_an_adopted_pod_whose_objects_cannot_be_made_is_refused(plane_on, caplog):
+    owner = WorkspaceOwner.session(THREAD_ID)
+    gone = CloudMountPlan(
+        mounts=(_mount(0, "gone"),),
         excluded=(),
         drain_seconds=60,
         cache_size="10Gi",
         passwords={0: PASSWORD},
     )
-    assert await provisioner._ensure_cloud_mount_objects(
-        _pod(build(provisioner, other)), PLAN, owner=owner
+    pod = _pod(build(plane_on, gone))
+    api = _CoreApi()
+    with caplog.at_level(logging.ERROR):
+        assert not await _with_api(plane_on, api)._ensure_cloud_mount_objects(
+            pod, PLAN, owner=owner
+        )
+        assert not await _with_api(plane_on, api)._ensure_cloud_mount_objects(
+            pod, None, owner=owner
+        )
+    assert "refusing it" in caplog.text and api.created == []
+    # Its attempt made them before (its plan ConfigMap exists): it is fine.
+    made = _CoreApi(configmaps={objects_name_from_pod(pod)})
+    assert await _with_api(plane_on, made)._ensure_cloud_mount_objects(
+        pod, PLAN, owner=owner
     )
-    assert api.created == []
+    assert made.created == []
 
 
 @pytest.mark.asyncio
@@ -759,3 +821,160 @@ async def test_a_fence_delete_gives_a_sidecar_pod_time_to_detach(plane_on):
         )
     assert [d["grace_period_seconds"] for d in deletes] == [5, 0]
     assert all(d["body"] == {"preconditions": {"uid": "u-1"}} for d in deletes)
+
+
+# --------------------------------------------------------------------------- #
+# A retried creation replays its own plan (fingerprint stability)
+# --------------------------------------------------------------------------- #
+
+
+def _stable(provisioner, *, in_flight, pod_plan=None):
+    class _Db:
+        get_in_flight_workspace_creation_digest = AsyncMock(return_value=in_flight)
+
+    provisioner._db = _Db()
+    provisioner._pod_recorded_cloud_plan = AsyncMock(
+        return_value=(
+            json.loads(plan_annotation(pod_plan)) if pod_plan is not None else None
+        )
+    )
+    return provisioner
+
+
+async def _fingerprint_of(provisioner, plan, profile):
+    value = _fingerprint(provisioner, plan, profile=profile)
+    return value, value
+
+
+@pytest.mark.asyncio
+async def test_an_intent_admitted_before_the_plane_replays_without_it(plane_on):
+    """An in-flight pinned intent from before the deploy (or from before a
+    protected grant was active) was admitted without a plan: its retry must
+    compute the same fingerprint, so it keeps the in-workspace path."""
+    owner = WorkspaceOwner.session(THREAD_ID)
+    before_deploy = _fingerprint(plane_on, None)
+    provisioner = _stable(plane_on, in_flight=before_deploy)
+    plan, profile, fingerprint = await provisioner._replay_cloud_plan(
+        owner,
+        PLAN,
+        _profile(),
+        pinned=True,
+        digest_of=lambda p, prof: _fingerprint_of(provisioner, p, prof),
+    )
+    assert plan is None and fingerprint == before_deploy
+    assert profile.fuse_enabled is True
+    provisioner._db.get_in_flight_workspace_creation_digest.assert_awaited_with(
+        provisioner._db, THREAD_ID, pinned=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_retry_replays_the_plan_its_pod_recorded(plane_on):
+    """Inputs that moved between attempts (the flags, a grant re-read) must
+    not hold an intent whose Pod already records its plan."""
+    owner = WorkspaceOwner.session(THREAD_ID)
+    earlier = CloudMountPlan(
+        mounts=(_mount(0, "project"),),
+        excluded=(),
+        drain_seconds=30,
+        cache_size="10Gi",
+        passwords={0: "old"},
+    )
+    admitted = _fingerprint(plane_on, earlier, profile=_profile(fuse=False))
+    provisioner = _stable(plane_on, in_flight=admitted, pod_plan=earlier)
+    plan, _profile_used, fingerprint = await provisioner._replay_cloud_plan(
+        owner,
+        PLAN,
+        _profile(),
+        pinned=True,
+        digest_of=lambda p, prof: _fingerprint_of(provisioner, p, prof),
+    )
+    assert fingerprint == admitted
+    assert plan.recorded()["fingerprint"] == earlier.recorded()["fingerprint"]
+    # Rebuilt with today's password for the same mount id.
+    assert plan.passwords == {0: PASSWORD}
+
+
+@pytest.mark.asyncio
+async def test_without_an_unfinished_creation_todays_plan_wins(plane_on):
+    owner = WorkspaceOwner.session(THREAD_ID)
+    for in_flight in (None, "f" * 64):
+        provisioner = _stable(plane_on, in_flight=in_flight)
+        plan, profile, fingerprint = await provisioner._replay_cloud_plan(
+            owner,
+            PLAN,
+            _profile(),
+            pinned=False,
+            digest_of=lambda p, prof: _fingerprint_of(provisioner, p, prof),
+        )
+        assert plan is PLAN and profile.fuse_enabled is False
+        assert fingerprint == _fingerprint(plane_on, PLAN, profile=profile)
+
+
+@pytest.mark.asyncio
+async def test_the_pinned_lock_is_taken_only_after_the_grant_landed(plane_on):
+    order: list[str] = []
+
+    class _Lock:
+        def __init__(self, db, thread_id):
+            pass
+
+        async def __aenter__(self):
+            order.append("lock")
+            return True
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Db:
+        thread_advisory_lock = _Lock
+
+        async def get_thread(self, thread_id):
+            order.append("read")
+            return None
+
+    plane_on._db = _Db()
+
+    async def waiter(thread_id):
+        order.append("grant")
+
+    plane_on._cloud_mount_grant_waiter = waiter
+    assert not await plane_on.create_pinned_thread_workspace(THREAD_ID)
+    assert order == ["grant", "lock", "read"]
+
+
+@pytest.mark.asyncio
+async def test_a_continued_or_recovered_pod_gets_its_objects_and_record(plane_on):
+    """A crash between creating a sidecar Pod and publishing its plan: the
+    continuation (and attach's recovery) makes its objects and records its
+    plan from the Pod's own annotation."""
+    api = _CoreApi()
+    provisioner = _with_api(plane_on, api)
+    owner = WorkspaceOwner.session(THREAD_ID)
+    pod = _pod(build(provisioner, PLAN))
+    provisioner._cloud_mount_planner = AsyncMock(return_value=PLAN)
+    store = SimpleNamespace(merge_thread_workspace_context=AsyncMock(return_value=True))
+    provisioner._db = store
+    statuses: list = []
+
+    async def record(_store, thread_id, recorded, incarnation):
+        statuses.append((recorded["fingerprint"], incarnation))
+        return True
+
+    with patch.object(cloud_mount_status, "record_pod", record):
+        assert await provisioner._settle_cloud_mount_plan(owner, pod, POD_UID)
+        provisioner._k8s_available = True
+        provisioner._core_api.read_namespaced_pod = lambda name, namespace: pod
+        assert await provisioner.recover_cloud_mount_plan(owner, POD_UID)
+        # Another Pod's UID recovers nothing.
+        assert not await provisioner.recover_cloud_mount_plan(
+            owner, "00000000-0000-4000-8000-0000000000aa"
+        )
+    assert [kind for kind, _ in api.created] == ["ConfigMap", "Secret"] * 2
+    written = store.merge_thread_workspace_context.await_args[0][1][PLAN_CONTEXT_KEY]
+    assert written["fingerprint"] == PLAN.recorded()["fingerprint"]
+    assert written["runtime_incarnation"] == POD_UID
+    assert statuses == [(PLAN.recorded()["fingerprint"], POD_UID)] * 2
+    # The plan was only read, never awaited a grant.
+    for call in provisioner._cloud_mount_planner.await_args_list:
+        assert call.kwargs == {"wait_for_grant": False}

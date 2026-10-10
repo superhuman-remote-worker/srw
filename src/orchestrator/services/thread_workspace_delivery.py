@@ -51,7 +51,10 @@ from orchestrator.services.session_workspace_policy import preparation_wait_budg
 from orchestrator.security.access import externalize_gitea_url
 from orchestrator.security.access import require_internal as _require_internal
 from orchestrator.services import connector_credential_leases
-from orchestrator.services.cloud_mount_sidecar import recorded_sidecar_plan
+from orchestrator.services.cloud_mount_sidecar import (
+    PLAN_CONTEXT_KEY,
+    recorded_sidecar_plan,
+)
 from orchestrator.services.container_provisioner import (
     WORKSPACE_RUNTIME_INCARNATION_KEY,
     WorkspaceRuntimeAttestation,
@@ -77,6 +80,7 @@ from orchestrator.services.workspace_binding import (
     remote_canvas_presentation_available,
     virtual_thread_backing_id,
 )
+from orchestrator.services.in_pod_mount import InPodPlaneSettings
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from orchestrator.services.workspace_suspension import (
     WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY,
@@ -502,6 +506,48 @@ async def prepare_agent_thread_workspace(
     await connector_credential_leases.prepare_thread_lease_delivery(
         dependencies.store, thread_id
     )
+    await _recover_cloud_mount_plan(thread_id, dependencies=dependencies)
+
+
+async def _recover_cloud_mount_plan(
+    thread_id: str, *, dependencies: ThreadWorkspaceDeliveryDependencies
+) -> None:
+    """A ready Pod whose plan never reached the thread (a crash between
+    creating the Pod and publishing its plan) gets it from the Pod's own
+    annotation, the plan's source of truth, before attach reads the record
+    (connector drivers D7). Never raises."""
+    if InPodPlaneSettings.from_env() is None:
+        return
+    try:
+        thread = await dependencies.store.get_thread(thread_id)
+        metadata = thread_metadata_object(thread)
+        workspace = metadata.get("workspace_container")
+        vm = metadata.get("vm") or {}
+        if (
+            not isinstance(workspace, Mapping)
+            or PLAN_CONTEXT_KEY in workspace
+            or workspace.get("status") != "ready"
+            or workspace.get("provisioner") != "k8s"
+            or not workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+            or (isinstance(vm, Mapping) and vm.get("status") == "ready")
+        ):
+            return
+        recover = getattr(
+            dependencies.container_provisioner, "recover_cloud_mount_plan", None
+        )
+        if callable(recover) and await recover(
+            WorkspaceOwner.session(thread_id),
+            str(workspace[WORKSPACE_RUNTIME_INCARNATION_KEY]),
+        ):
+            logger.warning(
+                "Thread %s: recovered its workspace Pod's cloud mount plan from "
+                "the Pod",
+                thread_id,
+            )
+    except Exception:
+        logger.warning(
+            "Thread %s: could not recover a cloud mount plan", thread_id, exc_info=True
+        )
 
 
 async def agent_get_thread_workspace_locked(

@@ -15238,13 +15238,18 @@ class PostgresDB:
         thread_id: str,
         *,
         fingerprint: str,
+        runtime_incarnation: str,
         mounts: Dict[str, Any],
         notice: Optional[str],
         updated_at: str,
+        clear_notice: bool = False,
     ) -> bool:
         """Merge mount entries (and a notice) into the cloud mount record of
-        the plan ``fingerprint`` only; a report about another Pod's plan
-        changes nothing and returns False."""
+        one Pod only: its plan ``fingerprint`` and its UID
+        (``runtime_incarnation``). Two Pods of the same plan share a
+        fingerprint; a report about any other Pod changes nothing and
+        returns False. ``clear_notice`` drops the notice (an up-to-date
+        agent reported)."""
         import json as json_module
 
         try:
@@ -15256,14 +15261,17 @@ class PostgresDB:
             "    metadata, '{cloud_mount_status}', "
             "    (metadata->'cloud_mount_status') "
             "    || jsonb_build_object('updated_at', $4::text) "
-            "    || CASE WHEN $5::text IS NULL THEN '{}'::jsonb "
-            "            ELSE jsonb_build_object('notice', $5::text) END "
+            "    || CASE WHEN $5::text IS NOT NULL "
+            "            THEN jsonb_build_object('notice', $5::text) "
+            "            WHEN $7::boolean THEN jsonb_build_object('notice', NULL) "
+            "            ELSE '{}'::jsonb END "
             "    || jsonb_build_object('mounts', "
             "         COALESCE(metadata->'cloud_mount_status'->'mounts', "
             "                  '{}'::jsonb) || $3::jsonb)"
             ") "
             "WHERE id = $1 "
-            "AND metadata->'cloud_mount_status'->>'fingerprint' = $2"
+            "AND metadata->'cloud_mount_status'->>'fingerprint' = $2 "
+            "AND metadata->'cloud_mount_status'->>'runtime_incarnation' = $6"
         )
         async with self.acquire() as conn:
             result = await conn.execute(
@@ -15273,8 +15281,38 @@ class PostgresDB:
                 json_module.dumps(mounts),
                 updated_at,
                 notice,
+                str(runtime_incarnation),
+                bool(clear_notice),
             )
         return result == "UPDATE 1"
+
+    async def get_in_flight_workspace_creation_digest(
+        self, thread_id: str, *, pinned: bool
+    ) -> Optional[str]:
+        """The manifest digest an unfinished creation of a session's
+        workspace was admitted with: the pinned provision intent's
+        fingerprint, or the open creation reservation's digest. ``None``
+        when nothing is in flight (connector drivers D7: a retry replays the
+        plan it was admitted with)."""
+        try:
+            uuid_val = UUID(thread_id)
+        except ValueError:
+            return None
+        if pinned:
+            query = (
+                "SELECT manifest_fingerprint FROM thread_workspace_provision_intents "
+                "WHERE thread_id = $1 AND status IN ('planned','revoking','fenced')"
+            )
+        else:
+            query = (
+                "SELECT desired_manifest_digest FROM "
+                "managed_repository_workspace_creation_reservations "
+                "WHERE owner_kind = 'thread' AND owner_id = $1 "
+                "AND scope = 'workspace_container' AND settled_at IS NULL"
+            )
+        async with self.acquire() as conn:
+            value = await conn.fetchval(query, uuid_val)
+        return str(value) if value else None
 
     async def clear_pinned_attach_abort_workspace_endpoint(
         self,

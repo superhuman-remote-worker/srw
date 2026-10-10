@@ -10,6 +10,7 @@ contracts (drivers/cloud-mount, the agent's sidecar payload).
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import re
 import subprocess
@@ -141,10 +142,63 @@ async def test_static_password_mounts_get_the_plane(monkeypatch):
     assert plan.protected is False and plan.excluded == ()
 
 
+def _with_cloud(**backend) -> agent_cloud_mounts.AgentCloudMountDependencies:
+    """Dependencies whose thread resolves to a main-cloud backend so."""
+    return dataclasses.replace(
+        _deps(),
+        cloud_router=SimpleNamespace(
+            for_thread_optional=lambda thread: SimpleNamespace(**backend)
+        ),
+    )
+
+
 @pytest.mark.asyncio
-async def test_an_empty_set_is_still_the_plane(monkeypatch):
-    plan = await _resolve(monkeypatch, [])
-    assert plan is not None and plan.mounts == ()
+async def test_nothing_to_mount_keeps_todays_path(monkeypatch):
+    """Decision 43: no mount and nothing left out (the main cloud off) is
+    no plan at all: the Pod keeps its FUSE profile and sends no status."""
+    assert await _resolve(monkeypatch, []) is None
+    off = _with_cloud(is_initialized=False, static_mount_credentials=True)
+    assert await _resolve(monkeypatch, [], dependencies=off) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("thread", "detail"),
+    [
+        (_thread(), "no_session_folder"),
+        ({**_thread(), "nc_session_folder": "nextcloud:x"}, "spec_failed"),
+    ],
+)
+async def test_a_session_folder_the_main_cloud_failed_to_make_is_named(
+    monkeypatch, thread, detail
+):
+    up = _with_cloud(is_initialized=True, static_mount_credentials=True)
+    plan = await _resolve(monkeypatch, [], thread=thread, dependencies=up)
+    assert plan.mounts == ()
+    assert plan.excluded == (
+        {
+            "source_ref": "session-folder",
+            "mount_kind": "session_folder",
+            "reason": "unbuildable",
+            "detail": detail,
+        },
+    )
+    # A provider whose mounts need bearer tokens keeps the old path anyway.
+    bearer = _with_cloud(is_initialized=True, static_mount_credentials=False)
+    assert await _resolve(monkeypatch, [], thread=thread, dependencies=bearer) is None
+
+
+@pytest.mark.asyncio
+async def test_a_plan_rebuilds_from_what_its_pod_recorded(monkeypatch):
+    plan = await _resolve(monkeypatch, [_entry("project"), _entry("home")])
+    recorded = json.loads(cloud_mount_plan.plan_annotation(plan))
+    rebuilt = CloudMountPlan.from_recorded(recorded, plan.passwords_by_mount_id())
+    assert rebuilt == plan
+    assert rebuilt.passwords == plan.passwords
+    # A password gone, or a record that is not intact, rebuilds nothing.
+    assert CloudMountPlan.from_recorded(recorded, {"row-project": PASSWORD}) is None
+    tampered = {**recorded, "drain_seconds": 5}
+    assert CloudMountPlan.from_recorded(tampered, plan.passwords_by_mount_id()) is None
 
 
 @pytest.mark.asyncio
@@ -189,6 +243,8 @@ async def test_containers_without_rclone_keep_the_old_path(monkeypatch):
         {"provider_flags": ["--rc-addr", ":5572"]},
         {"provider_flags": ["--config=/tmp/x"]},
         {"workspace_name": ".hidden"},
+        # The opener reads a target as PATH or PATH:ro.
+        {"workspace_name": "a:ro"},
     ],
 )
 async def test_a_mount_needing_more_than_a_password_keeps_the_whole_pod_on_the_old_path(
@@ -713,3 +769,68 @@ async def test_a_row_that_cannot_build_says_why_in_a_closed_code():
         is None
     )
     assert failures == ["no_transport", "backend_unavailable"]
+
+
+@pytest.mark.asyncio
+async def test_under_the_advisory_lock_the_planner_only_reads_the_grant(
+    monkeypatch, selection
+):
+    """The engage that mints a grant takes the thread's advisory lock: the
+    planner under that lock must not wait for it (nor poll), only read."""
+    resolver = AsyncMock(side_effect=AssertionError("waited under the lock"))
+    monkeypatch.setattr(agent_cloud_mounts, "_resolve_protected_grant", resolver)
+    tasks = SimpleNamespace(
+        protected_engage_get=lambda key: pytest.fail("awaited the engage task")
+    )
+    store = SimpleNamespace(get_ro_mount_by_thread=AsyncMock(return_value=_grant()))
+    plan = await resolve_cloud_mount_plan(
+        _protected_thread(),
+        mount_rows=[{"id": "row-1"}],
+        settings=SETTINGS,
+        dependencies=_protected_deps(store, tasks),
+        wait_for_grant=False,
+    )
+    assert plan.protected is True
+    store.get_ro_mount_by_thread.return_value = _grant(status="engaging")
+    assert (
+        await resolve_cloud_mount_plan(
+            _protected_thread(),
+            mount_rows=[{"id": "row-1"}],
+            settings=SETTINGS,
+            dependencies=_protected_deps(store, tasks),
+            wait_for_grant=False,
+        )
+        is None
+    )
+    resolver.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_grant_is_awaited_before_the_lock(monkeypatch):
+    finished: list[str] = []
+
+    async def engage():
+        await asyncio.sleep(0)
+        finished.append("engage")
+
+    task = asyncio.ensure_future(engage())
+    keys: list = []
+    tasks = SimpleNamespace(
+        protected_engage_get=lambda key: (keys.append(key), task)[1]
+    )
+    monkeypatch.setattr(
+        agent_cloud_mounts,
+        "_resolve_protected_grant",
+        AsyncMock(return_value=_grant(runtime_generation=EARLIER_GENERATION)),
+    )
+    await cloud_mount_plan.await_protected_grant(
+        _protected_thread(), dependencies=_protected_deps(tasks=tasks)
+    )
+    assert finished == ["engage"] and keys == [(THREAD_ID, GENERATION)]
+    # An unprotected thread waits for nothing.
+    resolver = AsyncMock()
+    monkeypatch.setattr(agent_cloud_mounts, "_resolve_protected_grant", resolver)
+    await cloud_mount_plan.await_protected_grant(
+        {**_protected_thread(), "metadata": {}}, dependencies=_protected_deps()
+    )
+    resolver.assert_not_awaited()

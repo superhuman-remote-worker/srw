@@ -95,13 +95,25 @@ async def agent_report_cloud_mount_status(
         body = await request.json()
     except ValueError:
         raise HTTPException(status_code=422, detail="body must be JSON") from None
-    if not isinstance(body, dict) or not isinstance(body.get("fingerprint"), str):
-        raise HTTPException(status_code=422, detail="fingerprint is required")
+    if (
+        not isinstance(body, dict)
+        or not isinstance(body.get("fingerprint"), str)
+        or not isinstance(body.get("pod_uid"), str)
+    ):
+        raise HTTPException(
+            status_code=422, detail="fingerprint and pod_uid are required"
+        )
     thread = await dependencies.store.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="thread not found")
     recorded = recorded_sidecar_plan(thread_metadata_object(thread))
-    if recorded is None or recorded.get("fingerprint") != body["fingerprint"]:
+    # Two Pods of one plan share a fingerprint: the UID tells them apart, so
+    # an agent of an earlier Pod never overwrites its successor's state.
+    if (
+        recorded is None
+        or recorded.get("fingerprint") != body["fingerprint"]
+        or recorded.get("runtime_incarnation") != body["pod_uid"]
+    ):
         raise HTTPException(
             status_code=409, detail="the report is not about this thread's Pod"
         )
@@ -113,6 +125,7 @@ async def agent_report_cloud_mount_status(
         dependencies.store,
         thread_id,
         fingerprint=body["fingerprint"],
+        runtime_incarnation=body["pod_uid"],
         entries=entries,
     )
     if not recorded_ok:

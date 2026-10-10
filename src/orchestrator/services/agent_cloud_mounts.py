@@ -733,7 +733,9 @@ async def _build_agent_cloud_mount(
     when the Pod is created.
     """
     sidecar_plan = recorded_sidecar_plan(metadata)
-    if sidecar_plan is not None:
+    # A sandbox upgraded to a VM keeps the Pod's record a while; the VM's
+    # folders are its own (the in-workspace path), never the old Pod's.
+    if sidecar_plan is not None and not _vm_runtime_ready(metadata):
         if terminal_retirement_token is None:
             workspace = metadata.get("workspace_container") or {}
             ready = workspace.get("status") == "ready" and bool(
@@ -746,7 +748,9 @@ async def _build_agent_cloud_mount(
                 terminal_token=terminal_retirement_token,
                 dependencies=dependencies,
             )
-        return agent_payload(sidecar_plan) if ready else None
+        if not ready:
+            return None
+        return agent_payload(sidecar_plan, status=metadata.get("cloud_mount_status"))
     if terminal_retirement_token is None:
         runtime_supported = _runtime_supports_rclone_mount(
             metadata, dependencies=dependencies

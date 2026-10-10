@@ -301,14 +301,16 @@ def agent_cloud_mount_dependencies(
 
 def cloud_mount_planner(
     resources: ApplicationResources,
-) -> Callable[[str], Awaitable[cloud_mount_plan.CloudMountPlan | None]]:
+) -> Callable[..., Awaitable[cloud_mount_plan.CloudMountPlan | None]]:
     """The container provisioner's planner of a new session Pod's cloud
     mounts (connector drivers D7). It reads the thread and its mount rows at
     call time and builds the cloud payload's collaborators per call, as
     every other cloud build does; the in-pod plane's settings are read from
     the environment each time too."""
 
-    async def plan(thread_id: str) -> cloud_mount_plan.CloudMountPlan | None:
+    async def plan(
+        thread_id: str, *, wait_for_grant: bool = True
+    ) -> cloud_mount_plan.CloudMountPlan | None:
         store = resources.postgres_db
         thread = await store.get_thread(thread_id)
         if not thread:
@@ -318,9 +320,27 @@ def cloud_mount_planner(
             mount_rows=await store.list_thread_mounts(thread_id),
             settings=InPodPlaneSettings.from_env(),
             dependencies=agent_cloud_mount_dependencies(resources),
+            wait_for_grant=wait_for_grant,
         )
 
     return plan
+
+
+def cloud_mount_grant_waiter(
+    resources: ApplicationResources,
+) -> Callable[[str], Awaitable[None]]:
+    """Awaits a protected session's in-flight reader grant for the
+    provisioner, before it takes the thread's advisory lock (connector
+    drivers D7)."""
+
+    async def wait(thread_id: str) -> None:
+        thread = await resources.postgres_db.get_thread(thread_id)
+        if thread:
+            await cloud_mount_plan.await_protected_grant(
+                thread, dependencies=agent_cloud_mount_dependencies(resources)
+            )
+
+    return wait
 
 
 def protected_cloud_engage_dependencies(

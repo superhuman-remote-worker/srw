@@ -1196,16 +1196,28 @@ async def _assign_thread_workspace(
         )
 
 
-def sidecar_pod_planned_at_create(plan: ThreadCreationPlan) -> bool:
+def sidecar_pod_planned_at_create(
+    plan: ThreadCreationPlan, main_cloud_router: Any = None
+) -> bool:
     """Whether a new session's container Pod plans its cloud mounts from the
     in-pod plane (connector drivers D7): a Kubernetes container session with
-    the plane on. Lite and VM sessions have no such Pod."""
-    return bool(
+    the plane on, on an installation whose main cloud mounts with a static
+    password. Lite and VM sessions have no such Pod; with no main cloud, or
+    one whose mounts need bearer tokens (OpenCloud), no plan results, so the
+    session folder need not come first."""
+    if not (
         plan.use_k8s
         and not plan.lite_session
         and not plan.vm_session
         and InPodPlaneSettings.from_env() is not None
-    )
+    ):
+        return False
+    if main_cloud_router is None:
+        return True
+    if getattr(main_cloud_router, "active_instance_id", None) is None:
+        return False
+    active = getattr(main_cloud_router, "active", None)
+    return getattr(active, "static_mount_credentials", False) is True
 
 
 async def provision_thread_workspace(
@@ -1573,7 +1585,9 @@ async def create_thread(
             plan, request_body, user, dependencies=dependencies
         )
 
-        main_cloud_first = sidecar_pod_planned_at_create(plan)
+        main_cloud_first = sidecar_pod_planned_at_create(
+            plan, dependencies.main_cloud_router
+        )
         if main_cloud_first:
             # A sidecar Pod's cloud folders are fixed when the Pod is created
             # (connector drivers D7), so its session folder must exist

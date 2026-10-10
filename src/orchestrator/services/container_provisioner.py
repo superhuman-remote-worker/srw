@@ -722,8 +722,9 @@ class ContainerProvisioner:
         # session Pod's cloud mounts (bound at connect).
         self._in_pod_plane = InPodPlaneSettings.from_env()
         self._cloud_mount_planner: (
-            Callable[[str], Awaitable[CloudMountPlan | None]] | None
+            Callable[..., Awaitable[CloudMountPlan | None]] | None
         ) = None
+        self._cloud_mount_grant_waiter: Callable[[str], Awaitable[None]] | None = None
 
     @property
     def is_available(self) -> bool:
@@ -775,11 +776,15 @@ class ContainerProvisioner:
         )
 
     async def _cloud_mount_plan_for(
-        self, owner: WorkspaceOwner
+        self, owner: WorkspaceOwner, *, wait_for_grant: bool = True
     ) -> CloudMountPlan | None:
         """A new session Pod's cloud mounts from the in-pod plane, or ``None``
         for the in-workspace path (the plane off, a job, an opted-out session,
-        or a planning error: today's behaviour is the safe fallback)."""
+        or a planning error: today's behaviour is the safe fallback).
+
+        ``wait_for_grant`` is False under the thread's advisory lock: a
+        protected session's engage takes that lock, so the plan then only
+        reads the grant (:meth:`await_cloud_mount_grant` waited before)."""
         if (
             owner.kind != "session"
             or self._in_pod_plane is None
@@ -787,7 +792,9 @@ class ContainerProvisioner:
         ):
             return None
         try:
-            return await self._cloud_mount_planner(owner.id)
+            return await self._cloud_mount_planner(
+                owner.id, wait_for_grant=wait_for_grant
+            )
         except Exception:
             logger.exception(
                 "Could not plan the cloud mounts of session %s; it keeps the "
@@ -795,6 +802,115 @@ class ContainerProvisioner:
                 owner.id,
             )
             return None
+
+    async def await_cloud_mount_grant(self, thread_id: str) -> None:
+        """Let a protected session's in-flight reader grant land before a
+        caller takes the thread's advisory lock (connector drivers D7). Never
+        raises; a no-op without the plane."""
+        if self._in_pod_plane is None or self._cloud_mount_grant_waiter is None:
+            return
+        try:
+            await self._cloud_mount_grant_waiter(thread_id)
+        except Exception:
+            logger.warning(
+                "Session %s: waiting for its protected reader grant failed",
+                thread_id,
+                exc_info=True,
+            )
+
+    async def _in_flight_creation_digest(
+        self, owner: WorkspaceOwner, *, pinned: bool
+    ) -> str | None:
+        """The digest (or pinned fingerprint) an unfinished creation of this
+        session was admitted with, if there is one."""
+        if owner.kind != "session" or self._db is None:
+            return None
+        reader = getattr(
+            type(self._db), "get_in_flight_workspace_creation_digest", None
+        )
+        if not callable(reader):
+            return None
+        try:
+            return await reader(self._db, owner.id, pinned=pinned)
+        except Exception:
+            logger.warning(
+                "Could not read the in-flight creation of session %s",
+                owner.id,
+                exc_info=True,
+            )
+            return None
+
+    async def _pod_recorded_cloud_plan(self, owner: WorkspaceOwner) -> dict | None:
+        """The plan the session's existing Pod recorded, if one exists."""
+        try:
+            pod = await self._bounded_kubernetes_call(
+                self._core_api.read_namespaced_pod,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+        except Exception:
+            return None
+        return recorded_plan_from_annotations(
+            getattr(getattr(pod, "metadata", None), "annotations", None)
+        )
+
+    async def _replay_cloud_plan(
+        self,
+        owner: WorkspaceOwner,
+        plan: CloudMountPlan | None,
+        base_profile: SandboxPodProfile,
+        *,
+        pinned: bool,
+        digest_of: Callable[
+            [CloudMountPlan | None, SandboxPodProfile], Awaitable[tuple[str, Any]]
+        ],
+    ) -> tuple[CloudMountPlan | None, SandboxPodProfile, Any]:
+        """The plan, profile and digest payload a creation goes on with.
+
+        An unfinished creation replays the plan it was admitted with: the
+        admission compares the digest (a pinned intent its fingerprint), and
+        a plan whose inputs moved meanwhile (a protected grant that landed,
+        an admission from before the plane) would hold it forever. Today's
+        plan wins unless one of :meth:`_cloud_plan_candidates` reproduces the
+        in-flight digest exactly."""
+        profile = self._profile_for_cloud_plan(base_profile, plan)
+        digest, payload = await digest_of(plan, profile)
+        in_flight = await self._in_flight_creation_digest(owner, pinned=pinned)
+        if in_flight and in_flight != digest:
+            for candidate in await self._cloud_plan_candidates(owner, plan):
+                candidate_profile = self._profile_for_cloud_plan(
+                    base_profile, candidate
+                )
+                candidate_digest, candidate_payload = await digest_of(
+                    candidate, candidate_profile
+                )
+                if candidate_digest == in_flight:
+                    logger.info(
+                        "Session %s: an unfinished workspace creation replays the "
+                        "cloud mount plan it was admitted with",
+                        owner.id,
+                    )
+                    return candidate, candidate_profile, candidate_payload
+        return plan, profile, payload
+
+    async def _cloud_plan_candidates(
+        self, owner: WorkspaceOwner, plan: CloudMountPlan | None
+    ) -> list[CloudMountPlan | None]:
+        """Plans an unfinished creation may have been admitted with, besides
+        today's: the in-workspace path (an admission from before the plane,
+        or from before a protected grant was active) and the plan its Pod
+        recorded (rebuilt with today's passwords, keyed by mount id)."""
+        candidates: list[CloudMountPlan | None] = []
+        recorded = await self._pod_recorded_cloud_plan(owner)
+        if recorded is not None and plan is not None:
+            rebuilt = CloudMountPlan.from_recorded(
+                recorded, plan.passwords_by_mount_id()
+            )
+            if rebuilt is not None and rebuilt != plan:
+                candidates.append(rebuilt)
+        if plan is not None:
+            candidates.append(None)
+        return candidates
 
     @staticmethod
     def _profile_for_cloud_plan(
@@ -824,21 +940,31 @@ class ContainerProvisioner:
         Pod from birth, so they never outlive it and need no cleanup.
 
         The Pod references both (not optional): the kubelet retries the
-        volumes until they exist, a second or so. A Pod adopted from another
-        plan keeps the objects its own attempt made. Only ``create`` on
-        Secrets is needed; a 409 is this attempt's own earlier create. The
+        volumes until they exist, a second or so. Only ``create`` on Secrets
+        is needed; a 409 is an earlier create of the same objects. The
         credential is never logged.
+
+        The objects follow the plan the Pod recorded. A Pod adopted from
+        another plan gets its own plan's objects, rebuilt with today's
+        passwords keyed by mount id; when that cannot be done (a password is
+        gone) and its plan ConfigMap does not exist either, the objects were
+        never made and the Pod would wait for them forever: refused.
         """
-        if plan is None or not plan.mounts:
-            return True
         metadata = getattr(pod, "metadata", None)
         recorded = recorded_plan_from_annotations(
             getattr(metadata, "annotations", None)
         )
-        if recorded is None or recorded.get("fingerprint") != plan.recorded().get(
+        if recorded is None or not recorded.get("mounts"):
+            return True
+        if plan is None or recorded.get("fingerprint") != plan.recorded().get(
             "fingerprint"
         ):
-            return True
+            rebuilt = CloudMountPlan.from_recorded(
+                recorded, plan.passwords_by_mount_id() if plan is not None else {}
+            )
+            if rebuilt is None:
+                return await self._cloud_mount_objects_exist(pod, owner=owner)
+            plan = rebuilt
         name = objects_name_from_pod(pod)
         pod_uid = str(getattr(metadata, "uid", "") or "")
         if not name or not pod_uid:
@@ -907,6 +1033,73 @@ class ContainerProvisioner:
                 )
                 return False
         return True
+
+    async def _cloud_mount_objects_exist(
+        self, pod: Any, *, owner: WorkspaceOwner
+    ) -> bool:
+        """Whether an adopted sidecar Pod's objects were made: its plan
+        ConfigMap is created first, in the same step as its Secret."""
+        name = objects_name_from_pod(pod)
+        if name:
+            try:
+                await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_config_map,
+                    name=name,
+                    namespace=self._namespace,
+                )
+                return True
+            except Exception:
+                pass
+        logger.error(
+            "Session %s: adopted workspace Pod %s waits for cloud mount objects "
+            "this orchestrator cannot rebuild; refusing it",
+            owner.id,
+            getattr(getattr(pod, "metadata", None), "name", owner.pod_name),
+        )
+        return False
+
+    async def recover_cloud_mount_plan(
+        self, owner: WorkspaceOwner, runtime_incarnation: str
+    ) -> bool:
+        """Record a ready Pod's plan from its annotation when the thread has
+        no record of it (a crash between creating the Pod and publishing its
+        plan): attach reads the record. True when one was recovered."""
+        if owner.kind != "session" or not self._k8s_available:
+            return False
+        try:
+            pod = await self._bounded_kubernetes_call(
+                self._core_api.read_namespaced_pod,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+        except Exception:
+            return False
+        metadata = getattr(pod, "metadata", None)
+        if str(getattr(metadata, "uid", "") or "") != str(runtime_incarnation):
+            return False
+        if (
+            recorded_plan_from_annotations(getattr(metadata, "annotations", None))
+            is None
+        ):
+            return False
+        return await self._settle_cloud_mount_plan(owner, pod, runtime_incarnation)
+
+    async def _settle_cloud_mount_plan(
+        self, owner: WorkspaceOwner, pod: Any, runtime_incarnation: str
+    ) -> bool:
+        """The cloud mount objects and the thread's plan record of a Pod this
+        orchestrator did not finish creating (a continuation, a recovery).
+        Plans only for a Pod whose recorded plan has mounts: their passwords
+        come from today's plan."""
+        recorded = recorded_plan_from_annotations(
+            getattr(getattr(pod, "metadata", None), "annotations", None)
+        )
+        plan = None
+        if recorded is not None and recorded.get("mounts"):
+            plan = await self._cloud_mount_plan_for(owner, wait_for_grant=False)
+        if not await self._ensure_cloud_mount_objects(pod, plan, owner=owner):
+            return False
+        return await self._publish_cloud_mount_plan(owner, pod, runtime_incarnation)
 
     async def _publish_cloud_mount_plan(
         self, owner: WorkspaceOwner, pod: Any, runtime_incarnation: str
@@ -1046,8 +1239,9 @@ class ContainerProvisioner:
         db: Any,
         snapshot_service: Optional[Any] = None,
         cloud_mount_planner: (
-            Callable[[str], Awaitable[CloudMountPlan | None]] | None
+            Callable[..., Awaitable[CloudMountPlan | None]] | None
         ) = None,
+        cloud_mount_grant_waiter: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         """Initialize the provisioner.
 
@@ -1057,10 +1251,14 @@ class ContainerProvisioner:
             cloud_mount_planner: Resolves a session's cloud mounts for a new
                 Pod (connector drivers D7); ``None`` keeps every Pod on the
                 in-workspace mount path.
+            cloud_mount_grant_waiter: Awaits a protected session's in-flight
+                reader grant, outside the thread's advisory lock (the engage
+                that mints it takes the same lock).
         """
         self._db = db
         self._snapshot_service = snapshot_service
         self._cloud_mount_planner = cloud_mount_planner
+        self._cloud_mount_grant_waiter = cloud_mount_grant_waiter
         self._init_k8s()
 
         if self._k8s_available:
@@ -1272,6 +1470,9 @@ class ContainerProvisioner:
             lock_impl = getattr(type(self._db), "thread_advisory_lock", None)
             if not callable(lock_impl):
                 return False
+            # The engage minting a protected reader grant takes the same lock:
+            # wait for it first, and only read it under the lock.
+            await self.await_cloud_mount_grant(thread_id)
             async with lock_impl(self._db, thread_id) as lock_owner:
                 if not lock_owner:
                     return False
@@ -1455,13 +1656,24 @@ class ContainerProvisioner:
                 owner.id,
             )
             return False
-        cloud_plan = await self._cloud_mount_plan_for(owner)
-        profile = self._profile_for_cloud_plan(profile, cloud_plan)
-        creation_plan = await self._workspace_creation_plan(
+
+        async def creation_digest(
+            plan: CloudMountPlan | None, plan_profile: SandboxPodProfile
+        ) -> tuple[str, dict[str, Any]]:
+            built = await self._workspace_creation_plan(
+                owner,
+                profile=plan_profile,
+                stateless_creation_generation=stateless_creation_generation,
+                cloud_plan=plan,
+            )
+            return str(built["digest"]), built
+
+        cloud_plan, profile, creation_plan = await self._replay_cloud_plan(
             owner,
-            profile=profile,
-            stateless_creation_generation=stateless_creation_generation,
-            cloud_plan=cloud_plan,
+            await self._cloud_mount_plan_for(owner),
+            profile,
+            pinned=False,
+            digest_of=creation_digest,
         )
         reservation = await reserve(
             self._db,
@@ -4084,8 +4296,14 @@ class ContainerProvisioner:
                 owner.id,
             )
             return False
-        cloud_plan = await self._cloud_mount_plan_for(owner)
-        profile = self._profile_for_cloud_plan(profile, cloud_plan)
+        base_profile = profile
+        # Under the thread's advisory lock the plan only reads a protected
+        # grant: the engage minting it needs that lock (create_pinned_thread_
+        # workspace awaited it before taking the lock).
+        cloud_plan = await self._cloud_mount_plan_for(
+            owner, wait_for_grant=not pinned_runtime_lock_held
+        )
+        profile = self._profile_for_cloud_plan(base_profile, cloud_plan)
         workspace_image = profile.image
         cpu, memory = profile.cpu, profile.memory
         cpu_limit, memory_limit = profile.cpu_limit, profile.memory_limit
@@ -4109,23 +4327,41 @@ class ContainerProvisioner:
             self._seed_configmap_name(pod_name) if seed_files or seed_exts else None
         )
         service_name = owner.pod_name if pvc_name is not None else None
-        manifest_fingerprint = self._pinned_workspace_provision_fingerprint(
-            owner=owner,
-            pod_name=pod_name,
-            pvc_name=pvc_name,
-            seed_configmap_name=seed_cm_name,
-            service_name=service_name,
-            network_tier=network_tier,
-            workspace_image=workspace_image,
-            cpu=cpu,
-            memory=memory,
-            cpu_limit=cpu_limit,
-            memory_limit=memory_limit,
-            seed_files=seed_files,
-            seed_extensions=seed_exts,
-            seed_needs_state=seed_needs_state,
-            profile=profile,
-            cloud_plan=cloud_plan,
+
+        def fingerprint_for(
+            plan: CloudMountPlan | None, plan_profile: SandboxPodProfile
+        ) -> str:
+            return self._pinned_workspace_provision_fingerprint(
+                owner=owner,
+                pod_name=pod_name,
+                pvc_name=pvc_name,
+                seed_configmap_name=seed_cm_name,
+                service_name=service_name,
+                network_tier=network_tier,
+                workspace_image=workspace_image,
+                cpu=cpu,
+                memory=memory,
+                cpu_limit=cpu_limit,
+                memory_limit=memory_limit,
+                seed_files=seed_files,
+                seed_extensions=seed_exts,
+                seed_needs_state=seed_needs_state,
+                profile=plan_profile,
+                cloud_plan=plan,
+            )
+
+        async def intent_fingerprint(
+            plan: CloudMountPlan | None, plan_profile: SandboxPodProfile
+        ) -> tuple[str, str]:
+            value = fingerprint_for(plan, plan_profile)
+            return value, value
+
+        cloud_plan, profile, manifest_fingerprint = await self._replay_cloud_plan(
+            owner,
+            cloud_plan,
+            base_profile,
+            pinned=True,
+            digest_of=intent_fingerprint,
         )
         pinned_intent: dict[str, Any] | None = None
         pinned_attempt_id: str | None = None
@@ -6169,6 +6405,10 @@ class ContainerProvisioner:
                     is not True
                 ):
                     return False
+            # A Pod created with the in-pod plane before a crash: its objects
+            # and its plan record, before it can be published Ready.
+            if not await self._settle_cloud_mount_plan(owner, pod, runtime_incarnation):
+                return False
 
             if pvc_name:
                 if expected_creation is None and (

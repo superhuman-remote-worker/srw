@@ -1149,19 +1149,34 @@ class TestCreateThreadOperation:
             monkeypatch.setenv("CONNECTOR_IN_POD_RCLONE_IMAGE", "r@sha256:" + "2" * 64)
         else:
             monkeypatch.delenv("CONNECTOR_IN_POD_OPENER_IMAGE", raising=False)
+        router = SimpleNamespace(
+            active_instance_id="00000000-0000-4000-8000-000000000001",
+            active=SimpleNamespace(static_mount_credentials=True),
+            for_owner=MagicMock(),
+        )
         deps = _deps(
             container_provisioner=SimpleNamespace(
                 is_available=True,
                 in_cluster=True,
                 create_pinned_thread_workspace=AsyncMock(return_value=True),
-            )
+            ),
+            main_cloud_router=router,
         )
         await ta.create_thread(ThreadCreateRequest(), MagicMock(), dependencies=deps)
         assert order == (
             ["main_cloud", "provision"] if plane else ["provision", "main_cloud"]
         )
         plan = await _plan(ThreadCreateRequest(), deps)
-        assert ta.sidecar_pod_planned_at_create(plan) is plane
+        assert ta.sidecar_pod_planned_at_create(plan, router) is plane
+        # No plan results without a main cloud, or on one whose mounts need
+        # bearer tokens (OpenCloud): the session folder need not come first.
+        no_cloud = SimpleNamespace(active_instance_id=None)
+        assert ta.sidecar_pod_planned_at_create(plan, no_cloud) is False
+        bearer = SimpleNamespace(
+            active_instance_id="00000000-0000-4000-8000-000000000001",
+            active=SimpleNamespace(static_mount_credentials=False),
+        )
+        assert ta.sidecar_pod_planned_at_create(plan, bearer) is False
 
     @pytest.mark.asyncio
     async def test_a_materialization_denial_is_403(self):

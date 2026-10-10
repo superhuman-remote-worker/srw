@@ -9,6 +9,7 @@ This module closes that gap with an idempotent ensure + a periodic safety-net.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from collections.abc import Callable
@@ -105,6 +106,14 @@ async def ensure_session_workspace(
         expected_runtime_generation = pinned_authority.generation
         if not _pinned_runtime_lock_held:
             lock_impl = getattr(type(db), "thread_advisory_lock", None)
+            # A protected session's reader grant is minted by an engage that
+            # takes the same lock: let it land first (connector drivers D7);
+            # the plan only reads it under the lock.
+            await_grant = getattr(provisioner, "await_cloud_mount_grant", None)
+            if callable(await_grant) and callable(lock_impl):
+                waiting = await_grant(thread_id)
+                if inspect.isawaitable(waiting):
+                    await waiting
             if callable(lock_impl):
                 async with lock_impl(db, thread_id):
                     return await ensure_session_workspace(

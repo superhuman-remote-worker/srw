@@ -198,6 +198,10 @@ class NextcloudBackend:
 
     backend_id = BACKEND_ID
     capabilities = NEXTCLOUD_CAPABILITIES
+    #: Its rclone mounts authenticate with a static app password, which the
+    #: in-pod plane's supervisor can hold as a config file (connector drivers
+    #: D7).
+    static_mount_credentials = True
     #: Routing keys and secret-reference fields ``ensure_initialized`` proves:
     #: it connects to the internal URL as the admin account and, when the
     #: protected-effect lane is configured, verifies its signed attestation

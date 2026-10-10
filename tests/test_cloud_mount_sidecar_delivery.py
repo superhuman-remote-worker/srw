@@ -447,9 +447,10 @@ async def test_an_older_agent_is_recorded_and_the_poll_never_fails():
             raise RuntimeError("database away")
 
     await cloud_mount_status.record_agent_outdated(
-        _Store(), THREAD_ID, {"fingerprint": "f" * 64}
+        _Store(), THREAD_ID, {"fingerprint": "f" * 64, "runtime_incarnation": POD_UID}
     )
     assert merges[0]["notice"] == "agent_outdated" and merges[0]["mounts"] == {}
+    assert merges[0]["runtime_incarnation"] == POD_UID
     await cloud_mount_status.record_agent_outdated(SimpleNamespace(), THREAD_ID, {})
 
 
@@ -774,24 +775,55 @@ async def test_the_state_merges_only_into_the_same_plan_on_postgres(db):
     entries = cloud_mount_status.report_entries(
         recorded, [{"name": "project", "state": "mounted"}]
     )
+
+    async def status() -> dict:
+        async with db.acquire() as conn:
+            metadata = json.loads(
+                await conn.fetchval(
+                    "SELECT metadata FROM threads WHERE id=$1", thread_id
+                )
+            )
+        assert metadata["keep"] == 1
+        return metadata.get("cloud_mount_status")
+
+    # An older agent leaves the notice; an up-to-date agent's report clears it.
+    await cloud_mount_status.record_agent_outdated(
+        db,
+        str(thread_id),
+        {"fingerprint": recorded["fingerprint"], "runtime_incarnation": POD_UID},
+    )
+    assert (await status())["notice"] == "agent_outdated"
     assert await cloud_mount_status.record_report(
-        db, str(thread_id), fingerprint=recorded["fingerprint"], entries=entries
+        db,
+        str(thread_id),
+        fingerprint=recorded["fingerprint"],
+        runtime_incarnation=POD_UID,
+        entries=entries,
+    )
+    current = await status()
+    assert current["notice"] is None
+    assert current["mounts"]["project"]["state"] == "mounted"
+    assert current["excluded"][0]["reason"] == "set_fallback"
+    # Another plan, or another Pod of the same plan, changes nothing.
+    other_pod = "00000000-0000-4000-8000-0000000000aa"
+    unavailable = cloud_mount_status.report_entries(
+        recorded, [{"name": "project", "state": "unavailable", "reason": "timeout"}]
     )
     assert not await cloud_mount_status.record_report(
-        db, str(thread_id), fingerprint="0" * 64, entries=entries
+        db,
+        str(thread_id),
+        fingerprint="0" * 64,
+        runtime_incarnation=POD_UID,
+        entries=unavailable,
     )
-    await cloud_mount_status.record_agent_outdated(
-        db, str(thread_id), {"fingerprint": recorded["fingerprint"]}
+    assert not await cloud_mount_status.record_report(
+        db,
+        str(thread_id),
+        fingerprint=recorded["fingerprint"],
+        runtime_incarnation=other_pod,
+        entries=unavailable,
     )
-    async with db.acquire() as conn:
-        metadata = json.loads(
-            await conn.fetchval("SELECT metadata FROM threads WHERE id=$1", thread_id)
-        )
-    status = metadata["cloud_mount_status"]
-    assert metadata["keep"] == 1
-    assert status["mounts"]["project"]["state"] == "mounted"
-    assert status["notice"] == "agent_outdated"
-    assert status["excluded"][0]["reason"] == "set_fallback"
+    assert (await status())["mounts"]["project"]["state"] == "mounted"
     assert await cloud_mount_status.record_pod(db, str(thread_id), None, POD_UID)
     async with db.acquire() as conn:
         metadata = json.loads(
@@ -838,14 +870,20 @@ async def test_the_agents_report_is_kept_only_for_this_pods_plan():
     fingerprint = _plan().recorded()["fingerprint"]
     good = {
         "fingerprint": fingerprint,
+        "pod_uid": POD_UID,
         "mounts": [{"name": "project", "state": "unavailable", "reason": "timeout"}],
     }
     assert await agent_report_cloud_mount_status(
         _Request(good, _Store()), THREAD_ID
     ) == {"ok": True}
     assert merges[0]["mounts"]["project"]["reason"] == "timeout"
+    assert merges[0]["runtime_incarnation"] == POD_UID
+    assert merges[0]["clear_notice"] is True
     for body, status in (
         ({**good, "fingerprint": "0" * 64}, 409),
+        # An earlier Pod of the same plan: same fingerprint, another UID.
+        ({**good, "pod_uid": "00000000-0000-4000-8000-0000000000aa"}, 409),
+        ({k: v for k, v in good.items() if k != "pod_uid"}, 422),
         ({**good, "mounts": [{"name": "project", "state": "exploded"}]}, 422),
         ({"mounts": []}, 422),
         (ValueError("not json"), 422),
@@ -854,3 +892,144 @@ async def test_the_agents_report_is_kept_only_for_this_pods_plan():
             await agent_report_cloud_mount_status(_Request(body, _Store()), THREAD_ID)
         assert refused.value.status_code == status
     assert len(merges) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_sandbox_upgraded_to_a_vm_gets_the_vms_folders_not_the_pods(
+    monkeypatch,
+):
+    metadata = _metadata()
+    metadata["vm"] = {"status": "ready", "ssh_host": "vm.example"}
+    monkeypatch.setattr(
+        agent_cloud_mounts,
+        "_runtime_supports_rclone_mount",
+        lambda metadata, dependencies: True,
+    )
+    live = agent_cloud_mounts.LiveMountSet(
+        mounts=[{"workspace_name": "project", "access": "read_only"}],
+        fallback=False,
+        excluded=[],
+    )
+    rows = AsyncMock(return_value=live)
+    monkeypatch.setattr(agent_cloud_mounts, "_resolve_live_mount_set", rows)
+    payload = await agent_cloud_mounts._build_agent_cloud_mount(
+        {"id": THREAD_ID},
+        mount_rows=[],
+        metadata=metadata,
+        dependencies=_deps(),
+    )
+    assert payload["driver"] == "rclone" and "delivery" not in payload
+    assert rows.await_args.kwargs["runtime_is_vm"] is True
+
+
+def test_the_payload_says_whether_the_pods_folders_already_settled():
+    recorded = {**_plan().recorded(), "runtime_incarnation": POD_UID}
+    status = cloud_mount_status.initial_status(recorded, POD_UID)
+    assert agent_cloud_mounts.agent_payload(recorded, status=status)["settled"] is False
+    status["mounts"]["project"]["state"] = "unavailable"
+    payload = agent_cloud_mounts.agent_payload(recorded, status=status)
+    assert payload["settled"] is True and payload["runtime_incarnation"] == POD_UID
+    # Another Pod's record says nothing about this one.
+    assert (
+        agent_cloud_mounts.agent_payload(
+            {**recorded, "runtime_incarnation": "00000000-0000-4000-8000-0000000000aa"},
+            status=status,
+        )["settled"]
+        is False
+    )
+    # A protected payload is part of the attach identity: never volatile.
+    protected = {**_protected_plan().recorded(), "runtime_incarnation": POD_UID}
+    assert "settled" not in agent_cloud_mounts.agent_payload(protected, status=status)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("workspace", "plane", "recovers"),
+    [
+        (
+            {"status": "ready", "provisioner": "k8s", "_runtime_incarnation": POD_UID},
+            True,
+            True,
+        ),
+        # Already recorded (a plan, or None for a Pod without one).
+        (
+            {
+                "status": "ready",
+                "provisioner": "k8s",
+                "_runtime_incarnation": POD_UID,
+                PLAN_CONTEXT_KEY: None,
+            },
+            True,
+            False,
+        ),
+        (
+            {
+                "status": "creating",
+                "provisioner": "k8s",
+                "_runtime_incarnation": POD_UID,
+            },
+            True,
+            False,
+        ),
+        (
+            {"status": "ready", "provisioner": "k8s", "_runtime_incarnation": POD_UID},
+            False,
+            False,
+        ),
+    ],
+)
+async def test_attach_recovers_a_plan_the_pod_records_but_the_thread_lacks(
+    monkeypatch, workspace, plane, recovers
+):
+    from orchestrator.services import thread_workspace_delivery
+
+    if plane:
+        monkeypatch.setenv("CONNECTOR_IN_POD_OPENER_IMAGE", "o:1")
+        monkeypatch.setenv("CONNECTOR_IN_POD_RCLONE_IMAGE", "r:1")
+    else:
+        monkeypatch.delenv("CONNECTOR_IN_POD_OPENER_IMAGE", raising=False)
+    recover = AsyncMock(return_value=True)
+    store = SimpleNamespace(
+        get_thread=AsyncMock(
+            return_value={
+                "id": THREAD_ID,
+                "metadata": {"workspace_container": workspace},
+            }
+        )
+    )
+    monkeypatch.setattr(
+        thread_workspace_delivery.connector_credential_leases,
+        "prepare_thread_lease_delivery",
+        AsyncMock(),
+    )
+    dependencies = SimpleNamespace(
+        store=store,
+        container_provisioner=SimpleNamespace(recover_cloud_mount_plan=recover),
+    )
+    await thread_workspace_delivery.prepare_agent_thread_workspace(
+        THREAD_ID, dependencies=dependencies
+    )
+    assert recover.await_count == (1 if recovers else 0)
+    if recovers:
+        owner, incarnation = recover.await_args.args
+        assert owner.id == THREAD_ID and incarnation == POD_UID
+    # It never fails the poll.
+    recover.side_effect = RuntimeError("apiserver away")
+    await thread_workspace_delivery.prepare_agent_thread_workspace(
+        THREAD_ID, dependencies=dependencies
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_in_flight_creation_digest_reads_the_real_tables(db):
+    """The query a retry uses to replay its own plan runs against the real
+    schema (both the pinned intent and the creation reservation)."""
+    thread_id = str(uuid4())
+    assert (
+        await db.get_in_flight_workspace_creation_digest(thread_id, pinned=True) is None
+    )
+    assert (
+        await db.get_in_flight_workspace_creation_digest(thread_id, pinned=False)
+        is None
+    )
+    assert await db.get_in_flight_workspace_creation_digest("nope", pinned=True) is None

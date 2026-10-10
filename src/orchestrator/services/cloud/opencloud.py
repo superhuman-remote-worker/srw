@@ -182,6 +182,9 @@ class OpenCloudBackend:
 
     backend_id = BACKEND_ID
     capabilities = OPENCLOUD_CAPABILITIES
+    #: Its rclone mounts use bearer tokens the agent refreshes, so they stay
+    #: on the in-workspace path (connector drivers D7).
+    static_mount_credentials = False
     #: What ``ensure_initialized`` proves: it mints a service-account token
     #: from the issuer with the client credentials and reaches the internal
     #: URL with it. The public URL and the role, quota and TLS settings are

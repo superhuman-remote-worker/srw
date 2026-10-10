@@ -281,6 +281,70 @@ class CloudMountPlan:
             ],
         }
 
+    def passwords_by_mount_id(self) -> dict[str, str]:
+        """Each mount's password keyed by its mount id (stable across plans)."""
+        return {
+            mount.mount_id: self.passwords[mount.index]
+            for mount in self.mounts
+            if self.passwords.get(mount.index)
+        }
+
+    @classmethod
+    def from_recorded(
+        cls, recorded: Mapping[str, Any], passwords: Mapping[str, str]
+    ) -> "CloudMountPlan | None":
+        """The plan a Pod recorded, rebuilt with today's ``passwords`` keyed
+        by mount id; ``None`` unless every mount has one and the rebuilt plan
+        reproduces the recorded fingerprint exactly."""
+        try:
+            mounts: list[SidecarMount] = []
+            by_index: dict[int, str] = {}
+            for raw in recorded.get("mounts") or []:
+                remote = dict(raw["remote"])
+                source_type = str(remote.pop("type"))
+                root = str(remote.pop("root"))
+                if set(remote) - set(_SOURCE_KEYS):
+                    return None
+                mount = SidecarMount(
+                    index=int(raw["index"]),
+                    name=str(raw["name"]),
+                    mount_id=str(raw["mount_id"]),
+                    mount_kind=str(raw["mount_kind"]),
+                    source_ref=(
+                        str(raw["source_ref"]) if raw.get("source_ref") else None
+                    ),
+                    backend=str(raw["backend"]),
+                    access=str(raw["access"]),
+                    source_type=source_type,
+                    source_config=tuple(
+                        (key, str(remote[key])) for key in _SOURCE_KEYS if key in remote
+                    ),
+                    root=root,
+                    flags=tuple(str(flag) for flag in raw.get("flags") or ()),
+                )
+                password = passwords.get(mount.mount_id)
+                if not password:
+                    return None
+                mounts.append(mount)
+                by_index[mount.index] = password
+            overlay = recorded.get("overlay")
+            grant = recorded.get("protected_grant")
+            plan = cls(
+                mounts=tuple(mounts),
+                excluded=tuple(dict(entry) for entry in recorded.get("excluded") or ()),
+                drain_seconds=int(recorded["drain_seconds"]),
+                cache_size=str(recorded["cache_size"]),
+                passwords=by_index,
+                protected=bool(recorded.get("protected")),
+                overlay=dict(overlay) if isinstance(overlay, Mapping) else None,
+                protected_grant=dict(grant) if isinstance(grant, Mapping) else None,
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        if plan.recorded().get("fingerprint") != recorded.get("fingerprint"):
+            return None
+        return plan
+
     def rclone_config(self) -> str:
         """The credential file. The only place a password is written."""
         sections: list[str] = []
@@ -369,6 +433,8 @@ def _sidecar_mount(
         root is None
         or not name
         or "/" in name
+        # The opener reads a target as PATH or PATH:ro.
+        or ":" in name
         or name.startswith(".")
         or cache is None
         or provider is None
@@ -417,11 +483,16 @@ async def resolve_cloud_mount_plan(
     mount_rows: list[dict[str, Any]] | None,
     settings: InPodPlaneSettings | None,
     dependencies: agent_cloud_mounts.AgentCloudMountDependencies,
+    wait_for_grant: bool = True,
 ) -> CloudMountPlan | None:
     """The plan for a new session container Pod, or ``None`` for the old path.
 
-    An empty plan (no mounts) still means the plane: nothing will ever mount
-    in that Pod, so its workspace needs no FUSE either.
+    A Pod with nothing to mount keeps today's path (decision 43): no plan
+    when there is no mount and nothing was left out, e.g. with the main
+    cloud off. When the main cloud is up but its session folder could not be
+    built, the plan has no mount and names the folder as ``unbuildable``,
+    so the user is told. ``wait_for_grant`` is False under the thread's
+    advisory lock (see :func:`await_protected_grant`).
     """
     if settings is None or dependencies.cloud_workspace_driver() != "rclone_mount":
         return None
@@ -440,6 +511,7 @@ async def resolve_cloud_mount_plan(
             mount_rows=mount_rows,
             settings=settings,
             dependencies=dependencies,
+            wait=wait_for_grant,
         )
 
     live = await agent_cloud_mounts._resolve_live_mount_set(
@@ -452,6 +524,11 @@ async def resolve_cloud_mount_plan(
     excluded: list[dict[str, str]] = [
         {key: str(value) for key, value in entry.items()} for entry in live.excluded
     ]
+    if not kept and not excluded:
+        missing = _missing_session_folder(thread, dependencies)
+        if missing is None:
+            return None
+        excluded.append(missing)
     for entry in live.mounts[settings.max_mounts :]:
         excluded.append(
             {
@@ -480,6 +557,72 @@ async def resolve_cloud_mount_plan(
     )
 
 
+def _missing_session_folder(
+    thread: dict[str, Any],
+    dependencies: agent_cloud_mounts.AgentCloudMountDependencies,
+) -> dict[str, str] | None:
+    """The exclusion naming a session folder the plane would have mounted
+    but could not build, or ``None`` when there is genuinely nothing to
+    mount (the main cloud off, or a provider whose mounts need more than a
+    static password, which keeps the old path anyway)."""
+    try:
+        backend = dependencies.cloud_router.for_thread_optional(thread)
+    except Exception:
+        return None
+    if (
+        backend is None
+        or not getattr(backend, "is_initialized", False)
+        or getattr(backend, "static_mount_credentials", False) is not True
+    ):
+        return None
+    has_handle = bool(
+        thread.get("main_cloud_session_handle") or thread.get("nc_session_folder")
+    )
+    return {
+        "source_ref": "session-folder",
+        "mount_kind": "session_folder",
+        "reason": "unbuildable",
+        "detail": "spec_failed" if has_handle else "no_session_folder",
+    }
+
+
+async def await_protected_grant(
+    thread: dict[str, Any],
+    *,
+    dependencies: agent_cloud_mounts.AgentCloudMountDependencies,
+) -> None:
+    """Let a protected session's in-flight reader grant land, as an attach
+    would wait for it. Call it before taking the thread's advisory lock: the
+    engage that mints the grant takes that lock too."""
+    metadata = thread_metadata_object(thread)
+    if protected_cloud_marker_state(metadata) != "on" or _officer(metadata):
+        return
+    authority = thread_runtime_authority(thread)
+    if authority is None:
+        return
+    tid = str(thread.get("id"))
+    row = await agent_cloud_mounts._resolve_protected_grant(
+        thread, metadata=metadata, dependencies=dependencies
+    )
+    # A missing row was waited for above; an earlier runtime's row, or one
+    # still engaging, is replaced by this runtime's engage task.
+    stale = row is not None and (
+        str(row.get("runtime_generation") or "") != authority.generation
+        or row.get("status") != "active"
+    )
+    if stale:
+        task = dependencies.cloud_tasks.protected_engage_get(
+            (tid, authority.generation)
+        )
+        if task is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task), timeout=PROTECTED_ENGAGE_WAIT_SECONDS
+                )
+            except Exception:
+                pass
+
+
 async def _protected_plan(
     thread: dict[str, Any],
     metadata: dict[str, Any],
@@ -487,6 +630,7 @@ async def _protected_plan(
     mount_rows: list[dict[str, Any]] | None,
     settings: InPodPlaneSettings,
     dependencies: agent_cloud_mounts.AgentCloudMountDependencies,
+    wait: bool = True,
 ) -> CloudMountPlan | None:
     """A protected session's plan: its read-only lower layer from the
     sidecars with the per-mount reader credential this runtime's engage
@@ -514,11 +658,17 @@ async def _protected_plan(
             runtime_generation=authority.generation,
         )
 
-    row = await agent_cloud_mounts._resolve_protected_grant(
-        thread, metadata=metadata, dependencies=dependencies
-    )
+    if not wait:
+        # Under the advisory lock: read only (await_protected_grant waited).
+        if not dependencies.is_protected_cloud_mode_enabled():
+            return None
+        row = await dependencies.store.get_ro_mount_by_thread(tid)
+    else:
+        row = await agent_cloud_mounts._resolve_protected_grant(
+            thread, metadata=metadata, dependencies=dependencies
+        )
     granted = row is not None and current(row)
-    if row is not None and not granted:
+    if wait and row is not None and not granted:
         task = dependencies.cloud_tasks.protected_engage_get(
             (tid, authority.generation)
         )
@@ -572,6 +722,7 @@ __all__ = [
     "PLAN_ANNOTATION",
     "CloudMountPlan",
     "SidecarMount",
+    "await_protected_grant",
     "plan_annotation",
     "protected_grant_identity",
     "rclone_obscure",
