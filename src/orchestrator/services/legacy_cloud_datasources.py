@@ -14,9 +14,13 @@
 Both carry a service account's credential to a whole cloud home, so they go
 rather than wait for the table work. A row is retired only in exactly the
 shape SRW made it: an administrator who renamed, re-described, linked or
-re-owned one made it theirs, and it stays. Each goes through
-``delete_datasource`` like any delete: links, leases and driver identities
-go with it, a tombstone keeps its name and threads naming it are scrubbed.
+re-owned one made it theirs, and it stays. The shape is the row's own
+columns and links, never ``manifest_resource_id``: that is the Connector
+write-through stamp (D3a), which ``create_datasource`` set on the personal
+row at birth and ``migrate_stored_connectors`` sets on every scoped row at
+each start, before this pass runs. Each goes through ``delete_datasource``
+like any delete: links, leases and driver identities go with it, a tombstone
+keeps its name and threads naming it are scrubbed.
 
 :func:`retire_legacy_cloud_datasources` runs at every startup, idempotent on
 every replica, and logs one count line; once it reads 0 on every
@@ -54,7 +58,6 @@ WHERE d.type = 'webdav'
   AND NOT d.is_global
   AND d.job_id IS NULL
   AND d.managed_key IS NULL
-  AND d.manifest_resource_id IS NULL
   AND (
       SELECT count(*) FROM project_datasources pd WHERE pd.datasource_id = d.id
   ) = 1
@@ -67,18 +70,23 @@ WHERE d.type = 'webdav'
 ORDER BY d.id
 """
 
-# Ownerless and global, named as the chart named it, at admin's home.
+# Ownerless and global, named as the chart named it, at admin's home, with
+# no description and no project link: ``upsert_default_datasource`` wrote
+# neither.
 _BUNDLED_NEXTCLOUD_SQL = """
 SELECT d.id
 FROM datasources d
 WHERE d.type = 'webdav'
   AND d.name = 'Nextcloud'
+  AND d.description IS NULL
   AND d.created_by IS NULL
   AND d.is_global
   AND d.job_id IS NULL
   AND d.managed_key IS NULL
-  AND d.manifest_resource_id IS NULL
   AND d.connection_url ~ '/remote\\.php/dav/files/admin/?$'
+  AND NOT EXISTS (
+      SELECT 1 FROM project_datasources pd WHERE pd.datasource_id = d.id
+  )
 ORDER BY d.id
 """
 

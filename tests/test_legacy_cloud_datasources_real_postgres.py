@@ -16,6 +16,7 @@ from orchestrator.database.postgres import PostgresDB
 from orchestrator.services.legacy_cloud_datasources import (
     retire_legacy_cloud_datasources,
 )
+from orchestrator.services.manifest_connectors import migrate_stored_connectors
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SCHEMA = _ROOT / "src/orchestrator/database/schema_current.sql"
@@ -183,6 +184,44 @@ async def test_the_first_weeks_description_is_the_same_shape(db):
 
 
 @pytest.mark.asyncio
+async def test_the_rows_as_srw_wrote_them_go_after_the_startup_connector_pass(db):
+    """The personal row as an administrator's create wrote it, through
+    ``create_datasource`` (its Connector written through at birth), and the
+    bundled row as ``init.py`` seeded it still go once
+    ``migrate_stored_connectors`` has run, as it does at every start before
+    this pass: the write-through stamp is not an administrator's edit."""
+    personal = await db.create_datasource(
+        name="Cloud Storage (Personal)",
+        ds_type="webdav",
+        connection_url="https://cloud.example/remote.php/dav/files/ada/",
+        description="Personal cloud storage",
+        credentials={"username": "agent-service", "password": "secret"},
+        scope_mode="projects",
+        auto_attach=False,
+        project_ids=[_DEFAULT_PROJECT],
+    )
+    await db.upsert_default_datasource(
+        name="Nextcloud",
+        ds_type="webdav",
+        connection_url=_ADMIN_HOME,
+        credentials={"username": "admin", "password": "secret"},
+    )
+    await migrate_stored_connectors(db)
+    async with db.acquire() as conn:
+        stamped = await conn.fetchval(
+            "SELECT manifest_resource_id IS NOT NULL FROM datasources "
+            "WHERE id = $1::uuid",
+            personal["id"],
+        )
+    assert stamped
+
+    counts = await retire_legacy_cloud_datasources(db)
+
+    assert counts == {"personal": 1, "bundled_nextcloud": 1}
+    assert await _ids(db) == set()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -210,8 +249,20 @@ async def test_a_personal_row_an_administrator_made_theirs_stays(db, overrides):
         {"connection_url": "http://srw-nextcloud/remote.php/dav/files/admin/Team/"},
         {"created_by": _USER},
         {"is_global": False},
+        {"description": "Admin's files"},
+        {"projects": (_OTHER_PROJECT,)},
+        {"projects": (_DEFAULT_PROJECT, _OTHER_PROJECT)},
     ],
-    ids=["renamed", "another-home", "a-subfolder", "owned", "not-global"],
+    ids=[
+        "renamed",
+        "another-home",
+        "a-subfolder",
+        "owned",
+        "not-global",
+        "described",
+        "linked",
+        "linked-twice",
+    ],
 )
 async def test_a_nextcloud_row_not_at_admins_home_or_not_ownerless_stays(db, overrides):
     shape = {"name": "Nextcloud", "connection_url": _ADMIN_HOME, "is_global": True}
