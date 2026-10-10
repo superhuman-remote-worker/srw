@@ -16,11 +16,13 @@ import pytest
 
 from orchestrator.services import project_cloud_connectors as connectors
 
-PROJECT = str(uuid4())
-OWNER = str(uuid4())
-EARLIER_OWNER = str(uuid4())
-INSTANCE = str(uuid4())
-OTHER_INSTANCE = str(uuid4())
+# Fixed ids: some name parametrized cases, whose ids xdist workers must
+# collect alike.
+PROJECT = "00000000-0000-4000-8000-0000000000b1"
+OWNER = "00000000-0000-4000-8000-0000000000c1"
+EARLIER_OWNER = "00000000-0000-4000-8000-0000000000c2"
+INSTANCE = "00000000-0000-4000-8000-0000000000e1"
+OTHER_INSTANCE = "00000000-0000-4000-8000-0000000000e2"
 
 
 def _project(**over: Any) -> dict[str, Any]:
