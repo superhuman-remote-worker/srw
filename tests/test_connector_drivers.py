@@ -377,15 +377,13 @@ def test_no_seam_falls_back_to_a_registry_of_its_own():
     )
     from orchestrator.services.datasources import DatasourceDependencies
     from orchestrator.services.manifest_execution import ManifestExecutionService
-    from orchestrator.services.user_administration import (
-        UserAdministrationDependencies,
-    )
 
+    # (User administration no longer validates a connector itself: the
+    # "Cloud Storage (Personal)" row it made is gone, main cloud slice 4.)
     required = [
         (DatasourceDependencies, "connector_drivers"),
         (DatasourcePayloadDependencies, "connector_drivers"),
         (DatasourcePayloadDependencies, "workspace_ssh_known_hosts"),
-        (UserAdministrationDependencies, "connector_drivers"),
     ]
     for dependencies, name in required:
         declared = {f.name: f for f in dataclasses.fields(dependencies)}[name]

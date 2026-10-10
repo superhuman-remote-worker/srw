@@ -129,7 +129,8 @@ async def test_new_account_deletion_keeps_completed_manifest_history(database):
     )
 
     result = await delete_user(
-        user_id=str(user["id"]), dependencies=SimpleNamespace(store=database)
+        user_id=str(user["id"]),
+        dependencies=SimpleNamespace(store=database, main_cloud_router=None),
     )
     assert result == {"status": "deleted"}
     assert await database.get_user(str(user["id"])) is None
