@@ -14,7 +14,9 @@ its pod) and writes one JSON object per line to stdout:
 * ``bind``: a binding descriptor for the workspace: ``EXAMPLE_TOKEN``, a
   credential derived for this binding from the connector's token (never the
   token itself); with ``file``, the same value in
-  ``~/.srw-files/example/token``, named by ``EXAMPLE_TOKEN_FILE``; and
+  ``~/.srw-files/example/token``, named by ``EXAMPLE_TOKEN_FILE``; with
+  ``kube``, the same value in ``~/.kube/example-token`` (a driver may use
+  any credential-file location, as SRW's own connectors do); and
   ``EXAMPLE_DRIVER_PROCESS``, what the kernel says about this process (user,
   capabilities, no-new-privs, seccomp), so a gate can read in the workspace
   how the pod ran. Every name it sets is declared in ``env_names`` in its
@@ -30,8 +32,9 @@ its pod) and writes one JSON object per line to stdout:
 * anything else: an ``unsupported`` error.
 
 ``misbehave`` (config) is for SRW's own gate: it makes ``bind`` return a
-variable no driver may set, one the spec does not declare, a file outside
-the allowed locations, or fail with a ``config`` error.
+variable no connector may set (``NODE_OPTIONS``), one the spec does not
+declare, a file outside the credential-file locations (``~/.bashrc``), or
+fail with a ``config`` error.
 
 It needs no network: a real driver would call its upstream here (and declare
 it as egress in its spec).
@@ -52,6 +55,7 @@ TOKEN_VARIABLE = "EXAMPLE_TOKEN"
 FILE_VARIABLE = "EXAMPLE_TOKEN_FILE"
 PROCESS_VARIABLE = "EXAMPLE_DRIVER_PROCESS"
 TOKEN_FILE = "~/.srw-files/example/token"
+KUBE_FILE = "~/.kube/example-token"
 
 
 def emit(line: dict[str, Any]) -> None:
@@ -171,12 +175,14 @@ def bind(request: dict[str, Any]) -> int:
     ]
     if config.get("file"):
         entries.append(credential_file(TOKEN_FILE, value + "\n", FILE_VARIABLE))
+    if config.get("kube"):
+        entries.append(credential_file(KUBE_FILE, value + "\n", None))
     if misbehave == "denied_variable":
-        entries.append(variable("GIT_SSH_COMMAND", "true"))
+        entries.append(variable("NODE_OPTIONS", "--require /tmp/x.js"))
     elif misbehave == "undeclared_variable":
         entries.append(variable("EXAMPLE_UNDECLARED", value))
     elif misbehave == "refused_file":
-        entries.append(credential_file("~/.kube/config", "{}\n", None))
+        entries.append(credential_file("~/.bashrc", "true\n", None))
     emit({"type": "log", "level": "info", "message": "minted a credential"})
     # What revoke needs to revoke the minted credential upstream.
     state = json.dumps({"minted": fingerprint(value)})

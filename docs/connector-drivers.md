@@ -29,10 +29,13 @@ What a driver can do in this release:
 - **Return data, never commands.** A bind returns environment variables and
   credential files for the workspace. SRW writes them over its own channel,
   and no driver image gets a shell in a workspace. What it returns is still
-  data the workspace's programs read: SRW refuses the variable names on its
-  list of known tool hooks and the file locations whose formats run a
-  command (see [what a binding may hold](#what-a-binding-may-hold)), but that
-  list is a best-effort lint, not a sandbox. **The author of a driver image is
+  data the workspace's programs read, held to the one rule every connector
+  follows, SRW's own included: credential connectors can't execute commands
+  in the workspace. SRW refuses the variables it reserves and the known
+  variables that make a tool run code, and a file outside the credential
+  locations or with an execute bit (see
+  [what a binding may hold](#what-a-binding-may-hold)), but that rule is a
+  best-effort lint, not a sandbox. **The author of a driver image is
   the trust boundary**, as the author of a workspace image is: register only
   images whose authors you trust with the connector's credentials and with
   what lands in your workspaces.
@@ -168,7 +171,7 @@ The rules SRW applies when you register:
   file's `env_var` included, each at most 128 characters. A driver that
   returns `env_file` must declare them: they are shown on the driver, on each
   of its connectors and in the attach picker, before anyone attaches one.
-  None may be a variable a driver may not set (see
+  None may be a variable no connector may set (see
   [what a binding may hold](#what-a-binding-may-hold)).
 - **`config_schema`** is a JSON Schema (2020-12) for the connector's config.
   SRW validates every connector against it when it is saved, on its own
@@ -245,48 +248,70 @@ def bind(request):
 
 ### What a binding may hold
 
+A binding follows the same rules as SRW's own environment and credential-file
+connectors, no more and no less: credential connectors can't execute commands
+in the workspace. (Anything more is for the workspace SSH access a driver will
+declare, a later feature.)
+
 - `env_file` entries: `{"name": ..., "value": ...}`. The name is one your spec
-  declares in `env_names`. SRW refuses the names on its list of known tool
-  hooks, compared in any case: SRW's own (`PATH`, `HOME`, `SRW_*`, `LD_*`,
-  `PYTHON*`…), the `GIT_*` and `SSH_*` families, every `*_PROXY`, the CA and
-  TLS variables (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`,
-  `NODE_EXTRA_CA_CERTS`…), `KUBECONFIG`, `DOCKER_*`, `XDG_*`, `TMPDIR`,
-  `HISTFILE`, shell prompts, editors and pagers (`PS1`, `EDITOR`, `*PAGER`,
-  `*EDITOR`, `LESSOPEN`, `*BROWSER`), `*ASKPASS`, rc files (`INPUTRC`,
-  `CONDARC`, `WGETRC`, `PSQLRC`, `NETRC`…), remote shells and merge tools
-  (`RSYNC_RSH`, `CVS_RSH`, `SVN_SSH`, `HGMERGE`, `FCEDIT`), libpq's TLS
-  settings (`PGSSLMODE`, `PGSSLROOTCERT`), `GODEBUG`, every name ending in
-  `_OPTS`, `_OPTIONS`, `FLAGS`, `_COMMAND`, `_ARGS`, `RCPATH`, `_CONFIG`,
-  `_CONFIG_FILE`, `_CONFIG_PATH`, `_CONFIG_DIR` or `_HOME`, and the settings
-  of the common runtimes, build tools and package managers (`NODE_*`,
-  `NPM_CONFIG_*`, `PIP_*`, `UV_*`, `CARGO_*`, `GRADLE_*`, `MAVEN_*`,
-  `YARN_*`, `COREPACK_*`, `ERL_*`, `ELIXIR_*`, `CMAKE_*`, `TF_*`,
-  `ANSIBLE_*`, `CLOUDSDK_*`, `JULIA_*`, `JUPYTER_*`, `DENO_*`, `BASH_*`,
-  `PERL5*`, `RUBY*`, `DOTNET_*`, `BUN_*`, `JAVA_HOME`, `CC`, `GOPROXY`…).
+  declares in `env_names`, at most 128 characters. Compared in any case, SRW
+  refuses:
+  - the names it reserves: `PATH`, `HOME`, the shell's own (`SHELL`, `ENV`,
+    `BASH_ENV`, `IFS`, `PROMPT_COMMAND`…), the `SRW_*`, `LD_*`, `DYLD_*` and
+    `PYTHON*` families, and `KUBECONFIG` (SRW's kubeconfig connectors merge
+    into it);
+  - the known variables that make a tool run code: commands and code
+    (`GIT_SSH_COMMAND`, `EDITOR`, `VISUAL`, `PAGER`, `SSH_ASKPASS`, `CC`,
+    every `*_COMMAND`, `*ASKPASS`, `*PAGER`, `*EDITOR`, `*BROWSER`), runtime
+    options and flags (`NODE_OPTIONS`, `JAVA_TOOL_OPTIONS`, `RUBYOPT`, every
+    `*_OPTS`, `*_OPTIONS`, `*FLAGS`, `*_ARGS`), the files and directories a
+    tool reads config, start-up code or plugins from (`GIT_CONFIG_*`,
+    `GIT_EXEC_PATH`, the rc files such as `INPUTRC`, `PSQLRC` and `WGETRC`,
+    `XDG_*`, `DOCKER_CONFIG`, `NODE_PATH`, every `*_CONFIG`, `*_CONFIG_FILE`,
+    `*_CONFIG_PATH`, `*_CONFIG_DIR`, `*RCPATH` and `*_HOME`), where the next
+    install fetches code (`GOPROXY`, `GOTOOLCHAIN`), and the settings of the
+    common runtimes, build tools and package managers as whole families
+    (`GIT_*`, `SSH_*`, `NODE_*`, `NPM_CONFIG_*`, `PIP_*`, `UV_*`, `CARGO_*`,
+    `GRADLE_*`, `MAVEN_*`, `YARN_*`, `COREPACK_*`, `ERL_*`, `ELIXIR_*`,
+    `CMAKE_*`, `TF_*`, `ANSIBLE_*`, `CLOUDSDK_*`, `JULIA_*`, `JUPYTER_*`,
+    `DENO_*`, `BASH_*`, `PERL5*`, `RUBY*`, `DOTNET_*`, `BUN_*`…).
+
   Within those prefix families a credential-shaped name, one ending in
   `_TOKEN`, `_API_KEY`, `_PASSWORD`, `_SECRET`, `_ACCESS_KEY` or
   `_SECRET_KEY` (`NODE_AUTH_TOKEN`, `CARGO_REGISTRY_TOKEN`,
   `UV_PUBLISH_TOKEN`, `GEM_HOST_API_KEY`), is yours to set; a name the list
-  spells out, and the workspace's own families (`SRW_*`, `LD_*`, `PYTHON*`),
-  never are. The full list is
+  spells out, `GIT_CONFIG_*` and the reserved families never are. Yours to
+  set too, because they change where a tool connects and what it trusts,
+  never what it runs: every proxy (`*_PROXY`, `NO_PROXY`), CA bundles and
+  TLS checks (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`,
+  `GIT_SSL_CAINFO`, `PGSSLMODE`…), name resolution (`HOSTALIASES`,
+  `RES_OPTIONS`), `DOCKER_HOST`, and Go's private-module and checksum
+  settings (`GOPRIVATE`, `GONOSUMDB`…); a variable that names a credential
+  file the file rule accepts anyway (`AWS_CONFIG_FILE`,
+  `AWS_SHARED_CREDENTIALS_FILE`, `NETRC`, `PGPASSFILE`,
+  `GOOGLE_APPLICATION_CREDENTIALS`); git's commit identity
+  (`GIT_AUTHOR_NAME`, `GIT_COMMITTER_EMAIL`…); and every other name, such as
+  `AWS_ACCESS_KEY_ID`, `PGPASSWORD`, `DATABASE_URL`, `GITHUB_TOKEN` or
+  `OPENAI_API_KEY`. The full rule, with the reasoning family by family, is
   [`env_names.py`](../src/shared/connectors/env_names.py). It is a
   best-effort lint against known hooks, not a sandbox: a tool it does not
-  know may read a name it does not list. Other credential-shaped names
-  (`AWS_ACCESS_KEY_ID`, `PGPASSWORD`, `DATABASE_URL`, `GITHUB_TOKEN`,
-  `OPENAI_API_KEY`…) are yours to set too. A value is a string of at most
+  know may read a name it does not list. A value is a string of at most
   64 KiB without NUL bytes. (A managed MCP server's own process, which never
   reaches a workspace, is checked against the shorter list its bridge
   refuses: `NODE_OPTIONS`, `PYTHONPATH`, `GIT_*`, `PIP_*`… A `server.json`'s
   `NODE_ENV` or `JAVA_HOME` is the server's own.)
 - `credential_file` entries: `{"path": ..., "content": ..., "mode": 384,
-  "env_var": ...}`. The path is `~/.srw-files/…`, `~/.netrc` or `~/.pgpass`,
-  at most 255 characters, and one binding writes each path once. The other
-  places a built-in credential file may land (`~/.kube/`, `~/.aws/`,
-  `~/.docker/`, `~/.config/<app>/`) hold formats that run a command (a
-  kubeconfig's `exec`, an AWS `credential_process`), which a driver's output
-  may not carry in this release; for the same reason a `~/.netrc` may not
-  define a macro (`macdef`). A file is never executable. `env_var`, when
-  set, names the file in the environment and follows the variable rules.
+  "env_var": ...}`. The path is a credential location, as for SRW's own file
+  connectors: `~/.kube/`, `~/.aws/`, `~/.azure/`, `~/.docker/` (but for
+  `~/.docker/cli-plugins/` and `~/.azure/cliextensions/`, where those CLIs
+  load code), `~/.config/<app>/` for `doctl`, `gcloud`, `hcloud`, `helm` and
+  `sops`, `~/.srw-files/`, `~/.netrc` and `~/.pgpass`; never `~/.ssh/` or
+  `~/.srw-credentials/`. It is at most 255 characters, and one binding
+  writes each path once. A file is never executable. SRW does not read what
+  a file says: a kubeconfig's `exec` or an AWS `credential_process` runs a
+  command when that CLI is used, which is part of what your driver is
+  trusted with. `env_var`, when set, names the file in the environment and
+  follows the variable rules.
 - Every entry's `recipient` is `workspace`.
 
 A variable two connectors of one Job or Session would set is never

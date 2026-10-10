@@ -14,10 +14,15 @@
         "description": "Also write the credential to ~/.srw-files/example/token, named by EXAMPLE_TOKEN_FILE",
         "x-srw-order": 1
       },
+      "kube": {
+        "type": "boolean",
+        "description": "Also write the credential to ~/.kube/example-token",
+        "x-srw-order": 2
+      },
       "misbehave": {
         "enum": ["denied_variable", "undeclared_variable", "refused_file", "fail"],
         "description": "For SRW's own gate only: make bind return what SRW refuses, or fail",
-        "x-srw-order": 2
+        "x-srw-order": 3
       }
     }
   },

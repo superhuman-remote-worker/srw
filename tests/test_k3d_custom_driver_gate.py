@@ -356,6 +356,22 @@ def test_the_refusal_reasons_are_srw_s_own_words():
     failed = bind({"misbehave": "fail"})
     assert failed.error.error_class == "config"
     assert failed.error.message == gate.FAILING
+    # The bind phase's connector: its files land in ~/.srw-files/ and in
+    # ~/.kube/, every credential-file location being a driver's to use.
+    delivered = bind({"file": True, "kube": True}).result["binding"]
+    assert (
+        image_binding_problems(
+            delivered,
+            spec_from_json(spec_json),
+            env_names=declared_env_names(spec_json),
+        )
+        == []
+    )
+    assert {
+        entry["value"]["path"]
+        for entry in delivered["entries"]
+        if entry["form"] == "credential_file"
+    } == {gate.TOKEN_FILE, gate.KUBE_FILE}
 
 
 def test_notices_are_the_readme_s_not_delivered_lines():

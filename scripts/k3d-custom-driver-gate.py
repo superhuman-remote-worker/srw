@@ -78,7 +78,9 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               reported UID 10001, no effective or bounding capability,
               no_new_privs and seccomp filtering (EXAMPLE_DRIVER_PROCESS); the
               workspace has the variable the driver minted for this binding
-              (never the connector's token) and its credential file (0600);
+              (never the connector's token), its credential file (0600) and
+              the same value in ~/.kube/example-token (a driver may use every
+              credential-file location, as SRW's own connectors do);
               the binding records reference, digest, resolution time, spec
               hash and protocol version; afterwards the pod, its Secret and
               its policy are gone and the operation is recorded removed
@@ -95,8 +97,9 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               revoking at once (connector_detached) and revoked by a revoke
               pod within a reconciler pass, which received the binding's own
               inputs and driver_state, and is gone afterwards
-  refusals    a variable a driver may not set, one the spec does not declare
-              and a file outside ~/.srw-files/, ~/.netrc and ~/.pgpass are
+  refusals    a variable no connector may set (NODE_OPTIONS, a code hook),
+              one the spec does not declare and a file outside the
+              credential-file locations (~/.bashrc) are
               each refused at bind with the reason on the connector and in
               the README, and what the bind minted is revoked
               (binding_refused); ``doomed``, bound, is deleted: its binding is
@@ -194,6 +197,9 @@ DRIVER_UID = "10001"
 TOKEN_VARIABLE = "EXAMPLE_TOKEN"
 FILE_VARIABLE = "EXAMPLE_TOKEN_FILE"
 TOKEN_FILE = "~/.srw-files/example/token"
+#: Where its ``kube`` config writes the same value: a credential-file
+#: location outside the narrow set D6 first allowed drivers.
+KUBE_FILE = "~/.kube/example-token"
 #: The lease exchange's routes and the result route, on the exchange port.
 EXCHANGE_PATH = "/v1/leases/exchange"
 INTROSPECT_PATH = "/v1/leases/introspect"
@@ -216,13 +222,13 @@ _POD_NAME_RE = re.compile(r"[a-z0-9]([-a-z0-9]{0,251}[a-z0-9])?\Z")
 REFUSALS = {
     "denied": (
         "denied_variable",
-        "GIT_SSH_COMMAND is not a variable a driver may set",
+        "NODE_OPTIONS is not a variable a connector may set",
     ),
     "undeclared": (
         "undeclared_variable",
         "sets EXAMPLE_UNDECLARED, which the driver's spec does not declare",
     ),
-    "file": ("refused_file", "a driver's file goes to ~/.srw-files/"),
+    "file": ("refused_file", "path is refused: not a credential-file location"),
 }
 #: The ``fail`` connector's bind error, a final ``config`` failure.
 FAILING = "Told to fail (misbehave)"
@@ -624,6 +630,10 @@ if [ -e "$GATE_FILE" ]; then
 fi
 if [ -n "${EXAMPLE_TOKEN_FILE:-}" ]; then
   printf 'var_real=%s\n' "$(readlink -f "$EXAMPLE_TOKEN_FILE")"
+fi
+if [ -e "$GATE_KUBE_FILE" ]; then
+  printf 'kube_sha=%s\n' "$(sha256sum < "$GATE_KUBE_FILE" | cut -d' ' -f1)"
+  printf 'kube_mode=%s\n' "$(stat -L -c %a "$GATE_KUBE_FILE")"
 fi
 printf 'notices=%s\n' "$(grep -rhF --include=README.md 'Not delivered' ~ 2>/dev/null | tr '\n' '|' | head -c 4000)"
 """
@@ -1174,7 +1184,8 @@ PLAN = [
     "shows registrations to who may see them",
     "bind: session one's bind runs one unprivileged pod (spec, Secret, its "
     "NetworkPolicy while it ran, the driver's own UID and capabilities) that "
-    "delivers the minted variable and file to the workspace; the binding "
+    "delivers the minted variable and files (one in ~/.kube/) to the "
+    "workspace; the binding "
     "records reference, digest, resolved_at, spec_hash and protocol_version; "
     "the pod, its Secret and policy are gone afterwards",
     "identity: the bind pod's sdi_ is refused by the lease exchange and its "
@@ -1185,7 +1196,8 @@ PLAN = [
     "is pushed back",
     "detach: detaching session one's connector live revokes its binding "
     "(connector_detached) in a revoke pod within a reconciler pass",
-    "refusals: a denied variable, an undeclared one and a refused file are "
+    "refusals: a code hook (NODE_OPTIONS), an undeclared variable and a file "
+    "outside the credential-file locations are "
     "each refused at bind with a visible reason, and revoked "
     "(binding_refused); a bound connector deleted is still revoked "
     "(connector_deleted) with the inputs of its bind",
@@ -1327,7 +1339,9 @@ class CustomDriverGate:
 
     def workspace_facts(self, pod: str) -> dict[str, str]:
         rc, out = self.ws(
-            pod, f"GATE_FILE={TOKEN_FILE.replace('~', HOME, 1)}\n" + _WORKSPACE_SCRIPT
+            pod,
+            f"GATE_FILE={TOKEN_FILE.replace('~', HOME, 1)}\n"
+            f"GATE_KUBE_FILE={KUBE_FILE.replace('~', HOME, 1)}\n" + _WORKSPACE_SCRIPT,
         )
         if rc:
             return {}
@@ -2249,7 +2263,7 @@ class CustomDriverGate:
     def bind_checks(self) -> None:
         self.watch = PodWatch(self.namespace)
         self.watch.start()
-        self.create_connector("example")
+        self.create_connector("example", {"file": True, "kube": True})
         thread = self.create_session("one", ["example"])
         row = self.settled(thread)
         self.report.check(
@@ -2326,6 +2340,13 @@ class CustomDriverGate:
             json.dumps(
                 {k: facts.get(k) for k in ("file_mode", "file_var", "file_real")}
             ),
+        )
+        self.report.check(
+            f"bind: the workspace has the driver's file in {KUBE_FILE} (0600): "
+            "a driver may use every credential-file location",
+            facts.get("kube_sha") == hashlib.sha256((value + "\n").encode()).hexdigest()
+            and facts.get("kube_mode") == "600",
+            json.dumps({k: facts.get(k) for k in ("kube_mode",)}),
         )
         process = process_facts(facts.get("process", ""))
         problems = unprivileged_process(process)
