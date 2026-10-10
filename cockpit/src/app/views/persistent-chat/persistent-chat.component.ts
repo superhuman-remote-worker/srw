@@ -1199,6 +1199,7 @@ export function clearDraft(threadId: string | null): void {
            workspace starts anyway, and this says which folder and why. -->
       <app-cloud-folders-notice
         [problems]="chat.cloudFolderProblems()"
+        [protectedCloud]="chat.cloudFoldersProtected()"
         [agentOutdated]="chat.cloudFoldersAgentOutdated()"
       />
 

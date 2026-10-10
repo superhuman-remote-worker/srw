@@ -40,7 +40,8 @@ function sessionState() {
     'hasOlderTurns', 'cloudDiffPanelOpen', 'cloudSyncDegraded', 'protectedCloud',
     'workspaceUpgradeInProgress', 'continueAfterUpgrade', 'rewindInFlight', 'rewindOutcomeUnknown',
     'rewindPreviewLoading', 'rewindModeAvailable', 'summarizeAvailable', 'outboxStalled',
-    'draftDefaultsLoading', 'reconnectGaveUp', 'endRetryAvailable', 'cloudFoldersAgentOutdated']) state[key] = signal(false);
+    'draftDefaultsLoading', 'reconnectGaveUp', 'endRetryAvailable', 'cloudFoldersAgentOutdated',
+    'cloudFoldersProtected']) state[key] = signal(false);
   for (const key of ['turns', 'visibleTurns', 'pendingAttachments', 'pendingPermissions', 'tasks',
     'outbox', 'outboxIds', 'draftDatasourceIds', 'runningTools', 'cloudFolderProblems']) state[key] = signal([]);
   for (const key of ['compaction', 'rewindPrefill', 'rewindPreview', 'pendingWorkspaceOffer',

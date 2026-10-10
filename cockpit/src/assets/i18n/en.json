@@ -1929,6 +1929,13 @@
       "regionLabel": "Cloud folders",
       "title": "Some cloud folders of this session are not available",
       "notAttached": "A cloud folder was not attached",
+      "notAttachedKind": {
+        "session_folder": "The session folder was not attached",
+        "project": "A project folder was not attached",
+        "project_default": "Your project folder was not attached"
+      },
+      "protectedTitle": "Protected cloud unavailable",
+      "protectedMeta": "This protected session runs without a cloud folder, so nothing it writes reaches the cloud. Start a new session once the cause is fixed.",
       "agentOutdated": "This session's agent is older than its workspace: its cloud folders are under /cloud, but the agent does not manage them. Start a new session to get the full cloud features.",
       "reason": {
         "credential_rejected": "the cloud refused its credential",
@@ -1936,7 +1943,7 @@
         "unreachable": "the cloud could not be reached",
         "timeout": "the cloud did not answer in time",
         "mount_failed": "the folder could not be mounted",
-        "config_missing": "its credential never reached the workspace",
+        "config_missing": "its credential never reached the cloud mount service",
         "sidecar_unavailable": "the workspace's cloud mount service is not running",
         "unbuildable": "it could not be prepared for this session",
         "set_fallback": "another folder of this session could not be prepared, so the session folder is mounted instead",

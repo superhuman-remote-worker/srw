@@ -1929,6 +1929,13 @@
       "regionLabel": "Cloud-Ordner",
       "title": "Einige Cloud-Ordner dieser Sitzung sind nicht verfügbar",
       "notAttached": "Ein Cloud-Ordner wurde nicht verbunden",
+      "notAttachedKind": {
+        "session_folder": "Der Sitzungsordner wurde nicht verbunden",
+        "project": "Ein Projektordner wurde nicht verbunden",
+        "project_default": "Dein Projektordner wurde nicht verbunden"
+      },
+      "protectedTitle": "Geschützte Cloud nicht verfügbar",
+      "protectedMeta": "Diese geschützte Sitzung läuft ohne Cloud-Ordner, nichts, was sie schreibt, erreicht die Cloud. Starte eine neue Sitzung, sobald die Ursache behoben ist.",
       "agentOutdated": "Der Agent dieser Sitzung ist älter als ihr Arbeitsbereich: Die Cloud-Ordner liegen unter /cloud, werden vom Agenten aber nicht verwaltet. Starte eine neue Sitzung, um alle Cloud-Funktionen zu nutzen.",
       "reason": {
         "credential_rejected": "die Cloud hat die Zugangsdaten abgelehnt",
@@ -1936,7 +1943,7 @@
         "unreachable": "die Cloud war nicht erreichbar",
         "timeout": "die Cloud hat nicht rechtzeitig geantwortet",
         "mount_failed": "der Ordner konnte nicht eingebunden werden",
-        "config_missing": "die Zugangsdaten sind nie im Arbeitsbereich angekommen",
+        "config_missing": "die Zugangsdaten sind nie beim Cloud-Mount-Dienst angekommen",
         "sidecar_unavailable": "der Cloud-Einbindungsdienst des Arbeitsbereichs läuft nicht",
         "unbuildable": "er konnte für diese Sitzung nicht vorbereitet werden",
         "set_fallback": "ein anderer Ordner dieser Sitzung konnte nicht vorbereitet werden, deshalb ist stattdessen der Sitzungsordner eingebunden",

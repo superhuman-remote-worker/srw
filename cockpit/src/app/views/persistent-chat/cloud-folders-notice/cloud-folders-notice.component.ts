@@ -8,6 +8,10 @@ import { CloudFolderProblem } from '../../../core/util/cloud-mount-status';
  * D7). A folder that does not mount never blocks the workspace; this is where
  * the user learns which one and why. Hidden when every folder came up.
  *
+ * A protected session whose cloud layer did not come up runs with no cloud
+ * folder at all (decision 42): one line says the protected cloud is
+ * unavailable, and why.
+ *
  * Main-cloud slice 3 replaces it with each connector's binding state in the
  * session header. Its own component, like the cloud review banner, so no
  * rules land in persistent-chat.component.scss.
@@ -27,13 +31,24 @@ import { CloudFolderProblem } from '../../../core/util/cloud-mount-status';
       >
         <app-icon size="sm" class="cfn__icon" aria-hidden="true">cloud_off</app-icon>
         <div class="cfn__body">
-          @if (problems().length) {
+          @if (protectedCloud() && problems().length) {
+            <p class="cfn__title" data-testid="cloud-folders-protected">
+              {{ 'chat.cloudFolders.protectedTitle' | transloco }}
+              <span class="cfn__sep" aria-hidden="true">·</span>
+              {{ 'chat.cloudFolders.reason.' + problems()[0].reason | transloco }}
+            </p>
+            <p class="cfn__meta">{{ 'chat.cloudFolders.protectedMeta' | transloco }}</p>
+          } @else if (problems().length) {
             <p class="cfn__title">{{ 'chat.cloudFolders.title' | transloco }}</p>
             <ul class="cfn__list">
               @for (problem of problems(); track $index) {
                 <li>
-                  @if (problem.name) {
-                    <span class="cfn__name">workspace/cloud/{{ problem.name }}</span>
+                  @if (problem.path) {
+                    <span class="cfn__name">{{ problem.path }}</span>
+                  } @else if (problem.kind) {
+                    <span class="cfn__name">{{
+                      'chat.cloudFolders.notAttachedKind.' + problem.kind | transloco
+                    }}</span>
                   } @else {
                     <span class="cfn__name">{{ 'chat.cloudFolders.notAttached' | transloco }}</span>
                   }
@@ -54,5 +69,7 @@ import { CloudFolderProblem } from '../../../core/util/cloud-mount-status';
 })
 export class CloudFoldersNoticeComponent {
   problems = input<CloudFolderProblem[]>([]);
+  /** A protected session runs without its cloud (decision 42). */
+  protectedCloud = input<boolean>(false);
   agentOutdated = input<boolean>(false);
 }

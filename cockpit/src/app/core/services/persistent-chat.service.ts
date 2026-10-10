@@ -67,7 +67,7 @@ import { CanvasService } from './canvas.service';
 import { CapabilitiesService } from './capabilities.service';
 import {
   CloudFolderProblem,
-  cloudFolderProblemsFromEvent,
+  cloudFolderStateFromEvent,
   cloudFolderStateFromStatus,
 } from '../util/cloud-mount-status';
 
@@ -1229,6 +1229,8 @@ export class PersistentChatService {
   readonly cloudFolderProblems = signal<CloudFolderProblem[]>([]);
   /** The session's agent predates the in-pod plane: folders unmanaged. */
   readonly cloudFoldersAgentOutdated = signal(false);
+  /** A protected session runs without its cloud (decision 42). */
+  readonly cloudFoldersProtected = signal(false);
   readonly cloudChangesCount = signal(0);
   readonly protectedMountName = signal<string | null>(null);
   /** ISO timestamp the current staged diff was captured at (the summary's
@@ -2449,6 +2451,7 @@ export class PersistentChatService {
         this._protectedCloud.set(false);
         this.cloudFolderProblems.set([]);
         this.cloudFoldersAgentOutdated.set(false);
+        this.cloudFoldersProtected.set(false);
         this.cloudChangesCount.set(0);
         this.protectedMountName.set(null);
         this.cloudStagedAt.set(null);
@@ -3065,6 +3068,7 @@ export class PersistentChatService {
         const folders = cloudFolderStateFromStatus(thread.metadata?.cloud_mount_status);
         this.cloudFolderProblems.set(folders.problems);
         this.cloudFoldersAgentOutdated.set(folders.agentOutdated);
+        this.cloudFoldersProtected.set(folders.protected);
         if (this._protectedCloud()) {
           void this.refreshCloudDiffCount();
           void this.resolveProtectedFolderLink();
@@ -5257,6 +5261,7 @@ export class PersistentChatService {
       this._protectedCloud.set(false);
       this.cloudFolderProblems.set([]);
       this.cloudFoldersAgentOutdated.set(false);
+      this.cloudFoldersProtected.set(false);
       this.cloudChangesCount.set(0);
       this.protectedMountName.set(null);
       this.cloudStagedAt.set(null);
@@ -8318,8 +8323,12 @@ export class PersistentChatService {
       }
 
       case 'cloud_mount.status': {
-        // The agent's live view of the sidecar cloud folders (D7).
-        this.cloudFolderProblems.set(cloudFolderProblemsFromEvent(params));
+        // The agent's live view of the sidecar cloud folders (D7). An agent
+        // that reports is up to date: an earlier outdated notice clears.
+        const folders = cloudFolderStateFromEvent(params);
+        this.cloudFolderProblems.set(folders.problems);
+        this.cloudFoldersProtected.set(folders.protected);
+        this.cloudFoldersAgentOutdated.set(folders.agentOutdated);
         break;
       }
 

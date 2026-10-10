@@ -2548,6 +2548,8 @@ describe('PersistentChatService — SSE event dispatch', () => {
   it('keeps the live state of sidecar cloud folders from cloud_mount.status (D7)', async () => {
     const { service, es } = await setup();
     expect(service.cloudFolderProblems()).toEqual([]);
+    // An older agent left the notice; a reporting agent is up to date.
+    service.cloudFoldersAgentOutdated.set(true);
     fireSseMessage(
       es,
       {
@@ -2563,14 +2565,29 @@ describe('PersistentChatService — SSE event dispatch', () => {
       '1:1',
     );
     expect(service.cloudFolderProblems()).toEqual([
-      { name: 'project', reason: 'credential_rejected' },
+      { name: 'project', path: 'workspace/cloud/project', kind: '', reason: 'credential_rejected' },
     ]);
+    expect(service.cloudFoldersAgentOutdated()).toBe(false);
+    expect(service.cloudFoldersProtected()).toBe(false);
     fireSseMessage(
       es,
       { method: 'cloud_mount.status', params: { mounts: [{ name: 'project', state: 'mounted' }] } },
       '1:2',
     );
     expect(service.cloudFolderProblems()).toEqual([]);
+    // A protected session without its cloud (decision 42).
+    fireSseMessage(
+      es,
+      {
+        method: 'cloud_mount.status',
+        params: {
+          protected: true,
+          mounts: [{ name: 'lower', state: 'unavailable', reason: 'protected_unavailable' }],
+        },
+      },
+      '1:3',
+    );
+    expect(service.cloudFoldersProtected()).toBe(true);
   });
 
   it('does NOT mark cloudSyncDegraded for a retryable per-turn workspace_sync.error', async () => {
