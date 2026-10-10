@@ -1826,8 +1826,11 @@ class OrchestratorClient:
             # New pinned runtimes bind credential delivery to their exact
             # reciprocal thread/agent ownership. Older orchestrators ignore
             # this additive header; compatibility mode still permits old
-            # agents until REQUIRE_PINNED_STATUS_IDENTITY is enabled.
-            headers: dict[str, str] = {}
+            # agents until REQUIRE_PINNED_STATUS_IDENTITY is enabled. This
+            # agent also attaches to the cloud folders a Pod's sidecars
+            # mounted (D7); an older one does not say so and gets no cloud
+            # payload it would misread.
+            headers: dict[str, str] = {"X-SRW-Cloud-Mount-Delivery": "sidecar"}
             if self.agent_id:
                 headers["X-Agent-ID"] = self.agent_id
             if self.session_runtime_generation:
@@ -1930,6 +1933,30 @@ class OrchestratorClient:
                 else None
             ),
         )
+
+    async def report_cloud_mount_status(
+        self,
+        thread_id: str,
+        *,
+        fingerprint: str,
+        mounts: list[dict[str, Any]],
+    ) -> bool:
+        """Report the state of the cloud folders a Pod's sidecars mounted
+        (connector drivers D7). The orchestrator keeps it only for the plan
+        ``fingerprint`` names. Best effort: False on any failure."""
+        if not self._client:
+            await self.connect()
+        try:
+            response = await self._client.post(
+                f"{self.orchestrator_url}/api/agents/threads/{thread_id}"
+                "/cloud-mount-status",
+                json={"fingerprint": fingerprint, "mounts": mounts},
+                timeout=15.0,
+            )
+        except Exception as e:
+            logger.debug("Failed to report cloud mount status: %s", e)
+            return False
+        return response.status_code == 200
 
     async def report_workspace_recovery(
         self,

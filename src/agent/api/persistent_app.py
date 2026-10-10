@@ -11524,7 +11524,11 @@ async def _handle_workspace_upgrade(
             _ws_info = await _orchestrator_client.get_thread_workspace(
                 _session_identity.thread_id
             )
-            _fresh_cloud_mount = _ws_info.get("cloud_mount") if _ws_info else None
+            _fresh_cloud_mount = (
+                (_ws_info.get("cloud_mount") or _ws_info.get("cloud_mount_sidecar"))
+                if _ws_info
+                else None
+            )
             if _fresh_cloud_mount:
                 if _session.cloud_mount_manager is not None:
                     await _session.cloud_mount_manager.aclose()

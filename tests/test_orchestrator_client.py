@@ -1749,9 +1749,11 @@ class TestGetThreadWorkspace:
             mock_http.get = AsyncMock(return_value=mock_response)
             await client.get_thread_workspace("tid-1")
 
+            # Every poll says this agent attaches to sidecar cloud folders
+            # (D7), so the orchestrator never takes it for an older one.
             mock_http.get.assert_called_once_with(
                 "http://localhost:8085/api/agents/threads/tid-1/workspace",
-                headers=None,
+                headers={"X-SRW-Cloud-Mount-Delivery": "sidecar"},
             )
 
     @pytest.mark.asyncio
@@ -1771,11 +1773,35 @@ class TestGetThreadWorkspace:
         mock_http.get.assert_awaited_once_with(
             "http://localhost:8085/api/agents/threads/tid-1/workspace",
             headers={
+                "X-SRW-Cloud-Mount-Delivery": "sidecar",
                 "X-Agent-ID": client.agent_id,
                 "X-Session-Runtime-Generation": RUNTIME_GENERATION,
                 "X-Session-Runtime-Attach-Token": RUNTIME_ATTACH_TOKEN,
             },
         )
+
+    @pytest.mark.asyncio
+    async def test_reports_sidecar_cloud_mount_state(self, client):
+        mock_response = MagicMock(status_code=200)
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.post = AsyncMock(return_value=mock_response)
+            assert await client.report_cloud_mount_status(
+                "tid-1",
+                fingerprint="f" * 64,
+                mounts=[{"name": "project", "state": "mounted"}],
+            )
+            mock_http.post.side_effect = RuntimeError("down")
+            assert not await client.report_cloud_mount_status(
+                "tid-1", fingerprint="f" * 64, mounts=[]
+            )
+        url, kwargs = mock_http.post.await_args_list[0]
+        assert url == (
+            "http://localhost:8085/api/agents/threads/tid-1/cloud-mount-status",
+        )
+        assert kwargs["json"] == {
+            "fingerprint": "f" * 64,
+            "mounts": [{"name": "project", "state": "mounted"}],
+        }
 
     @pytest.mark.asyncio
     async def test_returns_parsed_json_on_200(self, client):

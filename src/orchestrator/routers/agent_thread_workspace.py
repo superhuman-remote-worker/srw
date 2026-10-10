@@ -12,10 +12,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 
 from orchestrator.services import cloud_mount_status, thread_workspace_delivery
-from orchestrator.services.cloud_mount_sidecar import DELIVERY_HEADER
+from orchestrator.services.cloud_mount_sidecar import (
+    DELIVERY_HEADER,
+    recorded_sidecar_plan,
+)
+from orchestrator.services.stateless_workspace_gate import thread_metadata_object
 
 # No `tags=`: the declaration this replaces carried none, and a tag would
 # change the published OpenAPI operation for a route whose identity this
@@ -72,4 +76,55 @@ async def agent_get_thread_workspace(
     return payload
 
 
-__all__ = ["agent_get_thread_workspace", "get_thread_workspace_dependencies", "router"]
+@router.post("/api/agents/threads/{thread_id}/cloud-mount-status")
+async def agent_report_cloud_mount_status(
+    request: Request, thread_id: str
+) -> dict[str, Any]:
+    """The agent reports the state of the cloud folders its workspace Pod's
+    sidecars mounted (connector drivers D7). **Internal** (P4b) — requires
+    ``X-Internal-Key``. Ingress strips this path.
+
+    Kept only for the plan the thread's current Pod records (the report names
+    its fingerprint), checked against that plan and the closed state and
+    reason sets; a report about another Pod's plan is a 409. Nothing here is
+    a credential or a remote's own words.
+    """
+    dependencies = get_thread_workspace_dependencies(request)
+    await dependencies.require_internal(request)
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=422, detail="body must be JSON") from None
+    if not isinstance(body, dict) or not isinstance(body.get("fingerprint"), str):
+        raise HTTPException(status_code=422, detail="fingerprint is required")
+    thread = await dependencies.store.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="thread not found")
+    recorded = recorded_sidecar_plan(thread_metadata_object(thread))
+    if recorded is None or recorded.get("fingerprint") != body["fingerprint"]:
+        raise HTTPException(
+            status_code=409, detail="the report is not about this thread's Pod"
+        )
+    try:
+        entries = cloud_mount_status.report_entries(recorded, body.get("mounts"))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    recorded_ok = await cloud_mount_status.record_report(
+        dependencies.store,
+        thread_id,
+        fingerprint=body["fingerprint"],
+        entries=entries,
+    )
+    if not recorded_ok:
+        raise HTTPException(
+            status_code=409, detail="the report is not about this thread's Pod"
+        )
+    return {"ok": True}
+
+
+__all__ = [
+    "agent_get_thread_workspace",
+    "agent_report_cloud_mount_status",
+    "get_thread_workspace_dependencies",
+    "router",
+]

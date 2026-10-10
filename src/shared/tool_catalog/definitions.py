@@ -1400,7 +1400,7 @@ SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         # wanted "shell commands on" from silently acquiring a cloud-mount
         # reporter that happens to share the category.
         "grant": "code",
-        "gate": "cloud_mount_manager.active",
+        "gate": "cloud_mount_manager.active, or sidecar cloud folders attached",
     },
 }
 

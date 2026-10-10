@@ -122,6 +122,7 @@ POST   /api/agents/threads/{thread_id}/cloud-diff/apply                         
 POST   /api/agents/threads/{thread_id}/cloud-diff/reject                                pat=chat:write      gated:require_thread_owner
 POST   /api/agents/threads/{thread_id}/cloud-diff/restage                               pat=chat:write      gated:require_thread_owner
 GET    /api/agents/threads/{thread_id}/cloud-diff/{file_path:path}                      pat=chat:read       gated:require_thread_owner
+POST   /api/agents/threads/{thread_id}/cloud-mount-status                               pat=refused         internal:require_internal
 POST   /api/agents/threads/{thread_id}/cloud-stage                                      pat=refused         internal:require_internal
 PATCH  /api/agents/threads/{thread_id}/config                                           pat=refused         internal:require_internal
 GET    /api/agents/threads/{thread_id}/lifecycle                                        pat=refused         internal:require_internal

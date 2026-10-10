@@ -368,6 +368,7 @@ async def retire_stateless_workspace_residents(
     """Drain every workspace-resident writer while the remote record is active T."""
 
     from shared.runtime.services.cloud_mount import RcloneMountManager
+    from shared.runtime.services.cloud_mount.sidecar import SidecarMountWatcher
     from shared.runtime.services.cloud_overlay import OverlayMountManager
 
     authority = resolve_shell_retirement_authority(
@@ -401,13 +402,27 @@ async def retire_stateless_workspace_residents(
                     workspace_root="/home/agent-host/workspace",
                 )
                 counters.update(await overlay.retire_existing())
-            mount_manager = RcloneMountManager(
-                thread_id=authority.thread_id,
-                cloud_cfg=dict(cloud_mount_cfg),
-                workspace_backend=backend,
-                workspace_root="/home/agent-host/workspace",
-            )
-            counters.update(await mount_manager.retire_existing(drain=True))
+            if cloud_mount_cfg.get("delivery") == "sidecar":
+                # The Pod's sidecars own the folders (D7): nothing of the
+                # session runs in the workspace, but its writes must still
+                # reach the cloud while T is active, so ask for the flush
+                # and require it when a mounted folder has uploads pending.
+                watcher = SidecarMountWatcher(
+                    thread_id=authority.thread_id,
+                    cloud_cfg=dict(cloud_mount_cfg),
+                    workspace_backend=backend,
+                    workspace_root="/home/agent-host/workspace",
+                    terminal=True,
+                )
+                counters.update(await watcher.retire_existing(drain=True))
+            else:
+                mount_manager = RcloneMountManager(
+                    thread_id=authority.thread_id,
+                    cloud_cfg=dict(cloud_mount_cfg),
+                    workspace_backend=backend,
+                    workspace_root="/home/agent-host/workspace",
+                )
+                counters.update(await mount_manager.retire_existing(drain=True))
         await asyncio.to_thread(
             backend.exec_terminal_claim_resource,
             _resident_zero_command(authority.thread_id)
@@ -464,6 +479,8 @@ async def verify_stateless_workspace_residents_retired(
                     overlay._terminal_zero_script(),
                     30,
                 )
+        if cloud_mount_cfg and cloud_mount_cfg.get("delivery") != "sidecar":
+            # A sidecar Pod's folders have no workspace resident to re-prove.
             mount_manager = RcloneMountManager(
                 thread_id=authority.thread_id,
                 cloud_cfg=dict(cloud_mount_cfg),

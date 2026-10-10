@@ -430,3 +430,59 @@ async def test_the_state_merges_only_into_the_same_plan_on_postgres(db):
             await conn.fetchval("SELECT metadata FROM threads WHERE id=$1", thread_id)
         )
     assert "cloud_mount_status" not in metadata and metadata["keep"] == 1
+
+
+class _Request:
+    def __init__(self, body, store) -> None:
+        self._body = body
+        self.headers = {}
+        dependencies = SimpleNamespace(require_internal=AsyncMock(), store=store)
+        self.app = SimpleNamespace(
+            state=SimpleNamespace(
+                thread_workspace_delivery_dependencies_factory=lambda: dependencies
+            )
+        )
+
+    async def json(self):
+        if isinstance(self._body, Exception):
+            raise self._body
+        return self._body
+
+
+@pytest.mark.asyncio
+async def test_the_agents_report_is_kept_only_for_this_pods_plan():
+    from fastapi import HTTPException
+
+    from orchestrator.routers.agent_thread_workspace import (
+        agent_report_cloud_mount_status,
+    )
+
+    merges: list[dict] = []
+
+    class _Store:
+        async def get_thread(self, thread_id):
+            return {"id": thread_id, "metadata": _metadata()}
+
+        async def merge_thread_cloud_mount_status(self, thread_id, **kwargs):
+            merges.append(kwargs)
+            return True
+
+    fingerprint = _plan().recorded()["fingerprint"]
+    good = {
+        "fingerprint": fingerprint,
+        "mounts": [{"name": "project", "state": "unavailable", "reason": "timeout"}],
+    }
+    assert await agent_report_cloud_mount_status(
+        _Request(good, _Store()), THREAD_ID
+    ) == {"ok": True}
+    assert merges[0]["mounts"]["project"]["reason"] == "timeout"
+    for body, status in (
+        ({**good, "fingerprint": "0" * 64}, 409),
+        ({**good, "mounts": [{"name": "project", "state": "exploded"}]}, 422),
+        ({"mounts": []}, 422),
+        (ValueError("not json"), 422),
+    ):
+        with pytest.raises(HTTPException) as refused:
+            await agent_report_cloud_mount_status(_Request(body, _Store()), THREAD_ID)
+        assert refused.value.status_code == status
+    assert len(merges) == 1

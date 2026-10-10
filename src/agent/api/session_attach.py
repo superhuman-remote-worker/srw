@@ -451,6 +451,13 @@ class PoolAttachAdmission:
     body: dict[str, Any]
 
 
+def cloud_mount_payload(workspace: dict[str, Any]) -> dict[str, Any] | None:
+    """The cloud mount config a workspace payload carries: the in-workspace
+    ``cloud_mount``, or the ``cloud_mount_sidecar`` of a Pod whose folders its
+    sidecars mounted (connector drivers D7)."""
+    return workspace.get("cloud_mount") or workspace.get("cloud_mount_sidecar")
+
+
 class SessionAttachCoordinator:
     """Attach sequence, failed-attach cleanup, release receipts and the pool
     admission claim of one runtime."""
@@ -565,6 +572,28 @@ class SessionAttachCoordinator:
             if outcome is ending:
                 raise
             raise outcome from ending
+
+    async def _report_sidecar_mounts(
+        self, watcher: Any, report: list[dict[str, Any]]
+    ) -> None:
+        """Publish the sidecar cloud folders' state (D7): a cockpit event,
+        and the orchestrator's record for the Pod's plan. Never raises."""
+        self._ports.broadcast(
+            "cloud_mount.status",
+            {"mounts": report, "excluded": list(watcher.excluded)},
+        )
+        thread_id = self._identity.thread_id
+        report_status = getattr(self._client, "report_cloud_mount_status", None)
+        if not (thread_id and watcher.fingerprint and callable(report_status)):
+            return
+        try:
+            await report_status(
+                str(thread_id), fingerprint=watcher.fingerprint, mounts=report
+            )
+        except Exception as exc:
+            self._logger.warning(
+                "Could not report the cloud folders' state: %s", type(exc).__name__
+            )
 
     async def _poll_workspace(self, thread_id: str, **kwargs: Any) -> Any:
         """The readiness poll of this attach, fenced by the ending refusal."""
@@ -1160,7 +1189,7 @@ class SessionAttachCoordinator:
         if not project_ids:
             project_ids = (workspace_override or {}).get("project_ids") or []
         cloud_mount_cfg = (
-            workspace_override.get("cloud_mount") if workspace_override else None
+            cloud_mount_payload(workspace_override) if workspace_override else None
         )
         # Protected state is an exact three-way contract.  Always perform a fresh
         # fetch before constructing PersistentSession: an engage can be revoked or
@@ -1230,7 +1259,7 @@ class SessionAttachCoordinator:
                                 "protected workspace identity changed before setup"
                             )
                     elif not cloud_mount_cfg:
-                        cloud_mount_cfg = ws_info.get("cloud_mount")
+                        cloud_mount_cfg = cloud_mount_payload(ws_info)
                 elif protected_cloud:
                     raise ProtectedCloudUnavailable(
                         "protected-cloud workspace authority is unavailable"
@@ -2002,6 +2031,16 @@ class SessionAttachCoordinator:
                 "cloud_mount.error",
                 {"message": self._session.cloud_mount_error, "degraded": True},
             )
+        sidecar_mounts = self._session.cloud_mount_manager
+        if getattr(type(sidecar_mounts), "delivery", None) == "sidecar":
+            # Folders the Pod's sidecars own (D7): tell the cockpit and the
+            # orchestrator each one's state, and keep a pinned session's view
+            # live (a stateless session reports again on its next claim).
+            await self._report_sidecar_mounts(sidecar_mounts, sidecar_mounts.report())
+            if not self._ports.stateless_mode():
+                sidecar_mounts.start_monitor(
+                    lambda report: self._report_sidecar_mounts(sidecar_mounts, report)
+                )
 
         # Restore deliberately excludes persisted-but-unadmitted delivery rows:
         # they are executable inbox work, not passive conversation context. Claim

@@ -352,6 +352,16 @@ def create_shell_tools(
         """
         manager = _cloud_mount_manager(context)
         if manager is None:
+            # Folders the workspace's sidecars own (D7) report even when
+            # none of them mounted: that is when the agent needs the reason.
+            cloud_mount_cfg = context.get_config("cloud_mount", {})
+            candidate = (
+                cloud_mount_cfg.get("_manager")
+                if isinstance(cloud_mount_cfg, dict)
+                else None
+            )
+            if getattr(type(candidate), "delivery", None) == "sidecar":
+                return candidate.status()
             return "No active rclone cloud mount for this session."
         return manager.status()
 

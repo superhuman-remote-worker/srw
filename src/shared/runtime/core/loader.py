@@ -5601,6 +5601,42 @@ def append_expert_workflow_addendum(body: str, addendum: str) -> str:
     return f"{body.rstrip()}\n\n{addendum}\n"
 
 
+def cloud_mount_system_floor(unavailable: Any) -> str:
+    """Return what the agent must know about cloud folders that did not
+    mount, or "".
+
+    A mount that does not come up never blocks the workspace (connector
+    drivers D7, decision 23): the session starts, and the agent is told here,
+    at trusted system altitude, which folder is missing and why, so it never
+    says work is saved where nothing is mounted. ``unavailable`` comes from
+    the session's sidecar mount watcher: rows of ``name`` (empty for a folder
+    that was not attached at all) and plain ``text`` derived from a closed
+    reason code, never a remote's own words.
+    """
+    rows = [
+        row
+        for row in (unavailable or [])
+        if isinstance(row, dict) and isinstance(row.get("text"), str)
+    ]
+    if not rows:
+        return ""
+    lines = ["<cloud_folders>", "Some cloud folders of this session are not available:"]
+    for row in rows:
+        name = str(row.get("name") or "")
+        if name:
+            lines.append(f"- workspace/cloud/{name}: {row['text']}.")
+        else:
+            lines.append(f"- a cloud folder was not attached: {row['text']}.")
+    lines.append(
+        "Never say a file is saved to the cloud in a folder that is not "
+        "available. Tell the user plainly what is missing if their request "
+        "needs it; srw_cloud_status shows the current state, and the user can "
+        "start a new session once the folder is fixed."
+    )
+    lines.append("</cloud_folders>")
+    return "\n".join(lines)
+
+
 def scheduled_work_system_floor(
     tool_names: "set[str] | frozenset[str] | list[str] | tuple[str, ...] | None",
 ) -> str:
@@ -5904,6 +5940,14 @@ def get_phase_system_prompt(
         )
         if delegation_floor:
             rendered = f"{rendered}\n\n{delegation_floor}"
+
+        # Cloud folders this session's workspace could not mount (D7). Empty
+        # for every session whose folders all came up.
+        cloud_floor = cloud_mount_system_floor(
+            config.extra.get("_cloud_mounts_unavailable")
+        )
+        if cloud_floor:
+            rendered = f"{rendered}\n\n{cloud_floor}"
 
         # Stamped before the product-guide floor so the floor stays the tail.
         # persistent_graph rewrites this line in place on later turns.

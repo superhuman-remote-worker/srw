@@ -1099,6 +1099,9 @@ class PersistentSession:
                     "cloud mount requires an attached workspace"
                 )
             return
+        if cloud_mount_cfg.get("delivery") == "sidecar":
+            await self._setup_sidecar_cloud_mount(cloud_mount_cfg)
+            return
         from shared.runtime.services.cloud_mount import (
             RcloneMountCleanFailure,
             RcloneMountManager,
@@ -1265,6 +1268,54 @@ class PersistentSession:
             raise WorkspaceUnavailableError(
                 "protected-cloud lower and capture overlay are not both active"
             )
+
+    async def _setup_sidecar_cloud_mount(self, cloud_mount_cfg: Dict[str, Any]) -> None:
+        """Attach to the cloud folders the Pod's sidecars mounted (D7).
+
+        Nothing is started here: the folders were mounted when the Pod was
+        created. The watcher waits, bounded, for each to settle, links the
+        mounted ones into workspace/cloud, and keeps what did not come up
+        (with its reason) for the prompt and srw_cloud_status. A folder that
+        did not mount never fails the attach.
+        """
+        from shared.runtime.services.cloud_mount.sidecar import SidecarMountWatcher
+
+        watcher = SidecarMountWatcher(
+            thread_id=self.thread_id,
+            cloud_cfg=cloud_mount_cfg,
+            workspace_backend=self.workspace_manager.backend,
+            workspace_root=self.workspace_manager.path,
+        )
+        try:
+            await watcher.start_all()
+        except Exception as e:
+            if self.shell_owner_token is not None and not watcher.planned:
+                raise
+            # The folders may well be mounted; the session goes on without
+            # links or a fresh state read rather than without its workspace.
+            self.cloud_mount_error = f"cloud folders: {type(e).__name__}"
+            logger.warning("Could not attach to the sidecar cloud folders: %s", e)
+        self.cloud_mount_manager = watcher
+        unavailable = watcher.unavailable()
+        if unavailable:
+            self.cloud_mount_error = "; ".join(
+                f"{row['name'] or 'a folder'}: {row['text']}" for row in unavailable
+            )
+            if _dc_is_dataclass(self.config) and hasattr(self.config, "extra"):
+                # A copy, never an in-place write: the config may be the
+                # pod-wide singleton a later session reuses.
+                self.config = _dc_replace(
+                    self.config,
+                    extra={
+                        **self.config.extra,
+                        "_cloud_mounts_unavailable": unavailable,
+                    },
+                )
+        logger.info(
+            "Sidecar cloud folders: %d mounted, %d unavailable",
+            len(watcher.mounts),
+            len(unavailable),
+        )
 
     @staticmethod
     def _protected_cloud_config_valid(payload: Any) -> bool:
@@ -2788,7 +2839,12 @@ class PersistentSession:
         if not _canvas_enabled(self.config):
             tool_names = [name for name in tool_names if name not in canvas_tools]
 
-        if self.cloud_mount_manager and self.cloud_mount_manager.active:
+        # Also for sidecar folders that did not mount: the tool is how the
+        # agent learns why (D7).
+        if self.cloud_mount_manager is not None and (
+            self.cloud_mount_manager.active
+            or getattr(type(self.cloud_mount_manager), "delivery", None) == "sidecar"
+        ):
             if "srw_cloud_status" not in tool_names:
                 tool_names.append("srw_cloud_status")
 
