@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from shared.connectors.builtin import legacy_types_with_form, spec_for_type
+from shared.connectors.builtin import legacy_types_with_form
 from shared.connectors.env_names import connector_env_problem, env_value_problem
 
 #: Stored types whose driver delivers an environment file to the workspace.
@@ -70,35 +70,9 @@ def split_credential_env(
     return values, refused
 
 
-def collect_credential_env(datasources: list[dict[str, Any]]) -> dict[str, str]:
-    """Collect one unambiguous environment for the current work item."""
-    result: dict[str, str] = {}
-    for ds in datasources:
-        if ds.get("type") not in ENV_CONNECTOR_TYPES:
-            continue
-        values = normalize_credential_env(
-            (ds.get("credentials") or {}).get("env_vars", {}),
-            required=_env_vars_required(ds.get("type")),
-        )
-        for name, secret in values.items():
-            if name in result:
-                raise ValueError(f"Multiple attached connectors define {name}")
-            result[name] = secret
-    return result
-
-
-def _env_vars_required(ds_type: Any) -> bool:
-    """Whether the type's driver requires its environment slot (credentials)."""
-    spec = spec_for_type(ds_type)
-    return spec is not None and any(
-        slot.name == "env_vars" and slot.required for slot in spec.credential_slots
-    )
-
-
 __all__ = [
     "ENV_CONNECTOR_TYPES",
     "CredentialConnectorAttachedError",
-    "collect_credential_env",
     "normalize_credential_env",
     "split_credential_env",
 ]

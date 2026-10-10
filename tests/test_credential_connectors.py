@@ -13,7 +13,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from shared.credential_connectors import (
-    collect_credential_env,
     normalize_credential_env,
     split_credential_env,
 )
@@ -74,9 +73,17 @@ def test_a_stored_set_splits_into_what_is_delivered_and_what_is_refused():
         split_credential_env({"VENDOR_TOKEN": 3})
 
 
+def _environment(entries):
+    """What the environment materializer installs for a payload."""
+    from agent.connectors import deliveries_from_payload
+    from agent.connectors.env import credential_environment
+
+    return credential_environment(deliveries_from_payload(entries))
+
+
 def test_conflicting_connector_names_are_rejected():
     with pytest.raises(ValueError, match="Multiple attached connectors"):
-        collect_credential_env(
+        _environment(
             [
                 {
                     "type": "credentials",
@@ -92,14 +99,12 @@ def test_a_credentials_connector_without_variables_is_refused(env_vars):
     """The credentials spec's env_vars slot is required; generic's is not."""
     credentials = {} if env_vars is None else {"env_vars": env_vars}
     with pytest.raises(ValueError, match="Add at least one credential"):
-        collect_credential_env([{"type": "credentials", "credentials": credentials}])
-    assert (
-        collect_credential_env([{"type": "generic", "credentials": credentials}]) == {}
-    )
+        _environment([{"type": "credentials", "credentials": credentials}])
+    assert _environment([{"type": "generic", "credentials": credentials}]) == {}
 
 
 def test_only_env_connectors_contribute_variables():
-    assert collect_credential_env(
+    assert _environment(
         [
             {"type": "generic", "credentials": {"env_vars": {"A": "1"}}},
             {"type": "credentials", "credentials": {"env_vars": {"B": "2"}}},
@@ -154,7 +159,8 @@ def test_a_detached_driver_s_variables_are_unset_for_new_commands(
     tmp_path, monkeypatch
 ):
     """A registered image driver detached live (D6): its names are unset in
-    the work item's environment file; the others stay, and a reserved name is
+    the work item's environment file; the others stay, and a name no
+    connector may set (reserved, or a code hook the image may set itself) is
     never touched."""
     backend = RemoteBackend(host="unused", job_id="job-detach")
     monkeypatch.setattr(backend, "_init_shell", lambda: None)
@@ -170,13 +176,13 @@ def test_a_detached_driver_s_variables_are_unset_for_new_commands(
 
     monkeypatch.setattr(backend, "execute_claim_resource_with_secret_stdin", send)
     backend.install_credential_environment({"ACME_TOKEN": "minted", "KEEP": "k"})
-    backend.unset_credential_environment(["ACME_TOKEN", "PATH"])
+    backend.unset_credential_environment(["ACME_TOKEN", "PATH", "NODE_OPTIONS"])
     assert sent[-1] == {"ACME_TOKEN": None}
     assert _read_vars(Path(backend._credential_env_path), ["ACME_TOKEN", "KEEP"]) == {
         "ACME_TOKEN": None,
         "KEEP": "k",
     }
-    backend.unset_credential_environment(["PATH"])
+    backend.unset_credential_environment(["PATH", "NODE_OPTIONS", "DEBIAN_FRONTEND"])
     assert len(sent) == 2  # nothing to unset: no command
 
 
@@ -307,7 +313,7 @@ def test_the_environment_materializer_installs_every_env_connector():
     ],
 )
 def test_the_environment_materializer_keeps_the_delivery_errors(entries, message):
-    """The same refusals collect_credential_env gave, at delivery time."""
+    """The refusals a delivery keeps: what no delivery can take."""
     from agent.connectors import deliveries_from_payload
     from agent.connectors.env import credential_environment
 
@@ -357,11 +363,25 @@ def test_a_row_saved_before_the_rule_is_delivered_without_a_refused_name(kind, c
     text = "\n".join(facts.lines)
     assert "Environment: `VENDOR_TOKEN`" in text
     assert (
-        "Not set: NODE_OPTIONS is not a variable a connector may set: tools "
-        "read it to run code or load their config" in text
+        "  NODE_OPTIONS is not a variable a connector may set: tools read it to "
+        "run code or load their config; not delivered by SRW (a value set by an "
+        "earlier delivery stays until the work ends)" in facts.lines
     )
-    assert "Not set: Environment name PATH is reserved by the workspace" in text
+    assert (
+        "  Environment name PATH is reserved by the workspace; not delivered by "
+        "SRW (a value set by an earlier delivery stays until the work ends)"
+        in facts.lines
+    )
     assert "synthetic-value" not in text
+
+
+def test_the_readme_reads_no_variables_from_an_unreadable_set():
+    from agent.connectors import deliveries_from_payload
+    from agent.connectors.env import EnvFileMaterializer
+
+    entries = [{"type": "generic", "name": "Odd", "credentials": {"env_vars": ["X"]}}]
+    (facts,) = EnvFileMaterializer().facts(deliveries_from_payload(entries), None)
+    assert facts.lines == ["- **Odd** (generic) — CLI via env vars"]
 
 
 def _browser_executor():

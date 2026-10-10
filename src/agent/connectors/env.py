@@ -9,13 +9,16 @@ A name no connector may set (``shared.connectors.env_names``: an SRW
 reserved name or a known code hook) is refused when a connector is saved. A
 row saved before that rule is delivered without it: the variable is
 skipped, logged and named in the README with the reason, as a credential
-file outside the allowlist is (``agent.connectors.files``).
+file outside the allowlist is (``agent.connectors.files``). A value an
+earlier delivery installed stays in the work item's environment until the
+work ends: installs merge, and SRW never unsets a name it did not set
+(``shared.runtime.core.credential_env``).
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from agent.connectors.base import (
@@ -126,7 +129,9 @@ class EnvFileMaterializer:
                 f"— {cli}{read_only_note(ds)}"
             ]
             variables = (ds.get("credentials") or {}).get("env_vars", {})
-            refused = {key: connector_env_problem(key) for key in variables or ()}
+            if not isinstance(variables, Mapping):
+                variables = {}
+            refused = {key: connector_env_problem(key) for key in variables}
             delivered = [key for key, why in refused.items() if why is None]
             if delivered:
                 lines.append(
@@ -137,6 +142,11 @@ class EnvFileMaterializer:
                     'use browser_type(ref=..., env_var="VARIABLE_NAME"). '
                     "Avoid printing credentials or writing literal values into scripts."
                 )
-            lines += [f"  Not set: {why}" for why in refused.values() if why]
+            lines += [
+                f"  {why}; not delivered by SRW (a value set by an earlier "
+                "delivery stays until the work ends)"
+                for why in refused.values()
+                if why
+            ]
             out.append(FactsLines("Other", delivery.index, lines))
         return out

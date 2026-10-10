@@ -16,8 +16,10 @@ It does not decide what a file *says*. Several allowed formats run a command
 by design when their CLI is used: a kubeconfig ``exec`` credential plugin, an
 AWS ``credential_process``, a Docker or Helm registry ``credsStore`` /
 ``credHelpers`` (a ``docker-credential-<name>`` program on ``PATH``), an Azure
-CLI ``extension.dev_sources`` directory. Whether a shared connector may carry
-such content is a trust decision about the connector, not a location rule.
+CLI ``extension.dev_sources`` directory, a ``.netrc`` ``macdef`` (ftp runs
+the ``init`` macro, shell escapes included, on login). Whether a shared
+connector may carry such content is a trust decision about the connector,
+not a location rule.
 What this module does guarantee: no file lands executable, on ``PATH``, in a
 start-up or plugin directory, or where another tool's config would make it
 code.
