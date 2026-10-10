@@ -50518,7 +50518,7 @@ class PostgresDB:
             created_by: Owner user UUID
             is_global: Whether this datasource is visible to all users
             read_only: The creator's read-only tag (no write tools for anyone)
-                       (None = not applicable; declarative only)
+                       (None = never chosen: read-only once published)
             config: Non-secret type-specific configuration
             scope_mode: Availability upper bound (``all`` or ``projects``)
             auto_attach: Creator-owned creation-time default

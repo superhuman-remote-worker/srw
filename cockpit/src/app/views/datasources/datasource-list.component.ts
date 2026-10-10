@@ -1524,6 +1524,10 @@ type KeyValueRow = {key: string; value: string};
                           <app-badge class="ds-scope-inline" tone="warning" size="xs">
                             {{ 'datasources.table.badgeRw' | transloco }}
                           </app-badge>
+                        } @else if (isPrivateReadOnly(ds)) {
+                          <app-badge class="ds-scope-inline" tone="info" size="xs" data-creator-read-only>
+                            {{ 'datasources.table.badgeRo' | transloco }}
+                          </app-badge>
                         }
                         @if (capabilities.datasourceScopeAutoAttachAvailable()) {
                           <app-badge class="ds-scope-inline" [tone]="availabilityTone(ds)" size="xs">
@@ -1545,6 +1549,10 @@ type KeyValueRow = {key: string; value: string};
                       @if (ds.is_global && isPublicReadWrite(ds)) {
                         <app-badge tone="warning" size="xs">
                           {{ 'datasources.table.badgeRw' | transloco }}
+                        </app-badge>
+                      } @else if (isPrivateReadOnly(ds)) {
+                        <app-badge tone="info" size="xs" data-creator-read-only>
+                          {{ 'datasources.table.badgeRo' | transloco }}
                         </app-badge>
                       }
                     </td>
@@ -2650,9 +2658,10 @@ export class DatasourceListComponent implements OnInit {
   }
 
   /** Whether the form shows the creator's read-only tag: for every type
-   *  whose driver offers a level, but email, whose tier choice is its own. */
+   *  whose driver offers a level, but email, whose tier choice is its own,
+   *  and a project's native KB, which its agents write with kb_write. */
   showsAccessChoice(): boolean {
-    if (this.formData.type === 'email') return false;
+    if (this.formData.type === 'email' || this.isNativeProjectConnector()) return false;
     return this.offersReadOnly() || this.offersReadWrite();
   }
 
@@ -2702,6 +2711,13 @@ export class DatasourceListComponent implements OnInit {
   /** Whether a listed public connector reads as read-write. */
   isPublicReadWrite(ds: Datasource): boolean {
     return publicReadWrite(ds, this.connectorDrivers.forType(ds.type));
+  }
+
+  /** Whether a listed private connector carries its creator's read-only
+   *  tag, so its owner sees what every user's agents get. Not for a driver
+   *  with one read-write level, which binds every tool whatever the flag. */
+  isPrivateReadOnly(ds: Datasource): boolean {
+    return !ds.is_global && ds.read_only === true && !this.isPublicReadWrite(ds);
   }
 
   hasBespokeForm(): boolean {

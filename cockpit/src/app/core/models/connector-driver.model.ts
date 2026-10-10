@@ -212,10 +212,12 @@ export function offeredAccess(driver: ConnectorDriver | null | undefined): Offer
 }
 
 /**
- * Whether a public connector reads as read-write: its declared flag, unless
- * its driver offers one level only — an MCP server binds every tool it lists
- * whatever the flag says, and a KB is read-only whatever it says. Rows
- * stored before the matrix keep their flag; nothing is migrated.
+ * Whether a public connector reads as read-write by its creator's read-only
+ * tag: only when the tag is explicitly off (a public connector with no tag
+ * set is read-only), unless its driver offers one level only — an MCP server
+ * binds every tool it lists whatever the flag says, and a KB is read-only
+ * whatever it says. Rows stored before the matrix keep their flag; nothing
+ * is migrated.
  */
 export function publicReadWrite(
   row: {read_only?: boolean | null},

@@ -10,7 +10,10 @@ import {
   DatasourcesGroupComponent,
 } from './datasources-group.component';
 import {DatasourceType, EligibleDatasource} from '../../core/models/api.model';
-import {ConnectorDriverMatrix} from '../../core/models/connector-driver.model';
+import {
+  ConnectorDriverMatrix,
+  driverForType,
+} from '../../core/models/connector-driver.model';
 // The API's own capability matrix for the built-in drivers.
 import driversFixture from '../../core/models/fixtures/connector-drivers.json';
 
@@ -194,6 +197,34 @@ describe('datasources-group selection logic', () => {
   it('keeps the fallback copy for a type the matrix does not list', () => {
     expect(requiresShellWorkspace('repository', [])).toBe(true);
     expect(requiresShellWorkspace('kb', null)).toBe(false);
+  });
+});
+
+describe("datasources-group the creator's read-only tag", () => {
+  function picker(): DatasourcesGroupComponent {
+    const component = Object.create(DatasourcesGroupComponent.prototype);
+    component.connectorDrivers = {
+      forType: (type: string) => driverForType(BUILTIN_DRIVERS, type),
+    };
+    return component;
+  }
+
+  it('badges a private row its creator tagged read-only', () => {
+    const component = picker();
+    const row = (type: string, over: Partial<EligibleDatasource>) => ({
+      ...makeDs('ds', type),
+      ...over,
+    });
+    // Every user's agents get its read tools only (decision 31).
+    expect(component.isPrivateReadOnly(row('postgresql', {read_only: true}))).toBe(true);
+    expect(component.isPrivateReadOnly(row('postgresql', {read_only: false}))).toBe(false);
+    expect(component.isPrivateReadOnly(row('postgresql', {read_only: null}))).toBe(false);
+    // A public row keeps its own badge.
+    expect(
+      component.isPrivateReadOnly(row('postgresql', {read_only: true, is_global: true})),
+    ).toBe(false);
+    // An MCP server binds every tool it lists, whatever the flag says.
+    expect(component.isPrivateReadOnly(row('mcp', {read_only: true}))).toBe(false);
   });
 });
 

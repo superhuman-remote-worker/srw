@@ -84,12 +84,27 @@ describe('DatasourcesGroupComponent public access badge', () => {
     });
   });
 
-  it('reads the stored flag until the matrix loads, and loads it only for public rows', () => {
+  it('reads the stored flag until the matrix loads, and loads it only for rows it badges', () => {
     const {fixture} = mount([ds('mcp', 'mcp', true)], null);
     expect(badges(fixture)).toEqual({mcp: en.datasources.table.badgeRo});
     TestBed.resetTestingModule();
-    const {service} = mount([ds('pg', 'postgresql', true, false)], null);
+    // A private row never tagged needs no access badge, so no matrix.
+    const {service} = mount([ds('pg', 'postgresql', false, false)], null);
     expect(service.load).not.toHaveBeenCalled();
+  });
+
+  it("badges a private row its creator tagged read-only, so its owner sees it", () => {
+    const rows = [
+      ds('pg-ro', 'postgresql', true, false),
+      ds('pg', 'postgresql', false, false),
+      // An MCP server binds every tool it lists whatever the flag says.
+      ds('mcp', 'mcp', true, false),
+    ];
+    const {fixture, service} = mount(rows, DRIVERS);
+    expect(service.load).toHaveBeenCalled();
+    expect(badges(fixture)).toEqual({'pg-ro': en.datasources.table.badgeRo, pg: '', mcp: ''});
+    const tagged = (fixture.nativeElement as HTMLElement).querySelectorAll('[data-creator-read-only]');
+    expect(tagged.length).toBe(1);
   });
 });
 

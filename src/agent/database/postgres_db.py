@@ -3251,6 +3251,7 @@ class JobsNamespace:
             forge_web_url_matches_connector,
             parse_owner_repo,
         )
+        from shared.connectors.contract import bound_read_only
         from shared.deliverable_contract import normalize_repository_identity
 
         async with self.db.acquire() as conn:
@@ -3260,6 +3261,7 @@ class JobsNamespace:
                     SELECT datasource.connection_url,
                            datasource.config,
                            datasource.read_only,
+                           datasource.is_global,
                            datasource.policy_revision,
                            contract.pr_repositories,
                            contract.pr_bindings,
@@ -3285,11 +3287,18 @@ class JobsNamespace:
                     job_id,
                     datasource_id,
                 )
+                # Bound read-only (its project link or its creator's tag, a
+                # public one with no mode set included): no PR authority.
                 if (
                     row is None
                     or row["job_status"] != "processing"
-                    or row["read_only"]
-                    or row["project_read_only"]
+                    or bound_read_only(
+                        {
+                            "read_only": row["read_only"],
+                            "is_global": row["is_global"],
+                            "project_read_only": row["project_read_only"],
+                        }
+                    )
                 ):
                     return False
                 try:

@@ -268,6 +268,10 @@ export function allDatasourcesSelected(
                     ? 'datasources.table.badgeRw'
                     : 'datasources.table.badgeRo') | transloco }}
                 </span>
+              } @else if (isPrivateReadOnly(ds)) {
+                <span class="ds-type-badge" data-creator-read-only>
+                  {{ 'datasources.table.badgeRo' | transloco }}
+                </span>
               }
             </label>
           }
@@ -538,7 +542,8 @@ export function allDatasourcesSelected(
 export class DatasourcesGroupComponent {
   // Optional so the picker still renders in bare unit tests without an injector.
   private readonly api = inject(ApiService, {optional: true});
-  // The capability matrix, for the access badge of public connectors only.
+  // The capability matrix, for the access badge of public and read-only
+  // tagged connectors.
   private readonly connectorDrivers = inject(ConnectorDriversService, {optional: true});
 
   datasources = input<Datasource[]>([]);
@@ -604,11 +609,14 @@ export class DatasourcesGroupComponent {
         if (ds.type === 'kb') this.loadIndexStatus(ds.id);
       }
     });
-    // The matrix decides a public row's badge and, on a lite backend, which
-    // rows need a shell; read it once, when either shows.
+    // The matrix decides a public or read-only-tagged row's badge and, on a
+    // lite backend, which rows need a shell; read it once, when either shows.
     effect(() => {
       const rows = this.datasources();
-      if (rows.some((ds) => ds.is_global) || (this.isLiteBackend() && rows.length > 0)) {
+      if (
+        rows.some((ds) => ds.is_global || ds.read_only === true) ||
+        (this.isLiteBackend() && rows.length > 0)
+      ) {
         this.connectorDrivers?.load();
       }
     });
@@ -623,6 +631,13 @@ export class DatasourcesGroupComponent {
    *  level only (an MCP server binds every tool it lists). */
   isPublicReadWrite(ds: Datasource): boolean {
     return publicReadWrite(ds, this.connectorDrivers?.forType(ds.type));
+  }
+
+  /** A private row its creator tagged read-only: every user's agents get
+   *  its read tools only (decision 31). Not for a driver with one
+   *  read-write level, which binds every tool whatever the flag says. */
+  isPrivateReadOnly(ds: Datasource): boolean {
+    return !ds.is_global && ds.read_only === true && !this.isPublicReadWrite(ds);
   }
 
   readonly modifiedCount = computed(() =>

@@ -2758,7 +2758,8 @@ class AsyncCockpitClient:
             default_branch: Branch to clone (repository type)
             config: Non-secret type-specific configuration
             is_global: Publish for all users (capability-gated)
-            read_only: Declarative public/project access hint
+            read_only: The creator's read-only tag: agents get no write tools
+                for this connector, for everyone who uses it
             scope_mode: ``all`` for every otherwise-authorized work context,
                 or ``projects`` to restrict availability to project_ids
             project_ids: Full initial project scope. Omit for all-scope

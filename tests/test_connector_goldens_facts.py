@@ -118,8 +118,9 @@ README_CASES: dict[str, ReadmeCase] = {
         ],
     ),
     # The creator's read-only tag reaches the agent as ``project_read_only``
-    # (decisions 31 and 32), so the README states read-only tools; the
-    # advisory ``read_only`` suffix still never renders from a payload.
+    # (decisions 31 and 32), so the README states read-only tools, and a
+    # connector with no tools to drop (the generic one) carries the
+    # read-only note instead.
     "creator_read_only_via_payload": ReadmeCase(
         [
             resolved_row(kind, read_only=True, is_global=True)

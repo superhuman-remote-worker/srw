@@ -1714,7 +1714,7 @@
       "accessKbReadOnlyHint": "External OKF Knowledge Bases are read-only to agents in this release.",
       "accessEnforcedBy": "Enforced by:",
       "accessAdvisory": "Advisory only:",
-      "githubAppReadOnly": "the GitHub App token SRW mints for each execution has contents: read, so no push succeeds (the workspace shell included).",
+      "githubAppReadOnly": "the GitHub App token SRW mints for each execution has contents: read, so GitHub refuses pushes made with that token.",
       "accessCreatorReadOnly": "Read-only for everyone who uses it: its creator tagged it so, and a project link cannot lift that.",
       "unlink": "Unlink"
     },
@@ -2842,7 +2842,7 @@
       "accessAdvisoryHint": "Read-only is only passed on to the agent as a note: the same credentials are delivered either way, so they decide what can be changed. This applies to everyone who uses the connector.",
       "accessReadWriteOnlyHint": "SRW has no read-only mode for this connector type: agents get every tool it offers. Its credential decides what is allowed, for everyone who uses the connector.",
       "accessKbHint": "Knowledge bases are always read-only, for everyone who uses them: SRW indexes the repository, and agents get search tools but never its credentials.",
-      "accessGithubAppHint": "Read-only means SRW gives agents no write tools for this connector, for everyone who uses it. For a GitHub App connector SRW also mints each run's token with contents: read, so GitHub refuses pushes.",
+      "accessGithubAppHint": "Read-only means SRW gives agents no write tools for this connector, for everyone who uses it. For a GitHub App connector SRW also mints each run's token with contents: read, so pushes made with that token are refused by GitHub.",
       "availabilityTitle": "Availability",
       "scopeEverywhere": "Everywhere in my work",
       "scopeEverywhereHint": "Available in all projects and standalone work, subject to sharing and public-access rules.",

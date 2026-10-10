@@ -54,7 +54,10 @@ PR_HEAD_SHA = "d" * 40
 
 
 def repository_datasource(
-    *, read_only: bool = False, project_read_only: bool = False
+    *,
+    read_only: bool | None = False,
+    project_read_only: bool = False,
+    is_global: bool = False,
 ) -> dict:
     return {
         "id": DATASOURCE_ID,
@@ -62,6 +65,7 @@ def repository_datasource(
         "connection_url": "https://github.com/Acme/Widget.git",
         "config": {"forge": "github"},
         "read_only": read_only,
+        "is_global": is_global,
         "project_read_only": project_read_only,
         "policy_revision": 7,
     }
@@ -475,6 +479,8 @@ class TestPullRequestDeliverable:
             None,
             repository_datasource(read_only=True),
             repository_datasource(project_read_only=True),
+            # A public connector with no mode set is read-only (decision 32).
+            repository_datasource(read_only=None, is_global=True),
         ):
             db = make_db()
             configure_pr_contract(db)
@@ -1270,6 +1276,39 @@ class TestCreationRefusesClonedRepoManifests:
                 datasources=[repository_datasource()],
             )
         assert "pull request" in exc.value.message.lower()
+
+    @pytest.mark.parametrize(
+        "datasource",
+        [
+            # A public connector whose creator never chose a mode (decision 32).
+            repository_datasource(read_only=None, is_global=True),
+            # The creator's read-only tag under a read-write link (decision 31).
+            repository_datasource(read_only=True),
+        ],
+    )
+    def test_a_read_only_bound_repository_cannot_take_a_pr_deliverable(
+        self, datasource
+    ) -> None:
+        with pytest.raises(DeliveryContractConflict) as exc:
+            prepare_delivery_contract(["pr:acme/widget"], datasources=[datasource])
+        assert exc.value.code == "pr_deliverable_read_only"
+
+    @pytest.mark.parametrize(
+        "datasource",
+        [
+            # A private connector never tagged, and one published read-write.
+            repository_datasource(read_only=None),
+            repository_datasource(read_only=False, is_global=True),
+        ],
+    )
+    def test_an_untagged_repository_still_takes_a_pr_deliverable(
+        self, datasource
+    ) -> None:
+        plan = prepare_delivery_contract(["pr:acme/widget"], datasources=[datasource])
+        assert plan.pr_repositories == ("acme/widget",)
+        assert [binding["datasource_id"] for binding in plan.pr_bindings] == [
+            DATASOURCE_ID
+        ]
 
     def test_ordinary_and_kb_deliverables_still_pass(self) -> None:
         body = job_create_module.JobCreate(

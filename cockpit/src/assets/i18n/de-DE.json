@@ -1714,7 +1714,7 @@
       "accessKbReadOnlyHint": "Externe OKF Knowledge Bases sind in dieser Version für Agenten schreibgeschützt.",
       "accessEnforcedBy": "Durchgesetzt durch:",
       "accessAdvisory": "Nur ein Hinweis:",
-      "githubAppReadOnly": "das GitHub-App-Token, das SRW für jede Ausführung erzeugt, hat contents: read, kein Push gelingt (auch nicht aus der Workspace-Shell).",
+      "githubAppReadOnly": "das GitHub-App-Token, das SRW für jede Ausführung erzeugt, hat contents: read, daher lehnt GitHub Pushes mit diesem Token ab.",
       "accessCreatorReadOnly": "Nur Lesen für alle, die ihn nutzen: Sein Ersteller hat ihn so markiert, und ein Projekt-Link kann das nicht aufheben.",
       "unlink": "Trennen"
     },
@@ -2842,7 +2842,7 @@
       "accessAdvisoryHint": "Nur Lesen wird dem Agenten nur als Hinweis mitgegeben: Es werden in beiden Fällen dieselben Zugangsdaten ausgeliefert, und sie entscheiden, was sich ändern lässt. Das gilt für alle, die den Konnektor nutzen.",
       "accessReadWriteOnlyHint": "Für diesen Konnektortyp hat SRW keinen Nur-Lese-Modus: Agenten erhalten alle Werkzeuge, die er anbietet. Was erlaubt ist, entscheiden seine Zugangsdaten, für alle, die den Konnektor nutzen.",
       "accessKbHint": "Wissensdatenbanken sind für alle, die sie nutzen, immer nur lesbar: SRW indexiert das Repository, und Agenten erhalten Suchwerkzeuge, aber nie seine Zugangsdaten.",
-      "accessGithubAppHint": "Nur Lesen heißt: SRW gibt Agenten für diesen Konnektor keine Schreibwerkzeuge, für alle, die ihn nutzen. Bei einem GitHub-App-Konnektor erzeugt SRW das Token jeder Ausführung zusätzlich mit contents: read, sodass GitHub Pushes ablehnt.",
+      "accessGithubAppHint": "Nur Lesen heißt: SRW gibt Agenten für diesen Konnektor keine Schreibwerkzeuge, für alle, die ihn nutzen. Bei einem GitHub-App-Konnektor erzeugt SRW das Token jeder Ausführung zusätzlich mit contents: read, sodass GitHub Pushes mit diesem Token ablehnt.",
       "availabilityTitle": "Verfügbarkeit",
       "scopeEverywhere": "Überall in meiner Arbeit",
       "scopeEverywhereHint": "In allen Projekten und eigenständiger Arbeit verfügbar, vorbehaltlich Freigabe- und öffentlicher Zugriffsregeln.",

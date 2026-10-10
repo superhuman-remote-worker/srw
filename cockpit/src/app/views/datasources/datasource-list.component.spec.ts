@@ -1540,6 +1540,32 @@ describe("DatasourceListComponent the creator's read-only tag", () => {
     expect(api.updateDatasource.mock.calls[0][1].read_only).toBeUndefined();
   });
 
+  it("is not offered for a project's native KB, which its agents write with kb_write", () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm(
+      kbDatasource({config: {root_path: 'vault', native_project_id: 'project-a'}}),
+    );
+    expect(component.isNativeProjectConnector()).toBe(true);
+    expect(component.showsAccessChoice()).toBe(false);
+    component.saveForm();
+    expect(api.updateDatasource.mock.calls[0][1].read_only).toBeUndefined();
+  });
+
+  it('badges a private connector its creator tagged read-only in the list', () => {
+    const {component} = createComponent(false, null, BUILTIN_DRIVERS);
+    const row = (type: Datasource['type'], over: Partial<Datasource>) =>
+      kbDatasource({type, ...over});
+    expect(component.isPrivateReadOnly(row('postgresql', {read_only: true}))).toBe(true);
+    expect(component.isPrivateReadOnly(row('postgresql', {read_only: false}))).toBe(false);
+    expect(component.isPrivateReadOnly(row('postgresql', {read_only: null}))).toBe(false);
+    // A public row keeps its RW badge rule.
+    expect(
+      component.isPrivateReadOnly(row('postgresql', {read_only: true, is_global: true})),
+    ).toBe(false);
+    // An MCP server binds every tool whatever the flag says.
+    expect(component.isPrivateReadOnly(row('mcp', {read_only: true}))).toBe(false);
+  });
+
   it('is not offered for email, whose tier choice is its own', () => {
     const {component} = createPrivate('email');
     expect(component.showsAccessChoice()).toBe(false);

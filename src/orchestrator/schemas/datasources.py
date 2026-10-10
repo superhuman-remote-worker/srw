@@ -56,7 +56,8 @@ class DatasourceCreate(BaseModel):
         description=(
             "The creator's read-only tag: agents get no write tools for this "
             "connector, for everyone who uses it (defaults to true on "
-            "publish; kb is always read-only). The credential still decides "
+            "publish; kb is always read-only; a remote MCP connector still "
+            "gets every tool its server lists). The credential still decides "
             "what is really allowed."
         ),
     )
@@ -115,7 +116,8 @@ class DatasourceUpdate(BaseModel):
         None,
         description=(
             "The creator's read-only tag: agents get no write tools for this "
-            "connector, for everyone who uses it (kb: always true)"
+            "connector, for everyone who uses it (kb: always true; a remote "
+            "MCP connector still gets every tool its server lists)"
         ),
     )
     scope_mode: Literal["all", "projects"] | None = Field(

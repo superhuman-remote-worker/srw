@@ -2613,8 +2613,8 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   /** Whether a GitHub App repository connector (C5) binds read-only here:
    *  its link is read-only, or the connector itself is (its own flag, or
-   *  public with none set). Its read-only is enforced by the token SRW
-   *  mints with contents: read, so no push succeeds. */
+   *  public with none set). The token SRW mints for it has contents: read,
+   *  so GitHub refuses pushes made with that token. */
   githubAppReadOnly(
     ds: Pick<Datasource, 'type' | 'config'> &
       Partial<Pick<Datasource, 'read_only' | 'is_global'>> & {project_read_only?: boolean | null},

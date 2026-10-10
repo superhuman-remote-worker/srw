@@ -586,6 +586,41 @@ async def test_repo_open_pr_writer_requires_exact_writable_attachment(db, pg_dsn
 
 
 @pytest.mark.asyncio
+async def test_repo_open_pr_writer_refuses_a_public_repository_with_no_mode(db, pg_dsn):
+    """Decision 32: a public connector whose creator never chose a mode is
+    read-only, so it records no PR; one published read-write does."""
+    _project_id, datasource_id, job_id, _revision = await _seed_repository_job(db)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE datasources SET is_global=TRUE, read_only=NULL WHERE id=$1",
+            datasource_id,
+        )
+    writer = AgentPostgresDB(pg_dsn, min_connections=1, max_connections=2)
+    await writer.connect()
+    try:
+        record = {
+            "forge": "github",
+            "repo": "acme/widget",
+            "number": 9,
+            "url": "https://github.com/acme/widget/pull/9",
+            "head": "feature/delivery",
+            "base": "develop",
+        }
+        assert not await writer.jobs.record_pull_request(
+            job_id, datasource_id, record, source_revision=PR_REVISION
+        )
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE datasources SET read_only=FALSE WHERE id=$1", datasource_id
+            )
+        assert await writer.jobs.record_pull_request(
+            job_id, datasource_id, record, source_revision=PR_REVISION
+        )
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
 async def test_gitea_writer_accepts_only_configured_public_internal_host_pair(
     db, pg_dsn, monkeypatch
 ):

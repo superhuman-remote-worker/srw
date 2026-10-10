@@ -15,7 +15,7 @@ from agent.connectors.base import (
     Delivery,
     FactsLines,
     RuntimeContext,
-    declared_read_only_note,
+    read_only_note,
 )
 from agent.connectors.legacy import env_vars_unreadable
 from shared.connectors.builtin import IMAGE_DRIVER_SPEC
@@ -109,7 +109,7 @@ class EnvFileMaterializer:
             cli = ds.get("cli_hint") or "CLI via env vars"
             lines = [
                 f"- **{ds.get('name', 'Unnamed')}** ({ds.get('type', 'unknown')}) "
-                f"— {cli}{declared_read_only_note(ds)}"
+                f"— {cli}{read_only_note(ds)}"
             ]
             variables = (ds.get("credentials") or {}).get("env_vars", {})
             if variables:

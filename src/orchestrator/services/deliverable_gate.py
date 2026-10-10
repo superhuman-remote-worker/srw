@@ -49,6 +49,7 @@ from typing import Any, Callable, Iterator
 
 from orchestrator.services.deliverable_contracts import BLOCKED_UNDELIVERED_OUTCOME
 from orchestrator.services.job_delivery import forge_repo_from_datasource
+from shared.connectors.contract import bound_read_only
 from shared.runtime.services.forge import get_pull_request_status
 from shared.deliverable_contract import (
     KB_DELIVERABLE_PREFIX,
@@ -392,7 +393,7 @@ async def _evaluate_pr_deliverable(
         != _integer(datasource.get("policy_revision"), default=0)
         or _integer(authority.get("policy_revision"))
         != _integer(datasource.get("policy_revision"), default=0)
-        or bool(datasource.get("read_only") or datasource.get("project_read_only"))
+        or bound_read_only(datasource)
     ):
         return {
             "passed": False,

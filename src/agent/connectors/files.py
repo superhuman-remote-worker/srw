@@ -52,7 +52,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from agent.connectors.base import Delivery, FactsLines, RuntimeContext
+from agent.connectors.base import (
+    Delivery,
+    FactsLines,
+    RuntimeContext,
+    read_only_note,
+)
 from agent.connectors.legacy import unreadable_file_modes
 from shared.connectors.file_targets import mode_problem, safe_mode, target_problem
 from shared.credential_connectors import credential_file_env_problem
@@ -377,6 +382,8 @@ class CredentialFileMaterializer:
                     ", ".join(_fact_path(value, report) for value in values) or "<none>"
                 )
                 line = f"- **{name}** (file) — {paths}"
+            # The same file is delivered either way: read-only is this note.
+            line += read_only_note(delivery.entry)
             out.append(FactsLines("Credential Files", delivery.index, [line]))
         return out
 

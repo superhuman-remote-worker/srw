@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from shared.connectors.builtin import delivers_in
+from shared.connectors.contract import bound_read_only
 from shared.datasource_policy import resolve_repo_clone_names
 from shared.runtime.services.forge import ForgeError, parse_owner_repo
 from shared.deliverable_contract import (
@@ -66,7 +67,9 @@ def _repository_identity(datasource: Mapping[str, Any]) -> str | None:
 
 
 def _writable(datasource: Mapping[str, Any]) -> bool:
-    return not bool(datasource.get("read_only") or datasource.get("project_read_only"))
+    """Not bound read-only: neither its project link nor its creator's tag
+    (a public connector with no mode set included) is read-only."""
+    return not bound_read_only(datasource)
 
 
 def _binding(datasource: Mapping[str, Any], identity: str) -> dict[str, Any]:

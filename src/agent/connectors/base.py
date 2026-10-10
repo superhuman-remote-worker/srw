@@ -255,3 +255,16 @@ def declared_read_only_note(entry: Mapping[str, Any]) -> str:
     really allowed; this just tells the agent the intent.
     """
     return " (declared read-only — treat as no-write)" if entry.get("read_only") else ""
+
+
+def read_only_note(entry: Mapping[str, Any]) -> str:
+    """The README note of a read-only connector that has no tools to drop.
+
+    Environment, file, key and kubeconfig connectors deliver the same
+    credentials at either level, so their read-only (the project link or the
+    creator's tag, which the orchestrator folds into ``project_read_only``)
+    reaches the agent only as this note. An in-process resolved row's own
+    ``read_only`` counts too. The credentials still decide what is allowed.
+    """
+    read_only = entry.get("project_read_only") or entry.get("read_only")
+    return " (read-only — treat as no-write)" if read_only else ""

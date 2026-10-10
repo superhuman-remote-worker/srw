@@ -18,7 +18,12 @@ import re
 from collections.abc import Sequence
 from typing import Any, Dict, Optional
 
-from agent.connectors.base import Delivery, FactsLines, RuntimeContext
+from agent.connectors.base import (
+    Delivery,
+    FactsLines,
+    RuntimeContext,
+    read_only_note,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +264,9 @@ class SshIdentityMaterializer:
                     + _ssh_key_usage(
                         delivery.entry, rt.ssh_identity_status, shared_hosts
                     )
+                    # The same key is delivered either way: read-only is
+                    # this note.
+                    + read_only_note(delivery.entry)
                 ],
             )
             for delivery in deliveries
