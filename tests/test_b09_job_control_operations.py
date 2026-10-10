@@ -771,10 +771,13 @@ def _attested(dependencies):
 
 @pytest.fixture
 def scrub(monkeypatch):
+    """The file scrub; ``scrub.shells`` is the job's shell retirement."""
     run = AsyncMock(return_value=True)
+    run.shells = AsyncMock(return_value=True)
     monkeypatch.setattr(
         managed_repository_process_retirement, "scrub_workspace_credentials", run
     )
+    monkeypatch.setattr(refused_workspace_credentials, "retire_job_shells", run.shells)
     return run
 
 
@@ -802,12 +805,51 @@ async def test_a_revoked_resume_keeps_and_scrubs_the_attested_workspace(
     scrub.assert_awaited_once_with(
         host="10.0.0.9", port=30022, host_key_fingerprint=FINGERPRINT
     )
+    # The paused job's own shell goes first, fenced as a pinned shell.
+    scrub.shells.assert_awaited_once()
+    shell_job, shell_target = scrub.shells.await_args.args
+    assert shell_job == JOB_ID
+    assert shell_target.host == "10.0.0.9"
+    assert shell_target.shell_owner_token is None
+    record = dependencies.store.merge_job_context.await_args.args[1]
+    assert record[refused_workspace_credentials.SCRUB_CONTEXT_KEY] == {
+        "refusal": case.split("/")[0],
+        "outcome": "scrubbed",
+        "shells": "retired",
+        "files": "scrubbed",
+        "remains": list(refused_workspace_credentials.SCRUB_REMAINS),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["connector_unavailable", "grant_denied"])
+async def test_a_revoked_resume_nothing_can_reach_is_torn_down_and_says_why(
+    case, monkeypatch, scrub
+):
+    dependencies, _message = _resume_refusal(
+        case, commands_on=True, monkeypatch=monkeypatch
+    )
+    dependencies = dataclasses.replace(
+        dependencies,
+        store=SimpleNamespace(
+            update_job_status=AsyncMock(),
+            fetchrow=AsyncMock(return_value=None),
+            merge_job_context=AsyncMock(),
+        ),
+    )
+
+    assert not await _resume(dependencies)
+
+    assert dependencies.refuse_job_start.await_args.kwargs["resume"] is False
+    scrub.assert_not_awaited()
+    scrub.shells.assert_not_awaited()
     dependencies.store.merge_job_context.assert_awaited_once_with(
         JOB_ID,
         {
             refused_workspace_credentials.SCRUB_CONTEXT_KEY: {
-                "reason": case.split("/")[0],
-                "outcome": "scrubbed",
+                "refusal": case,
+                "outcome": "torn_down",
+                "reason": "unreachable: no attested workspace endpoint",
             }
         },
     )

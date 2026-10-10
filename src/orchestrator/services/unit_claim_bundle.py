@@ -207,7 +207,9 @@ async def _refuse_worker_start(
         plan = refused_workspace_credentials.plan_refused_resume(
             reason,
             job=job,
-            target=refused_workspace_credentials.attested_scrub_target(attestation),
+            target=refused_workspace_credentials.attested_scrub_target(
+                attestation, shell_owner_token=lease_token
+            ),
         )
     if await dependencies.refuse_job_start(
         unit_id,

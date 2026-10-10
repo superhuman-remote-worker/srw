@@ -1082,12 +1082,18 @@ def _refusing_worker_claim(
 
 @pytest.fixture
 def scrub(monkeypatch):
-    from orchestrator.services import managed_repository_process_retirement
+    """The file scrub; ``scrub.shells`` is the job's shell retirement."""
+    from orchestrator.services import (
+        managed_repository_process_retirement,
+        refused_workspace_credentials,
+    )
 
     run = AsyncMock(return_value=True)
+    run.shells = AsyncMock(return_value=True)
     monkeypatch.setattr(
         managed_repository_process_retirement, "scrub_workspace_credentials", run
     )
+    monkeypatch.setattr(refused_workspace_credentials, "retire_job_shells", run.shells)
     return run
 
 
@@ -1128,10 +1134,15 @@ async def test_a_refused_worker_start_fails_the_job_under_the_claim_lease(
     db.job_has_checkpoint.assert_awaited_once_with(UNIT_ID)
     if checkpoint:
         # A revoked resume keeps the workspace and scrubs SRW's credentials
-        # from it, through the endpoint this claim attested.
+        # from it, through the endpoint this claim attested; the job's shell
+        # is retired under this claim's lease.
         scrub.assert_awaited_once_with(
             host="10.0.0.9", port=30022, host_key_fingerprint=WORKSPACE_FINGERPRINT
         )
+        shell_job, shell_target = scrub.shells.await_args.args
+        assert shell_job == UNIT_ID
+        assert shell_target.shell_owner_token == 7
+        assert shell_target.runtime_incarnation == WORKSPACE_RUNTIME
         db.merge_job_context.assert_awaited_once()
     else:
         # A fresh start is torn down whole.
@@ -1144,6 +1155,35 @@ async def test_a_refused_worker_start_fails_the_job_under_the_claim_lease(
         "SELECT EXISTS (SELECT 1 FROM run_queue" in call.args[0]
         for call in db.conn.fetchval.await_args_list
     )
+
+
+@pytest.mark.asyncio
+async def test_a_worker_refusal_that_was_not_admitted_scrubs_nothing(
+    monkeypatch, scrub
+):
+    from orchestrator import main as orch_main
+
+    refusal = job_start_bundle.JobStartRefusal(
+        "connector_unavailable", "connector_unavailable"
+    )
+    db, _attest, refuse, dependencies = _refusing_worker_claim(
+        monkeypatch, orch_main, refusal, checkpoint=True
+    )
+    refuse.return_value = False
+
+    with pytest.raises(HTTPException):
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=dependencies,
+        )
+
+    refuse.assert_awaited_once()
+    scrub.assert_not_awaited()
+    scrub.shells.assert_not_awaited()
+    db.merge_job_context.assert_not_awaited()
 
 
 @pytest.mark.asyncio
