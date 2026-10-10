@@ -400,6 +400,7 @@ class SessionAttachPorts:
     effect_authority: Callable[..., Any]
     settlement_authority: Callable[..., Any]
     retirement_authorized: Callable[..., Any]
+    terminate_failed_attach_if_authorized: Callable[..., Awaitable[bool]]
     subagent_event_available: Callable[..., Any]
     # Runtime state an attach resets or clears.
     reset_turn_state: Callable[[], None]
@@ -2299,6 +2300,23 @@ class SessionAttachCoordinator:
         attempt = 0
         while True:
             try:
+                # A VM attach can fail after its remote writers exist. Its
+                # ordinary abort cannot mint process-zero or rotate G. If the
+                # owner subsequently authorizes this exact life's End, hand
+                # the still-held session to the normal terminal owner instead.
+                if (
+                    exact
+                    and expected_session is not None
+                    and self._session is expected_session
+                    and getattr(expected_session, "workspace_backend_tier", None)
+                    in {"vm", "remote"}
+                    and await self._ports.terminate_failed_attach_if_authorized(
+                        (thread_id, *expected_identity)
+                    )
+                ):
+                    # The actuator request is durable but not a zero proof.
+                    # Keep the exact process alive until Core stops its Pod.
+                    await asyncio.Event().wait()
                 return await self.cleanup_failed_attach(
                     thread_id,
                     restore_thread_id=restore_thread_id,

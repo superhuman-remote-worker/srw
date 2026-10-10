@@ -971,6 +971,26 @@ class SessionTerminationCoordinator:
             wake.set()
         return True
 
+    async def terminate_failed_attach_if_authorized(
+        self, life: tuple[str, str, str]
+    ) -> bool:
+        """Hand a failed VM attach to the existing exact End owner, if authorized.
+
+        Failed attach never starts the lifecycle watchdog. Its retry owner must
+        therefore read the same durable T itself; attach-abort without T still
+        belongs to the release-proof path and cannot use this handoff.
+        """
+        if not await self.retirement_authorized_now(life):
+            return False
+        if (
+            self.retirement_admission_identity != life
+            or self.retirement_admission_disposition != "ended"
+            or type(self.retirement_admission_permanent) is not bool
+            or not self.retirement_admission_token
+        ):
+            return False
+        return await self.terminate("thread_retirement_authorized") == "actuator_requested"
+
     def start_watchdogs(self) -> None:
         """Start watchdog tasks for the active session. Safe to call repeatedly."""
 

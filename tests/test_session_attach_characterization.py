@@ -814,6 +814,80 @@ async def test_session_setup_failure_retires_constructed_session_destructively(
 
 
 @pytest.mark.asyncio
+async def test_failed_vm_setup_handoff_does_not_reenter_outer_release_cleanup(
+    monkeypatch,
+):
+    monkeypatch.setattr(pa, "_orchestrator_client", _client())
+    _poll(monkeypatch, _workspace(backend="vm"))
+
+    async def failed_vm_setup(self, **_kwargs):
+        self.workspace_backend_tier = "vm"
+        self.local_quiescence_protocol = ""
+        raise RuntimeError("repository materialization failed")
+
+    monkeypatch.setattr(FakeSession, "setup", failed_vm_setup)
+    handoff = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        pa._session_termination,
+        "terminate_failed_attach_if_authorized",
+        handoff,
+    )
+    patch_retry_delays(monkeypatch, (0.01,))
+
+    task = asyncio.create_task(_exact_attach(monkeypatch))
+    try:
+        async def handoff_reached():
+            while handoff.await_count == 0:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(handoff_reached(), timeout=0.4)
+        await asyncio.sleep(0.02)
+        (session,) = FakeSession.instances
+        assert not task.done()
+        assert len(session.cleanups) == 1
+        assert pa._session is session
+        assert release_receipt() is None
+        assert (identity()["generation"], identity()["attach_token"]) == (G1, T1)
+        handoff.assert_awaited_once_with((TA, G1, T1))
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_non_vm_failed_attach_uses_release_proof_without_end_handoff(
+    monkeypatch,
+):
+    seed_identity(
+        monkeypatch,
+        thread_id=TA,
+        generation=G1,
+        attach_token=T1,
+        runtime_contract=True,
+    )
+    session = FakeSession(thread_id=TA)
+    session.workspace_backend_tier = "virtual"
+    session.local_quiescence_protocol = "agent_runtime_zero_v1"
+    session.workspace_generation = ""
+    session.workspace_runtime_incarnation = ""
+    monkeypatch.setattr(pa, "_session", session)
+    handoff = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        pa._session_termination,
+        "terminate_failed_attach_if_authorized",
+        handoff,
+    )
+
+    receipt = await cleanup_until_proven(TA)
+
+    handoff.assert_not_awaited()
+    assert receipt["local_quiescence_protocol"] == "agent_runtime_zero_v1"
+    assert receipt["session_runtime_generation"] == G1
+    assert receipt["session_runtime_attach_token"] == T1
+    assert pa._session is None
+
+
+@pytest.mark.asyncio
 async def test_lifecycle_cas_refusal_aborts_before_queue_publication(monkeypatch):
     monkeypatch.setattr(pa, "_orchestrator_client", _client())
     _poll(monkeypatch, _workspace())

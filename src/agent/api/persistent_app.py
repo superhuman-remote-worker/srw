@@ -457,6 +457,9 @@ _session_attach = SessionAttachCoordinator(
         retirement_authorized=lambda *args, **kwargs: (
             _session_termination.retirement_authorized_now(*args, **kwargs)
         ),
+        terminate_failed_attach_if_authorized=lambda life: (
+            _session_termination.terminate_failed_attach_if_authorized(life)
+        ),
         subagent_event_available=lambda *args, **kwargs: (
             _session_subagent_event_available(*args, **kwargs)
         ),

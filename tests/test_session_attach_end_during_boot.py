@@ -111,6 +111,8 @@ def boot(monkeypatch):
     agent.config = AgentConfig(agent_id="session_base", display_name="Session")
     monkeypatch.setattr(pa, "_agent", agent)
     monkeypatch.setattr(pa, "_session", None)
+    monkeypatch.setattr(pa, "_orchestrator_client", None)
+    monkeypatch.setattr(pa, "_control_owner_agent_id", None)
     monkeypatch.setattr(pa, "_event_writer", None)
     for name in ("_thread_id", "_session_generation", "_attach_token"):
         monkeypatch.setattr(pa._session_identity, name, None)
@@ -279,9 +281,13 @@ async def test_end_after_construction_retires_the_partial_runtime(monkeypatch):
     agent.postgres_conn = None
     monkeypatch.setattr(pa, "_agent", agent)
     monkeypatch.setattr(pa, "_session", None)
+    monkeypatch.setattr(pa, "_orchestrator_client", None)
+    monkeypatch.setattr(pa, "_control_owner_agent_id", None)
     monkeypatch.setattr(pa, "_event_writer", None)
     for name in ("_thread_id", "_session_generation", "_attach_token"):
         monkeypatch.setattr(pa._session_identity, name, None)
+    monkeypatch.setattr(pa._session_identity, "_runtime_contract", False)
+    monkeypatch.setattr(pa._session_identity, "_status_contract", False)
     for name in ("_release_receipt", "_cleanup_context"):
         monkeypatch.setattr(pa._session_attach, name, None)
     built: list[_ConstructedSession] = []

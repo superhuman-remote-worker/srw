@@ -1,5 +1,6 @@
-"""Healthy VM End drains locally without claiming whole-guest process zero."""
+"""Healthy and failed-attach VM End drain without claiming guest process zero."""
 
+import asyncio
 from agent.api import session_termination
 import re
 from contextlib import asynccontextmanager
@@ -373,3 +374,164 @@ async def test_rest_detach_reports_pending_after_native_vm_drain(monkeypatch):
     assert json.loads(response.body) == {"status": "ending", "thread_id": session.thread_id}
     assert app._session is session and backend._retired
     assert not app._session_ready()
+
+
+@pytest.mark.asyncio
+async def test_failed_vm_attach_observes_later_end_and_hands_off_after_retry(monkeypatch):
+    session, backend, events = native_vm_session(monkeypatch)
+    accepted = attach_native_session(monkeypatch, session, events)
+    generation = app._session_identity.session_generation
+    attach_token = app._session_identity.attach_token
+    retirement_token = app._session_termination.retirement_admission_token
+    for name in (
+        "retirement_admission_identity",
+        "retirement_admission_token",
+        "retirement_admission_disposition",
+        "retirement_admission_permanent",
+    ):
+        monkeypatch.setattr(app._session_termination, name, None)
+    monkeypatch.setattr(session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.01,))
+    import agent.api.session_attach as session_attach
+
+    monkeypatch.setattr(session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.01,))
+
+    async def lifecycle(_thread_id):
+        if "shell-stop" not in events:
+            return {
+                "status": "created",
+                "session_runtime_generation": generation,
+                "session_runtime_attach_token": attach_token,
+            }
+        return {
+            "status": "ending",
+            "runtime_retirement_authorized": True,
+            "retirement_disposition": "ended",
+            "retirement_permanent": False,
+            "session_runtime_generation": generation,
+            "session_runtime_attach_token": attach_token,
+            "session_runtime_retirement_token": retirement_token,
+        }
+
+    monkeypatch.setattr(
+        app._orchestrator_client, "get_thread_lifecycle", lifecycle, raising=False
+    )
+    monkeypatch.setattr(app._session_attach, "_cleanup_context", None)
+    monkeypatch.setattr(app._session_attach, "_release_receipt", None)
+
+    task = asyncio.create_task(
+        app._session_attach.cleanup_failed_attach_until_proven(session.thread_id)
+    )
+    try:
+        async def marker_accepted():
+            while not accepted:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(marker_accepted(), timeout=0.4)
+        assert not task.done()
+        assert backend._retired
+        assert session.terminal_vm_drain_complete is True
+        assert session.local_quiescence_protocol == ""
+        assert app._session is session
+        assert app._session_attach.release_receipt is None
+        assert (
+            app._session_identity.session_generation,
+            app._session_identity.attach_token,
+        ) == (generation, attach_token)
+        assert accepted == [(
+            session.thread_id,
+            {
+                "pinned_agent_id": app._orchestrator_client.agent_id,
+                "pod_uid": app._session_identity.snapshot().pod_uid,
+                "process_generation": app._orchestrator_client.dispatch_process_generation,
+                "session_runtime_generation": generation,
+                "session_runtime_attach_token": attach_token,
+                "session_runtime_retirement_token": retirement_token,
+                "retirement_disposition": "ended",
+                "retirement_permanent": False,
+                "workspace_generation": session.workspace_generation,
+                "workspace_runtime_incarnation": session.workspace_runtime_incarnation,
+            },
+        )]
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_end",
+    ["preflight", "wrong_generation", "wrong_attach", "missing_token", "suspended"],
+)
+async def test_failed_vm_attach_keeps_owner_without_exact_ended_token(
+    monkeypatch, invalid_end
+):
+    session, backend, events = native_vm_session(monkeypatch)
+    accepted = attach_native_session(monkeypatch, session, events)
+    generation = app._session_identity.session_generation
+    attach_token = app._session_identity.attach_token
+    retirement_token = app._session_termination.retirement_admission_token
+    for name in (
+        "retirement_admission_identity",
+        "retirement_admission_token",
+        "retirement_admission_disposition",
+        "retirement_admission_permanent",
+    ):
+        monkeypatch.setattr(app._session_termination, name, None)
+    import agent.api.session_attach as session_attach
+
+    monkeypatch.setattr(session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.01,))
+    lifecycle = {
+        "status": "ending",
+        "runtime_retirement_authorized": True,
+        "retirement_disposition": "ended",
+        "retirement_permanent": False,
+        "session_runtime_generation": generation,
+        "session_runtime_attach_token": attach_token,
+        "session_runtime_retirement_token": retirement_token,
+    }
+    if invalid_end == "preflight":
+        lifecycle["runtime_retirement_preflight"] = True
+        lifecycle["runtime_retirement_authorized"] = False
+    elif invalid_end == "wrong_generation":
+        lifecycle["session_runtime_generation"] = str(uuid4())
+    elif invalid_end == "wrong_attach":
+        lifecycle["session_runtime_attach_token"] = str(uuid4())
+    elif invalid_end == "missing_token":
+        lifecycle["session_runtime_retirement_token"] = None
+    else:
+        lifecycle["retirement_disposition"] = "suspended"
+
+    async def read_lifecycle(_thread_id):
+        return lifecycle
+
+    monkeypatch.setattr(
+        app._orchestrator_client,
+        "get_thread_lifecycle",
+        read_lifecycle,
+        raising=False,
+    )
+    monkeypatch.setattr(app._session_attach, "_release_receipt", None)
+    task = asyncio.create_task(
+        app._session_attach.cleanup_failed_attach_until_proven(session.thread_id)
+    )
+    try:
+        async def cleanup_attempted():
+            while "shell-stop" not in events:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(cleanup_attempted(), timeout=0.4)
+        await asyncio.sleep(0.03)
+        assert accepted == []
+        assert not task.done()
+        assert not backend._retired
+        assert session.terminal_vm_drain_complete is False
+        assert session.local_quiescence_protocol == ""
+        assert app._session is session
+        assert app._session_attach.release_receipt is None
+        assert (
+            app._session_identity.session_generation,
+            app._session_identity.attach_token,
+        ) == (generation, attach_token)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
