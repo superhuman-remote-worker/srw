@@ -89,10 +89,17 @@ async def authorize_thread_datasource_selection(
     effective_work_owner_id: str | None = None,
     trusted_system_inheritance: bool = False,
     legacy_job_id: str | None = None,
+    execution_kind: str | None = None,
     dependencies: ThreadDatasourceAuthorizationDependencies,
 ) -> tuple[list[str], dict[str, int]]:
-    """Resolve one complete selection and its exact policy snapshot."""
+    """Resolve one complete selection and its exact policy snapshot.
+
+    ``execution_kind`` (``session`` or ``job``) refuses, with a 400 that says
+    why, a connector its driver attaches only to the other kind (a cloud
+    folder to sessions).
+    """
     from orchestrator.services.datasource_policy import (
+        DatasourceExecutionKindError,
         DatasourceUnavailableError,
         DatasourceWorkspaceTierError,
         authorize_datasource_selection,
@@ -112,13 +119,14 @@ async def authorize_thread_datasource_selection(
             allow_admin_explicit_override=True,
             trusted_system_inheritance=trusted_system_inheritance,
             legacy_job_id=legacy_job_id,
+            execution_kind=execution_kind,
         )
     except DatasourceUnavailableError as exc:
         raise HTTPException(
             status_code=403,
             detail="One or more selected connectors are unavailable",
         ) from exc
-    except DatasourceWorkspaceTierError as exc:
+    except (DatasourceWorkspaceTierError, DatasourceExecutionKindError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

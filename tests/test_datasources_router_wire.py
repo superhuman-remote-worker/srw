@@ -374,6 +374,31 @@ def test_eligible_rows_are_redacted():
     assert "credentials" not in body[0]
 
 
+def test_eligible_narrows_to_what_the_execution_kind_attaches():
+    folder = {
+        "id": "00000000-0000-0000-0000-0000000000f1",
+        "name": "Atlas cloud folder",
+        "type": "cloud_folder",
+        "managed_key": f"project-cloud:{PROJECT_ID}",
+    }
+    wire = _wire(
+        store=_store(
+            list_eligible_datasources=AsyncMock(return_value=[dict(SECRET_ROW), folder])
+        )
+    )
+
+    def listed(query: str = "") -> list[str]:
+        response = wire.client.get(f"/api/datasources/eligible{query}")
+        assert response.status_code == 200, response.text
+        return [row["id"] for row in response.json()]
+
+    assert listed() == [DATASOURCE_ID, folder["id"]]
+    assert listed("?execution=session") == [DATASOURCE_ID, folder["id"]]
+    # A cloud folder mounts into sessions: a job form never lists it.
+    assert listed("?execution=job") == [DATASOURCE_ID]
+    assert wire.client.get("/api/datasources/eligible?execution=pod").status_code == 422
+
+
 def test_job_datasources_are_redacted():
     wire = _wire()
     body = wire.client.get(f"/api/jobs/{JOB_ID}/datasources").json()

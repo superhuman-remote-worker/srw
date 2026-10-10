@@ -459,6 +459,7 @@ async def select_thread_datasources(
             workspace_backend=thread_backend,
             target_project_ids=effective_project_ids,
             effective_work_owner_id=str(user["id"]),
+            execution_kind="session",
         )
     else:
         from orchestrator.services.datasource_policy import (

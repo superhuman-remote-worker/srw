@@ -8,6 +8,7 @@ import pytest
 from fastapi import HTTPException
 
 from orchestrator.services.datasource_policy import (
+    DatasourceExecutionKindError,
     DatasourceUnavailableError,
     DatasourceWorkspaceTierError,
     ItemVerdict,
@@ -433,6 +434,110 @@ async def test_native_only_keeps_the_works_own_and_jobs_never_get_a_folder():
     }
     assert await defaults("job", native_only=True) == {DS_NATIVE}
     assert await defaults("job", native_only=False) == {DS_NATIVE, DS_OWNED}
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_job_naming_a_cloud_folder_is_told_why():
+    folder = _row(
+        DS_NATIVE,
+        owner=OTHER,
+        scope="projects",
+        projects=(PROJECT_A,),
+        automatic=True,
+        ds_type="cloud_folder",
+        managed_key=f"project-cloud:{PROJECT_A}",
+    )
+    db = _db([folder, _row(DS_OWNED)])
+
+    for kind in (None, "session"):
+        selected, _ = await authorize_datasource_selection(
+            db,
+            {"id": OWNER},
+            OWNER,
+            [DS_OWNED, DS_NATIVE],
+            [PROJECT_A],
+            "sandbox",
+            execution_kind=kind,
+        )
+        assert selected == [DS_OWNED, DS_NATIVE]
+    with pytest.raises(DatasourceExecutionKindError) as refused:
+        await authorize_datasource_selection(
+            db,
+            {"id": OWNER},
+            OWNER,
+            [DS_OWNED, DS_NATIVE],
+            [PROJECT_A],
+            "sandbox",
+            execution_kind="job",
+        )
+    assert str(refused.value) == (
+        "Cloud folder connectors attach to sessions only; a job cannot attach one"
+    )
+    verdicts, _ = await classify_datasource_selection(
+        db,
+        {"id": OWNER},
+        OWNER,
+        [DS_NATIVE],
+        [PROJECT_A],
+        "sandbox",
+        execution_kind="job",
+    )
+    assert [(v.denied, v.reason) for v in verdicts] == [(True, "execution_kind")]
+    # Authority first: another project's folder stays the generic refusal,
+    # so the reason never tells a caller what it may not see.
+    with pytest.raises(DatasourceUnavailableError):
+        await authorize_datasource_selection(
+            db,
+            {"id": OWNER},
+            OWNER,
+            [DS_NATIVE],
+            [PROJECT_B],
+            "sandbox",
+            execution_kind="job",
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_thread_funnel_answers_400_with_the_reason():
+    folder = _row(
+        DS_NATIVE,
+        scope="projects",
+        projects=(PROJECT_A,),
+        ds_type="cloud_folder",
+        managed_key=f"project-cloud:{PROJECT_A}",
+    )
+    dependencies = thread_datasource_authorization_module.ThreadDatasourceAuthorizationDependencies(
+        store=_db([folder]), thread_project_ids=AsyncMock(return_value=[])
+    )
+    with pytest.raises(HTTPException) as refused:
+        await thread_datasource_authorization_module.authorize_thread_datasource_selection(
+            {"id": OWNER},
+            [DS_NATIVE],
+            workspace_backend="sandbox",
+            target_project_ids=[PROJECT_A],
+            execution_kind="job",
+            dependencies=dependencies,
+        )
+    assert refused.value.status_code == 400
+    assert "sessions only" in refused.value.detail
+
+
+@pytest.mark.asyncio
+async def test_an_inherited_selection_keeps_what_the_job_can_attach():
+    folder = _row(DS_NATIVE, ds_type="cloud_folder")
+    db = _db([folder, _row(DS_OWNED)])
+    dependencies = job_datasource_selection_module.JobDatasourceSelectionDependencies(
+        store=db,
+        authorize_thread_datasource_selection=AsyncMock(),
+        backend_from_override=lambda _override: None,
+        revalidate_selection=AsyncMock(),
+    )
+    assert await job_datasource_selection_module.filter_execution_kind_datasource_ids(
+        [DS_NATIVE, DS_OWNED, DS_SHARED], "job", dependencies=dependencies
+    ) == [DS_OWNED, DS_SHARED]
+    assert await job_datasource_selection_module.filter_execution_kind_datasource_ids(
+        [DS_NATIVE, DS_OWNED], "session", dependencies=dependencies
+    ) == [DS_NATIVE, DS_OWNED]
 
 
 def test_the_driver_names_the_executions_a_connector_serves():

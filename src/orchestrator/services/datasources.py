@@ -74,6 +74,7 @@ from orchestrator.services.connector_drivers.registered import (
     CheckRunner,
     SupportsDriverRegistration,
 )
+from orchestrator.services.datasource_policy import execution_kind_refuses
 from shared.credential_connectors import CredentialConnectorAttachedError
 from shared.connectors.platform import (
     PROJECT_KB,
@@ -291,6 +292,7 @@ async def list_eligible_datasources(
     project_id: list[str] | None,
     require_project_member: RequireProjectMember,
     dependencies: DatasourceDependencies,
+    execution: str | None = None,
 ) -> list[dict[str, Any]]:
     """Connectors the caller may pre-select for a job/session (the picker
     source of truth).
@@ -300,6 +302,10 @@ async def list_eligible_datasources(
     Membership is required for each supplied project (403 otherwise). Used to
     seed the create-job / create-session connector picker; with explicit-only
     resolution the picker is the only way a job gets connectors.
+    ``execution`` (``session`` or ``job``) keeps only the connectors that
+    kind of execution can attach, as their drivers say
+    (``execution_kind_refuses``: a cloud folder is a session's); ``None``
+    keeps all.
     """
     project_ids = list(dict.fromkeys(str(value) for value in (project_id or [])))
     scope_project_id = mcp_scope_project_id(user)
@@ -323,6 +329,7 @@ async def list_eligible_datasources(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+    rows = [row for row in rows if not execution_kind_refuses(row, execution)]
     await connector_driver_registrations.annotate_driver_env_names(
         dependencies.store, rows
     )

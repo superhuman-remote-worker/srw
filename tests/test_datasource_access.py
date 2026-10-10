@@ -862,6 +862,7 @@ class TestEligibleDatasourcesEndpoint:
         with _patch_caller(user_a):
             rows = await list_eligible_datasources(
                 fake_request,
+                execution=None,
                 project_id=[str(project_a["id"])],
                 dependencies=_ds_deps(user_a, fake_db),
             )
@@ -881,6 +882,7 @@ class TestEligibleDatasourcesEndpoint:
             with pytest.raises(HTTPException) as exc:
                 await list_eligible_datasources(
                     fake_request,
+                    execution=None,
                     project_id=[str(project_a["id"])],
                     dependencies=_ds_deps(user_b, fake_db),
                 )
@@ -896,7 +898,10 @@ class TestEligibleDatasourcesEndpoint:
         )
         with _patch_caller(user_a):
             rows = await list_eligible_datasources(
-                fake_request, project_id=None, dependencies=_ds_deps(user_a, fake_db)
+                fake_request,
+                execution=None,
+                project_id=None,
+                dependencies=_ds_deps(user_a, fake_db),
             )
         assert len(rows) == 2
         fake_db.list_eligible_datasources.assert_awaited_once()
@@ -915,7 +920,10 @@ class TestEligibleDatasourcesEndpoint:
 
         with _patch_caller(scoped):
             await list_eligible_datasources(
-                fake_request, project_id=None, dependencies=_ds_deps(scoped, fake_db)
+                fake_request,
+                execution=None,
+                project_id=None,
+                dependencies=_ds_deps(scoped, fake_db),
             )
 
         assert fake_db.list_eligible_datasources.await_args.args[1] == [
@@ -941,12 +949,39 @@ class TestEligibleDatasourcesEndpoint:
                 with pytest.raises(HTTPException) as exc:
                     await list_eligible_datasources(
                         fake_request,
+                        execution=None,
                         project_id=requested,
                         dependencies=_ds_deps(scoped, fake_db),
                     )
                 assert exc.value.status_code == 403
 
         fake_db.list_eligible_datasources.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_job_picker_never_lists_a_session_only_connector(
+        self, user_a, project_a, datasource_a, fake_db, fake_request
+    ):
+        folder = {
+            "id": "00000000-0000-4000-8000-0000000000f1",
+            "name": "Atlas cloud folder",
+            "type": "cloud_folder",
+            "managed_key": f"project-cloud:{project_a['id']}",
+        }
+        fake_db.list_eligible_datasources = AsyncMock(
+            return_value=[datasource_a, folder]
+        )
+        listed = {}
+        for execution in (None, "session", "job"):
+            with _patch_caller(user_a):
+                rows = await list_eligible_datasources(
+                    fake_request,
+                    execution=execution,
+                    project_id=[str(project_a["id"])],
+                    dependencies=_ds_deps(user_a, fake_db),
+                )
+            listed[execution] = {row["id"] for row in rows}
+        assert listed[None] == listed["session"] == {datasource_a["id"], folder["id"]}
+        assert listed["job"] == {datasource_a["id"]}
 
 
 # =============================================================================

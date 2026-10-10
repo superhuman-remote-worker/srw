@@ -33,6 +33,7 @@ class AuthorizeDatasourceSelection(Protocol):
         effective_work_owner_id: str | None,
         trusted_system_inheritance: bool,
         legacy_job_id: str | None,
+        execution_kind: str | None = None,
     ) -> tuple[list[str], dict[str, int]]: ...
 
 
@@ -73,6 +74,12 @@ class JobAdmissionDatasourcesDependencies:
     selection_provenance: DatasourceSelectionProvenance
     # ``execution.connectors`` refs to connector ids (services.connector_refs).
     resolve_connector_refs: ResolveConnectorRefs | None = None
+    # Drops what a job cannot attach (a session's cloud folder) from an
+    # inherited selection: ``(ids, execution_kind) -> ids``
+    # (``job_datasource_selection.filter_execution_kind_datasource_ids``).
+    filter_execution_kind_ids: (
+        Callable[[list[str], str], Awaitable[list[str]]] | None
+    ) = None
 
 
 @dataclass(frozen=True)
@@ -182,6 +189,8 @@ async def prepare_job_admission_datasources(
             ),
             trusted_system_inheritance=trusted_explicit_reuse,
             legacy_job_id=str(job.parent_job_id) if job.parent_job_id else None,
+            # A job naming a session's connector (a cloud folder) is told so.
+            execution_kind="job",
         )
     elif (job.thread_id or job.parent_job_id) and not wants_dispatch_defaults:
         selection_origin = "inherited"
@@ -191,6 +200,10 @@ async def prepare_job_admission_datasources(
         inherited_ids = await dependencies.filter_implicit_lite_ids(
             inherited_ids, lite_backend
         )
+        if dependencies.filter_execution_kind_ids is not None:
+            inherited_ids = await dependencies.filter_execution_kind_ids(
+                inherited_ids, "job"
+            )
         (
             selected_ds_ids,
             selected_ds_revisions,

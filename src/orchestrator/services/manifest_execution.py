@@ -191,6 +191,7 @@ class ManifestExecutionService:
                 effective_work_owner_id=str(user["id"]),
                 trusted_system_inheritance=False,
                 legacy_job_id=None,
+                execution_kind="job",
             )
         config_name, config_override = (
             "worker_base",

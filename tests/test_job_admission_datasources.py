@@ -107,6 +107,7 @@ async def test_explicit_presence_wins_over_thread_inheritance_and_defaults(
         effective_work_owner_id=USER,
         trusted_system_inheritance=False,
         legacy_job_id=parent,
+        execution_kind="job",
     )
     deps.inherit_parent_ids.assert_not_awaited()
     deps.filter_implicit_lite_ids.assert_not_awaited()
@@ -178,6 +179,21 @@ async def test_dispatch_defaults_do_not_widen_parented_delegation(
         )
         deps.inherit_parent_ids.assert_not_awaited()
         deps.authorize_selection.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_inherited_selection_drops_what_a_job_cannot_attach(deps):
+    # The session's cloud folder (OTHER) mounts into sessions only.
+    drop = AsyncMock(side_effect=lambda ids, kind: [v for v in ids if v != OTHER])
+    deps = replace(
+        deps,
+        filter_implicit_lite_ids=AsyncMock(side_effect=lambda ids, _b: ids),
+        filter_execution_kind_ids=drop,
+    )
+    result = await prepare(deps, fields={"thread_id": THREAD})
+    assert result.provenance["origin"] == "inherited"
+    assert result.datasource_ids == [CONNECTOR]
+    drop.assert_awaited_once_with([CONNECTOR, OTHER], "job")
 
 
 @pytest.mark.asyncio

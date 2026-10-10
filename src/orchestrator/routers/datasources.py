@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request
 
@@ -196,6 +196,13 @@ async def list_eligible_datasources(
         default=None,
         description="Project(s) to include linked connectors for (repeatable)",
     ),
+    execution: Literal["session", "job"] | None = Query(
+        default=None,
+        description=(
+            "Only connectors this kind of execution can attach (a cloud "
+            "folder is a session's); omit for all"
+        ),
+    ),
     *,
     dependencies: DatasourcesDependencies = Depends(get_datasources_dependencies),
 ) -> list[dict[str, Any]]:
@@ -211,6 +218,7 @@ async def list_eligible_datasources(
     return await datasources.list_eligible_datasources(
         user=user,
         project_id=project_id,
+        execution=execution,
         require_project_member=member_of,
         dependencies=dependencies.operations,
     )

@@ -37,6 +37,11 @@ class DatasourceWorkspaceTierError(ValueError):
     workspace (repositories, credential and generic environments, SSH keys)."""
 
 
+class DatasourceExecutionKindError(ValueError):
+    """An explicit connector whose driver serves another kind of execution
+    (a cloud folder mounts into sessions only); the message says which."""
+
+
 def _normalized_ids(values: Iterable[str] | None) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
@@ -109,6 +114,18 @@ def _scope_matches(row: dict[str, Any], target_project_ids: set[str]) -> bool:
     return target_project_ids.issubset(_row_project_ids(row))
 
 
+def execution_kind_detail(row: Mapping[str, Any], execution_kind: str) -> str:
+    """Why an explicit selection of ``row`` is refused for ``execution_kind``,
+    in the words of its driver's spec."""
+    spec = spec_for_row(row)
+    title = spec.title if spec is not None else "These"
+    served = " and ".join(f"{kind}s" for kind in (spec.executions if spec else ()))
+    return (
+        f"{title} connectors attach to {served or 'no execution'} only; "
+        f"a {execution_kind} cannot attach one"
+    )
+
+
 def execution_kind_refuses(row: Mapping[str, Any], execution_kind: str | None) -> bool:
     """Whether the connector cannot be attached to this kind of execution.
 
@@ -175,11 +192,14 @@ async def _validate_effective_owner(
 @dataclass(frozen=True)
 class ItemVerdict:
     """One connector's availability decision, for callers that must report
-    rather than deny. ``reason`` is None exactly when ``denied`` is False."""
+    rather than deny. ``reason`` is None exactly when ``denied`` is False;
+    ``detail`` is a sentence a person can read, for a refusal that may say
+    why (``execution_kind``)."""
 
     datasource_id: str
     denied: bool
     reason: str | None = None
+    detail: str | None = None
 
 
 async def classify_datasource_selection(
@@ -192,6 +212,7 @@ async def classify_datasource_selection(
     allow_admin_explicit_override: bool = False,
     trusted_system_inheritance: bool = False,
     legacy_job_id: str | None = None,
+    execution_kind: str | None = None,
 ) -> tuple[list[ItemVerdict], dict[str, int]]:
     """Per-item availability verdicts plus the policy snapshot of allowed rows.
 
@@ -277,6 +298,16 @@ async def classify_datasource_selection(
         if workspace_tier_refuses(row, workspace_backend):
             verdicts.append(ItemVerdict(datasource_id, True, "workspace_tier"))
             continue
+        if execution_kind_refuses(row, execution_kind):
+            verdicts.append(
+                ItemVerdict(
+                    datasource_id,
+                    True,
+                    "execution_kind",
+                    execution_kind_detail(row, str(execution_kind)),
+                )
+            )
+            continue
         try:
             policy_revision = int(row["policy_revision"])
             if policy_revision < 1:
@@ -299,6 +330,7 @@ async def authorize_datasource_selection(
     allow_admin_explicit_override: bool = False,
     trusted_system_inheritance: bool = False,
     legacy_job_id: str | None = None,
+    execution_kind: str | None = None,
 ) -> tuple[list[str], dict[str, int]]:
     """Authorize a complete selection and return its exact policy snapshot.
 
@@ -307,7 +339,9 @@ async def authorize_datasource_selection(
     non-enumerating exception. ``trusted_system_inheritance`` is narrowly for
     internal reuse of an already materialized selection: it bypasses user
     execution access, but never scope or workspace-tier checks and never scans
-    for ambient defaults.
+    for ambient defaults. ``execution_kind`` (``session`` or ``job``) refuses
+    a connector its driver serves only for the other kind, with
+    :class:`DatasourceExecutionKindError`; ``None`` asks nothing.
     """
     verdicts, revisions = await classify_datasource_selection(
         db,
@@ -319,6 +353,7 @@ async def authorize_datasource_selection(
         allow_admin_explicit_override=allow_admin_explicit_override,
         trusted_system_inheritance=trusted_system_inheritance,
         legacy_job_id=legacy_job_id,
+        execution_kind=execution_kind,
     )
     # Missing rows were rejected by a len() check that ran BEFORE the per-item
     # loop, so "deleted" is position-independent and outranks everything else.
@@ -331,6 +366,8 @@ async def authorize_datasource_selection(
             continue
         if verdict.reason == "workspace_tier":
             raise DatasourceWorkspaceTierError(SHELL_WORKSPACE_DETAIL)
+        if verdict.reason == "execution_kind":
+            raise DatasourceExecutionKindError(verdict.detail)
         raise DatasourceUnavailableError()
     return [v.datasource_id for v in verdicts], revisions
 
@@ -458,6 +495,7 @@ async def default_datasource_ids(
 
 
 __all__ = [
+    "DatasourceExecutionKindError",
     "DatasourceUnavailableError",
     "DatasourceWorkspaceTierError",
     "GENERIC_UNAVAILABLE_DETAIL",
@@ -468,6 +506,7 @@ __all__ = [
     "classify_datasource_selection",
     "default_datasource_ids",
     "default_datasource_selection",
+    "execution_kind_detail",
     "execution_kind_refuses",
     "workspace_tier_refuses",
 ]

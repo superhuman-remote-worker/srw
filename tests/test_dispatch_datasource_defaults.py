@@ -67,6 +67,9 @@ def db():
     db.link_datasource_to_job = AsyncMock()
     # No project_workspace_defaults row: the installation decides the tier.
     db.fetchrow = AsyncMock(return_value=None)
+    # An inherited selection is read for what a job cannot attach (a cloud
+    # folder); none of these is one.
+    db.get_datasource_policy_rows = AsyncMock(return_value=[])
     return db
 
 

@@ -36,7 +36,10 @@ from uuid import UUID
 
 from fastapi import HTTPException
 
-from orchestrator.services.datasource_policy import workspace_tier_refuses
+from orchestrator.services.datasource_policy import (
+    execution_kind_refuses,
+    workspace_tier_refuses,
+)
 from shared.backend_kinds import LITE_BACKENDS
 
 
@@ -165,6 +168,30 @@ async def filter_implicit_lite_datasource_ids(
         str(row["id"]) for row in rows if workspace_tier_refuses(row, workspace_backend)
     }
     return [value for value in datasource_ids if str(value) not in repositories]
+
+
+async def filter_execution_kind_datasource_ids(
+    datasource_ids: list[str],
+    execution_kind: str,
+    *,
+    dependencies: JobDatasourceSelectionDependencies,
+) -> list[str]:
+    """Drop the connectors ``execution_kind`` cannot attach from an implicit
+    selection (``execution_kind_refuses``).
+
+    A job that inherits its session's selection inherits the session's cloud
+    folder, which mounts into sessions only; the job keeps the rest, as a
+    lite tier keeps what it can serve. An explicit selection is refused
+    instead, in the central policy service. Missing IDs remain, and still
+    fail closed when the complete set is authorized.
+    """
+    if not datasource_ids:
+        return datasource_ids
+    rows = await dependencies.store.get_datasource_policy_rows(datasource_ids)
+    refused = {
+        str(row["id"]) for row in rows if execution_kind_refuses(row, execution_kind)
+    }
+    return [value for value in datasource_ids if str(value) not in refused]
 
 
 async def datasource_selection_provenance(

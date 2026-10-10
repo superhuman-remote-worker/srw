@@ -103,6 +103,8 @@ def wire(monkeypatch):
         resolve_datasources_for_thread=AsyncMock(return_value=[]),
         # No project_workspace_defaults row: the installation decides the tier.
         fetchrow=AsyncMock(return_value=None),
+        # An inherited selection is read for what a job cannot attach.
+        get_datasource_policy_rows=AsyncMock(return_value=[]),
     )
     defaults = AsyncMock(return_value=([CONNECTOR], {}))
     authorize = AsyncMock(side_effect=lambda _actor, ids, **kw: (list(ids), {}))
