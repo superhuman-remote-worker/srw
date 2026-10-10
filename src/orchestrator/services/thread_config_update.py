@@ -585,6 +585,11 @@ async def apply_thread_config_update_locked(
                 if spec_for_row(row) is IMAGE_DRIVER_SPEC
             ]
         target_project_ids = await dependencies.thread_project_ids(thread_id)
+        # A live edit is a session's selection, authorized as its creation
+        # is (``execution_kind="session"``): a connector its driver serves to
+        # jobs only (the project folder copy) is refused here as at create,
+        # rather than attached and later inherited by a job the session
+        # commissions.
         if thread_row.get("user_id"):
             owner = await dependencies.store.get_user(str(thread_row["user_id"]))
             if owner is None:
@@ -602,6 +607,7 @@ async def apply_thread_config_update_locked(
                 workspace_backend=thread_workspace_backend(thread_row),
                 target_project_ids=target_project_ids,
                 effective_work_owner_id=str(thread_row["user_id"]),
+                execution_kind="session",
             )
         else:
             # Ownerless/system threads have no ambient authority. A live edit
@@ -638,6 +644,7 @@ async def apply_thread_config_update_locked(
                 workspace_backend=thread_workspace_backend(thread_row),
                 target_project_ids=target_project_ids,
                 trusted_system_inheritance=True,
+                execution_kind="session",
             )
 
         resolved_ds = await dependencies.store.resolve_datasources_for_thread(

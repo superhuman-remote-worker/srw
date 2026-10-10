@@ -26,7 +26,7 @@ import contextlib
 import functools
 import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
@@ -994,6 +994,7 @@ class TestDatasourceSelection:
             "workspace_backend": "sandbox",
             "target_project_ids": [PROJECT, LINKED_PROJECT],
             "effective_work_owner_id": OWNER,
+            "execution_kind": "session",
         }
         assert fakes.only("thread_project_ids") == ((THREAD,), {})
 
@@ -1017,6 +1018,7 @@ class TestDatasourceSelection:
             "workspace_backend": "sandbox",
             "target_project_ids": [PROJECT, LINKED_PROJECT],
             "trusted_system_inheritance": True,
+            "execution_kind": "session",
         }
         assert result == ({"tools": FLIP["tools"]}, [DS_A])
 
@@ -1170,6 +1172,83 @@ class TestDatasourceSelection:
 # --------------------------------------------------------------------------- #
 # Grant enforcement
 # --------------------------------------------------------------------------- #
+
+
+class TestLiveEditExecutionKind:
+    """A live edit authorizes a session's selection as its creation does:
+    the project folder copy (jobs only) is refused with the 400 creation
+    gives, never attached for a commissioned job to inherit."""
+
+    CHECKOUT = DS_C
+
+    def _real_authorization(self):
+        from orchestrator.services import thread_datasource_authorization as tda
+
+        checkout = self.CHECKOUT
+
+        class _PolicyStore:
+            async def get_user(self, user_id):
+                return dict(OWNER_ROW)
+
+            async def user_is_member_of_projects(self, user_id, project_ids):
+                return True
+
+            async def get_user_project_roles(self, user_id, project_ids):
+                return {pid: "owner" for pid in project_ids}
+
+            async def get_datasource_policy_rows(self, ids, **_kwargs):
+                return [
+                    {
+                        "id": checkout,
+                        "type": "cloud_folder_checkout",
+                        "created_by": None,
+                        "is_global": False,
+                        "config": {"project_id": PROJECT},
+                        "scope_mode": "projects",
+                        "auto_attach": True,
+                        "policy_revision": 1,
+                        "managed_key": f"project-cloud-checkout:{PROJECT}",
+                        "project_ids": [PROJECT],
+                    }
+                    for value in ids
+                    if str(value) == checkout
+                ]
+
+        return functools.partial(
+            tda.authorize_thread_datasource_selection,
+            dependencies=tda.ThreadDatasourceAuthorizationDependencies(
+                store=_PolicyStore(), thread_project_ids=None
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        ("row", "actor"),
+        [
+            (pinned_row(user_id=uuid.UUID(OWNER), project_id=PROJECT), ACTOR),
+            (with_selection(pinned_row(user_id=None), [DS_C]), None),
+        ],
+        ids=["owner-rest", "ownerless-internal"],
+    )
+    async def test_a_jobs_only_connector_is_refused_like_at_creation(
+        self, apply_locked, fakes, row, actor
+    ):
+        fakes.results["thread_project_ids"] = [PROJECT]
+        bound = apply_locked(fakes)
+        dependencies = replace(
+            bound.dependencies,
+            authorize_thread_datasource_selection=self._real_authorization(),
+        )
+        core = functools.partial(
+            tcu.apply_thread_config_update_locked, dependencies=dependencies
+        )
+
+        error = await _refused(
+            core, THREAD, row, {}, [self.CHECKOUT], request=REQUEST, actor=actor
+        )
+
+        assert error.status_code == 400
+        assert "jobs only" in error.detail
+        assert "store.set_thread_datasource_ids" not in fakes.names()
 
 
 class TestGrantEnforcement:
