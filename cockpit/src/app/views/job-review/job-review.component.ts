@@ -18,6 +18,12 @@ import {
   jobStatusTone as sharedJobStatusTone,
 } from '../../core/util/job-status';
 import {workspaceContractTitle as formatWorkspaceContractTitle} from '../../core/util/workspace-contract-presentation';
+import {
+  checkoutCaptureState,
+  jobCloudAction,
+  jobOutboxRecord,
+  noProjectFolderChanges,
+} from '../../core/util/job-cloud';
 
 interface FrozenJobData {
   freeze_type?: string;    // "phase_boundary" | "job_complete" | "vm_upgrade_required"
@@ -375,12 +381,34 @@ export function selectDeliveryRepository(
             </div>
           }
 
-          <!-- Cloud folder preview (Mode B "open folder"). Export and open are
-               two separate clicks: the export takes longer than the browser's
-               transient-activation window, so an auto-open after it would be
-               popup-blocked. -->
-          @if (job()!.cloud_review_mode === 'open_folder') {
+          <!-- A project folder copy that goes through review but has no
+               diff: say so, rather than show nothing. -->
+          @if (noProjectFolderChanges(job()!)) {
+            <div class="section project-folder-copy" data-no-project-folder-changes>
+              {{ projectFolderCopyKey() | transloco }}
+            </div>
+          }
+
+          <!-- The job's outbox: its deliverables copied into a cloud folder
+               shared with its owner, re-synced on demand, for any job whose
+               project-folder diff is not waiting for review. Export and open
+               are two separate clicks: the export takes longer than the
+               browser's transient-activation window, so an auto-open after it
+               would be popup-blocked. -->
+          @if (cloudAction() !== 'none') {
             <div class="section cloud-folder">
+              @if (outbox(); as record) {
+                <div class="cloud-folder-state" data-outbox-state [attr.data-state]="record.state">
+                  @if (record.state === 'failed') {
+                    {{ 'jobReview.outbox.failed' | transloco:{ reason: ('jobReview.outbox.reason.' + record.reason) | transloco } }}
+                  } @else {
+                    {{ 'jobReview.outbox.delivered' | transloco:{ count: record.files } }}
+                    @if (record.unshared; as unshared) {
+                      {{ ' ' }}<span data-outbox-unshared>{{ 'jobReview.outbox.unshared.' + unshared | transloco }}</span>
+                    }
+                  }
+                </div>
+              }
               @if (job()!.exported_folder_url) {
                 <app-button
                   variant="info"
@@ -696,6 +724,13 @@ export function selectDeliveryRepository(
         line-height: 1.4;
       }
 
+      .cloud-folder-state,
+      .project-folder-copy {
+        color: var(--text-secondary, var(--text-secondary));
+        font-size: 0.9em;
+        line-height: 1.4;
+      }
+
       /* Actions */
       .actions-section {
         display: flex;
@@ -853,6 +888,28 @@ export class JobReviewComponent {
   readonly confirmingApprove = signal(false);
   readonly ideLoading = signal(false);
   readonly isExportingToCloud = signal(false);
+  /** The outbox affordance this job offers (core/util/job-cloud). */
+  readonly cloudAction = computed(() => {
+    const job = this.job();
+    return job ? jobCloudAction(job) : 'none';
+  });
+  /** What the latest copy into the job's outbox did. */
+  readonly outbox = computed(() => jobOutboxRecord(this.job()?.context));
+  readonly noProjectFolderChanges = noProjectFolderChanges;
+  /** Why a reviewed project folder copy has no diff, as the completion
+   *  capture recorded it. */
+  readonly projectFolderCopyKey = computed(() => {
+    switch (checkoutCaptureState(this.job()?.context)) {
+      case 'no_changes':
+        return 'jobReview.projectFolder.noChanges';
+      case 'no_baseline':
+        return 'jobReview.projectFolder.noBaseline';
+      case 'head_unreadable':
+        return 'jobReview.projectFolder.headUnreadable';
+      default:
+        return 'jobReview.projectFolder.nothingToReview';
+    }
+  });
   readonly reviewSessionLoading = signal(false);
   private readonly maxIdePollAttempts = 100;
   private idePollAttempts = 0;

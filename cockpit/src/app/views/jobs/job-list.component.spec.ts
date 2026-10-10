@@ -1157,9 +1157,19 @@ describe('JobListComponent — live refresh', () => {
 describe('jobCloudAction', () => {
   const base = {status: 'completed', cloud_review_mode: 'open_folder'} as Partial<JobSummary>;
 
-  it('offers nothing until the job is completed and in folder mode', () => {
+  it('offers nothing until the output is stable, or while its diff waits for review', () => {
     expect(jobCloudAction({...base, status: 'processing'} as JobSummary)).toBe('none');
-    expect(jobCloudAction({...base, cloud_review_mode: 'diff'} as JobSummary)).toBe('none');
+    expect(jobCloudAction({...base, status: 'failed'} as JobSummary)).toBe('none');
+    expect(jobCloudAction({...base, diff_status: 'pending'} as JobSummary)).toBe('none');
+  });
+
+  it("offers the outbox for a cloud project's job and a job in review too", () => {
+    // The outbox is the job's deliverables; the project folder's copy has
+    // its own diff review.
+    expect(jobCloudAction({...base, cloud_review_mode: 'diff'} as JobSummary)).toBe('export');
+    expect(jobCloudAction({...base, cloud_review_mode: 'diff', diff_status: 'accepted'} as JobSummary)).toBe('export');
+    expect(jobCloudAction({...base, status: 'pending_review'} as JobSummary)).toBe('export');
+    expect(jobCloudAction({...base, status: 'reviewing'} as JobSummary)).toBe('export');
   });
 
   it('offers export first, then the folder once a URL exists', () => {

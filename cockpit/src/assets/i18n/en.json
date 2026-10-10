@@ -801,6 +801,7 @@
       "createProject": "Create Project",
       "exportToCloud": "Export to cloud",
       "openCloudFolder": "Open cloud folder",
+      "resyncCloudFolder": "Re-sync cloud folder",
       "exported": "Exported",
       "approveRequest": "Approve request"
     },
@@ -3421,6 +3422,29 @@
       "openCloudFolder": "Open cloud folder"
     },
     "cloudFolderDisclaimer": "Preview — results are copied to a shared cloud folder you can browse. Use the feedback box below to request changes; edits made directly in this folder won't reach the agent and will be replaced when the job continues.",
+    "outbox": {
+      "delivered": "{{count}} file(s) in the job's cloud folder.",
+      "failed": "The copy into the job's cloud folder failed: {{reason}}.",
+      "unshared": {
+        "no_account": "It isn't shared with you yet: sign in to the cloud once, then re-sync.",
+        "rate_limited": "It isn't shared with you yet: the cloud is limiting new shares. Re-sync in a few minutes.",
+        "share_failed": "It isn't shared with you yet: sharing it failed. Re-sync to try again."
+      },
+      "reason": {
+        "backend_unavailable": "no main cloud was reachable",
+        "forge_unavailable": "the job's repository could not be read",
+        "folder_failed": "the cloud folder could not be created",
+        "file_missing": "a file it should copy is missing",
+        "copy_failed": "the files could not be copied",
+        "owner_unavailable": "the job or its owner is gone"
+      }
+    },
+    "projectFolder": {
+      "nothingToReview": "No changes to the project folder copy to review.",
+      "noChanges": "The job made no changes to its copy of the project folder, so nothing will be written back.",
+      "noBaseline": "The project folder was not copied for this job, so there are no changes to review.",
+      "headUnreadable": "The job's changes to its copy of the project folder could not be read, so there is nothing to review."
+    },
     "reviewSessionHint": "Starts a supervised session in a fresh sandbox checkout of the delivered branch with this job's model, project, and connectors. Job-only workspace and tool settings are not copied.",
     "vmUpgrade": {
       "title": "Sudo Required",
@@ -4298,6 +4322,8 @@
       "replySent": "Reply sent",
       "exportedToCloud": "Exported {{count}} file(s) to {{folder}}",
       "exportedNotShared": "Exported {{count}} file(s) to {{folder}}, but it isn't shared with you yet — sign in to the cloud once, then re-sync.",
+      "exportedRateLimited": "Exported {{count}} file(s) to {{folder}}, but the cloud is limiting new shares right now — re-sync in a few minutes to share it with you.",
+      "exportedShareFailed": "Exported {{count}} file(s) to {{folder}}, but sharing it with you failed — re-sync to try again.",
       "diffAccepted": "Applied {{applied}} change(s), {{deleted}} deletion(s) to the cloud folder.",
       "diffRejected": "Diff rejected; no cloud changes were made."
     },

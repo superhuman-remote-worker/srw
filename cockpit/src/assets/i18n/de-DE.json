@@ -801,6 +801,7 @@
       "createProject": "Projekt erstellen",
       "exportToCloud": "In die Cloud exportieren",
       "openCloudFolder": "Cloud-Ordner öffnen",
+      "resyncCloudFolder": "Cloud-Ordner neu synchronisieren",
       "exported": "Exportiert",
       "approveRequest": "Anfrage freigeben"
     },
@@ -3421,6 +3422,29 @@
       "openCloudFolder": "Cloud-Ordner öffnen"
     },
     "cloudFolderDisclaimer": "Vorschau – die Ergebnisse werden in einen geteilten Cloud-Ordner kopiert, den du durchsuchen kannst. Nutze das Feedback-Feld unten, um Änderungen anzufordern; direkte Änderungen an diesem Ordner erreichen den Agenten nicht und werden überschrieben, wenn der Job fortgesetzt wird.",
+    "outbox": {
+      "delivered": "{{count}} Datei(en) im Cloud-Ordner des Jobs.",
+      "failed": "Das Kopieren in den Cloud-Ordner des Jobs ist fehlgeschlagen: {{reason}}.",
+      "unshared": {
+        "no_account": "Er ist noch nicht für dich freigegeben: einmal in der Cloud anmelden, dann neu synchronisieren.",
+        "rate_limited": "Er ist noch nicht für dich freigegeben: die Cloud begrenzt gerade neue Freigaben. In ein paar Minuten neu synchronisieren.",
+        "share_failed": "Er ist noch nicht für dich freigegeben: die Freigabe ist fehlgeschlagen. Neu synchronisieren, um es erneut zu versuchen."
+      },
+      "reason": {
+        "backend_unavailable": "keine Haupt-Cloud war erreichbar",
+        "forge_unavailable": "das Repository des Jobs konnte nicht gelesen werden",
+        "folder_failed": "der Cloud-Ordner konnte nicht angelegt werden",
+        "file_missing": "eine zu kopierende Datei fehlt",
+        "copy_failed": "die Dateien konnten nicht kopiert werden",
+        "owner_unavailable": "der Job oder sein Besitzer existiert nicht mehr"
+      }
+    },
+    "projectFolder": {
+      "nothingToReview": "Keine Änderungen an der Kopie des Projektordners zu prüfen.",
+      "noChanges": "Der Job hat seine Kopie des Projektordners nicht geändert, es wird also nichts zurückgeschrieben.",
+      "noBaseline": "Der Projektordner wurde für diesen Job nicht kopiert, es gibt also keine Änderungen zu prüfen.",
+      "headUnreadable": "Die Änderungen des Jobs an seiner Kopie des Projektordners konnten nicht gelesen werden, es gibt also nichts zu prüfen."
+    },
     "reviewSessionHint": "Startet eine beaufsichtigte Sitzung in einem frischen Sandbox-Checkout des bereitgestellten Branches mit Modell, Projekt und Konnektoren dieses Jobs. Job-spezifische Arbeitsbereichs- und Tool-Einstellungen werden nicht kopiert.",
     "vmUpgrade": {
       "title": "Sudo erforderlich",
@@ -4298,6 +4322,8 @@
       "replySent": "Antwort gesendet",
       "exportedToCloud": "{{count}} Datei(en) nach {{folder}} exportiert",
       "exportedNotShared": "{{count}} Datei(en) nach {{folder}} exportiert, aber der Ordner ist noch nicht für dich freigegeben — einmal in der Cloud anmelden, dann neu synchronisieren.",
+      "exportedRateLimited": "{{count}} Datei(en) nach {{folder}} exportiert, aber die Cloud begrenzt gerade neue Freigaben — in ein paar Minuten neu synchronisieren, um ihn für dich freizugeben.",
+      "exportedShareFailed": "{{count}} Datei(en) nach {{folder}} exportiert, aber die Freigabe für dich ist fehlgeschlagen — neu synchronisieren, um es erneut zu versuchen.",
       "diffAccepted": "{{applied}} Änderung(en) und {{deleted}} Löschung(en) in den Cloud-Ordner geschrieben.",
       "diffRejected": "Diff verworfen; keine Änderungen in der Cloud."
     },

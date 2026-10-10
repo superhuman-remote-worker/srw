@@ -63,6 +63,7 @@ import {
   removeFilterToken,
   setPageSize,
 } from './job-filters';
+import {JobCloudAction, jobCloudAction} from '../../core/util/job-cloud';
 
 /**
  * Angular's ParamMap keeps repeated keys, which is how multi-value filters
@@ -92,28 +93,11 @@ interface JobRow {
   kind: 'job' | 'detail';
 }
 
-/**
- * Which Mode B cloud affordance a row offers, if any.
- *
- * `'export'` and `'open'` are deliberately two separate actions rather than one
- * button that exports-then-opens: the export routinely runs longer than the ~5s
- * of transient user activation a browser grants a click, so opening from its
- * completion callback gets swallowed by the popup blocker. `'exported'` is the
- * degraded state — the export happened but the cloud backend can't currently
- * hand us a URL, so there's nothing to link to.
- */
-export type JobCloudAction = 'none' | 'export' | 'open' | 'exported';
-
-/** Pure decision helper for the above — exported for unit tests, and shared by
- *  the wide-layout button row and the narrow-layout overflow menu so the two
- *  can't drift. */
-export function jobCloudAction(job: JobSummary): JobCloudAction {
-  if (job.status !== 'completed' || job.cloud_review_mode !== 'open_folder') {
-    return 'none';
-  }
-  if (!job.exported_at) return 'export';
-  return job.exported_folder_url ? 'open' : 'exported';
-}
+// The outbox affordance (re-sync a job's deliverables into its owner's cloud
+// folder) lives in core/util/job-cloud, shared with the job review page;
+// re-exported here for this component's callers and specs.
+export {jobCloudAction};
+export type {JobCloudAction};
 
 /**
  * Job List component that displays jobs with filtering and actions.
@@ -523,6 +507,10 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                         }
                         @case ('open') {
                           <app-menu-item (activated)="openExportedFolder(row.job)">{{ 'jobs.action.openCloudFolder' | transloco }}</app-menu-item>
+                          <app-menu-item (activated)="exportJobToSharedFolder(row.job.id)">{{ 'jobs.action.resyncCloudFolder' | transloco }}</app-menu-item>
+                        }
+                        @case ('exported') {
+                          <app-menu-item (activated)="exportJobToSharedFolder(row.job.id)">{{ 'jobs.action.resyncCloudFolder' | transloco }}</app-menu-item>
                         }
                       }
                       @if (row.job.status !== 'processing' && row.job.status !== 'paused' && row.job.status !== 'reviewing' && row.job.status !== 'waiting') {

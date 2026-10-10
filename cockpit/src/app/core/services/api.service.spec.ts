@@ -1607,3 +1607,44 @@ describe('workspace templates (Slice A3)', () => {
     await expect(checked).rejects.toBeInstanceOf(HttpErrorResponse);
   });
 });
+
+describe('ApiService job outbox re-sync', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+  let toast: {success: ReturnType<typeof vi.fn>; warning: ReturnType<typeof vi.fn>};
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    toast = {success: vi.fn(), warning: vi.fn()};
+    TestBed.configureTestingModule({providers: [
+      ApiService, provideHttpClient(), provideHttpClientTesting(),
+      {provide: AppToastService, useValue: toast},
+      {provide: TranslocoService, useValue: {translate: (key: string) => key}},
+      {provide: ErrorMessageService, useValue: {}},
+    ]});
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  it.each([
+    {unshared: 'no_account', key: 'toasts.jobs.exportedNotShared'},
+    {unshared: 'rate_limited', key: 'toasts.jobs.exportedRateLimited'},
+    {unshared: 'share_failed', key: 'toasts.jobs.exportedShareFailed'},
+    {unshared: undefined, key: 'toasts.jobs.exportedNotShared'},
+  ])('says why a copy is not shared yet ($unshared)', async ({unshared, key}) => {
+    const pending = firstValueFrom(api.exportJobToSharedFolder('job-1'));
+    const req = httpMock.expectOne((r) => r.url.endsWith('/jobs/job-1/export-to-shared-folder'));
+    req.flush({
+      job_id: 'job-1',
+      files_copied: 2,
+      shared: false,
+      ...(unshared ? {unshared} : {}),
+      folder: {name: 'job-1', path: '/job-1', browser_url: null, webdav_url: null},
+    });
+    await pending;
+    expect(toast.warning).toHaveBeenCalledWith(key);
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+});

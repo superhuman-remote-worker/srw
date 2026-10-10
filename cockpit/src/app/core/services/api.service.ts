@@ -3004,12 +3004,14 @@ export class ApiService {
   }
 
   /**
-   * Mode B of the job cloud workflow — export a completed loose job's output/
-   * folder to a freshly-allocated shared cloud folder. Only valid for jobs
-   * that are completed AND have no project_id. Returns the folder's
-   * browser/WebDAV URLs and the number of files copied.
+   * Re-sync a job's outbox: copy its deliverables into its owner's shared
+   * cloud folder (the completion copy's folder, overwritten in place). Valid
+   * for any completed, pending-review or reviewing job, a cloud project's
+   * too. Returns the folder's browser/WebDAV URLs and the number of files
+   * copied; `unshared` says why the folder is not visible yet.
    *
-   * See knowledge-history/done/job_cloud_export.md §3.2.
+   * See knowledge-history/done/job_cloud_export.md §3.2 and
+   * main_cloud_as_connectors.md, slice 6.2.
    */
   exportJobToSharedFolder(jobId: string): Observable<JobCloudExportResult | null> {
     return this.http
@@ -3026,10 +3028,17 @@ export class ApiService {
             folder: result?.folder?.path ?? result?.folder?.name ?? '',
           };
           // `shared: false` means the bytes landed but the folder isn't
-          // visible to this user yet (no cloud account until their first
-          // login), so opening it would 404. Say that instead of "success".
+          // visible to this user yet, so opening it would 404. Say why
+          // instead of "success": no cloud account until their first login,
+          // the cloud's share rate limit, or a share error.
           if (result && result.shared === false) {
-            this.toast.warning(this.t('toasts.jobs.exportedNotShared', params));
+            const key =
+              result.unshared === 'rate_limited'
+                ? 'toasts.jobs.exportedRateLimited'
+                : result.unshared === 'share_failed'
+                  ? 'toasts.jobs.exportedShareFailed'
+                  : 'toasts.jobs.exportedNotShared';
+            this.toast.warning(this.t(key, params));
           } else {
             this.toast.success(this.t('toasts.jobs.exportedToCloud', params));
           }

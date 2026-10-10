@@ -373,6 +373,57 @@ describe('JobReviewComponent delivery section', () => {
     expect(text).not.toContain('private.svc');
   });
 
+  it("offers the outbox re-sync on a cloud project's job too, with what the last copy did", async () => {
+    const root = await render(
+      {job_outbox: {state: 'delivered', files: 3, shared: false, unshared: 'rate_limited'}},
+      null,
+      undefined,
+      {
+        cloud_review_mode: 'diff',
+        diff_status: 'accepted',
+        exported_at: '2026-10-10T20:00:00Z',
+        exported_folder_url: 'https://cloud.example/f/1',
+      },
+    );
+    const section = root.querySelector('.cloud-folder') as HTMLElement;
+    const text = (section.textContent ?? '').replace(/\s+/g, ' ').trim();
+    expect(text).toContain("3 file(s) in the job's cloud folder.");
+    expect(section.querySelector('[data-outbox-unshared]')?.textContent?.trim()).toBe(
+      en.jobReview.outbox.unshared.rate_limited,
+    );
+    expect(text).toContain(en.jobReview.links.openCloudFolder);
+    expect(text).toContain(en.jobReview.actions.resyncCloudFolder);
+    expect(fixture.componentInstance.cloudAction()).toBe('open');
+  });
+
+  it('says why the copy into the outbox failed', async () => {
+    const root = await render({job_outbox: {state: 'failed', reason: 'folder_failed', detail: 'boom'}}, null);
+    const state = root.querySelector('[data-outbox-state]') as HTMLElement;
+    expect(state.dataset['state']).toBe('failed');
+    expect((state.textContent ?? '').replace(/\s+/g, ' ').trim()).toBe(
+      "The copy into the job's cloud folder failed: the cloud folder could not be created.",
+    );
+    // The server's own words never reach the page.
+    expect(root.textContent).not.toContain('boom');
+  });
+
+  it('says a reviewed project folder copy has no changes, and why', async () => {
+    const root = await render(
+      {cloud_checkout: {access: 'reviewed_write_back', capture: {state: 'no_changes'}}},
+      null,
+      undefined,
+      {cloud_review_mode: 'diff', diff_status: null},
+    );
+    expect(root.querySelector('[data-no-project-folder-changes]')?.textContent?.trim()).toBe(
+      en.jobReview.projectFolder.noChanges,
+    );
+  });
+
+  it('shows no project folder note for a job without a reviewed copy', async () => {
+    const root = await render(undefined, OPEN_STATUS, undefined, {cloud_review_mode: 'open_folder'});
+    expect(root.querySelector('[data-no-project-folder-changes]')).toBeNull();
+  });
+
   it('keeps a cancelled VM on the non-review screen without a workspace tooltip', async () => {
     const root = await render(undefined, OPEN_STATUS, {
       requested_backend: 'vm', assigned_backend: 'vm', effective_backend: null,

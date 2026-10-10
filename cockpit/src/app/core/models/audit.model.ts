@@ -121,6 +121,9 @@ export interface JobSummary {
   created_at: string;
   audit_count?: number | null;
   snapshot_status?: string | null;
+  /** The project-folder diff's review state: `pending` while it waits for
+   *  review (the outbox re-sync waits for it), null without one. */
+  diff_status?: 'pending' | 'accepted' | 'rejected' | null;
   /** Mode B export marker — set when "Export to shared folder" succeeds. */
   exported_at?: string | null;
   /**

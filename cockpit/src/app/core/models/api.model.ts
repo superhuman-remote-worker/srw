@@ -2599,19 +2599,25 @@ export interface JobCreateRequest {
 }
 
 /**
- * Result of the Mode B export (`POST /api/jobs/{id}/export-to-shared-folder`).
- * See knowledge-history/done/job_cloud_export.md §3.2.
+ * Result of the outbox re-sync (`POST /api/jobs/{id}/export-to-shared-folder`):
+ * the job's deliverables copied into a cloud folder shared with its owner.
+ * See knowledge-history/done/job_cloud_export.md §3.2 and
+ * main_cloud_as_connectors.md, slice 6.2.
  */
 export interface JobCloudExportResult {
   job_id: string;
   files_copied: number;
   /**
-   * False = the files were copied but the folder could not be shared with the
-   * caller, because the cloud backend has no account for them yet (Nextcloud
-   * provisions on first OIDC login). The export is real, the folder just
-   * isn't visible to them until they've signed in to the cloud once.
+   * False = the files were copied but the folder is not shared with the
+   * caller yet; `unshared` says why. The export is real, and a re-sync
+   * shares it.
    */
   shared: boolean;
+  /** Why the copy is not shared yet: no cloud account for the caller until
+   *  their first sign-in (`no_account`), the cloud's share rate limit
+   *  (`rate_limited`), or a share error (`share_failed`). Absent when
+   *  shared, and on orchestrators before main cloud slice 6. */
+  unshared?: 'no_account' | 'rate_limited' | 'share_failed';
   folder: {
     name: string;
     /** Path within the caller's own cloud drive — the share lands at its root,
