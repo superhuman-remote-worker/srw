@@ -890,6 +890,58 @@ class TestUnavailableModelRefusal:
         pool.provision_agent.assert_awaited_once_with(purpose="job")
 
 
+class TestClaimedJobsAreNotPending:
+    """A job this pass claimed is processing even when its delivery returned
+    False (a refused start fails it through the completion ledger, connector
+    drivers decision 34): it provisions no agent pod and preempts nothing."""
+
+    @pytest.mark.asyncio
+    async def test_a_refused_start_provisions_no_pod(self, no_dispatcher_error):
+        job = _job("j1")
+        store = FakeStore(pinned=[job], agents=[{"id": "a1", "metadata": {}}])
+        delivery = FakeDelivery()
+        delivery.dispatch = AsyncMock(return_value=False)
+        pool = _AgentPool()
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(store, delivery=delivery, agent_provisioner=pool)
+        )
+
+        delivery.dispatch.assert_awaited_once()
+        pool.provision_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_refused_start_preempts_nothing(self, no_dispatcher_error):
+        candidate = {"id": "running", "priority": 1, "assigned_agent_id": "a9"}
+        store = FakeStore(
+            pinned=[_job("j1", priority=9)],
+            agents=[{"id": "a1", "metadata": {}}],
+            candidates=[candidate],
+        )
+        delivery = FakeDelivery()
+        delivery.dispatch = AsyncMock(return_value=False)
+
+        await dispatch_pending_jobs(dependencies=_deps(store, delivery=delivery))
+        await _drain_tasks()
+
+        delivery.initiate_pause.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_job_another_replica_claimed_is_still_pending_here(
+        self, no_dispatcher_error
+    ):
+        store = FakeStore(
+            pinned=[_job("j1")],
+            agents=[{"id": "a1", "metadata": {}}],
+            claims={"j1": False},
+        )
+        pool = _AgentPool()
+
+        await dispatch_pending_jobs(dependencies=_deps(store, agent_provisioner=pool))
+
+        pool.provision_agent.assert_awaited_once_with(purpose="job")
+
+
 # =============================================================================
 # Stateless admission
 # =============================================================================

@@ -1331,8 +1331,12 @@ async def _match_jobs(
             )
 
     # Phase 1: Direct assignment
-    matched_job_ids = set()
     matched_agent_ids = set()
+    # Every job this pass claimed, delivered or not. A claimed row is
+    # processing: until its claim resolves (a refused start fails it through
+    # the completion ledger; a lost delivery waits for its lease) it is not
+    # pending, so it must not provision an agent or preempt a running job.
+    claimed_job_ids = set()
 
     agents_iter = iter(available_agents)
     for job in dispatchable_jobs:
@@ -1359,6 +1363,7 @@ async def _match_jobs(
                 job_id,
             )
             continue
+        claimed_job_ids.add(job_id)
         if resume_lane_applies(
             job,
             has_checkpoint=await dependencies.store.job_has_checkpoint(job_id),
@@ -1376,11 +1381,10 @@ async def _match_jobs(
             success = await dependencies.job_delivery_operations().dispatch(job, agent)
 
         if success:
-            matched_job_ids.add(job_id)
             matched_agent_ids.add(str(agent["id"]))
 
-    # Phase 1.5: Provision agent pods for unmatched jobs (K8s only)
-    remaining = [j for j in dispatchable_jobs if str(j["id"]) not in matched_job_ids]
+    # Phase 1.5: Provision agent pods for unclaimed jobs (K8s only)
+    remaining = [j for j in dispatchable_jobs if str(j["id"]) not in claimed_job_ids]
     if remaining and dependencies.agent_provisioner.is_available:
         for job in remaining:
             if (
@@ -1407,7 +1411,7 @@ async def _match_jobs(
     # workspace-ready jobs (dispatchable_jobs, not the full pending set)
     # may drive preemption — pausing a running job to free an agent is
     # pointless for a job that has no workspace to run in.
-    remaining = [j for j in dispatchable_jobs if str(j["id"]) not in matched_job_ids]
+    remaining = [j for j in dispatchable_jobs if str(j["id"]) not in claimed_job_ids]
     if not remaining:
         return
 
