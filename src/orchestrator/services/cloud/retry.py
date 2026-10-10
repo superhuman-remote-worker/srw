@@ -17,6 +17,9 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Deque
 
 import httpx
@@ -61,6 +64,39 @@ def retryable_policy(*, max_attempts: int = 4) -> AsyncRetrying:
     )
 
 
+#: The deadline (``time.monotonic()``) a caller's :func:`bounded_wait` puts
+#: on every bucket it waits on, or ``None``.
+_WAIT_DEADLINE: ContextVar[float | None] = ContextVar(
+    "leaky_bucket_wait_deadline", default=None
+)
+
+
+class BucketFull(Exception):
+    """A bucket has no capacity before the caller's bounded wait runs out
+    (:func:`bounded_wait`, ``acquire(timeout=...)``). Nothing was consumed;
+    ``retry_after`` is how long until it has capacity again, in seconds."""
+
+    def __init__(self, retry_after: float) -> None:
+        super().__init__(f"rate limited; capacity again in {retry_after:.0f}s")
+        self.retry_after = retry_after
+
+
+@contextmanager
+def bounded_wait(seconds: float) -> Iterator[None]:
+    """Bound every bucket wait inside the block to ``seconds`` in all.
+
+    For a caller that cannot block for a whole window (a session's outbox
+    share retry, a completion effect) around an adapter call that acquires
+    its own bucket (``NextcloudBackend.share_session_folder``): an acquire
+    that would wait past the deadline raises :class:`BucketFull` instead.
+    """
+    token = _WAIT_DEADLINE.set(time.monotonic() + max(0.0, seconds))
+    try:
+        yield
+    finally:
+        _WAIT_DEADLINE.reset(token)
+
+
 class LeakyBucket:
     """Async-safe fixed-window leaky bucket rate limiter.
 
@@ -69,7 +105,9 @@ class LeakyBucket:
     rate limiter — the window semantics are simple "sliding count of
     calls in the last N seconds". Callers ``await`` ``acquire()`` before
     issuing a rate-limited operation; the call blocks until the bucket
-    has capacity.
+    has capacity, or until a bounded wait runs out (``timeout``,
+    :func:`bounded_wait`), which raises :class:`BucketFull`.
+    :meth:`try_acquire` never waits.
 
     The bucket is conservative by design: set ``max_events`` below the
     server's actual limit so that even under clock-skew the client stays
@@ -82,17 +120,37 @@ class LeakyBucket:
         self._events: Deque[float] = deque()
         self._lock = asyncio.Lock()
 
-    async def acquire(self) -> None:
-        """Block until the bucket has capacity for one more event."""
+    def _take(self, now: float) -> float:
+        """Take one event now (0.0), or how long until there is room."""
+        cutoff = now - self._window_seconds
+        while self._events and self._events[0] < cutoff:
+            self._events.popleft()
+        if len(self._events) < self._max_events:
+            self._events.append(now)
+            return 0.0
+        return max(0.0, (self._events[0] + self._window_seconds) - now) or 1e-3
+
+    async def try_acquire(self) -> bool:
+        """Take one event if the bucket has room now; never waits."""
+        async with self._lock:
+            return self._take(time.monotonic()) == 0.0
+
+    async def acquire(self, *, timeout: float | None = None) -> None:
+        """Block until the bucket has capacity for one more event.
+
+        With ``timeout`` (or inside :func:`bounded_wait`, whichever ends
+        first) a wait that would run past it raises :class:`BucketFull`
+        without consuming anything."""
+        deadline = _WAIT_DEADLINE.get()
+        if timeout is not None:
+            own = time.monotonic() + max(0.0, timeout)
+            deadline = own if deadline is None else min(deadline, own)
         while True:
             async with self._lock:
                 now = time.monotonic()
-                cutoff = now - self._window_seconds
-                while self._events and self._events[0] < cutoff:
-                    self._events.popleft()
-                if len(self._events) < self._max_events:
-                    self._events.append(now)
+                wait_for = self._take(now)
+                if wait_for == 0.0:
                     return
-                oldest = self._events[0]
-                wait_for = max(0.0, (oldest + self._window_seconds) - now)
+            if deadline is not None and now + wait_for > deadline:
+                raise BucketFull(wait_for)
             await asyncio.sleep(wait_for)
