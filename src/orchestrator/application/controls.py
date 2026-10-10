@@ -48,6 +48,7 @@ from orchestrator.services import (
     docker_provisioner as docker_provisioner_module,
     grant_enforcement,
     ide_session,
+    job_completion,
     job_control_delivery,
     job_controls,
     job_datasource_selection,
@@ -448,6 +449,13 @@ def job_delivery_operations(
             grant_violations_detail=grant_enforcement.grant_violations_detail,
             mint_worker_runtime_actor=runtime_actor.mint_worker_runtime_actor,
             resume_reject_should_requeue=(job_controls.resume_reject_should_requeue),
+            # A refused start fails the job through the completion-command
+            # path while completion commands own job status (decision 34).
+            refuse_job_start=bound(
+                job_completion.refuse_job_start,
+                completion_composition.job_completion_dependencies,
+                resources,
+            ),
         )
     )
 

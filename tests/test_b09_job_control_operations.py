@@ -9,11 +9,21 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import HTTPException
 
+from orchestrator.services import job_control_delivery as job_control_delivery_module
+from orchestrator.services.grant_enforcement import GrantDenied
 from orchestrator.services.job_control_delivery import (
     JobDeliveryDependencies,
     dispatch_job_to_agent,
     initiate_pause,
+    resume_job_on_agent,
 )
+from orchestrator.services.job_start_bundle import JobStartRefusal
+from orchestrator.services.model_availability import (
+    WHERE_JOB,
+    ModelUnavailable,
+    UnavailableModel,
+)
+from orchestrator.services.workspace_tier_policy import LiteWorkspaceConfigError
 from orchestrator.services.job_mutation_controls import (
     JobControlDependencies,
     JobControlOperations,
@@ -352,6 +362,244 @@ async def test_legacy_dispatch_does_not_resurrect_a_control_that_won_after_claim
         expected_status="processing",
     )
     store.heartbeat.assert_not_awaited()
+
+
+# A refused start under completion commands (connector drivers decision 34):
+# the claim owner submits it through the completion-command path under its
+# agent fence instead of leaving the claimed job to its lease.
+
+JOB_ID = "00000000-0000-0000-0000-0000000000a1"
+
+
+def _refusing_delivery(*, commands_on: bool, build) -> JobDeliveryDependencies:
+    return _delivery(
+        store=SimpleNamespace(update_job_status=AsyncMock()),
+        completion_commands_enabled=lambda: commands_on,
+        prepare_job_workspace_runtime=AsyncMock(
+            side_effect=lambda job: ("proceed", job, None)
+        ),
+        attest_pinned_k8s_job_workspace=AsyncMock(side_effect=lambda job: (job, None)),
+        build_job_start_request=build,
+        prepare_pinned_job_mutation_target=AsyncMock(),
+        redispatch_livelock_trip=MagicMock(return_value=None),
+        bind_log_context=MagicMock(return_value="token"),
+        reset_log_context=MagicMock(),
+        refuse_job_start=AsyncMock(return_value=True),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_refused_start_fails_the_job_through_the_completion_ledger():
+    refusal = JobStartRefusal("unrouted_model", "Pinned model(s) have no endpoint")
+    dependencies = _refusing_delivery(
+        commands_on=True, build=AsyncMock(return_value=refusal)
+    )
+
+    assert not await dispatch_job_to_agent(
+        {"id": JOB_ID, "execution_lane": "pinned"},
+        {"id": "agent-1", "pod_ip": "10.0.0.1"},
+        dependencies=dependencies,
+    )
+
+    build_kwargs = dependencies.build_job_start_request.await_args.kwargs
+    assert build_kwargs["persist_dispatch_state"] is False
+    dependencies.refuse_job_start.assert_awaited_once_with(
+        JOB_ID,
+        reason="unrouted_model",
+        message="Pinned model(s) have no endpoint",
+        agent_id="agent-1",
+    )
+    # Nothing reaches the agent, and the status is the ledger's to write.
+    dependencies.prepare_pinned_job_mutation_target.assert_not_awaited()
+    dependencies.store.update_job_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_with_completion_commands_off_the_build_writes_the_refusal():
+    dependencies = _refusing_delivery(
+        commands_on=False, build=AsyncMock(return_value=None)
+    )
+
+    assert not await dispatch_job_to_agent(
+        {"id": JOB_ID, "execution_lane": "pinned"},
+        {"id": "agent-1", "pod_ip": "10.0.0.1"},
+        dependencies=dependencies,
+    )
+
+    build_kwargs = dependencies.build_job_start_request.await_args.kwargs
+    assert build_kwargs["persist_dispatch_state"] is True
+    dependencies.refuse_job_start.assert_not_awaited()
+
+
+def test_pinned_delivery_routes_refusals_to_the_completion_ledger():
+    import orchestrator.main as main
+    from orchestrator.application import controls as controls_composition
+    from orchestrator.services import job_completion
+
+    dependencies = controls_composition.job_delivery_operations(
+        main.app.state.resources
+    ).dependencies
+
+    assert dependencies.refuse_job_start.__wrapped__ is job_completion.refuse_job_start
+
+
+def _unavailable_model() -> ModelUnavailable:
+    return ModelUnavailable([UnavailableModel("llm", "MiniMax-M3", "disabled")])
+
+
+def _resume_refusal(case: str, *, commands_on: bool, monkeypatch):
+    """A resume that reaches one refusal; returns (dependencies, message).
+
+    ``message`` is ``None`` where the resume path composes the text itself.
+    """
+
+    decision = SimpleNamespace(
+        ready=True,
+        state="ready",
+        effective_backend="virtual",
+        reason=None,
+        safe_projection=lambda: {},
+    )
+    values = dict(
+        store=SimpleNamespace(
+            update_job_status=AsyncMock(),
+            fetchrow=AsyncMock(return_value=None),
+        ),
+        completion_commands_enabled=lambda: commands_on,
+        prepare_job_workspace_runtime=AsyncMock(
+            side_effect=lambda job: ("proceed", job, None)
+        ),
+        attest_pinned_k8s_job_workspace=AsyncMock(side_effect=lambda job: (job, None)),
+        redispatch_livelock_trip=MagicMock(return_value=None),
+        resume_missing_workspace=MagicMock(return_value=None),
+        resolve_authorized_job_datasources=AsyncMock(return_value=[]),
+        apply_cloud_storage_override=MagicMock(),
+        build_datasources_payload=MagicMock(return_value=None),
+        job_project_repositories=AsyncMock(return_value=None),
+        build_datasource_tool_override=MagicMock(side_effect=lambda ds, co: co),
+        inject_matching_workspace_config=MagicMock(
+            side_effect=lambda job, co, **kw: (co or {}, decision)
+        ),
+        authorize_job_repository_transport=AsyncMock(return_value=(None, None, None)),
+        apply_sticky_sudo_denial=MagicMock(side_effect=lambda job, co: co),
+        backend_from_override=MagicMock(return_value=None),
+        shell_connector_names=MagicMock(return_value=[]),
+        inject_lite_workspace_config=MagicMock(side_effect=lambda co, **kw: co),
+        is_experts_db_enabled=MagicMock(return_value=False),
+        user_experts_enabled=AsyncMock(return_value=False),
+        inject_dispatch_credentials=AsyncMock(side_effect=lambda job, co, **kw: co),
+        grant_violations_detail=MagicMock(
+            side_effect=lambda violations: f"denied: {violations[0]}"
+        ),
+        refuse_job_start=AsyncMock(return_value=True),
+    )
+    message: str | None
+    if case == "connector_unavailable":
+        values["resolve_authorized_job_datasources"] = AsyncMock(
+            side_effect=HTTPException(status_code=403, detail="gone")
+        )
+        message = "connector_unavailable"
+    elif case == "lite_shell_connector":
+        values["resolve_authorized_job_datasources"] = AsyncMock(
+            return_value=[{"id": "d1", "type": "repository", "name": "app"}]
+        )
+        values["backend_from_override"] = MagicMock(return_value="virtual")
+        values["shell_connector_names"] = MagicMock(return_value=["app"])
+        message = None
+    elif case == "lite_config":
+        values["backend_from_override"] = MagicMock(return_value="virtual")
+        values["inject_lite_workspace_config"] = MagicMock(
+            side_effect=LiteWorkspaceConfigError("no object store configured")
+        )
+        message = "no object store configured"
+    elif case == "grant_denied":
+        values.update(
+            user_experts_enabled=AsyncMock(return_value=True),
+            gather_in_scope_skills=AsyncMock(return_value=[]),
+            seed_registry_model_overrides=AsyncMock(return_value={}),
+            resolve_default_models=AsyncMock(return_value={}),
+            prefetch_roster_refs=AsyncMock(return_value={}),
+            enforce_dispatch_grants=AsyncMock(
+                side_effect=GrantDenied(["tools.shell not granted"])
+            ),
+        )
+        monkeypatch.setattr(
+            job_control_delivery_module,
+            "resolve_config",
+            lambda **kwargs: (kwargs["capture"].__setitem__("merged_fragment", {}))
+            or {"llm": {}},
+        )
+        message = "denied: tools.shell not granted"
+    elif case == "model_unavailable":
+        values["inject_dispatch_credentials"] = AsyncMock(
+            side_effect=_unavailable_model()
+        )
+        message = _unavailable_model().message(where=WHERE_JOB)
+    else:  # pragma: no cover - parametrization guard
+        raise AssertionError(case)
+    return _delivery(**values), message
+
+
+RESUME_REFUSALS = [
+    "connector_unavailable",
+    "lite_shell_connector",
+    "lite_config",
+    "grant_denied",
+    "model_unavailable",
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", RESUME_REFUSALS)
+async def test_a_refused_resume_fails_the_job_through_the_completion_ledger(
+    case, monkeypatch
+):
+    dependencies, message = _resume_refusal(
+        case, commands_on=True, monkeypatch=monkeypatch
+    )
+
+    assert not await resume_job_on_agent(
+        {"id": JOB_ID, "execution_lane": "pinned", "status": "paused"},
+        {"id": "agent-1", "pod_ip": "10.0.0.1"},
+        dependencies=dependencies,
+    )
+
+    dependencies.refuse_job_start.assert_awaited_once()
+    call = dependencies.refuse_job_start.await_args
+    assert call.args == (JOB_ID,)
+    assert call.kwargs["reason"] == case
+    assert call.kwargs["agent_id"] == "agent-1"
+    if message is None:
+        assert "lite tier" in call.kwargs["message"]
+        assert "app" in call.kwargs["message"]
+    else:
+        assert call.kwargs["message"] == message
+    dependencies.store.update_job_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", RESUME_REFUSALS)
+async def test_with_completion_commands_off_a_refused_resume_is_written(
+    case, monkeypatch
+):
+    dependencies, message = _resume_refusal(
+        case, commands_on=False, monkeypatch=monkeypatch
+    )
+
+    assert not await resume_job_on_agent(
+        {"id": JOB_ID, "execution_lane": "pinned", "status": "paused"},
+        {"id": "agent-1", "pod_ip": "10.0.0.1"},
+        dependencies=dependencies,
+    )
+
+    dependencies.refuse_job_start.assert_not_awaited()
+    dependencies.store.update_job_status.assert_awaited_once()
+    written = dependencies.store.update_job_status.await_args.kwargs
+    assert written["status"] == "failed"
+    if message is None:
+        assert "lite tier" in written["error_message"]
+    else:
+        assert written["error_message"] == message
 
 
 @pytest.mark.asyncio

@@ -86,6 +86,10 @@ from shared.workspace_contract import (
 logger = logging.getLogger(__name__)
 
 
+async def _start_refusal_not_routed(_job_id: str, **_refusal: Any) -> bool:
+    return False
+
+
 @dataclass(frozen=True)
 class UnitClaimBundleDependencies:
     """Everything the bundle needs from the application, per invocation.
@@ -121,6 +125,11 @@ class UnitClaimBundleDependencies:
     #: (``DeploymentSettings.session_subagent_fanout``), read at every claim.
     #: The default keeps fan-out off for a composition that does not wire it.
     session_subagent_fanout: Callable[[str], bool] = lambda _lane: False
+    #: Fails a worker job whose start bundle was refused through the
+    #: completion-command path, fenced by the claimant's lease
+    #: (``job_completion.refuse_job_start``, connector drivers decision 34).
+    #: The default admits nothing, so the claimant keeps retrying as before.
+    refuse_job_start: Callable[..., Awaitable[bool]] = _start_refusal_not_routed
 
 
 class _WorkspaceRecoveryRefusal(HTTPException):
@@ -700,6 +709,18 @@ async def _assemble_claim_bundle(
             deliver_connector_leases=False,
             dependencies=dependencies.job_start_bundle_dependencies(),
         )
+        if isinstance(job_start, job_start_bundle.JobStartRefusal):
+            # The build stays read-only for a stale claimant; the refusal is
+            # admitted as this lease's terminal report instead. The lease
+            # fence decides, and an admitted report closes the unit, so the
+            # job ends failed with its message and is not claimed again.
+            await dependencies.refuse_job_start(
+                unit_id,
+                reason=job_start.reason,
+                message=job_start.message,
+                lease_token=lease_token,
+            )
+            raise HTTPException(status_code=409, detail="Job bundle assembly refused")
         if job_start is None:
             raise HTTPException(status_code=409, detail="Job bundle assembly refused")
         job_start = job_start.model_copy(

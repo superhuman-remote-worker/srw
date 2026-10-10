@@ -14,6 +14,7 @@ import logging
 
 from orchestrator.application import (
     access as access_composition,
+    completion as completion_composition,
     controls as controls_composition,
     jobs as jobs_composition,
     preparation as preparation_composition,
@@ -38,6 +39,7 @@ from orchestrator.services import (
     dispatch_credentials,
     docker_provisioner as docker_provisioner_module,
     grant_enforcement,
+    job_completion,
     job_datasource_selection,
     job_dispatcher,
     managed_repository_authority,
@@ -731,6 +733,13 @@ def unit_claim_bundle_dependencies(
         attest_stateless_claimant=stateless_claimant_attestation.build_claimant_attestor(),
         session_subagent_fanout=lambda lane: (
             resources.settings.session_subagent_fanout(lane)
+        ),
+        # A refused worker start fails the job through the completion-command
+        # path, fenced by the claimant's lease (decision 34).
+        refuse_job_start=bound(
+            job_completion.refuse_job_start,
+            completion_composition.job_completion_dependencies,
+            resources,
         ),
     )
 

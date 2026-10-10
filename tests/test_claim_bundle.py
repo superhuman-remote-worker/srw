@@ -1039,6 +1039,113 @@ async def test_worker_bundle_reuses_job_start_builder_and_rechecks_lease(monkeyp
     }
 
 
+def _refusing_worker_claim(monkeypatch, orch_main, built):
+    """A leased worker claim whose start bundle returns ``built``."""
+
+    row = dict(LEASED_ROW, unit_kind="worker_batch")
+    job = {
+        "id": UNIT_ID,
+        "execution_lane": "stateless",
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "context": _worker_job_context(
+            {"status": "ready", "provisioner": "k8s", "pod_ip": "10.0.0.8"}
+        ),
+    }
+    db = FakeDB(run_queue_row=row, thread=None, job=job)
+    monkeypatch.setattr(access_module, "require_internal", AsyncMock())
+    monkeypatch.setattr(orch_main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(
+        job_start_bundle, "build_job_start_request", AsyncMock(return_value=built)
+    )
+    monkeypatch.setattr(
+        job_workspace_authority,
+        "resolve_subjob_inherited_workspace",
+        AsyncMock(return_value=("proceed", None)),
+    )
+    attest = _patch_worker_attestation(monkeypatch, orch_main)
+    refuse = AsyncMock(return_value=True)
+    dependencies = dataclasses.replace(
+        sessions_composition.unit_claim_bundle_dependencies(
+            orch_main.app.state.resources
+        ),
+        refuse_job_start=refuse,
+    )
+    return db, attest, refuse, dependencies
+
+
+@pytest.mark.asyncio
+async def test_a_refused_worker_start_fails_the_job_under_the_claim_lease(
+    monkeypatch,
+):
+    """Connector drivers decision 34: the build stays read-only, and the
+    refusal is admitted as this lease's terminal report."""
+    from orchestrator import main as orch_main
+
+    refusal = job_start_bundle.JobStartRefusal(
+        "connector_unavailable", "connector_unavailable"
+    )
+    db, attest, refuse, dependencies = _refusing_worker_claim(
+        monkeypatch, orch_main, refusal
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=dependencies,
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Job bundle assembly refused"
+    refuse.assert_awaited_once_with(
+        UNIT_ID,
+        reason="connector_unavailable",
+        message="connector_unavailable",
+        lease_token=7,
+    )
+    # No credential crosses the boundary: the confirming attestation and the
+    # final lease recheck never run.
+    assert attest.await_count == 1
+    assert not any(
+        "SELECT EXISTS (SELECT 1 FROM run_queue" in call.args[0]
+        for call in db.conn.fetchval.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_worker_bundle_that_is_not_ready_is_not_a_refusal(monkeypatch):
+    from orchestrator import main as orch_main
+
+    _db, _attest, refuse, dependencies = _refusing_worker_claim(
+        monkeypatch, orch_main, None
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=dependencies,
+        )
+
+    assert exc.value.status_code == 409
+    refuse.assert_not_awaited()
+
+
+def test_the_claim_bundle_routes_refusals_to_the_completion_ledger():
+    from orchestrator import main as orch_main
+    from orchestrator.services import job_completion
+
+    dependencies = sessions_composition.unit_claim_bundle_dependencies(
+        orch_main.app.state.resources
+    )
+
+    assert dependencies.refuse_job_start.__wrapped__ is job_completion.refuse_job_start
+
+
 @pytest.mark.asyncio
 async def test_a_stateless_job_claim_never_waits_on_a_bind(monkeypatch):
     """D6 re-review: the dispatcher's preflight already held the job until

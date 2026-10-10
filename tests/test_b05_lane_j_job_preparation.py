@@ -2505,19 +2505,19 @@ class TestJobStartBundle:
         self, bundle_env, monkeypatch
     ):
         """Credential resolution can outlive the queue lease, so the whole
-        build must be read-only from a stale claimant's point of view."""
+        build must be read-only from a stale claimant's point of view. The
+        refusal comes back for the claim owner to submit under its fence."""
         monkeypatch.setattr(
             job_datasource_selection_module,
             "resolve_authorized_job_datasources",
             AsyncMock(side_effect=HTTPException(status_code=403, detail="gone")),
         )
-        assert (
-            await job_start_bundle.build_job_start_request(
-                _bundle_job(),
-                persist_dispatch_state=False,
-                dependencies=_start_bundle_deps(),
-            )
-            is None
+        assert await job_start_bundle.build_job_start_request(
+            _bundle_job(),
+            persist_dispatch_state=False,
+            dependencies=_start_bundle_deps(),
+        ) == job_start_bundle.JobStartRefusal(
+            "connector_unavailable", "connector_unavailable"
         )
         assert bundle_env.status_writes == []
 
@@ -2909,6 +2909,347 @@ class TestJobStartBundle:
         assert (
             await job_start_bundle.build_job_start_request(
                 _bundle_job(), dependencies=_start_bundle_deps()
+            )
+            is None
+        )
+
+
+# Start refusals under completion commands (connector drivers decision 34).
+# Each scenario sets up one refusal and returns the job; the class runs it
+# with and without persistence and compares what each mode produced.
+
+
+def _refuse_connector(monkeypatch):
+    monkeypatch.setattr(
+        job_datasource_selection_module,
+        "resolve_authorized_job_datasources",
+        AsyncMock(side_effect=HTTPException(status_code=403, detail="gone")),
+    )
+    return _bundle_job()
+
+
+def _refuse_workspace_contract(monkeypatch):
+    job = _bundle_job(backend="sandbox")
+    job["context"]["workspace_container"] = {"status": "failed"}
+    return job
+
+
+def _refuse_lite_shell_connector(monkeypatch):
+    monkeypatch.setattr(
+        job_datasource_selection_module,
+        "resolve_authorized_job_datasources",
+        AsyncMock(
+            return_value=[
+                {
+                    "id": "d1",
+                    "type": "repository",
+                    "name": "app",
+                    "project_read_only": False,
+                }
+            ]
+        ),
+    )
+    return _bundle_job()
+
+
+def _refuse_lite_config(monkeypatch):
+    def boom(config_override, prefix=None):
+        raise workspace_tier_policy_module.LiteWorkspaceConfigError(
+            "no object store configured"
+        )
+
+    monkeypatch.setattr(
+        workspace_tier_policy_module, "inject_lite_workspace_config", boom
+    )
+    return _bundle_job()
+
+
+def _refuse_missing_ssh_remote(monkeypatch):
+    job = _bundle_job(backend="sandbox")
+    job["context"]["workspace_container"] = READY_CONTAINER
+    monkeypatch.setattr(
+        managed_repository_authority_module,
+        "authorize_job_repository_transport",
+        AsyncMock(return_value=(None, None, [])),
+    )
+    monkeypatch.setattr(
+        job_start_bundle,
+        "inject_matching_workspace_config",
+        lambda *a, **kw: (
+            {"workspace": {"backend": "sandbox"}},
+            SimpleNamespace(
+                ready=True,
+                state="ready",
+                effective_backend="sandbox",
+                reason=None,
+                safe_projection=lambda: {"backend": "sandbox"},
+            ),
+        ),
+    )
+    return job
+
+
+def _resolving_experts(monkeypatch, *, grants_on, model="m"):
+    monkeypatch.setattr(deployment_gates_module, "is_experts_db_enabled", lambda: True)
+    monkeypatch.setattr(
+        grant_enforcement_module,
+        "user_experts_enabled",
+        AsyncMock(return_value=grants_on),
+    )
+    monkeypatch.setattr(
+        session_config_resolution_module,
+        "resolve_default_models",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        catalogue_composition,
+        "expert_catalog_service",
+        lambda _resources: SimpleNamespace(
+            gather_in_scope_skills=AsyncMock(return_value=[])
+        ),
+    )
+    monkeypatch.setattr(
+        dispatch_credentials_module,
+        "seed_registry_model_overrides",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        session_config_resolution_module,
+        "prefetch_roster_refs",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        config_resolver_module,
+        "resolve_config",
+        lambda **kwargs: (kwargs["capture"].__setitem__("merged_fragment", {}))
+        or {"llm": {"model": model}},
+    )
+
+
+def _frozen_snapshot(monkeypatch, *, grants_on):
+    monkeypatch.setattr(
+        job_start_bundle, "read_execution", AsyncMock(return_value={"frozen": True})
+    )
+    monkeypatch.setattr(
+        job_start_bundle,
+        "srw_snapshot_config",
+        lambda _snapshot: (
+            {"agent": {"llm": {"model": "MiniMax-M3"}}},
+            {"workspace": {"backend": "virtual"}},
+        ),
+    )
+    monkeypatch.setattr(
+        job_start_bundle,
+        "apply_srw_delivery_bindings",
+        lambda blob, policy, _override: (blob, policy),
+    )
+    monkeypatch.setattr(
+        grant_enforcement_module,
+        "user_experts_enabled",
+        AsyncMock(return_value=grants_on),
+    )
+
+
+def _deny_grants(monkeypatch):
+    monkeypatch.setattr(
+        grant_enforcement_module,
+        "enforce_dispatch_grants",
+        AsyncMock(
+            side_effect=grant_enforcement_module.GrantDenied(
+                ["tools.shell not granted"]
+            )
+        ),
+    )
+
+
+def _unavailable_model():
+    from orchestrator.services.model_availability import (
+        ModelUnavailable,
+        UnavailableModel,
+    )
+
+    return ModelUnavailable([UnavailableModel("llm", "MiniMax-M3", "disabled")])
+
+
+def _refuse_grant_denied(monkeypatch):
+    _resolving_experts(monkeypatch, grants_on=True)
+    _deny_grants(monkeypatch)
+    return _bundle_job()
+
+
+def _refuse_frozen_grant_denied(monkeypatch):
+    _frozen_snapshot(monkeypatch, grants_on=True)
+    _deny_grants(monkeypatch)
+    return _bundle_job()
+
+
+def _refuse_model_unavailable(monkeypatch):
+    _resolving_experts(monkeypatch, grants_on=False, model="MiniMax-M3")
+    monkeypatch.setattr(
+        config_resolver_module,
+        "inject_blob_credentials",
+        AsyncMock(side_effect=_unavailable_model()),
+    )
+    return _bundle_job()
+
+
+def _refuse_frozen_model_unavailable(monkeypatch):
+    _frozen_snapshot(monkeypatch, grants_on=False)
+    monkeypatch.setattr(
+        config_resolver_module,
+        "inject_blob_credentials",
+        AsyncMock(side_effect=_unavailable_model()),
+    )
+    return _bundle_job()
+
+
+def _refuse_flat_model_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        job_dispatch_credentials_module,
+        "inject_dispatch_credentials",
+        AsyncMock(side_effect=_unavailable_model()),
+    )
+    return _bundle_job()
+
+
+def _refuse_unrouted_model(monkeypatch):
+    _resolving_experts(monkeypatch, grants_on=False, model="pinned")
+    monkeypatch.setattr(
+        config_resolver_module,
+        "inject_blob_credentials",
+        AsyncMock(side_effect=lambda resolved, inject: resolved),
+    )
+    monkeypatch.setattr(
+        job_start_bundle, "unrouted_model_slots", lambda resolved: ["llm.model"]
+    )
+    return _bundle_job()
+
+
+def _refuse_connector_bind(monkeypatch):
+    from orchestrator.services import connector_bind_time, connector_credential_leases
+
+    monkeypatch.setattr(
+        connector_credential_leases, "prepare_lease_delivery", AsyncMock()
+    )
+    monkeypatch.setattr(
+        connector_credential_leases,
+        "deliver_connector_leases_with",
+        AsyncMock(
+            side_effect=connector_bind_time.BindTimeRefused(
+                "connector 'gitea' failed to bind: image refused"
+            )
+        ),
+    )
+    return _bundle_job()
+
+
+START_REFUSALS = {
+    "connector_unavailable": _refuse_connector,
+    "workspace_contract": _refuse_workspace_contract,
+    "lite_shell_connector": _refuse_lite_shell_connector,
+    "lite_config": _refuse_lite_config,
+    "missing_ssh_remote": _refuse_missing_ssh_remote,
+    "grant_denied": _refuse_grant_denied,
+    "grant_denied/frozen": _refuse_frozen_grant_denied,
+    "model_unavailable": _refuse_model_unavailable,
+    "model_unavailable/frozen": _refuse_frozen_model_unavailable,
+    "model_unavailable/flat": _refuse_flat_model_unavailable,
+    "unrouted_model": _refuse_unrouted_model,
+    "connector_bind_refused": _refuse_connector_bind,
+}
+
+
+class TestStartRefusalsUnderCompletionCommands:
+    """A build that does not persist hands every refusal that fails the job
+    back as a JobStartRefusal with the message a persisting build writes."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("case", sorted(START_REFUSALS))
+    async def test_the_refusal_carries_the_message_the_persisting_build_writes(
+        self, bundle_env, monkeypatch, case
+    ):
+        job = START_REFUSALS[case](monkeypatch)
+
+        persisted = await job_start_bundle.build_job_start_request(
+            json.loads(json.dumps(job)), dependencies=_start_bundle_deps()
+        )
+        # Unchanged with completion commands off: written here, nothing back.
+        assert persisted is None
+        assert len(bundle_env.status_writes) == 1
+        written = bundle_env.status_writes[0][1]
+        assert written["status"] == "failed"
+        bundle_env.status_writes.clear()
+        bundle_env.resolved_config_writes.clear()
+
+        refusal = await job_start_bundle.build_job_start_request(
+            json.loads(json.dumps(job)),
+            persist_dispatch_state=False,
+            dependencies=_start_bundle_deps(),
+        )
+
+        assert refusal == job_start_bundle.JobStartRefusal(
+            case.split("/")[0], written["error_message"]
+        )
+        assert bundle_env.status_writes == []
+        assert bundle_env.resolved_config_writes == []
+
+    @pytest.mark.asyncio
+    async def test_a_workspace_still_coming_up_is_not_a_refusal(self, bundle_env):
+        job = _bundle_job(backend="sandbox")
+        job["context"]["workspace_container"] = {"status": "provisioning"}
+
+        assert (
+            await job_start_bundle.build_job_start_request(
+                job, persist_dispatch_state=False, dependencies=_start_bundle_deps()
+            )
+            is None
+        )
+        assert bundle_env.status_writes == []
+
+    @pytest.mark.asyncio
+    async def test_a_bind_still_running_is_not_a_refusal(self, bundle_env, monkeypatch):
+        from orchestrator.services import (
+            connector_bind_time,
+            connector_credential_leases,
+        )
+
+        monkeypatch.setattr(
+            connector_credential_leases, "prepare_lease_delivery", AsyncMock()
+        )
+        monkeypatch.setattr(
+            connector_credential_leases,
+            "deliver_connector_leases_with",
+            AsyncMock(side_effect=connector_bind_time.BindTimePending("binding")),
+        )
+
+        assert (
+            await job_start_bundle.build_job_start_request(
+                _bundle_job(),
+                persist_dispatch_state=False,
+                dependencies=_start_bundle_deps(),
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_unavailable_repository_authority_is_not_a_refusal(
+        self, bundle_env, monkeypatch
+    ):
+        job = _bundle_job(backend="sandbox")
+        job["context"]["workspace_container"] = READY_CONTAINER
+        monkeypatch.setattr(
+            managed_repository_authority_module,
+            "authorize_job_repository_transport",
+            AsyncMock(
+                side_effect=managed_repository_authority_module.ManagedRepositoryAuthorityError(
+                    "repository_unavailable"
+                )
+            ),
+        )
+
+        assert (
+            await job_start_bundle.build_job_start_request(
+                job, persist_dispatch_state=False, dependencies=_start_bundle_deps()
             )
             is None
         )

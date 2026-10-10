@@ -25,6 +25,7 @@ from orchestrator.services.config_resolver import (
 from orchestrator.services.container_provisioner import WorkspaceRuntimeAuthorityError
 from orchestrator.services.datasource_policy import SHELL_WORKSPACE_DETAIL
 from orchestrator.services.grant_enforcement import GrantDenied
+from orchestrator.services.job_start_bundle import JobStartRefusal
 from orchestrator.services.model_availability import WHERE_JOB, ModelUnavailable
 from orchestrator.services.managed_repository_authority import (
     ManagedRepositoryAuthorityError,
@@ -129,6 +130,10 @@ class JobDeliveryDependencies:
     grant_violations_detail: Callable[..., Any]
     mint_worker_runtime_actor: Callable[..., Any]
     resume_reject_should_requeue: Callable[..., Any]
+    #: Fails a claimed job whose start was refused through the completion-
+    #: command path (``job_completion.refuse_job_start``, connector drivers
+    #: decision 34). Used only while completion commands own job status.
+    refuse_job_start: Callable[..., Any]
 
 
 class JobDeliveryOperations:
@@ -210,6 +215,17 @@ async def dispatch_job_to_agent(
             job,
             persist_dispatch_state=not dependencies.completion_commands_enabled(),
         )
+        if isinstance(job_start, JobStartRefusal):
+            # Completion commands own the status, so the refusal fails the job
+            # through the ledger under this claim's fence. Left to the lease,
+            # it would be claimed again on a fresh agent at every expiry.
+            await dependencies.refuse_job_start(
+                job_id,
+                reason=job_start.reason,
+                message=job_start.message,
+                agent_id=agent_id,
+            )
+            return False
         if job_start is None:
             return False
 
@@ -362,11 +378,16 @@ async def dispatch_job_to_agent(
 
 
 async def _refuse_unavailable_model_resume(
-    job: dict[str, Any], unavailable: ModelUnavailable, dependencies: Any
+    job: dict[str, Any],
+    unavailable: ModelUnavailable,
+    dependencies: Any,
+    *,
+    agent_id: str,
 ) -> None:
     """Refuse a resume whose configured model cannot run, naming it
     (unavailable_model_handling.md §5). Mirrors the grant-denial branch: the
-    job fails with the message unless completion commands own job status."""
+    job fails with the message, through the completion-command path while
+    completion commands own job status."""
     dependencies.logger.warning(
         "Resume refused for job %s: unavailable model slot(s) %s",
         job.get("id"),
@@ -377,6 +398,13 @@ async def _refuse_unavailable_model_resume(
             str(job["id"]),
             status="failed",
             error_message=unavailable.message(where=WHERE_JOB),
+        )
+    else:
+        await dependencies.refuse_job_start(
+            str(job["id"]),
+            reason="model_unavailable",
+            message=unavailable.message(where=WHERE_JOB),
+            agent_id=agent_id,
         )
 
 
@@ -490,6 +518,13 @@ async def resume_job_on_agent(
                     job_id,
                     status="failed",
                     error_message="connector_unavailable",
+                )
+            else:
+                await dependencies.refuse_job_start(
+                    job_id,
+                    reason="connector_unavailable",
+                    message="connector_unavailable",
+                    agent_id=agent_id,
                 )
             return False
 
@@ -624,6 +659,13 @@ async def resume_job_on_agent(
                     await dependencies.store.update_job_status(
                         job_id=job_id, status="failed", error_message=msg
                     )
+                else:
+                    await dependencies.refuse_job_start(
+                        job_id,
+                        reason="lite_shell_connector",
+                        message=msg,
+                        agent_id=agent_id,
+                    )
                 return False
             try:
                 config_override = dependencies.inject_lite_workspace_config(
@@ -636,6 +678,13 @@ async def resume_job_on_agent(
                 if not dependencies.completion_commands_enabled():
                     await dependencies.store.update_job_status(
                         job_id=job_id, status="failed", error_message=str(exc)
+                    )
+                else:
+                    await dependencies.refuse_job_start(
+                        job_id,
+                        reason="lite_config",
+                        message=str(exc),
+                        agent_id=agent_id,
                     )
                 return False
 
@@ -702,7 +751,9 @@ async def resume_job_on_agent(
                 dependencies.logger.warning("Resume denied for job %s: %s", job_id, gd)
                 return False
             except ModelUnavailable as unavailable:
-                await _refuse_unavailable_model_resume(job, unavailable, dependencies)
+                await _refuse_unavailable_model_resume(
+                    job, unavailable, dependencies, agent_id=agent_id
+                )
                 return False
         elif resolved_resume_supported or user_experts_enabled:
             try:
@@ -780,9 +831,18 @@ async def resume_job_on_agent(
                             gd.violations
                         ),
                     )
+                else:
+                    await dependencies.refuse_job_start(
+                        job_id,
+                        reason="grant_denied",
+                        message=dependencies.grant_violations_detail(gd.violations),
+                        agent_id=agent_id,
+                    )
                 return False
             except ModelUnavailable as unavailable:
-                await _refuse_unavailable_model_resume(job, unavailable, dependencies)
+                await _refuse_unavailable_model_resume(
+                    job, unavailable, dependencies, agent_id=agent_id
+                )
                 return False
 
         # The blob and flat fallback are mutually exclusive on the wire. Inject
@@ -797,7 +857,9 @@ async def resume_job_on_agent(
                     include_kb_profile=has_knowledge_scope,
                 )
             except ModelUnavailable as unavailable:
-                await _refuse_unavailable_model_resume(job, unavailable, dependencies)
+                await _refuse_unavailable_model_resume(
+                    job, unavailable, dependencies, agent_id=agent_id
+                )
                 return False
             injected_env_keys = (config_override.get("env_keys") or {}).keys()
         else:

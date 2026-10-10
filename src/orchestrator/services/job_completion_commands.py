@@ -321,8 +321,14 @@ async def accept_completion_command(
     pinned_pod_uid: str | None = None,
     code_version: str | None = None,
     status_reorder_enabled: bool = False,
+    expected_job_status: str | None = None,
 ) -> CompletionAcceptResult:
-    """Accept one immutable completion report in a short fenced transaction."""
+    """Accept one immutable completion report in a short fenced transaction.
+
+    ``expected_job_status`` additionally requires the job's status under the
+    jobs-row lock: a server-side report for a claim (a refused job start)
+    loses to any control that moved the row first, before anything is written.
+    """
 
     job_uuid = UUID(str(job_id))
     canonical_payload = canonical_completion_payload(payload)
@@ -421,6 +427,12 @@ async def accept_completion_command(
                 job.get("context"), now_epoch=job.get("db_now_epoch")
             ):
                 raise CompletionControlInProgress
+            if expected_job_status is not None and str(job["status"]) != str(
+                expected_job_status
+            ):
+                raise CompletionFenceRejected(
+                    "job status changed before the report was admitted"
+                )
 
             if (
                 job["execution_lane"] == "pinned"
