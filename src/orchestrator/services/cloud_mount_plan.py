@@ -70,6 +70,7 @@ from orchestrator.services.in_pod_mount import (
     InPodPlaneSettings,
     SidecarSpec,
 )
+from orchestrator.services.officer_metadata import officer_meta_enabled
 from orchestrator.services.protected_cloud_engage import (
     _ro_mount_matches_protected_selection,
 )
@@ -470,13 +471,18 @@ def _container_rclone_allowed() -> bool:
 
 
 def _officer(metadata: Mapping[str, Any]) -> bool:
+    """An officer session: its ``officer.enabled`` is on. Every session's
+    override carries an ``officer`` block (creation materializes
+    ``{"enabled": false, "conference": false}``), so the block alone says
+    nothing."""
     override = metadata.get("config_override")
     if isinstance(override, str):
         try:
             override = json.loads(override)
         except ValueError:
             return False
-    return isinstance(override, Mapping) and bool(override.get("officer"))
+    officer = override.get("officer") if isinstance(override, Mapping) else None
+    return isinstance(officer, dict) and officer_meta_enabled(officer)
 
 
 async def resolve_cloud_mount_plan(

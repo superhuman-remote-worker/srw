@@ -35,6 +35,9 @@ from orchestrator.services.cloud_mount_sidecar import (
     recorded_sidecar_plan,
 )
 from orchestrator.services.in_pod_mount import InPodPlaneSettings
+from orchestrator.services.session_class_policy import (
+    materialized_session_class_override,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 THREAD_ID = "33333333-3333-4333-8333-333333333333"
@@ -207,7 +210,18 @@ async def test_a_plan_rebuilds_from_what_its_pod_recorded(monkeypatch):
     [
         ("plane off", {"settings": None}),
         ("sync driver", {"dependencies": _deps(driver="sync")}),
-        ("officer", {"thread": _thread(config_override={"officer": {"post": "x"}})}),
+        (
+            "officer",
+            {
+                "thread": _thread(
+                    config_override={
+                        "officer": materialized_session_class_override(
+                            {"officer": {"enabled": True}}
+                        )
+                    }
+                )
+            },
+        ),
         # No runtime authority, so no grant of this runtime (Phase B below).
         ("protected without a grant", {"thread": _thread(protected_cloud=True)}),
         ("malformed protected marker", {"thread": _thread(protected_cloud="yes")}),
@@ -215,6 +229,25 @@ async def test_a_plan_rebuilds_from_what_its_pod_recorded(monkeypatch):
 )
 async def test_opted_out_sessions_keep_the_old_path(monkeypatch, why, kwargs):
     assert await _resolve(monkeypatch, [_entry()], **kwargs) is None, why
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "officer",
+    [
+        # What creation materializes on every session's override.
+        materialized_session_class_override({}),
+        materialized_session_class_override({"officer": {"conference": True}}),
+        {"enabled": False},
+        {},
+    ],
+)
+async def test_a_session_that_is_no_officer_gets_the_plane(monkeypatch, officer):
+    """Every session's override carries an officer block; only an enabled one
+    keeps the old path (every k3d gate session fell back before)."""
+    thread = _thread(config_override={"officer": officer})
+    plan = await _resolve(monkeypatch, [_entry()], thread=thread)
+    assert plan is not None and len(plan.mounts) == 1
 
 
 @pytest.mark.asyncio
