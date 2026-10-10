@@ -128,6 +128,13 @@ compile_cloudignore() {
 """
 
 
+#: Non-secret source keys that may join a resident mount's identity
+#: (``nextcloud_chunk_size`` is "0" for a Nextcloud Group Folder).
+_IDENTITY_SOURCE_KEYS = frozenset(
+    {"url", "vendor", "user", "encoding", "nextcloud_chunk_size"}
+)
+
+
 class RcloneMountError(RuntimeError):
     """Raised when a lazy cloud mount cannot be started."""
 
@@ -770,7 +777,7 @@ echo "{_OK}"
 
         source = mount.get("source") or {}
         source_keys = {str(key) for key in dict(source.get("config") or {})}
-        if source_keys - {"url", "vendor", "user", "encoding"}:
+        if source_keys - _IDENTITY_SOURCE_KEYS:
             return False
         if mount.get("provider_flags"):
             return False
@@ -1034,7 +1041,7 @@ fi
         source_config = {
             str(key): value
             for key, value in dict(source.get("config") or {}).items()
-            if str(key) in {"url", "vendor", "user", "encoding"}
+            if str(key) in _IDENTITY_SOURCE_KEYS
         }
         auth = mount.get("auth") or {}
         safe_spec = {

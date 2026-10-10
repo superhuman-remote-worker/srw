@@ -552,3 +552,39 @@ class TestUninitialized:
         with pytest.raises(CloudBackendError) as ei:
             await be.list_project_folder(_handle())
         assert ei.value.kind == CloudBackendErrorKind.UNAVAILABLE
+
+
+class TestRcloneMountSpec:
+    """rclone's nextcloud vendor builds chunked uploads from a
+    /dav/files/<user>/ URL and refuses any other ("the remote url looks
+    incorrect"): a Group Folder's /dav/groupfolders/ URL mounts with
+    whole-file uploads, every other surface keeps chunking."""
+
+    @pytest.mark.asyncio
+    async def test_a_group_folder_mounts_without_chunked_uploads(self):
+        be = NextcloudBackend(_nc_test_settings())
+        spec = await be.build_rclone_mount_spec(
+            handle=_handle(),
+            mount_kind="project",
+            target_path="/cloud/test",
+            access="read_write",
+        )
+        assert spec.source_config["url"].startswith(
+            f"{NEXTCLOUD_BASE}/remote.php/dav/groupfolders/{AGENT_USER}/"
+        )
+        assert spec.source_config["nextcloud_chunk_size"] == "0"
+        assert spec.source_config["vendor"] == "nextcloud"
+
+    @pytest.mark.asyncio
+    async def test_a_session_folder_keeps_chunked_uploads(self):
+        from orchestrator.services.cloud import SessionFolderHandle
+
+        be = NextcloudBackend(_nc_test_settings())
+        spec = await be.build_rclone_mount_spec(
+            handle=SessionFolderHandle(backend="nextcloud", native_id="sessions/ab"),
+            mount_kind="session_folder",
+            target_path="/cloud/home",
+            access="read_write",
+        )
+        assert "/remote.php/dav/files/" in spec.source_config["url"]
+        assert "nextcloud_chunk_size" not in spec.source_config

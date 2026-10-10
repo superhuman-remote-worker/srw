@@ -1469,3 +1469,14 @@ def test_staged_script_has_remote_kill_budget_before_ssh_timeout():
     command, ssh_timeout = backend.commands[-1]
     assert "timeout --signal=TERM --kill-after=5s 17s bash" in command
     assert ssh_timeout == 57
+
+
+def test_a_group_folder_mount_stays_adoptable():
+    """``nextcloud_chunk_size`` is not a secret: a Group Folder mount (which
+    sets it to 0) may still adopt its resident rclone."""
+    cfg = _cloud_mount_cfg()
+    mount = cfg["mounts"][0]
+    mount["source"]["config"]["nextcloud_chunk_size"] = "0"
+    assert RcloneMountManager._resident_adoption_safe(mount) is True
+    mount["source"]["config"]["bearer_token"] = "t"
+    assert RcloneMountManager._resident_adoption_safe(mount) is False

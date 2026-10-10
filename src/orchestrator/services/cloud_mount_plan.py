@@ -116,8 +116,9 @@ _FLAG = re.compile(
     r"|no-modtime|no-checksum)(=[^\x00-\x1f\x7f]*)?"
 )
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
-#: The non-secret source keys a sidecar mount may carry.
-_SOURCE_KEYS = ("url", "vendor", "user")
+#: The non-secret source keys a sidecar mount may carry (written to the
+#: credential file beside the password, in this order).
+_SOURCE_KEYS = ("url", "vendor", "user", "nextcloud_chunk_size")
 _CACHE_FLAGS = {
     "vfs_cache_mode": "--vfs-cache-mode",
     "vfs_cache_max_age": "--vfs-cache-max-age",

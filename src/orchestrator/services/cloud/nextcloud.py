@@ -548,6 +548,7 @@ class NextcloudBackend:
         prefer_public_url: bool = False,
     ) -> RcloneMountSpec:
         """Build an rclone WebDAV spec for a Nextcloud-backed cloud surface."""
+        group_folder = False
         if isinstance(handle, SessionFolderHandle):
             webdav_url = self.get_session_folder_webdav_url(handle)
             creds = self.webdav_credentials
@@ -563,6 +564,7 @@ class NextcloudBackend:
             else:
                 webdav_url = self.get_project_folder_webdav_url(handle)
                 creds = self.webdav_credentials
+                group_folder = True
 
         # Cross-cluster VM runtimes can't reach the internal service URL; swap
         # to the public edge (no-op unless the URL is internal-prefixed). Mirror
@@ -589,13 +591,21 @@ class NextcloudBackend:
                 backend=self.backend_id,
             )
 
+        source_config = {
+            "url": webdav_url,
+            "vendor": "nextcloud",
+            "user": creds["username"],
+        }
+        if group_folder:
+            # rclone's nextcloud vendor uploads in chunks through
+            # /dav/uploads/<user>/, which it derives from a /dav/files/<user>/
+            # URL; a Group Folder's /dav/groupfolders/ URL has no such user
+            # home, so rclone refuses to build the remote at all ("the
+            # remote url looks incorrect"). Whole-file uploads work there.
+            source_config["nextcloud_chunk_size"] = "0"
         return RcloneMountSpec(
             source_type="webdav",
-            source_config={
-                "url": webdav_url,
-                "vendor": "nextcloud",
-                "user": creds["username"],
-            },
+            source_config=source_config,
             auth={"type": "basic", "password": creds["password"]},
             cache={
                 "vfs_cache_mode": "full",

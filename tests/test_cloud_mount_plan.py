@@ -868,3 +868,28 @@ async def test_the_grant_is_awaited_before_the_lock(monkeypatch):
         {**_protected_thread(), "metadata": {}}, dependencies=_protected_deps()
     )
     resolver.assert_not_awaited()
+
+
+def test_a_group_folder_keeps_whole_file_uploads_in_the_credential_file():
+    """The Nextcloud adapter turns chunked uploads off for a Group Folder;
+    the sidecar must hand rclone that key or it refuses the remote."""
+    entry = _entry()
+    entry["source"]["config"]["url"] = (
+        "http://srw-nextcloud/remote.php/dav/groupfolders/agent-service/p x/"
+    )
+    entry["source"]["config"]["nextcloud_chunk_size"] = "0"
+    built = cloud_mount_plan._sidecar_mount(0, entry, cache_bytes=1 << 30)
+    assert built is not None
+    mount, password = built
+    plan = CloudMountPlan(
+        mounts=(mount,),
+        excluded=(),
+        drain_seconds=60,
+        cache_size="10Gi",
+        passwords={0: password},
+    )
+    assert "nextcloud_chunk_size = 0\n" in plan.rclone_config()
+    recorded = plan.recorded()
+    assert recorded["mounts"][0]["remote"]["nextcloud_chunk_size"] == "0"
+    rebuilt = CloudMountPlan.from_recorded(recorded, plan.passwords_by_mount_id())
+    assert rebuilt == plan
