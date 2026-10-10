@@ -1009,12 +1009,25 @@ class CloudMountSidecarGate:
             self.moved_folders[folder_id] = mountpoint
             if self.occ(["groupfolders:rename", folder_id, f"{self.gate_id}-moved"]):
                 raise GateError(f"could not move group folder {folder_id}")
+        # The project's own cloud folder connector, alone: the session's
+        # folders are its attached connectors (main cloud slice 3), and an
+        # omitted list would attach the owner's session outbox beside it.
+        folder = wait_for(
+            f"project {label}'s cloud folder connector",
+            lambda: sql(
+                "SELECT id FROM datasources WHERE managed_key = "
+                f"{lit('project-cloud:' + project)}"
+            ),
+            timeout=180,
+            interval=5,
+        )
         body: dict[str, Any] = {
             "title": self.title(label),
             "permission_mode": "autonomous",
             "project_id": project,
             "config_override": {"workspace": {"backend": "sandbox"}},
             "model": self.args.model,
+            "datasource_ids": [folder],
         }
         if protected:
             body["protected_cloud"] = True
