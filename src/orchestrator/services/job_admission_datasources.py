@@ -68,7 +68,8 @@ class JobAdmissionDatasourcesDependencies:
     filter_implicit_lite_ids: Callable[[list[str], str | None], Awaitable[list[str]]]
     authorize_selection: AuthorizeDatasourceSelection
     # ``datasource_policy.default_datasource_selection`` over the store:
-    # ``(owner, projects, backend, *, execution_kind, native_only=False)``.
+    # ``(owner, projects, backend, *, execution_kind, native_only=False,
+    # unattended=False)``.
     default_selection: Callable[..., Awaitable[tuple[list[str], dict[str, int]]]]
     defaults_on_omission: Callable[[], bool]
     selection_provenance: DatasourceSelectionProvenance
@@ -102,7 +103,15 @@ async def prepare_job_admission_datasources(
     internal_call: bool,
     internal_origin_bound: bool,
     dependencies: JobAdmissionDatasourcesDependencies,
+    unattended: bool = False,
 ) -> JobAdmissionDatasources:
+    """Choose the job's connectors: explicit, inherited, or the defaults.
+
+    ``unattended`` is work nobody started by hand (an officer's ticket): its
+    defaults leave the owner's outbox out, as the officer's auto-pull, a
+    loop's iteration and an automation's fire do
+    (``datasource_policy.default_datasource_selection``).
+    """
     job = command
     # Resolve one complete attachment set before persistence. Presence —
     # not truthiness — distinguishes an explicit [] from omission.
@@ -237,6 +246,7 @@ async def prepare_job_admission_datasources(
                 lite_backend,
                 execution_kind="job",
                 native_only=not every_default,
+                unattended=unattended,
             )
         except Exception as exc:
             from orchestrator.services.datasource_policy import (

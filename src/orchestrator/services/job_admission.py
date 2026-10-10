@@ -148,6 +148,8 @@ async def admit_job(
             internal_call=origin == "internal_rest",
             internal_origin_bound=scope.origin_bound,
             dependencies=dependencies.datasources(),
+            # An officer's ticket is unattended: no outbox among its defaults.
+            unattended=officer.preparation is not None,
         )
         delivery = await prepare_job_admission_delivery(
             command=command,

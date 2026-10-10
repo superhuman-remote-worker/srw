@@ -176,9 +176,37 @@ async def test_dispatch_defaults_do_not_widen_parented_delegation(
             "virtual",
             execution_kind="job",
             native_only=origin == "native_default",
+            unattended=False,
         )
         deps.inherit_parent_ids.assert_not_awaited()
         deps.authorize_selection.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defaults", [False, True])
+async def test_unattended_work_asks_its_defaults_without_the_outbox(deps, defaults):
+    # An officer's ticket: whatever defaults it gets leave the owner's outbox
+    # out, as the officer's auto-pull does.
+    result = await prepare(
+        deps,
+        fields={"thread_id": THREAD, "use_datasource_defaults": defaults},
+        unattended=True,
+    )
+    if defaults:
+        assert result.provenance["origin"] == "default"
+        deps.default_selection.assert_awaited_once_with(
+            USER,
+            [PROJECT],
+            "virtual",
+            execution_kind="job",
+            native_only=False,
+            unattended=True,
+        )
+    else:
+        # Without defaults the thread's own selection is inherited; it is
+        # what the officer chose, so nothing is narrowed here.
+        assert result.provenance["origin"] == "inherited"
+        deps.default_selection.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -435,7 +463,11 @@ async def test_concurrent_preparations_keep_their_dependencies_and_scope(deps):
 
     async def suspended_default(owner, projects, backend, **kinds):
         assert (owner, projects, backend) == (USER, [PROJECT], "virtual")
-        assert kinds == {"execution_kind": "job", "native_only": False}
+        assert kinds == {
+            "execution_kind": "job",
+            "native_only": False,
+            "unattended": False,
+        }
         waiting.set()
         await release.wait()
         return [CONNECTOR], {CONNECTOR: 23}
