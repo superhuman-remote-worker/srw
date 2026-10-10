@@ -23715,6 +23715,7 @@ DECLARE a public.vm_job_cancel_retention_authorities%ROWTYPE;
         retained jsonb;
         expected jsonb;
         digest text;
+        preflight jsonb;
 BEGIN
     SELECT * INTO a FROM public.vm_job_cancel_retention_authorities WHERE cleanup_admission_id=parent_id;
     IF a.cleanup_admission_id IS NULL THEN RETURN false; END IF;
@@ -23723,10 +23724,11 @@ BEGIN
     SELECT * INTO i FROM public.vm_pre_ssh_stop_intents WHERE cleanup_admission_id=parent_id;
     SELECT * INTO s FROM public.vm_resource_cleanup_stop_receipts WHERE cleanup_admission_id=parent_id;
     SELECT * INTO v FROM public.vm_resource_reservations WHERE id=a.reservation_id;
+    preflight := COALESCE(a.ready_retention_preflight,i.retention_preflight);
     retained := jsonb_build_object('version',1,'kind','vm_retained_rootdisk_v1',
         'namespace',a.namespace,'owner_kind','job','owner_id',a.job_id,
-        'pvc_name',i.retention_preflight->>'pvc_name','pvc_uid',a.pvc_uid,
-        'dv_uid',i.retention_preflight->>'dv_uid','ownership','standalone_dv',
+        'pvc_name',preflight->>'pvc_name','pvc_uid',a.pvc_uid,
+        'dv_uid',preflight->>'dv_uid','ownership','standalone_dv',
         'deleting',false,'no_consumers',true);
     expected := jsonb_build_object('version',1,'kind','vm_cleanup_physical_stop',
         'job_id',a.job_id,'provision_generation',a.provision_generation,'vm_uid',a.vm_uid,
@@ -23735,7 +23737,7 @@ BEGIN
         'pvc_disposition','retained','controller_authenticated',true,'retained_rootdisk',retained);
     digest := 'sha256:'||encode(sha256(convert_to(expected::text,'UTF8')),'hex');
     RETURN c.completed_at IS NOT NULL AND c.outcome='completed'
-       AND i.cleanup_admission_id IS NOT NULL AND i.retention_preflight IS NOT NULL
+       AND preflight IS NOT NULL AND (a.ready_retention_preflight IS NOT NULL OR i.cleanup_admission_id IS NOT NULL)
        AND s.cleanup_admission_id IS NOT NULL AND s.stop_evidence=expected
        AND s.reservation_id=a.reservation_id AND s.request_id=a.creation_request_id
        AND s.intent_digest=a.intent_digest AND s.job_id=a.job_id
@@ -23746,8 +23748,8 @@ BEGIN
            'cleanup_admission_id',parent_id,'job_id',a.job_id,'provision_generation',a.provision_generation,
            'vm_uid',a.vm_uid,'vmi_uid',a.vmi_uid,'launcher_uid',a.launcher_uid,
            'pvc_uid',a.pvc_uid,'stop_evidence_digest',digest)
-       AND EXISTS (SELECT 1 FROM public.vm_pre_ssh_stop_proofs p WHERE p.cleanup_admission_id=parent_id
-           AND p.job_id=a.job_id AND p.provision_generation=a.provision_generation AND p.frozen_digest=i.frozen_digest)
+       AND (a.ready_retention_preflight IS NOT NULL OR EXISTS (SELECT 1 FROM public.vm_pre_ssh_stop_proofs p WHERE p.cleanup_admission_id=parent_id
+           AND p.job_id=a.job_id AND p.provision_generation=a.provision_generation AND p.frozen_digest=i.frozen_digest))
        AND EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts z
            WHERE z.owner_kind='job' AND z.owner_id=a.job_id AND z.scope='vm' AND z.provisioner='vm'
            AND z.runtime_incarnation=a.provision_generation::text)
