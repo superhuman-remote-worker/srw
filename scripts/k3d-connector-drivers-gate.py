@@ -115,6 +115,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import re
 import secrets
@@ -130,6 +131,16 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# Every account logs in through the gates' Keycloak client, whose ID token
+# carries the e-mail and the realm roles; admin-cli's carries neither, and a
+# login through it demotes an administrator (scripts/k3d_gate_oauth.py).
+_OAUTH_SPEC = importlib.util.spec_from_file_location(
+    "_k3d_gate_oauth", ROOT / "scripts" / "k3d_gate_oauth.py"
+)
+assert _OAUTH_SPEC is not None and _OAUTH_SPEC.loader is not None
+gate_oauth = importlib.util.module_from_spec(_OAUTH_SPEC)
+_OAUTH_SPEC.loader.exec_module(gate_oauth)
 LOCAL_CONTEXT = "k3d-srw"
 LOCAL_NAMESPACE = "srw"
 LOCAL_CONFIRMATION = "LOCAL-K3D-DISPOSABLE"
@@ -385,17 +396,15 @@ WS_MAX_FRAME = 8 << 20
 
 _API_PROGRAM = (
     _POD_MEMORY_CAP
+    + gate_oauth.LOGIN_SOURCE
     + r"""
 import json, sys, urllib.error, urllib.parse, urllib.request
 cap_memory()
 envelope = json.loads(sys.stdin.readline())
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-form = urllib.parse.urlencode({
-    "grant_type": "password", "client_id": "admin-cli", "scope": "openid",
-    "username": envelope["username"], "password": envelope["password"],
-}).encode()
-with opener.open(envelope["token_url"], data=form, timeout=30) as response:
-    token = json.load(response)["id_token"]
+token = gate_id_token(
+    opener, envelope["token_url"], envelope["username"], envelope["password"]
+)
 body = envelope.get("body")
 request = urllib.request.Request(
     "http://localhost:8085" + envelope["path"],
@@ -511,6 +520,7 @@ print(json.dumps(out))
 # same request id: ``config.changed`` or ``error``. Names only come back.
 _LIVE_UPDATE_PROGRAM = (
     _POD_MEMORY_CAP
+    + gate_oauth.LOGIN_SOURCE
     + r"""
 import asyncio, json, sys, urllib.error, urllib.parse, urllib.request
 import websockets
@@ -522,12 +532,7 @@ opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 RETRY_STATUS = (409, 425)
 RETRY_CLOSE = (4500, 4503)
 def session_token():
-    form = urllib.parse.urlencode({
-        "grant_type": "password", "client_id": "admin-cli", "scope": "openid",
-        "username": r["username"], "password": r["password"],
-    }).encode()
-    with opener.open(r["token_url"], data=form, timeout=30) as response:
-        bearer = json.load(response)["id_token"]
+    bearer = gate_id_token(opener, r["token_url"], r["username"], r["password"])
     request = urllib.request.Request(
         "http://localhost:8085/api/sessions/%s/connection" % r["thread"],
         headers={"Authorization": "Bearer " + bearer},

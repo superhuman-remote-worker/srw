@@ -156,10 +156,10 @@ PLAN = (
 class _OwnerApi:
     """The D7 gate's API surface over the run's own OAuth client.
 
-    The D7 gate logs in through ``admin-cli``, whose token carries no realm
-    roles: the orchestrator recomputes ``is_admin`` from the token and would
-    demote the owner. Every owner call here goes through the run's client,
-    whose token carries the roles."""
+    The orchestrator recomputes ``is_admin`` from each login's token, so the
+    owner logs in only through clients whose tokens carry the realm roles:
+    the run's client here, and the gates' client (scripts/k3d_gate_oauth.py)
+    in the D7 gate's own calls; ``admin-cli``'s would demote it."""
 
     def __init__(self, api) -> None:
         self.api = api

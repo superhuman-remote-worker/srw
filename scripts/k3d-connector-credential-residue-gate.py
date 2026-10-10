@@ -57,6 +57,7 @@ import base64
 import hashlib
 import json
 import re
+import importlib.util
 import secrets
 import subprocess
 import sys
@@ -66,7 +67,6 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
-from urllib.parse import urlencode
 from uuid import UUID
 
 
@@ -77,6 +77,16 @@ ORCHESTRATOR = "deploy/srw-orchestrator"
 STATELESS_AGENT = "deploy/srw-agent-stateless"
 POSTGRES_POD = "srw-postgres-0"
 ROOT = Path(__file__).resolve().parents[1]
+# ``test`` logs in through the gates' Keycloak client, whose ID token carries
+# the e-mail and the realm roles; admin-cli's carries neither, and a login
+# through it demotes the administrator (scripts/k3d_gate_oauth.py).
+_OAUTH_SPEC = importlib.util.spec_from_file_location(
+    "_k3d_gate_oauth", ROOT / "scripts" / "k3d_gate_oauth.py"
+)
+assert _OAUTH_SPEC is not None and _OAUTH_SPEC.loader is not None
+gate_oauth = importlib.util.module_from_spec(_OAUTH_SPEC)
+_OAUTH_SPEC.loader.exec_module(gate_oauth)
+KEYCLOAK_TOKEN_URL = "http://srw-keycloak:8080/realms/srw/protocol/openid-connect/token"
 DEFAULT_MODEL = "muse-spark-1.3-contributor"
 # Files whose deployed copy must match this checkout before the gate means
 # anything: the strip, the shell history fix and the snapshot excludes.
@@ -812,37 +822,20 @@ class Api:
 
     def __init__(self, kube: Kube, password: str) -> None:
         self.kube = kube
-        body = urlencode(
-            {
-                "grant_type": "password",
-                "client_id": "admin-cli",
-                "username": "test",
-                "scope": "openid",
-                "password": password,
-            }
+        # The password is on the program's stdin, never an argument.
+        login = gate_oauth.LOGIN_SOURCE + (
+            "import json, urllib.request\n"
+            "opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))\n"
+            f"token = gate_id_token(opener, {KEYCLOAK_TOKEN_URL!r}, 'test', "
+            f"{json.dumps(password)})\n"
+            "print(json.dumps({'id_token': token}))\n"
         )
-        raw = kube.run(
-            [
-                "exec",
-                "-i",
-                ORCHESTRATOR,
-                "-c",
-                "orchestrator",
-                "--",
-                "curl",
-                "-fsS",
-                "-X",
-                "POST",
-                "http://srw-keycloak:8080/realms/srw/protocol/openid-connect/token",
-                "--data-binary",
-                "@-",
-            ],
-            operation="keycloak login",
-            data=body,
+        report = kube.python(
+            ORCHESTRATOR, "orchestrator", login, operation="keycloak login"
         )
         try:
-            self._token = json.loads(raw)["id_token"]
-        except (KeyError, ValueError):
+            self._token = report["id_token"]
+        except (KeyError, TypeError):
             raise GateFailure("keycloak login returned no token") from None
 
     def call(self, method: str, path: str, body: Any = None, *, operation: str) -> Any:

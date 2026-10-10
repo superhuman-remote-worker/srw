@@ -177,8 +177,6 @@ class _FakeKube:
 
     def run(self, arguments, *, operation, data=None, timeout=None, ok_codes=(0,)):
         self.calls.append((list(arguments), data))
-        if operation == "keycloak login":
-            return json.dumps({"id_token": "header.payload.signature"})
         if operation == "find agent pod":
             return "pod/" + arguments[2]
         return json.dumps({"id": str(uuid4())}) + "\n200"
@@ -190,6 +188,8 @@ class _FakeKube:
 
     def python(self, target, container, script, *, operation):
         self.calls.append((["python", target, container], script))
+        if operation == "keycloak login":
+            return {"id_token": "header.payload.signature"}
         assert operation == "Gitea SSH endpoint"
         return {"host": "srw-gitea", "port": 2222}
 
@@ -235,6 +235,19 @@ def test_secrets_and_bearer_never_appear_in_an_argument() -> None:
         assert all(secret not in joined for secret in secrets)
     stdin = "".join(data or "" for _arguments, data in kube.calls)
     assert values.token in stdin and values.env_value in stdin
+
+
+def test_test_logs_in_through_the_gate_client_never_admin_cli() -> None:
+    # admin-cli's ID token carries no roles: a login through it demotes the
+    # administrator the gate runs as.
+    kube = _FakeKube()
+    gate.Api(kube, "pw")
+    [(arguments, login)] = [call for call in kube.calls if call[0][0] == "python"]
+    assert arguments == ["python", gate.ORCHESTRATOR, "orchestrator"]
+    compile(login, "login", "exec")
+    assert "gate_id_token(opener" in login and "'test'" in login
+    assert repr(gate.gate_oauth.GATE_CLIENT) in login
+    assert '"client_id": "admin-cli", "scope"' not in login
 
 
 @pytest.mark.parametrize(
@@ -513,8 +526,6 @@ def test_the_socket_listing_reads_a_real_ssh_agent() -> None:
 def test_api_reports_http_status_without_the_body() -> None:
     class Refusing(_FakeKube):
         def run(self, arguments, *, operation, **kwargs):
-            if operation == "keycloak login":
-                return super().run(arguments, operation=operation, **kwargs)
             return json.dumps({"detail": "leaky detail"}) + "\n409"
 
     api = gate.Api(Refusing(), "pw")
