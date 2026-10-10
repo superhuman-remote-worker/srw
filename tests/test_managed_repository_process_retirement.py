@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import os
+import shutil
 import subprocess
 from types import SimpleNamespace
 
@@ -112,20 +115,56 @@ def test_the_credential_scrub_is_valid_shell():
     assert " all " in command
 
 
-@pytest.mark.skipif(
-    not __import__("os").path.exists("/usr/bin/python3"),
-    reason="the workspace programs run as /usr/bin/python3",
+_needs_workspace_tools = pytest.mark.skipif(
+    not (os.path.exists("/usr/bin/python3") and shutil.which("git")),
+    reason="the workspace programs run as /usr/bin/python3, with git",
 )
-def test_the_credential_scrub_removes_srw_material_and_keeps_the_users(
-    monkeypatch, tmp_path
-):
-    import json
-    import os
+_KEY = "-----BEGIN OPENSSH " + "PRIVATE KEY-----\nAAAA\n-----END\n"
+
+
+def _block(ssh, name, host):
+    """Exactly what a pre-agent clone appended to ~/.ssh/config."""
+    return (
+        f"\nHost {host}\n  IdentityFile {ssh}/{name}\n"
+        "  StrictHostKeyChecking accept-new\n"
+    )
+
+
+def _git(home, *args):
+    subprocess.run(
+        ["git", *args],
+        check=True,
+        capture_output=True,
+        env={"PATH": os.environ["PATH"], "HOME": str(home), "GIT_CONFIG_NOSYSTEM": "1"},
+    )
+
+
+def _remotes(home, checkout):
+    listed = subprocess.run(
+        [
+            "git",
+            "config",
+            "--file",
+            str(home / "workspace" / "repos" / checkout / ".git" / "config"),
+            "--get-regexp",
+            r"^remote\.",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ["PATH"], "HOME": str(home), "GIT_CONFIG_NOSYSTEM": "1"},
+    )
+    return listed.stdout.splitlines()
+
+
+@pytest.fixture
+def workspace_home(monkeypatch, tmp_path):
+    """A throwaway workspace home holding SRW's material and the user's."""
 
     from shared.runtime.core.credential_env import INSTALL_CREDENTIAL_FILES
 
     # The process classifier is the terminal teardown's own, covered above;
-    # this exercises what the scrub removes from the home.
+    # these exercise what the scrub removes from the home.
     monkeypatch.setattr(subject, "_whole_workspace_retirement", lambda _home: "true")
     home = tmp_path / "home"
     home.mkdir()
@@ -163,40 +202,160 @@ def test_the_credential_scrub_removes_srw_material_and_keeps_the_users(
         check=False,
     )
     assert synced.returncode == 0, synced.stderr
-    srw = [
+    for relative in (
         ".srw-credentials/leases/0f0f",
         ".srw-credentials/git/config",
         ".ssh/srw-managed/config.d/a.conf",
-        ".ssh/repo_legacy",
-    ]
-    user = [
         ".ssh/id_ed25519",
-        ".ssh/config",
         ".gitconfig",
         ".config/tool/settings",
         "workspace/notes.md",
-    ]
-    for relative in srw + user:
+    ):
         (home / relative).parent.mkdir(parents=True, exist_ok=True)
         (home / relative).write_text("x")
+    ssh = home / ".ssh"
+    # A pre-agent clone's key, named by its exact block; and the user's own
+    # key that happens to share the prefix.
+    (ssh / "repo_legacy").write_text(_KEY)
+    (ssh / "repo_deploy").write_text(_KEY)
+    (ssh / "config").write_text(
+        "Host mine\n  User me\n" + _block(ssh, "repo_legacy", "gitea.example")
+    )
+    for name in ("app", "tool"):
+        _git(home, "init", "-q", str(home / "workspace" / "repos" / name))
+    app = ["-C", str(home / "workspace" / "repos" / "app")]
+    _git(
+        home,
+        *app,
+        "remote",
+        "add",
+        "origin",
+        "https://oauth2:tok1@gitea.example/o/app.git",
+    )
+    _git(
+        home,
+        *app,
+        "remote",
+        "set-url",
+        "--push",
+        "origin",
+        "https://oauth2:tok1@gitea.example/o/app.git",
+    )
+    _git(
+        home,
+        *app,
+        "remote",
+        "add",
+        "fork",
+        "https://alice:pw@example.com/alice/app.git",
+    )
+    tool = ["-C", str(home / "workspace" / "repos" / "tool")]
+    _git(
+        home,
+        *tool,
+        "remote",
+        "add",
+        "origin",
+        "https://x-access-token:ghs_tok2@github.com/o/tool.git",
+    )
+    _git(home, *tool, "remote", "add", "upstream", "git@github.com:o/tool.git")
+    return home
 
-    scrubbed = subprocess.run(
+
+def _scrub(home):
+    return subprocess.run(
         ["bash", "-c", subject.workspace_credential_scrub_command(str(home))],
         text=True,
         capture_output=True,
         check=False,
+        env={"PATH": os.environ["PATH"], "HOME": str(home)},
     )
 
+
+def _files(home):
+    """Every file in the home but the checkouts' own."""
+    found = set()
+    for root, _dirs, files in os.walk(home):
+        for name in files:
+            relative = os.path.relpath(os.path.join(root, name), home)
+            if not relative.startswith("workspace/repos/"):
+                found.add(relative)
+    return found
+
+
+@_needs_workspace_tools
+def test_the_credential_scrub_removes_srw_material_and_keeps_the_users(
+    workspace_home,
+):
+    home = workspace_home
+    ssh = home / ".ssh"
+
+    scrubbed = _scrub(home)
+
     assert scrubbed.returncode == 0, scrubbed.stderr
-    remaining = {
-        os.path.relpath(os.path.join(root, name), home)
-        for root, _dirs, files in os.walk(home)
-        for name in files
+    assert _files(home) == {
+        ".ssh/id_ed25519",
+        ".ssh/config",
+        ".ssh/repo_deploy",
+        ".gitconfig",
+        ".config/tool/settings",
+        "workspace/notes.md",
     }
-    assert remaining == set(user)
     # The links it placed are gone with the store; nothing dangles.
     assert not os.path.lexists(home / ".kube" / "config")
     assert not os.path.lexists(home / ".config" / "tool" / "token")
+    # Only the exact pre-agent block went with its key.
+    assert (ssh / "config").read_text() == "Host mine\n  User me\n"
+    # SRW's tokens left the remotes; the user's own credentials stayed.
+    assert sorted(_remotes(home, "app")) == sorted(
+        [
+            "remote.origin.url https://gitea.example/o/app.git",
+            "remote.origin.fetch +refs/heads/*:refs/remotes/origin/*",
+            "remote.origin.pushurl https://gitea.example/o/app.git",
+            "remote.fork.url https://alice:pw@example.com/alice/app.git",
+            "remote.fork.fetch +refs/heads/*:refs/remotes/fork/*",
+        ]
+    )
+    assert "remote.origin.url https://github.com/o/tool.git" in _remotes(home, "tool")
+    assert "remote.upstream.url git@github.com:o/tool.git" in _remotes(home, "tool")
+
+
+@_needs_workspace_tools
+def test_a_symlinked_credential_root_goes_as_a_link(workspace_home, tmp_path):
+    home = workspace_home
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "files-9999").mkdir(parents=True)
+    (elsewhere / "files-9999" / "keep").write_text("x")
+    shutil.rmtree(home / ".srw-credentials")
+    (home / ".srw-credentials").symlink_to(elsewhere)
+
+    scrubbed = _scrub(home)
+
+    assert scrubbed.returncode == 0, scrubbed.stderr
+    assert not os.path.lexists(home / ".srw-credentials")
+    assert (elsewhere / "files-9999" / "keep").read_text() == "x"
+
+
+@_needs_workspace_tools
+@pytest.mark.skipif(os.geteuid() == 0, reason="root removes a read-only directory")
+def test_anything_left_behind_fails_the_scrub_after_every_step(workspace_home):
+    home = workspace_home
+    stuck = home / ".srw-credentials" / "stuck"
+    stuck.mkdir()
+    (stuck / "token").write_text("x")
+    stuck.chmod(0o500)
+    try:
+        scrubbed = _scrub(home)
+
+        assert scrubbed.returncode != 0
+        # The other steps still ran.
+        assert not (home / ".ssh" / "repo_legacy").exists()
+        assert not (home / ".ssh" / "srw-managed").exists()
+        assert "remote.origin.url https://gitea.example/o/app.git" in _remotes(
+            home, "app"
+        )
+    finally:
+        stuck.chmod(0o700)
 
 
 @pytest.mark.asyncio

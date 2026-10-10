@@ -30,6 +30,11 @@ from shared.runtime.core.credential_env import (
     INSTALL_CREDENTIAL_FILES,
     WORKSPACE_PYTHON,
 )
+from shared.runtime.core.legacy_ssh_keys import (
+    LEGACY_KEY_MARKER,
+    RETIRE_LEGACY_KEYS_PROGRAM,
+    list_legacy_keys_command,
+)
 from shared.runtime.core.managed_repository import (
     managed_repository_agent_retirement_command,
     managed_repository_agent_zero_command,
@@ -38,6 +43,12 @@ from shared.runtime.core.managed_repository import (
 logger = logging.getLogger(__name__)
 
 _EMPTY_KNOWN_HOSTS = ((), (), (), (), (), (), ())
+
+#: The workspace image's home for its ``agent-host`` user, on Kubernetes and
+#: VM workspaces alike. No shared constant names it: the remote backend
+#: spells the same default (``RemoteBackend`` ``workspace_path``), as do the
+#: other terminal owners.
+WORKSPACE_HOME = "/home/agent-host"
 
 
 if asyncssh is not None:
@@ -74,7 +85,7 @@ async def retire_managed_repository_processes(
     host: str,
     port: int,
     host_key_fingerprint: str,
-    home_path: str = "/home/agent-host",
+    home_path: str = WORKSPACE_HOME,
     operation: str = "managed repository process retirement",
 ) -> bool:
     """Retire and independently prove zero on one pinned runtime endpoint."""
@@ -93,46 +104,159 @@ async def retire_managed_repository_processes(
     )
 
 
-def workspace_credential_scrub_command(home_path: str = "/home/agent-host") -> str:
+#: Strips the userinfo SRW's token-in-URL clones write (``oauth2:<token>@``,
+#: or ``x-access-token:<token>@`` for a minted GitHub App token; see
+#: ``agent.connectors.checkout.token_username``) from the remotes of the
+#: checkouts SRW clones under ``<workspace>/repos/``. ``argv``: that
+#: directory. Each checkout's own ``.git/config`` is read and written with
+#: ``git config --file`` (never followed through a symlink); a remote value
+#: without such userinfo is left as it is, and so is every other key. It
+#: prints one JSON line naming the checkouts and keys it changed, never a
+#: URL, and exits non-zero when a rewrite failed.
+STRIP_CHECKOUT_TOKENS_PROGRAM = r"""
+import json, os, subprocess, sys
+from urllib.parse import urlsplit, urlunsplit
+
+repos = sys.argv[1]
+USERS = ('oauth2', 'x-access-token')
+env = {
+    'PATH': os.environ.get('PATH') or '/usr/bin:/bin',
+    'HOME': os.environ.get('HOME') or '/',
+    'GIT_CONFIG_NOSYSTEM': '1',
+    'GIT_TERMINAL_PROMPT': '0',
+    'LC_ALL': 'C',
+}
+
+
+def git(*args):
+    return subprocess.run(
+        ('git',) + args, capture_output=True, text=True, env=env, timeout=30
+    )
+
+
+def clean(url):
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in ('http', 'https') or '@' not in parts.netloc:
+        return None
+    userinfo, _, host = parts.netloc.rpartition('@')
+    user, colon, secret = userinfo.partition(':')
+    if user not in USERS or not colon or not secret or not host:
+        return None
+    return urlunsplit(parts._replace(netloc=host))
+
+
+failed, stripped = 0, []
+try:
+    names = sorted(os.listdir(repos))
+except OSError:
+    names = []
+for name in names:
+    checkout = os.path.join(repos, name)
+    dot_git = os.path.join(checkout, '.git')
+    config = os.path.join(dot_git, 'config')
+    if any(os.path.islink(path) for path in (checkout, dot_git, config)):
+        continue
+    if not os.path.isfile(config):
+        continue
+    listed = git(
+        'config', '--file', config, '--null', '--get-regexp',
+        r'^remote\..*\.(url|pushurl)$',
+    )
+    if listed.returncode == 1:
+        continue
+    if listed.returncode != 0:
+        failed += 1
+        continue
+    values = {}
+    for item in listed.stdout.split('\0'):
+        if item:
+            key, _, value = item.partition('\n')
+            values.setdefault(key, []).append(value)
+    for key, current in values.items():
+        new = [clean(value) or value for value in current]
+        if new == current:
+            continue
+        ok = git('config', '--file', config, '--unset-all', key).returncode == 0
+        for value in new:
+            ok = ok and git('config', '--file', config, '--add', key, value).returncode == 0
+        if ok:
+            stripped.append(name + ':' + key)
+        else:
+            failed += 1
+print(json.dumps({'stripped': stripped, 'failed': failed}))
+sys.exit(1 if failed else 0)
+"""
+
+
+def workspace_credential_scrub_command(home_path: str = WORKSPACE_HOME) -> str:
     """Remove SRW's connector credential material from one workspace home.
 
-    What an agent's terminal shell retirement and its attach syncs remove,
-    for every work item at once, and nothing of the user's:
+    It removes, and nothing else:
 
     - each credential-file store, through its own ``retire`` program
-      (:data:`INSTALL_CREDENTIAL_FILES`), which removes the store, the links
-      it placed (the merged kubeconfig's ``~/.kube/config`` among them) and
-      the work item's environment file; a link it did not place, or a file
-      the user owns, is never touched;
+      (:data:`INSTALL_CREDENTIAL_FILES`): the store, the links it placed (the
+      merged kubeconfig's ``~/.kube/config`` among them) and the work item's
+      environment file; a link it did not place, or a file the user owns, is
+      never touched;
     - the rest of ``~/.srw-credentials/``: environment connectors' files,
-      lease tokens and the git swap driver's wiring (the ``include.path``
-      line it added to ``~/.gitconfig`` then names nothing, so git skips it);
-    - the legacy repository keys ``~/.ssh/repo_*``;
+      lease tokens and the git swap driver's wiring; a symlink standing
+      there is removed as a link, never followed;
+    - pre-agent repository keys ``~/.ssh/repo_<slug>``, only those an exact
+      SRW block in ``~/.ssh/config`` names, by the agent's own rule and
+      program (:mod:`shared.runtime.core.legacy_ssh_keys`), with those
+      blocks; a user's ``~/.ssh/repo_deploy`` is never touched;
+    - the token SRW's token-in-URL clones put in their remotes, in the
+      checkouts under ``~/workspace/repos/``
+      (:data:`STRIP_CHECKOUT_TOKENS_PROGRAM`);
     - the managed ssh-agent namespace ``~/.ssh/srw-managed/``, after its
       agents are retired exactly as a terminal teardown retires them.
 
-    The files go first: when the agent classifier refuses (an ambiguous
-    process), the command stops with a non-zero status after them.
+    What stays: the ``include.path`` line the git swap wiring added to
+    ``~/.gitconfig`` and the ``Include`` line for the managed namespace in
+    ``~/.ssh/config``; both are lines in the user's own files, and both name
+    nothing once the scrub ran. Live shells are not this command's: the
+    caller retires the job's tmux session first.
+
+    Every step runs even when an earlier one failed. The command exits
+    non-zero when any failed, or when ``~/.srw-credentials`` or
+    ``~/.ssh/srw-managed`` is still there afterwards.
     """
 
     home = str(home_path).rstrip("/")
-    root = f"{home}/.srw-credentials"
-    managed = f"{home}/.ssh/srw-managed"
+    root = shlex.quote(f"{home}/.srw-credentials")
+    managed = shlex.quote(f"{home}/.ssh/srw-managed")
+    ssh_dir = f"{home}/.ssh"
     retire_store = (
         f"{WORKSPACE_PYTHON} -c {shlex.quote(INSTALL_CREDENTIAL_FILES)} "
         f'{shlex.quote(home)} "${{_srw_store##*/}}" retire '
         "</dev/null >/dev/null 2>&1 || true"
     )
+    retire_keys = (
+        f"python3 -c {shlex.quote(RETIRE_LEGACY_KEYS_PROGRAM)} "
+        f"{shlex.quote(ssh_dir)} $_srw_keys"
+    )
     return (
-        f"for _srw_store in {shlex.quote(root)}/files-*; do "
+        "_srw_rc=0; "
+        f"if [ -L {root} ]; then rm -f -- {root} || _srw_rc=1; else "
+        f"for _srw_store in {root}/files-*; do "
         'test -d "$_srw_store" || continue; '
         f"{retire_store}; done; "
-        f"rm -rf -- {shlex.quote(root)}; "
-        f"rm -f -- {shlex.quote(home)}/.ssh/repo_*; "
-        + _whole_workspace_retirement(home)
-        + f"; rm -rf -- {shlex.quote(managed)}; "
-        f"test ! -e {shlex.quote(root)}; "
-        f"test ! -e {shlex.quote(managed)}"
+        f"rm -rf -- {root} || _srw_rc=1; fi; "
+        # A space after ``$(``: the listing opens with its own subshell, and
+        # ``$((`` would read as arithmetic.
+        f"_srw_keys=$( {list_legacy_keys_command(ssh_dir)} ) || _srw_keys=''; "
+        f"_srw_keys=${{_srw_keys##*{LEGACY_KEY_MARKER}}}; "
+        f'if [ -n "$_srw_keys" ]; then {retire_keys} || _srw_rc=1; fi; '
+        f"{WORKSPACE_PYTHON} -c {shlex.quote(STRIP_CHECKOUT_TOKENS_PROGRAM)} "
+        f"{shlex.quote(home + '/workspace/repos')} >/dev/null || _srw_rc=1; "
+        f"( {_whole_workspace_retirement(home)} ) || _srw_rc=1; "
+        f"rm -rf -- {managed} || _srw_rc=1; "
+        f"test ! -e {root} || _srw_rc=1; "
+        f"test ! -e {managed} || _srw_rc=1; "
+        'exit "$_srw_rc"'
     )
 
 
@@ -141,7 +265,7 @@ async def scrub_workspace_credentials(
     host: str,
     port: int,
     host_key_fingerprint: str,
-    home_path: str = "/home/agent-host",
+    home_path: str = WORKSPACE_HOME,
     operation: str = "refused-resume credential scrub",
 ) -> bool:
     """Scrub SRW's credential material on one pinned workspace endpoint."""
