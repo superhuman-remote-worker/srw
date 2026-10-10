@@ -267,7 +267,9 @@ fi
 # --- 3. Host Docker ------------------------------------------------------------
 port=$(docker inspect -f '{{index .Config.Labels "k3s.registry.port.external"}}' "$REGISTRY_NAME" 2>/dev/null || true)
 docker images --no-trunc --format '{{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.CreatedAt}}' > "$WORK/host-images"
-docker ps -aq | xargs -r docker inspect -f '{{.Image}}' > "$WORK/host-used"
+# A container can vanish between ps and inspect (testcontainers' reaper); inspect
+# still prints the rest. A missed one is safe: rmi refuses an image a container uses.
+docker ps -aq | xargs -r docker inspect -f '{{.Image}}' > "$WORK/host-used" 2>/dev/null || true
 python3 - "$WORK" "localhost:${port:-5005}/" "$KEEP_TAGS" "$KEEP_HOURS" > "$WORK/host-drop" <<'PY'
 import collections, datetime, os, sys, time
 work, prefix, keep_tags, keep_hours = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
