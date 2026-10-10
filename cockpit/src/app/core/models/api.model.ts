@@ -339,7 +339,12 @@ export type DatasourceType =
   | 'mcp'
   | 'kubeconfig'
   | 'ssh_key'
-  | 'generic_file';
+  | 'generic_file'
+  // Platform-owned, from the main cloud (main_cloud_as_connectors.md): SRW
+  // creates these for what it provisions; no form creates one.
+  | 'cloud_folder'
+  | 'cloud_folder_checkout'
+  | 'cloud_outbox';
 
 /**
  * Access tier for an ``email`` datasource (see knowledge-base/knowledge/features/email_datasource.md).
@@ -373,7 +378,9 @@ export interface CredentialFileEntry {
 
 /** Non-secret, type-specific datasource configuration. */
 export interface DatasourceConfig {
-  /** Server-owned marker for a project's native knowledge connector. */
+  /** The older server-owned marker for a project's native knowledge
+   *  connector; `Datasource.managed_key` replaces it (a row written before
+   *  the key carries only this). */
   native_project_id?: string;
   /** Repository-relative POSIX root containing OKF Markdown notes. */
   root_path?: string;
@@ -491,6 +498,12 @@ export interface Datasource {
   job_id: string | null;
   /** Creator id is used only to gate owner/admin management actions in Cockpit. */
   created_by?: string | null;
+  /** Set on a connector SRW provisions and manages itself: `<kind>:<uuid>`,
+   *  e.g. `project-cloud:<project>` (core/models/platform-connector.ts).
+   *  Null for everything a user created. An orchestrator that predates it
+   *  omits the field; a native knowledge base then carries only
+   *  `config.native_project_id`. */
+  managed_key?: string | null;
   /** Whether the datasource is visible to all users (vs owner/project only). */
   is_global?: boolean;
   /** The creator's read-only tag: when set, agents get no write tools for
@@ -515,11 +528,37 @@ export interface Datasource {
   updated_at: string;
 }
 
+/** One level of a {@link ConnectorAccessChoice}: a driver level, and
+ *  whether this connector offers it here (and why not). */
+export interface ConnectorAccessChoiceLevel {
+  id: string;
+  rank: number;
+  writes?: 'none' | 'reviewed' | 'direct';
+  enforced_by?: string;
+  offered: boolean;
+  reason?: string | null;
+}
+
+/** A strict connector's access as the eligible list offers it (a cloud
+ *  folder's `read_only` / `protected` / `read_write`): its levels, the one
+ *  it binds at unless the user picks another, and where that default came
+ *  from. Absent until the server sends it (main_cloud_as_connectors.md,
+ *  slice 5); the picker then shows no level. */
+export interface ConnectorAccessChoice {
+  levels: ConnectorAccessChoiceLevel[];
+  default: string | null;
+  default_origin?: string | null;
+  ceiling?: string | null;
+}
+
 /** Execution-context row. Consumers must seed from `default_selected`, not
  * from `auto_attach`: shared/public connectors can be automatic for their
- * owner while remaining manual for the current caller. */
+ * owner while remaining manual for the current caller. A platform-owned row
+ * (`managed_key`) is `default_selected` for its own project's (or user's)
+ * work, whatever the rollout gate for other defaults says. */
 export interface EligibleDatasource extends Datasource {
   default_selected: boolean;
+  access?: ConnectorAccessChoice | null;
 }
 
 export interface DatasourceCatalogResponse {
@@ -604,8 +643,9 @@ export interface LinkableDatasourceProjectsResponse {
 }
 
 /** Cursor page of connectors that may be newly linked to one target project.
- * The server excludes existing links, native project knowledge connectors,
- * and rows the caller is not authorized to add. */
+ * The server excludes existing links, platform-owned connectors (a
+ * project's own knowledge base and cloud folder, a user's own), and rows
+ * the caller is not authorized to add. */
 export interface LinkableProjectDatasourcesResponse {
   items: Datasource[];
   next_cursor: string | null;

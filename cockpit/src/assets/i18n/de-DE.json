@@ -2759,7 +2759,29 @@
       "generic_file": "Datei",
       "credentials": "Zugangsdaten",
       "image_driver": "Registrierter Treiber",
-      "gitea_mcp": "Gitea-MCP (verwaltet)"
+      "gitea_mcp": "Gitea-MCP (verwaltet)",
+      "cloud_folder": "Cloud-Ordner",
+      "cloud_folder_checkout": "Ordner-Checkout",
+      "cloud_outbox": "Outbox"
+    },
+    "platform": {
+      "kind": {
+        "projectKb": "Knowledge Base",
+        "projectCloud": "Projektordner",
+        "projectCloudCheckout": "Kopie des Projektordners (Jobs)",
+        "userCloudRoot": "Meine Cloud",
+        "cloudOutbox": "Session-Outbox"
+      },
+      "managedByProject": "Vom Projekt verwaltet",
+      "managedForYou": "Von SRW für dich verwaltet",
+      "managedForItsUser": "Von SRW für seinen Benutzer verwaltet",
+      "managedBySrw": "Von SRW verwaltet"
+    },
+    "accessLevel": {
+      "read_only": "Nur lesen",
+      "protected": "Geschützt",
+      "read_write": "Lesen/Schreiben",
+      "reviewed_write_back": "Rückschreiben nach Prüfung"
     },
     "catalog": {
       "search": "Konnektoren durchsuchen…",
@@ -3716,7 +3738,9 @@
       "notReady": "Noch nicht vollständig indiziert — der Agent sieht möglicherweise unvollständige Ergebnisse.",
       "lockedLive": "Wissensdatenbanken können während einer Session nicht geändert werden",
       "credentialsLocked": "Zugangsdaten bleiben für diese Sitzung verbunden",
-      "credentialsUnavailable": "Dieser Zugangsdaten-Konnektor ist nicht mehr verfügbar. Beende diese Sitzung und starte eine neue, um ihre Konnektoren zu ändern."
+      "credentialsUnavailable": "Dieser Zugangsdaten-Konnektor ist nicht mehr verfügbar. Beende diese Sitzung und starte eine neue, um ihre Konnektoren zu ändern.",
+      "lockedNextStart": "Wirkt erst beim nächsten Start und lässt sich daher während einer Session nicht ändern",
+      "nothingAttached": "Nichts ist verbunden, auch nicht die eigenen Konnektoren dieses Projekts."
     },
     "workspacePicker": {
       "templateLabel": "Vorlage",

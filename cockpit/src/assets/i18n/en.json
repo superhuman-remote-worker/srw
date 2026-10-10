@@ -2759,7 +2759,29 @@
       "generic_file": "File",
       "credentials": "Credentials",
       "image_driver": "Registered driver",
-      "gitea_mcp": "Gitea MCP (managed)"
+      "gitea_mcp": "Gitea MCP (managed)",
+      "cloud_folder": "Cloud folder",
+      "cloud_folder_checkout": "Folder checkout",
+      "cloud_outbox": "Outbox"
+    },
+    "platform": {
+      "kind": {
+        "projectKb": "Knowledge base",
+        "projectCloud": "Project folder",
+        "projectCloudCheckout": "Project folder copy (jobs)",
+        "userCloudRoot": "My cloud",
+        "cloudOutbox": "Session outbox"
+      },
+      "managedByProject": "Managed by its project",
+      "managedForYou": "Managed by SRW for you",
+      "managedForItsUser": "Managed by SRW for its user",
+      "managedBySrw": "Managed by SRW"
+    },
+    "accessLevel": {
+      "read_only": "Read-only",
+      "protected": "Protected",
+      "read_write": "Read-write",
+      "reviewed_write_back": "Reviewed write-back"
     },
     "catalog": {
       "search": "Search connectors…",
@@ -3716,7 +3738,9 @@
       "notReady": "Not fully indexed yet — the agent may see incomplete results.",
       "lockedLive": "Knowledge bases can't be changed during a session",
       "credentialsLocked": "Credentials stay attached for this session",
-      "credentialsUnavailable": "This credential connector is no longer available. End this session and start another to change its connectors."
+      "credentialsUnavailable": "This credential connector is no longer available. End this session and start another to change its connectors.",
+      "lockedNextStart": "Takes effect only at the next start, so it can't be changed during a session",
+      "nothingAttached": "Nothing is attached, not even this project's own connectors."
     },
     "workspacePicker": {
       "templateLabel": "Template",
