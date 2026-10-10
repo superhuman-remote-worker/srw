@@ -66,6 +66,7 @@ from shared.connectors.builtin import (
     DEVELOPMENT_SPECS,
     LEASE_PROBE_SPEC,
 )
+from shared.connectors.env_names import connector_env_problem
 from shared.manifests import preview_documents, validate_documents
 
 REGISTRY = builtin_connector_drivers()
@@ -629,7 +630,12 @@ def test_the_slot_rules_describe_what_the_api_stores(case_id, case, stored):
     assert stored is not None
     rules = {slot.update for slot in driver.spec.credential_slots}
     if "merge" in rules:
-        previous = existing["credentials"]["env_vars"]
+        # An edit also drops a stored name no connector may set (decision 36).
+        previous = {
+            name: value
+            for name, value in existing["credentials"]["env_vars"].items()
+            if connector_env_problem(name) is None
+        }
         assert stored == {"env_vars": {**previous, **sent["env_vars"]}}
         return
     before = _leaf_values(driver, existing["credentials"])
