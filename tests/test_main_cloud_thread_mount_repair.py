@@ -246,7 +246,10 @@ class TestRepairHappyPath:
         assert entry["written"] is True
 
     @pytest.mark.asyncio
-    async def test_default_project_row_is_rebuilt_as_the_owner_home(self):
+    async def test_a_default_project_row_is_left_alone(self):
+        """A default project's cloud is its owner's own root, the user-root
+        connector (main cloud slice 4): its old row is never rebuilt as the
+        owner's home."""
         project = _project(is_default=True, name="alice's Project")
         row = _partial_row(project, mount_kind="project_default")
         db = _db(partial=[row], projects=[project])
@@ -254,17 +257,10 @@ class TestRepairHappyPath:
             result = await repair_thread_mount_transport(
                 MagicMock(), apply=True, dependencies=ctx.dependencies
             )
-        assert result["repaired"] == 1
-        db.repair_thread_mount_transport.assert_awaited_once_with(
-            str(row["id"]),
-            backend_id="nextcloud",
-            backend_instance_id=INSTANCE,
-            cloud_handle="nextcloud:home:9edad2a0",
-            webdav_url=HOME_URL,
-            target_user_sub="sub-1",
-        )
+        assert result["repaired"] == 0 and result["skipped"] == 1
+        db.repair_thread_mount_transport.assert_not_awaited()
         (entry,) = result["plan"]
-        assert entry["target_user_sub"] is True  # presence only, never the value
+        assert (entry["action"], entry["reason"]) == ("skip", "transport_unresolvable")
 
     @pytest.mark.asyncio
     async def test_one_bad_row_does_not_block_the_others(self):

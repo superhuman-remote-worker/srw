@@ -57,7 +57,6 @@ from orchestrator.services import (
     workspace_suspension,
     workspace_tier_policy,
 )
-from orchestrator.services.cloud import identity
 from orchestrator.services.grant_enforcement import GrantDenied
 from orchestrator.services.workspace_tier_policy import LiteWorkspaceConfigError
 from shared.runtime.core import model_registry
@@ -524,7 +523,6 @@ def thread_mount_dependencies(
     return thread_mount_rows.ThreadMountDependencies(
         store=resources.postgres_db,
         cloud_router=resources.main_cloud_router,
-        resolve_user_identity_cached=identity.resolve_user_identity_cached,
         externalize_gitea_url=access.externalize_gitea_url,
         resolve_authorized_thread_datasources=bound(
             thread_datasource_authorization_service.resolve_authorized_thread_datasources,

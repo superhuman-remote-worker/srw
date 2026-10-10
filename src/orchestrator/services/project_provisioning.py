@@ -188,11 +188,11 @@ async def ensure_project_cloud_resources(
       several external HTTP round-trips — see
       knowledge-base/knowledge/issues/project_page_open_blocks_on_cloud_heal.md).
 
-    Default projects skip both: they piggyback on the owner's personal home
-    Space (already attached as a datasource by the user-creation flow), so a
-    separate project Space + `project-<id>` group would be dead state. The
-    cloud_storage_url branch in `get_project` resolves to the user's home
-    browser URL for default projects.
+    Default projects skip both: their cloud is the owner's own root, the
+    user-root connector ("My cloud", linked to the default project; main
+    cloud slice 4), so a separate project Space + `project-<id>` group would
+    be dead state. The cloud_storage_url branch in `get_project` resolves to
+    the user's home browser URL for default projects.
 
     Returns the (possibly updated) project dict.
     """

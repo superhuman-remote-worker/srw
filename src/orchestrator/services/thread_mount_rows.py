@@ -24,9 +24,10 @@ Three properties are load-bearing and moved unchanged:
   its column) still reads its list from the legacy places
   (main_cloud_as_connectors.md, slice 1).
 * **``project_default`` rows count as project attachments** of such a legacy
-  Session. They mount the owner's cloud home at the workspace root rather
-  than under ``projects/``. The shape excluded from the project scope is
-  ``repo``.
+  Session. Only sessions created before main cloud slice 4 have them: a
+  default project's cloud is now its owner's own root, the user-root
+  connector, and no row is written for it. The shape excluded from the
+  project scope is ``repo``.
 
 Collaborators arrive through :class:`ThreadMountDependencies`, rebuilt per
 invocation by the application rather than captured at import: ``store`` and
@@ -63,7 +64,6 @@ class ThreadMountDependencies:
 
     store: Any
     cloud_router: Any
-    resolve_user_identity_cached: Callable[..., Awaitable[Any]]
     externalize_gitea_url: Callable[[str], str]
     resolve_authorized_thread_datasources: Callable[..., Awaitable[Any]]
     build_datasources_payload: Callable[[Any], Any]
@@ -81,9 +81,9 @@ def project_ids_from_mounts(mounts: list[dict[str, Any]]) -> list[str]:
     """Pick out project ``source_ref``s from a list of mount rows.
 
     Both ``project`` (non-default, mounted under ``projects/<slug>/``) and
-    ``project_default`` (default project, mounted at workspace root via the
-    user's cloud home) rows contribute — the default project is still a
-    project attachment for datasource resolution and visibility.
+    ``project_default`` (a default project's, written before main cloud
+    slice 4) rows contribute — the default project is still a project
+    attachment for datasource resolution and visibility.
     """
     out: list[str] = []
     for m in mounts:
@@ -185,86 +185,6 @@ async def thread_project_ids(
     return scope
 
 
-async def build_default_project_mount_row(
-    project_id: str,
-    project: dict[str, Any],
-    *,
-    dependencies: ThreadMountDependencies,
-) -> Optional[dict[str, Any]]:
-    """Shape a ``project_default`` mount row for a default project.
-
-    Resolves the project's owner on the cloud backend and queries their
-    personal home Space. The mount targets the workspace root (``target_path
-    = ""``) — the agent's workspace and the user's cloud home become two
-    views of the same surface. Phase 2 of cloud_collaboration_model.md §9.
-
-    Also stashes the owner's Keycloak ``sub`` on the row (``target_user_sub``)
-    so the agent can mint a user-scoped token via RFC 8693 token-exchange
-    at WebDAV-call time. Without that, the agent's service-account
-    bearer token gets a 404 on PROPFIND against the user's Personal Space
-    (owned by exactly one user, not shared with the service account).
-
-    Returns ``None`` when the user-home can't be resolved (no owner, owner
-    missing from the cloud backend, no webdav URL, no keycloak_sub on the
-    owner, backend down). The caller treats ``None`` as "fall back to the
-    legacy session folder" so a transient resolution failure never leaves
-    the thread with zero mounts.
-    """
-    store = dependencies.store
-    router = dependencies.cloud_router
-    backend = (
-        router.for_project_optional(project)
-        if project.get("main_cloud_backend")
-        else router.for_owner()
-    )
-    # An unresolvable installation authority is one more "can't resolve the
-    # user-home" case, which this function is documented to report as None so
-    # the caller falls back to the legacy session folder — not an exception
-    # that strands the thread with zero mounts.
-    if backend is None or not backend.is_initialized:
-        return None
-    members = await store.get_project_members(project_id)
-    owner = next((m for m in members if m.get("role") == "owner"), None)
-    if not owner:
-        return None
-    owner_email = owner.get("email")
-    if not owner_email:
-        return None
-    owner_user = await store.get_user(str(owner["user_id"]))
-    target_user_sub = (owner_user or {}).get("keycloak_sub")
-    if not target_user_sub:
-        # Owner has never completed an SSO login, so we don't have their
-        # Keycloak sub yet. Token-exchange impersonation needs a real sub —
-        # bail out and let the caller fall back to the legacy session folder.
-        return None
-    # Identity args come from the member row (email + display_name); the
-    # users row fetched above only vouches for the keycloak_sub.
-    owner_identity = {
-        "id": owner["user_id"],
-        "email": owner_email,
-        "display_name": owner.get("display_name"),
-    }
-    resolved = await dependencies.resolve_user_identity_cached(
-        store, owner_identity, backend
-    )
-    if not resolved:
-        return None
-    home = await backend.get_user_home(resolved)
-    if not home or not home.webdav_url:
-        return None
-    return {
-        "mount_kind": "project_default",
-        "target_path": "",
-        "source_kind": "user_home",
-        "source_ref": project_id,
-        "backend_id": backend.backend_id,
-        "backend_instance_id": backend.backend_instance_id,
-        "cloud_handle": home.handle.to_db(),
-        "webdav_url": home.webdav_url,
-        "target_user_sub": target_user_sub,
-    }
-
-
 def _project_folder_transport(
     project_id: str,
     project: dict[str, Any],
@@ -330,18 +250,16 @@ async def build_project_mount_row(
     """One *complete* mount row for ``project``, or ``None``.
 
     The single-project form of :func:`build_thread_mount_rows`, used by the
-    transport repair. A default project yields its ``project_default`` row
-    through :func:`build_default_project_mount_row`; any other project yields
-    a ``project`` row only when every transport column resolved. A partial
-    transport is ``None`` here on purpose: the repair exists to remove that
-    shape and must never mint it. ``target_path`` is the uncollided slug — a
-    caller repairing a persisted row keeps the ``target_path`` decided at
-    create time, suffix and all.
+    transport repair. A default project yields nothing: its cloud is its
+    owner's own root, the user-root connector (main cloud slice 4), never a
+    mount row. Any other project yields a ``project`` row only when every
+    transport column resolved. A partial transport is ``None`` here on
+    purpose: the repair exists to remove that shape and must never mint it.
+    ``target_path`` is the uncollided slug — a caller repairing a persisted
+    row keeps the ``target_path`` decided at create time, suffix and all.
     """
     if project.get("is_default"):
-        return await build_default_project_mount_row(
-            project_id, project, dependencies=dependencies
-        )
+        return None
     transport = _project_folder_transport(
         project_id, project, dependencies=dependencies
     )
@@ -361,12 +279,12 @@ async def build_thread_mount_rows(
 ) -> list[dict[str, Any]]:
     """Resolve mount-row payloads for the given project_ids.
 
-    Each row carries everything ``replace_thread_mounts`` needs. Default
-    projects (Phase 2) produce a ``project_default`` row that mounts the
-    owner's cloud home at the workspace root; non-default projects produce
-    a ``project`` row that mounts at ``projects/<slug>/``. Projects whose
-    cloud transport can't be resolved are skipped — the mount-row entry is
-    not partially filled, the caller observes a missing row.
+    Each row carries everything ``replace_thread_mounts`` needs. A
+    non-default project produces a ``project`` row that mounts at
+    ``projects/<slug>/``. A default project produces none: its cloud is its
+    owner's own root, the user-root connector (main cloud slice 4); the
+    ``project_default`` rows written before stay readable for the scope and
+    End's reconstruction.
 
     Multi-project collisions (two attached projects whose slugified names
     are identical, including case-insensitive matches since the slugifier
@@ -386,20 +304,6 @@ async def build_thread_mount_rows(
         if not project:
             continue
         if project.get("is_default"):
-            try:
-                default_row = await build_default_project_mount_row(
-                    project_id, project, dependencies=dependencies
-                )
-            except Exception as e:
-                logger.warning(
-                    "Project %s (default): failed to resolve user-home mount row: %s",
-                    project_id,
-                    e,
-                )
-                continue
-            if default_row:
-                rows.append(default_row)
-                used_paths.add(default_row.get("target_path", ""))
             continue
         transport = _project_folder_transport(
             project_id, project, dependencies=dependencies
@@ -523,7 +427,6 @@ async def resolve_thread_repositories(
 
 __all__ = [
     "ThreadMountDependencies",
-    "build_default_project_mount_row",
     "build_project_mount_row",
     "build_thread_mount_rows",
     "durable_project_ids",

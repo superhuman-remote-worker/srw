@@ -108,7 +108,6 @@ def _mount_dependencies(store: _Store) -> ThreadMountDependencies:
     return ThreadMountDependencies(
         store=store,
         cloud_router=MagicMock(),
-        resolve_user_identity_cached=AsyncMock(),
         externalize_gitea_url=lambda url: url,
         resolve_authorized_thread_datasources=AsyncMock(),
         build_datasources_payload=lambda rows: rows,

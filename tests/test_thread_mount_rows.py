@@ -1,11 +1,12 @@
-"""Unit tests for the thread-mount-row builders in ``orchestrator/main.py``.
+"""Unit tests for the thread-mount-row builders (``thread_mount_rows``).
 
-Phase 2 of ``knowledge-base/knowledge/features/cloud_collaboration_model.md`` §9 introduces the
-``project_default`` row shape — default projects mount the owner's cloud
-home at the workspace root rather than under ``projects/<slug>/``. These
-tests cover the builder helpers (``build_thread_mount_rows`` and
-``build_default_project_mount_row``) directly so the wiring is exercised
-without standing up the full thread-create path.
+Phase 2 of ``knowledge-base/knowledge/features/cloud_collaboration_model.md``
+§9 introduced the ``project_default`` row shape (a default project mounting
+its owner's cloud home); main cloud slice 4 replaced it with the user-root
+connector, so a default project writes no row any more, while rows written
+before still count for the project scope. These tests cover the builder
+helpers (``build_thread_mount_rows``, ``build_project_mount_row``) directly so
+the wiring is exercised without standing up the full thread-create path.
 """
 
 from __future__ import annotations
@@ -97,185 +98,11 @@ def _fake_db() -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_default_project_emits_user_home_row():
-    """Default project → ``project_default`` row with target_path='' and
-    the owner's home Space's webdav URL. ``target_user_sub`` carries the
-    Keycloak ``sub`` of the owner so the agent can do RFC 8693 exchange.
-    """
-    from orchestrator.services.thread_mount_rows import (
-        build_default_project_mount_row,
-    )
-
-    project = _project(project_id="p-default", is_default=True, name="Default")
-    backend = _backend()
-
-    fake_db = _fake_db()
-    fake_db.get_project_members = AsyncMock(return_value=[_owner_member()])
-    fake_db.get_user = AsyncMock(return_value=_owner_user_record())
-    router = MagicMock()
-    router.for_project.return_value = backend
-    router.for_project_optional.return_value = backend
-
-    with (
-        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
-        patch("orchestrator.main.app.state.resources.main_cloud_router", router),
-    ):
-        row = await build_default_project_mount_row(
-            "p-default",
-            project,
-            dependencies=preparation_composition.thread_mount_dependencies(
-                orch_main.app.state.resources
-            ),
-        )
-
-    assert row is not None
-    assert row["mount_kind"] == "project_default"
-    assert row["target_path"] == ""
-    assert row["source_kind"] == "user_home"
-    assert row["source_ref"] == "p-default"
-    assert row["backend_id"] == "opencloud"
-    assert row["webdav_url"] == "https://oc.test/dav/spaces/drive-xyz/"
-    assert row["cloud_handle"] == "opencloud:drive-xyz:user_home"
-    assert row["target_user_sub"] == "alice-keycloak-sub"
-    backend.resolve_user_identity.assert_awaited_once_with("alice@example.com", "alice")
-    backend.get_user_home.assert_awaited_once_with("user-xyz")
-
-
-@pytest.mark.asyncio
-async def test_default_project_no_owner_returns_none():
-    """Owner missing from the project → fall back to legacy session folder."""
-    from orchestrator.services.thread_mount_rows import (
-        build_default_project_mount_row,
-    )
-
-    project = _project(project_id="p", is_default=True)
-    fake_db = _fake_db()
-    fake_db.get_project_members = AsyncMock(return_value=[])
-    fake_db.get_user = AsyncMock(return_value=None)
-    router = MagicMock()
-    _b = _backend()
-    router.for_project.return_value = _b
-    router.for_project_optional.return_value = _b
-
-    with (
-        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
-        patch("orchestrator.main.app.state.resources.main_cloud_router", router),
-    ):
-        row = await build_default_project_mount_row(
-            "p",
-            project,
-            dependencies=preparation_composition.thread_mount_dependencies(
-                orch_main.app.state.resources
-            ),
-        )
-    assert row is None
-
-
-@pytest.mark.asyncio
-async def test_default_project_owner_missing_keycloak_sub_returns_none():
-    """Owner exists but has never SSO'd, so we don't have their Keycloak
-    sub yet → can't do token-exchange → no row. Caller falls back to
-    legacy session folder so the thread still has SOMETHING.
-    """
-    from orchestrator.services.thread_mount_rows import (
-        build_default_project_mount_row,
-    )
-
-    project = _project(project_id="p", is_default=True)
-    fake_db = _fake_db()
-    fake_db.get_project_members = AsyncMock(return_value=[_owner_member()])
-    fake_db.get_user = AsyncMock(
-        return_value={"id": "owner-uuid", "keycloak_sub": None}
-    )
-    router = MagicMock()
-    _b = _backend()
-    router.for_project.return_value = _b
-    router.for_project_optional.return_value = _b
-
-    with (
-        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
-        patch("orchestrator.main.app.state.resources.main_cloud_router", router),
-    ):
-        row = await build_default_project_mount_row(
-            "p",
-            project,
-            dependencies=preparation_composition.thread_mount_dependencies(
-                orch_main.app.state.resources
-            ),
-        )
-    assert row is None
-
-
-@pytest.mark.asyncio
-async def test_default_project_user_home_unresolvable_returns_none():
-    """Owner exists on the backend but ``get_user_home`` returns None
-    (e.g. drive not yet provisioned) → fall back, no row.
-    """
-    from orchestrator.services.thread_mount_rows import (
-        build_default_project_mount_row,
-    )
-
-    project = _project(project_id="p", is_default=True)
-    backend = _backend()
-    backend.get_user_home = AsyncMock(return_value=None)
-
-    fake_db = _fake_db()
-    fake_db.get_project_members = AsyncMock(
-        return_value=[_owner_member(email="bob@example.com", display_name="Bob")]
-    )
-    fake_db.get_user = AsyncMock(return_value=_owner_user_record())
-    router = MagicMock()
-    router.for_project.return_value = backend
-    router.for_project_optional.return_value = backend
-
-    with (
-        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
-        patch("orchestrator.main.app.state.resources.main_cloud_router", router),
-    ):
-        row = await build_default_project_mount_row(
-            "p",
-            project,
-            dependencies=preparation_composition.thread_mount_dependencies(
-                orch_main.app.state.resources
-            ),
-        )
-    assert row is None
-
-
-@pytest.mark.asyncio
-async def test_default_project_backend_uninitialized_returns_none():
-    from orchestrator.services.thread_mount_rows import (
-        build_default_project_mount_row,
-    )
-
-    project = _project(project_id="p", is_default=True)
-    backend = _backend(initialized=False)
-    fake_db = _fake_db()
-    fake_db.get_project_members = AsyncMock(return_value=[])
-    fake_db.get_user = AsyncMock(return_value=None)
-    router = MagicMock()
-    router.for_project.return_value = backend
-    router.for_project_optional.return_value = backend
-
-    with (
-        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
-        patch("orchestrator.main.app.state.resources.main_cloud_router", router),
-    ):
-        row = await build_default_project_mount_row(
-            "p",
-            project,
-            dependencies=preparation_composition.thread_mount_dependencies(
-                orch_main.app.state.resources
-            ),
-        )
-    assert row is None
-
-
-@pytest.mark.asyncio
-async def test_build_thread_mount_rows_mixes_default_and_non_default():
-    """One default project + one non-default project → two rows of the
-    right shapes. The default-project row points at workspace root; the
-    non-default row lives under ``projects/<slug>/``.
+async def test_build_thread_mount_rows_writes_no_row_for_a_default_project():
+    """One default project + one non-default project → one ``project`` row
+    under ``projects/<slug>/``. A default project's cloud is its owner's own
+    root, the user-root connector (main cloud slice 4): no row, and its
+    owner is not even resolved on the cloud.
     """
     from orchestrator.services.thread_mount_rows import build_thread_mount_rows
 
@@ -310,12 +137,25 @@ async def test_build_thread_mount_rows_mixes_default_and_non_default():
             ),
         )
 
-    assert len(rows) == 2
-    by_kind = {r["mount_kind"]: r for r in rows}
-    assert by_kind["project_default"]["target_path"] == ""
-    assert by_kind["project_default"]["source_ref"] == "p-default"
-    assert by_kind["project"]["target_path"] == "projects/alpha"
-    assert by_kind["project"]["source_ref"] == "p-other"
+    assert [(r["mount_kind"], r["target_path"], r["source_ref"]) for r in rows] == [
+        ("project", "projects/alpha", "p-other")
+    ]
+    backend.resolve_user_identity.assert_not_awaited()
+    backend.get_user_home.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_build_project_mount_row_is_none_for_a_default_project():
+    from orchestrator.services.thread_mount_rows import build_project_mount_row
+
+    assert (
+        await build_project_mount_row(
+            "p-default",
+            _project(project_id="p-default", is_default=True),
+            dependencies=MagicMock(),
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -735,11 +575,8 @@ async def test_dedupe_repeated_project_id():
 
 @pytest.mark.asyncio
 async def test_collision_with_default_project_present():
-    """Default project at workspace root + two collision-named non-default
-    projects. The default's empty ``target_path`` doesn't share the
-    namespace with non-defaults (which live under ``projects/``), so the
-    suffix logic only fires between the non-defaults.
-    """
+    """A default project (no row) + two collision-named non-default
+    projects: the suffix logic fires between the non-defaults only."""
     from orchestrator.services.thread_mount_rows import build_thread_mount_rows
 
     fake_db = _multi_project_db(
@@ -765,13 +602,9 @@ async def test_collision_with_default_project_present():
             ),
         )
 
-    assert len(rows) == 3
-    paths = [r["target_path"] for r in rows]
-    assert "" in paths  # default at root
-    assert "projects/alpha" in paths
-    assert "projects/alpha-2" in paths
+    assert [r["target_path"] for r in rows] == ["projects/alpha", "projects/alpha-2"]
     # source_refs preserved in input order
-    assert [r["source_ref"] for r in rows] == ["p-default", "p-1", "p-2"]
+    assert [r["source_ref"] for r in rows] == ["p-1", "p-2"]
 
 
 def test_protected_cloud_mount_payload_is_ro_lower_plus_overlay():
