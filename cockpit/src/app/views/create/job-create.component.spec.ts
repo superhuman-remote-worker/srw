@@ -307,15 +307,11 @@ describe('JobCreateComponent project picker', () => {
 
   afterEach(() => TestBed.resetTestingModule());
 
-  it('lets a job make cloud storage read-only but never ask for write', () => {
-    // The server only lets cloud_storage_read_only tighten a project link.
+  it('sends no cloud storage override: the folder copy binds at its link level', () => {
+    // The project folder now reaches a job as its checkout connector, at the
+    // level its project link holds (main cloud slice 6).
     const {component} = setup(null);
     expect(component.buildRequest().context?.['cloud_storage_read_only']).toBeUndefined();
-    component.onCloudStorageChange('readwrite');
-    expect(component.cloudStorageOverride()).toBe('inherit');
-    expect(component.buildRequest().context?.['cloud_storage_read_only']).toBeUndefined();
-    component.onCloudStorageChange('readonly');
-    expect(component.buildRequest().context?.['cloud_storage_read_only']).toBe(true);
   });
 
   it("asks for a job's eligible connectors, for the selected project", () => {

@@ -282,23 +282,6 @@ import {AppFormFieldComponent} from '../../ui/form-field';
             @if (noShellNoteKey(); as noteKey) {
               <span workspacePicker class="field-warning" data-testid="no-shell-note">{{ noteKey | transloco }}</span>
             }
-
-            <!-- Cloud Storage Access Override (unchanged until the main cloud
-                 becomes connectors — creation_ui_expert_workspace_connectors.md D9) -->
-            @if (selectedProjectHasCloudStorage()) {
-              <app-form-field connectorsExtra [label]="'jobs.create.cloudStorageLabel' | transloco" [hint]="'jobs.create.cloudStorageHint' | transloco">
-                <app-select
-                  [value]="cloudStorageOverride()"
-                  (changed)="onCloudStorageChange($event)"
-                  [disabled]="isSubmitting()"
-                >
-                  <!-- No read-write choice: a job's override only tightens the
-                       project's link, it never lifts a read-only one. -->
-                  <option value="inherit">{{ 'jobs.create.cloudStorageInherit' | transloco }}</option>
-                  <option value="readonly">{{ 'jobs.create.cloudStorageReadonly' | transloco }}</option>
-                </app-select>
-              </app-form-field>
-            }
           </app-agent-settings>
 
           @if (manifestOpen()) {
@@ -1180,31 +1163,15 @@ export class JobCreateComponent implements OnInit {
     this.loadToolPreview();
   }
 
-  onCloudStorageChange(value: string | null): void {
-    if (value === 'inherit' || value === 'readonly') {
-      this.cloudStorageOverride.set(value);
-    }
-  }
-
   readonly projects = signal<Project[]>([]);
   readonly selectedProjectId = signal<string | null>(null);
 
-  /** A job can make the project's cloud storage read-only, never writable:
-   *  the server only lets `cloud_storage_read_only` tighten a link. */
-  readonly cloudStorageOverride = signal<'inherit' | 'readonly'>('inherit');
   /** A project reachable only through a `?project=` deep link can be archived;
    *  the form says so instead of pretending the job will be accepted. */
   readonly selectedProjectIsArchived = computed(() => {
     const pid = this.selectedProjectId();
     if (!pid) return false;
     return this.projects().find((p) => p.id === pid)?.status === 'archived';
-  });
-
-  readonly selectedProjectHasCloudStorage = computed(() => {
-    const pid = this.selectedProjectId();
-    if (!pid) return false;
-    const proj = this.projects().find((p) => p.id === pid);
-    return !!proj?.cloud_storage_url;
   });
 
   readonly availableDatasources = signal<EligibleDatasource[]>([]);
@@ -1710,14 +1677,6 @@ export class JobCreateComponent implements OnInit {
     const priority = this.selectedPriority();
     if (priority !== 5) request.priority = priority;
 
-    // Cloud storage override
-    if (this.cloudStorageOverride() === 'readonly') {
-      request.context = {
-        ...(request.context ?? {}),
-        cloud_storage_read_only: true,
-      };
-    }
-
     const currentUserId = this.userService.currentUserId();
     if (currentUserId) request.user_id = currentUserId;
     return request;
@@ -1802,7 +1761,6 @@ export class JobCreateComponent implements OnInit {
     this.selectedPriority.set(5);
     this.workspaceChoice.set({kind: 'default'});
     this.picker?.reset();
-    this.cloudStorageOverride.set('inherit');
     this.agentSettings?.resetAll();
     this.selectDefaultProject(this.projects());
     this.afterProjectSelection();
