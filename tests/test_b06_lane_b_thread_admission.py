@@ -1128,6 +1128,42 @@ class TestCreateThreadOperation:
         assert "agent" in order
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("plane", [True, False])
+    async def test_a_sidecar_pod_waits_for_the_session_folder(self, monkeypatch, plane):
+        """With the in-pod plane (D7) a container session's Pod fixes its
+        cloud folders when created, so the session folder comes first;
+        without it the two still run side by side."""
+        order: list[str] = []
+
+        async def main_cloud(*_a, **_kw):
+            order.append("main_cloud")
+
+        async def provision(*_a, **_kw):
+            order.append("provision")
+
+        monkeypatch.setattr(ta, "setup_thread_main_cloud", main_cloud)
+        monkeypatch.setattr(ta, "provision_thread_workspace", provision)
+        monkeypatch.setattr(ta, "setup_thread_gitea", AsyncMock())
+        if plane:
+            monkeypatch.setenv("CONNECTOR_IN_POD_OPENER_IMAGE", "o@sha256:" + "1" * 64)
+            monkeypatch.setenv("CONNECTOR_IN_POD_RCLONE_IMAGE", "r@sha256:" + "2" * 64)
+        else:
+            monkeypatch.delenv("CONNECTOR_IN_POD_OPENER_IMAGE", raising=False)
+        deps = _deps(
+            container_provisioner=SimpleNamespace(
+                is_available=True,
+                in_cluster=True,
+                create_pinned_thread_workspace=AsyncMock(return_value=True),
+            )
+        )
+        await ta.create_thread(ThreadCreateRequest(), MagicMock(), dependencies=deps)
+        assert order == (
+            ["main_cloud", "provision"] if plane else ["provision", "main_cloud"]
+        )
+        plan = await _plan(ThreadCreateRequest(), deps)
+        assert ta.sidecar_pod_planned_at_create(plan) is plane
+
+    @pytest.mark.asyncio
     async def test_a_materialization_denial_is_403(self):
         deps = _deps(
             require_approved_user=AsyncMock(

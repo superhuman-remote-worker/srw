@@ -79,6 +79,7 @@ from orchestrator.services.connector_refs import (
     resolve_execution_connectors,
 )
 from orchestrator.services.config_resolver import resolve_config
+from orchestrator.services.in_pod_mount import InPodPlaneSettings
 from orchestrator.services.model_availability import render_fallback_notice
 from orchestrator.services.default_experts import (
     DefaultExpertUnavailable,
@@ -1195,6 +1196,18 @@ async def _assign_thread_workspace(
         )
 
 
+def sidecar_pod_planned_at_create(plan: ThreadCreationPlan) -> bool:
+    """Whether a new session's container Pod plans its cloud mounts from the
+    in-pod plane (connector drivers D7): a Kubernetes container session with
+    the plane on. Lite and VM sessions have no such Pod."""
+    return bool(
+        plan.use_k8s
+        and not plan.lite_session
+        and not plan.vm_session
+        and InPodPlaneSettings.from_env() is not None
+    )
+
+
 async def provision_thread_workspace(
     plan: ThreadCreationPlan,
     thread_id: str,
@@ -1560,6 +1573,13 @@ async def create_thread(
             plan, request_body, user, dependencies=dependencies
         )
 
+        main_cloud_first = sidecar_pod_planned_at_create(plan)
+        if main_cloud_first:
+            # A sidecar Pod's cloud folders are fixed when the Pod is created
+            # (connector drivers D7), so its session folder must exist
+            # first; the Pod then starts a Nextcloud folder-create later.
+            await setup_thread_main_cloud(thread_id, user, dependencies=dependencies)
+
         await provision_thread_workspace(plan, thread_id, dependencies=dependencies)
 
         # Run Gitea + Nextcloud setup in parallel, and AWAIT both before
@@ -1578,7 +1598,13 @@ async def create_thread(
                 lite_session=plan.lite_session,
                 dependencies=dependencies,
             ),
-            setup_thread_main_cloud(thread_id, user, dependencies=dependencies),
+            *(
+                ()
+                if main_cloud_first
+                else (
+                    setup_thread_main_cloud(thread_id, user, dependencies=dependencies),
+                )
+            ),
         )
 
         schedule_thread_agent(
