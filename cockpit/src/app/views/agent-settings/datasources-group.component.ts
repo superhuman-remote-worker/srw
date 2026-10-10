@@ -13,7 +13,14 @@ import {
   Datasource,
   DatasourceIndexStatus,
   DatasourceType,
+  EligibleDatasource,
 } from '../../core/models/api.model';
+import {
+  accessLevelLabelKey,
+  isPlatformOwned,
+  PlatformRow,
+  platformKindLabelKey,
+} from '../../core/models/platform-connector';
 
 /** A user's explicit picker selection, tagged with the datasource-set identity
  *  it was made against (so a stale tag falls back to the default). */
@@ -46,6 +53,8 @@ const SHELL_WORKSPACE_TYPES = new Set([
   'cloud_folder',
   // A session's mount, or a copy from a job's repository.
   'cloud_outbox',
+  // Copied into a job's repository before it starts.
+  'cloud_folder_checkout',
 ]);
 
 /** Whether a connector type needs a shell workspace: its driver's
@@ -70,22 +79,39 @@ export function datasourceSetKey(datasources: {id: string}[]): string {
     .join(',');
 }
 
-/** Active selection: the user's tagged choice, or the default when the
- *  selection is untouched (null) or stale (made against a different datasource
- *  set). The default is the server-computed `default_selected` set — except
- *  when `defaultIds` is provided (live mode: the session's currently attached
- *  set, possibly empty). */
+/** A picker row: what the selection rules read. */
+type PickerRow = {id: string; default_selected?: boolean} & NonNullable<PlatformRow>;
+
+/** The default selection. With `defaultIds` (live mode: the session's
+ *  currently attached set, possibly empty), exactly those. Otherwise the
+ *  server-computed `default_selected` rows: the platform-owned ones (the
+ *  project's own connectors) always, every other one only while the
+ *  rollout gate for server defaults is on. */
+export function defaultDatasourceIds(
+  datasources: PickerRow[],
+  defaultIds?: Set<string> | null,
+  serverDefaultsEnabled = false,
+): Set<string> {
+  if (defaultIds !== undefined && defaultIds !== null) {
+    return new Set(datasources.filter(d => defaultIds.has(d.id)).map(d => d.id));
+  }
+  return new Set(
+    datasources
+      .filter(d => d.default_selected === true && (serverDefaultsEnabled || isPlatformOwned(d)))
+      .map(d => d.id),
+  );
+}
+
+/** Active selection: the user's tagged choice, or the default
+ *  ({@link defaultDatasourceIds}) when the selection is untouched (null) or
+ *  stale (made against a different datasource set). */
 export function activeDatasourceIds(
-  datasources: Array<{id: string; default_selected?: boolean}>,
+  datasources: PickerRow[],
   selection: DatasourceSelection,
   defaultIds?: Set<string> | null,
   serverDefaultsEnabled = false,
 ): Set<string> {
-  const defaults = defaultIds !== undefined && defaultIds !== null
-    ? new Set(datasources.filter(d => defaultIds.has(d.id)).map(d => d.id))
-    : serverDefaultsEnabled
-      ? new Set(datasources.filter(d => d.default_selected === true).map(d => d.id))
-      : new Set<string>();
+  const defaults = defaultDatasourceIds(datasources, defaultIds, serverDefaultsEnabled);
   if (!selection) return defaults;
 
   // Old exact-set selections remain supported. New selections carry `touched`
@@ -108,7 +134,7 @@ export function activeDatasourceIds(
 /** Number of selected/unselected choices that differ from the current
  * server-computed default. This is what the Settings badge should count. */
 export function datasourceSelectionDifferenceCount(
-  datasources: Array<{id: string; default_selected?: boolean}>,
+  datasources: PickerRow[],
   selection: DatasourceSelection,
   defaultIds?: Set<string> | null,
   serverDefaultsEnabled = false,
@@ -116,11 +142,7 @@ export function datasourceSelectionDifferenceCount(
   const active = activeDatasourceIds(
     datasources, selection, defaultIds, serverDefaultsEnabled,
   );
-  const defaults = defaultIds !== undefined && defaultIds !== null
-    ? new Set(datasources.filter(d => defaultIds.has(d.id)).map(d => d.id))
-    : serverDefaultsEnabled
-      ? new Set(datasources.filter(d => d.default_selected === true).map(d => d.id))
-      : new Set<string>();
+  const defaults = defaultDatasourceIds(datasources, defaultIds, serverDefaultsEnabled);
   return datasources.filter(d => active.has(d.id) !== defaults.has(d.id)).length;
 }
 
@@ -247,7 +269,11 @@ export function allDatasourcesSelected(
                 } @else if (ds.unavailable) {
                   <span class="ds-desc">{{ 'agentSettings.datasources.unavailableLive' | transloco }}</span>
                 } @else if (isLocked(ds)) {
-                  <span class="ds-desc">{{ (ds.type === 'credentials' ? 'agentSettings.datasources.credentialsLocked' : 'agentSettings.datasources.lockedLive') | transloco }}</span>
+                  <span class="ds-desc" data-locked-hint>{{ (ds.type === 'credentials'
+                    ? 'agentSettings.datasources.credentialsLocked'
+                    : ds.type === 'kb'
+                      ? 'agentSettings.datasources.lockedLive'
+                      : 'agentSettings.datasources.lockedNextStart') | transloco }}</span>
                 } @else if (ds.description) {
                   <span class="ds-desc">{{ ds.description }}</span>
                 }
@@ -264,7 +290,7 @@ export function allDatasourcesSelected(
                 }
               </span>
               <span class="ds-type-badge" [class.ds-rw-badge]="ds.unavailable">
-                {{ (ds.unavailable ? 'agentSettings.datasources.unavailableBadge' : 'datasources.filter.' + ds.type) | transloco }}
+                {{ (ds.unavailable ? 'agentSettings.datasources.unavailableBadge' : typeLabelKey(ds)) | transloco }}
               </span>
               @if (ds.is_global) {
                 <span class="ds-type-badge" [class.ds-rw-badge]="isPublicReadWrite(ds)">
@@ -277,6 +303,24 @@ export function allDatasourcesSelected(
                   {{ 'datasources.table.badgeRo' | transloco }}
                 </span>
               }
+              <!-- The level the connector binds at, when the row carries one
+                   (a cloud folder's read-only / protected / read-write).
+                   Slice 5 of main_cloud_as_connectors puts the access select
+                   here, on a selected row; accessLevel() is its seam. -->
+              @if (accessLevel(ds); as level) {
+                <span
+                  class="ds-type-badge"
+                  [class.ds-rw-badge]="accessLevelWritesDirect(ds)"
+                  data-access-level
+                  [attr.data-level]="level"
+                >
+                  @if (accessLevelKey(level); as key) {
+                    {{ key | transloco }}
+                  } @else {
+                    {{ level }}
+                  }
+                </span>
+              }
             </label>
           }
           @if (searchable() && visibleDatasources().length === 0) {
@@ -285,6 +329,14 @@ export function allDatasourcesSelected(
             </div>
           }
         </div>
+        @if (nothingAttached()) {
+          <!-- An empty list is sent as such: no connector at all, the
+               project's own included. Say so where the choice is made. -->
+          <p class="ds-none-note" data-nothing-attached>
+            <app-icon size="sm">info</app-icon>
+            <span>{{ 'agentSettings.datasources.nothingAttached' | transloco }}</span>
+          </p>
+        }
         @if (error()) {
           <div class="ds-error" role="alert">
             <span>{{ 'agentSettings.datasources.loadFailed' | transloco }}</span>
@@ -400,6 +452,9 @@ export function allDatasourcesSelected(
     .ds-type-mongodb { color: var(--alert); }
     .ds-type-webdav { color: var(--info); }
     .ds-type-kb { color: var(--accent-color); }
+    .ds-type-cloud_folder,
+    .ds-type-cloud_folder_checkout,
+    .ds-type-cloud_outbox { color: var(--info); }
     .ds-info {
       display: flex;
       flex-direction: column;
@@ -529,6 +584,14 @@ export function allDatasourcesSelected(
       padding: 10px 2px;
       font-size: 13px;
       color: var(--text-muted);
+    }
+    .ds-none-note {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin: 8px 0 0;
+      font-size: 12px;
+      color: var(--text-secondary);
     }
     .ds-error {
       display: flex;
@@ -666,6 +729,16 @@ export class DatasourcesGroupComponent {
     return this.datasources().filter(d => ids.has(d.id));
   });
 
+  /** Nothing would be attached although the project's own connectors were
+   *  on offer: the explicit empty list a create sends, said in words. */
+  readonly nothingAttached = computed(
+    () =>
+      !this.loading() &&
+      !this.error() &&
+      this.selectedList().length === 0 &&
+      this.datasources().some((ds) => isPlatformOwned(ds) && !this.isLiteExcluded(ds)),
+  );
+
   /** Rows after the search text and the Attached-only filter. */
   readonly visibleDatasources = computed<Datasource[]>(() => {
     const needle = this.query().trim().toLowerCase();
@@ -771,8 +844,38 @@ export class DatasourcesGroupComponent {
       webdav: 'cloud',
       email: 'mail',
       kb: 'menu_book',
+      cloud_folder: 'folder',
+      cloud_folder_checkout: 'folder_copy',
+      cloud_outbox: 'outbox',
     };
     return icons[type] || 'storage';
+  }
+
+  /** The type badge: what a platform-owned row is to its user ("Project
+   *  folder", "Knowledge base"), else the connector type. */
+  typeLabelKey(ds: Datasource): string {
+    return platformKindLabelKey(ds) ?? 'datasources.filter.' + ds.type;
+  }
+
+  /** The access level a row binds at, when it carries one; null shows no
+   *  level badge. */
+  accessLevel(ds: Datasource): string | null {
+    if (ds.unavailable) return null;
+    return (ds as Partial<EligibleDatasource>).access?.default ?? null;
+  }
+
+  accessLevelKey(level: string): string | null {
+    return accessLevelLabelKey(level);
+  }
+
+  /** Whether the row's level writes straight through to the upstream: the
+   *  badge then takes the read-write tone. */
+  accessLevelWritesDirect(ds: Datasource): boolean {
+    const access = (ds as Partial<EligibleDatasource>).access;
+    const level = access?.default ?? null;
+    if (!access || level === null) return false;
+    const writes = access.levels?.find((l) => l.id === level)?.writes;
+    return writes ? writes === 'direct' : level === 'read_write';
   }
 
   /**

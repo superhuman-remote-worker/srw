@@ -139,6 +139,45 @@ describe('datasources-group selection logic', () => {
     expect(activeDatasourceIds(ds, null, new Set(['auto']))).toEqual(new Set(['auto']));
   });
 
+  it("preselects a project's own connectors whatever the rollout gate says", () => {
+    const folder = {...makeDs('folder', 'cloud_folder', true), managed_key: 'project-cloud:p1'};
+    // Written before the key: only the older marker says it is the project's.
+    const kb = {...makeDs('kb', 'kb', true), config: {native_project_id: 'p1'}};
+    const shared = makeDs('shared', 'postgresql', true);
+    const ds = [folder, kb, shared];
+    // Gate off: the platform-owned defaults only, never another default.
+    expect(activeDatasourceIds(ds, null)).toEqual(new Set(['folder', 'kb']));
+    expect(datasourceSelectionDifferenceCount(ds, null)).toBe(0);
+    // Gate on: every server default.
+    expect(activeDatasourceIds(ds, null, undefined, true)).toEqual(
+      new Set(['folder', 'kb', 'shared']),
+    );
+    // A platform-owned row the server does not default (another project's
+    // folder) stays off; so does a marker on a row that is no KB.
+    const foreign = {...makeDs('foreign', 'cloud_folder'), managed_key: 'project-cloud:p2'};
+    const marked = {...makeDs('marked', 'postgresql', true), config: {native_project_id: 'p1'}};
+    expect(activeDatasourceIds([foreign, marked], null)).toEqual(new Set());
+    // Live mode keeps the session's attached set, platform rows or not.
+    expect(activeDatasourceIds(ds, null, new Set(['shared']))).toEqual(new Set(['shared']));
+  });
+
+  it("a project's own connector is removable, and removing every one sends none", () => {
+    const folder = {...makeDs('folder', 'cloud_folder', true), managed_key: 'project-cloud:p1'};
+    const kb = {...makeDs('kb', 'kb', true), managed_key: 'project-kb:p1'};
+    const ds = [folder, kb];
+    const withoutFolder = {
+      key: datasourceSetKey(ds),
+      ids: new Set(['kb']),
+      touched: new Set(['folder']),
+    };
+    expect(selectedDatasourceIds(ds, withoutFolder, false)).toEqual(['kb']);
+    expect(datasourceSelectionDifferenceCount(ds, withoutFolder)).toBe(1);
+    const none = {key: datasourceSetKey(ds), ids: new Set<string>(), touched: new Set(['folder', 'kb'])};
+    // The explicit empty list the create form sends: no connector at all.
+    expect(selectedDatasourceIds(ds, none, false)).toEqual([]);
+    expect(datasourceSelectionDifferenceCount(ds, none)).toBe(2);
+  });
+
   it('isRepositoryDatasource is case-insensitive', () => {
     expect(isRepositoryDatasource('repository')).toBe(true);
     expect(isRepositoryDatasource('Repository')).toBe(true);
