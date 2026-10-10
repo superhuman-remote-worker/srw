@@ -244,16 +244,45 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         expect(ctx.service.outbox().length).toBe(0);
     });
 
-    it('selects no connector defaults while the rollout capability is unavailable', async () => {
+    it("previews the work's own connectors while the rollout capability is unavailable", async () => {
+        // An omitted selection attaches the personal project's own (My cloud,
+        // the owner's outbox) and no other default; the server names them.
         const ctx = createService({
             policyAvailable: false,
             projects: [{id: 'p-def', is_default: true}],
-            datasourceIds: ['auto'],
+            datasourceIds: ['my-cloud', 'outbox'],
         });
         ctx.service.enterDraftSession();
         await flushTick();
 
         expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+            expect.stringContaining('/persistent/threads/preview'),
+            {project_ids: ['p-def']},
+        );
+        expect(ctx.service.draftDatasourceIds()).toEqual(['my-cloud', 'outbox']);
+
+        // The create sends the reviewed ids, never an omission.
+        await ctx.service.sendMessage('hello');
+        await flushTick();
+        expect(createPosts(ctx)[0][1]).toEqual({
+            title: 'hello',
+            project_ids: ['p-def'],
+            datasource_ids: ['my-cloud', 'outbox'],
+        });
+    });
+
+    it('keeps an explicit empty selection when the user removed every connector', async () => {
+        const ctx = createService({
+            policyAvailable: false,
+            projects: [{id: 'p-def', is_default: true}],
+            datasourceIds: ['my-cloud'],
+        });
+        ctx.service.enterDraftSession();
+        await flushTick();
+        ctx.service.setDraftConnectorsEnabled(false);
+        await flushTick();
+
+        expect(ctx.mockHttp.post).toHaveBeenLastCalledWith(
             expect.stringContaining('/persistent/threads/preview'),
             {project_ids: ['p-def'], datasource_ids: []},
         );

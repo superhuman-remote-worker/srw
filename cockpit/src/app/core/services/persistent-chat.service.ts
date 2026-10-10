@@ -2578,13 +2578,17 @@ export class PersistentChatService {
       this.draftProjectIds = defaultProject ? [defaultProject.id] : [];
       this.draftProjectId.set(this.draftProjectIds?.[0] ?? null);
       const body = this.draftCreationContext();
-      if (this.capabilities.datasourceScopeAutoAttachAvailable() && this.draftConnectorsEnabled()) {
-        body['use_datasource_defaults'] = true;
-      } else {
-        // An opt-out or unavailable rollout capability is an explicit empty
-        // selection, even if the server enables defaults on omission.
+      if (!this.draftConnectorsEnabled()) {
+        // The user removed every connector: an explicit empty selection,
+        // the work's own included, even if the server attaches defaults on
+        // omission.
         body['datasource_ids'] = [];
+      } else if (this.capabilities.datasourceScopeAutoAttachAvailable()) {
+        body['use_datasource_defaults'] = true;
       }
+      // Otherwise neither field: an omitted selection attaches the work's
+      // own connectors (a personal project's My cloud and the owner's
+      // outbox) and no other default, which the preview names for review.
       // Admission resolves the workspace before selecting implicit defaults.
       // Keep the reviewed IDs explicit at create so later auto-attach edits
       // cannot add a connector the user did not see here.
