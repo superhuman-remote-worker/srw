@@ -62,7 +62,8 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               the reader account disabled and the supervisor restarted, the
               lower reads unavailable with credential_rejected, the workspace
               never restarts, and the next claim starts without cloud with
-              the thread's state saying credential_rejected (decision 42;
+              the thread's state saying credential_rejected, no overlay left
+              on /cloud/merged and no workspace/cloud link to it (decision 42;
               the account is enabled again at once)
   teardown    50 MB written into the rw folder, then End at once: End returns
               within the grace period, the Pod is gone with nothing of it in
@@ -658,7 +659,7 @@ PLAN = [
     "/cloud/merged captures a write in its upper layer; the reader credential "
     "is refused a WebDAV PUT; reader disabled + supervisor restarted -> "
     "credential_rejected, no workspace restart, the next claim starts without "
-    "cloud and says so (decision 42)",
+    "cloud, keeps no overlay or workspace/cloud link, and says so (decision 42)",
     "teardown: 50 MB written, End at once: End within the grace period, the "
     "Pod gone with nothing in the node's mount table, its ConfigMap and "
     "Secret collected, the file complete in Nextcloud",
@@ -1366,6 +1367,20 @@ class CloudMountSidecarGate:
             "says credential_rejected (decision 42)",
             started,
             detail,
+        )
+        # Without its cloud means no folder at all: no overlay on the dead
+        # lower, and no workspace/cloud link into the sidecars' volume.
+        merged = top_mounts(self.inspect(session.pod).get("mountinfo", "")).get(
+            "/cloud/merged", ("", "")
+        )[0]
+        _rc, link, _err = self.as_agent(
+            session.pod, f"readlink {HOME}/workspace/cloud || true"
+        )
+        self.report.check(
+            "protected: without its cloud no overlay stays on /cloud/merged and "
+            "workspace/cloud is no link to it",
+            merged != "fuse.fuse-overlayfs" and link.strip() != "/cloud/merged",
+            f"/cloud/merged {merged or 'unmounted'}; link {link.strip() or 'none'}",
         )
 
     def teardown(self) -> None:
