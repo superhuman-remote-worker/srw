@@ -398,6 +398,25 @@ class SidecarMountWatcher:
                 rows.append({"name": mount.workspace_name, "state": "pending"})
         return rows
 
+    def event_rows(self, report: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """``report`` (:meth:`report`) for the session header's live event:
+        each mount also says what it is (``mount_kind``), the level it is
+        bound at (``level``; ``protected`` for a protected session's lower)
+        and, for a connector's folder, its ``connector_id`` (the planned
+        mount id), all from the plan, so the header never has to look a
+        folder up by its name."""
+        rows: list[dict[str, Any]] = []
+        for row, mount in zip(report, self.planned):
+            protected = mount.mount_kind == "protected_lower"
+            extra: dict[str, Any] = {
+                "mount_kind": mount.mount_kind,
+                "level": "protected" if protected else mount.access,
+            }
+            if not protected:
+                extra["connector_id"] = mount.mount_id
+            rows.append({**row, **extra})
+        return rows
+
     def unavailable(self) -> list[dict[str, str]]:
         """What did not mount, in plain words (for the agent's prompt):
         ``name``, its ``path`` in the workspace (``workspace/cloud`` for a

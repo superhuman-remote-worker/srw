@@ -1023,6 +1023,35 @@ async def test_a_sandbox_upgraded_to_a_vm_gets_the_vms_folders_not_the_pods(
     assert rows.await_args.kwargs["runtime_is_vm"] is True
 
 
+def test_the_record_keeps_the_level_a_left_out_folder_would_have_bound_at():
+    recorded = {
+        "fingerprint": "f" * 64,
+        "mounts": [],
+        "excluded": [
+            {
+                "source_ref": "c",
+                "mount_kind": "project",
+                "reason": "grant_unavailable",
+                "name": "acme",
+                "detail": "not_ready",
+                "level": "read_only",
+            },
+            {"source_ref": "d", "mount_kind": "project", "reason": "not_eligible"},
+        ],
+    }
+    status = cloud_mount_status.initial_status(recorded, POD_UID, now="t")
+    assert status["excluded"] == [
+        {
+            "source_ref": "c",
+            "mount_kind": "project",
+            "reason": "grant_unavailable",
+            "detail": "not_ready",
+            "level": "read_only",
+        },
+        {"source_ref": "d", "mount_kind": "project", "reason": "not_eligible"},
+    ]
+
+
 def test_the_payload_says_whether_the_pods_folders_already_settled():
     recorded = {**_plan().recorded(), "runtime_incarnation": POD_UID}
     status = cloud_mount_status.initial_status(recorded, POD_UID)

@@ -740,10 +740,14 @@ async def _bind_folder(
     binding = _folder_binding(connector, ctx=ctx)
     if isinstance(binding, CloudFolderUnavailable):
         return excluded_entry(connector, binding.reason, detail=binding.detail)
+    level = binding.access
     binder = FOLDER_KIND_BINDERS.get(binding.folder_kind)
     if binder is None:
         return excluded_entry(
-            connector, "config_invalid", detail="SRW mounts no folder of this kind"
+            connector,
+            "config_invalid",
+            detail="SRW mounts no folder of this kind",
+            level=level,
         )
     bound = await binder(
         FolderBindRequest(
@@ -756,13 +760,17 @@ async def _bind_folder(
         )
     )
     if isinstance(bound, CloudFolderUnavailable):
-        return excluded_entry(connector, bound.reason, detail=bound.detail)
+        return excluded_entry(connector, bound.reason, detail=bound.detail, level=level)
     granted = await _folder_grant_subject(
         thread, bound.row, binding, dependencies=dependencies
     )
     if isinstance(granted, CloudFolderUnavailable):
         return excluded_entry(
-            connector, granted.reason, name=bound.name, detail=granted.detail
+            connector,
+            granted.reason,
+            name=bound.name,
+            detail=granted.detail,
+            level=level,
         )
     name = _unique_name(bound.name, used)
     failures: list[str] = []
@@ -781,6 +789,7 @@ async def _bind_folder(
             "unbuildable",
             name=name,
             detail=failures[-1] if failures else "error",
+            level=level,
         )
     return built
 
@@ -1061,6 +1070,7 @@ async def _bind_outbox(
             "unbuildable",
             name=name,
             detail=failures[-1] if failures else "error",
+            level=binding.access,
         )
     return built
 

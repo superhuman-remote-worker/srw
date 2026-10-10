@@ -138,7 +138,8 @@ function excludedBindings(excluded: unknown): CloudFolderBinding[] {
     name: '',
     path: '',
     kind: kindOf(entry['mount_kind']),
-    level: '',
+    // The level it would have bound at, once the server resolved one.
+    level: levelValue(entry['level']),
     state: 'excluded',
     reason: reasonOf(entry['reason']),
     connectorId: typeof entry['source_ref'] === 'string' ? entry['source_ref'] : '',
@@ -151,6 +152,12 @@ function excludedBindings(excluded: unknown): CloudFolderBinding[] {
 function levelOf(kind: unknown, access: unknown): string {
   if (kind === 'protected_lower') return 'protected';
   return access === 'read_only' || access === 'read_write' ? access : '';
+}
+
+/** A level as the server names it (`read_only`, `read_write`,
+ *  `protected`), or ''. */
+function levelValue(value: unknown): string {
+  return value === 'protected' ? value : levelOf('', value);
 }
 
 function stateOf(value: unknown): CloudFolderBinding['state'] {
@@ -201,9 +208,10 @@ export function cloudFolderStateFromStatus(status: unknown): CloudFolderState {
   };
 }
 
-/** From a `cloud_mount.status` event's params. The event names each mount
- *  and its state only: what a folder is and its level come from `previous`
- *  (the thread's record), matched by name. */
+/** From a `cloud_mount.status` event's params. Each mount names its state,
+ *  what it is (`mount_kind`), its `level` and its `connector_id`; from an
+ *  agent that sends only the state, what a folder is and its level come
+ *  from `previous` (the thread's record), matched by name. */
 export function cloudFolderStateFromEvent(
   params: Record<string, unknown>,
   previous?: CloudFolderState | null,
@@ -221,14 +229,17 @@ export function cloudFolderStateFromEvent(
     const reason = state === 'unavailable' ? reasonOf(row['reason']) : '';
     if (state === 'unavailable') problems.push({name, path, kind: '', reason});
     const before = known.get(name);
+    const kind = kindOf(row['mount_kind']);
+    const level = levelValue(row['level']);
     return {
       name,
       path,
-      kind: before?.kind ?? '',
-      level: before?.level ?? '',
+      kind: kind || (before?.kind ?? ''),
+      level: level || (before?.level ?? ''),
       state,
       reason,
-      connectorId: '',
+      connectorId:
+        typeof row['connector_id'] === 'string' ? row['connector_id'] : (before?.connectorId ?? ''),
       title: '',
     };
   });

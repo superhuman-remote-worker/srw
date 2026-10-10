@@ -580,12 +580,13 @@ class SessionAttachCoordinator:
         self, watcher: Any, report: list[dict[str, Any]]
     ) -> None:
         """Publish the sidecar cloud folders' state (D7): a cockpit event at
-        once, and the orchestrator's record for this Pod in the background,
-        so a slow orchestrator never holds the attach. Never raises."""
+        once, each folder with its kind and level, and the orchestrator's
+        record for this Pod in the background, so a slow orchestrator never
+        holds the attach. Never raises."""
         self._ports.broadcast(
             "cloud_mount.status",
             {
-                "mounts": report,
+                "mounts": watcher.event_rows(report),
                 "excluded": list(watcher.excluded),
                 "protected": bool(watcher.cloud_cfg.get("protected")),
             },

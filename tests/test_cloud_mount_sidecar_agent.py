@@ -753,6 +753,16 @@ async def test_the_state_report_names_its_pod_and_never_holds_the_attach():
         coordinator._report_sidecar_mounts(watcher, [{"name": "project"}]), 1
     )
     assert events[0][0] == "cloud_mount.status"
+    # The cockpit's event says what each folder is and its level; the
+    # orchestrator's report stays the state alone (it reads the plan).
+    assert events[0][1]["mounts"] == [
+        {
+            "name": "project",
+            "mount_kind": "project",
+            "level": "read_write",
+            "connector_id": "row-project",
+        }
+    ]
     await asyncio.sleep(0)
     assert calls == [
         {
@@ -763,6 +773,39 @@ async def test_the_state_report_names_its_pod_and_never_holds_the_attach():
     ]
     gate.set()
     await asyncio.gather(*coordinator._report_tasks)
+
+
+def test_the_live_event_names_each_folders_kind_and_level():
+    cfg = _cfg("acme", "outbox")
+    cfg["mounts"][0]["access"] = "read_only"
+    cfg["mounts"][1]["mount_kind"] = "cloud_outbox"
+    watcher = _watcher(_Workspace(["acme", "outbox"]), cfg)
+    rows = watcher.event_rows(
+        [{"name": "acme", "state": "mounted"}, {"name": "outbox", "state": "pending"}]
+    )
+    assert rows == [
+        {
+            "name": "acme",
+            "state": "mounted",
+            "mount_kind": "project",
+            "level": "read_only",
+            "connector_id": "row-acme",
+        },
+        {
+            "name": "outbox",
+            "state": "pending",
+            "mount_kind": "cloud_outbox",
+            "level": "read_write",
+            "connector_id": "row-outbox",
+        },
+    ]
+    # A protected session's lower is bound at protected, and is no connector.
+    protected = _cfg("cloud")
+    protected["mounts"][0].update(mount_kind="protected_lower", access="read_only")
+    [row] = _watcher(_Workspace(["cloud"]), protected).event_rows(
+        [{"name": "cloud", "state": "mounted"}]
+    )
+    assert (row["level"], "connector_id" in row) == ("protected", False)
 
 
 def test_a_protected_sidecar_shape_needs_the_marker():

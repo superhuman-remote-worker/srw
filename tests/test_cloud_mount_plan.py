@@ -321,6 +321,7 @@ async def test_left_out_rows_are_named_and_extra_mounts_capped(monkeypatch):
             "mount_kind": "project",
             "reason": "too_many_mounts",
             "name": "c",
+            "level": "read_write",
         },
     ]
 

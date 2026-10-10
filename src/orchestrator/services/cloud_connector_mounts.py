@@ -329,9 +329,11 @@ def excluded_entry(
     *,
     name: str = "",
     detail: str | None = None,
+    level: str | None = None,
 ) -> dict[str, str]:
-    """An exclusion of the plan: which connector, what it was, why, and the
-    name it would have been mounted under (empty when it never got one)."""
+    """An exclusion of the plan: which connector, what it was, why, the
+    name it would have been mounted under (empty when it never got one),
+    and the level it would have bound at, once that was resolved."""
     entry = {
         "source_ref": connector.connector_id,
         "mount_kind": connector.folder_kind,
@@ -340,6 +342,8 @@ def excluded_entry(
     }
     if detail:
         entry["detail"] = detail
+    if level:
+        entry["level"] = level
     return entry
 
 

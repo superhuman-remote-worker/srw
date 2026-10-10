@@ -164,6 +164,45 @@ describe('cloud folder state', () => {
       ['', 'project', '', 'excluded', 'beside_protected', 'Other folder'],
     ]);
   });
+
+  it("prefers what the agent's event says each folder is over the record", () => {
+    // The record knows only an older name; the event names kind and level.
+    const before = cloudFolderStateFromStatus({
+      mounts: { acme: { mount_kind: 'project', access: 'read_write', state: 'pending' } },
+    });
+    const after = cloudFolderStateFromEvent(
+      {
+        mounts: [
+          { name: 'acme', state: 'mounted', mount_kind: 'project', level: 'read_only', connector_id: 'ds-1' },
+          { name: 'my_cloud', state: 'pending', mount_kind: 'user_root', level: 'read_write', connector_id: 'ds-2' },
+          { name: 'cloud', state: 'mounted', mount_kind: 'protected_lower', level: 'protected' },
+          { name: 'odd', state: 'mounted', mount_kind: 'nonsense', level: 'everything' },
+        ],
+        excluded: [
+          { source_ref: 'ds-3', mount_kind: 'project', reason: 'grant_unavailable', level: 'read_write' },
+        ],
+      },
+      before,
+    );
+    expect(after.folders.map((f) => [f.name, f.kind, f.level, f.connectorId])).toEqual([
+      ['acme', 'project', 'read_only', 'ds-1'],
+      ['my_cloud', 'user_root', 'read_write', 'ds-2'],
+      ['cloud', 'protected_lower', 'protected', ''],
+      // Anything outside the closed sets is not shown as a kind or level.
+      ['odd', '', '', ''],
+      ['', 'project', 'read_write', 'ds-3'],
+    ]);
+  });
+
+  it('shows the level a folder left out would have bound at', () => {
+    const state = cloudFolderStateFromStatus({
+      excluded: [
+        { source_ref: 'ds-b', mount_kind: 'project', reason: 'reader_unavailable', level: 'read_only' },
+        { source_ref: 'ds-c', mount_kind: 'project', reason: 'not_eligible' },
+      ],
+    });
+    expect(state.folders.map((f) => f.level)).toEqual(['read_only', '']);
+  });
 });
 
 describe('CloudFoldersNoticeComponent', () => {

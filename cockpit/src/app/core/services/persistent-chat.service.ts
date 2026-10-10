@@ -8342,8 +8342,8 @@ export class PersistentChatService {
       case 'cloud_mount.status': {
         // The agent's live view of the sidecar cloud folders (D7). An agent
         // that reports is up to date: an earlier outdated notice clears.
-        // The event names each mount's state; what it is and its level stay
-        // the thread record's.
+        // The event names each mount's state, what it is and its level; for
+        // an agent that names only the state, the thread record says the rest.
         const folders = cloudFolderStateFromEvent(params, {
           problems: this.cloudFolderProblems(),
           folders: this.cloudFolders(),

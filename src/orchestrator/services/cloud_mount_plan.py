@@ -547,6 +547,7 @@ async def resolve_cloud_mount_plan(
                 "mount_kind": str(entry.get("mount_kind") or "project"),
                 "reason": "too_many_mounts",
                 "name": str(entry.get("workspace_name") or ""),
+                **({"level": str(entry["access"])} if entry.get("access") else {}),
             }
         )
     cache_bytes = _quantity_bytes(settings.cache_size) // max(1, len(kept))

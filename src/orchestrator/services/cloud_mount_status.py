@@ -12,7 +12,7 @@ starts, the mount is marked unavailable, and the reason reaches the user
       "notice": null | "agent_outdated",
       "mounts": {<name>: {mount_kind, target_path, access, state, reason,
                           reported_by, updated_at}},
-      "excluded": [{source_ref, mount_kind, reason, detail?}]
+      "excluded": [{source_ref, mount_kind, reason, detail?, level?}]
     }
 
 Two writers, never more:
@@ -80,7 +80,7 @@ def initial_status(
         "excluded": [
             {
                 key: entry.get(key)
-                for key in ("source_ref", "mount_kind", "reason", "detail")
+                for key in ("source_ref", "mount_kind", "reason", "detail", "level")
                 if entry.get(key) is not None
             }
             for entry in recorded.get("excluded") or []

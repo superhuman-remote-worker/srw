@@ -334,6 +334,8 @@ async def test_a_broken_folder_is_named_and_the_others_still_mount(denied):
             "reason": "unbuildable",
             "name": "acme_launch",
             "detail": "backend_unavailable",
+            # The level it would have bound at, for the session header.
+            "level": "read_write",
             "title": "Acme Launch cloud folder",
         }
     ]
@@ -478,6 +480,8 @@ async def test_without_its_grant_a_folder_is_left_out_never_the_service_account(
     assert [(e["reason"], e["detail"], e["name"]) for e in live.excluded] == [
         (reason, detail, "acme_launch")
     ]
+    # It says the level it would have bound at: a VM's folder is its reader's.
+    assert [e["level"] for e in live.excluded] == ["read_only" if vm else "read_write"]
 
 
 @pytest.mark.asyncio
