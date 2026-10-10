@@ -212,6 +212,12 @@ class _FakeStore:
     def resolve_catalog_model(self, *_a, **_k):
         return None
 
+    @contextlib.asynccontextmanager
+    async def acquire(self):
+        # Startup's retirement of the legacy cloud WebDAV rows (main cloud
+        # slice 8) reads through a connection: there is nothing to retire.
+        yield SimpleNamespace(fetch=AsyncMock(return_value=[]))
+
     def __getattr__(self, item: str):
         # Startup hands some bound store methods to loops as references; a
         # task body never runs here, so they only need to exist.
