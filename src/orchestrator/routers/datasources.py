@@ -203,6 +203,13 @@ async def list_eligible_datasources(
             "folder is a session's); omit for all"
         ),
     ),
+    workspace_backend: Literal["sandbox", "vm", "virtual", "none"] | None = Query(
+        default=None,
+        description=(
+            "The execution's workspace tier: a connector with access levels "
+            "(a cloud folder) lists the levels offered on it; omit for any tier"
+        ),
+    ),
     *,
     dependencies: DatasourcesDependencies = Depends(get_datasources_dependencies),
 ) -> list[dict[str, Any]]:
@@ -219,6 +226,7 @@ async def list_eligible_datasources(
         user=user,
         project_id=project_id,
         execution=execution,
+        workspace_backend=workspace_backend,
         require_project_member=member_of,
         dependencies=dependencies.operations,
     )

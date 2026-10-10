@@ -15,9 +15,11 @@ from typing import Any, Iterable, Literal, Mapping
 from uuid import UUID
 
 from shared.connectors.builtin import spec_for_row
+from shared.connectors.contract import read_only_ceiling
 from shared.connectors.platform import (
     CLOUD_OUTBOX,
     managed_kind,
+    native_cloud_project,
     native_project,
     native_user,
 )
@@ -104,19 +106,47 @@ def _native_default(
     return native_user(row) == owner_id
 
 
-def _scope_matches(row: dict[str, Any], target_project_ids: set[str]) -> bool:
+def _scope_matches(
+    row: dict[str, Any],
+    target_project_ids: set[str],
+    member_projects: Iterable[str] = (),
+) -> bool:
     native_project_id = _native_project_id(row)
     if native_project_id is not None:
         # A project's own connectors represent one binding per project. In a
         # multi-project session each selected project's native binding is
         # independently valid, rather than requiring one synthetic row to be
-        # linked to every project.
-        return native_project_id in target_project_ids
+        # linked to every project. A project's cloud folder alone reaches
+        # past its project: into any work of a member of its project
+        # (``member_projects``: the owner's projects), never as a default.
+        if native_project_id in target_project_ids:
+            return True
+        return native_cloud_project(row) is not None and (
+            native_project_id in set(member_projects)
+        )
     if row.get("scope_mode") == "all":
         return True
     if row.get("scope_mode") != "projects" or not target_project_ids:
         return False
     return target_project_ids.issubset(_row_project_ids(row))
+
+
+def access_ceiling_for(row: Mapping[str, Any], role: str | None) -> str | None:
+    """The highest level the owner may bind ``row`` at, from the owner's
+    role in the row's project, or ``None`` for no ceiling.
+
+    Only a project's cloud folder has one: a viewer of its project gets at
+    most its read-only level (``read_only_ceiling``), in its own project's
+    work and another's alike; an editor or owner, or a non-member admin of
+    its own project, gets every level. Every other connector keeps its
+    policy (``None``).
+    """
+    if native_cloud_project(row) is None or role != "viewer":
+        return None
+    spec = spec_for_row(row)
+    # A strict spec always has a level that writes nothing; one that does
+    # not leaves a viewer no level at all, never a write.
+    return (read_only_ceiling(spec) if spec is not None else None) or "none"
 
 
 def execution_kind_detail(row: Mapping[str, Any], execution_kind: str) -> str:
@@ -199,12 +229,15 @@ class ItemVerdict:
     """One connector's availability decision, for callers that must report
     rather than deny. ``reason`` is None exactly when ``denied`` is False;
     ``detail`` is a sentence a person can read, for a refusal that may say
-    why (``execution_kind``)."""
+    why (``execution_kind``). ``access_ceiling`` is the highest level an
+    allowed connector may be bound at for the owner (``access_ceiling_for``:
+    a project viewer's cloud folder), ``None`` for no ceiling."""
 
     datasource_id: str
     denied: bool
     reason: str | None = None
     detail: str | None = None
+    access_ceiling: str | None = None
 
 
 async def classify_datasource_selection(
@@ -260,6 +293,16 @@ async def classify_datasource_selection(
             legacy_job_id=normalized_legacy_job_id,
         )
     by_id = {str(row["id"]): row for row in rows}
+    # The owner's role in the project of every project cloud folder named:
+    # a member of its project may attach it in any work, a viewer read-only.
+    cloud_projects = sorted(
+        {project for row in rows if (project := native_cloud_project(row)) is not None}
+    )
+    owner_roles: dict[str, str] = (
+        await db.get_user_project_roles(owner_id, cloud_projects)
+        if owner_id is not None and cloud_projects
+        else {}
+    )
 
     actor_is_admin = bool(actor and actor.get("is_admin"))
     admin_override = allow_admin_explicit_override and actor_is_admin
@@ -271,7 +314,7 @@ async def classify_datasource_selection(
         if row is None:
             verdicts.append(ItemVerdict(datasource_id, True, "deleted"))
             continue
-        if not _scope_matches(row, target_set):
+        if not _scope_matches(row, target_set, owner_roles):
             verdicts.append(ItemVerdict(datasource_id, True, "out_of_scope"))
             continue
 
@@ -282,7 +325,13 @@ async def classify_datasource_selection(
         native_access = bool(
             owner_is_authoritative
             and native_target is not None
-            and native_target in target_set
+            and (
+                native_target in target_set
+                or (
+                    native_cloud_project(row) is not None
+                    and native_target in owner_roles
+                )
+            )
         )
         legacy_job_binding = bool(
             normalized_legacy_job_id
@@ -321,7 +370,16 @@ async def classify_datasource_selection(
             verdicts.append(ItemVerdict(datasource_id, True, "corrupt_revision"))
             continue
         revisions[datasource_id] = policy_revision
-        verdicts.append(ItemVerdict(datasource_id, False, None))
+        verdicts.append(
+            ItemVerdict(
+                datasource_id,
+                False,
+                None,
+                access_ceiling=access_ceiling_for(
+                    row, owner_roles.get(native_target or "")
+                ),
+            )
+        )
     return verdicts, revisions
 
 
@@ -511,6 +569,7 @@ __all__ = [
     "GENERIC_UNAVAILABLE_DETAIL",
     "SHELL_WORKSPACE_DETAIL",
     "ItemVerdict",
+    "access_ceiling_for",
     "authorize_datasource_ids",
     "authorize_datasource_selection",
     "classify_datasource_selection",

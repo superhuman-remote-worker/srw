@@ -193,11 +193,22 @@ async def test_every_member_may_use_it_and_no_other_project(database):
     }
     assert eligible[row_id]["default_selected"] is True
     assert eligible[row_id]["managed_key"] == f"project-cloud:{project['id']}"
-    # Not in another project's work, nor anyone's projectless work.
-    for user, projects in ((member, [other]), (member, []), (outsider, [])):
+    # A member may attach it in another project's work and projectless work
+    # too (slice 5), never preselected there; an outsider nowhere.
+    for projects in ([other], []):
+        listed = {
+            str(entry["id"]): entry
+            for entry in await database.list_eligible_datasources(
+                member["id"], projects
+            )
+        }
+        assert listed[row_id]["default_selected"] is False
+    for projects in ([other], [], [str(project["id"])]):
         assert row_id not in {
             str(entry["id"])
-            for entry in await database.list_eligible_datasources(user["id"], projects)
+            for entry in await database.list_eligible_datasources(
+                outsider["id"], projects
+            )
         }
 
     selected, _revisions = await default_datasource_selection(

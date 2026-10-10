@@ -74,7 +74,12 @@ from orchestrator.services.connector_drivers.registered import (
     CheckRunner,
     SupportsDriverRegistration,
 )
-from orchestrator.services.datasource_policy import execution_kind_refuses
+from orchestrator.services.connector_access import access_choice, strict_spec_row
+from orchestrator.services.datasource_policy import (
+    access_ceiling_for,
+    execution_kind_refuses,
+)
+from shared.connectors.contract import AccessContext
 from shared.credential_connectors import CredentialConnectorAttachedError
 from shared.connectors.platform import (
     PROJECT_KB,
@@ -121,6 +126,9 @@ class DatasourceDependencies:
     #: Runs a registered driver's ``check`` in a driver pod (D6); ``None``
     #: where this installation runs no driver pods.
     driver_check_runner: CheckRunner | None = None
+    #: The installation's protected-cloud switch, which narrows the levels
+    #: the picker offers (``None``: on).
+    is_protected_cloud_mode_enabled: Callable[[], bool] | None = None
 
     async def driver_for(self, row: dict[str, Any]) -> DatasourceDriver | None:
         """The driver of a stored row: its type's, or for a registered
@@ -293,6 +301,7 @@ async def list_eligible_datasources(
     require_project_member: RequireProjectMember,
     dependencies: DatasourceDependencies,
     execution: str | None = None,
+    workspace_backend: str | None = None,
 ) -> list[dict[str, Any]]:
     """Connectors the caller may pre-select for a job/session (the picker
     source of truth).
@@ -306,6 +315,14 @@ async def list_eligible_datasources(
     kind of execution can attach, as their drivers say
     (``execution_kind_refuses``: a cloud folder is a session's); ``None``
     keeps all.
+
+    A connector whose driver has strict levels (a cloud folder) carries
+    ``access`` (``connector_access.access_choice``): the levels the
+    execution may choose on ``workspace_backend`` (``None``: any tier),
+    each with why not, below the caller's ceiling (a viewer of a cloud
+    folder's project: ``read_only``), and the level it gets unchosen. A
+    project's cloud folder is listed in another project's work for a member
+    of its project, never preselected there.
     """
     project_ids = list(dict.fromkeys(str(value) for value in (project_id or [])))
     scope_project_id = mcp_scope_project_id(user)
@@ -330,6 +347,24 @@ async def list_eligible_datasources(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     rows = [row for row in rows if not execution_kind_refuses(row, execution)]
+    ctx = AccessContext(
+        workspace_backend=workspace_backend,
+        protected_mode_enabled=(
+            dependencies.is_protected_cloud_mode_enabled()
+            if dependencies.is_protected_cloud_mode_enabled is not None
+            else True
+        ),
+        execution=execution if execution in ("session", "job") else None,
+    )
+    for row in rows:
+        role = row.pop("native_member_role", None)
+        if strict_spec_row(row):
+            row["access"] = access_choice(
+                row,
+                dependencies.connector_drivers.for_type(row.get("type")),
+                ctx,
+                ceiling=access_ceiling_for(row, role),
+            )
     await connector_driver_registrations.annotate_driver_env_names(
         dependencies.store, rows
     )

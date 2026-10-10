@@ -53,6 +53,7 @@ from shared.connectors.builtin import (
     legacy_types_with_config_key,
 )
 from shared.connectors.platform import (
+    native_cloud_project_sql,
     native_project_sql,
     native_user_sql,
     platform_owned_sql,
@@ -51739,7 +51740,10 @@ class PostgresDB:
 
         ``project_ids`` is used solely to surface the project-level ``read_only``
         setting for a selected datasource that is linked to those projects; it
-        never widens the result set. Selection authorization applies all-match
+        never widens the result set. ``project_access`` is the link's default
+        level (a strict driver's): a native row's own project link, wherever
+        it is used, else the one level the target links that set one agree
+        on. Selection authorization applies all-match
         scope before this resolver runs. For a multi-project thread, this query
         keeps one row per selected connector and conservatively applies
         ``BOOL_OR`` across its matching project overrides: any read-only link
@@ -51769,18 +51773,27 @@ class PostgresDB:
             except ValueError:
                 pass
 
+        native_project = native_project_sql("d")
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT d.id, d.name, d.description, d.type,
                     d.connection_url, d.credentials, d.config,
                     d.cli_hint, d.default_branch, d.read_only,
                     d.created_by, d.is_global, d.scope_mode, d.auto_attach,
                     d.policy_revision, d.created_at, d.updated_at,
-                    project_policy.read_only AS project_read_only
+                    project_policy.read_only AS project_read_only,
+                    CASE WHEN {native_project} IS NOT NULL THEN (
+                        SELECT own_pd.access
+                        FROM project_datasources own_pd
+                        WHERE own_pd.datasource_id = d.id
+                          AND own_pd.project_id::text = {native_project}
+                    ) ELSE project_policy.access END AS project_access
                 FROM datasources d
                 LEFT JOIN LATERAL (
-                    SELECT BOOL_OR(pd.read_only) AS read_only
+                    SELECT BOOL_OR(pd.read_only) AS read_only,
+                           CASE WHEN count(DISTINCT pd.access) = 1
+                                THEN min(pd.access) END AS access
                     FROM project_datasources pd
                     WHERE pd.datasource_id = d.id
                       AND pd.project_id = ANY($2::uuid[])
@@ -51867,6 +51880,15 @@ class PostgresDB:
         user's own connector (``native_user_sql``) is eligible for that user
         only, an administrator included. Credentials are decrypted here; REST
         callers must redact them before returning the rows.
+
+        One native kind crosses projects: a project's cloud folder
+        (``native_cloud_project_sql``) is eligible in any work of a member of
+        its project, an administrator only as a member, and never
+        ``default_selected`` outside its project. Each row carries
+        ``native_member_role`` (the user's role in a native row's project,
+        for the viewer ceiling) and ``project_access`` (the link's default
+        level: a native row's own project link, else the one level every
+        target link that sets one agrees on).
         """
         try:
             u_uuid = UUID(user_id) if user_id else None
@@ -51883,6 +51905,7 @@ class PostgresDB:
         project_id_strings = [str(value) for value in proj_uuids]
 
         native_project = native_project_sql("d")
+        native_cloud = native_cloud_project_sql("d")
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 f"""
@@ -51892,9 +51915,35 @@ class PostgresDB:
                        d.scope_mode, d.auto_attach, d.policy_revision,
                        d.managed_key, d.created_at, d.updated_at,
                        (
+                           SELECT role_pm.role
+                           FROM project_members role_pm
+                           WHERE role_pm.project_id::text = {native_project}
+                             AND role_pm.user_id = $1
+                       ) AS native_member_role,
+                       CASE WHEN {native_project} IS NOT NULL THEN (
+                           SELECT own_pd.access
+                           FROM project_datasources own_pd
+                           WHERE own_pd.datasource_id = d.id
+                             AND own_pd.project_id::text = {native_project}
+                       ) ELSE (
+                           SELECT CASE WHEN count(DISTINCT target_pd.access) = 1
+                                       THEN min(target_pd.access) END
+                           FROM project_datasources target_pd
+                           WHERE target_pd.datasource_id = d.id
+                             AND target_pd.project_id = ANY($2::uuid[])
+                       ) END AS project_access,
+                       (
                            d.auto_attach
                            AND (
-                               d.created_by = $1
+                               -- A native row is its own project's default
+                               -- only, whoever created it.
+                               (
+                                   d.created_by = $1
+                                   AND (
+                                       {native_project} IS NULL
+                                       OR {native_project} = ANY($4::text[])
+                                   )
+                               )
                                OR (
                                    {native_project} = ANY($4::text[])
                                    AND (
@@ -51949,6 +51998,14 @@ class PostgresDB:
                                   )
                               )
                               OR {native_project} = ANY($4::text[])
+                              -- A project's cloud folder, for a member of its
+                              -- project in any work.
+                              OR EXISTS (
+                                  SELECT 1
+                                  FROM project_members cloud_scope_pm
+                                  WHERE cloud_scope_pm.project_id::text = {native_cloud}
+                                    AND cloud_scope_pm.user_id = $1
+                              )
                           )
                       )
                   )
@@ -51987,6 +52044,12 @@ class PostgresDB:
                               WHERE native_pm.project_id::text = {native_project}
                                 AND native_pm.user_id = $1
                           )
+                      )
+                      OR EXISTS (
+                          SELECT 1
+                          FROM project_members cloud_pm
+                          WHERE cloud_pm.project_id::text = {native_cloud}
+                            AND cloud_pm.user_id = $1
                       )
                   )
                   -- A user's own connector is that user's alone.
@@ -52157,6 +52220,38 @@ class PostgresDB:
                 project_uuids,
             )
         return int(count or 0) == len(project_uuids)
+
+    async def get_user_project_roles(
+        self, user_id: str | None, project_ids: list[str] | None
+    ) -> dict[str, str]:
+        """``user_id``'s role in each of ``project_ids`` it is a member of
+        (``{project id: role}``); malformed ids name no project."""
+        if not user_id:
+            return {}
+        try:
+            user_uuid = UUID(str(user_id))
+        except ValueError:
+            return {}
+        project_uuids = []
+        for value in project_ids or ():
+            try:
+                project_uuids.append(UUID(str(value)))
+            except ValueError:
+                continue
+        if not project_uuids:
+            return {}
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT project_id, role
+                FROM project_members
+                WHERE user_id = $1
+                  AND project_id = ANY($2::uuid[])
+                """,
+                user_uuid,
+                project_uuids,
+            )
+        return {str(row["project_id"]): str(row["role"]) for row in rows}
 
     # -- Project ↔ Datasource junction (N:M) ----------------------------------
 

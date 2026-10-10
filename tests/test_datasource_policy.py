@@ -71,7 +71,7 @@ def _row(
     }
 
 
-def _db(rows: list[dict], *, member: bool = True):
+def _db(rows: list[dict], *, member: bool = True, roles: dict | None = None):
     by_id = {row["id"]: row for row in rows}
     db = AsyncMock()
     db.get_user = AsyncMock(
@@ -81,6 +81,15 @@ def _db(rows: list[dict], *, member: bool = True):
         }
     )
     db.user_is_member_of_projects = AsyncMock(return_value=member)
+    # The owner's role per project, for a project cloud folder's ceiling and
+    # its reach past its own project.
+    db.get_user_project_roles = AsyncMock(
+        side_effect=lambda _user, projects: {
+            project: role
+            for project, role in (roles or {}).items()
+            if project in projects
+        }
+    )
 
     def policy_rows(ids, *, legacy_job_id=None):
         return [

@@ -90,6 +90,9 @@ def datasources_dependencies(
             ),
             # A registered driver's Test runs its check in a driver pod (D6).
             driver_check_runner=connector_bind_time.run_check,
+            is_protected_cloud_mode_enabled=(
+                deployment_gates.is_protected_cloud_mode_enabled
+            ),
         ),
         require_approved_user=auth.require_approved_user,
         require_project_member=access.require_project_member,

@@ -18,7 +18,9 @@ The kinds, and what the uuid names:
 
 A project kind is the project's own connector: it is in scope for, and a
 default of, that project's work (:func:`native_project`,
-:func:`native_project_sql`). A user kind is the user's own
+:func:`native_project_sql`). A project's cloud folder alone may also be
+attached to another project's session by a member of its project, never as
+a default there (:func:`native_cloud_project`). A user kind is the user's own
 (:func:`native_user`, :func:`native_user_sql`): only that user's work may
 attach it, whoever else could see it (an administrator, a project member).
 
@@ -189,6 +191,17 @@ def native_user(row: Mapping[str, Any] | None) -> str | None:
     return _owner_uuid(row, USER_KINDS)
 
 
+def native_cloud_project(row: Mapping[str, Any] | None) -> str | None:
+    """The project whose own cloud folder this connector is
+    (:data:`PROJECT_CLOUD`), or ``None``.
+
+    The one native kind another project's work may attach: a member of the
+    folder's project may mount it in a session of any project, at most
+    read-only as a viewer, never as a default outside its own project.
+    """
+    return _owner_uuid(row, frozenset({PROJECT_CLOUD}))
+
+
 def managed_key_for(row: Mapping[str, Any] | None) -> str | None:
     """The managed key a row should store: its own, else one derived from a
     well-formed native marker."""
@@ -228,6 +241,16 @@ def native_project_sql(alias: str | None = None) -> str:
         f"THEN split_part({prefix}managed_key, ':', 2) END "
         f"WHEN {prefix}type = '{_KB_TYPE}' THEN "
         f"lower(NULLIF({prefix}config->>'{NATIVE_PROJECT_CONFIG_KEY}', '')) END)"
+    )
+
+
+def native_cloud_project_sql(alias: str | None = None) -> str:
+    """:func:`native_cloud_project` as a SQL expression over a
+    ``datasources`` row: the project id as text, or NULL."""
+    prefix = f"{alias}." if alias else ""
+    return (
+        f"(CASE WHEN split_part({prefix}managed_key, ':', 1) = '{PROJECT_CLOUD}' "
+        f"THEN split_part({prefix}managed_key, ':', 2) END)"
     )
 
 
@@ -306,6 +329,8 @@ __all__ = [
     "managed_key_for",
     "managed_kind",
     "managed_refusal",
+    "native_cloud_project",
+    "native_cloud_project_sql",
     "native_kb_project",
     "native_project",
     "native_project_sql",
