@@ -77,7 +77,9 @@ That FUSE profile applies only to SRW's own workspace images (`image.workspace`
 and `image.workspaceMinimal`) and to repositories listed in
 `workspace.images.trustedRepositories`. A WorkspaceTemplate
 may name any other image. Such a custom image runs unprivileged: no `/dev/fuse`,
-no `SYS_ADMIN` and seccomp `RuntimeDefault`. It therefore gets no cloud mount.
+no `SYS_ADMIN` and seccomp `RuntimeDefault`. It therefore gets no cloud mount
+inside the workspace; a Session still gets its folders from the in-pod plane
+(below).
 `workspace.customImages.privileged: true` gives custom images the full profile.
 Enable it only if you trust everyone who can author workspace templates, because
 the template's image then decides what runs as root in a privileged container.
@@ -86,6 +88,50 @@ Even unprivileged, a template image runs with the workspace owner's secrets, so
 use images only from authors you trust. Container resources come only from the
 selected template; callers can't set them through `config_override`. See
 [container workspace templates](../examples/manifests/container-workspace-templates.md).
+
+### Cloud folders from the in-pod plane
+
+With `connectors.inPodPlane.enabled` (on by default), a Session's container
+workspace gets its cloud folders from two sidecars in its Pod, not from
+rclone inside the workspace container:
+
+- `srw-fuse-opener` is the only privileged container. It opens `/dev/fuse`,
+  mounts it at each folder's place with `nosuid`, `nodev` and, for a
+  read-only folder, `ro`, and passes the descriptor to the supervisor. It has
+  no network listener and never reads the folders' contents.
+- `srw-cloud-mount` runs rclone as uid 65534 with every capability dropped
+  and a read-only root filesystem. It alone mounts the cloud credential: an
+  rclone config file from a Secret, never an environment variable. Its remote
+  controls listen on Unix sockets only.
+
+The workspace container then runs without FUSE: no `/dev/fuse`, no
+`SYS_ADMIN` and no privilege. Its folders are created when the Session's
+workspace Pod is created. A folder that does not mount never holds the
+workspace back; the Session shows it as unavailable, with the reason.
+
+**What users notice:** a shell in such a Session can't mount FUSE filesystems
+itself. `sshfs`, `rclone mount` and `fuse-overlayfs` fail there. Use a VM
+workspace for that, or turn the plane off.
+
+These keep the old in-workspace path and `workspace.fuse`:
+
+- Jobs.
+- VM and lite workspaces.
+- Officer sessions.
+- OpenCloud folders, whose bearer tokens the agent refreshes.
+- Protected Sessions. A protected Session keeps the FUSE profile for its
+  capture overlay, so its workspace stays privileged. When its reader grant is
+  active as the Pod is created, the read-only lower layer comes from the
+  sidecars, using the per-mount reader credential. Read-only remains assisted,
+  not guaranteed: it rests on that credential and rclone's `--read-only`. The
+  overlay mounts beside the lower, so such a workspace sees the sidecars'
+  volume writable; being privileged, it was never held back by a read-only
+  view.
+
+The orchestrator needs `create` on Secrets in the workspace namespace. The
+chart grants nothing more: not `get`, `list` or `delete`. Each credential
+Secret is immutable and owned by its Pod, so it is garbage-collected with
+the Pod. The namespace must admit the privileged opener.
 
 ## Defense in depth
 
@@ -128,7 +174,8 @@ Before exposing a deployment or connecting valuable systems:
    manager rather than values files.
 3. Confirm NetworkPolicy enforcement with the actual cluster CNI.
 4. Disable privileged FUSE workspaces unless the feature is required; isolate
-   workspace nodes when it is enabled. Keep `workspace.customImages.privileged`
+   workspace nodes when it is enabled. The in-pod plane already removes it
+   from most Session workspaces (see above). Keep `workspace.customImages.privileged`
    off, and add only images you trust to
    `workspace.images.trustedRepositories`. Cap what one workspace may request
    with a namespace `LimitRange` and `ResourceQuota`; SRW sets no ceilings of

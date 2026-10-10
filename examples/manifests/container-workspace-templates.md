@@ -613,11 +613,18 @@ repository with any tag or digest; a tag or digest written in the entry is
 ignored.
 
 Any other image runs unprivileged: no `/dev/fuse`, no `SYS_ADMIN` and seccomp
-`RuntimeDefault`. It therefore gets no rclone cloud mount. Protected cloud
-Sessions aren't supported on such an image: their mount requires FUSE, so the
-Session fails instead of falling back. An operator who trusts every template
-author can set `workspace.customImages.privileged: true` to give custom images
-the full profile.
+`RuntimeDefault`. It therefore gets no rclone cloud mount of its own. A Session
+on it still gets its cloud folders when the in-pod plane is on (the default):
+sidecars of its Pod mount them, whatever the image. Jobs don't. Protected cloud
+Sessions aren't supported on such an image: their capture overlay requires
+FUSE, so the Session fails instead of falling back. An operator who trusts
+every template author can set `workspace.customImages.privileged: true` to give
+custom images the full profile.
+
+With the in-pod plane, a Session's workspace runs without FUSE on any image,
+SRW's included (protected, officer and OpenCloud Sessions excepted): `sshfs`
+and `rclone mount` fail in its shell. See
+[Cloud folders from the in-pod plane](../../docs/security-model.md#cloud-folders-from-the-in-pod-plane).
 
 ## Known limitations
 
