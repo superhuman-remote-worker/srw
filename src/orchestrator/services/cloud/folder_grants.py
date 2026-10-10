@@ -111,6 +111,8 @@ REVOKE_RETRY_BASE_SECONDS = 30.0
 REVOKE_RETRY_MAX_SECONDS = 3600.0
 #: The sweep's interval: a backstop; the hooks revoke at once.
 SWEEP_SECONDS = 300.0
+#: How long a reader's probe waits for its canary to be removed.
+CANARY_CLEANUP_SECONDS = 10.0
 
 
 class FolderGrantUnavailable(Exception):
@@ -363,9 +365,16 @@ async def _verify_read_only(
     finally:
         if canary is not None:
             try:
-                await backend.remove_canary_fixture(handle, canary)
+                # Bounded: a slow trash purge must not hold the grant back
+                # (a canary left in the trash only takes space).
+                await asyncio.wait_for(
+                    backend.remove_canary_fixture(handle, canary),
+                    CANARY_CLEANUP_SECONDS,
+                )
             except Exception:  # pragma: no cover - best effort
-                logger.exception("failed to remove the folder reader's canary")
+                logger.warning(
+                    "failed to remove the folder reader's canary", exc_info=True
+                )
         try:
             await client.aclose()
         except Exception:  # pragma: no cover - best effort
@@ -520,6 +529,40 @@ async def ensure_folder_grant(
         raise FolderGrantUnavailable(
             "busy", "another mint of this grant did not finish in time"
         ) from None
+
+
+#: This process's mints in flight, by slot: a caller that stops waiting
+#: leaves its mint running (an interrupted one would be redone from its
+#: probe), and the next caller joins it rather than queue on its lock.
+_MINTS: dict[tuple[str, str, str], asyncio.Task[FolderGrant]] = {}
+
+
+def start_folder_grant(
+    store: Any,
+    router: Any,
+    target: FolderGrantTarget,
+    *,
+    user_id: str,
+    kind: str,
+) -> asyncio.Task[FolderGrant]:
+    """:func:`ensure_folder_grant` as a task this module keeps until it
+    ends; a caller bounds its own wait with ``asyncio.shield``."""
+    key = (target.datasource_id, str(user_id), kind)
+    task = _MINTS.get(key)
+    if task is None or task.done():
+        task = asyncio.create_task(
+            ensure_folder_grant(store, router, target, user_id=str(user_id), kind=kind)
+        )
+        _MINTS[key] = task
+
+        def forget(done: asyncio.Task[FolderGrant], key=key) -> None:
+            if _MINTS.get(key) is done:
+                del _MINTS[key]
+            if not done.cancelled():
+                done.exception()  # retrieved: a failure is the caller's to log
+
+        task.add_done_callback(forget)
+    return task
 
 
 # --------------------------------------------------------------------------- #
@@ -734,5 +777,6 @@ __all__ = [
     "lookup_active_folder_grant",
     "principal_ids",
     "revoke_folder_grants",
+    "start_folder_grant",
     "sweep_folder_grants_once",
 ]

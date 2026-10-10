@@ -228,3 +228,33 @@ def test_the_agent_can_say_why_a_folder_has_no_grant():
 
     assert {"grant_unavailable", "reader_unavailable"} <= set(EXCLUSION_REASONS)
     assert set(EXCLUSION_REASONS) <= set(REASON_TEXT)
+
+
+@pytest.mark.asyncio
+async def test_a_mint_outlives_a_caller_that_stops_waiting(monkeypatch):
+    """A reader's probe can outlast a preparation's budget: the mint goes on,
+    and the next caller joins it instead of starting (and probing) again."""
+    started = []
+    release = asyncio.Event()
+
+    async def ensure(store, router, target, *, user_id, kind):
+        started.append(kind)
+        await release.wait()
+        return "grant"
+
+    monkeypatch.setattr(folder_grants, "ensure_folder_grant", ensure)
+    target = folder_grants.FolderGrantTarget("c", "p", "nextcloud", "i", "h")
+    first = folder_grants.start_folder_grant(
+        object(), object(), target, user_id="u", kind="reader"
+    )
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(first), timeout=0.01)
+    assert not first.done()
+    second = folder_grants.start_folder_grant(
+        object(), object(), target, user_id="u", kind="reader"
+    )
+    assert second is first
+    release.set()
+    assert await second == "grant" and started == ["reader"]
+    await asyncio.sleep(0)
+    assert folder_grants._MINTS == {}

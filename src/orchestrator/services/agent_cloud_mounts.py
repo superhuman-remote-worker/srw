@@ -942,17 +942,18 @@ async def prepare_folder_grants(
                     thread.get("id"),
                 )
                 return
+            # Shielded: past the budget the mint goes on in the background
+            # (a reader's probe takes a while) and the next preparation finds
+            # it active.
+            mint = folder_grants.start_folder_grant(
+                dependencies.store,
+                dependencies.cloud_router,
+                target,
+                user_id=str(thread["user_id"]),
+                kind=kind,
+            )
             try:
-                await asyncio.wait_for(
-                    folder_grants.ensure_folder_grant(
-                        dependencies.store,
-                        dependencies.cloud_router,
-                        target,
-                        user_id=str(thread["user_id"]),
-                        kind=kind,
-                    ),
-                    timeout=remaining,
-                )
+                await asyncio.wait_for(asyncio.shield(mint), timeout=remaining)
             except FolderGrantUnavailable as exc:
                 logger.info(
                     "Thread %s: no %s grant for cloud folder %s (%s)",
