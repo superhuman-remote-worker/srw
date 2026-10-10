@@ -483,7 +483,7 @@ async def apply_thread_cloud_diff(
         if not await protected_source_admissible(
             str(user.get("id") or ""),
             binding if isinstance(binding, dict) else None,
-            dependencies=postgres_db,
+            store=postgres_db,
         ):
             raise HTTPException(
                 status_code=403,

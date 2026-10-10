@@ -546,10 +546,8 @@ class TestTheEngageRecheck:
             await protected_source_admissible(
                 USER["id"],
                 {"source_ref": OTHER_PROJECT},
-                dependencies=SimpleNamespace(store=store),
+                store=store,
             )
             is admitted
         )
-        assert not await protected_source_admissible(
-            USER["id"], {}, dependencies=SimpleNamespace(store=store)
-        )
+        assert not await protected_source_admissible(USER["id"], {}, store=store)

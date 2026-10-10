@@ -51,6 +51,8 @@ RUNTIME_GENERATION = "33333333-3333-4333-8333-333333333333"
 ATTACH_TOKEN = "44444444-4444-4444-8444-444444444444"
 WORKSPACE_GENERATION = "55555555-5555-4555-8555-555555555555"
 WORKSPACE_RUNTIME = "66666666-6666-4666-8666-666666666666"
+#: The protected folder's project, which the caller must own or edit.
+FOLDER_PROJECT = "77777777-7777-4777-8777-777777777777"
 
 
 # --------------------------------------------------------------------------- #
@@ -106,6 +108,7 @@ def _patch_endpoint(
     thread: dict,
     require_thread_owner_result=None,
     reset_overlay_result: bool = True,
+    member_role: str | None = "owner",
 ):
     """Patch every global the two endpoints touch; yield db + dependencies.
 
@@ -124,7 +127,18 @@ def _patch_endpoint(
     )
     db = MagicMock()
     db.get_ro_mount_by_thread = AsyncMock(
-        return_value={"staged_epoch": 5, "staged_summary": _staged_summary()}
+        return_value={
+            "staged_epoch": 5,
+            "staged_summary": _staged_summary(),
+            "source_binding": {"source_ref": FOLDER_PROJECT},
+        }
+    )
+    # The caller owns the protected folder's project (main cloud slice 5:
+    # apply rechecks it).
+    db.get_user_project_roles = AsyncMock(
+        side_effect=lambda _user, projects: dict.fromkeys(projects, member_role)
+        if member_role
+        else {}
     )
     stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     stack.enter_context(
@@ -171,6 +185,29 @@ def _patch_endpoint(
 
 
 class TestApplyEndpoint:
+    @pytest.mark.asyncio
+    async def test_a_viewer_of_the_folders_project_may_not_apply(self, fake_request):
+        engine_mock = AsyncMock()
+        with (
+            _patch_endpoint(
+                user=_make_user(), thread=_make_thread(), member_role="viewer"
+            ) as wired,
+            patch(
+                "orchestrator.services.cloud_staging.apply.apply_staged_diff",
+                engine_mock,
+            ),
+        ):
+            with pytest.raises(HTTPException) as refused:
+                await diff_routes.apply_thread_cloud_diff(
+                    fake_request,
+                    THREAD_ID,
+                    {"epoch": 5},
+                    dependencies=wired.dependencies,
+                )
+        assert refused.value.status_code == 403
+        assert refused.value.detail["code"] == "protected_cloud_apply_not_member"
+        engine_mock.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_apply_passes_epoch_and_call_args(self, fake_request):
         user = _make_user()

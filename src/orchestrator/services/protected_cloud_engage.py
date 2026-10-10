@@ -515,7 +515,7 @@ async def _engage_protected_cloud_for_thread(
             dependencies=dependencies,
         )
         return
-    if not await protected_source_admissible(user_id, row, dependencies=dependencies):
+    if not await protected_source_admissible(user_id, row, store=dependencies.store):
         await _record_protected_error(
             thread_id,
             "the session's owner may no longer write the protected folder's project",
@@ -706,7 +706,7 @@ async def protected_source_admissible(
     user_id: str | None,
     source: Mapping[str, Any] | None,
     *,
-    dependencies: Any,
+    store: Any,
 ) -> bool:
     """Whether ``user_id`` may protect ``source`` now: an owner or editor of
     the folder's project (``source_ref``), whichever project the session
@@ -716,7 +716,6 @@ async def protected_source_admissible(
     project_id = str((source or {}).get("source_ref") or "")
     if not user_id or not project_id:
         return False
-    store = getattr(dependencies, "store", dependencies)
     roles = await store.get_user_project_roles(str(user_id), [project_id])
     return roles.get(project_id) in PROTECTED_SOURCE_ROLES
 
