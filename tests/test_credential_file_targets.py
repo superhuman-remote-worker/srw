@@ -16,10 +16,7 @@ from orchestrator.services.connector_drivers.credential_files import (
     undeliverable_files,
 )
 from shared.connectors.builtin import GENERIC_FILE_SPEC
-from shared.credential_connectors import (
-    credential_file_env_problem,
-    normalize_credential_env,
-)
+from shared.connectors.env_names import connector_env_problem
 from shared.connectors.file_targets import (
     ALLOWED_CONFIG_APPS,
     BAD_CHARACTERS,
@@ -191,6 +188,11 @@ def test_undeliverable_files_name_paths_and_modes_only():
                     "target_path": "/home/srw/.local/bin/git",
                     "mode": "0755",
                 },
+                {
+                    "contents": "secret-4",
+                    "target_path": "/home/srw/.srw-files/x",
+                    "env_var": "NODE_OPTIONS",
+                },
             ]
         }
     )
@@ -198,6 +200,8 @@ def test_undeliverable_files_name_paths_and_modes_only():
         "/tmp/ca.pem is outside the home",
         "/home/srw/.local/bin/git is not a credential-file location",
         "/home/srw/.local/bin/git has mode 0755: a credential file is never executable",
+        "/home/srw/.srw-files/x's variable: NODE_OPTIONS is not a variable a "
+        "connector may set: tools read it to run code or load their config",
     ]
     assert not any("secret" in problem for problem in problems)
 
@@ -224,7 +228,7 @@ async def test_test_connection_says_why_a_saved_file_is_not_delivered():
 
 
 # =============================================================================
-# A credential file's env_var never points a tool at it as a config or code
+# A credential file's env_var follows the one rule for every connector
 # =============================================================================
 
 
@@ -290,7 +294,8 @@ async def test_test_connection_says_why_a_saved_file_is_not_delivered():
     ],
 )
 def test_a_credential_files_variable_never_points_a_tool_at_code(name):
-    assert credential_file_env_problem(name) is not None
+    """The one rule every connector follows (``connector_env_problem``)."""
+    assert connector_env_problem(name) is not None
 
 
 @pytest.mark.parametrize(
@@ -303,18 +308,14 @@ def test_a_credential_files_variable_never_points_a_tool_at_code(name):
         "NETRC",
         "PGPASSFILE",
         "VENDOR_TOKEN_FILE",
+        # CA bundles: they name trusted certificates, never code.
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
     ],
 )
 def test_a_variable_that_names_a_credential_file_is_fine(name):
-    assert credential_file_env_problem(name) is None
-
-
-def test_environment_connectors_keep_their_own_rules():
-    """The owner decides whether they adopt the list; nothing changed yet."""
-    assert normalize_credential_env({"GIT_SSH_COMMAND": "x", "EDITOR": "vi"}) == {
-        "GIT_SSH_COMMAND": "x",
-        "EDITOR": "vi",
-    }
+    assert connector_env_problem(name) is None
 
 
 # =============================================================================

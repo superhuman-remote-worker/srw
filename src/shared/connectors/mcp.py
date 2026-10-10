@@ -472,8 +472,8 @@ def code_env(name: str) -> bool:
     """Whether a variable loads code, names a command or a package index:
     :data:`CODE_ENV` and :data:`CODE_ENV_PREFIXES` (kept in
     ``shared.connectors.env_names``), the list the bridge refuses on its
-    own. The server's process is the server's: a workspace's longer list
-    (``env_names.loads_code``) does not apply to it."""
+    own. The server's process is the server's: the workspace's longer rule
+    (``env_names.connector_env_problem``) does not apply to it."""
     upper = name.upper()
     return upper in CODE_ENV or upper.startswith(CODE_ENV_PREFIXES)
 

@@ -4,10 +4,17 @@ The variables go to the workspace over its own transport and are sourced
 for every command there; they never enter the agent process. The file
 belongs to the physical workspace, so a backend swap installs it again on
 the new host before the old one retires.
+
+A name no connector may set (``shared.connectors.env_names``: an SRW
+reserved name or a known code hook) is refused when a connector is saved. A
+row saved before that rule is delivered without it: the variable is
+skipped, logged and named in the README with the reason, as a credential
+file outside the allowlist is (``agent.connectors.files``).
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from typing import Any
 
@@ -19,7 +26,10 @@ from agent.connectors.base import (
 )
 from agent.connectors.legacy import env_vars_unreadable
 from shared.connectors.builtin import IMAGE_DRIVER_SPEC
-from shared.credential_connectors import normalize_credential_env
+from shared.connectors.env_names import connector_env_problem
+from shared.credential_connectors import split_credential_env
+
+logger = logging.getLogger(__name__)
 
 
 def _required(delivery: Delivery) -> bool:
@@ -33,18 +43,22 @@ def _required(delivery: Delivery) -> bool:
 def credential_environment(deliveries: Sequence[Delivery]) -> dict[str, str]:
     """One unambiguous environment for the attached connectors.
 
-    Raises ``ValueError`` (with no secret in the message) for an invalid or
-    reserved name, a required connector without variables, or a name two
-    connectors define.
+    A name no connector may set is skipped with a warning (the README says
+    why: :meth:`EnvFileMaterializer.facts`). Raises ``ValueError`` (with no
+    secret in the message) for a set that is not a name/value object, a
+    value the workspace refuses, a required connector without variables, or
+    a name two connectors define.
     """
     result: dict[str, str] = {}
     for delivery in deliveries:
         if env_vars_unreadable(delivery.entry):
             raise ValueError("Environment variables must be a name/value object")
-        values = normalize_credential_env(
+        values, refused = split_credential_env(
             {value["name"]: value["value"] for value in delivery.values("env_file")},
             required=_required(delivery),
         )
+        for name, why in refused.items():
+            logger.warning("Skipping %s for '%s': %s", name, delivery.name, why)
         for name, secret in values.items():
             if name in result:
                 raise ValueError(f"Multiple attached connectors define {name}")
@@ -112,14 +126,17 @@ class EnvFileMaterializer:
                 f"— {cli}{read_only_note(ds)}"
             ]
             variables = (ds.get("credentials") or {}).get("env_vars", {})
-            if variables:
+            refused = {key: connector_env_problem(key) for key in variables or ()}
+            delivered = [key for key, why in refused.items() if why is None]
+            if delivered:
                 lines.append(
-                    "  Environment: " + ", ".join(f"`{key}`" for key in variables)
+                    "  Environment: " + ", ".join(f"`{key}`" for key in delivered)
                 )
                 lines.append(
                     "  Read values with os.environ in workspace scripts. For login forms, "
                     'use browser_type(ref=..., env_var="VARIABLE_NAME"). '
                     "Avoid printing credentials or writing literal values into scripts."
                 )
+            lines += [f"  Not set: {why}" for why in refused.values() if why]
             out.append(FactsLines("Other", delivery.index, lines))
         return out

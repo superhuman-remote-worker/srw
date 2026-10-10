@@ -265,18 +265,29 @@ class TestPlan:
                     }
                     for letter, name in (
                         ("a", "PATH"),
-                        ("b", "TOOL_CONFIG"),
-                        ("c", "TOOL_CONFIG"),
+                        ("b", "TOOL_TOKEN_FILE"),
+                        ("c", "TOOL_TOKEN_FILE"),
                         ("d", "KUBECONFIG"),
+                        ("e", "NODE_OPTIONS"),
                     )
                 ),
             )
         ]
         with caplog.at_level(logging.WARNING):
             plan = plan_credential_files(deliveries_from_payload(rows))
-        assert _env(plan) == {"TOOL_CONFIG": [plan.files[1]["name"]]}
+        assert _env(plan) == {"TOOL_TOKEN_FILE": [plan.files[1]["name"]]}
         assert "PATH" in caplog.text and "reserved" in caplog.text
-        assert "KUBECONFIG for 'Vars': the name is reserved" in caplog.text
+        assert (
+            "KUBECONFIG for 'Vars': KUBECONFIG is reserved: it names the merged "
+            "kubeconfig" in caplog.text
+        )
+        # A code hook saved before the one rule: skipped, and why.
+        assert (
+            "NODE_OPTIONS for 'Vars': NODE_OPTIONS is not a variable a connector "
+            "may set" in caplog.text
+        )
+        # Its file still arrives.
+        assert len(plan.files) == 5
 
     def test_a_bad_file_mode_warns_and_falls_back_to_0600(self, caplog):
         """The warning the agent always gave for an unreadable mode."""
@@ -445,7 +456,8 @@ class TestFacts:
             "- **Mixed** (file) — `~/.netrc` (`$NETRC`), "
             "`/tmp/outside` (not delivered: outside the home), "
             "`/home/srw/.ssh/config` (not delivered: not a credential-file "
-            "location), `~/.srw-files/x`"
+            "location), `~/.srw-files/x` (variable not set: Environment name "
+            "PATH is reserved by the workspace)"
         ]
 
     def test_the_readme_says_what_the_last_sync_could_not_place(self):

@@ -15,6 +15,7 @@ import pytest
 from shared.credential_connectors import (
     collect_credential_env,
     normalize_credential_env,
+    split_credential_env,
 )
 from shared.runtime.core.backends.remote import RemoteBackend
 from shared.runtime.core.credential_env import INSTALL_CREDENTIAL_ENV
@@ -27,6 +28,50 @@ def test_invalid_or_reserved_env_names(name):
     with pytest.raises(ValueError) as caught:
         normalize_credential_env({name: "synthetic-value"})
     assert "synthetic-value" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "NODE_OPTIONS",
+        "GIT_SSH_COMMAND",
+        "JAVA_TOOL_OPTIONS",
+        "EDITOR",
+        "PAGER",
+        "PSQLRC",
+        "npm_config_registry",
+        "KUBECONFIG",
+    ],
+)
+def test_an_environment_connector_may_not_set_a_code_hook(name):
+    """Decision 36: SRW's own environment connectors follow the one rule."""
+    with pytest.raises(ValueError, match="connector may set|reserved") as caught:
+        normalize_credential_env({"VENDOR_TOKEN": "t", name: "synthetic-value"})
+    assert "synthetic-value" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["HTTPS_PROXY", "no_proxy", "SSL_CERT_FILE", "NODE_AUTH_TOKEN", "GITHUB_TOKEN"],
+)
+def test_an_environment_connector_may_set_proxies_ca_bundles_and_credentials(name):
+    assert normalize_credential_env({name: "v"}) == {name: "v"}
+
+
+def test_a_stored_set_splits_into_what_is_delivered_and_what_is_refused():
+    values, refused = split_credential_env(
+        {"VENDOR_TOKEN": "t", "NODE_OPTIONS": "synthetic-value", "PATH": "/x"}
+    )
+    assert values == {"VENDOR_TOKEN": "t"}
+    assert set(refused) == {"NODE_OPTIONS", "PATH"}
+    assert "connector may set" in refused["NODE_OPTIONS"]
+    assert "reserved by the workspace" in refused["PATH"]
+    assert "synthetic-value" not in " ".join(refused.values())
+    # What no delivery can take still fails the delivery.
+    with pytest.raises(ValueError, match="name/value object"):
+        split_credential_env(["VENDOR_TOKEN"])
+    with pytest.raises(ValueError, match="must be a string"):
+        split_credential_env({"VENDOR_TOKEN": 3})
 
 
 def test_conflicting_connector_names_are_rejected():
@@ -252,10 +297,6 @@ def test_the_environment_materializer_installs_every_env_connector():
             "Add at least one credential environment variable",
         ),
         (
-            [{"type": "generic", "credentials": {"env_vars": {"PATH": "/x"}}}],
-            "reserved by the workspace",
-        ),
-        (
             [{"type": "credentials", "credentials": {"env_vars": ["API_KEY"]}}],
             "must be a name/value object",
         ),
@@ -272,6 +313,55 @@ def test_the_environment_materializer_keeps_the_delivery_errors(entries, message
 
     with pytest.raises(ValueError, match=message):
         credential_environment(deliveries_from_payload(entries))
+
+
+@pytest.mark.parametrize("kind", ["generic", "credentials"])
+def test_a_row_saved_before_the_rule_is_delivered_without_a_refused_name(kind, caplog):
+    """At delivery the refused variable is skipped, logged and named in the
+    README with its reason, as a credential file outside the allowlist is;
+    the connector's other variables still arrive."""
+    import logging
+
+    from agent.connectors import deliveries_from_payload
+    from agent.connectors.env import EnvFileMaterializer, credential_environment
+
+    entries = [
+        {
+            "type": kind,
+            "name": "Vendor",
+            "credentials": {
+                "env_vars": {
+                    "VENDOR_TOKEN": "t",
+                    "NODE_OPTIONS": "synthetic-value",
+                    "PATH": "/x",
+                }
+            },
+        }
+    ]
+    deliveries = deliveries_from_payload(entries)
+    with caplog.at_level(logging.WARNING):
+        assert credential_environment(deliveries) == {"VENDOR_TOKEN": "t"}
+    assert "Skipping NODE_OPTIONS for 'Vendor'" in caplog.text
+    assert "Skipping PATH for 'Vendor'" in caplog.text
+    assert "synthetic-value" not in caplog.text
+
+    installed = []
+    backend = SimpleNamespace(
+        supports_shell=True, install_credential_environment=installed.append
+    )
+    rt = SimpleNamespace(workspace_manager=SimpleNamespace(backend=backend))
+    EnvFileMaterializer().materialize(deliveries, rt)
+    assert installed == [{"VENDOR_TOKEN": "t"}]
+
+    (facts,) = EnvFileMaterializer().facts(deliveries, rt)
+    text = "\n".join(facts.lines)
+    assert "Environment: `VENDOR_TOKEN`" in text
+    assert (
+        "Not set: NODE_OPTIONS is not a variable a connector may set: tools "
+        "read it to run code or load their config" in text
+    )
+    assert "Not set: Environment name PATH is reserved by the workspace" in text
+    assert "synthetic-value" not in text
 
 
 def _browser_executor():

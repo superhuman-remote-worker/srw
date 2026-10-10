@@ -1501,13 +1501,15 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         processes keep their environment."""
         import json
 
-        from shared.connectors.env_names import workspace_name_problem
+        from shared.connectors.env_names import connector_env_problem
         from shared.runtime.core.credential_env import (
             INSTALL_CREDENTIAL_ENV,
             WORKSPACE_PYTHON,
         )
 
-        stale = {name: None for name in names if workspace_name_problem(name) is None}
+        # Only a name a connector may set was ever installed: never unset
+        # one of the workspace's own.
+        stale = {name: None for name in names if connector_env_problem(name) is None}
         if not stale:
             return
         self._init_shell()

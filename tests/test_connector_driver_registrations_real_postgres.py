@@ -425,7 +425,7 @@ class TestRegistration:
     @pytest.mark.parametrize(
         ("change", "message"),
         [
-            ({"env_names": ["GIT_SSH_COMMAND"]}, "not a variable a driver may set"),
+            ({"env_names": ["GIT_SSH_COMMAND"]}, "not a variable a connector may set"),
             ({"env_names": []}, "declares every name"),
             (
                 {
@@ -897,7 +897,7 @@ class TestBinding:
             ({**ENV, "value": {"name": "SRW_TOKEN", "value": "x"}}, "reserved"),
             (
                 {**ENV, "value": {"name": "GIT_SSH_COMMAND", "value": "x"}},
-                "not a variable a driver may set",
+                "not a variable a connector may set",
             ),
             (
                 {**ENV, "value": {"name": "ACME_OTHER", "value": "x"}},
@@ -907,10 +907,10 @@ class TestBinding:
                 {
                     "recipient": "workspace",
                     "form": "credential_file",
-                    "value": {"path": "~/.kube/config", "content": "{}"},
+                    "value": {"path": "~/.bashrc", "content": "true"},
                     "collision": "skip_existing",
                 },
-                "~/.srw-files/",
+                "not a credential-file location",
             ),
         ],
     )

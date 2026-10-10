@@ -22,10 +22,37 @@
     },
     "probe_calls": []
   },
-  "credentials/invalid_stored_env_is_a_500": {
+  "credentials/refused_stored_name_is_reported": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "Not delivered as saved: Environment name PATH is reserved by the workspace. Create the connector again without it: an edit keeps every stored variable.",
+      "error_class": "config"
+    },
+    "probe_calls": []
+  },
+  "credentials/stored_code_hook_is_reported": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "Not delivered as saved: NODE_OPTIONS is not a variable a connector may set: tools read it to run code or load their config. Create the connector again without it: an edit keeps every stored variable.",
+      "error_class": "config"
+    },
+    "probe_calls": []
+  },
+  "credentials/malformed_stored_env_is_a_500": {
     "status": 500,
     "body": {
       "detail": "Connector test failed (error_ref=<error_ref>)"
+    },
+    "probe_calls": []
+  },
+  "generic/stored_code_hook_is_reported": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "Not delivered as saved: GIT_SSH_COMMAND is not a variable a connector may set: tools read it to run code or load their config. Save its variables again without it.",
+      "error_class": "config"
     },
     "probe_calls": []
   },
@@ -34,6 +61,15 @@
     "body": {
       "status": "unsupported",
       "message": "Generic file connectors have no connection test; the file's path and size are checked when it is saved"
+    },
+    "probe_calls": []
+  },
+  "generic_file/stored_code_hook_variable_is_reported": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "Not delivered as saved: /home/srw/.srw-files/x/token's variable: NODE_OPTIONS is not a variable a connector may set: tools read it to run code or load their config. Credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/doctl/, ~/.config/gcloud/, ~/.config/hcloud/, ~/.config/helm/, ~/.config/sops/, ~/.netrc, ~/.pgpass; save the connector with a new target or variable.",
+      "error_class": "config"
     },
     "probe_calls": []
   },

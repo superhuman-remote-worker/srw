@@ -11,7 +11,9 @@ The orchestrator stores each target resolved against ``/home/srw``; here it
 becomes the same path under the workspace home, if the credential-file
 allowlist (:mod:`shared.connectors.file_targets`) permits it. The
 orchestrator refuses anything else when a connector is saved; a row saved
-before that rule is skipped here and the README says why. A target that
+before that rule is skipped here and the README says why. So is a file's
+``env_var`` that no connector may set
+(``shared.connectors.env_names.connector_env_problem``). A target that
 already holds a file of the user's is left alone (the contents still reach
 the store).
 
@@ -59,8 +61,8 @@ from agent.connectors.base import (
     read_only_note,
 )
 from agent.connectors.legacy import unreadable_file_modes
+from shared.connectors.env_names import connector_env_problem
 from shared.connectors.file_targets import mode_problem, safe_mode, target_problem
-from shared.credential_connectors import credential_file_env_problem
 
 logger = logging.getLogger(__name__)
 
@@ -203,12 +205,6 @@ class CredentialFilePlan:
         return [item["name"] for item in self.env]
 
 
-def _usable_env_name(name: str) -> bool:
-    """Not reserved, not KUBECONFIG, and no config or code pointer
-    (``credential_file_env_problem``: the orchestrator's rule at save)."""
-    return credential_file_env_problem(name) is None
-
-
 def plan_credential_files(
     deliveries: Sequence[Delivery], *, quiet: bool = False
 ) -> CredentialFilePlan:
@@ -268,8 +264,9 @@ def plan_credential_files(
             )
             env_var = value.get("env_var")
             if env_var:
-                if not _usable_env_name(env_var):
-                    warn("Skipping %s for '%s': the name is reserved", env_var, name)
+                refused = connector_env_problem(env_var)
+                if refused is not None:
+                    warn("Skipping %s for '%s': %s", env_var, name, refused)
                 elif env_var in named:
                     warn("Skipping %s for '%s': already set", env_var, name)
                 else:
@@ -443,13 +440,16 @@ def _fact_path(value: Mapping[str, Any], report: Mapping[str, Any]) -> str:
     if relative is None:
         return f"`{path}` (not delivered: {refused})"
     env_var = value.get("env_var")
-    named = bool(env_var) and _usable_env_name(env_var)
+    unnamed = connector_env_problem(env_var) if env_var else None
+    named = bool(env_var) and unnamed is None
     taken = named and env_var in (report.get("env_skipped") or {})
     skipped = (report.get("skipped") or {}).get(relative)
     notes: list[str] = []
     if skipped:
         notes.append(f"not linked: {skipped}")
-    if named and not taken:
+    if unnamed is not None:
+        notes.append(f"variable not set: {unnamed}")
+    elif named and not taken:
         notes.append(f"`${env_var}`")
     elif taken:
         notes.append(f"`${env_var}` is another connector's")

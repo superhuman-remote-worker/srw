@@ -8,8 +8,9 @@ shim posts the driver's typed JSON lines to the result route on the lease
 exchange's port. What the driver returns is data: a binding descriptor of
 ``env_file`` and ``credential_file`` entries, checked
 (``shared.connectors.registration.image_binding_problems``: only the
-variable names the spec declares, none on the best-effort list of known
-tool hooks, files only in ``~/.srw-files/``, ``~/.netrc`` or ``~/.pgpass``),
+variable names the spec declares, each one any connector may set, files
+only in the credential-file allowlist and never executable: the rules every
+connector follows, SRW's own included),
 stored encrypted on the binding row and delivered by SRW's own materializers
 in the agent, keyed by delivery form, as an environment or credential-file
 connector's. No driver image gets a shell in a workspace; what it returns is

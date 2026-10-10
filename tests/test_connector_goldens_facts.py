@@ -109,6 +109,30 @@ README_CASES: dict[str, ReadmeCase] = {
     "generic_without_env_or_hint": ReadmeCase(
         [resolved_row("generic", credentials={}, cli_hint=None)]
     ),
+    # Rows saved before the one rule for every connector's names: the
+    # README says which variable the workspace does not receive, and why.
+    "refused_names_saved_before_the_rule": ReadmeCase(
+        [
+            resolved_row(
+                "generic",
+                credentials={"env_vars": {"BILLING_TOKEN": "x", "NODE_OPTIONS": "y"}},
+            ),
+            resolved_row(
+                "generic_file",
+                credentials={
+                    "files": [
+                        {
+                            "name": "token",
+                            "contents": "x",
+                            "target_path": "/home/srw/.srw-files/x/token",
+                            "mode": "0600",
+                            "env_var": "GIT_SSH_COMMAND",
+                        }
+                    ]
+                },
+            ),
+        ]
+    ),
     "credential_files_only": ReadmeCase(
         [
             resolved_row("kubeconfig"),

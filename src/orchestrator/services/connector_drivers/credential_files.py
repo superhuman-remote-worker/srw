@@ -52,6 +52,7 @@ from shared.connectors.envelope import (
     api_check_result,
     unsupported_check,
 )
+from shared.connectors.env_names import connector_env_problem
 from shared.connectors.file_targets import (
     allowed_targets_text,
     mode_problem,
@@ -63,7 +64,9 @@ def undeliverable_files(credentials: Mapping[str, Any] | None) -> list[str]:
     """Why each stored file would not be delivered as saved (empty: none).
 
     A row saved before the allowlist keeps its target; the agent skips it
-    and an execute bit is dropped. Paths and modes only, never contents.
+    and an execute bit is dropped. So is an ``env_var`` no connector may set
+    (``shared.connectors.env_names``): the file arrives, the variable does
+    not. Paths, modes and names only, never contents.
     """
     files = (
         (credentials or {}).get("files") if isinstance(credentials, Mapping) else None
@@ -76,6 +79,10 @@ def undeliverable_files(credentials: Mapping[str, Any] | None) -> list[str]:
         _relative, refused = target_problem(path)
         if refused is not None:
             problems.append(f"{path or '(no target)'} is {refused}")
+        env_var = item.get("env_var")
+        unnamed = connector_env_problem(env_var) if env_var else None
+        if unnamed is not None:
+            problems.append(f"{path}'s variable: {unnamed}")
         try:
             mode = int(str(item.get("mode") or "0600"), 8)
         except ValueError:
@@ -158,7 +165,7 @@ class CredentialFileDriver(DatasourceDriver):
                         "Not delivered as saved: "
                         + "; ".join(problems)
                         + f". Credential files go under {allowed_targets_text()}; "
-                        "save the connector with a new target.",
+                        "save the connector with a new target or variable.",
                     )
                 )
             )

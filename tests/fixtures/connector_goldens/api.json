@@ -555,7 +555,7 @@
       }
     ]
   },
-  "create/generic/env_not_validated": {
+  "create/generic/env_validated": {
     "request": {
       "method": "POST",
       "path": "/api/datasources",
@@ -569,6 +569,53 @@
           "env_vars": {
             "1BAD": 3,
             "PATH": "/x"
+          }
+        }
+      }
+    },
+    "status": 400,
+    "body": {
+      "detail": "Environment names must contain letters, digits or underscores and cannot start with a digit"
+    },
+    "calls": []
+  },
+  "create/generic/code_hook_refused": {
+    "request": {
+      "method": "POST",
+      "path": "/api/datasources",
+      "body": {
+        "name": "Billing API",
+        "type": "generic",
+        "description": "Billing REST API",
+        "connection_url": "https://billing.example.test/api",
+        "cli_hint": "curl $BILLING_URL",
+        "credentials": {
+          "env_vars": {
+            "NODE_OPTIONS": "--require x"
+          }
+        }
+      }
+    },
+    "status": 400,
+    "body": {
+      "detail": "NODE_OPTIONS is not a variable a connector may set: tools read it to run code or load their config"
+    },
+    "calls": []
+  },
+  "create/generic/proxy_and_ca_bundle_allowed": {
+    "request": {
+      "method": "POST",
+      "path": "/api/datasources",
+      "body": {
+        "name": "Billing API",
+        "type": "generic",
+        "description": "Billing REST API",
+        "connection_url": "https://billing.example.test/api",
+        "cli_hint": "curl $BILLING_URL",
+        "credentials": {
+          "env_vars": {
+            "HTTPS_PROXY": "http://p:3128",
+            "SSL_CERT_FILE": "/x"
           }
         }
       }
@@ -604,8 +651,8 @@
           "description": "Billing REST API",
           "credentials": {
             "env_vars": {
-              "1BAD": 3,
-              "PATH": "/x"
+              "HTTPS_PROXY": "http://p:3128",
+              "SSL_CERT_FILE": "/x"
             }
           },
           "job_id": null,
@@ -622,8 +669,7 @@
           "authority_is_admin": false
         }
       }
-    ],
-    "pinned_defect": "generic env vars are not validated at create; a bad set is only refused when it is installed at attach (L1 §2)"
+    ]
   },
   "create/generic/config_refused": {
     "request": {
@@ -831,6 +877,26 @@
     "status": 400,
     "body": {
       "detail": "Environment name SRW_TOKEN is reserved by the workspace"
+    },
+    "calls": []
+  },
+  "create/credentials/code_hook_refused": {
+    "request": {
+      "method": "POST",
+      "path": "/api/datasources",
+      "body": {
+        "name": "Vendor login",
+        "type": "credentials",
+        "credentials": {
+          "env_vars": {
+            "GIT_SSH_COMMAND": "x"
+          }
+        }
+      }
+    },
+    "status": 400,
+    "body": {
+      "detail": "GIT_SSH_COMMAND is not a variable a connector may set: tools read it to run code or load their config"
     },
     "calls": []
   },
@@ -1524,6 +1590,30 @@
     "status": 400,
     "body": {
       "detail": "env_var KUBECONFIG is reserved: it names the merged kubeconfig"
+    },
+    "calls": []
+  },
+  "create/generic_file/code_hook_env_var_refused": {
+    "request": {
+      "method": "POST",
+      "path": "/api/datasources",
+      "body": {
+        "name": "Service account",
+        "type": "generic_file",
+        "credentials": {
+          "files": [
+            {
+              "contents": "x",
+              "target_path": "~/.srw-files/x",
+              "env_var": "NODE_OPTIONS"
+            }
+          ]
+        }
+      }
+    },
+    "status": 400,
+    "body": {
+      "detail": "env_var NODE_OPTIONS is not a variable a connector may set: tools read it to run code or load their config"
     },
     "calls": []
   },
@@ -5802,8 +5892,7 @@
       "body": {
         "credentials": {
           "env_vars": {
-            "OTHER": "x",
-            "1BAD": "y"
+            "OTHER": "x"
           }
         }
       }
@@ -5840,8 +5929,7 @@
           "connection_url": null,
           "credentials": {
             "env_vars": {
-              "OTHER": "x",
-              "1BAD": "y"
+              "OTHER": "x"
             }
           },
           "cli_hint": null,
@@ -5851,8 +5939,44 @@
           "read_only": null
         }
       }
-    ],
-    "pinned_defect": "generic env vars are not validated on update either; the set is replaced, not merged"
+    ]
+  },
+  "update/generic/env_validated": {
+    "request": {
+      "method": "PUT",
+      "path": "/api/datasources/d5000001-0000-0000-0000-000000000001",
+      "body": {
+        "credentials": {
+          "env_vars": {
+            "OTHER": "x",
+            "1BAD": "y"
+          }
+        }
+      }
+    },
+    "status": 400,
+    "body": {
+      "detail": "Environment names must contain letters, digits or underscores and cannot start with a digit"
+    },
+    "calls": []
+  },
+  "update/generic/code_hook_refused": {
+    "request": {
+      "method": "PUT",
+      "path": "/api/datasources/d5000001-0000-0000-0000-000000000001",
+      "body": {
+        "credentials": {
+          "env_vars": {
+            "EDITOR": "vi"
+          }
+        }
+      }
+    },
+    "status": 400,
+    "body": {
+      "detail": "EDITOR is not a variable a connector may set: tools read it to run code or load their config"
+    },
+    "calls": []
   },
   "update/generic/empty_credentials_keep_stored": {
     "request": {
@@ -6117,6 +6241,77 @@
       "detail": "Environment name HOME is reserved by the workspace"
     },
     "calls": []
+  },
+  "update/credentials/stored_code_hook_refused": {
+    "request": {
+      "method": "PUT",
+      "path": "/api/datasources/d5000002-0000-0000-0000-000000000002",
+      "body": {
+        "credentials": {
+          "env_vars": {
+            "VENDOR_PASSWORD": "rotated"
+          }
+        }
+      }
+    },
+    "status": 400,
+    "body": {
+      "detail": "NODE_OPTIONS is not a variable a connector may set: tools read it to run code or load their config. It was saved before this rule. Create the connector again without it: an edit keeps every stored variable."
+    },
+    "calls": []
+  },
+  "update/credentials/stored_code_hook_kept_without_variables": {
+    "request": {
+      "method": "PUT",
+      "path": "/api/datasources/d5000002-0000-0000-0000-000000000002",
+      "body": {
+        "credentials": {},
+        "name": "Vendor"
+      }
+    },
+    "status": 200,
+    "body": {
+      "id": "d5000002-0000-0000-0000-000000000002",
+      "name": "Vendor",
+      "description": "Vendor portal account",
+      "type": "credentials",
+      "connection_url": null,
+      "config": {},
+      "cli_hint": null,
+      "default_branch": null,
+      "read_only": null,
+      "created_by": "00000000-0000-0000-0000-0000000000c1",
+      "is_global": false,
+      "scope_mode": "all",
+      "auto_attach": false,
+      "policy_revision": 1,
+      "created_at": "2026-01-02T03:04:05Z",
+      "updated_at": "2026-01-02T03:04:05Z",
+      "project_ids": [],
+      "env_var_names": [
+        "NODE_OPTIONS",
+        "VENDOR_USER"
+      ]
+    },
+    "calls": [
+      {
+        "call": "update_datasource",
+        "args": [
+          "d5000002-0000-0000-0000-000000000002"
+        ],
+        "kwargs": {
+          "name": "Vendor",
+          "description": null,
+          "connection_url": null,
+          "credentials": null,
+          "cli_hint": null,
+          "default_branch": null,
+          "config": null,
+          "is_global": null,
+          "read_only": null
+        }
+      }
+    ]
   },
   "update/credentials/empty_env_refused": {
     "request": {

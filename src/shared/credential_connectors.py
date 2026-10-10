@@ -1,17 +1,20 @@
-"""ENV credential contracts shared by the API and workspace runtime."""
+"""ENV credential contracts shared by the API and workspace runtime.
+
+An environment connector's names follow the one rule every connector does
+(``shared.connectors.env_names.connector_env_problem``): no SRW reserved
+name and no known code hook. The orchestrator refuses a name when the
+connector is saved (:func:`normalize_credential_env`); a row saved before the
+rule is delivered without it, the refused names reported
+(:func:`split_credential_env`).
+"""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from shared.connectors.builtin import legacy_types_with_form, spec_for_type
-from shared.connectors.env_names import (
-    CONFIG_POINTER_ENV_NAMES,
-    CONFIG_POINTER_ENV_PREFIXES,
-    env_value_problem,
-    points_a_tool_at_code,
-    workspace_name_problem,
-)
+from shared.connectors.env_names import connector_env_problem, env_value_problem
 
 #: Stored types whose driver delivers an environment file to the workspace.
 ENV_CONNECTOR_TYPES = legacy_types_with_form("env_file")
@@ -21,21 +24,50 @@ class CredentialConnectorAttachedError(ValueError):
     """Credentials already attached to work cannot be detached in v1."""
 
 
-def normalize_credential_env(value: Any, *, required: bool = False) -> dict[str, str]:
-    """Validate values without including any secret in error messages."""
+def _variables(value: Any, *, required: bool) -> Mapping[Any, Any]:
+    """``value`` as a set of variables, or ``ValueError`` for its shape."""
     if not isinstance(value, dict):
         raise ValueError("Environment variables must be a name/value object")
     if required and not value:
         raise ValueError("Add at least one credential environment variable")
     if len(value) > 100:
         raise ValueError("A connector supports at most 100 environment variables")
+    return value
+
+
+def normalize_credential_env(value: Any, *, required: bool = False) -> dict[str, str]:
+    """Validate values without including any secret in error messages."""
     result: dict[str, str] = {}
-    for name, secret in value.items():
-        problem = workspace_name_problem(name) or env_value_problem(name, secret)
+    for name, secret in _variables(value, required=required).items():
+        problem = connector_env_problem(name) or env_value_problem(name, secret)
         if problem is not None:
             raise ValueError(problem)
         result[name] = secret
     return result
+
+
+def split_credential_env(
+    value: Any, *, required: bool = False
+) -> tuple[dict[str, str], dict[str, str]]:
+    """What a stored set delivers: ``(values, refused)``.
+
+    ``refused`` maps each name no connector may set to why, for a row saved
+    before the rule; the caller skips and reports it. A shape no delivery
+    can take, or a value the workspace refuses, is a ``ValueError`` as in
+    :func:`normalize_credential_env`.
+    """
+    values: dict[str, str] = {}
+    refused: dict[str, str] = {}
+    for name, secret in _variables(value, required=required).items():
+        problem = connector_env_problem(name)
+        if problem is not None:
+            refused[str(name)] = problem
+            continue
+        problem = env_value_problem(name, secret)
+        if problem is not None:
+            raise ValueError(problem)
+        values[name] = secret
+    return values, refused
 
 
 def collect_credential_env(datasources: list[dict[str, Any]]) -> dict[str, str]:
@@ -63,49 +95,10 @@ def _env_vars_required(ds_type: Any) -> bool:
     )
 
 
-# ---------------------------------------------------------------------------
-# Variables that point a tool at a config, start-up or code file
-# ---------------------------------------------------------------------------
-#
-# A credential file's ``env_var`` is set to the stored file's path. Naming a
-# variable in ``shared.connectors.env_names.CONFIG_POINTER_ENV_NAMES`` would
-# make that file a config or code: a shared connector's file would become
-# code. So a credential file may not name one.
-#
-# Environment connectors still reserve only the workspace's own names
-# (:func:`normalize_credential_env`); whether they adopt this list, or the
-# stricter one drivers keep (``env_names.driver_env_problem``), is the
-# owner's decision (slices D1d and D6). The lists live in
-# ``shared.connectors.env_names`` so every caller uses one copy.
-
-
-def credential_file_env_problem(name: str) -> str | None:
-    """Why a credential file's ``env_var`` is refused (``None``: it is not).
-
-    The workspace's reserved names (as an environment connector's), the
-    kubeconfig merge's ``KUBECONFIG``, and every variable that points a tool
-    at a config or code file (:data:`CONFIG_POINTER_ENV_NAMES`).
-    """
-    try:
-        normalize_credential_env({name: ""})
-    except ValueError as exc:
-        return str(exc)
-    if name == "KUBECONFIG":
-        return "KUBECONFIG is reserved: it names the merged kubeconfig"
-    if points_a_tool_at_code(name):
-        return (
-            f"{name} is reserved: it would point a tool at the file as a config or code"
-        )
-    return None
-
-
 __all__ = [
-    "CONFIG_POINTER_ENV_NAMES",
-    "CONFIG_POINTER_ENV_PREFIXES",
     "ENV_CONNECTOR_TYPES",
     "CredentialConnectorAttachedError",
     "collect_credential_env",
-    "credential_file_env_problem",
     "normalize_credential_env",
-    "points_a_tool_at_code",
+    "split_credential_env",
 ]

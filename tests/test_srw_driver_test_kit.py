@@ -206,7 +206,8 @@ class TestBrokenDrivers:
     @pytest.mark.parametrize(
         ("name", "message"),
         [
-            ("GIT_SSH_COMMAND", "not a variable a driver may set"),
+            ("GIT_SSH_COMMAND", "not a variable a connector may set"),
+            ("NODE_OPTIONS", "not a variable a connector may set"),
             ("EXAMPLE_UNDECLARED", "does not declare"),
         ],
     )
@@ -218,15 +219,40 @@ class TestBrokenDrivers:
         assert list(failures) == ["bind"]
         assert any(message in problem for problem in failures["bind"])
 
-    def test_a_file_outside_the_driver_s_locations_fails_bind(self, tmp_path):
-        kubeconfig = (
+    @pytest.mark.parametrize(
+        "path", ["~/.kube/config", "~/.aws/credentials", "~/.config/gcloud/x.json"]
+    )
+    def test_a_file_in_any_credential_location_passes(self, tmp_path, path):
+        """A driver gets the whole credential-file allowlist SRW's own file
+        connectors have (connector drivers decision 26)."""
+        entry = (
             '{"recipient": "workspace", "form": "credential_file", '
-            '"value": {"path": "~/.kube/config", "content": "{}"}, '
+            f'"value": {{"path": "{path}", "content": "{{}}"}}, '
             '"collision": "skip_existing"}'
         )
-        driver = _driver(tmp_path, GOOD.replace("ENTRY", kubeconfig))
+        driver = _driver(tmp_path, GOOD.replace("ENTRY", entry))
+        assert _failures(Kit(driver, FIXTURE).run()) == {}
+
+    @pytest.mark.parametrize(
+        ("path", "mode", "message"),
+        [
+            ("~/.bashrc", 384, "not a credential-file location"),
+            ("~/.ssh/config", 384, "not a credential-file location"),
+            ("~/.srw-files/x", 493, "never executable"),
+        ],
+    )
+    def test_a_file_outside_them_or_executable_fails_bind(
+        self, tmp_path, path, mode, message
+    ):
+        entry = (
+            '{"recipient": "workspace", "form": "credential_file", '
+            f'"value": {{"path": "{path}", "content": "x", "mode": {mode}}}, '
+            '"collision": "skip_existing"}'
+        )
+        driver = _driver(tmp_path, GOOD.replace("ENTRY", entry))
         failures = _failures(Kit(driver, FIXTURE).run())
-        assert any("~/.srw-files/" in problem for problem in failures["bind"])
+        assert list(failures) == ["bind"]
+        assert any(message in problem for problem in failures["bind"])
 
     def test_revoke_must_succeed_when_already_gone(self, tmp_path):
         marker = str(tmp_path / "revoked")

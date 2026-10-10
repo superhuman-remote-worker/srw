@@ -479,11 +479,41 @@ CASES: dict[str, ProbeCase] = {
     # ---- env connectors ----------------------------------------------------
     "generic/no_test": ProbeCase(_stored("generic")),
     "credentials/valid": ProbeCase(_stored("credentials")),
-    "credentials/invalid_stored_env_is_a_500": ProbeCase(
+    # A name refused since the row was saved (the one rule for every
+    # connector): Test says the workspace does not receive it.
+    "credentials/refused_stored_name_is_reported": ProbeCase(
         _stored("credentials", credentials={"env_vars": {"PATH": "x"}})
+    ),
+    "credentials/stored_code_hook_is_reported": ProbeCase(
+        _stored(
+            "credentials",
+            credentials={"env_vars": {"VENDOR_USER": "a", "NODE_OPTIONS": "x"}},
+        )
+    ),
+    "credentials/malformed_stored_env_is_a_500": ProbeCase(
+        _stored("credentials", credentials={"env_vars": ["PATH"]})
+    ),
+    "generic/stored_code_hook_is_reported": ProbeCase(
+        _stored("generic", credentials={"env_vars": {"GIT_SSH_COMMAND": "x"}})
     ),
     # ---- credential files --------------------------------------------------
     "generic_file/no_connection_test": ProbeCase(_stored("generic_file")),
+    "generic_file/stored_code_hook_variable_is_reported": ProbeCase(
+        _stored(
+            "generic_file",
+            credentials={
+                "files": [
+                    {
+                        "name": "token",
+                        "contents": "x",
+                        "target_path": "/home/srw/.srw-files/x/token",
+                        "mode": "0600",
+                        "env_var": "NODE_OPTIONS",
+                    }
+                ]
+            },
+        )
+    ),
     "kubeconfig/no_connection_test": ProbeCase(_stored("kubeconfig")),
     # Without a host there is nothing to reach (with one, Test reports its
     # host key; see tests/test_workspace_ssh_connector.py).

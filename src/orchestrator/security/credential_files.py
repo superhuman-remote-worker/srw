@@ -15,7 +15,9 @@ is the single source of truth for:
 - file ``mode`` well-formedness (4-digit octal), never an execute bit for a
   file the workspace receives
 - ``env_var`` well-formedness (POSIX identifier), and for a file the
-  workspace receives no reserved name and not ``KUBECONFIG``
+  workspace receives a name any connector may set
+  (``shared.connectors.env_names``: no SRW reserved name, ``KUBECONFIG``
+  included, and no known code hook)
 - type-specific defaults (e.g. ssh_key private at ``~/.ssh/<slug>`` with 0600,
   a generic file without a target in ``~/.srw-files/<slug>-<token>/``)
 
@@ -33,13 +35,13 @@ from shared.connectors.builtin import (
     legacy_types_with_form,
     legacy_types_with_slot,
 )
+from shared.connectors.env_names import connector_env_problem
 from shared.connectors.file_targets import (
     DEFAULT_DIRECTORY,
     allowed_targets_text,
     mode_problem,
     target_problem,
 )
-from shared.credential_connectors import credential_file_env_problem
 
 #: Stored types whose credentials are a ``files[]`` list, normalized here
 #: (from the driver specs). An ssh_key's first file is its private key: it is
@@ -167,7 +169,7 @@ def _validate_env_var(env_var: Any, *, written: bool = False) -> str | None:
         raise CredentialFileValidationError(
             f"env_var must be a POSIX identifier ([A-Za-z_][A-Za-z0-9_]*), got {env_var!r}"
         )
-    problem = credential_file_env_problem(env_var) if written else None
+    problem = connector_env_problem(env_var) if written else None
     if problem is not None:
         raise CredentialFileValidationError(
             f"env_var {problem}"

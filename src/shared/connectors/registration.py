@@ -17,11 +17,11 @@ someone registers must follow on top of :func:`~.contract.validate_spec`:
   server (imported from its ``server.json``).
 * **Environment names.** A bind-time driver that sets variables declares
   every name its bind may return (``env_names`` in its spec), so the names
-  are visible when it is registered and on its connector, and none may be
-  on the list of known tool hooks (``env_names.driver_env_problem``: names
-  tools read to run code, redirect traffic or loosen TLS). The list is a
-  best-effort lint, not a sandbox: the image's author is the trust
-  boundary, as a workspace image's is.
+  are visible when it is registered and on its connector, the way a store
+  shows what an app asks for. Each must be one any connector may set
+  (``env_names.connector_env_problem``: no SRW reserved name, no known code
+  hook). The rule is a best-effort lint, not a sandbox: the image's author
+  is the trust boundary, as a workspace image's is.
 * **Schemas.** A registered schema is validated on SRW's servers, so it
   uses only a small allowlist of cheap keywords (:data:`SCHEMA_KEYWORDS`),
   references only its own ``$defs``, and its size and the cost of one
@@ -31,12 +31,12 @@ someone registers must follow on top of :func:`~.contract.validate_spec`:
 What one ``bind`` of a bind-time image returns is checked by
 :func:`image_binding_problems` (the one check SRW and the author test kit
 both run) and turned into the wire entry the agent already reads for its
-stored type (:func:`wire_credentials`). A file goes to ``~/.srw-files/``,
-``~/.netrc`` or ``~/.pgpass`` only (:data:`IMAGE_FILE_TARGETS`): the other
-credential-file locations hold formats that run a command (a kubeconfig's
-``exec``, an AWS ``credential_process``), which a shared driver's output
-must not carry until the owner rules on it. A moved tag's new spec is
-compared with the one bound before by :func:`moved_spec_problems`.
+stored type (:func:`wire_credentials`). It is held to the rules every
+connector is, SRW's own included (connector drivers, decisions 24 to 26 and
+36): a variable any connector may set (:mod:`.env_names`), and a file in the
+credential-file allowlist, never executable (:mod:`.file_targets`). A moved
+tag's new spec is compared with the one bound before by
+:func:`moved_spec_problems`.
 
 Design: knowledge-base/knowledge/features/connector_drivers.md, "Trust and
 registration", "The driver contract" and slice D6.
@@ -61,11 +61,16 @@ from .contract import (
 )
 from .env_names import (
     ENV_NAME,
-    MAX_DRIVER_ENV_NAME,
-    driver_env_problem,
+    MAX_ENV_NAME,
+    connector_env_problem,
     env_value_problem,
 )
-from .file_targets import STORED_HOME, mode_problem, target_problem
+from .file_targets import (
+    STORED_HOME,
+    allowed_targets_text,
+    mode_problem,
+    target_problem,
+)
 from .images import SPEC_LABEL, ImageReference, SpecContract, compatibility_problems
 
 #: The namespace of SRW's own drivers; no registration may use it.
@@ -119,11 +124,6 @@ _SERVICE_KEYS = frozenset(
 #: The most entries one bind may deliver, and names a spec may declare.
 MAX_BINDING_ENTRIES = 100
 MAX_ENV_NAMES = 100
-#: Where a bind-time image driver's file may land (home-relative): a
-#: directory SRW owns, and the two login files curl, git and libpq read.
-IMAGE_FILE_DIRECTORY = ".srw-files"
-IMAGE_FILE_NAMES: tuple[str, ...] = (".netrc", ".pgpass")
-IMAGE_FILE_TARGETS = f"~/{IMAGE_FILE_DIRECTORY}/, ~/.netrc or ~/.pgpass"
 #: Bounds on a registered schema (its canonical JSON, and its nesting).
 MAX_SCHEMA_BYTES = 32 * 1024
 MAX_SCHEMA_DEPTH = 12
@@ -331,10 +331,10 @@ def declared_env_names(value: Mapping[str, Any]) -> tuple[str, ...]:
     if len(set(names)) != len(names):
         raise ValueError("env_names lists a name twice")
     for name in names:
-        if not ENV_NAME.fullmatch(name) or len(name) > MAX_DRIVER_ENV_NAME:
+        if not ENV_NAME.fullmatch(name) or len(name) > MAX_ENV_NAME:
             raise ValueError(
                 f"env_names: {name[:40]!r} is not a variable name of at most "
-                f"{MAX_DRIVER_ENV_NAME} characters"
+                f"{MAX_ENV_NAME} characters"
             )
     return names
 
@@ -812,7 +812,7 @@ def _bind_time_problems(spec: DriverSpec, env_names: tuple[str, ...]) -> list[st
             "its bind may return in env_names"
         )
     problems += [
-        f"env_names: {why}" for why in map(driver_env_problem, env_names) if why
+        f"env_names: {why}" for why in map(connector_env_problem, env_names) if why
     ]
     extra = sorted(set(spec.delivery_forms) - set(IMAGE_BIND_FORMS))
     if extra:
@@ -908,11 +908,11 @@ def image_binding_problems(
     (and SRW delivers for images), it stays within
     :data:`MAX_BINDING_ENTRIES`, every variable it sets (a file's
     ``env_var`` included) is one the spec declares in ``env_names`` and one
-    a driver may set (``env_names.driver_env_problem``), with a value the
-    workspace takes, no name is set twice, and every file lands at
-    :data:`IMAGE_FILE_TARGETS` (one path once, at most
-    :data:`MAX_IMAGE_FILE_PATH` characters), never executable, a ``.netrc``
-    without a ``macdef``. The messages never show a value.
+    any connector may set (``env_names.connector_env_problem``), with a
+    value the workspace takes, no name is set twice, and every file lands in
+    the credential-file allowlist (``file_targets.target_problem``; one path
+    once, at most :data:`MAX_IMAGE_FILE_PATH` characters), never
+    executable. The messages never show a value.
     """
     problems = validate_binding(descriptor)
     if problems:
@@ -958,7 +958,7 @@ def image_binding_problems(
             name = value.get("env_var") or None
         if name is None:
             continue
-        why = driver_env_problem(name)
+        why = connector_env_problem(name)
         if why is not None:
             problems.append(f"entries[{index}]: {why}")
         elif name not in declared:
@@ -974,8 +974,6 @@ def image_binding_problems(
 
 #: The longest path a driver's file may name.
 MAX_IMAGE_FILE_PATH = 255
-#: A ``.netrc`` macro: ftp runs the ``init`` one on login.
-_NETRC_MACRO = re.compile(r"(?:^|\s)macdef(?:\s|$)")
 
 
 def _file_problems(value: Mapping[str, Any], index: int) -> list[str]:
@@ -984,14 +982,11 @@ def _file_problems(value: Mapping[str, Any], index: int) -> list[str]:
     path = str(value.get("path") or "")
     if len(path) > MAX_IMAGE_FILE_PATH:
         return [f"{at}.path is longer than {MAX_IMAGE_FILE_PATH} characters"]
-    relative, why = target_problem(path)
+    _relative, why = target_problem(path)
     if why is not None:
-        problems.append(f"{at}.path is refused: {why}")
-    elif relative not in IMAGE_FILE_NAMES and not relative.startswith(
-        IMAGE_FILE_DIRECTORY + "/"
-    ):
         problems.append(
-            f"{at}.path is refused: a driver's file goes to {IMAGE_FILE_TARGETS}"
+            f"{at}.path is refused: {why}: credential files go under "
+            f"{allowed_targets_text()}"
         )
     mode = value.get("mode")
     if mode is not None:
@@ -1000,15 +995,6 @@ def _file_problems(value: Mapping[str, Any], index: int) -> list[str]:
             problems.append(f"{at}.mode is refused: {why}")
     if value.get("transform") is not None or value.get("merge_group") is not None:
         problems.append(f"{at}: transform and merge_group are SRW's own")
-    content = value.get("content")
-    if (
-        relative == ".netrc"
-        and isinstance(content, str)
-        and _NETRC_MACRO.search(content)
-    ):
-        problems.append(
-            f"{at}: a .netrc may not define a macro (macdef): ftp runs one on login"
-        )
     return problems
 
 
@@ -1152,7 +1138,6 @@ def moved_spec_problems(
 
 __all__ = [
     "IMAGE_BIND_FORMS",
-    "IMAGE_FILE_TARGETS",
     "MAX_BINDING_ENTRIES",
     "MAX_ENV_NAMES",
     "MAX_CONFIG_BYTES",

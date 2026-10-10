@@ -16,7 +16,8 @@ from shared.connectors.builtin import (
     spec_for_type,
 )
 from shared.connectors.contract import validate_spec
-from shared.connectors.env_names import driver_env_problem
+from shared.connectors.env_names import connector_env_problem
+from shared.connectors.file_targets import target_problem
 from shared.connectors.registration import (
     MAX_BINDING_ENTRIES,
     MAX_SCHEMA_BYTES,
@@ -339,8 +340,8 @@ class TestWhatABindReturns:
 
 
 #: What the D6 review showed a driver could set before the strict list
-#: (scratchpad d6-review/probe_env.py): each runs code, redirects traffic or
-#: loosens TLS in the consumer's workspace.
+#: (scratchpad d6-review/probe_env.py) that still makes a tool run code or is
+#: SRW's own: refused for every connector (decisions 24 and 36).
 DENIED = [
     "GIT_SSH_COMMAND",
     "GIT_CONFIG_COUNT",
@@ -351,7 +352,6 @@ DENIED = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_EXEC_PATH",
-    "GIT_SSL_NO_VERIFY",
     "NODE_OPTIONS",
     "PERL5OPT",
     "RUBYOPT",
@@ -371,18 +371,8 @@ DENIED = [
     "SSH_ASKPASS",
     "SUDO_ASKPASS",
     "SSH_AUTH_SOCK",
-    "HTTPS_PROXY",
-    "https_proxy",
-    "ALL_PROXY",
-    "no_proxy",
-    "SSL_CERT_FILE",
-    "SSL_CERT_DIR",
-    "REQUESTS_CA_BUNDLE",
-    "CURL_CA_BUNDLE",
-    "NODE_EXTRA_CA_CERTS",
     "KUBECONFIG",
     "DOCKER_CONFIG",
-    "DOCKER_HOST",
     "XDG_CONFIG_HOME",
     "GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES",
     "TMPDIR",
@@ -391,7 +381,6 @@ DENIED = [
     "BUN_INSTALL",
     "OPENSSL_CONF",
     "GLIBC_TUNABLES",
-    "AWS_CONFIG_FILE",
     "CURL_HOME",
     "PSQLRC",
     "MAKEFLAGS",
@@ -422,12 +411,53 @@ ALLOWED = [
     "ANTHROPIC_API_KEY",
     "TERM",
 ]
+#: What the strict D6 list refused and decision 36 allows every connector:
+#: proxies, CA bundles and TLS checks, name resolution, Docker's daemon, a
+#: credential file the file rule accepts anyway, git's commit identity. They
+#: change where a tool connects or what it trusts, never what it runs.
+ALLOWED_FOR_EVERYONE = [
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "ALL_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+    "npm_config_https_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "AWS_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "GIT_SSL_CAINFO",
+    "GIT_SSL_CAPATH",
+    "GIT_SSL_NO_VERIFY",
+    "PGSSLMODE",
+    "PGSSLROOTCERT",
+    "NODE_TLS_REJECT_UNAUTHORIZED",
+    "PIP_CERT",
+    "DENO_CERT",
+    "HOSTALIASES",
+    "RES_OPTIONS",
+    "DOCKER_HOST",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CERT_PATH",
+    "GOPRIVATE",
+    "GONOSUMDB",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "NETRC",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+]
 
 
 class TestEnvironmentNames:
     @pytest.mark.parametrize("name", DENIED)
-    def test_a_driver_may_not_set_what_runs_code_or_redirects(self, name):
-        assert driver_env_problem(name) is not None
+    def test_a_driver_may_not_set_a_code_hook_or_a_reserved_name(self, name):
+        assert connector_env_problem(name) is not None
         # Refused at bind even were it declared...
         problems = _check(_env(name=name), names=(*NAMES, name))
         assert any(name in p for p in problems)
@@ -439,8 +469,16 @@ class TestEnvironmentNames:
 
     @pytest.mark.parametrize("name", ALLOWED)
     def test_ordinary_credentials_are_fine(self, name):
-        assert driver_env_problem(name) is None
+        assert connector_env_problem(name) is None
         assert _check(_env(name=name), names=(name,)) == []
+
+    @pytest.mark.parametrize("name", ALLOWED_FOR_EVERYONE)
+    def test_what_runs_no_code_is_a_driver_s_to_set(self, name):
+        """D6's extra list is trimmed to code hooks (decisions 25 and 36)."""
+        assert connector_env_problem(name) is None
+        assert _check(_env(name=name), names=(name,)) == []
+        assert _check(_file(env_var=name), names=(name,)) == []
+        assert _problems(env_names=[*NAMES, name]) == []
 
     def test_a_name_the_spec_does_not_declare_is_refused(self):
         problems = _check(_env(name="EXAMPLE_UNDECLARED"))
@@ -483,37 +521,58 @@ class TestEnvironmentNames:
 
 
 class TestFileTargets:
-    @pytest.mark.parametrize(
-        "path",
-        ["~/.srw-files/example/token", "~/.srw-files/x", "~/.netrc", "~/.pgpass"],
-    )
-    def test_a_driver_s_file_lands_in_srw_s_directory_or_a_login_file(self, path):
-        assert _check(_file(path=path)) == []
+    """A driver's file follows D1d's allowlist, as SRW's own file connectors
+    do (decision 26): D6's narrow ``~/.srw-files/``, ``~/.netrc`` and
+    ``~/.pgpass`` are gone."""
 
     @pytest.mark.parametrize(
         "path",
         [
-            # Credential-file locations whose formats run a command, until the
-            # owner rules on shared env and file connectors.
+            "~/.srw-files/example/token",
+            "~/.srw-files/x",
+            "~/.netrc",
+            "~/.pgpass",
             "~/.kube/config",
+            "~/.kube/example-token",
             "~/.aws/config",
             "~/.aws/credentials",
+            "~/.azure/msal_token_cache.json",
             "~/.docker/config.json",
             "~/.config/helm/repositories.yaml",
             "~/.config/gcloud/credentials.db",
-            # Never a credential-file location at all.
+            "~/.config/sops/age/keys.txt",
+        ],
+    )
+    def test_a_driver_s_file_lands_in_any_credential_location(self, path):
+        assert _check(_file(path=path)) == []
+        assert target_problem(path)[1] is None
+
+    @pytest.mark.parametrize(
+        "path",
+        [
             "~/.gitconfig",
             "~/.bashrc",
             "~/.ssh/config",
+            "~/.ssh/authorized_keys",
             "~/.srw-credentials/leases/x",
             "~/.config/git/config",
+            "~/.docker/cli-plugins/docker-x",
+            "~/.azure/cliextensions/x/__init__.py",
+            "~/.local/bin/git",
             "/etc/passwd",
+            "/tmp/x",
             "~/.srw-files/../.bashrc",
         ],
     )
     def test_everything_else_is_refused(self, path):
         problems = _check(_file(path=path))
         assert any("path is refused" in p for p in problems)
+        assert target_problem(path)[1] is not None
+
+    @pytest.mark.parametrize("mode", [0o700, 0o755, 0o644 | 0o4000, 0o610])
+    def test_a_file_in_an_allowed_location_is_still_never_executable(self, mode):
+        problems = _check(_file(path="~/.kube/config", mode=mode))
+        assert any("mode is refused" in p for p in problems)
 
 
 #: The D6 review's ReDoS probe (d6-review/probe_redos.py): this pattern
@@ -704,7 +763,6 @@ REREVIEW_DENIED = [
     "TF_CLI_CONFIG_FILE",
     "JUPYTER_CONFIG_DIR",
     "JULIA_DEPOT_PATH",
-    "DENO_CERT",
     "DENO_DIR",
     "MAILCAPS",
     "LOCPATH",
@@ -719,7 +777,6 @@ REREVIEW_DENIED = [
     "HELM_DATA_HOME",
     "PERL5DB",
     "LUA_INIT",
-    "NETRC",
     "LESS",
     "MANOPT",
     "PS0",
@@ -770,7 +827,7 @@ CREDENTIAL_SHAPED = [
 class TestTheOneEnvironmentList:
     @pytest.mark.parametrize("name", REREVIEW_DENIED)
     def test_known_tool_hooks_are_refused(self, name):
-        assert driver_env_problem(name) is not None
+        assert connector_env_problem(name) is not None
         problems = _check(_env(name=name), names=(*NAMES, name))
         assert any(name in p for p in problems)
         declared = _problems(env_names=[*NAMES, name])
@@ -778,12 +835,12 @@ class TestTheOneEnvironmentList:
 
     @pytest.mark.parametrize("name", CREDENTIAL_SHAPED)
     def test_credential_shaped_names_stay_allowed(self, name):
-        assert driver_env_problem(name) is None
+        assert connector_env_problem(name) is None
         assert _check(_env(name=name), names=(name,)) == []
         assert _problems(env_names=[name]) == []
 
     def test_a_name_is_at_most_128_characters(self):
-        assert driver_env_problem("A" * 128) is None
+        assert connector_env_problem("A" * 128) is None
         long = "A" * 129
         problems = _check(_env(name=long), names=(long,))
         assert any("at most 128" in p for p in problems)
@@ -802,12 +859,12 @@ class TestTheOneEnvironmentList:
 
         assert mcp.CODE_ENV is env_names.CODE_ENV
         assert mcp.CODE_ENV_PREFIXES is env_names.CODE_ENV_PREFIXES
-        assert env_names.CODE_ENV <= env_names.DRIVER_DENIED_NAMES
+        assert env_names.CODE_ENV <= env_names.CODE_HOOK_NAMES
         for name in ("NODE_OPTIONS", "PYTHONPATH", "GIT_SSH_COMMAND", "PIP_INDEX_URL"):
             assert mcp.code_env(name)
         for name in ("NODE_ENV", "JAVA_HOME", "DATA_HOME", "FEATURE_FLAGS"):
             assert not mcp.code_env(name)
-            assert env_names.loads_code(name)
+            assert connector_env_problem(name) is not None
         for name in CREDENTIAL_SHAPED:
             assert not mcp.code_env(name)
 
@@ -820,6 +877,16 @@ class TestTheOneEnvironmentList:
         assert "cannot run code" not in doc
         assert "nothing it names may run code" not in doc
         assert "trust boundary" in " ".join(registration.__doc__.split())
+
+    def test_the_rule_and_its_reason_are_stated_once(self):
+        from shared.connectors import env_names
+
+        doc = " ".join(env_names.__doc__.split())
+        assert "Credential connectors can't execute commands" in doc
+        assert "SSH entry point" in doc
+        assert "SRW's own and a registered image driver's alike" in doc
+        for family in ("``GIT_*``", "``SSH_*``"):
+            assert family in doc
 
 
 #: probe_schema_ref.py: a ``$ref`` to a key no structural walk visits, an
@@ -978,28 +1045,21 @@ class TestReReviewFiles:
         assert any("longer than 255" in p for p in problems)
 
     @pytest.mark.parametrize(
-        "content",
+        ("path", "content"),
         [
-            "machine a login b password c\nmacdef init\n!id\n\n",
-            "macdef init\n!id\n\n",
-            "machine a login b password c macdef init\n",
-            "machine a\tmacdef\tinit\n",
+            ("~/.netrc", "machine a login b password c\nmacdef init\n!id\n\n"),
+            ("~/.kube/config", "users: [{user: {exec: {command: id}}}]\n"),
+            ("~/.aws/config", "[default]\ncredential_process = id\n"),
         ],
     )
-    def test_a_netrc_defines_no_macro(self, content):
-        entry = _file("~/.netrc")
+    def test_srw_reads_no_file_s_content(self, path, content):
+        """One rule for every connector (decision 26): where a file lands and
+        its mode, never what it says. A ``.netrc`` macro, like a kubeconfig's
+        ``exec`` or an AWS ``credential_process``, is the driver's, as in
+        SRW's own file connectors (``file_targets``)."""
+        entry = _file(path)
         entry["value"]["content"] = content
-        problems = _check(entry)
-        assert any("macdef" in p for p in problems)
-        assert not any("!id" in p for p in problems)
-
-    def test_a_netrc_without_a_macro_and_a_pgpass_are_fine(self):
-        entry = _file("~/.netrc")
-        entry["value"]["content"] = "machine a login macdefault password c\n"
         assert _check(entry) == []
-        pgpass = _file("~/.pgpass")
-        pgpass["value"]["content"] = "host:5432:db:user:macdef\n"
-        assert _check(pgpass) == []
 
 
 class TestReReviewMovedTags:
@@ -1364,8 +1424,6 @@ CREDENTIALS_IN_A_FAMILY = [
     "DENO_AUTH_SECRET",
 ]
 SPELLED_OUT = [
-    "PGSSLMODE",
-    "PGSSLROOTCERT",
     "GODEBUG",
     "RSYNC_RSH",
     "CVS_RSH",
@@ -1376,7 +1434,6 @@ SPELLED_OUT = [
     "INPUTRC",
     "CONDARC",
     "WGETRC",
-    "NETRC",
     "PSQLRC",
 ]
 
@@ -1384,12 +1441,12 @@ SPELLED_OUT = [
 class TestTheListsReach:
     @pytest.mark.parametrize("name", CREDENTIALS_IN_A_FAMILY)
     def test_a_credential_in_a_prefix_family_is_a_driver_s_to_set(self, name):
-        assert driver_env_problem(name) is None
+        assert connector_env_problem(name) is None
         assert _check(_env(name=name), names=(name,)) == []
 
     @pytest.mark.parametrize("name", SPELLED_OUT)
     def test_names_the_list_spells_out_are_refused(self, name):
-        assert driver_env_problem(name) is not None
+        assert connector_env_problem(name) is not None
 
     @pytest.mark.parametrize(
         "name",
@@ -1402,22 +1459,19 @@ class TestTheListsReach:
         ],
     )
     def test_the_workspace_s_own_families_spare_no_credential(self, name):
-        assert driver_env_problem(name) is not None
+        assert connector_env_problem(name) is not None
 
     def test_an_exact_entry_is_refused_whatever_it_ends_with(self):
         from shared.connectors import env_names
 
-        exact = [
-            name
-            for name in env_names.DRIVER_DENIED_NAMES
-            if env_names.credential_shaped(name)
-        ]
-        for name in exact:
-            assert driver_env_problem(name) is not None
+        for name in env_names.CODE_HOOK_NAMES:
+            assert connector_env_problem(name) is not None
+            assert connector_env_problem(name.lower()) is not None
+        assert not env_names.CODE_HOOK_NAMES & env_names.ALLOWED_NAMES
 
     @pytest.mark.parametrize("name", ["DATA_SRC", "MY_SRC", "RESOURCE_SRC", "ORC"])
     def test_rc_is_named_never_matched_as_a_suffix(self, name):
-        assert driver_env_problem(name) is None
+        assert connector_env_problem(name) is None
 
     def test_the_exemption_is_documented(self):
         from shared.connectors import env_names

@@ -317,12 +317,21 @@ CASES: dict[str, ApiCase] = {
     # ---- generic -------------------------------------------------------------
     "create/generic/valid": _create(GENERIC),
     "create/generic/public_defaults_read_only": _create(_with(GENERIC, is_global=True)),
-    "create/generic/env_not_validated": _create(
-        _with(GENERIC, credentials={"env_vars": {"1BAD": 3, "PATH": "/x"}}),
-        pinned_defect=(
-            "generic env vars are not validated at create; a bad set is only "
-            "refused when it is installed at attach (L1 §2)"
-        ),
+    # The one rule for every connector's names (connector drivers decisions
+    # 24 to 26 and 36): checked when generic's variables are written too.
+    "create/generic/env_validated": _create(
+        _with(GENERIC, credentials={"env_vars": {"1BAD": 3, "PATH": "/x"}})
+    ),
+    "create/generic/code_hook_refused": _create(
+        _with(GENERIC, credentials={"env_vars": {"NODE_OPTIONS": "--require x"}})
+    ),
+    "create/generic/proxy_and_ca_bundle_allowed": _create(
+        _with(
+            GENERIC,
+            credentials={
+                "env_vars": {"HTTPS_PROXY": "http://p:3128", "SSL_CERT_FILE": "/x"}
+            },
+        )
     ),
     "create/generic/config_refused": _create(_with(GENERIC, config={"x": 1})),
     # ---- credentials ---------------------------------------------------------
@@ -344,6 +353,9 @@ CASES: dict[str, ApiCase] = {
     ),
     "create/credentials/reserved_prefix": _create(
         _with(CREDENTIALS, credentials={"env_vars": {"SRW_TOKEN": "x"}})
+    ),
+    "create/credentials/code_hook_refused": _create(
+        _with(CREDENTIALS, credentials={"env_vars": {"GIT_SSH_COMMAND": "x"}})
     ),
     "create/credentials/non_string_value": _create(
         _with(CREDENTIALS, credentials={"env_vars": {"KEY": 3}})
@@ -489,6 +501,20 @@ CASES: dict[str, ApiCase] = {
                         "contents": "x",
                         "target_path": "~/.srw-files/x",
                         "env_var": "KUBECONFIG",
+                    }
+                ]
+            },
+        )
+    ),
+    "create/generic_file/code_hook_env_var_refused": _create(
+        _with(
+            GENERIC_FILE,
+            credentials={
+                "files": [
+                    {
+                        "contents": "x",
+                        "target_path": "~/.srw-files/x",
+                        "env_var": "NODE_OPTIONS",
                     }
                 ]
             },
@@ -808,12 +834,14 @@ CASES.update(
         ),
         # ---- generic ---------------------------------------------------------
         "update/generic/env_replaced_not_merged": _update(
+            _stored("generic"), {"credentials": {"env_vars": {"OTHER": "x"}}}
+        ),
+        "update/generic/env_validated": _update(
             _stored("generic"),
             {"credentials": {"env_vars": {"OTHER": "x", "1BAD": "y"}}},
-            pinned_defect=(
-                "generic env vars are not validated on update either; the set "
-                "is replaced, not merged"
-            ),
+        ),
+        "update/generic/code_hook_refused": _update(
+            _stored("generic"), {"credentials": {"env_vars": {"EDITOR": "vi"}}}
         ),
         "update/generic/empty_credentials_keep_stored": _update(
             _stored("generic"), {"credentials": {}, "cli_hint": "new hint"}
@@ -843,6 +871,23 @@ CASES.update(
         ),
         "update/credentials/reserved_name": _update(
             _stored("credentials"), {"credentials": {"env_vars": {"HOME": "x"}}}
+        ),
+        # A row saved before the one rule: an edit of its variables would
+        # store the refused name again, so it is refused with the reason;
+        # an edit that leaves the variables alone is not.
+        "update/credentials/stored_code_hook_refused": _update(
+            _stored(
+                "credentials",
+                credentials={"env_vars": {"VENDOR_USER": "a", "NODE_OPTIONS": "x"}},
+            ),
+            {"credentials": {"env_vars": {"VENDOR_PASSWORD": "rotated"}}},
+        ),
+        "update/credentials/stored_code_hook_kept_without_variables": _update(
+            _stored(
+                "credentials",
+                credentials={"env_vars": {"VENDOR_USER": "a", "NODE_OPTIONS": "x"}},
+            ),
+            {"credentials": {}, "name": "Vendor"},
         ),
         "update/credentials/empty_env_refused": _update(
             _stored("credentials"), {"credentials": {"env_vars": {}}}

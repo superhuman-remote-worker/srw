@@ -42,7 +42,7 @@ from .contract import (
     SUPPORTED_PROTOCOL_MAJORS,
     WORKSPACE_BACKENDS,
 )
-from .env_names import MAX_DRIVER_ENV_NAME
+from .env_names import MAX_ENV_NAME
 from .envelope import BINDING_OPERATIONS, ERROR_CLASSES
 from .registration import MAX_ENV_NAMES
 
@@ -288,15 +288,15 @@ def spec_schema() -> dict[str, Any]:
             "tool_category": {"type": ["string", "null"]},
             "service": service,
             # Every variable a bind-time driver's bind may set (a file's
-            # env_var included); registration refuses the ones a driver may
-            # not set (shared.connectors.env_names).
+            # env_var included); registration refuses the ones no connector
+            # may set (shared.connectors.env_names).
             "env_names": {
                 "type": "array",
                 "maxItems": MAX_ENV_NAMES,
                 "uniqueItems": True,
                 "items": {
                     "type": "string",
-                    "maxLength": MAX_DRIVER_ENV_NAME,
+                    "maxLength": MAX_ENV_NAME,
                     "pattern": r"^[A-Za-z_][A-Za-z0-9_]*$",
                 },
             },
