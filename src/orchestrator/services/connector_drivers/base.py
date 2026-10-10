@@ -6,7 +6,9 @@ The orchestrator asks a driver of a stored connector type four things:
   400/403 ``HTTPException`` (the detail strings are the contract);
 * ``check`` — Test connection: a ``{"status", "message", ...}`` report that
   never raises for a target failure;
-* ``effective_access`` — the access level a resolved row binds at;
+* ``effective_access`` — the access level a resolved row binds at (a
+  driver that narrows its levels per connector and tier implements
+  :class:`SupportsOfferedAccess`, and :func:`bound_access` applies it);
 * ``bind`` — the payload entry an agent receives for one resolved row, or
   ``None`` to send nothing.  Built-in drivers return today's wire entry,
   byte for byte; the agent builds binding descriptors from it.
@@ -42,7 +44,12 @@ from orchestrator.services import datasource_config
 from orchestrator.services.connector_drivers import knowledge_note
 from orchestrator.services.connector_secrets import RESERVED_FIELDS
 from shared.connectors.binding import BindingDescriptor
-from shared.connectors.contract import DriverSpec
+from shared.connectors.contract import (
+    AccessResolution,
+    DriverSpec,
+    bound_read_only,
+    resolve_access,
+)
 from shared.connectors.envelope import unsupported_check
 
 logger = logging.getLogger(__name__)
@@ -617,3 +624,42 @@ class SupportsIndexOperations(Protocol):
     async def reindex(
         self, row: Mapping[str, Any], *, full: bool, knowledge_index: Any
     ) -> dict[str, Any]: ...
+
+
+@runtime_checkable
+class SupportsOfferedAccess(Protocol):
+    """A driver whose levels depend on the connector and the workspace tier,
+    not on its spec alone (a cloud folder: what its provider enforces for
+    the folder's kind on that tier). Its spec keeps the union of them all,
+    so the capability matrix stays one row per driver; a binding takes its
+    level from the narrowed set (:func:`bound_access`)."""
+
+    def offered_access(
+        self, row: Mapping[str, Any], workspace_backend: str | None
+    ) -> tuple[str, ...]:
+        """The level ids ``row`` can be bound at on ``workspace_backend``
+        (``None``: on any tier), lowest rank first."""
+        ...
+
+
+def bound_access(
+    driver: DatasourceDriver,
+    row: Mapping[str, Any],
+    *,
+    workspace_backend: str | None = None,
+    requested: str | None = None,
+) -> AccessResolution:
+    """The level ``row`` binds at through ``driver``, or why none.
+
+    The contract's rule (:func:`~shared.connectors.contract.resolve_access`)
+    over the levels the driver offers this row on ``workspace_backend``
+    (every level of its spec, unless it narrows them), read-only when the
+    row's project link or its creator's tag says so (``bound_read_only``).
+    """
+    offered = (
+        driver.offered_access(row, workspace_backend)
+        if isinstance(driver, SupportsOfferedAccess)
+        else None
+    )
+    entry = {**row, "project_read_only": bound_read_only(row)}
+    return resolve_access(entry, driver.spec, offered=offered, requested=requested)

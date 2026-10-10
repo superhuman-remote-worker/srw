@@ -57,6 +57,11 @@ export interface ConnectorAccessLevel {
   enforced_by: string;
   /** Only told to the agent; nothing stops it from doing more. */
   advisory: boolean;
+  /** What the level lets through to the upstream: no write (`none`), writes
+   *  that land once their owner reviewed them (`reviewed`), or writes
+   *  straight through (`direct`). Absent on every level of a driver that is
+   *  not strict ({@link strictAccess}). */
+  writes?: 'none' | 'reviewed' | 'direct';
 }
 
 export type CredentialSlotKind = 'secret_string' | 'file' | 'ssh_private_key' | 'oauth2' | 'kubeconfig';
@@ -194,21 +199,92 @@ export interface ConnectorDriverMatrix {
  * `enforced_by` says how), so read-only is offered only when a lower level
  * exists to floor to, and read-write leaves the connector at its own level,
  * so a driver forced read-only has none. A driver with no access levels
- * (env and file delivery) offers neither.
+ * (env and file delivery) offers neither. A strict driver
+ * ({@link strictAccess}) offers read-only only at a level that writes
+ * nothing. `offered` narrows the driver's levels to the ones it offers one
+ * connector on one workspace tier.
  */
 export interface OfferedAccess {
   readOnly: ConnectorAccessLevel | null;
   readWrite: ConnectorAccessLevel | null;
 }
 
-export function offeredAccess(driver: ConnectorDriver | null | undefined): OfferedAccess | null {
+export function offeredAccess(
+  driver: ConnectorDriver | null | undefined,
+  offered?: readonly string[] | null,
+): OfferedAccess | null {
   if (!driver) return null;
-  const levels = [...driver.access_levels].sort((a, b) => a.rank - b.rank);
+  const levels = rankedLevels(driver, offered);
   if (levels.length === 0) return {readOnly: null, readWrite: null};
   const lowest = levels[0];
+  const highest = levels[levels.length - 1];
+  if (strictAccess(driver)) {
+    // Read-only only at a level that writes nothing, never the lowest one
+    // whatever it lets through: a cloud folder's `protected` is no
+    // read-only. The top level is the read-write choice unless it writes
+    // nothing either.
+    const floor = levels.find((level) => level.writes === 'none') ?? null;
+    if (driver.forced_read_only) return {readOnly: floor, readWrite: null};
+    return {readOnly: floor, readWrite: highest.writes === 'none' ? null : highest};
+  }
   if (driver.forced_read_only) return {readOnly: lowest, readWrite: null};
   if (levels.length === 1) return {readOnly: null, readWrite: lowest};
-  return {readOnly: lowest, readWrite: levels[levels.length - 1]};
+  return {readOnly: lowest, readWrite: highest};
+}
+
+/** A driver's levels, lowest rank first, narrowed to `offered` when given
+ *  (the levels a driver offers one connector on one workspace tier). */
+function rankedLevels(
+  driver: ConnectorDriver,
+  offered?: readonly string[] | null,
+): ConnectorAccessLevel[] {
+  return driver.access_levels
+    .filter((level) => !offered || offered.includes(level.id))
+    .sort((a, b) => a.rank - b.rank);
+}
+
+/**
+ * Whether every level of a driver says what it lets through (`writes`), as
+ * the server's `strict_access` asks: such a driver binds read-only only at a
+ * level that writes nothing, and refuses a level it does not offer instead
+ * of flooring it. Drivers without `writes` keep the older rule.
+ */
+export function strictAccess(driver: ConnectorDriver | null | undefined): boolean {
+  return (
+    !!driver &&
+    driver.access_levels.length > 0 &&
+    driver.access_levels.every((level) => level.writes != null)
+  );
+}
+
+/**
+ * The level a strict driver binds a connector at, or null when the server
+ * refuses the binding (contract `resolve_access`): read-only at its lowest
+ * offered level that writes nothing; otherwise the level asked for, else
+ * the one its config names (a driver whose config has an `access` key),
+ * else the driver's default, else its highest — and only if it is offered.
+ */
+export function strictAccessLevel(
+  driver: ConnectorDriver,
+  options: {
+    readOnly: boolean;
+    config?: unknown;
+    requested?: string | null;
+    offered?: readonly string[] | null;
+  },
+): ConnectorAccessLevel | null {
+  const levels = rankedLevels(driver, options.offered);
+  if (levels.length === 0) return null;
+  if (options.readOnly) return levels.find((level) => level.writes === 'none') ?? null;
+  let wanted = options.requested ?? null;
+  if (wanted === null && driver.config_schema.properties?.['access']) {
+    const own = (options.config as {access?: unknown} | null | undefined)?.access;
+    // A stored value that names no level is refused, as the server does.
+    if (own != null && typeof own !== 'string') return null;
+    wanted = own ?? null;
+  }
+  wanted = wanted ?? driver.default_access ?? levels[levels.length - 1].id;
+  return levels.find((level) => level.id === wanted) ?? null;
 }
 
 /**

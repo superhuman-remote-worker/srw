@@ -380,13 +380,18 @@ def _json(value: Any) -> Any:
 
 
 def _access_level(level: AccessLevel) -> dict[str, Any]:
-    return {
+    out: dict[str, Any] = {
         "id": level.id,
         "rank": level.rank,
         "tools": level.tools if level.tools == "*" else list(level.tools),
         "enforced_by": level.enforced_by,
         "advisory": level.advisory,
     }
+    # Only a strict driver's levels say what they let through; the rest
+    # keep their rows as they were.
+    if level.writes is not None:
+        out["writes"] = level.writes
+    return out
 
 
 def _slot(slot: CredentialSlot) -> dict[str, Any]:

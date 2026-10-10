@@ -829,6 +829,43 @@ describe('ProjectDetailPageComponent link access from the capability matrix', ()
     expect(component.githubAppReadOnly({type: 'repository', config: {forge: 'github'}, read_only: true})).toBe(false);
   });
 
+  it('binds a strict driver read-only only at a level that writes nothing', () => {
+    const postgres = BUILTIN_DRIVERS.find((driver) => driver.name === 'srw.postgresql/v1')!;
+    const level = (id: string, rank: number, writes: 'none' | 'reviewed' | 'direct') => ({
+      id,
+      rank,
+      tools: [],
+      enforced_by: `${id} line`,
+      advisory: false,
+      writes,
+    });
+    const strict = (levels: ReturnType<typeof level>[]): ConnectorDriver => ({
+      ...postgres,
+      name: 'acme.folder/v1',
+      legacy_type: 'folder',
+      default_access: null,
+      access_levels: levels,
+    });
+    const folder = 'folder' as Datasource['type'];
+    const full = strict([
+      level('read_only', 10, 'none'),
+      level('protected', 20, 'reviewed'),
+      level('read_write', 30, 'direct'),
+    ]);
+    let created = createComponent({drivers: [...BUILTIN_DRIVERS, full]});
+    expect(created.component.linkAccess({type: folder})).toBe('choice');
+    expect(created.component.linkAccessLevel({type: folder, project_read_only: true})?.id).toBe('read_only');
+    expect(created.component.linkAccessLevel({type: folder, read_only: true})?.id).toBe('read_only');
+    expect(created.component.linkAccessLevel({type: folder, project_read_only: false})?.id).toBe('read_write');
+    // Without a level that writes nothing, a read-only link binds nothing:
+    // no "read-only" that is really reviewed writes.
+    const noReader = strict([level('protected', 20, 'reviewed'), level('read_write', 30, 'direct')]);
+    created = createComponent({drivers: [...BUILTIN_DRIVERS, noReader]});
+    expect(created.component.linkAccess({type: folder})).toBe('read_write');
+    expect(created.component.linkAccessLevel({type: folder, project_read_only: true})).toBeNull();
+    expect(created.component.linkAccessLevel({type: folder})?.id).toBe('read_write');
+  });
+
   it("binds the stricter of the link and the creator's read-only tag", () => {
     const {component} = createComponent({drivers: BUILTIN_DRIVERS});
     const row = (over: object) => ({type: 'postgresql' as const, config: {}, ...over});

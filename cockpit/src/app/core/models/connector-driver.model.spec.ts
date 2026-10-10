@@ -6,6 +6,8 @@ import {
   managedConnectorDrivers,
   offeredAccess,
   publicReadWrite,
+  strictAccess,
+  strictAccessLevel,
 } from './connector-driver.model';
 // The API's own response for the built-in drivers, and the rows the managed
 // MCP servers add where the chart installs them
@@ -57,6 +59,84 @@ describe('offeredAccess', () => {
     for (const name of ['srw.generic/v1', 'srw.credentials/v1', 'srw.ssh-key/v1', 'srw.repository/v1']) {
       expect(offeredAccess(byName(name))!.readOnly!.advisory).toBe(true);
     }
+  });
+});
+
+/** A driver whose levels say what they let through, as a cloud folder's do. */
+function strictDriver(over: Partial<ConnectorDriver> = {}): ConnectorDriver {
+  const base = byName('srw.postgresql/v1');
+  return {
+    ...base,
+    name: 'acme.folder/v1',
+    legacy_type: 'folder',
+    access_levels: [
+      {id: 'read_write', rank: 30, tools: [], enforced_by: 'A writer.', advisory: false, writes: 'direct'},
+      {id: 'read_only', rank: 10, tools: [], enforced_by: 'A reader grant.', advisory: false, writes: 'none'},
+      {id: 'protected', rank: 20, tools: [], enforced_by: 'Reviewed apply.', advisory: false, writes: 'reviewed'},
+    ],
+    default_access: null,
+    ...over,
+  };
+}
+
+describe('the strict access rule', () => {
+  it('is strict only when every level says what it lets through', () => {
+    expect(strictAccess(strictDriver())).toBe(true);
+    for (const driver of matrix.drivers) expect(strictAccess(driver), driver.name).toBe(false);
+    const [first, ...rest] = strictDriver().access_levels;
+    expect(strictAccess(strictDriver({access_levels: [{...first, writes: undefined}, ...rest]}))).toBe(false);
+    expect(strictAccess(null)).toBe(false);
+  });
+
+  it('offers read-only at the level that writes nothing, never at a reviewed one', () => {
+    const access = offeredAccess(strictDriver())!;
+    expect(access.readOnly?.id).toBe('read_only');
+    expect(access.readWrite?.id).toBe('read_write');
+    // Narrowed to what the provider enforces there: no read-only to offer.
+    expect(offeredAccess(strictDriver(), ['protected', 'read_write'])).toEqual({
+      readOnly: null,
+      readWrite: expect.objectContaining({id: 'read_write'}),
+    });
+    expect(offeredAccess(strictDriver(), ['read_only'])).toEqual({
+      readOnly: expect.objectContaining({id: 'read_only'}),
+      readWrite: null,
+    });
+    expect(offeredAccess(strictDriver(), [])).toEqual({readOnly: null, readWrite: null});
+  });
+
+  it('binds read-only at the level that writes nothing, or not at all', () => {
+    const driver = strictDriver();
+    expect(strictAccessLevel(driver, {readOnly: true})?.id).toBe('read_only');
+    expect(strictAccessLevel(driver, {readOnly: true, offered: ['protected', 'read_write']})).toBeNull();
+  });
+
+  it('refuses a level it does not offer instead of flooring it', () => {
+    const driver = strictDriver();
+    expect(strictAccessLevel(driver, {readOnly: false})?.id).toBe('read_write');
+    expect(strictAccessLevel(driver, {readOnly: false, requested: 'protected'})?.id).toBe('protected');
+    expect(strictAccessLevel(driver, {readOnly: false, requested: 'admin'})).toBeNull();
+    expect(
+      strictAccessLevel(driver, {readOnly: false, requested: 'protected', offered: ['read_write']}),
+    ).toBeNull();
+    // The config's access counts only where the config declares the key.
+    expect(strictAccessLevel(driver, {readOnly: false, config: {access: 'bogus'}})?.id).toBe('read_write');
+    const configured = strictDriver({
+      config_schema: {type: 'object', properties: {access: {type: 'string'}}},
+    });
+    expect(strictAccessLevel(configured, {readOnly: false, config: {access: 'bogus'}})).toBeNull();
+    expect(strictAccessLevel(configured, {readOnly: false, config: {access: 'protected'}})?.id).toBe(
+      'protected',
+    );
+    // A default the tier does not offer is refused, never widened.
+    const defaulted = strictDriver({default_access: 'read_only'});
+    expect(strictAccessLevel(defaulted, {readOnly: false})?.id).toBe('read_only');
+    expect(strictAccessLevel(defaulted, {readOnly: false, offered: ['read_write']})).toBeNull();
+  });
+
+  it('leaves every built-in driver on the older rule', () => {
+    // An MCP server's one level still binds a read-only link (pinned server-side).
+    expect(offeredAccess(byName('srw.mcp/v1'))!.readWrite?.id).toBe('ReadWrite');
+    expect(offeredAccess(byName('srw.email/v1'), ['draft', 'send'])!.readOnly?.id).toBe('draft');
   });
 });
 

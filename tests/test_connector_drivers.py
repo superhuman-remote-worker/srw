@@ -243,6 +243,95 @@ def test_only_the_knowledge_base_has_index_capabilities():
         } == {"kb"}
 
 
+class TestBoundAccess:
+    """A driver may narrow its levels per connector and tier
+    (``SupportsOfferedAccess``); ``bound_access`` binds from what is left."""
+
+    @staticmethod
+    def _narrowing(offered):
+        from orchestrator.services.connector_drivers.base import DatasourceDriver
+        from shared.connectors.contract import AccessLevel
+
+        levels = (
+            AccessLevel("read_only", 10, "A reader grant.", writes="none"),
+            AccessLevel("protected", 20, "Reviewed apply.", writes="reviewed"),
+            AccessLevel("read_write", 30, "A writer.", writes="direct"),
+        )
+        spec = replace(
+            _REGISTRY.for_type("generic").spec,
+            name="acme.folder/v1",
+            legacy_type="folder",
+            access_levels=levels,
+            credential_slots=(),
+        )
+        calls = []
+
+        class Narrowing(DatasourceDriver):
+            def offered_access(self, row, workspace_backend):
+                calls.append(workspace_backend)
+                return offered[workspace_backend]
+
+        return Narrowing(spec), calls
+
+    def test_the_narrowed_set_decides_on_each_tier(self):
+        from orchestrator.services.connector_drivers.base import (
+            SupportsOfferedAccess,
+            bound_access,
+        )
+
+        driver, calls = self._narrowing(
+            {"sandbox": ("protected", "read_write"), "vm": ()}
+        )
+        assert isinstance(driver, SupportsOfferedAccess)
+        assert bound_access(driver, {}, workspace_backend="sandbox").level == (
+            "read_write"
+        )
+        assert bound_access(
+            driver, {}, workspace_backend="sandbox", requested="protected"
+        ).level == ("protected")
+        refused = bound_access(driver, {"read_only": True}, workspace_backend="sandbox")
+        assert refused.code == "read_only_unavailable"
+        assert bound_access(driver, {}, workspace_backend="vm").code == (
+            "no_level_offered"
+        )
+        assert calls == ["sandbox", "sandbox", "sandbox", "vm"]
+
+    @pytest.mark.parametrize(
+        ("row", "read_only"),
+        [
+            ({"project_read_only": True}, True),
+            # The creator's tag binds read-only whatever the link says.
+            ({"project_read_only": False, "read_only": True}, True),
+            ({"is_global": True}, True),
+            ({"is_global": True, "read_only": False}, False),
+            ({}, False),
+        ],
+    )
+    def test_the_link_or_the_creators_tag_makes_it_read_only(self, row, read_only):
+        from orchestrator.services.connector_drivers.base import bound_access
+
+        driver, _calls = self._narrowing({None: ("read_only", "read_write")})
+        level = bound_access(driver, row).level
+        assert level == ("read_only" if read_only else "read_write")
+
+    @pytest.mark.parametrize("type_id", _REGISTRY.type_ids())
+    def test_a_driver_that_does_not_narrow_binds_its_whole_spec(self, type_id):
+        from orchestrator.services.connector_drivers.base import (
+            SupportsOfferedAccess,
+            bound_access,
+        )
+        from shared.connectors.contract import effective_access
+
+        driver = _REGISTRY.for_type(type_id)
+        if isinstance(driver, SupportsOfferedAccess):
+            pytest.skip("narrows its levels")
+        for row in ({}, {"project_read_only": True}, {"config": {"access": "send"}}):
+            entry = {**row, "project_read_only": bool(row.get("project_read_only"))}
+            assert bound_access(driver, row).level == effective_access(
+                entry, driver.spec
+            )
+
+
 class TestKnowledgeBaseWriteEffects:
     @pytest.fixture
     def recorded(self, monkeypatch):

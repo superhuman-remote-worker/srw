@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping, get_args
+from typing import Any, Iterable, Literal, Mapping, get_args
 
 #: The driver protocol SRW speaks: the envelope, not a driver's config
 #: contract (``/vN`` in its name) and not its image tag.
@@ -52,6 +52,10 @@ CredentialUpdate = Literal["keep_if_blank", "merge", "replace"]
 #: (slice C2, "The lease service").
 CredentialDeliveryMode = Literal["inline", "lease"]
 LiveDetach = Literal["immediate", "next_attach", "refused"]
+#: What an access level lets through to the upstream: no write at all
+#: (``none``), writes that land only once their owner reviewed them
+#: (``reviewed``), or writes straight through (``direct``).
+Writes = Literal["none", "reviewed", "direct"]
 Operation = Literal[
     "spec", "check", "bind", "revoke", "renew", "discover", "gc", "status", "reindex"
 ]
@@ -63,6 +67,7 @@ CREDENTIAL_DELIVERIES: tuple[str, ...] = get_args(CredentialDelivery)
 CREDENTIAL_UPDATES: tuple[str, ...] = get_args(CredentialUpdate)
 CREDENTIAL_DELIVERY_MODES: tuple[str, ...] = get_args(CredentialDeliveryMode)
 LIVE_DETACH: tuple[str, ...] = get_args(LiveDetach)
+WRITES: tuple[str, ...] = get_args(Writes)
 OPERATIONS: tuple[str, ...] = get_args(Operation)
 REQUIRED_OPERATIONS: frozenset[str] = frozenset({"spec", "check", "bind", "revoke"})
 OPTIONAL_OPERATIONS: frozenset[str] = frozenset(OPERATIONS) - REQUIRED_OPERATIONS
@@ -118,6 +123,13 @@ class AccessLevel:
     ``tools`` lists the built-in tools the level binds, or ``"*"`` for tools
     discovered at runtime.  Across connectors of one category the highest
     ``rank`` wins.
+
+    ``writes``, when set, says what the level lets through to the upstream
+    (:data:`Writes`).  A driver whose levels all set it is *strict*
+    (:func:`strict_access`): a read-only binding takes a level that writes
+    nothing or none at all, and a level it does not offer is refused
+    rather than floored. Unset (every driver before the main cloud's
+    folders) keeps the older rule.
     """
 
     id: str
@@ -125,6 +137,7 @@ class AccessLevel:
     enforced_by: str
     tools: tuple[str, ...] | Literal["*"] = ()
     advisory: bool = False
+    writes: Writes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,30 +325,142 @@ def bound_read_only(row: Mapping[str, Any]) -> bool:
     return bool(row.get("project_read_only")) or connector_read_only(row)
 
 
-def effective_access(entry: Mapping[str, Any], spec: DriverSpec) -> str | None:
+def strict_access(spec: DriverSpec) -> bool:
+    """Whether every level of ``spec`` says what it lets through (``writes``).
+
+    Such a driver binds read-only only at a level that writes nothing, and
+    never maps a level it does not offer onto another one
+    (:func:`resolve_access`).
+    """
+    return bool(spec.access_levels) and all(
+        level.writes is not None for level in spec.access_levels
+    )
+
+
+#: Why :func:`resolve_access` binds no level, as closed codes.
+#: ``read_only_unavailable``: the binding is read-only and no offered level
+#: writes nothing; ``level_not_offered``: the level asked for (or the
+#: driver's default) is not offered; ``no_level_offered``: the driver
+#: offers this connector no level at all here.
+ACCESS_REFUSALS: tuple[str, ...] = (
+    "read_only_unavailable",
+    "level_not_offered",
+    "no_level_offered",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class AccessResolution:
+    """The level a binding gets, or, refused, why it gets none.
+
+    ``level`` is ``None`` both for a driver with no access levels at all
+    (env and file delivery: nothing to refuse, ``code`` unset) and for a
+    refusal, whose ``code`` is one of :data:`ACCESS_REFUSALS` and whose
+    ``reason`` is a line a person can read.
+    """
+
+    level: str | None
+    code: str | None = None
+    reason: str | None = None
+
+    @property
+    def refused(self) -> bool:
+        return self.code is not None
+
+
+def resolve_access(
+    entry: Mapping[str, Any],
+    spec: DriverSpec,
+    *,
+    offered: Iterable[str] | None = None,
+    requested: str | None = None,
+) -> AccessResolution:
     """The access level a delivered entry binds at, from the driver's levels.
 
     The one rule for the agent (a binding's ``access``) and SRW (the level a
-    credential lease is issued at). A read-only entry clamps to the lowest
-    level: its ``project_read_only``, which the orchestrator's payload sets
-    to :func:`bound_read_only` of its row. Otherwise the level the
-    connector's config names (a driver whose config has an ``access``
-    property, such as email), else the driver's default, else its highest;
-    a name the driver does not offer fails closed to the lowest.
+    credential lease is issued at, the level a cloud folder mounts at).
+    ``offered`` narrows the spec's levels to the ones a driver offers this
+    connector on this workspace tier (``SupportsOfferedAccess`` in the
+    orchestrator); ``None`` offers them all. ``requested`` is a level the
+    caller asks for (a per-link or per-execution choice), in place of the
+    one the config names.
+
+    A read-only entry is one whose ``project_read_only`` is set, which the
+    orchestrator's payload sets to :func:`bound_read_only` of its row.
+    Otherwise the level asked for, else the one the connector's config names
+    (a driver whose config has an ``access`` property, such as email), else
+    the driver's default, else its highest.
+
+    * A driver that is not :func:`strict_access` clamps a read-only entry to
+      its lowest level, and fails closed to the lowest for a name it does
+      not offer.
+    * A strict driver binds a read-only entry at its lowest level that
+      writes nothing, and refuses one where none is offered; it refuses a
+      name it does not offer instead of mapping it onto another level.
     """
     levels = spec.ranked_access_ids()
+    if offered is not None:
+        narrowed = frozenset(offered)
+        levels = tuple(level for level in levels if level in narrowed)
+        if not levels and spec.access_levels:
+            return AccessResolution(
+                None,
+                "no_level_offered",
+                f"{spec.title} offers this connector no access level here",
+            )
     if not levels:
-        return None
+        return AccessResolution(None)
+    strict = strict_access(spec)
     if entry.get("project_read_only", False):
-        return levels[0]
-    requested = None
+        if not strict:
+            return AccessResolution(levels[0])
+        floor = next(
+            (
+                level
+                for level in levels
+                if (declared := spec.access_level(level)) is not None
+                and declared.writes == "none"
+            ),
+            None,
+        )
+        if floor is None:
+            return AccessResolution(
+                None,
+                "read_only_unavailable",
+                f"{spec.title} cannot bind this connector read-only here: "
+                f"every level it offers ({', '.join(levels)}) lets writes through",
+            )
+        return AccessResolution(floor)
+    wanted = requested
     properties = spec.config_schema.get("properties")
     config = entry.get("config")
-    if isinstance(properties, Mapping) and "access" in properties:
-        requested = config.get("access") if isinstance(config, Mapping) else None
-    if requested is None:
-        requested = spec.default_access or levels[-1]
-    return requested if requested in levels else levels[0]
+    if wanted is None and isinstance(properties, Mapping) and "access" in properties:
+        wanted = config.get("access") if isinstance(config, Mapping) else None
+    if wanted is None:
+        wanted = spec.default_access or levels[-1]
+    if wanted in levels:
+        return AccessResolution(wanted)
+    if not strict:
+        return AccessResolution(levels[0])
+    return AccessResolution(
+        None,
+        "level_not_offered",
+        f"{spec.title} does not offer the access level {wanted!r} here "
+        f"(offered: {', '.join(levels)})",
+    )
+
+
+def effective_access(
+    entry: Mapping[str, Any],
+    spec: DriverSpec,
+    *,
+    offered: Iterable[str] | None = None,
+    requested: str | None = None,
+) -> str | None:
+    """The level :func:`resolve_access` binds, or ``None``: no level, or a
+    refusal (whose reason :func:`resolve_access` carries). A caller that
+    gets ``None`` delivers nothing at a level."""
+    return resolve_access(entry, spec, offered=offered, requested=requested).level
 
 
 def protocol_major(version: str) -> int | None:
@@ -497,6 +622,19 @@ def _access_problems(spec: DriverSpec) -> list[str]:
             problems.append(f"access level {level.id!r} has no enforced_by line")
         if level.tools != "*" and not isinstance(level.tools, tuple):
             problems.append(f"access level {level.id!r} tools must be a tuple or '*'")
+        if level.writes is not None and level.writes not in WRITES:
+            problems.append(
+                f"access level {level.id!r} writes {level.writes!r} is not one of "
+                f"{WRITES}"
+            )
+    declared = [level.id for level in spec.access_levels if level.writes is not None]
+    if declared and len(declared) != len(ids):
+        # Half a strict driver would bind its undeclared levels by the older
+        # rule and its declared ones by the strict one.
+        problems.append(
+            "access level writes is declared on some levels but not all: "
+            f"{sorted(set(ids) - set(declared))} lack it"
+        )
     if spec.default_access is not None and spec.default_access not in ids:
         problems.append(f"default_access {spec.default_access!r} is not a level")
     if spec.tool_category and not spec.access_levels:

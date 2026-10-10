@@ -9,7 +9,12 @@ import {effectiveJobStatus} from '../../core/util/job-status';
 import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
-import {ConnectorAccessLevel, offeredAccess} from '../../core/models/connector-driver.model';
+import {
+  ConnectorAccessLevel,
+  offeredAccess,
+  strictAccess,
+  strictAccessLevel,
+} from '../../core/models/connector-driver.model';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
@@ -2586,7 +2591,9 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
    *  tag, either, floors the connector at its lowest level. Otherwise it
    *  keeps its own: the top one for a read/read-write driver, or, for a
    *  tiered one (email), the tier its config stores, else the driver's
-   *  default. */
+   *  default. A strict driver (its levels say what they let through) binds
+   *  read-only only at a level that writes nothing, and null stands for the
+   *  binding the server refuses. */
   linkAccessLevel(
     ds: Pick<Datasource, 'type' | 'config'> &
       Partial<Pick<Datasource, 'read_only' | 'is_global'>> & {project_read_only?: boolean | null},
@@ -2597,6 +2604,12 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     if (this.githubAppReadOnly(ds) && access.readOnly) {
       // Enforced, not advisory: the token SRW mints has contents: read.
       return {...access.readOnly, advisory: false};
+    }
+    if (strictAccess(driver)) {
+      return strictAccessLevel(driver, {
+        readOnly: ds.project_read_only === true || this.connectorReadOnly(ds),
+        config: ds.config,
+      });
     }
     if (
       access.readOnly &&

@@ -60,8 +60,13 @@ from shared.connectors.builtin import (
 from shared.connectors.contract import (
     CONNECTOR_READ_ONLY_SQL,
     WORKSPACE_BACKENDS,
+    AccessResolution,
+    DriverSpec,
     bound_read_only,
     connector_read_only,
+    effective_access,
+    resolve_access,
+    strict_access,
 )
 
 _PACKAGE = Path(__file__).resolve().parents[1] / "src" / "shared" / "connectors"
@@ -376,6 +381,193 @@ class TestCreatorReadOnlyTag:
         assert CONNECTOR_READ_ONLY_SQL == (
             "(d.read_only IS TRUE OR (d.is_global AND d.read_only IS NULL))"
         )
+
+
+# =============================================================================
+# The access rule: strict levels say what they let through (main cloud 3.1)
+# =============================================================================
+
+
+def _strict_spec(**changes) -> DriverSpec:
+    """A driver whose levels all declare ``writes``, as a cloud folder's do."""
+    spec = DriverSpec(
+        name="acme.folder/v1",
+        title="Folder",
+        plane="in_pod",
+        delivery_forms=("checkout",),
+        config_schema={"type": "object"},
+        access_levels=(
+            AccessLevel("read_only", 10, "A reader grant.", writes="none"),
+            AccessLevel("protected", 20, "Reviewed apply.", writes="reviewed"),
+            AccessLevel("read_write", 30, "A writer.", writes="direct"),
+        ),
+        supported_backends=frozenset({"sandbox"}),
+        workspace_requirements="A mount.",
+    )
+    return replace(spec, **changes)
+
+
+class TestStrictAccess:
+    def test_a_spec_is_strict_only_when_every_level_declares_writes(self):
+        assert strict_access(_strict_spec())
+        assert not strict_access(GENERIC_SPEC)
+        assert not strict_access(_strict_spec(access_levels=()))
+
+    def test_no_builtin_driver_before_the_cloud_folder_is_strict(self):
+        assert {spec.name for spec in BUILTIN_SPECS if strict_access(spec)} == set()
+
+    def test_a_read_only_binding_takes_the_lowest_level_that_writes_nothing(self):
+        resolved = resolve_access({"project_read_only": True}, _strict_spec())
+        assert resolved == AccessResolution("read_only")
+        assert not resolved.refused
+
+    def test_a_read_only_binding_is_refused_where_every_level_writes(self):
+        resolved = resolve_access(
+            {"project_read_only": True},
+            _strict_spec(),
+            offered=("protected", "read_write"),
+        )
+        assert resolved.level is None and resolved.refused
+        assert resolved.code == "read_only_unavailable"
+        assert resolved.reason == (
+            "Folder cannot bind this connector read-only here: every level it "
+            "offers (protected, read_write) lets writes through"
+        )
+        # Never the lowest offered level, which writes after review.
+        assert (
+            effective_access(
+                {"project_read_only": True},
+                _strict_spec(),
+                offered=("protected", "read_write"),
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize("requested", ["admin", "ReadWrite", ""])
+    def test_a_level_it_does_not_offer_is_refused_not_floored(self, requested):
+        resolved = resolve_access({}, _strict_spec(), requested=requested)
+        assert resolved.code == "level_not_offered"
+        assert resolved.reason == (
+            f"Folder does not offer the access level {requested!r} here "
+            "(offered: read_only, protected, read_write)"
+        )
+
+    def test_a_level_narrowed_away_is_refused(self):
+        resolved = resolve_access(
+            {}, _strict_spec(), offered=("read_write",), requested="protected"
+        )
+        assert resolved.code == "level_not_offered"
+        assert resolve_access(
+            {}, _strict_spec(), offered=("protected",), requested="protected"
+        ) == AccessResolution("protected")
+
+    def test_a_config_access_it_does_not_offer_is_refused(self):
+        spec = _strict_spec(
+            config_schema={
+                "type": "object",
+                "properties": {"access": {"type": "string"}},
+            }
+        )
+        assert resolve_access(
+            {"config": {"access": "protected"}}, spec
+        ) == AccessResolution("protected")
+        assert resolve_access({"config": {"access": "bogus"}}, spec).code == (
+            "level_not_offered"
+        )
+        # A caller's request wins over the stored config.
+        assert resolve_access(
+            {"config": {"access": "bogus"}}, spec, requested="read_only"
+        ) == AccessResolution("read_only")
+
+    def test_without_a_request_the_default_else_the_highest_offered_binds(self):
+        assert resolve_access({}, _strict_spec()).level == "read_write"
+        narrowed = resolve_access(
+            {}, _strict_spec(), offered=("read_only", "protected")
+        )
+        assert narrowed.level == "protected"
+        spec = _strict_spec(default_access="protected")
+        assert resolve_access({}, spec).level == "protected"
+        # A default this tier does not offer is refused, never widened.
+        assert resolve_access({}, spec, offered=("read_write",)).code == (
+            "level_not_offered"
+        )
+
+    def test_nothing_offered_is_refused_with_its_reason(self):
+        resolved = resolve_access({}, _strict_spec(), offered=())
+        assert resolved.code == "no_level_offered"
+        assert resolved.reason == "Folder offers this connector no access level here"
+        # Unknown ids narrow nothing in.
+        assert resolve_access({}, _strict_spec(), offered=("admin",)).refused
+
+    def test_a_driver_with_no_levels_has_no_level_and_no_refusal(self):
+        from shared.connectors.builtin import ENV_SPEC
+
+        resolved = resolve_access({"project_read_only": True}, ENV_SPEC)
+        assert resolved == AccessResolution(None)
+        assert not resolved.refused
+        assert resolve_access({}, ENV_SPEC, offered=()) == AccessResolution(None)
+
+    @pytest.mark.parametrize(
+        ("entry", "kwargs", "level"),
+        [
+            # Today's rule, untouched: read-only clamps to the lowest level,
+            # an unknown name fails closed to the lowest.
+            ({"type": "postgresql", "project_read_only": True}, {}, "ReadOnly"),
+            ({"type": "postgresql"}, {}, "ReadWrite"),
+            ({"type": "email", "config": {"access": "bogus"}}, {}, "read"),
+            ({"type": "email"}, {"requested": "bogus"}, "read"),
+            ({"type": "email"}, {"requested": "send"}, "send"),
+            # Narrowed, the same rule over what is left.
+            ({"type": "email"}, {"offered": ("read", "read_write")}, "read"),
+            (
+                {"type": "email", "config": {"access": "read_write"}},
+                {"offered": ("read", "read_write")},
+                "read_write",
+            ),
+            (
+                {"type": "email", "project_read_only": True},
+                {"offered": ("draft", "send")},
+                "draft",
+            ),
+        ],
+    )
+    def test_a_driver_without_writes_keeps_todays_rule(self, entry, kwargs, level):
+        spec = spec_for_type(entry["type"])
+        resolved = resolve_access(entry, spec, **kwargs)
+        assert resolved == AccessResolution(level)
+        assert effective_access(entry, spec, **kwargs) == level
+
+    def test_a_read_only_mcp_server_still_binds_read_write(self):
+        """Pinned as it is: the MCP drivers offer ReadWrite only, so a
+        read-only binding (a public server with no mode set) resolves to it.
+        A separate finding for connector_drivers.md, not changed here."""
+        from shared.connectors.builtin import MCP_REMOTE_SPEC, MCP_SPEC
+
+        for spec in (MCP_SPEC, MCP_REMOTE_SPEC):
+            assert not strict_access(spec)
+            assert resolve_access({"project_read_only": True}, spec) == (
+                AccessResolution("ReadWrite")
+            )
+
+    def test_validate_spec_wants_writes_on_every_level_or_none(self):
+        assert validate_spec(_strict_spec()) == []
+        half = _strict_spec(
+            access_levels=(
+                AccessLevel("read_only", 10, "A reader grant.", writes="none"),
+                AccessLevel("read_write", 30, "A writer."),
+            )
+        )
+        assert validate_spec(half) == [
+            "access level writes is declared on some levels but not all: "
+            "['read_write'] lack it"
+        ]
+        bad = _strict_spec(
+            access_levels=(AccessLevel("read_only", 10, "A grant.", writes="some"),)
+        )
+        assert validate_spec(bad) == [
+            "access level 'read_only' writes 'some' is not one of "
+            "('none', 'reviewed', 'direct')"
+        ]
 
 
 # =============================================================================

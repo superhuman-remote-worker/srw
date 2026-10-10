@@ -194,6 +194,23 @@ class TestBuiltinMatrix:
             assert level["tools"] == (
                 "*" if declared.tools == "*" else list(declared.tools)
             )
+            # Only a strict driver's levels say what they let through; the
+            # others' rows are as they were before the key existed.
+            assert level.get("writes") == declared.writes
+            assert ("writes" in level) is (declared.writes is not None)
+
+    def test_a_declared_writes_is_carried_and_an_unset_one_is_absent(self):
+        from orchestrator.services.connector_drivers.matrix import _access_level
+
+        assert _access_level(AccessLevel("r", 0, "A grant.", writes="none")) == {
+            "id": "r",
+            "rank": 0,
+            "tools": [],
+            "enforced_by": "A grant.",
+            "advisory": False,
+            "writes": "none",
+        }
+        assert "writes" not in _access_level(AccessLevel("r", 0, "A grant."))
 
     def test_spec_fields_are_carried(self, matrix):
         kb = next(d for d in matrix["drivers"] if d["name"] == "srw.kb/v1")
