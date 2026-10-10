@@ -555,6 +555,86 @@ async def test_a_revoke_is_given_up_after_its_attempts(database, probe, monkeypa
     assert row["status"] == "abandoned" and row["revoked_at"] is not None
     assert "down" in row["revoke_error"]
     assert grant.principal_id in world.backend.principals
+    # Given up is recorded as a security event, once, naming the principal.
+    [event] = await database.fetch(
+        "SELECT * FROM security_events WHERE event_type=$1",
+        folder_grants.REVOKE_ABANDONED_EVENT,
+    )
+    assert (event["resource_type"], event["resource_id"]) == (
+        "cloud_folder_grant",
+        grant.id,
+    )
+    assert str(event["user_id"]) == world.owner["id"]
+    assert grant.principal_id in event["detail"] and "attempts=2" in event["detail"]
+
+    # ...but never the end: its principal may be live, so it is tried again
+    # at the backoff's cap.
+    assert row["revoke_attempts"] == 2
+    wait = (row["revoke_next_at"] - row["revoked_at"]).total_seconds()
+    assert abs(wait - folder_grants.ABANDONED_RETRY_SECONDS) < 60
+    assert (await sweep_folder_grants_once(database, world.router)).any() is False
+    await database.execute(
+        "UPDATE cloud_folder_grants SET revoke_next_at=now() WHERE id=$1", row["id"]
+    )
+    report = await sweep_folder_grants_once(database, world.router)
+    assert (report.retried, report.given_up) == (1, 0)
+    [row] = await _grants(database)
+    assert (row["status"], row["revoke_attempts"]) == ("abandoned", 3)
+    assert row["revoke_next_at"] > row["revoked_at"]
+    assert (
+        await database.fetchval(
+            "SELECT count(*) FROM security_events WHERE event_type=$1",
+            folder_grants.REVOKE_ABANDONED_EVENT,
+        )
+        == 1
+    )
+
+    # Once the provider answers, the principal goes.
+    world.backend.fail_revoke = None
+    await database.execute(
+        "UPDATE cloud_folder_grants SET revoke_next_at=now() WHERE id=$1", row["id"]
+    )
+    report = await sweep_folder_grants_once(database, world.router)
+    assert report.revoked == 1
+    [row] = await _grants(database)
+    assert (row["status"], row["revoke_error"]) == ("revoked", None)
+    assert grant.principal_id not in world.backend.principals
+
+
+@pytest.mark.asyncio
+async def test_due_revokes_come_before_abandoned_ones(database, probe):
+    world = await _world(database)
+    member = await _user(database, "Second")
+    await database.execute(
+        "INSERT INTO project_members(project_id,user_id,role) VALUES($1,$2,'editor')",
+        UUID(world.target.project_id),
+        UUID(member["id"]),
+    )
+    first = await _insert(database, world)
+    second = await _insert(database, world, user_id=member["id"])
+    for row in (first, second):
+        await database.request_cloud_folder_grant_revokes(
+            reason="member_removed", grant_id=row["id"]
+        )
+    # The first was given up long ago; the second is a fresh revoke.
+    assert await database.finish_cloud_folder_grant_revoke(
+        first["id"], abandoned=True, error="down", attempts=12
+    )
+    await database.execute(
+        "UPDATE cloud_folder_grants SET revoke_next_at=now() - interval '1 day' "
+        "WHERE id=$1",
+        UUID(first["id"]),
+    )
+    due = await database.list_due_cloud_folder_grant_revokes(limit=10)
+    assert [row["id"] for row in due] == [second["id"], first["id"]]
+    assert [
+        row["id"] for row in await database.list_due_cloud_folder_grant_revokes(limit=1)
+    ] == [second["id"]]
+    # An abandoned grant is never abandoned twice.
+    assert not await database.finish_cloud_folder_grant_revoke(
+        first["id"], abandoned=True, error="down"
+    )
+    assert await database.cloud_folder_grants_pending()
 
 
 @pytest.mark.asyncio

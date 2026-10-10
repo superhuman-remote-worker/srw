@@ -63710,15 +63710,18 @@ class PostgresDB:
         grant_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """``revoking`` grants whose next attempt is due (``grant_ids``
-        narrows them to a hook's own), longest-due first."""
+        narrows them to a hook's own), longest-due first, then the
+        ``abandoned`` ones due their next try: SRW gave them up, but their
+        principal may still be live, so it keeps trying."""
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
                 SELECT * FROM cloud_folder_grants
-                 WHERE status = 'revoking'
+                 WHERE status IN ('revoking', 'abandoned')
                    AND COALESCE(revoke_next_at, now()) <= now()
                    AND ($2::uuid[] IS NULL OR id = ANY($2::uuid[]))
-                 ORDER BY revoke_next_at NULLS FIRST, created_at, id
+                 ORDER BY (status = 'abandoned'), revoke_next_at NULLS FIRST,
+                          created_at, id
                  LIMIT $1
                 """,
                 int(limit),
@@ -63729,10 +63732,18 @@ class PostgresDB:
         return [self._cloud_folder_grant_row(row) for row in rows]
 
     async def finish_cloud_folder_grant_revoke(
-        self, grant_id: str, *, abandoned: bool = False, error: str | None = None
+        self,
+        grant_id: str,
+        *,
+        abandoned: bool = False,
+        error: str | None = None,
+        attempts: int | None = None,
+        retry_seconds: float = 0.0,
     ) -> bool:
-        """``revoking`` -> ``revoked`` (``failed`` for a failed mint), or
-        ``abandoned`` when SRW gives the revoke up."""
+        """``revoking`` (or ``abandoned``) -> ``revoked`` (``failed`` for a
+        failed mint); or ``revoking`` -> ``abandoned`` when SRW gives the
+        revoke up, its next try ``retry_seconds`` away (it keeps trying).
+        False when the row was not in a state to make that move."""
         async with self.acquire() as conn:
             result = await conn.execute(
                 """
@@ -63743,26 +63754,35 @@ class PostgresDB:
                          ELSE 'revoked'
                        END,
                        revoked_at = now(), credentials = NULL,
-                       revoke_error = $3
-                 WHERE id = $1::uuid AND status = 'revoking'
+                       revoke_error = $3,
+                       revoke_attempts = COALESCE($4, revoke_attempts),
+                       revoke_next_at = CASE
+                         WHEN $2 THEN now() + make_interval(secs => $5::float8)
+                         ELSE revoke_next_at
+                       END
+                 WHERE id = $1::uuid
+                   AND (status = 'revoking' OR (NOT $2 AND status = 'abandoned'))
                 """,
                 str(grant_id),
                 bool(abandoned),
                 error,
+                int(attempts) if attempts is not None else None,
+                float(retry_seconds),
             )
         return result == "UPDATE 1"
 
     async def retry_cloud_folder_grant_revoke(
         self, grant_id: str, *, attempts: int, error: str, delay_seconds: float
     ) -> bool:
-        """Record a failed revoke attempt and when the next one is due."""
+        """Record a failed revoke attempt (of a ``revoking`` or an
+        ``abandoned`` grant) and when the next one is due."""
         async with self.acquire() as conn:
             result = await conn.execute(
                 """
                 UPDATE cloud_folder_grants
                    SET revoke_attempts = $2, revoke_error = $3,
                        revoke_next_at = now() + make_interval(secs => $4::float8)
-                 WHERE id = $1::uuid AND status = 'revoking'
+                 WHERE id = $1::uuid AND status IN ('revoking', 'abandoned')
                 """,
                 str(grant_id),
                 int(attempts),
@@ -63791,12 +63811,13 @@ class PostgresDB:
             )
 
     async def cloud_folder_grants_pending(self) -> bool:
-        """Whether any grant may still need a provider call."""
+        """Whether any grant may still need a provider call (an abandoned
+        revoke is still tried)."""
         async with self.acquire() as conn:
             return bool(
                 await conn.fetchval(
                     "SELECT EXISTS (SELECT 1 FROM cloud_folder_grants "
-                    "WHERE status IN ('minting', 'revoking'))"
+                    "WHERE status IN ('minting', 'revoking', 'abandoned'))"
                 )
             )
 

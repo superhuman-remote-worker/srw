@@ -193,7 +193,10 @@ guarantees it.
   `agent-service`. The accounts are revoked when the project is deleted, the
   member leaves (or, for the writer, becomes a viewer), the connector goes,
   the user is deleted or the installation changes; a sweep retries revokes
-  and removes half-made accounts.
+  and removes half-made accounts. A revoke that still fails after 12 tries
+  is recorded as a `cloud_folder_grant_revoke_abandoned` security event
+  naming the account, which may still be live, and the sweep keeps trying
+  it every hour.
 - **What still uses a service account**, plainly:
   - Nextcloud's session outbox lives in `agent-service`'s home, and a Session
     mounts it with `agent-service`'s password. That account is a member of

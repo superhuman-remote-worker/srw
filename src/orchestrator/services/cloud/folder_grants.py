@@ -31,9 +31,11 @@ principal; it is dropped once the principal is gone.
   delete requests it in its own transaction (``PostgresDB.delete_user``).
 * :func:`folder_grant_sweep_loop` (leader-gated, beside the RO reader
   reconciler) finishes due revokes with backoff, gives up after
-  :data:`MAX_REVOKE_ATTEMPTS` (``abandoned``), revokes a mint a lost process
-  left behind, and revokes every active grant that no longer serves: its
-  connector or project is gone, its member left the project (or, for a
+  :data:`MAX_REVOKE_ATTEMPTS` (``abandoned``, a security event) yet keeps
+  trying every :data:`ABANDONED_RETRY_SECONDS`, since the principal may
+  still be live; revokes a mint a lost process left behind, and revokes
+  every active grant that no longer serves: its connector or project is
+  gone, its member left the project (or, for a
   writer, is a viewer of it now), its installation is not the active one,
   or the project's folder is another now.
 
@@ -110,6 +112,12 @@ REVOKES_PER_PASS = 50
 MAX_REVOKE_ATTEMPTS = 12
 REVOKE_RETRY_BASE_SECONDS = 30.0
 REVOKE_RETRY_MAX_SECONDS = 3600.0
+#: How often a revoke SRW gave up on is still tried: its principal may be a
+#: live account in the main cloud, so ``abandoned`` is never the end.
+ABANDONED_RETRY_SECONDS = REVOKE_RETRY_MAX_SECONDS
+#: The security event a given-up revoke records (``security_events``,
+#: which outlives the grant's connector, project and user).
+REVOKE_ABANDONED_EVENT = "cloud_folder_grant_revoke_abandoned"
 #: The sweep's interval: a backstop; the hooks revoke at once.
 SWEEP_SECONDS = 300.0
 #: How long a reader's probe waits for its canary to be removed.
@@ -577,9 +585,38 @@ def _backoff(attempt: int) -> float:
     )
 
 
+async def _record_abandoned(
+    store: Any, row: Mapping[str, Any], *, attempts: int, why: str
+) -> None:
+    """The security event of a revoke SRW gave up on; never raises."""
+    try:
+        await store.record_security_event(
+            event_type=REVOKE_ABANDONED_EVENT,
+            resource_type="cloud_folder_grant",
+            user_id=str(row.get("user_id") or "") or None,
+            resource_id=str(row["id"]),
+            detail=(
+                f"principal={row.get('principal_id')} group={row.get('group_id')} "
+                f"kind={row.get('kind')} project={row.get('project_id')} "
+                f"connector={row.get('datasource_id')} "
+                f"installation={row.get('backend_instance_id')} "
+                f"reason={row.get('revoke_reason')} attempts={attempts} "
+                f"error={why[:200]}"
+            ),
+        )
+    except Exception:
+        logger.error(
+            "Per-folder grant %s: its abandoned revoke was not recorded as a "
+            "security event",
+            row.get("id"),
+        )
+
+
 async def _revoke_one(store: Any, router: Any, row: Mapping[str, Any]) -> str:
-    """One ``revoking`` grant: ``revoked``, ``retried`` (later, with
-    backoff) or ``abandoned``."""
+    """One ``revoking`` (or ``abandoned``) grant: ``revoked``, ``retried``
+    (later, with backoff) or ``abandoned`` (given up now: a security event,
+    then tried every :data:`ABANDONED_RETRY_SECONDS`)."""
+    given_up = row.get("status") == "abandoned"
     attempts = int(row.get("revoke_attempts") or 0) + 1
     try:
         backend = await _resolve_backend(
@@ -603,17 +640,40 @@ async def _revoke_one(store: Any, router: Any, row: Mapping[str, Any]) -> str:
             why = "the revoke took too long"
         else:
             why = type(exc).__name__
-        if attempts >= MAX_REVOKE_ATTEMPTS:
-            await store.finish_cloud_folder_grant_revoke(
-                str(row["id"]), abandoned=True, error=why[:500]
+        if given_up:
+            await store.retry_cloud_folder_grant_revoke(
+                str(row["id"]),
+                attempts=attempts,
+                error=why[:500],
+                delay_seconds=ABANDONED_RETRY_SECONDS,
             )
             logger.warning(
-                "Giving up revoking per-folder grant %s (%s) after %d attempts: %s; "
-                "its principal may be left in the main cloud",
+                "Revoking per-folder grant %s (%s), given up on, failed again "
+                "(attempt %d): %s; its principal may be live in the main cloud",
                 row["id"],
                 row.get("principal_id"),
                 attempts,
                 why,
+            )
+            return "retried"
+        if attempts >= MAX_REVOKE_ATTEMPTS:
+            if await store.finish_cloud_folder_grant_revoke(
+                str(row["id"]),
+                abandoned=True,
+                error=why[:500],
+                attempts=attempts,
+                retry_seconds=ABANDONED_RETRY_SECONDS,
+            ):
+                await _record_abandoned(store, row, attempts=attempts, why=why)
+            logger.warning(
+                "Giving up revoking per-folder grant %s (%s) after %d attempts: %s; "
+                "its principal may be left in the main cloud, and SRW tries "
+                "again every %.0fs",
+                row["id"],
+                row.get("principal_id"),
+                attempts,
+                why,
+                ABANDONED_RETRY_SECONDS,
             )
             return "abandoned"
         await store.retry_cloud_folder_grant_revoke(
@@ -630,7 +690,12 @@ async def _revoke_one(store: Any, router: Any, row: Mapping[str, Any]) -> str:
         )
         return "retried"
     await store.finish_cloud_folder_grant_revoke(str(row["id"]))
-    logger.info("Per-folder grant %s revoked (%s)", row["id"], row.get("revoke_reason"))
+    logger.info(
+        "Per-folder grant %s revoked (%s)%s",
+        row["id"],
+        row.get("revoke_reason"),
+        f" after it was given up, attempt {attempts}" if given_up else "",
+    )
     return "revoked"
 
 
@@ -767,9 +832,11 @@ async def folder_grant_sweep_loop(
 
 
 __all__ = [
+    "ABANDONED_RETRY_SECONDS",
     "FAILURE_CODES",
     "KINDS",
     "KIND_FOR_ACCESS",
+    "REVOKE_ABANDONED_EVENT",
     "REVOKE_REASONS",
     "FolderGrant",
     "FolderGrantSweepReport",

@@ -222,6 +222,66 @@ async def test_a_hook_never_fails_its_caller():
         )
 
 
+@pytest.mark.asyncio
+async def test_a_given_up_revoke_is_audited_once_and_tried_again_later(monkeypatch):
+    """The 12th failure gives the revoke up (a security event) and sets its
+    next try at the backoff's cap; a later failure only reschedules it."""
+    calls: list[tuple[str, dict]] = []
+
+    def recorder(name):
+        async def record(*_args, **kwargs):
+            calls.append((name, kwargs))
+            return True
+
+        return record
+
+    store = SimpleNamespace(
+        finish_cloud_folder_grant_revoke=recorder("finish"),
+        retry_cloud_folder_grant_revoke=recorder("retry"),
+        record_security_event=recorder("event"),
+    )
+    backend = SimpleNamespace(
+        revoke_folder_principal=AsyncMock(side_effect=TimeoutError())
+    )
+    monkeypatch.setattr(
+        folder_grants, "_resolve_backend", AsyncMock(return_value=backend)
+    )
+    row = {
+        "id": "g-1",
+        "status": "revoking",
+        "kind": "writer",
+        "user_id": USER_ID,
+        "principal_id": "srw-writer-f-" + "1" * 32,
+        "group_id": "srw-rwg-f-" + "1" * 32,
+        "backend_id": "nextcloud",
+        "backend_instance_id": "i-1",
+        "revoke_reason": "member_removed",
+        "revoke_attempts": folder_grants.MAX_REVOKE_ATTEMPTS - 1,
+    }
+
+    assert await folder_grants._revoke_one(store, object(), row) == "abandoned"
+    [(finish, finish_kw), (event, event_kw)] = calls
+    assert (finish, event) == ("finish", "event")
+    assert finish_kw["abandoned"] is True
+    assert finish_kw["retry_seconds"] == folder_grants.ABANDONED_RETRY_SECONDS
+    assert event_kw["event_type"] == folder_grants.REVOKE_ABANDONED_EVENT
+    assert event_kw["resource_id"] == "g-1" and event_kw["user_id"] == USER_ID
+    assert row["principal_id"] in event_kw["detail"]
+
+    calls.clear()
+    again = {**row, "status": "abandoned", "revoke_attempts": 12}
+    assert await folder_grants._revoke_one(store, object(), again) == "retried"
+    [(retry, retry_kw)] = calls
+    assert retry == "retry" and retry_kw["attempts"] == 13
+    assert retry_kw["delay_seconds"] == folder_grants.ABANDONED_RETRY_SECONDS
+
+    # A security event that cannot be written never stops the revoke.
+    calls.clear()
+    del store.record_security_event
+    assert await folder_grants._revoke_one(store, object(), row) == "abandoned"
+    assert [name for name, _ in calls] == ["finish"]
+
+
 def test_the_agent_can_say_why_a_folder_has_no_grant():
     """Every reason a plan may leave a folder out has the agent's words."""
     from orchestrator.services.cloud_connector_mounts import EXCLUSION_REASONS
