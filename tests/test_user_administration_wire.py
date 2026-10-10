@@ -68,13 +68,11 @@ def _wire(
     admin_gate=None,
     backend=None,
     features=None,
-    drivers=None,
 ):
     from orchestrator.routers.user_administration import (
         UserAdministrationDependencies as RouteDeps,
     )
     from orchestrator.routers.user_administration import router
-    from orchestrator.services.connector_drivers import builtin_connector_drivers
     from orchestrator.services.user_administration import (
         UserAdministrationDependencies as OpDeps,
     )
@@ -103,7 +101,6 @@ def _wire(
         store=db,
         logger=MagicMock(),
         main_cloud_router=router_singleton,
-        user_id_type=lambda value: value,
         provision_default_project_knowledge=knowledge,
         ensure_user_provisioned=provisioned,
         notification_service=notifications,
@@ -111,7 +108,6 @@ def _wire(
         is_protected_cloud_mode_enabled=lambda: flags.get("protected_cloud", False),
         datasource_scope_auto_attach_v1_enabled=lambda: flags.get("auto_attach", False),
         datasource_defaults_on_omission=lambda: flags.get("defaults", False),
-        connector_drivers=drivers or builtin_connector_drivers(),
     )
     deps = RouteDeps(
         store=db,
@@ -375,56 +371,46 @@ def test_create_user_skips_cloud_provisioning_without_a_backend():
     wire.store.create_datasource.assert_not_awaited()
 
 
-def test_create_user_provisions_personal_cloud_storage():
+def test_create_user_gives_no_service_account_storage_and_ensures_the_root(
+    monkeypatch,
+):
+    """The "Cloud Storage (Personal)" WebDAV row (the service account's
+    credential) is gone; the new user's cloud root is ensured instead, holding
+    no credential (main cloud slice 4)."""
+    from orchestrator.services import user_administration
+
+    ensured = AsyncMock(return_value="created")
+    monkeypatch.setattr(user_administration, "ensure_user_root_if_cloud", ensured)
     backend = SimpleNamespace(
         is_initialized=True,
         webdav_credentials={"user": "u", "password": "p"},
         get_user_home=AsyncMock(
             return_value=SimpleNamespace(webdav_url="https://cloud/dav/a")
         ),
-    )
-    wire = _wire(backend=backend)
-    wire.client.post("/api/users", json={"display_name": "Ada", "email": "a@test"})
-    kwargs = wire.store.create_datasource.await_args.kwargs
-    assert kwargs["connection_url"] == "https://cloud/dav/a"
-    assert kwargs["project_ids"] == [PROJECT_ID]
-    assert kwargs["auto_attach"] is False
-    assert kwargs["credentials"] == {"user": "u", "password": "p"}
-
-
-def test_personal_cloud_storage_goes_through_its_driver():
-    """A platform row is validated by its driver like any create; one the
-    driver refuses is logged and not stored, and the user is still created."""
-    from orchestrator.services.connector_drivers import ConnectorDriverRegistry
-
-    backend = SimpleNamespace(
-        is_initialized=True,
-        webdav_credentials={"user": "u", "password": "p"},
-        get_user_home=AsyncMock(
-            return_value=SimpleNamespace(webdav_url="https://cloud/dav/a")
-        ),
-    )
-    wire = _wire(backend=backend, drivers=ConnectorDriverRegistry([]))
-    resp = wire.client.post(
-        "/api/users", json={"display_name": "Ada", "email": "a@test"}
-    )
-    assert resp.status_code == 200
-    wire.store.create_datasource.assert_not_awaited()
-    wire.ops.logger.warning.assert_called_once()
-
-
-def test_a_cloud_provisioning_failure_does_not_fail_user_creation():
-    backend = SimpleNamespace(
-        is_initialized=True,
-        webdav_credentials={},
-        get_user_home=AsyncMock(side_effect=RuntimeError("cloud down")),
     )
     wire = _wire(backend=backend)
     resp = wire.client.post(
         "/api/users", json={"display_name": "Ada", "email": "a@test"}
     )
     assert resp.status_code == 200
-    wire.ops.logger.warning.assert_called_once()
+    wire.store.create_datasource.assert_not_awaited()
+    backend.get_user_home.assert_not_awaited()
+    assert ensured.await_args.args[2] == USER_ID
+
+
+def test_delete_user_revokes_the_cloud_root_only_once_deleted(monkeypatch):
+    from orchestrator.services import user_administration
+
+    revoke = AsyncMock()
+    monkeypatch.setattr(
+        user_administration, "retirement_revoke", AsyncMock(return_value=revoke)
+    )
+    refused = _wire(store=_store(delete_user=AsyncMock(return_value=False)))
+    assert refused.client.delete(f"/api/users/{USER_ID}").status_code == 404
+    revoke.assert_not_awaited()
+    wire = _wire()
+    assert wire.client.delete(f"/api/users/{USER_ID}").status_code == 200
+    revoke.assert_awaited_once()
 
 
 def test_create_user_wraps_a_store_failure_as_500():

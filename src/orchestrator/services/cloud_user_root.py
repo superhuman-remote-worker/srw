@@ -61,7 +61,7 @@ import asyncio
 import functools
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -724,32 +724,54 @@ async def disconnect(
     return {**public_status(fresh), "provider_revoked": revoked}
 
 
-async def revoke_for_retirement(store: Any, cloud_router: Any, user_id: Any) -> None:
-    """Before a user's account is deleted: their root's credential revoked
-    in the cloud, best effort (the row itself goes with the account). If
-    the cloud cannot be asked, the credential stays in the account's device
-    list and SRW no longer holds it."""
+async def retirement_revoke(
+    store: Any, cloud_router: Any, user_id: Any
+) -> Callable[[], Awaitable[None]]:
+    """For a user's account deletion: their root's credential, read before
+    the delete (the row goes with the account), and the revoke to run once
+    the delete succeeded, so a refused delete leaves the root working.
+
+    The revoke is best effort: if the cloud cannot be asked, the credential
+    stays in the account's device list and SRW no longer holds it. Never
+    raises.
+    """
+
+    async def nothing() -> None:
+        return None
+
     try:
         row = await store.get_datasource_by_managed_key(user_root_key(user_id))
-        if row is None:
-            return
-        full = await store.get_datasource(str(row["id"])) or row
-        credentials = full.get("credentials") or {}
-        if not credentials.get("password"):
-            return
-        backend = _row_provider(cloud_router, full)
-        if backend is None or not await backend.revoke_user_root(
-            str(credentials.get("username") or ""), str(credentials["password"])
-        ):
-            logger.warning(
-                "User %s: their cloud root's credential could not be revoked "
-                "before the account's deletion",
-                user_id,
-            )
+        full = await store.get_datasource(str(row["id"])) if row else None
+        credentials = (full or {}).get("credentials") or {}
+        backend = _row_provider(cloud_router, full) if full else None
     except Exception:
         logger.warning(
-            "User %s: cloud root revoke before deletion failed", user_id, exc_info=True
+            "User %s: their cloud root could not be read before the account's deletion",
+            user_id,
+            exc_info=True,
         )
+        return nothing
+    if not credentials.get("password"):
+        return nothing
+    login_name = str(credentials.get("username") or "")
+    credential = str(credentials["password"])
+
+    async def revoke() -> None:
+        try:
+            revoked = backend is not None and await backend.revoke_user_root(
+                login_name, credential
+            )
+        except Exception:
+            revoked = False
+        if not revoked:
+            logger.warning(
+                "User %s: their cloud root's credential could not be revoked "
+                "with the account's deletion; it stays in the cloud's device "
+                "list",
+                user_id,
+            )
+
+    return revoke
 
 
 @dataclass
@@ -1090,7 +1112,7 @@ __all__ = [
     "is_user_root",
     "own_root",
     "public_status",
-    "revoke_for_retirement",
+    "retirement_revoke",
     "revoke_root_credential",
     "root_state",
     "status",

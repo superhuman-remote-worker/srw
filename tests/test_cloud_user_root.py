@@ -562,10 +562,22 @@ class TestDisconnect:
         _secrets_absent(body, store.events)
 
     @pytest.mark.asyncio
-    async def test_a_retirement_revokes_the_credential_first(self, store, cloud):
+    async def test_a_retirement_revokes_once_the_account_is_gone(self, store, cloud):
         await _connected(store, cloud)
-        await cloud_user_root.revoke_for_retirement(store, FakeRouter(cloud), ANN)
+        revoke = await cloud_user_root.retirement_revoke(store, FakeRouter(cloud), ANN)
+        assert cloud.revoked == []  # the delete has not run yet
+        store.rows.clear()  # the account's deletion removes the row
+        await revoke()
         assert cloud.revoked == [TOKEN]
+
+    @pytest.mark.asyncio
+    async def test_a_retirement_without_a_credential_revokes_nothing(
+        self, store, cloud
+    ):
+        await cloud_user_root.ensure_user_root_connector(store, FakeRouter(cloud), ANN)
+        revoke = await cloud_user_root.retirement_revoke(store, FakeRouter(cloud), ANN)
+        await revoke()
+        assert cloud.revoked == []
 
 
 # =============================================================================

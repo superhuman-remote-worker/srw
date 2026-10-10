@@ -60,7 +60,6 @@ from orchestrator.services import (
     workspace,
     workspace_suspension,
 )
-from orchestrator.services.cloud import UserId
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +152,6 @@ def user_administration_dependencies(
             store=resources.postgres_db,
             logger=logger,
             main_cloud_router=resources.main_cloud_router,
-            user_id_type=UserId,
             provision_default_project_knowledge=(
                 lambda user, project: (
                     project_provisioning_operations.provision_default_project_knowledge(
@@ -177,7 +175,6 @@ def user_administration_dependencies(
                 deployment_gates.datasource_scope_auto_attach_v1_enabled
             ),
             datasource_defaults_on_omission=deployment_gates.datasource_defaults_on_omission,
-            connector_drivers=resources.connector_drivers,
         ),
         require_admin=functools.partial(access_composition.require_admin, resources),
         require_approved_user=auth.require_approved_user,
