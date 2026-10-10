@@ -90,7 +90,11 @@ class TestTheDeclarations:
 class TestTheDriverVocabulary:
     def test_offered_levels_are_a_driver_specs_access_levels(self):
         levels = NEXTCLOUD.access_levels("cloud_folder", "project")
-        assert [level.id for level in levels] == ["read_only", "protected", "read_write"]
+        assert [level.id for level in levels] == [
+            "read_only",
+            "protected",
+            "read_write",
+        ]
         assert all(level.enforced_by for level in levels)
         spec = DriverSpec(
             name="srw.cloud-folder/v1",
