@@ -947,6 +947,17 @@ async def update_project_member(
     )
     if not success:
         raise HTTPException(status_code=404, detail="Member not found")
+    if body.role == "viewer":
+        # A viewer binds the project's folder read-only: its writer goes now,
+        # best effort (the sweep revokes what is left).
+        await folder_grants.revoke_folder_grants(
+            dependencies.store,
+            dependencies.main_cloud_router,
+            reason="role_lowered",
+            project_id=project_id,
+            user_id=user_id,
+            kind="writer",
+        )
     return {"status": "updated"}
 
 

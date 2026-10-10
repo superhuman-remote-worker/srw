@@ -258,3 +258,32 @@ async def test_a_mint_outlives_a_caller_that_stops_waiting(monkeypatch):
     assert await second == "grant" and started == ["reader"]
     await asyncio.sleep(0)
     assert folder_grants._MINTS == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("role", "revoked"), [("viewer", True), ("editor", False)])
+async def test_lowering_a_member_to_viewer_revokes_their_writer(
+    monkeypatch, role, revoked
+):
+    from orchestrator.schemas.projects import ProjectMemberUpdate
+
+    revoke = AsyncMock(return_value=1)
+    monkeypatch.setattr(folder_grants, "revoke_folder_grants", revoke)
+    store = SimpleNamespace(update_project_member_role=AsyncMock(return_value=True))
+    deps = _project_dependencies(store)
+
+    await projects.update_project_member(
+        PROJECT_ID, USER_ID, ProjectMemberUpdate(role=role), dependencies=deps
+    )
+
+    if revoked:
+        revoke.assert_awaited_once_with(
+            store,
+            deps.main_cloud_router,
+            reason="role_lowered",
+            project_id=PROJECT_ID,
+            user_id=USER_ID,
+            kind="writer",
+        )
+    else:
+        revoke.assert_not_awaited()

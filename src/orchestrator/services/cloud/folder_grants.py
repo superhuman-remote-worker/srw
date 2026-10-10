@@ -33,9 +33,9 @@ principal; it is dropped once the principal is gone.
   reconciler) finishes due revokes with backoff, gives up after
   :data:`MAX_REVOKE_ATTEMPTS` (``abandoned``), revokes a mint a lost process
   left behind, and revokes every active grant that no longer serves: its
-  connector or project is gone, its member left the project, its
-  installation is not the active one, or the project's folder is another
-  now.
+  connector or project is gone, its member left the project (or, for a
+  writer, is a viewer of it now), its installation is not the active one,
+  or the project's folder is another now.
 
 The adapter side is ``SupportsFolderGrant`` (``cloud.base``); a provider
 without it keeps its service account, and the matrix says so.
@@ -94,6 +94,7 @@ REVOKE_REASONS: tuple[str, ...] = (
     "connector_gone",
     "project_deleted",
     "member_removed",
+    "role_lowered",
     "installation_inactive",
     "repointed",
     "credential_unreadable",
@@ -659,10 +660,12 @@ async def revoke_folder_grants(
     datasource_id: str | None = None,
     project_id: str | None = None,
     user_id: str | None = None,
+    kind: str | None = None,
 ) -> int:
-    """Request the revoke of every live grant the selection names and run
-    it at once; returns how many were revoked now. Best effort: it never
-    raises, and what it could not finish the sweep does."""
+    """Request the revoke of every live grant the selection names (of one
+    ``kind`` only, when given) and run it at once; returns how many were
+    revoked now. Best effort: it never raises, and what it could not finish
+    the sweep does."""
     if reason not in REVOKE_REASONS:
         raise ValueError(f"unknown per-folder grant revoke reason {reason!r}")
     try:
@@ -671,6 +674,7 @@ async def revoke_folder_grants(
             datasource_id=datasource_id,
             project_id=project_id,
             user_id=user_id,
+            kind=kind,
         )
         if not rows:
             return 0

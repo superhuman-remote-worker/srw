@@ -63738,11 +63738,13 @@ class PostgresDB:
         datasource_id: str | None = None,
         project_id: str | None = None,
         user_id: str | None = None,
+        kind: str | None = None,
         failure_code: str | None = None,
     ) -> list[dict[str, Any]]:
         """Move the matching live grants to ``revoking`` (their passwords
         dropped: nothing may mount them any more) and return them. At least
-        one selector is required; ``failure_code`` marks a failed mint."""
+        one selector is required (``kind`` narrows another);
+        ``failure_code`` marks a failed mint."""
         if (
             grant_id is None
             and datasource_id is None
@@ -63763,6 +63765,7 @@ class PostgresDB:
                    AND ($2::uuid IS NULL OR datasource_id = $2::uuid)
                    AND ($3::uuid IS NULL OR project_id = $3::uuid)
                    AND ($4::uuid IS NULL OR user_id = $4::uuid)
+                   AND ($7::text IS NULL OR kind = $7)
                 RETURNING *
                 """,
                 grant_id,
@@ -63771,6 +63774,7 @@ class PostgresDB:
                 user_id,
                 reason,
                 failure_code,
+                kind,
             )
         return [self._cloud_folder_grant_row(row) for row in rows]
 
@@ -63802,7 +63806,8 @@ class PostgresDB:
         """Every active grant that no longer serves, with why (``reason``):
         its connector is gone (``connector_gone``), its project is
         (``project_deleted``), its member left the project
-        (``member_removed``), its installation is no longer the active one
+        (``member_removed``) or, for a writer, is a viewer of it now
+        (``role_lowered``: a viewer binds read-only), its installation is no longer the active one
         (``installation_inactive``, only when that one is known), or its
         project's folder is another now (``repointed``)."""
         async with self.acquire() as conn:
@@ -63816,6 +63821,8 @@ class PostgresDB:
                              WHEN d.id IS NULL THEN 'connector_gone'
                              WHEN p.id IS NULL THEN 'project_deleted'
                              WHEN pm.user_id IS NULL THEN 'member_removed'
+                             WHEN g.kind = 'writer' AND pm.role = 'viewer'
+                               THEN 'role_lowered'
                              WHEN $1::uuid IS NOT NULL
                                   AND g.backend_instance_id <> $1::uuid
                                THEN 'installation_inactive'

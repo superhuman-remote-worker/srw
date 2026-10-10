@@ -591,3 +591,33 @@ async def test_a_users_delete_requests_its_revokes(database, probe):
     report = await sweep_folder_grants_once(database, world.router)
     assert report.revoked == 1
     assert grant.principal_id not in world.backend.principals
+
+
+@pytest.mark.asyncio
+async def test_a_member_lowered_to_viewer_loses_the_writer_only(database, probe):
+    """A viewer binds the folder read-only (slice 5's ceiling): its writer
+    serves nothing any more; its reader stays."""
+    world = await _world(database)
+    member = await _user(database, "Lowered")
+    await database.execute(
+        "INSERT INTO project_members(project_id,user_id,role) VALUES($1,$2,'editor')",
+        UUID(world.target.project_id),
+        UUID(member["id"]),
+    )
+    writer = await ensure_folder_grant(
+        database, world.router, world.target, user_id=member["id"], kind="writer"
+    )
+    reader = await ensure_folder_grant(
+        database, world.router, world.target, user_id=member["id"], kind="reader"
+    )
+    assert await database.update_project_member_role(
+        world.target.project_id, member["id"], "viewer"
+    )
+    report = await sweep_folder_grants_once(database, world.router)
+    assert (report.stale, report.revoked) == (1, 1)
+    rows = {str(g["principal_id"]): g for g in await _grants(database)}
+    assert (
+        rows[writer.principal_id]["status"],
+        rows[writer.principal_id]["revoke_reason"],
+    ) == ("revoked", "role_lowered")
+    assert rows[reader.principal_id]["status"] == "active"
