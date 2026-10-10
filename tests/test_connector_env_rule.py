@@ -93,6 +93,135 @@ RUNS_NO_CODE = [
     # Private Go modules need these (the coordinator's call).
     "GOPRIVATE",
     "GONOPROXY",
+    # Directories that hold no code a tool loads.
+    "JUPYTER_RUNTIME_DIR",
+    "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR",
+    "DENO_INSTALL_ROOT",
+    "PERL_LOCAL_LIB_ROOT",
+    # libuv's, not uv's.
+    "UV_THREADPOOL_SIZE",
+]
+
+#: A family's credential-shaped names: the _USER and _USERNAME halves, and
+#: Bundler's host credentials (Gemfury's GEM__ host included).
+FAMILY_CREDENTIALS = [
+    "ANSIBLE_REMOTE_USER",
+    "PIP_USER",
+    "CONDA_USER",
+    "NPM_CONFIG_USERNAME",
+    "BUNDLE_GEM__FURY__IO",
+    "BUNDLE_GEMS__CONTRIBSYS__COM",
+]
+
+#: TLS, CA, client certificate and proxy settings, family by family: they
+#: change what a tool trusts and where it connects, never what it runs.
+TRUST_AND_TRAFFIC = {
+    "git": [
+        "GIT_SSL_CAINFO",
+        "GIT_SSL_CAPATH",
+        "GIT_SSL_NO_VERIFY",
+        "GIT_SSL_CERT",
+        "GIT_SSL_KEY",
+        "GIT_SSL_CERT_PASSWORD_PROTECTED",
+        "GIT_PROXY_SSL_CAINFO",
+        "GIT_PROXY_SSL_CERT",
+        "GIT_PROXY_SSL_KEY",
+    ],
+    "npm": [
+        "NPM_CONFIG_CA",
+        "npm_config_ca",
+        "NPM_CONFIG_CAFILE",
+        "NPM_CONFIG_CERT",
+        "NPM_CONFIG_KEY",
+        "NPM_CONFIG_STRICT_SSL",
+        "NPM_CONFIG_NOPROXY",
+        "NPM_CONFIG_HTTPS_PROXY",
+        "npm_config_proxy",
+    ],
+    "pip": ["PIP_CERT", "PIP_CLIENT_CERT", "PIP_TRUSTED_HOST", "PIP_PROXY"],
+    "yarn": [
+        "YARN_CA_FILE_PATH",
+        "YARN_HTTPS_CA_FILE_PATH",
+        "YARN_HTTPS_CERT_FILE_PATH",
+        "YARN_HTTPS_KEY_FILE_PATH",
+        "YARN_ENABLE_STRICT_SSL",
+        "YARN_HTTPS_PROXY",
+    ],
+    "conda": [
+        "CONDA_SSL_VERIFY",
+        "CONDA_CLIENT_SSL_CERT",
+        "CONDA_CLIENT_SSL_CERT_KEY",
+        "CONDA_PROXY_SERVERS_HTTPS_PROXY",
+    ],
+    "bundler": [
+        "BUNDLE_SSL_CA_CERT",
+        "BUNDLE_SSL_CLIENT_CERT",
+        "BUNDLE_SSL_VERIFY_MODE",
+    ],
+    "uv": ["UV_NATIVE_TLS", "UV_INSECURE_HOST", "UV_HTTP_PROXY"],
+    "poetry": [
+        "POETRY_CERTIFICATES_PRIVATE_CERT",
+        "POETRY_CERTIFICATES_PRIVATE_CLIENT_CERT",
+    ],
+    "cargo": ["CARGO_HTTP_CAINFO", "CARGO_HTTP_CHECK_REVOKE", "CARGO_HTTP_PROXY"],
+    "everywhere": [
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+        "HTTPS_PROXY",
+        "no_proxy",
+    ],
+}
+
+#: Hooks the narrowing reopened, and ones never listed before.
+MORE_HOOKS = [
+    # A build's <tool>-config program, and pkg-config's own variables.
+    "PKG_CONFIG",
+    "PKG_CONFIG_PATH",
+    "PKG_CONFIG_LIBDIR",
+    "LLVM_CONFIG",
+    "GDAL_CONFIG",
+    "PG_CONFIG",
+    # OpenSSH's helper programs.
+    "SSH_SK_HELPER",
+    "SSH_PKCS11_HELPER",
+    # gcloud's other Pythons, Terraform's old config name, MySQL's my.cnf.
+    "CLOUDSDK_GSUTIL_PYTHON",
+    "CLOUDSDK_BQ_PYTHON",
+    "TERRAFORM_CONFIG",
+    "MYSQL_HOME",
+    "MARIADB_HOME",
+    # Go.
+    "GOCACHEPROG",
+    "GOAUTH",
+    "GCCGO",
+    "GOTMPDIR",
+    "GOVCS",
+    "CGO_CFLAGS_ALLOW",
+    "CGO_LDFLAGS_ALLOW",
+    # ccache maps its whole config onto CCACHE_*, credential-shaped or not.
+    "CCACHE_DIR",
+    "CCACHE_COMPILER",
+    "CCACHE_CONFIGPATH",
+    "CCACHE_TOKEN",
+    # libpq's system config directory (pg_service.conf, a system psqlrc).
+    "PGSYSCONFDIR",
+    # MSBuild imports, in any case.
+    "CustomBeforeMicrosoftCommonTargets",
+    "CustomAfterMicrosoftCommonTargets",
+    "CustomBeforeMicrosoftCommonProps",
+    "CUSTOMAFTERMICROSOFTCOMMONPROPS",
+    # NuGet's credential and other plugins.
+    "NUGET_PLUGIN_PATHS",
+    "NUGET_NETCORE_PLUGIN_PATHS",
+    "NUGET_NETFX_PLUGIN_PATHS",
+    # cargo's command and credential-provider aliases, credential-shaped or
+    # not.
+    "CARGO_ALIAS_B",
+    "CARGO_ALIAS_MY_TOKEN",
+    "CARGO_CREDENTIAL_ALIAS_VAULT",
+    "CARGO_CREDENTIAL_ALIAS_VAULT_KEY",
 ]
 
 #: The hooks the narrowed families and suffixes still refuse, and the review's
@@ -344,6 +473,29 @@ class TestTheRule:
     @pytest.mark.parametrize("name", RUNS_NO_CODE)
     def test_a_name_that_runs_no_code_is_allowed(self, name):
         assert connector_env_problem(name) is None
+
+    @pytest.mark.parametrize("name", FAMILY_CREDENTIALS)
+    def test_a_family_s_credential_halves_are_allowed(self, name):
+        assert connector_env_problem(name) is None
+
+    @pytest.mark.parametrize(
+        ("family", "name"),
+        [
+            (family, name)
+            for family, names in TRUST_AND_TRAFFIC.items()
+            for name in names
+        ],
+    )
+    def test_tls_ca_certificate_and_proxy_names_pass_in_every_family(
+        self, family, name
+    ):
+        assert connector_env_problem(name) is None, family
+
+    @pytest.mark.parametrize("name", MORE_HOOKS)
+    def test_more_hooks_are_refused(self, name):
+        problem = connector_env_problem(name)
+        assert problem is not None
+        assert "connector may set" in problem
 
     @pytest.mark.parametrize("name", NARROWED_HOOKS)
     def test_the_hooks_stay_refused(self, name):

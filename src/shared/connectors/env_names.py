@@ -17,8 +17,10 @@ refuses only names that make a tool run code or load a config or code file:
 * **Code hooks**, the known variables that make a tool run code. A name a
   tool reads as a command or code to run (``GIT_SSH_COMMAND``, ``EDITOR``,
   ``VISUAL``, ``PAGER``, ``SSH_ASKPASS``, ``CC``, ``MAKE``,
-  ``KUBECTL_EXTERNAL_DIFF``, every ``*_COMMAND``, ``*ASKPASS``, ``*PAGER``,
-  ``*EDITOR`` and ``*BROWSER``); as options or flags it hands a runtime or a
+  ``KUBECTL_EXTERNAL_DIFF``, ``GOCACHEPROG``, a build's ``<tool>-config``
+  program, ``PKG_CONFIG``, ``LLVM_CONFIG`` or ``PG_CONFIG``, every
+  ``*_COMMAND``, ``*ASKPASS``, ``*PAGER``, ``*EDITOR`` and ``*BROWSER``); as
+  options or flags it hands a runtime or a
   build (``NODE_OPTIONS``, ``JAVA_TOOL_OPTIONS``, ``RUBYOPT``,
   ``PYTEST_ADDOPTS``, every ``*_OPTS``, ``*_OPTIONS`` and ``*_ARGS``, and
   ``CFLAGS``, ``MAKEFLAGS``, ``RUSTFLAGS``: a ``FLAGS`` ending not after an
@@ -38,18 +40,22 @@ refuses only names that make a tool run code or load a config or code file:
   environment, so that any member may be a hook: ``GIT_*``,
   ``NPM_CONFIG_*``, ``PIP_*``, ``UV_*``, ``CARGO_*``, ``BUNDLE_*``,
   ``YARN_*``, ``POETRY_*``, ``PIPENV_*``, ``COMPOSER_*``, ``CONDA_*``,
-  ``ANSIBLE_*``, ``CMAKE_*``, ``COREPACK_*``, ``BUN_CONFIG_*``, ``DOTNET_*``
-  (with ``CORECLR_*`` and ``COMPlus_*``, the same runtime's), ``PERL5*`` and
-  ``BASH_*``. Elsewhere only the hooks are named: ``NODE_OPTIONS`` but not
-  ``NODE_ENV``, ``TF_CLI_ARGS*`` but not ``TF_VAR_*``, ``CLOUDSDK_PYTHON*``
-  but not ``CLOUDSDK_CORE_PROJECT``, OpenSSH's variables but not
-  ``SSH_HOST``.
+  ``ANSIBLE_*``, ``CMAKE_*``, ``COREPACK_*``, ``BUN_CONFIG_*``, ``CCACHE_*``,
+  ``DOTNET_*`` (with ``CORECLR_*`` and ``COMPlus_*``, the same runtime's),
+  ``PERL5*`` and ``BASH_*``. Elsewhere only the hooks are named:
+  ``NODE_OPTIONS`` but not ``NODE_ENV``, ``TF_CLI_ARGS*`` but not
+  ``TF_VAR_*``, ``CLOUDSDK_PYTHON*`` but not ``CLOUDSDK_CORE_PROJECT``,
+  OpenSSH's variables but not ``SSH_HOST``.
 
 Allowed for everyone, because they change where a tool connects and which
 certificates it trusts, never what it runs: proxies (every ``*_PROXY``,
-``NO_PROXY`` included), CA bundles and TLS checks (``SSL_CERT_FILE``,
-``REQUESTS_CA_BUNDLE``, ``NODE_EXTRA_CA_CERTS``, ``GIT_SSL_CAINFO``,
-``PGSSLMODE``...), name resolution (``HOSTALIASES``, ``RES_OPTIONS``),
+``NO_PROXY`` included), CA bundles, client certificates and TLS checks, in a
+refused family too (``SSL_CERT_FILE``, ``REQUESTS_CA_BUNDLE``,
+``NODE_EXTRA_CA_CERTS``, ``GIT_SSL_CAINFO``, ``GIT_SSL_CERT``,
+``NPM_CONFIG_CA``, ``NPM_CONFIG_STRICT_SSL``, ``PIP_CLIENT_CERT``,
+``PIP_TRUSTED_HOST``, ``YARN_HTTPS_CA_FILE_PATH``, ``UV_NATIVE_TLS``,
+``POETRY_CERTIFICATES_<REPO>_CERT``, ``PGSSLMODE``...), name resolution
+(``HOSTALIASES``, ``RES_OPTIONS``),
 Docker's daemon address, and ``GOPRIVATE`` and ``GONOPROXY``, which
 private-module credentials need. An allowed proxy with an allowed CA bundle
 can redirect what a tool fetches too; that residual is accepted, because the
@@ -68,9 +74,10 @@ one ending in ``_TOKEN``, ``_TOKENS``, ``_AUTH``, ``_AUTH_IDENT``,
 (:data:`CREDENTIAL_SUFFIXES`: ``NPM_CONFIG__AUTH``, ``CARGO_REGISTRY_TOKEN``,
 ``YARN_NPM_AUTH_IDENT``, ``COMPOSER_AUTH``), Poetry's
 ``POETRY_PYPI_TOKEN_<repository>``, and Bundler's credentials for a gem
-server, ``BUNDLE_<HOST>__<TLD>`` (but for its ``MIRROR__``, ``BUILD__``,
-``LOCAL__`` and ``GEM__`` settings). A name the list spells out, and the
-variants of one hook (``GIT_CONFIG_*``, ``TF_CLI_ARGS*``, ``LUA_PATH*``...:
+server, ``BUNDLE_<HOST>__<TLD>`` (but for its ``MIRROR__``, ``BUILD__``
+and ``LOCAL__`` settings). A name the list spells out, and the variants of
+one hook (``GIT_CONFIG_*``, ``TF_CLI_ARGS*``, ``LUA_PATH*``,
+``PKG_CONFIG*``, ``CARGO_ALIAS_*``, ``CCACHE_*``...:
 :data:`NEVER_EXEMPT_PREFIXES`), never are. Names are compared in upper case:
 a tool that reads ``https_proxy`` reads it in lower case.
 
@@ -95,10 +102,12 @@ The two families SRW's own work runs on, name by name:
   names), which git only records, and git's CA bundle and TLS check
   (``GIT_SSL_CAINFO``, ``GIT_SSL_CAPATH``, ``GIT_SSL_NO_VERIFY``), as for
   every tool.
-* ``SSH_*`` is not a family: OpenSSH reads only a few variables, and each is
-  refused by name. ``SSH_ASKPASS`` and ``SSH_ASKPASS_REQUIRE`` run a
-  program, ``SSH_SK_PROVIDER`` loads a library, ``SSH_AUTH_SOCK`` and
-  ``SSH_AGENT_PID`` are the ssh-agent SRW's managed repositories and SSH
+* ``SSH_*`` is not a family: the ``SSH_`` variables OpenSSH is known to
+  read as a program, a library or SRW's own are refused by name.
+  ``SSH_ASKPASS`` and ``SSH_ASKPASS_REQUIRE`` run a program,
+  ``SSH_SK_PROVIDER`` loads a library, ``SSH_SK_HELPER`` and
+  ``SSH_PKCS11_HELPER`` name the helper programs it starts, ``SSH_AUTH_SOCK``
+  and ``SSH_AGENT_PID`` are the ssh-agent SRW's managed repositories and SSH
   identities sign with, and ``SSH_CONNECTION``, ``SSH_CLIENT``, ``SSH_TTY``
   and ``SSH_ORIGINAL_COMMAND`` belong to the session SRW reaches the
   workspace through. A script's own ``SSH_HOST``, ``SSH_USER`` or
@@ -122,8 +131,10 @@ refuses: those variables never reach a workspace, and a server's
 ``NODE_ENV`` or ``JAVA_HOME`` is its own business.
 
 This is a **best-effort lint against known tool hooks**, never a sandbox: a
-tool the list does not know may read a variable it does not name, and a
-value a connector delivers is data the workspace's own programs then read.
+tool the list does not know may read a variable it does not name (MSBuild,
+for one, reads every variable as a property: only its known import hooks
+are named), and a value a connector delivers is data the workspace's own
+programs then read.
 What a connector does is its user's responsibility (decision 17), as with a
 workspace image: the author of a driver image is the trust boundary, so
 register only images whose authors you trust with the connector's
@@ -270,6 +281,8 @@ CODE_HOOK_NAMES: frozenset[str] = CODE_ENV | frozenset(
         "SSH_CLIENT",
         "SSH_CONNECTION",
         "SSH_ORIGINAL_COMMAND",
+        "SSH_PKCS11_HELPER",
+        "SSH_SK_HELPER",
         "SSH_SK_PROVIDER",
         "SSH_TTY",
         # A shell's prompts and mail checks expand commands (MAILPATH's at
@@ -336,11 +349,12 @@ CODE_HOOK_NAMES: frozenset[str] = CODE_ENV | frozenset(
         "IPYTHONDIR",
         "JUPYTER_DATA_DIR",
         "JUPYTER_PATH",
-        "JUPYTER_RUNTIME_DIR",
         "KRB5_CONFIG",
         "MAVEN_CONFIG",
+        "PGSYSCONFDIR",
         "RCLONE_CONFIG",
         "STARSHIP_CONFIG",
+        "TERRAFORM_CONFIG",
         "TF_CLI_CONFIG_FILE",
         "TF_DATA_DIR",
         "TF_PLUGIN_CACHE_DIR",
@@ -349,15 +363,12 @@ CODE_HOOK_NAMES: frozenset[str] = CODE_ENV | frozenset(
         "XDG_CONFIG_HOME",
         "XDG_DATA_DIRS",
         "XDG_DATA_HOME",
-        "XDG_RUNTIME_DIR",
-        "XDG_STATE_HOME",
         # Tool homes: where a runtime, toolchain or version manager keeps
         # the code it runs and its plugins.
         "ANDROID_HOME",
         "ANDROID_SDK_ROOT",
         "CARGO_HOME",
         "DENO_DIR",
-        "DENO_INSTALL_ROOT",
         "GOMODCACHE",
         "GOPATH",
         "GOROOT",
@@ -365,15 +376,22 @@ CODE_HOOK_NAMES: frozenset[str] = CODE_ENV | frozenset(
         "HELM_DATA_HOME",
         "JAVA_HOME",
         "M2_HOME",
+        "MARIADB_HOME",
         "MAVEN_HOME",
         "MIX_HOME",
+        "MYSQL_HOME",
+        "NUGET_FALLBACK_PACKAGES",
+        "NUGET_PACKAGES",
         "NVM_DIR",
         "PNPM_HOME",
         "PYENV_ROOT",
         "RBENV_ROOT",
         "RUSTUP_HOME",
         "VOLTA_HOME",
-        # Runtimes: code, search paths, options, profilers, debug switches.
+        # Runtimes: code, search paths, options, profilers, plugins, debug
+        # switches.
+        "CLOUDSDK_BQ_PYTHON",
+        "CLOUDSDK_GSUTIL_PYTHON",
         "CORECLR_ENABLE_PROFILING",
         "CORECLR_PROFILER",
         "CORECLR_PROFILER_PATH",
@@ -388,8 +406,10 @@ CODE_HOOK_NAMES: frozenset[str] = CODE_ENV | frozenset(
         "JULIA_LOAD_PATH",
         "JULIA_PROJECT",
         "NODE_COMPILE_CACHE",
+        "NUGET_NETCORE_PLUGIN_PATHS",
+        "NUGET_NETFX_PLUGIN_PATHS",
+        "NUGET_PLUGIN_PATHS",
         "PERL_CPANM_OPT",
-        "PERL_LOCAL_LIB_ROOT",
         "PERL_MB_OPT",
         "PERL_MM_OPT",
         "PHPRC",
@@ -414,7 +434,12 @@ CODE_HOOK_NAMES: frozenset[str] = CODE_ENV | frozenset(
         "CPP",
         "CXX",
         "FC",
+        "GCCGO",
+        "GOAUTH",
+        "GOCACHEPROG",
         "GOFLAGS",
+        "GOTMPDIR",
+        "GOVCS",
         "KUBECTL_EXTERNAL_DIFF",
         "LD",
         "MAKE",
@@ -427,6 +452,41 @@ CODE_HOOK_NAMES: frozenset[str] = CODE_ENV | frozenset(
         "RUSTC_WRAPPER",
         "RUSTDOC",
         "STRIP",
+        # The flags cgo lets a module's own #cgo lines pass (-fplugin=...).
+        "CGO_CFLAGS_ALLOW",
+        "CGO_CPPFLAGS_ALLOW",
+        "CGO_CXXFLAGS_ALLOW",
+        "CGO_FFLAGS_ALLOW",
+        "CGO_LDFLAGS_ALLOW",
+        # A build's *-config program (autoconf runs $PKG_CONFIG unquoted):
+        # the <tool>-config convention, the known ones named.
+        "CURL_CONFIG",
+        "FREETYPE_CONFIG",
+        "GDAL_CONFIG",
+        "GEOS_CONFIG",
+        "GPGME_CONFIG",
+        "GPG_ERROR_CONFIG",
+        "ICU_CONFIG",
+        "LIBGCRYPT_CONFIG",
+        "LLVM_CONFIG",
+        "MARIADB_CONFIG",
+        "MYSQL_CONFIG",
+        "NC_CONFIG",
+        "PCRE2_CONFIG",
+        "PCRE_CONFIG",
+        "PG_CONFIG",
+        "SDL2_CONFIG",
+        "SDL_CONFIG",
+        "XML2_CONFIG",
+        "XSLT_CONFIG",
+        # MSBuild reads every variable as a property; these import a
+        # project file before or after the common targets and props.
+        "CUSTOMAFTERMICROSOFTCOMMONPROPS",
+        "CUSTOMAFTERMICROSOFTCOMMONTARGETS",
+        "CUSTOMAFTERMICROSOFTCSHARPTARGETS",
+        "CUSTOMBEFOREMICROSOFTCOMMONPROPS",
+        "CUSTOMBEFOREMICROSOFTCOMMONTARGETS",
+        "CUSTOMBEFOREMICROSOFTCSHARPTARGETS",
         # A remote shell, connection program or merge tool another tool
         # starts.
         "CVS_RSH",
@@ -482,16 +542,22 @@ CODE_HOOK_PREFIXES: tuple[str, ...] = CODE_ENV_PREFIXES + (
     "POETRY_",
     "YARN_",
 )
-#: The variants of one hook, and git's config entries (any key is config):
-#: no credential-shaped name escapes them.
+#: The variants of one hook, git's config entries (any key is config),
+#: cargo's command and credential-provider aliases, and ccache's whole
+#: configuration (no credential in it): no credential-shaped name escapes
+#: them.
 NEVER_EXEMPT_PREFIXES: tuple[str, ...] = (
     "BUN_INSTALL",
+    "CARGO_ALIAS_",
+    "CARGO_CREDENTIAL_ALIAS_",
+    "CCACHE_",
     "CLOUDSDK_COMPONENT_MANAGER_",
     "CLOUDSDK_PYTHON",
     "GIT_CONFIG_",
     "LUA_CPATH",
     "LUA_INIT",
     "LUA_PATH",
+    "PKG_CONFIG",
     "TF_CLI_ARGS",
 )
 #: Suffixes that name a password prompt, a pager, an editor, a browser,
@@ -540,12 +606,11 @@ CREDENTIAL_SUFFIXES: tuple[str, ...] = (
 #: Credentials named by a prefix: Poetry's API token for a repository.
 CREDENTIAL_PREFIXES: tuple[str, ...] = ("POETRY_PYPI_TOKEN_",)
 #: Bundler names a gem server's credentials after its host, its dots as
-#: ``__`` (``BUNDLE_GEMS__EXAMPLE__COM``); these dotted settings are not
-#: credentials: a mirror (a fetch source), a gem's build options, a local
-#: override of a gem's code, the gem generator's.
+#: ``__`` (``BUNDLE_GEMS__EXAMPLE__COM``, Gemfury's ``BUNDLE_GEM__FURY__IO``);
+#: these dotted settings are not credentials: a mirror (a fetch source), a
+#: gem's build options, a local override of a gem's code.
 BUNDLE_SETTINGS: tuple[str, ...] = (
     "BUNDLE_BUILD__",
-    "BUNDLE_GEM__",
     "BUNDLE_LOCAL__",
     "BUNDLE_MIRROR__",
 )
@@ -578,6 +643,33 @@ ALLOWED_NAMES: frozenset[str] = frozenset(
         "REQUESTS_CA_BUNDLE",
         "SSL_CERT_DIR",
         "SSL_CERT_FILE",
+        # The same inside a refused family: CA bundles, client
+        # certificates, TLS checks and proxy exceptions of git, npm, pip,
+        # Yarn, conda, Bundler, uv and Cargo (Poetry's are a pattern:
+        # ALLOWED_PREFIX_SUFFIXES).
+        "BUNDLE_SSL_CLIENT_CERT",
+        "BUNDLE_SSL_VERIFY_MODE",
+        "CARGO_HTTP_CHECK_REVOKE",
+        "CONDA_CLIENT_SSL_CERT",
+        "CONDA_SSL_VERIFY",
+        "GIT_PROXY_SSL_CAINFO",
+        "GIT_PROXY_SSL_CERT",
+        "GIT_PROXY_SSL_CERT_PASSWORD_PROTECTED",
+        "GIT_SSL_CERT",
+        "GIT_SSL_CERT_PASSWORD_PROTECTED",
+        "NPM_CONFIG_CA",
+        "NPM_CONFIG_CERT",
+        "NPM_CONFIG_NOPROXY",
+        "NPM_CONFIG_STRICT_SSL",
+        "PIP_CLIENT_CERT",
+        "PIP_TRUSTED_HOST",
+        "UV_INSECURE_HOST",
+        "UV_NATIVE_TLS",
+        "YARN_CA_FILE_PATH",
+        "YARN_ENABLE_STRICT_SSL",
+        "YARN_HTTPS_CA_FILE_PATH",
+        "YARN_HTTPS_CERT_FILE_PATH",
+        "YARN_HTTPS_KEY_FILE_PATH",
         # TLS checks.
         "DOCKER_TLS_VERIFY",
         "GIT_SSL_NO_VERIFY",
@@ -619,10 +711,18 @@ ALLOWED_NAMES: frozenset[str] = frozenset(
         "DOTNET_CLI_TELEMETRY_OPTOUT",
         "DOTNET_ENVIRONMENT",
         "DOTNET_NOLOGO",
+        # libuv's thread pool, not uv's.
+        "UV_THREADPOOL_SIZE",
     }
 )
 #: Allowed prefixes within a refused family: cargo's terminal output.
 ALLOWED_PREFIXES: tuple[str, ...] = ("CARGO_TERM_",)
+#: Allowed by prefix and suffix: Poetry's CA bundle and client certificate
+#: for a repository (``POETRY_CERTIFICATES_<REPO>_CERT``,
+#: ``POETRY_CERTIFICATES_<REPO>_CLIENT_CERT``).
+ALLOWED_PREFIX_SUFFIXES: tuple[tuple[str, str], ...] = (
+    ("POETRY_CERTIFICATES_", "_CERT"),
+)
 #: The suffix of every proxy variable (``HTTPS_PROXY``, ``no_proxy``,
 #: ``npm_config_https_proxy``...).
 PROXY_SUFFIX = "_PROXY"
@@ -647,6 +747,10 @@ def _code_hook(upper: str) -> bool:
         upper in ALLOWED_NAMES
         or upper.endswith(PROXY_SUFFIX)
         or upper.startswith(ALLOWED_PREFIXES)
+        or any(
+            upper.startswith(prefix) and upper.endswith(suffix)
+            for prefix, suffix in ALLOWED_PREFIX_SUFFIXES
+        )
     ):
         return False
     if upper.endswith(CODE_HOOK_SUFFIXES) or (
@@ -692,6 +796,7 @@ def env_value_problem(name: str, value: object) -> str | None:
 __all__ = [
     "ALLOWED_NAMES",
     "ALLOWED_PREFIXES",
+    "ALLOWED_PREFIX_SUFFIXES",
     "BUNDLE_SETTINGS",
     "CODE_ENV",
     "CODE_ENV_PREFIXES",

@@ -266,12 +266,14 @@ path at most 255 characters and written once, each name set once.
     (SRW's kubeconfig connectors merge into it);
   - the known code hooks: commands and code (`GIT_SSH_COMMAND`, `EDITOR`,
     `VISUAL`, `PAGER`, `SSH_ASKPASS`, `CC`, `MAKE`, `KUBECTL_EXTERNAL_DIFF`,
-    `MAILPATH`, every `*_COMMAND`, `*ASKPASS`, `*PAGER`, `*EDITOR`,
-    `*BROWSER`), runtime and build options (`NODE_OPTIONS`,
-    `JAVA_TOOL_OPTIONS`, `RUBYOPT`, `PYTEST_ADDOPTS`, every `*_OPTS`,
-    `*_OPTIONS` and `*_ARGS`, and `CFLAGS`, `MAKEFLAGS`, `RUSTFLAGS`: not
-    `FEATURE_FLAGS`), profilers and start-up hooks (`DOTNET_STARTUP_HOOKS`,
-    `CORECLR_PROFILER`), the files and directories a tool reads config,
+    `MAILPATH`, `GOCACHEPROG`, a build's `<tool>-config` program such as
+    `PKG_CONFIG`, `LLVM_CONFIG` or `PG_CONFIG`, every `*_COMMAND`,
+    `*ASKPASS`, `*PAGER`, `*EDITOR`, `*BROWSER`), runtime and build options
+    (`NODE_OPTIONS`, `JAVA_TOOL_OPTIONS`, `RUBYOPT`, `PYTEST_ADDOPTS`,
+    every `*_OPTS`, `*_OPTIONS` and `*_ARGS`, and `CFLAGS`, `MAKEFLAGS`,
+    `RUSTFLAGS`: not `FEATURE_FLAGS`), profilers and start-up hooks
+    (`DOTNET_STARTUP_HOOKS`, `CORECLR_PROFILER`), the files and directories
+    a tool reads config,
     start-up code or plugins from (`GIT_CONFIG_*`, `GIT_EXEC_PATH`, the rc
     files such as `INPUTRC`, `PSQLRC` and `WGETRC`, `XDG_CONFIG_HOME`,
     `DOCKER_CONFIG`, `NODE_PATH`, `BOTO_CONFIG`, every `*_CONFIG_FILE`,
@@ -284,9 +286,10 @@ path at most 255 characters and written once, each name set once.
     runtime its settings, onto the environment: `GIT_*`, `NPM_CONFIG_*`,
     `PIP_*`, `UV_*`, `CARGO_*`, `BUNDLE_*`, `YARN_*`, `POETRY_*`, `PIPENV_*`,
     `COMPOSER_*`, `CONDA_*`, `ANSIBLE_*`, `CMAKE_*`, `COREPACK_*`,
-    `BUN_CONFIG_*`, `DOTNET_*` (with `CORECLR_*` and `COMPlus_*`), `PERL5*`
-    and `BASH_*`. Elsewhere only the hooks are refused: `NODE_OPTIONS` but
-    not `NODE_ENV`, `TF_CLI_ARGS*` but not `TF_VAR_*` or `TF_TOKEN_*`,
+    `BUN_CONFIG_*`, `CCACHE_*`, `DOTNET_*` (with `CORECLR_*` and
+    `COMPlus_*`), `PERL5*` and `BASH_*`. Elsewhere only the hooks are
+    refused: `NODE_OPTIONS` but not `NODE_ENV`, `TF_CLI_ARGS*` but not
+    `TF_VAR_*` or `TF_TOKEN_*`,
     `CLOUDSDK_PYTHON*` but not `CLOUDSDK_CORE_PROJECT`, OpenSSH's variables
     but not your own `SSH_HOST` or `SSH_PRIVATE_KEY`.
 
@@ -300,9 +303,12 @@ path at most 255 characters and written once, each name set once.
   `ANSIBLE_HOST_KEY_CHECKING`…). A name the list spells out, `GIT_CONFIG_*`
   and the reserved families never are. Yours to set too, because they change
   where a tool connects and what it trusts, never what it runs: every proxy
-  (`*_PROXY`, `NO_PROXY`), CA bundles and TLS checks (`SSL_CERT_FILE`,
-  `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`,
-  `PGSSLMODE`…), name resolution (`HOSTALIASES`, `RES_OPTIONS`),
+  (`*_PROXY`, `NO_PROXY`), CA bundles, client certificates and TLS checks,
+  inside a family too (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`,
+  `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`, `GIT_SSL_CERT`, `NPM_CONFIG_CA`,
+  `PIP_CLIENT_CERT`, `PIP_TRUSTED_HOST`, `YARN_HTTPS_CA_FILE_PATH`,
+  `UV_NATIVE_TLS`, `POETRY_CERTIFICATES_<REPO>_CERT`, `PGSSLMODE`…), name
+  resolution (`HOSTALIASES`, `RES_OPTIONS`),
   `DOCKER_HOST`, and `GOPRIVATE` and `GONOPROXY`, which private Go modules
   need (a proxy with a CA bundle can redirect a fetch too; the rule accepts
   that, since it allows proxies); a variable that names a credential file
