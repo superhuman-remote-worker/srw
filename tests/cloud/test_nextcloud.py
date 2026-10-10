@@ -653,7 +653,15 @@ class TestRcloneMountSpec:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("username", "access"),
-        [(AGENT_USER, "read_write"), ("admin", "read_only"), (_READER, "read_write")],
+        [
+            (AGENT_USER, "read_write"),
+            ("admin", "read_only"),
+            (_READER, "read_write"),
+            # Read-only is the reader's doing, never a writer behind a flag.
+            (_WRITER, "read_only"),
+            (_WRITER, "protected"),
+            (_READER, "protected"),
+        ],
     )
     async def test_only_a_grant_principal_at_its_level_is_mounted(
         self, username, access

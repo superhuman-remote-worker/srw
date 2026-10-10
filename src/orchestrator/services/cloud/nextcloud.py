@@ -97,6 +97,9 @@ _FOLDER_GRANT_PERMISSIONS = {"reader": _READ_PERMISSION, "writer": 15}
 _FOLDER_PRINCIPAL_RE = re.compile(r"srw-(reader|writer)-f-([0-9a-f]{32})\Z")
 _FOLDER_GROUP_RE = re.compile(r"srw-(rog|rwg)-f-([0-9a-f]{32})\Z")
 _FOLDER_GROUP_KIND = {"rog": "reader", "rwg": "writer"}
+#: The one grant kind a project mount at each level may carry (as
+#: ``folder_grants.KIND_FOR_ACCESS``).
+_FOLDER_KIND_FOR_ACCESS = {"read_only": "reader", "read_write": "writer"}
 #: A per-folder principal's own quota: it is an ordinary Nextcloud user,
 #: but stores nothing of its own (its folder's Group Folder quota is apart).
 #: Nextcloud has no per-user or per-group switch for sharing or user
@@ -554,7 +557,9 @@ class NextcloudBackend(NextcloudUserRootGrant):
         """A project's Group Folder as its per-folder grant's principal.
 
         ``subject`` carries the grant's principal and password; a reader is
-        mounted read-only only. A project mount is never made as the
+        mounted read-only only, a writer read-write only (a read-only level
+        is the reader's credential's doing, never a writer's behind an
+        rclone flag). A project mount is never made as the
         service account, which can write every project folder: without a
         grant there is no mount (``NOT_SUPPORTED``). The one exception is
         End's reconstruction of a mount the old rule made that way
@@ -562,9 +567,8 @@ class NextcloudBackend(NextcloudUserRootGrant):
         """
         if subject is not None and subject.credential:
             principal = _FOLDER_PRINCIPAL_RE.fullmatch(str(subject.username or ""))
-            if principal is None or (
-                principal.group(1) == "reader" and access != "read_only"
-            ):
+            kind = principal.group(1) if principal is not None else None
+            if kind is None or kind != _FOLDER_KIND_FOR_ACCESS.get(access):
                 raise CloudBackendError(
                     CloudBackendErrorKind.INVALID_REQUEST,
                     "a project mount's principal is not its per-folder grant's",
