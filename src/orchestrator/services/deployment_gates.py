@@ -62,9 +62,12 @@ def mcp_datasources_enabled() -> bool:
 def datasource_defaults_on_omission() -> bool:
     """Temporary rollout gate for the root REST omission contract.
 
-    Cockpit always submits a reviewed explicit array and internal schedulers
-    call the default policy directly.  This gate protects older REST clients
-    that historically encoded "none" by omitting ``datasource_ids``.
+    Omitting ``datasource_ids`` always attaches the work's own platform-owned
+    connectors (the project's knowledge base and cloud folder); this gate
+    adds the owner's and the project's other defaults.  An explicit ``[]``
+    attaches nothing either way.  Cockpit always submits a reviewed explicit
+    array and internal schedulers call the default policy directly; the gate
+    protects older REST clients that encoded "none" by omission.
     """
     return os.getenv("DATASOURCE_DEFAULTS_ON_OMISSION", "false").lower().strip() in (
         "true",

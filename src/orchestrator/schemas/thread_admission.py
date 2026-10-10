@@ -94,7 +94,12 @@ class ThreadCreateRequest(BaseModel):
         ),
     )
     datasource_ids: list[str] | None = Field(
-        None, description="Explicit connector IDs to attach to this thread"
+        None,
+        description=(
+            "Explicit connector IDs to attach to this thread; [] attaches "
+            "none. Omit for the project's own connectors (knowledge base, "
+            "cloud folder), plus the other defaults when enabled."
+        ),
     )
     use_datasource_defaults: bool = Field(
         False,

@@ -11,7 +11,7 @@ and only then use the ordinary explicit datasource resolver to deliver secrets.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Literal, Mapping
 from uuid import UUID
 
 from shared.connectors.builtin import spec_for_row
@@ -82,6 +82,18 @@ def _user_kind_refuses(row: Mapping[str, Any], owner_id: str | None) -> bool:
     )
 
 
+def _native_default(
+    row: Mapping[str, Any], owner_id: str, target_project_ids: set[str]
+) -> bool:
+    """Whether the row is the work's own: a target project's own connector
+    (its knowledge base, its cloud folder) or the owner's own (a user kind).
+    These attach whenever work takes no explicit list."""
+    project = native_project(row)
+    if project is not None:
+        return project in target_project_ids
+    return native_user(row) == owner_id
+
+
 def _scope_matches(row: dict[str, Any], target_project_ids: set[str]) -> bool:
     native_project_id = _native_project_id(row)
     if native_project_id is not None:
@@ -95,6 +107,19 @@ def _scope_matches(row: dict[str, Any], target_project_ids: set[str]) -> bool:
     if row.get("scope_mode") != "projects" or not target_project_ids:
         return False
     return target_project_ids.issubset(_row_project_ids(row))
+
+
+def execution_kind_refuses(row: Mapping[str, Any], execution_kind: str | None) -> bool:
+    """Whether the connector cannot be attached to this kind of execution.
+
+    The connector's driver names the executions it serves
+    (``spec.executions``: a cloud folder mounts into sessions only). ``None``
+    asks nothing; a type no driver serves refuses nothing.
+    """
+    if execution_kind is None:
+        return False
+    spec = spec_for_row(row)
+    return spec is not None and execution_kind not in spec.executions
 
 
 def workspace_tier_refuses(
@@ -341,17 +366,26 @@ async def default_datasource_selection(
     effective_work_owner_id: str | None,
     target_project_ids: list[str] | None,
     workspace_backend: str | None,
+    *,
+    execution_kind: Literal["session", "job"],
+    native_only: bool = False,
 ) -> tuple[list[str], dict[str, int]]:
     """Return default IDs and the policy revisions used to select them.
 
     Shared/public connector publisher preferences never affect another user.
-    Native project KB rows are the project-managed exception, and a project
-    admin's connector defaults (``project_connector_defaults``, slice D3c)
-    add the connectors linked to every target project that the project chose
-    (candidate rows flagged ``project_default``), whatever their owner's own
-    ``auto_attach``. Connectors a lite workspace tier cannot serve (``workspace_tier_refuses``)
-    are silently omitted because this is an implicit default rather than an
-    explicit user requirement.
+    The work's own connectors (``_native_default``: a target project's
+    knowledge base and cloud folder, the owner's own) are the project-managed
+    exception, and a project admin's connector defaults
+    (``project_connector_defaults``, slice D3c) add the connectors linked to
+    every target project that the project chose (candidate rows flagged
+    ``project_default``), whatever their owner's own ``auto_attach``.
+    ``native_only`` keeps only the work's own connectors: what work that
+    names no connector list attaches when the deployment does not attach
+    defaults on omission. Connectors a lite workspace tier cannot serve
+    (``workspace_tier_refuses``), or this kind of execution cannot attach
+    (``execution_kind_refuses``: a cloud folder is a session's), are silently
+    omitted because this is an implicit default rather than an explicit user
+    requirement.
 
     The revision snapshot comes from the exact candidate rows used for the
     decision. Callers pass both values to the atomic creation API, which locks
@@ -372,11 +406,10 @@ async def default_datasource_selection(
     for row in rows:
         if not _scope_matches(row, target_set) or _user_kind_refuses(row, owner_id):
             continue
-        native_project_id = _native_project_id(row)
-        owned =str(row.get("created_by") or "") == owner_id
-        native_default = (
-            native_project_id is not None and native_project_id in target_set
-        )
+        owned = str(row.get("created_by") or "") == owner_id
+        native_default = _native_default(row, owner_id, target_set)
+        if native_only and not native_default:
+            continue
         project_default = (
             bool(row.get("project_default"))
             and bool(target_set)
@@ -387,6 +420,8 @@ async def default_datasource_selection(
         ):
             continue
         if workspace_tier_refuses(row, workspace_backend):
+            continue
+        if execution_kind_refuses(row, execution_kind):
             continue
         try:
             datasource_id = str(UUID(str(row["id"])))
@@ -406,6 +441,9 @@ async def default_datasource_ids(
     effective_work_owner_id: str | None,
     target_project_ids: list[str] | None,
     workspace_backend: str | None,
+    *,
+    execution_kind: Literal["session", "job"],
+    native_only: bool = False,
 ) -> list[str]:
     """Compatibility wrapper returning only creation-time default IDs."""
     selected, _revisions = await default_datasource_selection(
@@ -413,6 +451,8 @@ async def default_datasource_ids(
         effective_work_owner_id,
         target_project_ids,
         workspace_backend,
+        execution_kind=execution_kind,
+        native_only=native_only,
     )
     return selected
 
@@ -428,5 +468,6 @@ __all__ = [
     "classify_datasource_selection",
     "default_datasource_ids",
     "default_datasource_selection",
+    "execution_kind_refuses",
     "workspace_tier_refuses",
 ]

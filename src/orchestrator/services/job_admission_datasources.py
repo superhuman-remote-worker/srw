@@ -66,9 +66,9 @@ class JobAdmissionDatasourcesDependencies:
     inherit_parent_ids: InheritParentDatasourceIds
     filter_implicit_lite_ids: Callable[[list[str], str | None], Awaitable[list[str]]]
     authorize_selection: AuthorizeDatasourceSelection
-    default_selection: Callable[
-        [str, list[str], str | None], Awaitable[tuple[list[str], dict[str, int]]]
-    ]
+    # ``datasource_policy.default_datasource_selection`` over the store:
+    # ``(owner, projects, backend, *, execution_kind, native_only=False)``.
+    default_selection: Callable[..., Awaitable[tuple[list[str], dict[str, int]]]]
     defaults_on_omission: Callable[[], bool]
     selection_provenance: DatasourceSelectionProvenance
     # ``execution.connectors`` refs to connector ids (services.connector_refs).
@@ -131,8 +131,8 @@ async def prepare_job_admission_datasources(
     # dropped.
     #
     # Cost of that, found live on Better Resavio 2026-08-15: the officer's
-    # own thread had been created without a selection, which persists as
-    # ``datasource_ids: []`` (origin ``omitted_compat``). Every job he
+    # own thread had been created without a selection, which then persisted
+    # as ``datasource_ids: []`` (origin ``omitted_compat``). Every job he
     # commissioned faithfully inherited the empty list, so his workers got
     # no KurortEngine checkout, could not clone/commit/push, and he
     # correctly refused to dispatch further against a candidate that could
@@ -205,10 +205,15 @@ async def prepare_job_admission_datasources(
             trusted_system_inheritance=trusted_system_origin,
             legacy_job_id=str(job.parent_job_id) if job.parent_job_id else None,
         )
-    elif effective_user_id and (
-        job.use_datasource_defaults or dependencies.defaults_on_omission()
-    ):
-        selection_origin = "default"
+    elif effective_user_id:
+        # Omission attaches the job's own connectors (its project's knowledge
+        # base; a cloud folder is a session's), and every other default when
+        # the caller asks or the deployment attaches defaults on omission.
+        # An explicit [] (above) attaches nothing.
+        every_default = bool(
+            job.use_datasource_defaults or dependencies.defaults_on_omission()
+        )
+        selection_origin = "default" if every_default else "native_default"
         try:
             (
                 selected_ds_ids,
@@ -217,6 +222,8 @@ async def prepare_job_admission_datasources(
                 str(effective_user_id),
                 target_project_ids,
                 lite_backend,
+                execution_kind="job",
+                native_only=not every_default,
             )
         except Exception as exc:
             from orchestrator.services.datasource_policy import (
@@ -230,7 +237,7 @@ async def prepare_job_admission_datasources(
                 ) from exc
             raise
     else:
-        selection_origin = "omitted_compat" if effective_user_id else "system_empty"
+        selection_origin = "system_empty"
         selected_ds_ids = []
         selected_ds_revisions = {}
 

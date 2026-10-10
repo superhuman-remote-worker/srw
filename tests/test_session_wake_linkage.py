@@ -145,6 +145,9 @@ def linkage_db():
     db.link_datasource_to_job = AsyncMock()
     # No project_workspace_defaults row: the installation decides the tier.
     db.fetchrow = AsyncMock(return_value=None)
+    # An omitted connector list attaches the job's own connectors (none here).
+    db.user_is_member_of_projects = AsyncMock(return_value=True)
+    db.list_default_datasource_candidates = AsyncMock(return_value=[])
     return db
 
 

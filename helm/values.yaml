@@ -965,8 +965,11 @@ agent:
   # the former agent.mcpStdioEnabled fails the render when set to true.
   mcpDatasourcesEnabled: "false"
   # -- Temporary compatibility gate for REST/session requests that omit
-  # datasource_ids. Cockpit submits an explicit reviewed array; enable this
-  # after legacy clients no longer encode "none" by omission.
+  # datasource_ids. Omission always attaches the project's own platform-owned
+  # connectors (knowledge base, cloud folder); this gate adds the owner's and
+  # the project's other defaults. An explicit [] attaches none. Cockpit
+  # submits an explicit reviewed array; enable this after legacy clients no
+  # longer encode "none" by omission.
   datasourceDefaultsOnOmission: "false"
   # -- Coordinated rollout gate for the connector project-scope/auto-attach UI.
   # Keep false until all orchestrator replicas understand the v1 API contract.

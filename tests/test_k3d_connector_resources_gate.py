@@ -125,20 +125,13 @@ def test_the_expected_details_are_the_products():
 
     assert gate.LINKED_CONNECTOR_MESSAGE == manifest_store.LINKED_CONNECTOR_MESSAGE
     assert gate.PLATFORM_MANAGED_MESSAGE == manifest_store.PLATFORM_MANAGED_MESSAGE
-    sources = {
-        path: (gate.ROOT / path).read_text()
-        for path in (
-            "src/orchestrator/services/datasources.py",
-            "src/orchestrator/services/projects.py",
-        )
-    }
-    text = "".join(sources.values())
-    for detail in (
-        gate.NATIVE_POLICY_DETAIL,
-        gate.NATIVE_DELETE_DETAIL,
-        gate.NATIVE_UNLINK_DETAIL,
-    ):
-        assert detail in text
+    # The API's locks word a knowledge base's refusals by its managed key.
+    from shared.connectors.platform import managed_refusal, project_kb_key
+
+    native_kb = {"managed_key": project_kb_key(uuid.uuid4())}
+    assert gate.NATIVE_POLICY_DETAIL == managed_refusal(native_kb, "policy")
+    assert gate.NATIVE_DELETE_DETAIL == managed_refusal(native_kb, "delete")
+    assert gate.NATIVE_UNLINK_DETAIL == managed_refusal(native_kb, "unlink")
     from shared.connectors.builtin import MCP_REMOTE_DRIVER
 
     assert gate.MCP_REMOTE_DRIVER == MCP_REMOTE_DRIVER

@@ -118,7 +118,7 @@ async def test_explicit_presence_wins_over_thread_inheritance_and_defaults(
 @pytest.mark.parametrize(
     "thread,parent,requested_defaults,omission_defaults,origin,flag_reads",
     [
-        (None, None, False, False, "omitted_compat", 1),
+        (None, None, False, False, "native_default", 1),
         (None, None, False, True, "default", 1),
         (None, None, True, False, "default", 0),
         (THREAD, None, False, False, "inherited", 0),
@@ -162,19 +162,22 @@ async def test_dispatch_defaults_do_not_widen_parented_delegation(
             legacy_job_id=parent,
         )
         deps.default_selection.assert_not_awaited()
-    elif origin == "default":
+    else:
+        # Omission: the job's own connectors, and every other default when
+        # asked for or attached on omission.
         assert (result.datasource_ids, result.policy_revisions) == (
             [OTHER],
             {OTHER: 11},
         )
-        deps.default_selection.assert_awaited_once_with(USER, [PROJECT], "virtual")
+        deps.default_selection.assert_awaited_once_with(
+            USER,
+            [PROJECT],
+            "virtual",
+            execution_kind="job",
+            native_only=origin == "native_default",
+        )
         deps.inherit_parent_ids.assert_not_awaited()
         deps.authorize_selection.assert_not_awaited()
-    else:
-        assert result.datasource_ids == [] and result.policy_revisions == {}
-        deps.inherit_parent_ids.assert_not_awaited()
-        deps.authorize_selection.assert_not_awaited()
-        deps.default_selection.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -414,8 +417,9 @@ async def test_concurrent_preparations_keep_their_dependencies_and_scope(deps):
     waiting = asyncio.Event()
     release = asyncio.Event()
 
-    async def suspended_default(owner, projects, backend):
+    async def suspended_default(owner, projects, backend, **kinds):
         assert (owner, projects, backend) == (USER, [PROJECT], "virtual")
+        assert kinds == {"execution_kind": "job", "native_only": False}
         waiting.set()
         await release.wait()
         return [CONNECTOR], {CONNECTOR: 23}

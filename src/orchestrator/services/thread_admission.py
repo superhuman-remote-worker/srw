@@ -13,7 +13,7 @@ The operation is split along the seams it already had, not into helpers:
   ``delegation``/``workspace``/``tools``/``officer`` block is carried (or named
   as dropped) is testable on its own.
 * :func:`select_thread_datasources` — the three-way selection origin
-  (``explicit`` / ``default`` / ``omitted_compat``) plus its provenance stamp.
+  (``explicit`` / ``default`` / ``native_default``) plus its provenance stamp.
 * :func:`resolve_thread_creation_plan` — every admission decision and every
   refusal, ending in the exact ``create_thread`` INSERT arguments. Nothing here
   has a side effect outside the request.
@@ -425,9 +425,13 @@ async def select_thread_datasources(
 ) -> tuple[list[str], dict[str, int], dict[str, Any]]:
     """Materialize one complete selection with the thread row.
 
-    Cockpit sends a reviewed array (including ``[]``); omission is temporarily
-    gated for older API clients that encoded an opt-out by leaving the field
-    out. Returns ``(ids, policy_revisions, provenance)``.
+    An explicit list (the cockpit's reviewed array, ``execution`` refs) is
+    exactly what attaches: ``[]`` attaches nothing, the project's own
+    connectors included. Omission attaches the session's own connectors (its
+    projects' knowledge base and cloud folder, ``native_default``), plus every
+    other default when the caller asks (``use_datasource_defaults``) or the
+    deployment attaches defaults on omission. Returns
+    ``(ids, policy_revisions, provenance)``.
     """
     requested_ids = request_body.datasource_ids or []
     if request_body.execution is not None:
@@ -456,16 +460,17 @@ async def select_thread_datasources(
             target_project_ids=effective_project_ids,
             effective_work_owner_id=str(user["id"]),
         )
-    elif (
-        request_body.use_datasource_defaults
-        or dependencies.datasource_defaults_on_omission()
-    ):
+    else:
         from orchestrator.services.datasource_policy import (
             DatasourceUnavailableError,
             default_datasource_selection,
         )
 
-        thread_selection_origin = "default"
+        every_default = bool(
+            request_body.use_datasource_defaults
+            or dependencies.datasource_defaults_on_omission()
+        )
+        thread_selection_origin = "default" if every_default else "native_default"
         try:
             (
                 selected_thread_datasource_ids,
@@ -475,16 +480,14 @@ async def select_thread_datasources(
                 str(user["id"]),
                 effective_project_ids,
                 thread_backend,
+                execution_kind="session",
+                native_only=not every_default,
             )
         except DatasourceUnavailableError as exc:
             raise HTTPException(
                 status_code=403,
                 detail="One or more selected connectors are unavailable",
             ) from exc
-    else:
-        thread_selection_origin = "omitted_compat"
-        selected_thread_datasource_ids = []
-        selected_thread_datasource_revisions = {}
 
     thread_selection_provenance = await datasource_selection_provenance(
         datasource_ids=selected_thread_datasource_ids,
@@ -1682,11 +1685,15 @@ async def list_threads(
                 t, mounts_by_thread.get(str(t["id"]), [])
             )
         if getattr(dependencies.store, "supports_vm_creation_retry", False):
-            from orchestrator.services.vm_creation_owner_view import thread_creation_views
+            from orchestrator.services.vm_creation_owner_view import (
+                thread_creation_views,
+            )
 
             progress = await thread_creation_views(
-                dependencies.store, [str(t["id"]) for t in threads],
-                viewer_user_id=str(user["id"]), admin=user.get("is_admin") is True,
+                dependencies.store,
+                [str(t["id"]) for t in threads],
+                viewer_user_id=str(user["id"]),
+                admin=user.get("is_admin") is True,
             )
             for t in threads:
                 t["vm_creation"] = progress.get(str(t["id"]))

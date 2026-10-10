@@ -171,6 +171,7 @@ class TestCreateJobFromAutomation:
             row["owner_id"],
             [project_id],
             "sandbox",
+            execution_kind="job",
         )
         kwargs = db.create_job.await_args.kwargs
         assert kwargs["datasource_ids"] == selected
@@ -204,6 +205,7 @@ class TestCreateJobFromAutomation:
             row["owner_id"],
             [],
             "virtual",
+            execution_kind="job",
         )
 
     @pytest.mark.asyncio

@@ -561,7 +561,7 @@ async def test_a_project_default_attaches_for_every_member_while_linked():
         _row(KB, owner=member, projects=(), automatic=True, scope_mode="all"),
     ]
     selected, revisions = await default_datasource_selection(
-        _policy_db(rows), member, [PROJECT], "sandbox"
+        _policy_db(rows), member, [PROJECT], "sandbox", execution_kind="session"
     )
     assert selected == [CONNECTOR, KB]
     assert revisions == {CONNECTOR: 1, KB: 1}
@@ -577,11 +577,15 @@ async def test_a_project_default_needs_its_link_to_every_target():
         )
     ]
     selected, _ = await default_datasource_selection(
-        _policy_db(rows), OWNER, [PROJECT], "sandbox"
+        _policy_db(rows), OWNER, [PROJECT], "sandbox", execution_kind="session"
     )
     assert selected == []
     selected, _ = await default_datasource_selection(
-        _policy_db([_row(CONNECTOR, project_default=True)]), OWNER, [], "sandbox"
+        _policy_db([_row(CONNECTOR, project_default=True)]),
+        OWNER,
+        [],
+        "sandbox",
+        execution_kind="session",
     )
     assert selected == []
 
@@ -590,7 +594,7 @@ async def test_a_project_default_needs_its_link_to_every_target():
 async def test_a_project_default_a_lite_tier_cannot_serve_is_left_out():
     rows = [_row(CONNECTOR, project_default=True, type="repository")]
     selected, _ = await default_datasource_selection(
-        _policy_db(rows), OWNER, [PROJECT], "virtual"
+        _policy_db(rows), OWNER, [PROJECT], "virtual", execution_kind="session"
     )
     assert selected == []
 

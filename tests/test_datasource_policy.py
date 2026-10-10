@@ -16,6 +16,7 @@ from orchestrator.services.datasource_policy import (
     classify_datasource_selection,
     default_datasource_ids,
     default_datasource_selection,
+    execution_kind_refuses,
     workspace_tier_refuses,
 )
 from orchestrator.application import preparation as preparation_composition
@@ -250,7 +251,10 @@ async def test_public_publishers_cannot_set_another_users_defaults():
         ]
     )
 
-    assert await default_datasource_ids(db, OWNER, [], "sandbox") == []
+    assert (
+        await default_datasource_ids(db, OWNER, [], "sandbox", execution_kind="session")
+        == []
+    )
 
 
 @pytest.mark.asyncio
@@ -267,7 +271,7 @@ async def test_native_project_kb_is_project_managed_default():
     db = _db([native])
 
     assert await default_datasource_ids(
-        db, OWNER, [PROJECT_A, PROJECT_B], "sandbox"
+        db, OWNER, [PROJECT_A, PROJECT_B], "sandbox", execution_kind="session"
     ) == [DS_NATIVE]
 
 
@@ -285,11 +289,16 @@ async def test_native_project_cloud_folder_is_project_managed_default():
     )
     db = _db([native])
 
-    assert await default_datasource_ids(db, OWNER, [PROJECT_A], "sandbox") == [
-        DS_NATIVE
-    ]
+    assert await default_datasource_ids(
+        db, OWNER, [PROJECT_A], "sandbox", execution_kind="session"
+    ) == [DS_NATIVE]
     # Another project's work neither defaults to it nor may name it.
-    assert await default_datasource_ids(db, OWNER, [PROJECT_B], "sandbox") == []
+    assert (
+        await default_datasource_ids(
+            db, OWNER, [PROJECT_B], "sandbox", execution_kind="session"
+        )
+        == []
+    )
     with pytest.raises(DatasourceUnavailableError):
         await authorize_datasource_ids(
             db, {"id": OWNER}, OWNER, [DS_NATIVE], [PROJECT_B], "sandbox"
@@ -353,13 +362,87 @@ async def test_a_users_own_connector_defaults_only_for_its_user():
     root = _user_root(scope="projects", projects=(PROJECT_A,))
     root["project_default"] = True
     db = _db([root])
-    assert await default_datasource_ids(db, OWNER, [PROJECT_A], "sandbox") == [
-        DS_NATIVE
-    ]
-    assert await default_datasource_ids(db, OTHER, [PROJECT_A], "sandbox") == []
+    assert await default_datasource_ids(
+        db, OWNER, [PROJECT_A], "sandbox", execution_kind="session"
+    ) == [DS_NATIVE]
+    assert (
+        await default_datasource_ids(
+            db, OTHER, [PROJECT_A], "sandbox", execution_kind="session"
+        )
+        == []
+    )
     mismatched = _user_root()
     mismatched["created_by"] = OTHER
-    assert await default_datasource_ids(_db([mismatched]), OTHER, [], "sandbox") == []
+    assert (
+        await default_datasource_ids(
+            _db([mismatched]), OTHER, [], "sandbox", execution_kind="session"
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_only_keeps_the_works_own_and_jobs_never_get_a_folder():
+    kb = _row(
+        DS_NATIVE,
+        owner=None,
+        scope="projects",
+        projects=(PROJECT_A,),
+        automatic=True,
+        ds_type="kb",
+        managed_key=f"project-kb:{PROJECT_A}",
+    )
+    folder = _row(
+        DS_SHARED,
+        owner=OTHER,
+        scope="projects",
+        projects=(PROJECT_A,),
+        automatic=True,
+        ds_type="cloud_folder",
+        managed_key=f"project-cloud:{PROJECT_A}",
+    )
+    other_folder = _row(
+        DS_REPOSITORY,
+        owner=OTHER,
+        scope="projects",
+        projects=(PROJECT_B,),
+        automatic=True,
+        ds_type="cloud_folder",
+        managed_key=f"project-cloud:{PROJECT_B}",
+    )
+    owned = _row(DS_OWNED, automatic=True)
+    db = _db([kb, folder, other_folder, owned])
+
+    async def defaults(kind, *, native_only):
+        return set(
+            await default_datasource_ids(
+                db,
+                OWNER,
+                [PROJECT_A],
+                "sandbox",
+                execution_kind=kind,
+                native_only=native_only,
+            )
+        )
+
+    assert await defaults("session", native_only=True) == {DS_NATIVE, DS_SHARED}
+    assert await defaults("session", native_only=False) == {
+        DS_NATIVE,
+        DS_SHARED,
+        DS_OWNED,
+    }
+    assert await defaults("job", native_only=True) == {DS_NATIVE}
+    assert await defaults("job", native_only=False) == {DS_NATIVE, DS_OWNED}
+
+
+def test_the_driver_names_the_executions_a_connector_serves():
+    folder = _row(DS_NATIVE, ds_type="cloud_folder")
+    assert execution_kind_refuses(folder, "job")
+    assert not execution_kind_refuses(folder, "session")
+    assert not execution_kind_refuses(folder, None)
+    assert not execution_kind_refuses(_row(DS_OWNED), "job")
+    # A type no driver serves refuses nothing.
+    assert not execution_kind_refuses(_row(DS_OWNED, ds_type="unknown"), "job")
 
 
 @pytest.mark.asyncio
@@ -371,7 +454,10 @@ async def test_lite_tier_filters_implicit_repository_but_rejects_explicit_one():
     )
     db = _db([repository])
 
-    assert await default_datasource_ids(db, OWNER, [], "virtual") == []
+    assert (
+        await default_datasource_ids(db, OWNER, [], "virtual", execution_kind="session")
+        == []
+    )
     with pytest.raises(DatasourceWorkspaceTierError):
         await authorize_datasource_ids(
             db,
@@ -399,6 +485,7 @@ async def test_default_selection_returns_revisions_from_decision_rows():
         OWNER,
         [],
         "virtual",
+        execution_kind="session",
     )
 
     assert selected == [DS_OWNED]
@@ -411,7 +498,9 @@ async def test_named_owner_membership_loss_fails_closed():
     db = _db([_row(DS_OWNED, automatic=True)], member=False)
 
     with pytest.raises(DatasourceUnavailableError):
-        await default_datasource_ids(db, OWNER, [PROJECT_A], "sandbox")
+        await default_datasource_ids(
+            db, OWNER, [PROJECT_A], "sandbox", execution_kind="session"
+        )
 
 
 def test_delivery_snapshot_rejects_missing_or_revision_changed_rows():
@@ -551,7 +640,9 @@ async def test_admin_effective_owner_uses_project_acl_without_membership_row():
         return_value={"id": OWNER, "is_approved": True, "is_admin": True}
     )
 
-    assert await default_datasource_ids(db, OWNER, [PROJECT_A], "sandbox") == [DS_OWNED]
+    assert await default_datasource_ids(
+        db, OWNER, [PROJECT_A], "sandbox", execution_kind="session"
+    ) == [DS_OWNED]
 
 
 @pytest.mark.asyncio

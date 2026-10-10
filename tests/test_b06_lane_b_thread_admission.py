@@ -94,6 +94,11 @@ def _deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         bind_thread_managed_repository=AsyncMock(return_value=True),
         update_thread_main_cloud=AsyncMock(),
         thread_advisory_lock=_lock(),
+        # The policy reads behind an omitted connector list (the session's
+        # own connectors): an approved member with none.
+        get_user=AsyncMock(return_value={"id": USER["id"], "is_approved": True}),
+        user_is_member_of_projects=AsyncMock(return_value=True),
+        list_default_datasource_candidates=AsyncMock(return_value=[]),
     )
     for key, value in store_over.items():
         setattr(store, key, value)
@@ -292,38 +297,58 @@ class TestDatasourceSelection:
         deps.authorize_thread_datasource_selection.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_omission_without_the_gate_selects_nothing(self):
+    async def test_omission_without_the_gate_selects_the_sessions_own(
+        self, monkeypatch
+    ):
+        from orchestrator.services import datasource_policy
+
+        resolver = AsyncMock(return_value=(["kb", "cloud"], {"kb": 1, "cloud": 3}))
+        monkeypatch.setattr(datasource_policy, "default_datasource_selection", resolver)
         deps = _deps()
-        ids, _revisions, provenance = await ta.select_thread_datasources(
+        ids, revisions, provenance = await ta.select_thread_datasources(
             ThreadCreateRequest(),
             USER,
             thread_backend="sandbox",
-            effective_project_ids=[],
+            effective_project_ids=[PROJECT],
             dependencies=deps,
         )
-        assert ids == []
-        assert provenance["origin"] == "omitted_compat"
+        assert ids == ["kb", "cloud"] and revisions == {"kb": 1, "cloud": 3}
+        assert provenance["origin"] == "native_default"
+        resolver.assert_awaited_once_with(
+            deps.store,
+            USER["id"],
+            [PROJECT],
+            "sandbox",
+            execution_kind="session",
+            native_only=True,
+        )
         deps.authorize_thread_datasource_selection.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_defaults_are_resolved_when_the_caller_asks(self, monkeypatch):
         from orchestrator.services import datasource_policy
 
-        monkeypatch.setattr(
-            datasource_policy,
-            "default_datasource_selection",
-            AsyncMock(return_value=(["d1"], {"d1": 2})),
-        )
+        resolver = AsyncMock(return_value=(["d1"], {"d1": 2}))
+        monkeypatch.setattr(datasource_policy, "default_datasource_selection", resolver)
+        deps = _deps()
         ids, revisions, provenance = await ta.select_thread_datasources(
             ThreadCreateRequest(use_datasource_defaults=True),
             USER,
             thread_backend="sandbox",
             effective_project_ids=[PROJECT],
-            dependencies=_deps(),
+            dependencies=deps,
         )
         assert ids == ["d1"] and revisions == {"d1": 2}
         assert provenance["origin"] == "default"
         assert provenance["creation_path"] == "persistent_thread_rest"
+        resolver.assert_awaited_once_with(
+            deps.store,
+            USER["id"],
+            [PROJECT],
+            "sandbox",
+            execution_kind="session",
+            native_only=False,
+        )
 
     @pytest.mark.asyncio
     async def test_an_unavailable_default_is_the_generic_403(self, monkeypatch):

@@ -509,6 +509,9 @@ def job_db():
     db.get_datasource = AsyncMock(return_value=None)
     db.link_datasource_to_job = AsyncMock()
     db.create_job = AsyncMock(return_value={"id": JOB_ID, "status": "created"})
+    # An omitted connector list attaches the job's own connectors (none here).
+    db.user_is_member_of_projects = AsyncMock(return_value=True)
+    db.list_default_datasource_candidates = AsyncMock(return_value=[])
     return db
 
 
@@ -770,6 +773,11 @@ def session_create_env(monkeypatch):
         merge_thread_workspace_context=AsyncMock(return_value=True),
         list_thread_mounts=AsyncMock(return_value=[]),
         replace_thread_mounts=AsyncMock(),
+        # An omitted connector list attaches the session's own connectors:
+        # the policy reads behind it, for an approved owner with none.
+        get_user=AsyncMock(return_value={"id": SESSION_USER_ID, "is_approved": True}),
+        user_is_member_of_projects=AsyncMock(return_value=True),
+        list_default_datasource_candidates=AsyncMock(return_value=[]),
     )
     user = {"id": SESSION_USER_ID, "is_admin": False}
 
@@ -1463,6 +1471,8 @@ class TestSessionCreateBoundary:
             SESSION_USER_ID,
             [],
             "virtual",
+            execution_kind="session",
+            native_only=False,
         )
         kwargs = db.create_thread.await_args.kwargs
         assert kwargs["datasource_ids"] == [SESSION_DATASOURCE_ID]

@@ -738,7 +738,7 @@ async def test_project_connector_defaults_settings_and_selection(database):
 
     async def defaults_for(user):
         selected, _ = await default_datasource_selection(
-            db, user["id"], [project], "sandbox"
+            db, user["id"], [project], "sandbox", execution_kind="session"
         )
         return selected
 
@@ -764,7 +764,9 @@ async def test_project_connector_defaults_settings_and_selection(database):
     assert (await read_view(db, project_row, owner))["can_edit"] is True
 
     # A projectless session never takes a project's defaults.
-    selected, _ = await default_datasource_selection(db, member["id"], [], "sandbox")
+    selected, _ = await default_datasource_selection(
+        db, member["id"], [], "sandbox", execution_kind="session"
+    )
     assert shared not in selected
 
     # Unlinked, it is no default any more, and the stored id is pruned.
@@ -795,7 +797,7 @@ async def test_manifest_owns_its_connector_defaults_until_it_goes(database):
         UUID(member["id"]),
     )
     selected, _ = await default_datasource_selection(
-        db, member["id"], [project], "sandbox"
+        db, member["id"], [project], "sandbox", execution_kind="session"
     )
     assert selected == [connector]
     with pytest.raises(HTTPException, match=MANAGED_BY_MANIFEST):

@@ -27,7 +27,16 @@ from orchestrator.services import project_cloud_connectors
 from orchestrator.services.datasource_policy import default_datasource_selection
 from orchestrator.services.manifest_store import ManifestStore
 from tests import test_manifest_native_full_schema as full_schema
-from tests.test_project_connectors_real_postgres import _links, _listed, _project, _user
+from tests.test_project_connectors_real_postgres import (
+    _connector,
+    _job_selection,
+    _knowledge_base,
+    _links,
+    _listed,
+    _project,
+    _session_selection,
+    _user,
+)
 
 database = full_schema.database
 postgres_url = full_schema.postgres_url
@@ -180,13 +189,56 @@ async def test_every_member_may_use_it_and_no_other_project(database):
         }
 
     selected, _revisions = await default_datasource_selection(
-        database, member["id"], [str(project["id"])], "sandbox"
+        database,
+        member["id"],
+        [str(project["id"])],
+        "sandbox",
+        execution_kind="session",
     )
     assert row_id in selected
     selected, _revisions = await default_datasource_selection(
-        database, member["id"], [other], "sandbox"
+        database, member["id"], [other], "sandbox", execution_kind="session"
     )
     assert row_id not in selected
+    # A cloud folder mounts into sessions: a job never defaults to it.
+    selected, _revisions = await default_datasource_selection(
+        database, member["id"], [str(project["id"])], "sandbox", execution_kind="job"
+    )
+    assert row_id not in selected
+
+
+@pytest.mark.asyncio
+async def test_an_omitted_list_attaches_the_works_own_and_an_empty_one_nothing(
+    database,
+):
+    owner = await _user(database, "Owner")
+    member = await _user(database, "Member")
+    instance = await _instance(database)
+    project = await _cloud_project(
+        database, "Omission", owner, instance, **{member["id"]: "editor"}
+    )
+    project_id = str(project["id"])
+    await _ensure(database, project, instance)
+    [cloud] = [str(row["id"]) for row in await _native_rows(database, project_id)]
+    kb = await _knowledge_base(database, project_id, owner)
+    # The member's own auto-attach connector: a default only when every
+    # default is asked for.
+    own = await _connector(database, "Mine", member, scope_mode="all", auto_attach=True)
+
+    async def session(**fields):
+        ids, _ = await _session_selection(database, member, project_id, **fields)
+        return set(ids)
+
+    async def job(**fields):
+        ids, _ = await _job_selection(database, member, project_id, **fields)
+        return set(ids)
+
+    assert await session() == {kb, cloud}
+    assert await session(datasource_ids=[]) == set()
+    assert await session(use_datasource_defaults=True) == {kb, cloud, own}
+    assert await job() == {kb}
+    assert await job(datasource_ids=[]) == set()
+    assert await job(use_datasource_defaults=True) == {kb, own}
 
 
 @pytest.mark.asyncio
@@ -298,7 +350,7 @@ async def test_a_users_own_connector_is_eligible_for_that_user_only(database):
     }
     assert row_id not in candidates
     selected, _revisions = await default_datasource_selection(
-        database, owner["id"], [project], "sandbox"
+        database, owner["id"], [project], "sandbox", execution_kind="session"
     )
     assert row_id in selected
 

@@ -148,7 +148,12 @@ class JobCreate(BaseModel):
         ),
     )
     datasource_ids: list[str] | None = Field(
-        None, description="Connector IDs to attach to the job"
+        None,
+        description=(
+            "Connector IDs to attach to the job; [] attaches none. Omit for "
+            "the project's own connectors (its knowledge base), plus the "
+            "other defaults when enabled."
+        ),
     )
     use_datasource_defaults: bool = Field(
         False,

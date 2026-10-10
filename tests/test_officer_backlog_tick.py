@@ -903,6 +903,11 @@ class TestTickOfficer:
         assert counts["dispatched"] == 1
         assert db.created["datasource_ids"] == [KB_DS, REPO_DS]
         assert db.created["datasource_policy_revisions"] == {KB_DS: 2, REPO_DS: 4}
+        # A dispatched worker is a job: a session-only connector (a cloud
+        # folder) is never among its defaults.
+        assert mod.default_datasource_selection.await_args.kwargs == {
+            "execution_kind": "job"
+        }
         provenance = db.created["datasource_selection_provenance"]
         assert provenance["origin"] == "default"
         assert provenance["creation_path"] == "officer_backlog_tick"

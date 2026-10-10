@@ -514,7 +514,7 @@ async def test_the_picker_preselects_a_project_default(database):
     assert linked not in await preselected(member, [])
     # The picker and creation agree.
     selected, _ = await default_datasource_selection(
-        db, member["id"], [project], "sandbox"
+        db, member["id"], [project], "sandbox", execution_kind="session"
     )
     assert set(selected) == {kb, linked}
 

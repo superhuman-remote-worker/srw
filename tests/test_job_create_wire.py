@@ -1037,7 +1037,9 @@ async def test_actual_create_json_keeps_row_nulls_extensions_and_serialization(
 @pytest.mark.parametrize(
     "selection,gate,expected,origin",
     [
-        ({}, False, [], "omitted_compat"),
+        # Omission: the job's own connectors (the resolver's native_only),
+        # every default with the gate; an explicit [] attaches nothing.
+        ({}, False, [CONNECTOR], "native_default"),
         ({}, True, [CONNECTOR], "default"),
         ({"datasource_ids": []}, True, [], "explicit"),
         ({"datasource_ids": [CONNECTOR]}, False, [CONNECTOR], "explicit"),
@@ -1060,7 +1062,13 @@ async def test_datasource_wire_presence_preserves_selection_intent(
     args = wire.db.create_job.await_args.kwargs
     assert args["datasource_ids"] == expected
     assert args["datasource_selection_provenance"]["origin"] == origin
-    assert wire.defaults.await_count == (origin == "default")
+    resolved = origin in {"default", "native_default"}
+    assert wire.defaults.await_count == resolved
+    if resolved:
+        assert wire.defaults.await_args.kwargs == {
+            "execution_kind": "job",
+            "native_only": origin == "native_default",
+        }
 
 
 @pytest.mark.asyncio

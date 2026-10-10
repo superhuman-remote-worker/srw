@@ -82,6 +82,11 @@ def _admission_deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         bind_thread_managed_repository=AsyncMock(return_value=True),
         update_thread_main_cloud=AsyncMock(),
         thread_advisory_lock=_lock(),
+        # The policy reads behind an omitted connector list (the session's
+        # own connectors): an approved member with none.
+        get_user=AsyncMock(return_value={"id": "u", "is_approved": True}),
+        user_is_member_of_projects=AsyncMock(return_value=True),
+        list_default_datasource_candidates=AsyncMock(return_value=[]),
     )
     for key, value in store_over.items():
         setattr(store, key, value)

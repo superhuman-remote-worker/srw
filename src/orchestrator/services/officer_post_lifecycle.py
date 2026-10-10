@@ -468,8 +468,8 @@ async def commission_project_officer(
         # Third field of this shape, after config_name and permission_mode:
         # the endpoint hand-builds the funnel request and omits what the UI
         # supplies (buildConferenceThreadCreateBody sends exactly this for the
-        # conference thread). Without it the post falls to ``omitted_compat``
-        # and persists ``datasource_ids: []``, which is then inherited by
+        # conference thread). Without it the post gets only the project's own
+        # connectors (``native_default``), which is then inherited by
         # anything that legitimately reads the officer's own selection. His
         # tier is lite, so default_datasource_selection correctly withholds
         # clone-based repositories here — dispatch resolves defaults again
