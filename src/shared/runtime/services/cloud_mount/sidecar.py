@@ -66,6 +66,16 @@ REASON_TEXT = {
     "access_unavailable": "the cloud offers no access to it in this kind of workspace",
     "not_eligible": "this session may no longer use it",
     "config_invalid": "it is not a cloud folder SRW set up",
+    # A user's own root (main cloud slice 4): their own account, connected
+    # by them.
+    "cloud_not_connected": (
+        "the user has not connected their cloud yet: they connect it under "
+        "Settings, Connectors"
+    ),
+    "cloud_grant_revoked": (
+        "the cloud no longer accepts the user's connection: they reconnect it "
+        "under Settings, Connectors"
+    ),
     "no_session_folder": "SRW has not created this session's outbox folder",
     "backend_unavailable": "the main cloud was not reachable when the session started",
     "beside_protected": "a protected session mounts only its protected folder",
@@ -78,7 +88,10 @@ FOLDER_KIND_TEXT = {
         "a folder SRW created for this session and shared with the user; it is "
         "not the project folder"
     ),
-    "user_root": "the user's own files in the main cloud",
+    "user_root": (
+        "the user's own files in the main cloud, everything they see in Files "
+        "including project folders they belong to; full access"
+    ),
     "protected_lower": (
         "the project's folder, protected: what you change there reaches the "
         "cloud only after the owner approves it"

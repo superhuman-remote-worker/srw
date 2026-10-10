@@ -57,7 +57,7 @@ class TestTheDeclarations:
             ("offered", ["sandbox", "vm"], None),  # project · read_only (reader)
             ("offered", ["sandbox"], None),  # project · read_write (writer)
             ("offered", ["sandbox"], None),  # project · protected (container only)
-            ("planned", ["sandbox"], 4),  # user root · read_write (app token)
+            ("offered", ["sandbox"], None),  # user root · read_write (app token)
             ("unsupported", [], None),  # user root · read_only
             ("unsupported", [], None),  # user root · protected
             ("offered", ["sandbox", "vm"], None),  # checkout
@@ -109,7 +109,11 @@ class TestTheDriverVocabulary:
         assert [(level.id, level.rank) for level in levels] == [("read_write", 30)]
 
     def test_planned_and_unsupported_levels_are_absent(self):
-        assert NEXTCLOUD.access_levels("cloud_folder", "user_root") == ()
+        # A user root offers read_write only: its app token can be limited
+        # to neither read-only nor one folder.
+        levels = NEXTCLOUD.access_levels("cloud_folder", "user_root")
+        assert [level.id for level in levels] == ["read_write"]
+        assert OPENCLOUD.access_levels("cloud_folder", "user_root") == ()
 
 
 class TestQueries:

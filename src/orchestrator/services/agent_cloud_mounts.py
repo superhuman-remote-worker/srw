@@ -44,6 +44,7 @@ from orchestrator.services.cloud import (
     provider_offers,
 )
 from orchestrator.services.cloud import folder_grants
+from orchestrator.services.cloud.user_root_grant import SupportsUserRootGrant
 from orchestrator.services.cloud.folder_grants import (
     KIND_FOR_ACCESS,
     FolderGrantTarget,
@@ -238,6 +239,13 @@ def _build_agent_cloud_sync(
                 "account; skipped",
                 row.get("id") or row.get("source_ref"),
             )
+            continue
+        if row.get("mount_kind") == "project_default" and isinstance(
+            backend, SupportsUserRootGrant
+        ):
+            # A user's root of a provider with user roots is the user's own
+            # connector, mounted with their own credential (main cloud slice
+            # 4): never synced as the service account.
             continue
         cfg = _backend_cloud_cfg(
             backend,
@@ -744,6 +752,7 @@ async def _bind_folder(
             binding=binding,
             store=dependencies.store,
             slugify=dependencies.slugify_mount_name,
+            cloud_router=dependencies.cloud_router,
         )
     )
     if isinstance(bound, CloudFolderUnavailable):
@@ -762,7 +771,7 @@ async def _bind_folder(
         workspace_name=name,
         runtime_is_vm=runtime_is_vm,
         access=binding.access,
-        subject=granted,
+        subject=granted if granted is not None else bound.subject,
         dependencies=dependencies,
         failures=failures,
     )

@@ -37,6 +37,11 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from orchestrator.services.cloud.base import CloudMountSubject
+from orchestrator.services.cloud_user_root import (
+    MOUNT_NAME as USER_ROOT_MOUNT_NAME,
+    user_root_mount,
+)
 from orchestrator.services.connector_drivers.cloud_folder import (
     CloudFolderDriver,
     CloudFolderMount,
@@ -71,10 +76,12 @@ OUTBOX_FAILURE_REASONS: tuple[str, ...] = (
 #: ``no_session_folder``, ``backend_unavailable``), ``unbuildable`` for a
 #: mount the provider could not build (``detail`` says why, a closed code),
 #: ``beside_protected`` beside a protected session's folder,
-#: ``too_many_mounts`` past the workspace's limit, and ``grant_unavailable``
+#: ``too_many_mounts`` past the workspace's limit, ``grant_unavailable``
 #: / ``reader_unavailable`` for a project folder whose per-folder grant (a
 #: writer, a reader) is not active (``detail``: the failed mint's code, or
-#: ``not_ready``).
+#: ``not_ready``), and ``cloud_not_connected`` / ``cloud_grant_revoked`` for
+#: a user's own root its user has not connected, or whose credential the
+#: cloud refused (``cloud_user_root``).
 EXCLUSION_REASONS: tuple[str, ...] = (
     "access_unavailable",
     "config_invalid",
@@ -86,6 +93,8 @@ EXCLUSION_REASONS: tuple[str, ...] = (
     "too_many_mounts",
     "grant_unavailable",
     "reader_unavailable",
+    "cloud_not_connected",
+    "cloud_grant_revoked",
 )
 
 _DRIVERS: dict[str, CloudFolderDriver | CloudOutboxDriver] = {
@@ -340,13 +349,15 @@ def excluded_entry(
 class FolderBindRequest:
     """What a folder kind's binder gets for one attached ``cloud_folder``
     connector: the session, the connector row, and the driver's binding (its
-    level resolved, its key checked). ``store`` is the application's."""
+    level resolved, its key checked). ``store`` and ``cloud_router`` are the
+    application's."""
 
     thread: Mapping[str, Any]
     row: Mapping[str, Any]
     binding: CloudFolderMount
     store: Any
     slugify: Callable[[str], str]
+    cloud_router: Any = None
 
 
 @dataclass(frozen=True)
@@ -354,10 +365,14 @@ class FolderBinding:
     """A folder ready for the rclone builder: ``row`` in the shape of a
     ``thread_mounts`` row (``CloudFolderMount.mount_row``; ``target_user_sub``
     or any other subject field the builder reads may be added), and the
-    workspace ``name`` it asks for, which the caller suffixes on a clash."""
+    workspace ``name`` it asks for, which the caller suffixes on a clash.
+    ``subject`` is the principal the folder is mounted as when the binder
+    names one (a user's own root: its user's own credential, never printed);
+    a project folder's comes from its per-folder grant instead."""
 
     row: dict[str, Any]
     name: str
+    subject: CloudMountSubject | None = None
 
 
 FolderBinder = Callable[
@@ -422,17 +437,33 @@ async def bind_project_folder(
 async def bind_user_root_folder(
     request: FolderBindRequest,
 ) -> FolderBinding | CloudFolderUnavailable:
-    """A user's personal root: not mounted before slice 4.
+    """A user's own root, mounted at ``cloud/my_cloud`` as its user's own
+    account with its own credential (``cloud_user_root``).
 
-    The user-root package replaces this entry of :data:`FOLDER_KIND_BINDERS`
-    with its own binder (owner only, the user's own credential, connect
-    state), returning a :class:`FolderBinding` whose row carries the user's
-    home handle, or an exclusion (``cloud_not_connected``, ...).
+    Only the session owner's own root mounts (``not_eligible`` otherwise);
+    one its user has not connected is ``cloud_not_connected``, one whose
+    credential the cloud refused ``cloud_grant_revoked``. Nothing takes its
+    place. Reads the database only.
     """
-    return CloudFolderUnavailable(
-        request.binding.connector_id,
-        "access_unavailable",
-        "SRW does not mount a personal cloud folder yet",
+    owner = request.thread.get("user_id")
+    built = await user_root_mount(
+        request.row,
+        owner_id=str(owner) if owner else None,
+        store=request.store,
+        cloud_router=request.cloud_router,
+    )
+    if isinstance(built, CloudFolderUnavailable):
+        return built
+    row, credential = built
+    row["access"] = request.binding.access
+    return FolderBinding(
+        row=row,
+        name=USER_ROOT_MOUNT_NAME,
+        subject=CloudMountSubject(
+            user_id=str(owner),
+            username=credential.login_name,
+            credential=credential.credential,
+        ),
     )
 
 

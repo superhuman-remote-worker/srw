@@ -170,7 +170,7 @@ EXPECTED_MATRIX: dict[tuple[str, str | None, str], dict[str, str]] = {
         "opencloud": "unsupported",
     },
     ("cloud_folder", "user_root", "read_write"): {
-        "nextcloud": "planned",
+        "nextcloud": "offered",
         "opencloud": "unsupported",
     },
     ("cloud_folder", "user_root", "read_only"): {

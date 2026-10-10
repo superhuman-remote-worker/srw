@@ -29,7 +29,6 @@ from __future__ import annotations
 import itertools
 import hashlib
 import logging
-import os
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -70,6 +69,7 @@ from orchestrator.services.cloud.handles import (
     ShareHandle,
     UserId,
 )
+from orchestrator.services.cloud.nextcloud_user_root import NextcloudUserRootGrant
 from orchestrator.services.cloud.retry import LeakyBucket
 from orchestrator.services.cloud.telemetry import instrument_backend_op
 from orchestrator.services.cloud.protected_reader_authority import (
@@ -155,10 +155,11 @@ NEXTCLOUD_CAPABILITIES = ProviderCapabilities(
             "cloud_folder",
             "user_root",
             "read_write",
-            "planned",
-            "a per-user app token for the user's own files",
+            "offered",
+            "a per-user app token for the user's own files, granted once by the "
+            "user (Connect your cloud); it cannot be limited to read-only or to "
+            "one folder",
             frozenset({"sandbox"}),
-            slice=4,
         ),
         CloudCapability(
             "cloud_folder",
@@ -207,7 +208,7 @@ NEXTCLOUD_CAPABILITIES = ProviderCapabilities(
 )
 
 
-class NextcloudBackend:
+class NextcloudBackend(NextcloudUserRootGrant):
     """Main-cloud backend for Nextcloud.
 
     Reads configuration from environment variables:
@@ -522,44 +523,6 @@ class NextcloudBackend:
             "auth": {"type": "basic", "password": row["credentials"]},
         }
 
-    def _explicit_user_home_credentials(
-        self, handle: ProjectFolderHandle, subject: CloudMountSubject | None
-    ) -> dict[str, str] | None:
-        """Resolve explicit user-granted credentials for a user-home mount.
-
-        v1 intentionally does not pair ``/remote.php/dav/files/{user}/`` with
-        the agent-service password. For homelab/single-user deployments we
-        support an explicit app-password-style env pair:
-
-        * ``NEXTCLOUD_RCLONE_USER_HOME_USERNAME``
-        * ``NEXTCLOUD_RCLONE_USER_HOME_PASSWORD``
-
-        A username-specific password env is also accepted for multi-user test
-        deployments: ``NEXTCLOUD_RCLONE_USER_HOME_PASSWORD_<SANITIZED_USER>``.
-        """
-        username = (
-            handle.vendor_meta.get("username")
-            or (subject.username if subject else None)
-            or ""
-        )
-        username = str(username).strip()
-        if not username:
-            return None
-
-        configured_user = os.getenv("NEXTCLOUD_RCLONE_USER_HOME_USERNAME")
-        configured_password = os.getenv("NEXTCLOUD_RCLONE_USER_HOME_PASSWORD")
-        if configured_user and configured_password and configured_user == username:
-            return {"username": configured_user, "password": configured_password}
-
-        env_suffix = re.sub(r"[^A-Z0-9]+", "_", username.upper()).strip("_")
-        if env_suffix:
-            user_password = os.getenv(
-                f"NEXTCLOUD_RCLONE_USER_HOME_PASSWORD_{env_suffix}"
-            )
-            if user_password:
-                return {"username": username, "password": user_password}
-        return None
-
     def _project_folder_transport(
         self,
         handle: ProjectFolderHandle,
@@ -616,13 +579,23 @@ class NextcloudBackend:
             creds = self.webdav_credentials
         else:
             if handle.vendor_meta.get("kind") == "user_home":
+                # A user's own root: as the user's own account, with the app
+                # password they granted (the user-root connector's), never
+                # the service account. Without it there is no mount
+                # (``NOT_SUPPORTED``). rclone's chunked uploads stay on: they
+                # go through /dav/uploads/<uid>/, which it derives from this
+                # URL.
                 username = str(handle.vendor_meta.get("username") or "")
                 webdav_url = (
                     f"{self._base_url}/remote.php/dav/files/{quote(username, safe='')}/"
                     if username
                     else None
                 )
-                creds = self._explicit_user_home_credentials(handle, subject) or {}
+                creds = (
+                    {"username": str(subject.username), "password": subject.credential}
+                    if subject is not None and subject.credential and subject.username
+                    else {}
+                )
             else:
                 webdav_url, creds = self._project_folder_transport(
                     handle, subject, access

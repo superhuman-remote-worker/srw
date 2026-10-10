@@ -108,12 +108,12 @@
         "access": "read_write",
         "cells": {
           "nextcloud": {
-            "status": "planned",
-            "note": "a per-user app token for the user's own files",
+            "status": "offered",
+            "note": "a per-user app token for the user's own files, granted once by the user (Connect your cloud); it cannot be limited to read-only or to one folder",
             "workspace_backends": [
               "sandbox"
             ],
-            "slice": 4
+            "slice": null
           },
           "opencloud": {
             "status": "unsupported",

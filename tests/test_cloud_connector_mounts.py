@@ -588,50 +588,96 @@ async def test_names_never_collide_and_the_outbox_keeps_its_own(denied):
     assert names == {OUTBOX: "outbox", FOLDER: "outbox-2", FOLDER_2: "outbox-3"}
 
 
-@pytest.mark.asyncio
-async def test_a_user_root_waits_for_its_package_through_its_own_hook(
-    denied, monkeypatch
-):
-    row = _folder_row(
-        config={
-            "folder_kind": "user_root",
-            "backend_id": "nextcloud",
-            "backend_instance_id": INSTANCE,
-            "folder_handle": "home",
-        },
-        managed_key=f"user-cloud-root:{USER}",
-    )
-    store = Store([row])
-    live, _ = await _live(_thread([FOLDER]), store)
-    # Nextcloud's user root is planned (slice 4): not offered.
-    assert [e["reason"] for e in live.excluded] == ["access_unavailable"]
+ROOT = "00000000-0000-4000-8000-0000000000f9"
 
-    # Once offered, the kind's binder decides; until the user-root package
-    # replaces it, the hook says it is not mounted yet.
-    from orchestrator.services.connector_drivers.cloud_folder import CloudFolderDriver
 
-    monkeypatch.setattr(
-        CloudFolderDriver, "offered_access", lambda self, row, ctx: ("read_write",)
-    )
-    live, _ = await _live(_thread([FOLDER]), store)
-    assert [(e["reason"], e["detail"]) for e in live.excluded] == [
-        ("access_unavailable", "SRW does not mount a personal cloud folder yet")
-    ]
-    calls = []
-
-    async def user_root(request):
-        calls.append(request.binding.folder_kind)
-        return rule.FolderBinding(
-            row={**request.binding.mount_row(), "cloud_handle": "home"},
-            name="my_cloud",
+def _root_row(owner=USER, *, connected=True, revoked=False):
+    config = {
+        "folder_kind": "user_root",
+        "project_id": PROJECT,
+        "backend_id": "nextcloud",
+        "backend_instance_id": INSTANCE,
+    }
+    credentials = {}
+    if connected or revoked:
+        config.update(
+            {
+                "folder_handle": (
+                    '{"backend":"nextcloud","native_id":"home:uid-ann",'
+                    '"vendor_meta":{"kind":"user_home","username":"uid-ann"}}'
+                ),
+                "account_id": "uid-ann",
+                "grant": {"state": "revoked" if revoked else "connected"},
+            }
         )
+    if connected and not revoked:
+        credentials = {"username": "ann", "password": "app-pw-SECRET"}
+    return _folder_row(
+        ROOT,
+        name="My cloud",
+        config=config,
+        credentials=credentials,
+        managed_key=f"user-cloud-root:{owner}",
+        created_by=owner,
+    )
 
-    monkeypatch.setitem(rule.FOLDER_KIND_BINDERS, "user_root", user_root)
-    live, _ = await _live(_thread([FOLDER]), store)
-    assert calls == ["user_root"]
-    assert [(m["workspace_name"], m["mount_kind"]) for m in live.mounts] == [
-        ("my_cloud", "user_root")
+
+class SubjectBackend(Backend):
+    def __init__(self):
+        super().__init__()
+        self.subjects = []
+
+    async def build_rclone_mount_spec(self, **kwargs):
+        self.subjects.append(kwargs.get("subject"))
+        return await super().build_rclone_mount_spec(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_user_root_mounts_as_its_user_at_my_cloud(denied):
+    """Main cloud slice 4: the owner's own root, with the owner's own
+    credential (the binder's subject, never a grant's or the service
+    account's), at cloud/my_cloud; the credential is never printed."""
+    backend = SubjectBackend()
+    live, _ = await _live(_thread([ROOT]), Store([_root_row()]), backend=backend)
+    assert live.excluded == []
+    [mount] = live.mounts
+    assert (mount["workspace_name"], mount["mount_kind"], mount["access"]) == (
+        "my_cloud",
+        "user_root",
+        "read_write",
+    )
+    assert backend.specs[0]["handle"] == "home:uid-ann"
+    [subject] = backend.subjects
+    assert (subject.username, subject.credential) == ("ann", "app-pw-SECRET")
+    assert "app-pw-SECRET" not in repr(subject)
+    assert "app-pw-SECRET" not in repr(live.excluded)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row", "reason"),
+    [
+        (_root_row(connected=False), "cloud_not_connected"),
+        (_root_row(revoked=True), "cloud_grant_revoked"),
+        # Another user's root, even one its policy let through.
+        (_root_row(OTHER), "not_eligible"),
+    ],
+)
+async def test_a_user_root_that_cannot_mount_says_why_and_nothing_takes_its_place(
+    denied, row, reason
+):
+    live, _ = await _live(_thread([ROOT]), Store([row]))
+    assert live.mounts == []
+    assert [(e["reason"], e["mount_kind"], e["title"]) for e in live.excluded] == [
+        (reason, "user_root", "My cloud")
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_user_root_is_not_offered_on_a_vm(denied):
+    live, _ = await _live(_thread([ROOT]), Store([_root_row()]), vm=True)
+    assert live.mounts == []
+    assert [e["reason"] for e in live.excluded] == ["access_unavailable"]
 
 
 @pytest.mark.asyncio
