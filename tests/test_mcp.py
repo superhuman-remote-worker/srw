@@ -707,6 +707,32 @@ async def test_update_datasource_tool_reports_new_policy_revision():
     assert "Policy revision: 8" in result
     assert "Availability scope: projects" in result
     assert "Projects: project-a" in result
+    assert "Notice" not in result
+
+
+@pytest.mark.asyncio
+async def test_update_datasource_tool_reports_each_notice():
+    """An edit that dropped a stored variable no connector may set says so,
+    one line per notice, as the cockpit does."""
+    mock_client = AsyncMock()
+    mock_client.update_datasource.return_value = {
+        "id": "connector-1",
+        "notices": [
+            "Dropped from the stored variables: NODE_OPTIONS is not a variable",
+            "Dropped from the stored variables: EDITOR is not a variable",
+        ],
+    }
+
+    with patch.object(_mcp_server_mod, "_get_client", return_value=mock_client):
+        result = await _mcp_server_mod.update_datasource(
+            "connector-1", credentials={"env_vars": {"VENDOR_TOKEN": "t"}}
+        )
+
+    lines = result.splitlines()
+    assert lines[1:] == [
+        "Notice: Dropped from the stored variables: NODE_OPTIONS is not a variable",
+        "Notice: Dropped from the stored variables: EDITOR is not a variable",
+    ]
 
 
 @pytest.mark.asyncio

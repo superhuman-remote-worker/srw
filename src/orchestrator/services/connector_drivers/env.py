@@ -160,9 +160,9 @@ class CredentialsDriver(EnvironmentDriver):
                 }
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            # The reason names the variable already.
             notices = tuple(
-                f"{name} was dropped from the stored variables: {why}"
-                for name, why in refused.items()
+                f"Dropped from the stored variables: {why}" for why in refused.values()
             )
         return NormalizedConnector(
             draft.connection_url,

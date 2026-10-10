@@ -578,6 +578,25 @@ class TestFacts:
             "get-contexts`.",
         ]
 
+    def test_the_users_own_kube_config_stays_the_default_before_another_s(self):
+        """The user's own file blocked the other connector's link: the user's
+        context is the default, and the README says so first."""
+        admin = _file_row(
+            "Admin",
+            {"contents": "admin", "target_path": "/home/srw/.kube/config"},
+        )
+        backend = _Backend()
+        backend.credential_files_report = {
+            "skipped": {".kube/config": "a file of the user is there"}
+        }
+        lines = self._facts([admin, _kube_row("Kube", "a", "t")], backend)
+        assert lines[1] == (
+            "- **Kube** (kubeconfig) — merged into `$KUBECONFIG` after your own "
+            "`~/.kube/config`, whose current context stays the default, and "
+            "**Admin**'s file for that path; contexts prefixed `kube-*`. Where "
+            "kubectl is installed, try `kubectl config get-contexts`."
+        )
+
     def test_a_kubeconfig_saved_off_the_allowlist_is_not_delivered(self):
         row = _kube_row("Kube", "a", "t", target_path="/tmp/kube.yaml")
         assert self._facts([row]) == [

@@ -468,15 +468,18 @@ def _kubeconfig_line(
             if MERGED_KUBECONFIG_LINK not in skipped
             else "merged, but `~/.kube/config` and `$KUBECONFIG` are taken"
         )
+    elif MERGED_KUBECONFIG_LINK in skipped:
+        # Your own file holds the path: it comes first, before any other
+        # connector's file meant for it.
+        where = (
+            "merged into `$KUBECONFIG` after your own `~/.kube/config`, whose "
+            "current context stays the default"
+            + (f", and **{after}**'s file for that path" if after else "")
+        )
     elif after is not None:
         where = (
             f"merged into `$KUBECONFIG` after **{after}**'s `~/.kube/config`, "
             "whose current context stays the default"
-        )
-    elif MERGED_KUBECONFIG_LINK in skipped:
-        where = (
-            "merged into `$KUBECONFIG` after your own `~/.kube/config`, whose "
-            "current context stays the default"
         )
     else:
         where = "merged into `~/.kube/config` (`$KUBECONFIG`)"

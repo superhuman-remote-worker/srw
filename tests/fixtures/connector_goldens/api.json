@@ -6278,7 +6278,7 @@
         "VENDOR_USER"
       ],
       "notices": [
-        "NODE_OPTIONS was dropped from the stored variables: NODE_OPTIONS is not a variable a connector may set: tools read it to run code or load their config"
+        "Dropped from the stored variables: NODE_OPTIONS is not a variable a connector may set: tools read it to run code or load their config"
       ]
     },
     "calls": [

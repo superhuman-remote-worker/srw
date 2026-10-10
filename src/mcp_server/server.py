@@ -1950,6 +1950,9 @@ async def update_datasource(
     if result.get("project_ids") is not None:
         projects = ", ".join(str(value) for value in result["project_ids"]) or "none"
         lines.append(f"Projects: {projects}")
+    # What the update changed beyond what was asked (a stored variable no
+    # connector may set, dropped).
+    lines += [f"Notice: {notice}" for notice in result.get("notices") or ()]
     return "\n".join(lines)
 
 
