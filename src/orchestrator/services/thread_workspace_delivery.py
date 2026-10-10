@@ -52,6 +52,10 @@ from orchestrator.services.session_workspace_policy import preparation_wait_budg
 from orchestrator.security.access import externalize_gitea_url
 from orchestrator.security.access import require_internal as _require_internal
 from orchestrator.services import cloud_mount_status, connector_credential_leases
+from orchestrator.services.cloud_connector_mounts import (
+    outbox_attached,
+    uses_connector_rule,
+)
 from orchestrator.services.cloud_mount_sidecar import (
     PLAN_CONTEXT_KEY,
     recorded_sidecar_plan,
@@ -1122,17 +1126,26 @@ async def agent_get_thread_workspace_locked(
     # otherwise run unsynced with no signal. Flag it so the agent surfaces the
     # same degraded-sync state it shows for a failed initial pull, instead of
     # silently skipping cloud sync for the session's whole life.
+    #
+    # A session under the connector rule has a session folder only for an
+    # attached outbox (main cloud slice 6.1): without one there is no sync
+    # target to miss, and a stateless turn refuses tool work while the sync
+    # is degraded, so such a session is never marked so.
     try:
         _cloud_up = main_cloud_router.active.is_initialized
     except Exception:
         _cloud_up = False
+    expects_sync_target = not uses_connector_rule(metadata) or outbox_attached(metadata)
     cloud_sync_degraded = bool(
         not suppress_disposable_cloud
         and _cloud_up
         and not cloud_mount_cfg
         and not cloud_mount_sidecar_cfg
         and not cloud_sync_cfg
-        and (metadata.get("protected_cloud") or not thread.get("nc_session_folder"))
+        and (
+            metadata.get("protected_cloud")
+            or (expects_sync_target and not thread.get("nc_session_folder"))
+        )
     )
     # Re-inject credentials in-flight: the persisted config_override is stripped
     # of secrets (redact_config_override at create/hot-swap). This endpoint is

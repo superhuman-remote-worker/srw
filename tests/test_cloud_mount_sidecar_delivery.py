@@ -310,11 +310,18 @@ async def _poll(
     driver: str = "rclone_mount",
     exclusions: list | None = None,
     status_writes: list | None = None,
+    sidecar_pod: bool | None = None,
+    cloud_sync: dict | None = None,
+    thread_metadata: dict | None = None,
+    session_folder: bool = True,
 ) -> dict:
     """The real delivery under the application's composition, with the cloud
-    payload of a sidecar Pod; under the sync driver, with no mount, the
-    connector folders it does not deliver (``exclusions``), and the status
-    record writes in ``status_writes``."""
+    payload of a sidecar Pod (``sidecar_pod``, by default under the mounting
+    driver); under the sync driver, with no mount, the connector folders it
+    does not deliver (``exclusions``), and the status record writes in
+    ``status_writes``. ``cloud_sync`` is what the sync builder answers,
+    ``thread_metadata`` joins the thread's, and ``session_folder`` says
+    whether it has one."""
     import orchestrator.main as orch_main
     from orchestrator.application import preparation as preparation_composition
     from orchestrator.services import (
@@ -326,10 +333,10 @@ async def _poll(
         workspace_tier_policy,
     )
 
+    if sidecar_pod is None:
+        sidecar_pod = driver == "rclone_mount"
     sidecar = (
-        agent_cloud_mounts.agent_payload(_plan().recorded())
-        if driver == "rclone_mount"
-        else None
+        agent_cloud_mounts.agent_payload(_plan().recorded()) if sidecar_pod else None
     )
 
     async def write_status(_store, thread_id, status):
@@ -345,8 +352,13 @@ async def _poll(
         "execution_lane": "stateless",
         "runtime_generation": str(uuid4()),
         "runtime_retirement_token": None,
-        "nc_session_folder": 'nextcloud:{"path": "sessions/x"}',
-        "metadata": {"workspace_container": {"status": "ready", "pod_ip": "10.0.0.9"}},
+        "nc_session_folder": (
+            'nextcloud:{"path": "sessions/x"}' if session_folder else None
+        ),
+        "metadata": {
+            "workspace_container": {"status": "ready", "pod_ip": "10.0.0.9"},
+            **(thread_metadata or {}),
+        },
     }
     resources = orch_main.app.state.resources
     with (
@@ -371,6 +383,11 @@ async def _poll(
         ),
         patch.object(
             thread_mount_rows,
+            "resolve_thread_datasource_delivery",
+            AsyncMock(return_value=(None, None)),
+        ),
+        patch.object(
+            thread_mount_rows,
             "resolve_thread_repositories",
             AsyncMock(return_value=None),
         ),
@@ -387,7 +404,9 @@ async def _poll(
         patch.object(
             agent_cloud_mounts,
             "_build_agent_cloud_sync",
-            return_value={"version": 2, "mounts": []},
+            return_value=(
+                {"version": 2, "mounts": []} if cloud_sync is None else cloud_sync
+            ),
         ),
         patch.object(
             agent_cloud_mounts,
@@ -485,6 +504,44 @@ async def test_the_sync_driver_names_the_folders_it_does_not_deliver():
     writes.clear()
     response = await _poll("sidecar", status_writes=writes)
     assert response["cloud_folders_excluded"] == [] and writes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("metadata", "degraded"),
+    [
+        # Under the connector rule a session folder exists only for an
+        # attached outbox: without one there is no sync target to miss.
+        ({"cloud_mount_rule": "connectors", "datasource_ids": []}, False),
+        (
+            {
+                "cloud_mount_rule": "connectors",
+                "datasource_ids": ["00000000-0000-4000-8000-0000000000f2"],
+                "cloud_outbox": {
+                    "connector_id": "00000000-0000-4000-8000-0000000000f2",
+                    "state": "failed",
+                },
+            },
+            True,
+        ),
+        # The old rule always expected its session folder.
+        ({}, True),
+    ],
+)
+async def test_only_a_session_that_expects_a_sync_target_is_degraded(
+    metadata, degraded
+):
+    """A stateless turn refuses tool work while the cloud sync is degraded,
+    so a session with nothing to sync must never be marked so."""
+    response = await _poll(
+        "sidecar",
+        sidecar_pod=False,
+        cloud_sync={},
+        thread_metadata=metadata,
+        session_folder=False,
+    )
+    assert response["cloud_mount"] is None and not response["cloud_sync"]
+    assert response["cloud_sync_degraded"] is degraded
 
 
 def test_the_sync_record_is_written_only_when_it_changes():
