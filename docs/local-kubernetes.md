@@ -371,22 +371,54 @@ local change.
 
 ### Reclaiming disk
 
-Every Tilt build pushes new image tags to the k3d registry and the k3d node,
-and neither removes old ones on its own. The registry can grow past 100 GB in
-a few weeks. Prune it with:
+Every Tilt build pushes new image tags to the k3d registry and caches the
+images in the k3d node. Neither removes old ones on its own: the registry has
+no garbage collection, and the node's kubelet only prunes images once the host
+disk is 85% full. An active development machine can accumulate more than
+100 GB in a few weeks, and a full disk evicts every pod and can stop the k3s
+API server.
+
+Preview the cleanup, then run it:
 
 ```bash
-./scripts/local-dev-gc.sh --dry-run   # show what would go
+./scripts/local-dev-gc.sh --dry-run
 ./scripts/local-dev-gc.sh
 ```
 
-The script keeps every image a k3d workload still references, the newest two
-tags per repository, and anything pushed in the last 24 hours. Tune these
-limits with `KEEP_TAGS` and `KEEP_HOURS`. It stops the registry for the
-collection, usually for under a minute, and skips that step while Tilt is
-building. To run it daily, add a systemd user service whose `ExecStart` points
-at the script, plus a timer such as `OnCalendar=*-*-* 04:30` with
-`Persistent=true`.
+The script keeps:
+
+- every image that a workload in any running k3d cluster references;
+- the newest two tags per repository (`KEEP_TAGS`); and
+- anything pushed in the last 24 hours (`KEEP_HOURS`).
+
+It also removes older Tilt tags from the host Docker image store and trims
+BuildKit cache above 20 GB (`BUILD_CACHE_MAX`). The registry is stopped during
+its garbage collection, usually for less than a minute. The script skips that
+step while Tilt is building. If a running k3d cluster cannot list its
+workloads, it does not prune the registry or the node at all.
+
+To run it every day, install a systemd user timer:
+
+```bash
+./scripts/local-dev-gc.sh --install-timer
+journalctl --user -u srw-local-dev-gc   # what each run removed
+./scripts/local-dev-gc.sh --remove-timer
+```
+
+The timer runs at about 04:30. If the machine was off then, it runs at your
+next login. The unit records the checkout path, your `PATH`, and the settings
+above when you install it. After moving the checkout or changing a setting, run
+`--install-timer` again, for example
+`KEEP_TAGS=3 ./scripts/local-dev-gc.sh --install-timer`. User timers run only
+while you are logged in unless you enable lingering with
+`loginctl enable-linger`.
+
+When you investigate disk use by hand, note that `/var/lib/docker` and
+`/var/lib/containerd` are readable only by root. Unprivileged `du` and desktop
+disk analyzers skip them silently, so use `docker system df -v`. With Docker's
+containerd image store, image layers appear under both Images and Build Cache
+in that output. The build-cache figure therefore overstates what pruning it
+would free.
 
 ## Teardown
 
@@ -501,6 +533,25 @@ kubectl --context k3d-srw --namespace srw get secret srw-session-jwt
 
 Re-running `scripts/local-dev-up.sh` creates the Secret if it is absent without
 rotating an existing value.
+
+### The disk filled up and pods were evicted
+
+The local registry and node image cache grow with every Tilt build. Free space
+as described in [Reclaiming disk](#reclaiming-disk). If `kubectl` still cannot
+reach the cluster afterwards, check for a `k3s server` process:
+
+```bash
+docker exec k3d-srw-server-0 ps aux | grep 'k3s server'
+```
+
+The node container can stay `Up`, and `k3d cluster list` can still report it as
+running, after k3s itself has crashed. Restart the node, then delete the
+evicted pods:
+
+```bash
+docker restart k3d-srw-server-0
+kubectl --context k3d-srw delete pods --all-namespaces --field-selector=status.phase=Failed
+```
 
 ### Source and images appear out of sync
 

@@ -232,6 +232,10 @@ tilt down
 resource also runs its Helm delete command; it does not merely pause source
 sync. These actions do not delete the k3d cluster or every retained PVC.
 
+Each image rebuild leaves its previous tags in the local registry and the k3d
+node. See [Reclaiming disk](local-kubernetes.md#reclaiming-disk) to prune them
+or to schedule a daily cleanup.
+
 ## Develop and verify
 
 For a substantial behavior change, open an issue or proposal that records the

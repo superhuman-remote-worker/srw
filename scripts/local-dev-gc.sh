@@ -5,7 +5,7 @@
 # Every Tilt build pushes fresh tags to the k3d registry and the k3d node's
 # containerd, and nothing collects them: the registry never garbage-collects,
 # and the node's kubelet only prunes images once the host disk is 85% full.
-# Left alone, the registry alone grows past 100 GB within weeks.
+# Left alone, the registry grows past 100 GB within weeks.
 #
 # What it removes, keeping anything a k3d workload still references:
 #   1. Registry: every tag except the newest KEEP_TAGS per repository, tags
@@ -21,7 +21,13 @@
 # Fails safe: if any running k3d cluster cannot report its workloads, steps 1
 # and 2 are skipped rather than run blind.
 #
-# Usage: scripts/local-dev-gc.sh [--dry-run]
+# Usage: scripts/local-dev-gc.sh [--dry-run | --install-timer | --remove-timer]
+#   --install-timer  run daily via a systemd user timer; the unit records this
+#                    checkout's path, your PATH, and the settings below
+#   --remove-timer   disable and delete that timer
+#
+# Settings (environment): CLUSTER_NAME (srw), REGISTRY_NAME (<cluster>-registry),
+# KEEP_TAGS (2), KEEP_HOURS (24), BUILD_CACHE_MAX (20GB).
 # =============================================================================
 set -euo pipefail
 
@@ -31,16 +37,63 @@ KEEP_TAGS="${KEEP_TAGS:-2}"
 KEEP_HOURS="${KEEP_HOURS:-24}"
 BUILD_CACHE_MAX="${BUILD_CACHE_MAX:-20GB}"
 DRY_RUN=0
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+UNIT=srw-local-dev-gc
 
 log()  { printf '\033[1;34m[gc]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
 skip() { printf '\033[1;33m[skip]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
+install_timer() {
+  command -v systemctl >/dev/null || die "systemd not found; schedule $SELF with cron instead"
+  mkdir -p "$UNIT_DIR"
+  cat > "$UNIT_DIR/$UNIT.service" <<EOF
+[Unit]
+Description=Prune the local k3d registry, node, and Tilt image churn
+
+[Service]
+Type=oneshot
+Environment="PATH=$PATH"
+Environment=CLUSTER_NAME=$CLUSTER_NAME REGISTRY_NAME=$REGISTRY_NAME
+Environment=KEEP_TAGS=$KEEP_TAGS KEEP_HOURS=$KEEP_HOURS BUILD_CACHE_MAX=$BUILD_CACHE_MAX
+ExecStart="$SELF"
+Nice=10
+IOSchedulingClass=idle
+EOF
+  cat > "$UNIT_DIR/$UNIT.timer" <<EOF
+[Unit]
+Description=Daily local k3d/Tilt image pruning
+
+[Timer]
+OnCalendar=*-*-* 04:30
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl --user daemon-reload
+  systemctl --user --quiet enable --now "$UNIT.timer"
+  ok "daily timer installed for $SELF"
+  systemctl --user list-timers "$UNIT.timer" --no-pager | awk 'NR <= 2'
+  echo "Logs: journalctl --user -u $UNIT"
+}
+
+remove_timer() {
+  systemctl --user --quiet disable --now "$UNIT.timer" 2>/dev/null || true
+  rm -f "$UNIT_DIR/$UNIT.service" "$UNIT_DIR/$UNIT.timer"
+  systemctl --user daemon-reload
+  ok "daily timer removed"
+}
+
 case "${1:-}" in
   "") ;;
   --dry-run) DRY_RUN=1 ;;
-  -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  --install-timer) install_timer; exit 0 ;;
+  --remove-timer) remove_timer; exit 0 ;;
+  -h|--help) awk 'NR > 2 && /^# ====/ {exit} NR > 2 {sub(/^# ?/, ""); print}' "$0"; exit 0 ;;
   *) die "unknown argument: $1 (try --help)" ;;
 esac
 
