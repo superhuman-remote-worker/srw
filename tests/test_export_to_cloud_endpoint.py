@@ -12,7 +12,7 @@ copying the agent's declared deliverables instead of ``output/`` wholesale:
   (declared paths only, missing skipped, shared wrapper directories collapsed
   via ``_common_dir_prefix``), the ``output/`` fallback for jobs without a
   deliverables list, folder naming/reuse, and whether the folder actually
-  ended up shared with the caller.
+  ended up shared with the job's owner (whoever re-synced it).
 
 Follows the house pattern in tests/test_job_access.py: import ``main`` (conftest
 puts orchestrator/ on sys.path) and patch its module globals.
@@ -61,12 +61,15 @@ def _make_job(**over) -> dict:
         "freeze_data": None,
         "repo_name": "job-682baab8",
         "description": "Write the quarterly report",
+        "user_id": _make_user()["id"],
     }
     job.update(over)
     return job
 
 
-def _patch_endpoint(*, user, job, backend, gitea_files, repo=("job-682baab8", "main")):
+def _patch_endpoint(
+    *, user, job, backend, gitea_files, repo=("job-682baab8", "main"), owner=None
+):
     """Patch every global ``export_job_to_shared_folder`` touches.
 
     ``gitea_files`` maps repo-relative path -> bytes; it backs both
@@ -125,6 +128,8 @@ def _patch_endpoint(*, user, job, backend, gitea_files, repo=("job-682baab8", "m
     db = MagicMock()
     db.update_job_exported_folder = AsyncMock(return_value=True)
     db.merge_job_context = AsyncMock(return_value=True)
+    # The job's owner, whom the outbox is shared with: the caller by default.
+    db.get_user = AsyncMock(return_value=owner if owner is not None else user)
     stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
 
     return stack, backend, db
@@ -412,7 +417,8 @@ class TestDeliverablesCopy:
 
 
 class TestExportSharing:
-    """The export is only *useful* if the folder ends up visible to the caller.
+    """The export is only *useful* if the folder ends up visible to the job's
+    owner, and it is shared with them only, whoever re-syncs it.
 
     Backends that can't provision accounts (Nextcloud: user_oidc materialises
     one on first browser login) resolve to None until the user has signed in
@@ -433,7 +439,104 @@ class TestExportSharing:
                 fake_request, job["id"], dependencies=_deps(user, job)
             )
         assert result["shared"] is True
+        assert result["shared_with"] == user["id"]
         assert [c[0] for c in backend.calls].count("share_session_folder") == 1
+
+    @pytest.mark.asyncio
+    async def test_another_members_resync_shares_with_the_owner_only(
+        self, fake_request
+    ):
+        """A project member re-syncing someone else's job neither takes the
+        folder nor drops the owner's share: the owner gets it."""
+        owner = _make_user()
+        member = {
+            "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "keycloak_sub": "kc-sub-2",
+            "email": "member@example.test",
+        }
+        job = _make_job(freeze_data={"deliverables": ["spec.yaml"]})
+        backend = FakeMainCloudBackend()
+        stack, backend, db = _patch_endpoint(
+            user=member,
+            job=job,
+            backend=backend,
+            gitea_files={"spec.yaml": b"x"},
+            owner=owner,
+        )
+        with stack:
+            result = await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(member, job)
+            )
+        db.get_user.assert_awaited_once_with(owner["id"])
+        assert result["shared_with"] == owner["id"]
+        (share,) = backend._shares.values()
+        assert share["user_id"] != member["id"]
+        record = db.merge_job_context.await_args_list[-1].args[1]["job_outbox"]
+        assert (record["trigger"], record["shared_with"]) == ("resync", owner["id"])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error_kind, shared",
+        [("ALREADY_EXISTS", True), ("UNAVAILABLE", False)],
+        ids=["cloud-refuses-a-second-share", "cloud-down"],
+    )
+    async def test_a_resync_renews_the_owners_share(
+        self, fake_request, error_kind, shared
+    ):
+        """A re-sync re-creates a share the owner removed; when the cloud
+        refuses a second share of a folder recorded as shared, the share it
+        has stands."""
+        user = _make_user()
+        handle = "sessions/write-the-quarterly-report-682baab8"
+        job = _make_job(
+            freeze_data={"deliverables": ["spec.yaml"]},
+            exported_folder_handle=handle,
+            context={
+                "job_outbox": {
+                    "state": "delivered",
+                    "trigger": "completion",
+                    "shared": True,
+                    "shared_with": user["id"],
+                    "handle": handle,
+                }
+            },
+        )
+        backend = FakeMainCloudBackend()
+        stack, backend, db = _patch_endpoint(
+            user=user, job=job, backend=backend, gitea_files={"spec.yaml": b"x"}
+        )
+        with stack:
+            backend.share_session_folder = AsyncMock(
+                side_effect=job_export.CloudBackendError(
+                    getattr(job_export.CloudBackendErrorKind, error_kind),
+                    "refused",
+                    backend="fake",
+                )
+            )
+            result = await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(user, job)
+            )
+        backend.share_session_folder.assert_awaited_once()
+        assert result["shared"] is shared
+
+    @pytest.mark.asyncio
+    async def test_a_job_whose_owner_is_gone_is_refused(self, fake_request):
+        user = _make_user()
+        job = _make_job(freeze_data={"deliverables": ["spec.yaml"]}, user_id=None)
+        stack, backend, db = _patch_endpoint(
+            user=user,
+            job=job,
+            backend=FakeMainCloudBackend(),
+            gitea_files={"spec.yaml": b"x"},
+        )
+        with stack:
+            with pytest.raises(HTTPException) as exc:
+                await job_review_routes.export_job_to_shared_folder(
+                    fake_request, job["id"], dependencies=_deps(user, job)
+                )
+        assert exc.value.status_code == 409
+        assert _copied_paths(backend) == set()
+        db.merge_job_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_reports_unshared_when_no_cloud_account(self, fake_request):
@@ -583,10 +686,13 @@ class TestExportFolderName:
 
     JOB = "a6fa6f2a-9101-41f4-9ccb-5a7f362dc305"
 
-    def test_slugs_the_description_and_keeps_an_id_suffix(self):
+    HEX = "a6fa6f2a910141f49ccb5a7f362dc305"
+
+    def test_slugs_the_description_and_keeps_the_full_id(self):
+        # The full id: a short suffix collides (32 random bits).
         assert (
             job_export._job_export_folder_name(self.JOB, "You maintain a daily digest.")
-            == "you-maintain-a-daily-digest-a6fa6f2a"
+            == f"you-maintain-a-daily-digest-{self.HEX}"
         )
 
     def test_deterministic(self):
@@ -612,12 +718,12 @@ class TestExportFolderName:
 
     def test_only_uses_the_first_line(self):
         name = job_export._job_export_folder_name(self.JOB, "Daily digest\nSecond line")
-        assert name == "daily-digest-a6fa6f2a"
+        assert name == f"daily-digest-{self.HEX}"
 
     def test_folds_accents_rather_than_dropping_them(self):
         assert job_export._job_export_folder_name(
             self.JOB, "Führe die Prüfung durch"
-        ) == ("fuhre-die-prufung-durch-a6fa6f2a")
+        ) == (f"fuhre-die-prufung-durch-{self.HEX}")
 
     def test_path_safe_charset(self):
         name = job_export._job_export_folder_name(
@@ -628,7 +734,7 @@ class TestExportFolderName:
     def test_falls_back_when_nothing_slugs(self):
         for desc in ("", "   ", "!!! ???", None):
             assert (
-                job_export._job_export_folder_name(self.JOB, desc) == "job-a6fa6f2a9101"
+                job_export._job_export_folder_name(self.JOB, desc) == f"job-{self.HEX}"
             )
 
 
@@ -669,8 +775,78 @@ class TestExportFolderReuse:
             result = await job_review_routes.export_job_to_shared_folder(
                 fake_request, job["id"], dependencies=_deps(user, job)
             )
-        assert result["folder"]["name"] == "write-the-quarterly-report-682baab8"
-        assert result["folder"]["path"] == "/write-the-quarterly-report-682baab8"
+        name = "write-the-quarterly-report-" + job["id"].replace("-", "")
+        assert result["folder"]["name"] == name
+        assert result["folder"]["path"] == f"/{name}"
+
+    @pytest.mark.asyncio
+    async def test_a_folder_not_recorded_as_the_jobs_is_never_reused(
+        self, fake_request
+    ):
+        """A folder of the new copy's name that exists already is not this
+        job's: nothing is copied into it and it is not shared."""
+        user = _make_user()
+        job = _make_job(freeze_data={"deliverables": ["spec.yaml"]})
+        backend = FakeMainCloudBackend()
+        await backend.ensure_initialized()
+        taken = job_export._job_export_folder_name(job["id"], job["description"])
+        await backend.ensure_session_folder(session_id=taken)
+        stack, backend, db = _patch_endpoint(
+            user=user, job=job, backend=backend, gitea_files={"spec.yaml": b"x"}
+        )
+        with stack:
+            with pytest.raises(HTTPException) as exc:
+                await job_review_routes.export_job_to_shared_folder(
+                    fake_request, job["id"], dependencies=_deps(user, job)
+                )
+        assert exc.value.status_code == 409
+        assert "not recorded as this job's" in exc.value.detail
+        assert _copied_paths(backend) == set()
+        assert "share_session_folder" not in [c[0] for c in backend.calls]
+        db.update_job_exported_folder.assert_not_awaited()
+        # Nothing records the folder as this job's.
+        db.merge_job_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_interrupted_copy_resumes_into_its_own_folder(self, fake_request):
+        """The new folder is recorded as the job's before the first file
+        lands; a copy that failed after creating it resumes into it."""
+        user = _make_user()
+        job = _make_job(freeze_data={"deliverables": ["spec.yaml"]})
+        backend = FakeMainCloudBackend()
+        stack, backend, db = _patch_endpoint(
+            user=user, job=job, backend=backend, gitea_files={"spec.yaml": b"x"}
+        )
+        with stack:
+            backend.put_session_file = AsyncMock(
+                side_effect=job_export.CloudBackendError(
+                    job_export.CloudBackendErrorKind.UNAVAILABLE,
+                    "cloud gone",
+                    backend="fake",
+                )
+            )
+            with pytest.raises(HTTPException) as exc:
+                await job_review_routes.export_job_to_shared_folder(
+                    fake_request, job["id"], dependencies=_deps(user, job)
+                )
+        assert exc.value.status_code == 502
+        (copying,) = [
+            call.args[1]["job_outbox"] for call in db.merge_job_context.await_args_list
+        ]
+        assert copying["state"] == "copying"
+
+        # The retry finds the folder recorded as the job's and reuses it.
+        retry_job = {**job, "context": {"job_outbox": copying}}
+        del backend.put_session_file
+        stack, backend, db = _patch_endpoint(
+            user=user, job=retry_job, backend=backend, gitea_files={"spec.yaml": b"x"}
+        )
+        with stack:
+            result = await job_review_routes.export_job_to_shared_folder(
+                fake_request, job["id"], dependencies=_deps(user, retry_job)
+            )
+        assert result["files_copied"] == 1
+        assert f"sessions/{result['folder']['name']}" in copying["handle"]
 
 
 # --------------------------------------------------------------------------- #

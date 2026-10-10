@@ -298,6 +298,49 @@ class TestRemoveUserFromGroup:
         assert b"grp1" in seen["content"]  # groupid sent in the request body
 
 
+class TestEnsureSessionFolderExclusive:
+    """An exclusive create refuses a folder that exists already (the job
+    outbox copies only into a folder of its own); a plain one reuses it."""
+
+    def _backend(self, existing: set[str]) -> tuple[NextcloudBackend, list[str]]:
+        made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.method == "MKCOL"
+            path = unquote(request.url.path).split(f"/files/{AGENT_USER}/", 1)[1]
+            if path in existing:
+                return httpx.Response(405)
+            made.append(path)
+            return httpx.Response(201)
+
+        be = NextcloudBackend(_nc_test_settings())
+        be._client = httpx.AsyncClient(
+            base_url=NEXTCLOUD_BASE, transport=httpx.MockTransport(handler)
+        )
+        be._initialized = True
+        return be, made
+
+    @pytest.mark.asyncio
+    async def test_an_existing_folder_is_refused_only_when_exclusive(self):
+        be, _made = self._backend({"sessions", "sessions/report-1"})
+
+        with pytest.raises(CloudBackendError) as ei:
+            await be.ensure_session_folder(session_id="report-1", exclusive=True)
+        assert ei.value.kind is CloudBackendErrorKind.ALREADY_EXISTS
+
+        handle = await be.ensure_session_folder(session_id="report-1")
+        assert handle.native_id == "sessions/report-1"
+
+    @pytest.mark.asyncio
+    async def test_an_existing_parent_never_refuses(self):
+        be, made = self._backend({"sessions"})
+
+        handle = await be.ensure_session_folder(session_id="report-2", exclusive=True)
+
+        assert handle.native_id == "sessions/report-2"
+        assert made == ["sessions/report-2"]
+
+
 def _install_fake(backend: NextcloudBackend, fake: FakeNextcloud) -> None:
     """Wire a pre-initialized adapter up to the fake server."""
     backend._client = httpx.AsyncClient(

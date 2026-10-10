@@ -3,9 +3,9 @@
 All three routes are gated by ``require_job_access``, which enforces both user
 visibility AND the MCP/officer ``project:<uuid>`` scope. The export and the
 review session need the authenticated *user* as well as the row (the export
-acts in a user's name; the review session is the caller's, and attaches only
-the job's connectors a session of theirs may), so they keep both halves of the
-gate's result; the PR status needs only the row.
+names who re-synced the job owner's outbox; the review session is the
+caller's, and attaches only the job's connectors a session of theirs may), so
+they keep both halves of the gate's result; the PR status needs only the row.
 """
 
 from __future__ import annotations
@@ -51,12 +51,13 @@ async def export_job_to_shared_folder(
     whether or not its project has a cloud folder: the outbox is the job's
     deliverables, while the project folder's copy has its own diff review.
     A job whose owner's outbox is attached is copied at completion already
-    (the ``job_outbox_delivery`` effect); this repeats the copy for the
-    calling user, overwriting the same folder, re-stamping ``exported_at``
-    as "last synced at", and sharing a folder the completion copy could not
-    share yet (``unshared``). Workspace-relative paths are kept **except**
-    for the leading directories every deliverable shares, which are
-    collapsed (``_common_dir_prefix``).
+    (the ``job_outbox_delivery`` effect); this repeats the copy, overwriting
+    the job's own folder, re-stamping ``exported_at`` as "last synced at",
+    and sharing it with the job's owner (whoever calls), which shares a
+    folder the completion copy could not share yet (``unshared``) and
+    re-creates a share the owner removed. Workspace-relative paths are kept
+    **except** for the leading directories every deliverable shares, which
+    are collapsed (``_common_dir_prefix``).
 
     See knowledge-history/done/job_cloud_export.md §3.2 and
     main_cloud_as_connectors.md, slice 6.2.

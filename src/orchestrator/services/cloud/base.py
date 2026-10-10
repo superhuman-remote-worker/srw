@@ -322,7 +322,7 @@ class MainCloudBackend(Protocol):
 
     # ------------------------------------------------------------- Session folders
     async def ensure_session_folder(
-        self, *, session_id: str
+        self, *, session_id: str, exclusive: bool = False
     ) -> SessionFolderHandle: ...
 
     async def delete_session_folder(

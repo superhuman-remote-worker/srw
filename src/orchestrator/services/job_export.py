@@ -9,11 +9,20 @@ endpoint (:func:`export_job_to_shared_folder`) runs on demand for any job,
 whether or not its project has a cloud folder. Properties that are
 load-bearing:
 
-* **The folder name is deterministic.** ``_job_export_folder_name`` must map
-  a job to the same segment forever, because the copy is re-syncable and
-  re-derives the name to find the folder again. A job that already carries a
-  handle reuses it instead, so a naming-scheme change cannot strand an
-  existing share.
+* **A job copies only into a folder recorded as its own.** A new copy
+  creates ``<slug>-<the job's full id>`` exclusively
+  (``ensure_session_folder(exclusive=True)``) and records it before the
+  first file lands (``job_outbox.state: copying``); a folder of that name
+  that exists already is refused (``folder_failed``), never reused: it is
+  not this job's, and its share may be someone else's. A job that already
+  carries a handle (``exported_folder_handle``, or the record's) reuses it,
+  so a naming-scheme change cannot strand an existing share and a copy
+  interrupted mid-way resumes into its own folder.
+* **The outbox is shared with the job's owner only.** Whoever re-syncs it,
+  the share goes to the owner (``job_outbox.shared_with``): another member's
+  re-sync can neither take the folder nor drop the owner's share, and a
+  re-sync re-creates a share the owner removed (a cloud's refusal of a
+  second share of a folder it recorded as shared stands for the share).
 * **Copy failures are fail-soft only where the original made them so.** A
   declared-but-missing deliverable is logged and skipped; a missing file in
   the ``output/`` fallback fails the copy. Everything else — an unexpected
@@ -39,7 +48,11 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from orchestrator.services.cloud import CloudBackendError, SessionFolderHandle
+from orchestrator.services.cloud import (
+    CloudBackendError,
+    CloudBackendErrorKind,
+    SessionFolderHandle,
+)
 from orchestrator.services.cloud.retry import BucketFull, bounded_wait
 
 logger = logging.getLogger(__name__)
@@ -81,18 +94,18 @@ class JobExportDependencies:
 
 
 def _job_export_folder_name(job_id: str, description: str | None) -> str:
-    """Human-readable, stable folder name for a job's Mode B export.
+    """Human-readable folder name for a new job outbox.
 
-    A cloud root full of ``job-a6fa6f2a9101`` folders is unnavigable after a
-    handful of exports, so lead with a slug of the job's prompt and keep a short
-    id suffix for uniqueness (two jobs can share a description) — e.g.
-    ``you-maintain-a-daily-digest-a6fa6f2a``.
+    A cloud root full of bare ``job-<id>`` folders is unnavigable after a
+    handful of exports, so lead with a slug of the job's prompt, then the
+    job's **full** id (two jobs can share a description, and a short suffix
+    collides: 32 random bits) — e.g.
+    ``you-maintain-a-daily-digest-a6fa6f2a91014c1e9b9e0000000000c1``. The
+    folder is created exclusively under that name, so it is the job's own.
 
-    Must stay **deterministic**: the endpoint is re-syncable and re-derives this
-    name to find the folder again. ``description`` is fixed at job creation, so
-    the same job always maps to the same name. Output is restricted to
-    ``[a-z0-9-]``, which is a safe single path segment for every backend
-    (both build ``sessions/<name>`` over WebDAV).
+    Deterministic (``description`` is fixed at job creation). Output is
+    restricted to ``[a-z0-9-]``, which is a safe single path segment for
+    every backend (both build ``sessions/<name>`` over WebDAV).
     """
     short = job_id.replace("-", "")
     # splitlines() on a blank string yields [], so index defensively.
@@ -109,8 +122,8 @@ def _job_export_folder_name(job_id: str, description: str | None) -> str:
         slug = slug[:_EXPORT_SLUG_MAX].rsplit("-", 1)[0].strip("-")
     if not slug:
         # Descriptions are NOT NULL but can be punctuation-only in theory.
-        return f"job-{short[:12]}"
-    return f"{slug}-{short[:8]}"
+        return f"job-{short}"
+    return f"{slug}-{short}"
 
 
 def _common_dir_prefix(paths: list[str]) -> str:
@@ -145,13 +158,18 @@ def _common_dir_prefix(paths: list[str]) -> str:
 class JobOutboxError(Exception):
     """A copy that did not land. ``reason`` is one of
     :data:`FAILURE_REASONS`; ``status_code`` and ``detail`` are what the
-    re-sync endpoint answers with."""
+    re-sync endpoint answers with. ``handle`` is the job's own folder when
+    it was created before the copy failed: the record keeps it, so the next
+    copy resumes into it."""
 
-    def __init__(self, reason: str, status_code: int, detail: str) -> None:
+    def __init__(
+        self, reason: str, status_code: int, detail: str, *, handle: str | None = None
+    ) -> None:
         super().__init__(detail)
         self.reason = reason
         self.status_code = status_code
         self.detail = detail
+        self.handle = handle
 
 
 def _job_context(job: dict[str, Any]) -> dict[str, Any]:
@@ -164,15 +182,38 @@ def _job_context(job: dict[str, Any]) -> dict[str, Any]:
     return context if isinstance(context, dict) else {}
 
 
-def _already_shared(job: dict[str, Any]) -> bool:
-    """Whether an earlier copy shared this job's stored folder already."""
+def _recorded_folder(job: dict[str, Any]) -> str | None:
+    """The folder recorded as this job's own: its stamp, else the handle the
+    latest copy's record kept (a copy that created it and then failed or
+    was interrupted)."""
+    if job.get("exported_folder_handle"):
+        return str(job["exported_folder_handle"])
     record = _job_context(job).get("job_outbox")
-    return bool(
+    handle = record.get("handle") if isinstance(record, dict) else None
+    return str(handle) if handle else None
+
+
+def _recorded_share(job: dict[str, Any], handle: str) -> tuple[bool, str | None]:
+    """Whether an earlier copy recorded ``handle`` as shared, and with whom
+    (``None``: a record from before the recipient was kept, unless a
+    completion made it, which shared with the owner)."""
+    record = _job_context(job).get("job_outbox")
+    if not (
         isinstance(record, dict)
         and record.get("shared") is True
-        and job.get("exported_folder_handle")
-        and record.get("handle") == job.get("exported_folder_handle")
-    )
+        and record.get("handle") == handle
+    ):
+        return False, None
+    shared_with = record.get("shared_with")
+    if not shared_with and record.get("trigger") == "completion":
+        shared_with = job.get("user_id")
+    return True, (str(shared_with) if shared_with else None)
+
+
+#: A cloud's refusal of a second share of one folder to one user.
+_DUPLICATE_SHARE_KINDS = frozenset(
+    {CloudBackendErrorKind.ALREADY_EXISTS, CloudBackendErrorKind.PERMISSION_DENIED}
+)
 
 
 async def _share_with_owner(
@@ -182,9 +223,12 @@ async def _share_with_owner(
     *,
     share_wait_seconds: float,
     folder_session_id: str,
+    recorded_share: bool = False,
 ) -> str | None:
     """Share the folder with the owner; ``None`` when shared, else why not
-    (:data:`UNSHARED_REASONS`)."""
+    (:data:`UNSHARED_REASONS`). With ``recorded_share`` (an earlier copy
+    recorded this folder as shared, with the owner or with no recorded
+    recipient) a cloud that refuses a second share keeps the one it has."""
     try:
         resolved_user_id = await backend.ensure_user(
             sub=owner.get("keycloak_sub") or "",
@@ -232,7 +276,14 @@ async def _share_with_owner(
             exc.retry_after,
         )
         return "rate_limited"
-    except CloudBackendError:
+    except CloudBackendError as exc:
+        if recorded_share and exc.kind in _DUPLICATE_SHARE_KINDS:
+            logger.info(
+                "Job outbox: folder %s is shared with user %s already",
+                folder_session_id,
+                owner.get("id"),
+            )
+            return None
         logger.warning(
             "Job outbox: sharing folder %s with user %s failed",
             folder_session_id,
@@ -249,9 +300,15 @@ async def deliver_job_outbox(
     owner: dict[str, Any],
     dependencies: JobExportDependencies,
     share_wait_seconds: float = 0.0,
+    reshare: bool = False,
+    trigger: str = "completion",
 ) -> dict[str, Any]:
     """Copy a job's deliverables into its outbox folder and share it with
     its owner; return what landed.
+
+    ``owner`` is the job's owner, whoever asked for the copy. A folder
+    recorded as shared with them is not shared again unless ``reshare`` (a
+    re-sync, which re-creates a share the owner removed).
 
     Copies the agent's declared deliverables (from
     ``freeze_data.deliverables``; falls back to ``output/`` for jobs without
@@ -270,10 +327,11 @@ async def deliver_job_outbox(
     set changes can therefore leave files from the previous shape behind,
     since the collapsed prefix is recomputed per call.
 
-    Returns ``{job_id, files_copied, shared, unshared?, folder, handle}``;
-    raises :class:`JobOutboxError` when the copy did not land. Neither the
-    status nor anything else of the job changes, apart from its exported
-    folder stamp.
+    Returns ``{job_id, files_copied, shared, shared_with, unshared?, folder,
+    handle}``; raises :class:`JobOutboxError` when the copy did not land.
+    Neither the status nor anything else of the job changes, apart from its
+    exported folder stamp and, for a new folder, the record that it is the
+    job's (``job_outbox.state: copying``) before the first file lands.
 
     See knowledge-history/done/job_cloud_export.md §3.2.
     """
@@ -299,8 +357,10 @@ async def deliver_job_outbox(
     # 1) Provision the folder. A job that has been exported before keeps the
     #    folder it already has — re-deriving the name would strand the old
     #    folder (and its share) whenever the naming scheme changes, which it did
-    #    once already when these went from `job-<uuid>` to slugged names.
-    previous_handle = job.get("exported_folder_handle")
+    #    once already when these went from `job-<uuid>` to slugged names. A new
+    #    one is created exclusively: a folder of that name that exists already
+    #    is not recorded as this job's, so nothing is copied into it.
+    previous_handle = _recorded_folder(job)
     if previous_handle:
         folder_session_id = (
             SessionFolderHandle.from_db(previous_handle, backend=backend.backend_id)
@@ -311,13 +371,41 @@ async def deliver_job_outbox(
         folder_session_id = _job_export_folder_name(job_id, job.get("description"))
     try:
         folder_handle = await backend.ensure_session_folder(
-            session_id=folder_session_id
+            session_id=folder_session_id, exclusive=not previous_handle
         )
     except CloudBackendError as e:
+        if e.kind is CloudBackendErrorKind.ALREADY_EXISTS and not previous_handle:
+            logger.error(
+                "Job outbox: folder %s exists but is not recorded as job %s's; "
+                "nothing copied",
+                folder_session_id,
+                job_id,
+            )
+            raise JobOutboxError(
+                "folder_failed",
+                409,
+                f"A cloud folder named '{folder_session_id}' already exists and "
+                "is not recorded as this job's; nothing was copied into it.",
+            ) from e
         logger.exception("Job outbox: folder provisioning failed for job %s", job_id)
         raise JobOutboxError(
             "folder_failed", 502, f"Cloud folder provisioning failed: {e}"
         ) from e
+    handle_db = folder_handle.to_db()
+    if not previous_handle:
+        # The folder is the job's from here: a copy that fails or is cut off
+        # before its stamp resumes into it rather than finding it "taken".
+        await _record(
+            dependencies.store,
+            job_id,
+            {
+                "trigger": trigger,
+                "at": datetime.now(timezone.utc).isoformat(),
+                "state": "copying",
+                "folder": folder_session_id,
+                "handle": handle_db,
+            },
+        )
 
     # 2) Copy the job's deliverables from Gitea → cloud, bytes-faithful via
     #    get_file_bytes so binary outputs (PDFs, images) survive the round trip
@@ -408,7 +496,8 @@ async def deliver_job_outbox(
                 rel[len(prefix) + 1 :] if prefix else rel,
                 required=required,
             )
-    except JobOutboxError:
+    except JobOutboxError as e:
+        e.handle = handle_db
         raise
     except CloudBackendError as e:
         logger.exception(
@@ -420,28 +509,32 @@ async def deliver_job_outbox(
             "copy_failed",
             502,
             f"File copy to cloud failed after {files_copied} files: {e}",
+            handle=handle_db,
         ) from e
     except Exception as e:
         logger.exception("Job outbox: unexpected failure for job %s", job_id)
-        raise JobOutboxError("copy_failed", 502, f"Export failed: {e}") from e
+        raise JobOutboxError(
+            "copy_failed", 502, f"Export failed: {e}", handle=handle_db
+        ) from e
 
     # 3) Stamp the job — only on success so retries are safe.
-    handle_db = folder_handle.to_db()
     await dependencies.store.update_job_exported_folder(job_id, handle=handle_db)
 
     # 4) Share the folder with the owner, after the files landed: a folder
     #    that cannot be shared yet still holds them, and a re-sync shares it.
-    unshared = (
-        None
-        if _already_shared({**job, "exported_folder_handle": handle_db})
-        else await _share_with_owner(
+    owner_id = str(owner["id"])
+    recorded, shared_with = _recorded_share(job, handle_db)
+    if recorded and shared_with == owner_id and not reshare:
+        unshared = None
+    else:
+        unshared = await _share_with_owner(
             backend,
             folder_handle,
             owner,
             share_wait_seconds=share_wait_seconds,
             folder_session_id=folder_session_id,
+            recorded_share=recorded and shared_with in (None, owner_id),
         )
-    )
 
     result: dict[str, Any] = {
         "job_id": job_id,
@@ -450,6 +543,8 @@ async def deliver_job_outbox(
         # (``unshared`` says why). The cockpit turns this into a distinct
         # toast instead of claiming an unqualified success.
         "shared": unshared is None,
+        # Always the job's owner: the outbox is theirs, whoever re-synced it.
+        "shared_with": owner_id if unshared is None else None,
         "folder": {
             "name": folder_session_id,
             # Where the owner will actually find it: the share lands at the
@@ -481,6 +576,8 @@ def outbox_record(
         record.update(
             state="failed", reason=error.reason, detail=str(error.detail)[:500]
         )
+        if error.handle:
+            record["handle"] = error.handle
         return record
     if result is None:
         raise ValueError("an outbox record needs a result or an error")
@@ -491,6 +588,8 @@ def outbox_record(
         folder=result["folder"]["name"],
         handle=result["handle"],
     )
+    if result.get("shared_with"):
+        record["shared_with"] = str(result["shared_with"])
     if result.get("unshared"):
         record["unshared"] = result["unshared"]
     return record
@@ -512,14 +611,17 @@ async def export_job_to_shared_folder(
     authorized_job: dict[str, Any],
     dependencies: JobExportDependencies,
 ) -> dict[str, Any]:
-    """Re-sync a job's outbox now: :func:`deliver_job_outbox` for the
-    calling user, as an HTTP answer ("Open cloud folder").
+    """Re-sync a job's outbox now: :func:`deliver_job_outbox`, as an HTTP
+    answer ("Open cloud folder").
 
     Valid for any job whose output is stable (``completed``,
     ``pending_review`` or ``reviewing``), whether or not its project has a
     cloud folder: the outbox is the job's deliverables, never the project
-    folder's copy, which goes through the diff review. A failed copy is the
-    HTTP error :class:`JobOutboxError` carries.
+    folder's copy, which goes through the diff review. Any member who can
+    see the job may re-sync it (``user``), but the folder is the job
+    owner's and is shared with them only, re-created when they removed it;
+    a job whose owner is gone is refused (409). A failed copy is the HTTP
+    error :class:`JobOutboxError` carries.
     """
     job = authorized_job
 
@@ -535,17 +637,37 @@ async def export_job_to_shared_folder(
             ),
         )
 
-    # No idempotency refusal: this endpoint is re-syncable. The folder id is
-    # derived deterministically from the job id, so a repeat call overwrites
-    # the same folder and re-stamps ``exported_at`` as "last synced at".
+    # The outbox is the job owner's, whoever re-syncs it.
+    owner_id = str(job.get("user_id") or "")
+    owner = await dependencies.store.get_user(owner_id) if owner_id else None
+    if not owner:
+        raise HTTPException(
+            status_code=409,
+            detail="The job's owner is gone; its outbox is shared with its owner only.",
+        )
+    if str(user.get("id") or "") != owner_id:
+        logger.info(
+            "Job outbox: user %s re-syncs job %s's outbox for its owner %s",
+            user.get("id"),
+            job_id,
+            owner_id,
+        )
+
+    # No idempotency refusal: this endpoint is re-syncable. A repeat call
+    # overwrites the job's own folder and re-stamps ``exported_at`` as "last
+    # synced at".
     try:
         result = await deliver_job_outbox(
             job={**job, "id": job_id},
-            owner=user,
+            owner=owner,
             dependencies=dependencies,
             share_wait_seconds=RESYNC_SHARE_WAIT_SECONDS,
+            reshare=True,
+            trigger="resync",
         )
     except JobOutboxError as exc:
+        # Not recorded: a failed re-sync leaves the last copy's record (and
+        # a new folder's ``copying`` record) as it was.
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     await _record(dependencies.store, job_id, outbox_record(result, trigger="resync"))
     result = dict(result)

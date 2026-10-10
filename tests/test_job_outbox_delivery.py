@@ -162,12 +162,26 @@ async def test_without_an_owner_nothing_is_copied():
 
 
 @pytest.mark.asyncio
-async def test_a_resync_reuses_the_folder_and_its_share():
+@pytest.mark.parametrize(
+    "recorded",
+    [
+        {"shared_with": OWNER["id"]},
+        # Recorded before the recipient was: a completion shared with the owner.
+        {"trigger": "completion"},
+    ],
+    ids=["shared-with-the-owner", "an-older-completion-record"],
+)
+async def test_a_second_completion_reuses_the_folder_and_the_owners_share(recorded):
     handle = FOLDER.to_db()
     job = _job(
         exported_folder_handle=handle,
         context={
-            "job_outbox": {"state": "delivered", "shared": True, "handle": handle}
+            "job_outbox": {
+                "state": "delivered",
+                "shared": True,
+                "handle": handle,
+                **recorded,
+            }
         },
     )
     deps, store, backend = _deps(job=job)
@@ -176,9 +190,66 @@ async def test_a_resync_reuses_the_folder_and_its_share():
 
     assert result["shared"] is True
     assert backend.ensure_session_folder.await_args.kwargs == {
-        "session_id": "report-682baab8"
+        "session_id": "report-682baab8",
+        "exclusive": False,
     }
     backend.share_session_folder.assert_not_awaited()
+    assert _record(store)["shared_with"] == OWNER["id"]
+
+
+@pytest.mark.asyncio
+async def test_a_folder_shared_with_someone_else_is_shared_with_the_owner():
+    """An older re-sync shared the folder with the member who asked; the
+    owner's completion copy shares it with the owner."""
+    handle = FOLDER.to_db()
+    job = _job(
+        exported_folder_handle=handle,
+        context={
+            "job_outbox": {
+                "state": "delivered",
+                "trigger": "resync",
+                "shared": True,
+                "shared_with": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "handle": handle,
+            }
+        },
+    )
+    deps, store, backend = _deps(job=job)
+
+    result = await job_export.run_job_outbox_effect(job_id=JOB_ID, dependencies=deps)
+
+    assert result["shared"] is True
+    backend.share_session_folder.assert_awaited_once_with(FOLDER, "owner")
+    assert _record(store)["shared_with"] == OWNER["id"]
+
+
+@pytest.mark.asyncio
+async def test_a_new_folder_is_the_jobs_own_before_the_first_file():
+    from orchestrator.services.cloud import CloudBackendError, CloudBackendErrorKind
+
+    backend = _backend(
+        put_session_file=AsyncMock(
+            side_effect=CloudBackendError(
+                CloudBackendErrorKind.UNAVAILABLE, "gone", backend="nextcloud"
+            )
+        )
+    )
+    deps, store, _ = _deps(backend=backend)
+
+    result = await job_export.run_job_outbox_effect(job_id=JOB_ID, dependencies=deps)
+
+    assert (result["state"], result["reason"]) == ("failed", "copy_failed")
+    assert backend.ensure_session_folder.await_args.kwargs == {
+        "session_id": "write-the-report-" + JOB_ID.replace("-", ""),
+        "exclusive": True,
+    }
+    copying, failed = [
+        call.args[1]["job_outbox"] for call in store.merge_job_context.await_args_list
+    ]
+    assert (copying["state"], copying["handle"]) == ("copying", FOLDER.to_db())
+    # The failure keeps it: the next copy resumes into the job's own folder.
+    assert failed["handle"] == FOLDER.to_db()
+    store.update_job_exported_folder.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -437,12 +437,20 @@ class FakeMainCloudBackend:
 
     # ------------------------------------------------------------- Session folders
 
-    async def ensure_session_folder(self, *, session_id: str) -> SessionFolderHandle:
+    async def ensure_session_folder(
+        self, *, session_id: str, exclusive: bool = False
+    ) -> SessionFolderHandle:
         self._ensure_ready()
         self._fail_if_configured()
-        # Idempotent
+        # Idempotent, unless the caller asks for a folder of its own.
         for existing_id in self._session_folders:
             if existing_id == session_id:
+                if exclusive:
+                    raise CloudBackendError(
+                        CloudBackendErrorKind.ALREADY_EXISTS,
+                        f"session folder {session_id} exists",
+                        backend=self.backend_id,
+                    )
                 return SessionFolderHandle(
                     backend=self.backend_id,
                     native_id=f"sessions/{session_id}",

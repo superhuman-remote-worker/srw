@@ -1464,8 +1464,14 @@ class NextcloudBackend(NextcloudUserRootGrant):
     # ------------------------------------------------------------- Session folders
 
     @instrument_backend_op("ensure_session_folder")
-    async def ensure_session_folder(self, *, session_id: str) -> SessionFolderHandle:
-        """Create a session folder under the agent-service user's home."""
+    async def ensure_session_folder(
+        self, *, session_id: str, exclusive: bool = False
+    ) -> SessionFolderHandle:
+        """Create a session folder under the agent-service user's home.
+
+        ``exclusive`` refuses a folder that exists already
+        (``ALREADY_EXISTS``) instead of reusing it: the caller has no record
+        that the folder is its own."""
         self._ensure_ready()
         folder_path = f"sessions/{session_id}"
         try:
@@ -1478,6 +1484,13 @@ class NextcloudBackend(NextcloudUserRootGrant):
                     url,
                     auth=(self._agent_user, self._agent_password),
                 )
+                if resp.status_code == 405 and exclusive and i == len(parts) - 1:
+                    raise CloudBackendError(
+                        CloudBackendErrorKind.ALREADY_EXISTS,
+                        f"Session folder '{folder_path}' already exists",
+                        backend=self.backend_id,
+                        status_code=405,
+                    )
                 # 201 = created, 405 = already exists — both fine.
                 if resp.status_code in (201, 405):
                     continue

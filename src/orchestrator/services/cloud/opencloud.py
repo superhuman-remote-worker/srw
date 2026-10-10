@@ -1265,13 +1265,16 @@ class OpenCloudBackend:
     # ------------------------------------------------------------- Session folders
 
     @instrument_backend_op("ensure_session_folder")
-    async def ensure_session_folder(self, *, session_id: str) -> SessionFolderHandle:
+    async def ensure_session_folder(
+        self, *, session_id: str, exclusive: bool = False
+    ) -> SessionFolderHandle:
         """Create ``sessions/{session_id}`` under the agent-home Space via WebDAV.
 
         OpenCloud WebDAV lives at ``{base_url}/dav/spaces/{drive-id}/``
         (note: NOT ``/remote.php/dav/...`` — that's Nextcloud only). The
         path must be MKCOL-ed one segment at a time because intermediate
-        collections are NOT auto-created.
+        collections are NOT auto-created. ``exclusive`` refuses a folder that
+        exists already (``ALREADY_EXISTS``) instead of reusing it.
         """
         self._ensure_ready()
         if self._agent_home_webdav_base is None:
@@ -1292,6 +1295,13 @@ class OpenCloudBackend:
                     url,
                     headers={"Authorization": f"Bearer {token}"},
                 )
+                if resp.status_code == 405 and exclusive and i == len(parts) - 1:
+                    raise CloudBackendError(
+                        CloudBackendErrorKind.ALREADY_EXISTS,
+                        f"Session folder '{folder_path}' already exists",
+                        backend=self.backend_id,
+                        status_code=405,
+                    )
                 if resp.status_code in (201, 405):
                     continue
                 resp.raise_for_status()
