@@ -45,6 +45,7 @@ from orchestrator.services.connector_drivers.cloud_folder_checkout import (
     CloudFolderCheckoutDriver,
 )
 from orchestrator.services.connector_drivers.cloud_outbox import is_outbox_row
+from shared.connectors.contract import read_only_ceiling
 from shared.connectors.platform import native_user
 from shared.job_cloud_connectors import (
     CLOUD_CONNECTORS_CONTEXT_KEY,
@@ -66,7 +67,8 @@ OUTBOX_TYPE = "cloud_outbox"
 
 _ATTACHED_ROWS_SQL = """
     SELECT d.id, d.name, d.type, d.config, d.managed_key, d.read_only,
-           d.is_global, d.created_by, pd.read_only AS project_read_only
+           d.is_global, d.created_by, pd.read_only AS project_read_only,
+           pd.access AS project_access
       FROM datasources d
       LEFT JOIN project_datasources pd
         ON pd.datasource_id = d.id AND pd.project_id = $2::uuid
@@ -76,7 +78,8 @@ _ATTACHED_ROWS_SQL = """
 """
 _JOB_ROWS_SQL = """
     SELECT d.id, d.name, d.type, d.config, d.managed_key, d.read_only,
-           d.is_global, d.created_by, pd.read_only AS project_read_only
+           d.is_global, d.created_by, pd.read_only AS project_read_only,
+           pd.access AS project_access
       FROM job_datasources jd
       JOIN datasources d ON d.id = jd.datasource_id
       LEFT JOIN project_datasources pd
@@ -182,19 +185,39 @@ async def attached_cloud_rows(
     return out
 
 
+async def owner_role(
+    store: Any, user_id: str | None, project_id: str | None
+) -> str | None:
+    """The job owner's role in its project (``None``: not a member, as an
+    administrator may be)."""
+    if not user_id or not project_id:
+        return None
+    roles = await store.get_user_project_roles(str(user_id), [str(project_id)])
+    return roles.get(str(project_id))
+
+
 def resolve_checkout(
     rows: list[dict[str, Any]],
     *,
     project: Mapping[str, Any],
     workspace_backend: str | None = None,
+    role: str | None = None,
 ) -> CloudFolderCheckout | None:
     """The job's checkout among its attached ``rows``, at its level; ``None``
     when none of them copies the job's project's folder (none attached, the
     project has no folder, or the level is refused: logged, never
-    substituted)."""
+    substituted).
+
+    The level is the project link's default, else the highest the provider
+    offers; a project viewer's job gets at most ``read_only`` (the project
+    folder's viewer ceiling, ``datasource_policy.access_ceiling_for``): a
+    reviewed write-back would let the viewer write the folder by accepting
+    their own job's diff.
+    """
     if not project_has_folder(project):
         return None
     driver = CloudFolderCheckoutDriver()
+    ceiling = read_only_ceiling(driver.spec) if role == "viewer" else None
     ctx = AccessContext(
         workspace_backend,
         execution="job",
@@ -203,7 +226,9 @@ def resolve_checkout(
     for row in rows:
         if row.get("type") != CHECKOUT_TYPE:
             continue
-        bound = driver.checkout_binding(row, project_id=str(project.get("id")), ctx=ctx)
+        bound = driver.checkout_binding(
+            row, project_id=str(project.get("id")), ctx=ctx, ceiling=ceiling
+        )
         if isinstance(bound, CloudFolderCheckout):
             return bound
         logger.warning(
@@ -290,6 +315,7 @@ async def admission_stamp(
         rows = await attached_cloud_rows(
             store, project_id=project_id, datasource_ids=datasource_ids
         )
+        role = await owner_role(store, user_id, project_id) if project else None
     except Exception:
         logger.warning(
             "cloud connectors: could not read the attached rows of a job in "
@@ -299,7 +325,9 @@ async def admission_stamp(
         )
         return {}
     checkout = (
-        resolve_checkout(rows, project=project, workspace_backend=workspace_backend)
+        resolve_checkout(
+            rows, project=project, workspace_backend=workspace_backend, role=role
+        )
         if project is not None
         else None
     )
@@ -357,6 +385,9 @@ async def provisioning_stamp(
         rows = await attached_cloud_rows(
             store, project_id=str(project.get("id")), job_id=str(job_row["id"])
         )
+        role = await owner_role(
+            store, job_row.get("user_id"), str(project.get("id") or "")
+        )
     except Exception:
         logger.warning(
             "cloud connectors: could not read job %s's attached rows; no copy",
@@ -364,7 +395,7 @@ async def provisioning_stamp(
             exc_info=True,
         )
         return None
-    checkout = resolve_checkout(rows, project=project)
+    checkout = resolve_checkout(rows, project=project, role=role)
     if checkout is None:
         return None
     return {
@@ -389,6 +420,7 @@ __all__ = [
     "cloud_connectors",
     "job_context",
     "legacy_checkout",
+    "owner_role",
     "owners_outbox",
     "project_has_folder",
     "provisioning_stamp",

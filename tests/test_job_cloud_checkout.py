@@ -89,16 +89,21 @@ class _Ctx:
         return False
 
 
-def _store(rows, project=PROJECT):
+def _store(rows, project=PROJECT, role="owner"):
     conn = SimpleNamespace(fetch=AsyncMock(return_value=rows))
     store = MagicMock()
     store.acquire = MagicMock(return_value=_Ctx(conn))
     store.get_project = AsyncMock(return_value=project)
+    store.get_user_project_roles = AsyncMock(
+        return_value={PROJECT_ID: role} if role else {}
+    )
     return store, conn
 
 
-async def _admit(rows, *, project=PROJECT, outbox_allowed=True, ids=(CHECKOUT_ID,)):
-    store, _conn = _store(rows, project)
+async def _admit(
+    rows, *, project=PROJECT, outbox_allowed=True, ids=(CHECKOUT_ID,), role="owner"
+):
+    store, _conn = _store(rows, project, role)
     return await checkout.admission_stamp(
         store,
         datasource_ids=list(ids),
@@ -137,6 +142,37 @@ class TestAdmission:
                 }
             ],
         }
+
+    @pytest.mark.asyncio
+    async def test_a_link_default_is_the_level(self):
+        stamp = await _admit([_checkout_row(project_access="read_only")])
+        assert stamp["cloud_checkout"]["access"] == "read_only"
+
+    @pytest.mark.asyncio
+    async def test_a_viewers_job_never_writes_back(self):
+        # Accepting their own job's diff would write a folder they only view.
+        stamp = await _admit([_checkout_row()], role="viewer")
+        assert stamp["cloud_checkout"]["access"] == "read_only"
+        assert stamp["cloud_connectors"][0]["edits"] == "discarded"
+        # A non-member (an administrator) keeps every level.
+        stamp = await _admit([_checkout_row()], role=None)
+        assert stamp["cloud_checkout"]["access"] == "reviewed_write_back"
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_role_costs_the_copy(self):
+        store, _conn = _store([_checkout_row()])
+        store.get_user_project_roles.side_effect = RuntimeError("db down")
+        assert (
+            await checkout.admission_stamp(
+                store,
+                datasource_ids=[CHECKOUT_ID],
+                project_id=PROJECT_ID,
+                user_id=USER_ID,
+                workspace_backend=None,
+                outbox_allowed=True,
+            )
+            == {}
+        )
 
     @pytest.mark.asyncio
     async def test_a_read_only_link_copies_without_write_back(self):

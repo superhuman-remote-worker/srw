@@ -233,16 +233,19 @@ class CloudFolderCheckoutDriver(DatasourceDriver):
         project_id: str,
         ctx: AccessContext,
         requested: str | None = None,
+        ceiling: str | None = None,
     ) -> CloudFolderCheckout | CloudFolderCheckoutUnavailable:
         """The level a job of ``project_id`` binds its attached checkout row
         at, or why it gets no copy.
 
         Only the job's own project's checkout copies anything: a row with
         its managed key, naming that project. ``requested`` is a level the
-        job asks for; without one the row binds at its highest offered
-        level, and read-only when its project link or its creator's tag
-        says so (the strict rule: a read-only binding never gets the
-        reviewed level).
+        job asks for; without one the row binds at its project link's
+        default level (``project_access``), else its highest offered one,
+        lowered to ``ceiling`` (a project viewer's job: ``read_only``, so a
+        viewer never writes the folder through an accept) and read-only
+        when its project link or its creator's tag says so (the strict
+        rule: a read-only binding never gets the reviewed level).
         """
         connector_id = str(row.get("id") or "")
         try:
@@ -265,7 +268,7 @@ class CloudFolderCheckoutDriver(DatasourceDriver):
                 "config_invalid",
                 "This project folder copy connector is not the job's project's own",
             )
-        access = bound_access(self, row, ctx=ctx, requested=requested)
+        access = bound_access(self, row, ctx=ctx, requested=requested, ceiling=ceiling)
         if access.level is None:
             return CloudFolderCheckoutUnavailable(
                 connector_id,

@@ -72,6 +72,7 @@ def _make_db(
     db.managed_repository_scope_is_unambiguous = AsyncMock(return_value=True)
     db.get_user = AsyncMock(return_value=user)
     db.get_project = AsyncMock(return_value=project)
+    db.get_user_project_roles = AsyncMock(return_value={})
     db.get_project_repositories = AsyncMock(return_value=project_repos or [])
     db.get_job = AsyncMock(return_value=parent)
     authority_id = uuid.uuid4()

@@ -449,8 +449,18 @@ class TestHealLock:
 
         assert backend.ensure_project_folder.await_count == 1
         assert store.row["main_cloud_folder_handle"] == "opencloud:drive-1"
-        # The new folder got its own connector, once.
-        [connector] = store.connectors.values()
+        # The new folder got its own connectors, one of each kind, once: the
+        # folder's and its copy into the project's jobs.
+        by_kind = {
+            row["managed_key"].split(":")[0]: row for row in store.connectors.values()
+        }
+        assert sorted(by_kind) == ["project-cloud", "project-cloud-checkout"]
+        assert len(store.connectors) == 2
+        copy = by_kind["project-cloud-checkout"]
+        assert copy["managed_key"] == f"project-cloud-checkout:{PROJECT_ID}"
+        assert copy["ds_type"] == "cloud_folder_checkout"
+        assert copy["config"] == {"project_id": PROJECT_ID}
+        connector = by_kind["project-cloud"]
         assert connector["managed_key"] == f"project-cloud:{PROJECT_ID}"
         assert connector["ds_type"] == "cloud_folder"
         assert connector["project_ids"] == [PROJECT_ID]
