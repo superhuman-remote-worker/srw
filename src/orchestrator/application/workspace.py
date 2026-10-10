@@ -42,6 +42,7 @@ from orchestrator.services import (
     agent_cloud_mounts,
     agent_provisioner as agent_provisioner_module,
     cloud_mount_plan,
+    cloud_user_root,
     container_provisioner as container_provisioner_module,
     deployment_gates,
     grant_enforcement,
@@ -306,9 +307,10 @@ async def _prepare_session_cloud(
     mount_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """What a session's cloud folders need before its Pod is planned (main
-    cloud slices 3 and 6.1): the one-time conversion of a session created
+    cloud slices 3, 4 and 6.1): the one-time conversion of a session created
     before cloud connectors, then its outbox folder ensured and its share
-    retried. The thread as it now is. Never raises."""
+    retried, and its owner's root probed. The thread as it now is. Never
+    raises."""
     store = resources.postgres_db
     try:
         converted = await session_cloud_preparation.convert_to_connector_rule(
@@ -323,6 +325,12 @@ async def _prepare_session_cloud(
         converted = None
     thread = converted or thread
     await session_cloud_preparation.prepare_session_outbox(
+        thread, store=store, cloud_router=resources.main_cloud_router
+    )
+    # The owner's own root (main cloud slice 4): its credential probed here,
+    # outside the lock; one the cloud refused is recorded, so the planner
+    # excludes it.
+    await cloud_user_root.prepare_session_root(
         thread, store=store, cloud_router=resources.main_cloud_router
     )
     thread = await store.get_thread(str(thread["id"])) or thread

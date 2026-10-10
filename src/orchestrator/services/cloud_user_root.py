@@ -1086,6 +1086,25 @@ async def verify_selected_user_root(
         return None
 
 
+async def prepare_session_root(
+    thread: Mapping[str, Any], *, store: Any, cloud_router: Any
+) -> str | None:
+    """:func:`verify_selected_user_root` for a session's own selection: the
+    provisioner's pre-plan step, outside the thread's lock. Never raises."""
+    from orchestrator.services.cloud_connector_mounts import selected_ids
+    from orchestrator.services.stateless_workspace_gate import (
+        thread_metadata_object,
+    )
+
+    try:
+        ids = selected_ids(thread_metadata_object(dict(thread)))
+    except Exception:
+        return None
+    return await verify_selected_user_root(
+        thread, selected_ids=ids, store=store, cloud_router=cloud_router
+    )
+
+
 __all__ = [
     "CLOUD_FOLDER_TYPE",
     "CONNECT_FAILURES",
@@ -1111,6 +1130,7 @@ __all__ = [
     "ensure_user_root_if_cloud",
     "is_user_root",
     "own_root",
+    "prepare_session_root",
     "public_status",
     "retirement_revoke",
     "revoke_root_credential",

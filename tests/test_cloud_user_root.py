@@ -798,3 +798,29 @@ class TestStatus:
         assert body["supported"] is True
         assert body["state"] == "not_connected"
         assert body["connector_id"] == store.root()["id"]
+
+
+@pytest.mark.asyncio
+async def test_the_pre_plan_step_probes_the_sessions_own_selection(store, cloud):
+    row = await _connected(store, cloud)
+    cloud.issued.clear()
+    router = FakeRouter(cloud)
+    unselected = {"id": "t1", "user_id": ANN, "metadata": {"datasource_ids": []}}
+    assert (
+        await cloud_user_root.prepare_session_root(
+            unselected, store=store, cloud_router=router
+        )
+        is None
+    )
+    selected = {
+        "id": "t1",
+        "user_id": ANN,
+        "metadata": '{"datasource_ids": ["%s"]}' % row["id"],
+    }
+    assert (
+        await cloud_user_root.prepare_session_root(
+            selected, store=store, cloud_router=router
+        )
+        == "rejected"
+    )
+    assert cloud_user_root.root_state(store.root()) == "revoked"
