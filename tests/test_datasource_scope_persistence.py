@@ -949,7 +949,7 @@ async def test_connector_owner_can_revoke_link_without_project_owner_role():
 
 
 @pytest.mark.asyncio
-async def test_delete_project_removes_native_kb_datasource_before_project_row():
+async def test_delete_project_removes_its_own_connectors_before_project_row():
     conn = AsyncMock()
     # This Project has no saved resources, retained workspace or live execution.
     conn.fetch.return_value = []
@@ -970,12 +970,19 @@ async def test_delete_project_removes_native_kb_datasource_before_project_row():
         index for index, sql in enumerate(statements) if "DELETE FROM projects" in sql
     )
     assert native_index < project_index
-    native_sql, native_project_id = conn.execute.await_args_list[native_index].args
+    native_sql, native_project_id, managed_keys = conn.execute.await_args_list[
+        native_index
+    ].args
+    assert "WHERE managed_key = ANY($2::text[])" in native_sql
     assert "type = 'kb'" in native_sql
     assert "WHEN config->>'native_project_id' ~*" in native_sql
     assert "THEN (config->>'native_project_id')::uuid" in native_sql
     assert "END = $1" in native_sql
     assert native_project_id == UUID(PROJECT_A)
+    # Every kind a project's own connector carries: its knowledge base, its
+    # cloud folder.
+    assert f"project-kb:{PROJECT_A}" in managed_keys
+    assert f"project-cloud:{PROJECT_A}" in managed_keys
     parent_lock_sql, parent_lock_project = conn.fetch.await_args.args
     assert "ORDER BY d.id" in parent_lock_sql
     assert "FOR UPDATE OF d" in parent_lock_sql

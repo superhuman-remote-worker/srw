@@ -56,6 +56,7 @@ from shared.connectors.platform import (
     native_project_sql,
     native_user_sql,
     platform_owned_sql,
+    project_managed_keys,
 )
 
 try:
@@ -50560,6 +50561,59 @@ class PostgresDB:
 
         return _datasource_row_to_dict(row) if row else None
 
+    async def get_datasource_by_managed_key(
+        self, managed_key: str
+    ) -> Dict[str, Any] | None:
+        """The connector SRW keeps under ``managed_key``
+        (``shared.connectors.platform``), without its credentials, or None."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, name, description, type, connection_url, config,
+                       cli_hint, default_branch, job_id, created_by, is_global,
+                       read_only, scope_mode, auto_attach, policy_revision,
+                       managed_key, created_at, updated_at
+                FROM datasources
+                WHERE managed_key = $1
+                """,
+                managed_key,
+            )
+        return _datasource_row_to_dict(row) if row else None
+
+    async def list_project_cloud_folders(self) -> List[Dict[str, Any]]:
+        """Every non-default project with a folder in the main cloud, for the
+        project cloud folder connectors' startup pass
+        (``project_cloud_connectors``).
+
+        Each row carries the project's folder columns, archived projects
+        included, and ``owner_id``: its earliest-added owner (None without
+        one). A project known only by its legacy Nextcloud folder id is
+        listed too, with no ``main_cloud_folder_handle``.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT p.id, p.name, p.is_default, p.main_cloud_backend,
+                       p.main_cloud_backend_instance_id,
+                       p.main_cloud_folder_handle, p.nextcloud_folder_id,
+                       (
+                           SELECT pm.user_id
+                           FROM project_members pm
+                           WHERE pm.project_id = p.id AND pm.role = 'owner'
+                           ORDER BY pm.added_at, pm.user_id
+                           LIMIT 1
+                       ) AS owner_id
+                FROM projects p
+                WHERE p.is_default = FALSE
+                  AND (
+                      p.main_cloud_folder_handle IS NOT NULL
+                      OR p.nextcloud_folder_id IS NOT NULL
+                  )
+                ORDER BY p.id
+                """
+            )
+        return [dict(row) for row in rows]
+
     async def get_native_project_kb_datasource_ref(
         self, project_id: str
     ) -> Dict[str, Any] | None:
@@ -50673,7 +50727,8 @@ class PostgresDB:
         authority_user_id: str | None = None,
         authority_is_admin: bool = False,
         driver_registration_id: str | None = None,
-    ) -> Dict[str, Any]:
+        managed_key: str | None = None,
+    ) -> Dict[str, Any] | None:
         """Create a new datasource.
 
         Args:
@@ -50702,9 +50757,13 @@ class PostgresDB:
             driver_registration_id: The registered image driver the connector
                 runs (connector drivers D6), pinned in the same transaction
                 before its Connector resource is written
+            managed_key: The platform identity of a connector SRW provisions
+                itself (``shared.connectors.platform``). The row is created
+                only if no row holds the key yet; the API never sets it
 
         Returns:
-            Created datasource dict
+            Created datasource dict, or ``None`` when ``managed_key`` is set
+            and another row already holds it (nothing is written)
 
         Raises:
             asyncpg.UniqueViolationError: If a datasource with the same
@@ -50731,18 +50790,27 @@ class PostgresDB:
                     authority_user_id=authority_user_id,
                     authority_is_admin=authority_is_admin,
                 )
+                # A platform row is SRW's to create once: a second provisioning
+                # pass (another replica, a rerun backfill) finds the key taken.
+                on_conflict = (
+                    "ON CONFLICT (managed_key) WHERE managed_key IS NOT NULL DO NOTHING"
+                    if managed_key is not None
+                    else ""
+                )
                 row = await conn.fetchrow(
-                    """
+                    f"""
                     INSERT INTO datasources (name, description, type, connection_url,
                                              credentials, config, job_id, cli_hint,
                                              default_branch, created_by, is_global,
-                                             read_only, scope_mode, auto_attach)
+                                             read_only, scope_mode, auto_attach,
+                                             managed_key)
                     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10,
-                            $11, $12, $13, $14)
+                            $11, $12, $13, $14, $15)
+                    {on_conflict}
                     RETURNING id, name, description, type, connection_url, credentials,
                               config, job_id, cli_hint, default_branch, created_by,
                               is_global, read_only, scope_mode, auto_attach,
-                              policy_revision, created_at, updated_at
+                              policy_revision, managed_key, created_at, updated_at
                     """,
                     name,
                     description,
@@ -50758,7 +50826,10 @@ class PostgresDB:
                     read_only,
                     scope_mode,
                     auto_attach,
+                    managed_key,
                 )
+                if row is None:
+                    return None
                 datasource_uuid = row["id"]
                 if driver_registration_id is not None:
                     # Locked against a delete or disable racing this create.
@@ -50804,7 +50875,7 @@ class PostgresDB:
                                credentials, config, job_id, cli_hint,
                                default_branch, created_by, is_global, read_only,
                                scope_mode, auto_attach, policy_revision,
-                               created_at, updated_at
+                               managed_key, created_at, updated_at
                         FROM datasources
                         WHERE id = $1
                         """,
@@ -57376,23 +57447,29 @@ class PostgresDB:
                     """,
                     uuid_val,
                 )
-                # Native KB connectors are project-owned synthetic rows. Their
-                # project link would otherwise cascade away while the
-                # datasource itself survived as an unreachable orphan. Match
-                # the server-owned marker exactly and remove the datasource
-                # before deleting its project in the same transaction.
+                # A project's own connectors (its knowledge base, its cloud
+                # folder) are project-owned synthetic rows. Their project link
+                # would otherwise cascade away while the datasource itself
+                # survived as an unreachable orphan. Match the project's
+                # managed keys, or a knowledge base's older server-owned
+                # marker, exactly and remove the datasource before deleting
+                # its project in the same transaction.
                 await conn.execute(
                     """
                     DELETE FROM datasources
-                    WHERE type = 'kb'
-                      AND CASE
-                          WHEN config->>'native_project_id' ~*
-                               '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
-                          THEN (config->>'native_project_id')::uuid
-                          ELSE NULL
-                      END = $1
+                    WHERE managed_key = ANY($2::text[])
+                       OR (
+                           type = 'kb'
+                           AND CASE
+                               WHEN config->>'native_project_id' ~*
+                                    '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+                               THEN (config->>'native_project_id')::uuid
+                               ELSE NULL
+                           END = $1
+                       )
                     """,
                     uuid_val,
+                    project_managed_keys(uuid_val),
                 )
                 result = await conn.execute(
                     "DELETE FROM projects WHERE id = $1",

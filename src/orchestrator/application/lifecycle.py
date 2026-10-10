@@ -46,6 +46,7 @@ from orchestrator.services import (
     notification_service as notification_service_module,
     officer_paging as officer_paging_service,
     persistent_provisioner as persistent_provisioner_module,
+    project_cloud_connectors,
     readiness as readiness_service,
     session_wake,
     sitrep as sitrep_service,
@@ -352,6 +353,20 @@ async def bind_services(resources: ApplicationResources) -> None:
         await instance_registry.preload_retained_main_cloud_instances(
             resources.postgres_db, resources.main_cloud_router
         )
+        # Every project folder of the now-authoritative active installation
+        # has its own connector (main cloud slice 3). Idempotent on every
+        # replica (the key is unique); a failure only defers it.
+        try:
+            await project_cloud_connectors.backfill_project_cloud_connectors(
+                resources.postgres_db,
+                active_instance_id=resources.main_cloud_router.active_instance_id,
+            )
+        except Exception:
+            logger.error(
+                "Project cloud folder connectors backfill failed; it retries "
+                "at the next start",
+                exc_info=True,
+            )
         if _legacy_overlay is not None:
             try:
                 await resources.postgres_db.delete_system_setting("main_cloud")

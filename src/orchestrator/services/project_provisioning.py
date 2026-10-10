@@ -27,6 +27,7 @@ from uuid import uuid4
 from fastapi import HTTPException
 
 from orchestrator.schemas.projects import ExternalKnowledgeBase
+from orchestrator.services import project_cloud_connectors
 from orchestrator.services.cloud import FeatureNotAvailable
 from orchestrator.services.cloud.identity import resolve_user_identity_cached
 from orchestrator.services.datasource_config import (
@@ -166,14 +167,17 @@ async def ensure_project_cloud_resources(
     *,
     dependencies: ProjectProvisioningDependencies,
 ) -> dict[str, Any]:
-    """Ensure a project has its Keycloak group, main-cloud Space and WebDAV
-    datasource — and that every current member is in both groups.
+    """Ensure a project has its Keycloak group, main-cloud Space and cloud
+    folder connector — and that every current member is in both groups.
 
-    Two conditional steps:
+    Two conditional steps, and the connector:
 
     * **Folder creation** runs only when `main_cloud_folder_handle` is missing
       (protected by a per-project lock because `ensure_project_folder` is not
       idempotent — each call creates a new Space).
+    * **The cloud folder connector** (``project_cloud_connectors``) is
+      created once the project has a folder in the active installation, and
+      repointed when its folder handle was repaired.
     * **Member sync** runs unconditionally (the Keycloak and LibreGraph adds
       are idempotent). This repairs the common case where the Space already
       exists but the user was never added to the groups — e.g. project created
@@ -294,6 +298,15 @@ async def ensure_project_cloud_resources(
                         f"Failed to create cloud resources for project "
                         f"{project_id_str}: {e}"
                     )
+
+    # The folder's own connector, once the folder exists; repointed when the
+    # project's folder handle was repaired. Never raises.
+    await project_cloud_connectors.ensure_project_cloud_connector(
+        store,
+        project,
+        active_instance_id=dependencies.main_cloud_router.active_instance_id,
+        log=logger,
+    )
 
     # Member sync — always runs when this helper does. Idempotent add in both
     # Keycloak and the backend; essential for self-healing projects whose

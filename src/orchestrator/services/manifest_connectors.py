@@ -75,7 +75,8 @@ from orchestrator.services.manifest_store import ManifestStore, decoded, resourc
 from shared.connectors.platform import (
     NATIVE_PROJECT_CONFIG_KEY,
     managed_key_for,
-    native_kb_project,
+    native_project,
+    native_user,
 )
 from shared.manifests import API_VERSION, preview_documents
 from shared.manifests.resolution import content_revision
@@ -153,10 +154,18 @@ def connector_scope(
     row: Mapping[str, Any], project_ids: list[Any] | tuple[Any, ...]
 ) -> dict[str, str] | None:
     """The scope a row's new Connector lives in, or ``None`` for the legacy
-    path."""
-    project = native_kb_project(row)
+    path.
+
+    A project's own connector (its knowledge base, its cloud folder) lives in
+    its project and a user's own in that user's Account, whoever created
+    the row.
+    """
+    project = native_project(row)
     if project:
         return {"kind": "Project", "name": project}
+    user = native_user(row)
+    if user:
+        return {"kind": "Account", "name": user}
     if row.get("created_by"):
         return {"kind": "Account", "name": str(row["created_by"])}
     linked = sorted({str(value) for value in project_ids})
@@ -319,7 +328,12 @@ async def _retire(db, resource: Mapping[str, Any] | None) -> bool:
 async def _scope(db, row, live) -> dict[str, str] | None:
     """Where the row's resource lives: its owner decides, except that an
     ownerless row's resource keeps the scope it was created in."""
-    if live is not None and not native_kb_project(row) and not row.get("created_by"):
+    if (
+        live is not None
+        and not native_project(row)
+        and not native_user(row)
+        and not row.get("created_by")
+    ):
         return dict(live["document"]["metadata"]["scope"])
     links = await db.fetch(
         "SELECT project_id FROM project_datasources WHERE datasource_id=$1",

@@ -495,6 +495,16 @@ class TestScope:
         row = _row("kb", created_by=None, managed_key=project_kb_key(PROJECT))
         assert connector_scope(row, []) == {"kind": "Project", "name": PROJECT}
 
+    def test_a_project_cloud_folder_lives_in_its_project(self):
+        row = _row("cloud_folder", managed_key=project_cloud_key(PROJECT))
+        assert connector_scope(row, [PROJECT]) == {"kind": "Project", "name": PROJECT}
+
+    def test_a_users_own_connector_lives_in_its_users_account(self):
+        row = _row(
+            "cloud_folder", created_by=None, managed_key="user-cloud-root:" + OWNER
+        )
+        assert connector_scope(row, [PROJECT]) == {"kind": "Account", "name": OWNER}
+
     def test_an_ownerless_row_with_one_link_lives_in_that_project(self):
         assert connector_scope(_row("postgresql", created_by=None), [PROJECT]) == {
             "kind": "Project",

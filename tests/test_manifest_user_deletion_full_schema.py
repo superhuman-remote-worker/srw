@@ -275,6 +275,43 @@ async def test_account_deletion_detaches_native_project_kb_creator(database):
 
 
 @pytest.mark.asyncio
+async def test_account_deletion_detaches_native_project_cloud_folder_creator(database):
+    """A key-only project connector (no config marker) outlives its creator too."""
+
+    user, project = await owner(database, "Native cloud creator")
+    datasource_id = uuid4()
+    await database.execute(
+        "INSERT INTO datasources "
+        "(id,name,type,created_by,scope_mode,auto_attach,managed_key) "
+        "VALUES ($1,'Project cloud folder','cloud_folder',$2,'projects',TRUE,"
+        "'project-cloud:' || $3::uuid::text)",
+        datasource_id,
+        user["id"],
+        project["id"],
+    )
+    await database.execute(
+        "INSERT INTO project_datasources (project_id,datasource_id) VALUES ($1,$2)",
+        project["id"],
+        datasource_id,
+    )
+
+    assert await database.delete_user(str(user["id"])) is True
+    assert (
+        await database.fetchval(
+            "SELECT created_by FROM datasources WHERE id=$1", datasource_id
+        )
+        is None
+    )
+    assert await database.delete_project(str(project["id"])) is True
+    assert (
+        await database.fetchval(
+            "SELECT count(*) FROM datasources WHERE id=$1", datasource_id
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
 async def test_project_delete_ignores_only_settled_ownerless_session_history(
     database, monkeypatch
 ):

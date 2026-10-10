@@ -390,6 +390,20 @@ class _HealStore:
     async def get_project_members(self, _project_id: str) -> list[dict[str, Any]]:
         return []
 
+    # The project's own cloud folder connector, unique by its managed key.
+    connectors: dict[str, dict[str, Any]]
+
+    async def get_datasource_by_managed_key(self, key: str) -> dict[str, Any] | None:
+        return getattr(self, "connectors", {}).get(key)
+
+    async def create_datasource(self, **row: Any) -> dict[str, Any] | None:
+        connectors = self.__dict__.setdefault("connectors", {})
+        await asyncio.sleep(0)
+        if row["managed_key"] in connectors:
+            return None
+        connectors[row["managed_key"]] = {"id": str(uuid4()), **row}
+        return connectors[row["managed_key"]]
+
 
 def _folder_backend() -> SimpleNamespace:
     handle = SimpleNamespace(native_id="drive-1", to_db=lambda: "opencloud:drive-1")
@@ -420,6 +434,7 @@ class TestHealLock:
             main_cloud_router=SimpleNamespace(
                 for_project_optional=MagicMock(return_value=backend),
                 for_owner=MagicMock(return_value=backend),
+                active_instance_id=backend.backend_instance_id,
             ),
         )
 
@@ -434,6 +449,18 @@ class TestHealLock:
 
         assert backend.ensure_project_folder.await_count == 1
         assert store.row["main_cloud_folder_handle"] == "opencloud:drive-1"
+        # The new folder got its own connector, once.
+        [connector] = store.connectors.values()
+        assert connector["managed_key"] == f"project-cloud:{PROJECT_ID}"
+        assert connector["ds_type"] == "cloud_folder"
+        assert connector["project_ids"] == [PROJECT_ID]
+        assert connector["config"] == {
+            "folder_kind": "project",
+            "project_id": PROJECT_ID,
+            "backend_id": "opencloud",
+            "backend_instance_id": backend.backend_instance_id,
+            "folder_handle": "opencloud:drive-1",
+        }
 
     @pytest.mark.asyncio
     async def test_the_lock_map_is_owned_by_the_dependencies_not_the_module(self):
@@ -443,6 +470,7 @@ class TestHealLock:
         router = SimpleNamespace(
             for_project_optional=MagicMock(return_value=backend),
             for_owner=MagicMock(return_value=backend),
+            active_instance_id=backend.backend_instance_id,
         )
         first = _deps(store=store, main_cloud_router=router)
         second = _deps(store=_HealStore(), main_cloud_router=router)
@@ -594,6 +622,7 @@ class TestMemberSyncDegradation:
             main_cloud_router=SimpleNamespace(
                 for_project_optional=MagicMock(return_value=backend),
                 for_owner=MagicMock(return_value=backend),
+                active_instance_id=backend.backend_instance_id,
             ),
         )
         project = {
