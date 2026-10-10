@@ -470,6 +470,23 @@ class NextcloudBackend(NextcloudUserRootGrant):
         """Agent credentials for WebDAV access to Nextcloud folders."""
         return {"username": self._agent_user, "password": self._agent_password}
 
+    @property
+    def service_account_logins(self) -> frozenset[tuple[str, str]]:
+        """``(host, username)`` of each account SRW itself signs in as (the
+        admin and the agent account) on each host this installation is
+        reached at, internal and public, lower-cased. A connector holding
+        one holds SRW's own credential to a whole cloud home (main cloud
+        slice 8 retires the ownerless ones)."""
+        hosts = {urlsplit(url).hostname for url in (self._base_url, self._public_url)}
+        users = {self._admin_user, self._agent_user}
+        return frozenset(
+            (host.lower(), user.casefold())
+            for host in hosts
+            if host
+            for user in users
+            if user
+        )
+
     def cloud_sync_config(
         self, webdav_url: str, *, target_user_sub: Optional[str] = None
     ) -> Optional[dict[str, Any]]:

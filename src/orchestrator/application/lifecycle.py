@@ -300,7 +300,9 @@ async def open_stores(resources: ApplicationResources) -> tuple[bool, Any]:
     resources.metering = metering
 
     # Idempotent data backfills (R1.B11: moved to services/startup_backfills).
-    await startup_backfills.run_startup_backfills(resources.postgres_db)
+    await startup_backfills.run_startup_backfills(
+        resources.postgres_db, main_cloud_router=resources.main_cloud_router
+    )
     return audit_ready, metering_capabilities
 
 

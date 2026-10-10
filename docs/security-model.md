@@ -237,7 +237,11 @@ guarantees it.
   could point would mount with the main cloud's credential, so the API
   refuses the types. The older connectors that held a service account's
   credential to a whole cloud home ("Cloud Storage (Personal)", and the
-  bundled Nextcloud row at `admin`'s home) are deleted at startup.
+  bundled Nextcloud row at `admin`'s home) are deleted at startup, and so
+  is any other ownerless WebDAV connector that signs in to the main cloud's
+  host as `agent-service` or the cloud's admin, however it was renamed or
+  linked. A connector someone owns is theirs and stays, whatever credential
+  it holds.
 - **An explicit empty connector list means no connectors.** No folder
   mounts and no connector binds. The project's knowledge base stays
   reachable as project memory, which follows project membership, not the

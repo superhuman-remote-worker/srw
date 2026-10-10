@@ -1,5 +1,7 @@
-"""The two WebDAV rows the old main-cloud wiring made, retired at startup
-(main cloud slice 8).
+"""The WebDAV rows holding the main cloud's own credential, retired at
+startup (main cloud slice 8).
+
+The old main-cloud wiring made two:
 
 * **"Cloud Storage (Personal)"**: what an administrator's ``create_user``
   made for the new user's default project, the user's Nextcloud home reached
@@ -12,15 +14,24 @@
   ConfigMap cannot seed it again.
 
 Both carry a service account's credential to a whole cloud home, so they go
-rather than wait for the table work. A row is retired only in exactly the
-shape SRW made it: an administrator who renamed, re-described, linked or
-re-owned one made it theirs, and it stays. The shape is the row's own
-columns and links, never ``manifest_resource_id``: that is the Connector
-write-through stamp (D3a), which ``create_datasource`` set on the personal
-row at birth and ``migrate_stored_connectors`` sets on every scoped row at
-each start, before this pass runs. Each goes through ``delete_datasource``
-like any delete: links, leases and driver identities go with it, a tombstone
-keeps its name and threads naming it are scrubbed.
+rather than wait for the table work. Each is retired in exactly the shape
+SRW made it, whatever its login. The shape is the row's own columns and
+links, never ``manifest_resource_id``: that is the Connector write-through
+stamp (D3a), which ``create_datasource`` set on the personal row at birth
+and ``migrate_stored_connectors`` sets on every scoped row at each start,
+before this pass runs.
+
+A renamed, re-described or relinked one still holds the same credential, so
+a third match goes by the login: any other **ownerless** WebDAV row whose
+URL is on the main cloud's host and whose username is one of the accounts
+SRW itself signs in as there (``agent-service``, the cloud's admin;
+``NextcloudBackend.service_account_logins``) goes too. A row someone owns
+is theirs and stays, whatever it holds; so does an ownerless row with
+another login or at another host.
+
+Each goes through ``delete_datasource`` like any delete: links, leases and
+driver identities go with it, a tombstone keeps its name and threads naming
+it are scrubbed.
 
 :func:`retire_legacy_cloud_datasources` runs at every startup, idempotent on
 every replica, and logs one count line; once it reads 0 on every
@@ -91,6 +102,18 @@ ORDER BY d.id
 """
 
 
+# Every other ownerless WebDAV row: the third match reads its login.
+_OWNERLESS_WEBDAV_SQL = """
+SELECT d.id
+FROM datasources d
+WHERE d.type = 'webdav'
+  AND d.created_by IS NULL
+  AND d.job_id IS NULL
+  AND d.managed_key IS NULL
+ORDER BY d.id
+"""
+
+
 def is_nextcloud_admin_home_url(url: str | None) -> bool:
     """Whether a WebDAV URL is Nextcloud admin's own home, the shape no
     seeded row may take."""
@@ -103,9 +126,33 @@ def is_nextcloud_admin_home_url(url: str | None) -> bool:
     return bool(_ADMIN_HOME_PATH.search(path))
 
 
-async def _retire(store: Any, sql: str, *args: Any) -> int:
+def main_cloud_service_logins(router: Any) -> frozenset[tuple[str, str]]:
+    """The ``(host, username)`` logins of the main cloud's own accounts, from
+    its configured backend; none without a router or for a provider that
+    describes none."""
+    backend = getattr(router, "active", None) if router is not None else None
+    return frozenset(getattr(backend, "service_account_logins", None) or ())
+
+
+def _holds_service_login(
+    row: dict[str, Any], logins: frozenset[tuple[str, str]]
+) -> bool:
+    try:
+        host = urlsplit(str(row.get("connection_url") or "").strip()).hostname
+    except ValueError:
+        return False
+    username = (row.get("credentials") or {}).get("username")
+    if not host or not isinstance(username, str):
+        return False
+    return (host.lower(), username.strip().casefold()) in logins
+
+
+async def _candidate_ids(store: Any, sql: str, *args: Any) -> list[str]:
     async with store.acquire() as conn:
-        ids = [str(row["id"]) for row in await conn.fetch(sql, *args)]
+        return [str(row["id"]) for row in await conn.fetch(sql, *args)]
+
+
+async def _delete(store: Any, ids: list[str]) -> int:
     retired = 0
     for datasource_id in ids:
         # Another replica may have taken it first: only a delete counts.
@@ -114,24 +161,51 @@ async def _retire(store: Any, sql: str, *args: Any) -> int:
     return retired
 
 
+async def _retire(store: Any, sql: str, *args: Any) -> int:
+    return await _delete(store, await _candidate_ids(store, sql, *args))
+
+
+async def _retire_service_logins(store: Any, logins: frozenset[tuple[str, str]]) -> int:
+    if not logins:
+        return 0
+    held = []
+    for datasource_id in await _candidate_ids(store, _OWNERLESS_WEBDAV_SQL):
+        row = await store.get_datasource(datasource_id)
+        if row and row.get("created_by") is None and _holds_service_login(row, logins):
+            held.append(datasource_id)
+    return await _delete(store, held)
+
+
 async def retire_legacy_cloud_datasources(
-    store: Any, *, log: Any = None
+    store: Any,
+    *,
+    service_logins: frozenset[tuple[str, str]] = frozenset(),
+    log: Any = None,
 ) -> dict[str, int]:
     """Delete every "Cloud Storage (Personal)" row and the bundled
-    ``Nextcloud`` admin-home row still in SRW's own shape, and log one count
-    line. Idempotent: a second pass retires nothing."""
+    ``Nextcloud`` admin-home row still in SRW's own shape, then every other
+    ownerless WebDAV row holding one of ``service_logins``
+    (:func:`main_cloud_service_logins`), and log one count line. Idempotent:
+    a second pass retires nothing."""
     log = log or logger
     counts = {
         "personal": await _retire(store, _PERSONAL_SQL, list(_PERSONAL_DESCRIPTIONS)),
         "bundled_nextcloud": await _retire(store, _BUNDLED_NEXTCLOUD_SQL),
+        "service_login": await _retire_service_logins(store, service_logins),
     }
     log.info(
         "Legacy cloud WebDAV connectors retired: %d Cloud Storage (Personal), "
-        "%d bundled Nextcloud admin home",
+        "%d bundled Nextcloud admin home, %d other ownerless holding the main "
+        "cloud's own login",
         counts["personal"],
         counts["bundled_nextcloud"],
+        counts["service_login"],
     )
     return counts
 
 
-__all__ = ["is_nextcloud_admin_home_url", "retire_legacy_cloud_datasources"]
+__all__ = [
+    "is_nextcloud_admin_home_url",
+    "main_cloud_service_logins",
+    "retire_legacy_cloud_datasources",
+]

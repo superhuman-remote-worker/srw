@@ -12,8 +12,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from orchestrator.services.cloud import MainCloudRouter
+from orchestrator.services.cloud.config import NextcloudSettings
+from orchestrator.services.cloud.nextcloud import NextcloudBackend
 from orchestrator.services.legacy_cloud_datasources import (
     is_nextcloud_admin_home_url,
+    main_cloud_service_logins,
 )
 
 
@@ -32,6 +36,37 @@ from orchestrator.services.legacy_cloud_datasources import (
 )
 def test_admins_home_is_recognised(url, expected):
     assert is_nextcloud_admin_home_url(url) is expected
+
+
+def test_the_main_clouds_own_logins_are_its_accounts_on_each_of_its_hosts():
+    backend = NextcloudBackend(
+        NextcloudSettings(
+            base_url="http://NC.internal:8080/",
+            public_url="https://cloud.example/nc",
+            admin_user="Admin",
+            admin_password="admin-secret",
+            agent_user="agent-service",
+            agent_password="agent-secret",
+        )
+    )
+
+    assert main_cloud_service_logins(MainCloudRouter(backend)) == {
+        ("nc.internal", "admin"),
+        ("nc.internal", "agent-service"),
+        ("cloud.example", "admin"),
+        ("cloud.example", "agent-service"),
+    }
+
+
+def test_no_router_or_a_provider_without_logins_names_none():
+    class _Provider:
+        pass
+
+    class _Router:
+        active = _Provider()
+
+    assert main_cloud_service_logins(None) == frozenset()
+    assert main_cloud_service_logins(_Router()) == frozenset()
 
 
 @pytest.fixture

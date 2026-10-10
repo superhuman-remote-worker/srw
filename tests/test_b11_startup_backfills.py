@@ -20,7 +20,9 @@ def _no_legacy_cloud_rows(monkeypatch):
     monkeypatch.setattr(
         startup_backfills,
         "retire_legacy_cloud_datasources",
-        AsyncMock(return_value={"personal": 0, "bundled_nextcloud": 0}),
+        AsyncMock(
+            return_value={"personal": 0, "bundled_nextcloud": 0, "service_login": 0}
+        ),
     )
 
 
@@ -62,7 +64,7 @@ async def test_each_backfill_failure_is_logged_and_the_next_step_still_runs(
 
     store.backfill_encrypt_datasource_credentials.assert_awaited_once()
     store.backfill_strip_thread_config_secrets.assert_awaited_once()
-    retire.assert_awaited_once_with(store)
+    retire.assert_awaited_once_with(store, service_logins=frozenset())
     seed.assert_awaited_once_with(store)
     assert "Datasource credentials backfill failed" in caplog.text
     assert "Thread config_override strip backfill failed" in caplog.text
@@ -101,3 +103,19 @@ async def test_a_failing_dev_token_seed_does_not_stop_startup(monkeypatch, caplo
     caplog.set_level(logging.WARNING)
     await startup_backfills.run_startup_backfills(_store())
     assert "MCP dev token seed at startup failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_retire_pass_gets_the_main_clouds_own_logins(monkeypatch):
+    monkeypatch.delenv("MCP_DEV_TOKEN", raising=False)
+    retire = AsyncMock(return_value={})
+    monkeypatch.setattr(startup_backfills, "retire_legacy_cloud_datasources", retire)
+    router = MagicMock()
+    router.active.service_account_logins = frozenset({("nc.internal", "admin")})
+    store = _store()
+
+    await startup_backfills.run_startup_backfills(store, main_cloud_router=router)
+
+    retire.assert_awaited_once_with(
+        store, service_logins=frozenset({("nc.internal", "admin")})
+    )

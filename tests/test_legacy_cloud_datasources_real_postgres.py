@@ -1,6 +1,7 @@
 """The legacy cloud WebDAV rows retired on a real PostgreSQL (main cloud
-slice 8): only the exact shapes SRW made go, with their links, a tombstone
-and the threads' references; a second pass retires nothing."""
+slice 8): the exact shapes SRW made go, and any other ownerless row holding
+the main cloud's own login, with their links, a tombstone and the threads'
+references; a second pass retires nothing."""
 
 from __future__ import annotations
 
@@ -12,8 +13,12 @@ import pytest
 import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
-from orchestrator.database.postgres import PostgresDB
+from orchestrator.database.postgres import PostgresDB, _encrypt_credentials_dict
+from orchestrator.services.cloud import MainCloudRouter
+from orchestrator.services.cloud.config import NextcloudSettings
+from orchestrator.services.cloud.nextcloud import NextcloudBackend
 from orchestrator.services.legacy_cloud_datasources import (
+    main_cloud_service_logins,
     retire_legacy_cloud_datasources,
 )
 from orchestrator.services.manifest_connectors import migrate_stored_connectors
@@ -86,6 +91,7 @@ async def _row(
     created_by: str | None = None,
     is_global: bool = False,
     projects: tuple[str, ...] = (),
+    credentials: dict[str, str] | None = None,
 ) -> str:
     async with db.acquire() as conn:
         datasource_id = await conn.fetchval(
@@ -93,7 +99,7 @@ async def _row(
             INSERT INTO datasources (
                 name, description, type, connection_url, credentials,
                 created_by, is_global, scope_mode
-            ) VALUES ($1, $2, 'webdav', $3, '{}'::jsonb, $4::uuid, $5, $6)
+            ) VALUES ($1, $2, 'webdav', $3, $7::jsonb, $4::uuid, $5, $6)
             RETURNING id
             """,
             name,
@@ -102,6 +108,7 @@ async def _row(
             created_by,
             is_global,
             "all" if is_global else "projects",
+            _encrypt_credentials_dict(credentials),
         )
         for project_id in projects:
             await conn.execute(
@@ -148,7 +155,7 @@ async def test_the_shapes_srw_made_go_with_their_links_once(db):
 
     counts = await retire_legacy_cloud_datasources(db)
 
-    assert counts == {"personal": 1, "bundled_nextcloud": 1}
+    assert counts == {"personal": 1, "bundled_nextcloud": 1, "service_login": 0}
     assert await _ids(db) == {kept}
     async with db.acquire() as conn:
         links = await conn.fetchval(
@@ -172,6 +179,7 @@ async def test_the_shapes_srw_made_go_with_their_links_once(db):
     assert await retire_legacy_cloud_datasources(db) == {
         "personal": 0,
         "bundled_nextcloud": 0,
+        "service_login": 0,
     }
     assert await _ids(db) == {kept}
 
@@ -217,7 +225,7 @@ async def test_the_rows_as_srw_wrote_them_go_after_the_startup_connector_pass(db
 
     counts = await retire_legacy_cloud_datasources(db)
 
-    assert counts == {"personal": 1, "bundled_nextcloud": 1}
+    assert counts == {"personal": 1, "bundled_nextcloud": 1, "service_login": 0}
     assert await _ids(db) == set()
 
 
@@ -269,3 +277,105 @@ async def test_a_nextcloud_row_not_at_admins_home_or_not_ownerless_stays(db, ove
     kept = await _row(db, **{**shape, **overrides})
     assert (await retire_legacy_cloud_datasources(db))["bundled_nextcloud"] == 0
     assert await _ids(db) == {kept}
+
+
+def _main_cloud_logins() -> frozenset[tuple[str, str]]:
+    return main_cloud_service_logins(
+        MainCloudRouter(
+            NextcloudBackend(
+                NextcloudSettings(
+                    base_url="http://srw-nextcloud",
+                    public_url="https://cloud.localhost",
+                    admin_user="admin",
+                    admin_password="admin-secret",
+                    agent_user="agent-service",
+                    agent_password="agent-secret",
+                )
+            )
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_ownerless_row_holding_the_main_clouds_login_goes_whatever_its_shape(
+    db,
+):
+    """A bundled admin row an administrator renamed, described and linked,
+    and a personal row they renamed and linked twice, still hold SRW's own
+    credential to a whole cloud home: they go by their login. A row someone
+    owns stays whatever it holds, and so does an ownerless row with another
+    login or at another host."""
+    admin_row = await _row(
+        db,
+        name="Admin files",
+        description="Everything",
+        connection_url=_ADMIN_HOME,
+        is_global=True,
+        projects=(_OTHER_PROJECT,),
+        credentials={"username": "admin", "password": "admin-secret"},
+    )
+    agent_row = await _row(
+        db,
+        name="Ada's cloud",
+        connection_url="https://Cloud.Localhost/remote.php/dav/files/ada/",
+        projects=(_DEFAULT_PROJECT, _OTHER_PROJECT),
+        credentials={"username": "Agent-Service", "password": "rotated"},
+    )
+    kept = {
+        await _row(
+            db,
+            name="Ada's own",
+            connection_url="https://cloud.localhost/remote.php/dav/files/ada/",
+            created_by=_USER,
+            projects=(_OTHER_PROJECT,),
+            credentials={"username": "agent-service", "password": "agent-secret"},
+        ),
+        await _row(
+            db,
+            name="Ada as herself",
+            connection_url="http://srw-nextcloud/remote.php/dav/files/ada/",
+            is_global=True,
+            credentials={"username": "ada", "password": "app-password"},
+        ),
+        await _row(
+            db,
+            name="External",
+            connection_url="https://dav.example/remote.php/dav/files/admin/Team/",
+            is_global=True,
+            credentials={"username": "admin", "password": "elsewhere"},
+        ),
+        await _row(db, name="No login", connection_url=_ADMIN_HOME, is_global=True),
+    }
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO threads (id, user_id, status, metadata)
+            VALUES ($1::uuid, $2::uuid, 'created', $3::jsonb)
+            """,
+            _THREAD,
+            _USER,
+            json.dumps({"datasource_ids": [agent_row, *sorted(kept)]}),
+        )
+
+    # Without the main cloud's logins only the exact shapes go.
+    assert (await retire_legacy_cloud_datasources(db))["service_login"] == 0
+    assert await _ids(db) == kept | {admin_row, agent_row}
+
+    logins = _main_cloud_logins()
+    counts = await retire_legacy_cloud_datasources(db, service_logins=logins)
+
+    assert counts == {"personal": 0, "bundled_nextcloud": 0, "service_login": 2}
+    assert await _ids(db) == kept
+    async with db.acquire() as conn:
+        tombstones = {
+            str(t["id"])
+            for t in await conn.fetch("SELECT id FROM datasource_tombstones")
+        }
+        metadata = await conn.fetchval(
+            "SELECT metadata FROM threads WHERE id = $1::uuid", _THREAD
+        )
+    assert tombstones == {admin_row, agent_row}
+    assert set(json.loads(metadata)["datasource_ids"]) == kept
+    assert (await retire_legacy_cloud_datasources(db, service_logins=logins))[
+        "service_login"
+    ] == 0

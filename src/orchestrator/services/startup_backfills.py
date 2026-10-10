@@ -13,16 +13,18 @@ import os
 from typing import Any
 
 from orchestrator.services.legacy_cloud_datasources import (
+    main_cloud_service_logins,
     retire_legacy_cloud_datasources,
 )
 
 logger = logging.getLogger(__name__)
 
 
-async def run_startup_backfills(store: Any) -> None:
+async def run_startup_backfills(store: Any, *, main_cloud_router: Any = None) -> None:
     """Encrypt legacy datasource credentials, strip stored thread secrets,
-    retire the legacy cloud WebDAV rows and, on a dev cluster with
-    ``MCP_DEV_TOKEN``, seed the admin MCP token."""
+    retire the legacy cloud WebDAV rows (those holding the configured main
+    cloud's own login with them, given ``main_cloud_router``) and, on a dev
+    cluster with ``MCP_DEV_TOKEN``, seed the admin MCP token."""
 
     # Encrypt any legacy plaintext datasource credentials. Idempotent — once
     # all rows are v1 ciphertexts this is a fast no-op. Runs at startup
@@ -73,10 +75,13 @@ async def run_startup_backfills(store: Any) -> None:
 
     # Retire the two WebDAV rows the old main-cloud wiring made, each holding
     # a service account's credential to a whole cloud home (main cloud slice
-    # 8): "Cloud Storage (Personal)" and the bundled Nextcloud admin home.
+    # 8): "Cloud Storage (Personal)" and the bundled Nextcloud admin home,
+    # and any other ownerless row holding the main cloud's own login.
     # Idempotent; logs one count line.
     try:
-        await retire_legacy_cloud_datasources(store)
+        await retire_legacy_cloud_datasources(
+            store, service_logins=main_cloud_service_logins(main_cloud_router)
+        )
     except Exception as _e:
         logger.error("Legacy cloud WebDAV connector retirement failed: %s", _e)
 
