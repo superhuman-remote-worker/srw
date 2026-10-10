@@ -161,3 +161,31 @@ def test_every_main_cloud_key_in_the_config_map_reaches_the_orchestrator():
     }
     assert keys >= {"MAIN_CLOUD_BACKEND", "MAIN_CLOUD_REPLACE_INSTALLATION"}
     assert keys <= set(_orchestrator_env(documents))
+
+
+def test_a_bundled_cloud_seeds_no_webdav_datasource():
+    """The bundled Nextcloud's default WebDAV row was a global connector at
+    Nextcloud admin's home (main cloud slice 8); neither bundled cloud
+    describes one any more."""
+    for values in (
+        ("--set", "opencloud.enabled=false", "--set", "nextcloud.enabled=true"),
+        ("--set", "opencloud.enabled=true", "--set", "nextcloud.enabled=false"),
+    ):
+        config = _config(*values)
+        assert not {key for key in config if key.startswith("DEFAULT_DS_WEBDAV_")}
+
+
+def test_an_external_webdav_server_still_seeds_its_datasource():
+    config = _config(
+        "--set",
+        "opencloud.enabled=false",
+        "--set",
+        "nextcloud.enabled=false",
+        "--set",
+        "cloud.externalBackend=webdav",
+        "--set",
+        "cloud.externalUrl=https://dav.example/remote.php/webdav/",
+    )
+    assert config["MAIN_CLOUD_BACKEND"] == "webdav"
+    assert config["DEFAULT_DS_WEBDAV_URL"] == "https://dav.example/remote.php/webdav/"
+    assert config["DEFAULT_DS_WEBDAV_NAME"] == "External WebDAV"

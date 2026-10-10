@@ -161,8 +161,6 @@ secrets:
     DISCORD_WEBHOOK_URL: ""
     SLACK_WEBHOOK_URL: ""
     NTFY_TOKEN: ""
-    DEFAULT_DS_WEBDAV_USERNAME: ""
-    DEFAULT_DS_WEBDAV_PASSWORD: ""
     CODEX_MANAGEMENT_KEY: "dev_codex_key"
     MCP_INTERNAL_KEY: "dev_mcp_internal_key"
     # Fixed admin MCP token, seeded into the DB at orchestrator startup + on

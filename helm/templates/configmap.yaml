@@ -730,11 +730,9 @@ data:
   NEXTCLOUD_PROTECTED_EFFECT_URL: {{ printf "http://%s" (include "srw.nextcloudProtectedEffectName" .) | quote }}
   NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256: {{ include "srw.nextcloudProtectedEffectConfigSha256" . | quote }}
   {{- end }}
-
-  # Nextcloud / WebDAV datasource (optional)
-  DEFAULT_DS_WEBDAV_URL: {{ printf "http://%s/remote.php/dav/files/admin/" (include "srw.serviceName" (dict "context" . "component" "nextcloud")) | quote }}
-  DEFAULT_DS_WEBDAV_NAME: {{ "Nextcloud" | quote }}
-  DEFAULT_DS_WEBDAV_READ_ONLY: {{ "false" | quote }}
+  {{- /* No default WebDAV datasource for the bundled Nextcloud: it was a
+       global row at Nextcloud admin's home (main cloud slice 8). Project
+       folders, user roots and outboxes are the main cloud's own connectors. */}}
   {{- end }}
 
   # Main-cloud workspace data plane. "sync" preserves the legacy eager clone

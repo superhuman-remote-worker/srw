@@ -719,7 +719,9 @@ without this policy.
   tools and the `present-with-canvas` companion skill rather than advertising
   a broken capability; an enabled MCP pod also requires the key to start.
   Chart-created mode generates and preserves it automatically.
-- `DEFAULT_DS_WEBDAV_*` (auto-configure a default WebDAV datasource for new users)
+- `DEFAULT_DS_WEBDAV_USERNAME`, `DEFAULT_DS_WEBDAV_PASSWORD` (only with
+  `cloud.externalBackend: webdav`: the credential of the default WebDAV
+  datasource `init.py` seeds for that server; the bundled clouds seed none)
 
 A skeleton `srw.env` to feed into `kubectl create secret generic ... --from-env-file=`:
 
