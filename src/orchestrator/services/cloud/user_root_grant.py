@@ -67,14 +67,18 @@ class LoginFlowGrant:
 class CloudAccount:
     """The provider's own record of an account, read as its administrator.
 
-    ``administrator`` is whether the account administers the provider: SRW
-    never mounts such an account's whole root.
+    ``administrator`` is whether the account administers the provider or
+    any of its groups (a group admin manages other people's accounts);
+    ``service_account`` whether it is one of SRW's own (the agent service
+    account, a per-folder or protected-mode principal, a member of an SRW
+    service group). SRW never mounts either kind's whole root as a user's.
     """
 
     account_id: str
     email: Optional[str]
     enabled: bool
     administrator: bool
+    service_account: bool = False
 
 
 @runtime_checkable

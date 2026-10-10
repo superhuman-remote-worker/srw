@@ -37,7 +37,7 @@ describe('cloudRootDetail', () => {
       cloudRootDetail(status({state: 'connected'})),
       cloudRootDetail(status({state: 'connecting'})),
       cloudRootDetail(status()),
-      ...['wrong_account', 'admin_account', 'account_disabled', 'verify_failed', 'expired', 'provider_error', 'account_missing', 'error']
+      ...['wrong_account', 'admin_account', 'service_account', 'identity_mismatch', 'account_disabled', 'verify_failed', 'expired', 'provider_error', 'account_missing', 'error']
         .map((reason) => cloudRootDetail(status({state: 'failed', failure: {reason, at: null}}))),
       cloudRootDetail(status({state: 'revoked', revoked_reason: 'user'})),
       cloudRootDetail(status({state: 'revoked', revoked_reason: 'rejected_by_cloud'})),

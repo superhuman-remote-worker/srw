@@ -90,6 +90,10 @@ class FakeCloud:
             "uid-root": CloudAccount("uid-root", "ann@example.com", True, True),
             "uid-off": CloudAccount("uid-off", "ann@example.com", False, False),
             "uid-eve": CloudAccount("uid-eve", "eve@example.com", True, False),
+            "uid-svc": CloudAccount(
+                "uid-svc", "ann@example.com", True, False, service_account=True
+            ),
+            "uid-ann-2": CloudAccount("uid-ann-2", "ann@example.com", True, False),
         }
         # credential -> (login name, account id)
         self.issued: dict[str, tuple[str, str]] = {}
@@ -193,7 +197,10 @@ class FakeStore:
         self.rows: dict[str, dict[str, Any]] = {}
         self.events: list[dict[str, Any]] = []
         self.identities: list[tuple[str, str, dict]] = []
+        # users.cloud_identity: user id -> provider -> entry.
+        self.cloud_identity: dict[str, dict[str, dict]] = {}
         self.fail_update = False
+        self.fail_identity = False
 
     async def get_user(self, user_id):
         user = self.users.get(str(user_id))
@@ -261,7 +268,14 @@ class FakeStore:
 
     async def merge_user_cloud_identity(self, user_id, backend_id, entry):
         self.identities.append((user_id, backend_id, entry))
+        known = self.cloud_identity.setdefault(str(user_id), {})
+        known[backend_id] = {**known.get(backend_id, {}), **entry}
         return True
+
+    async def get_user_cloud_identity(self, user_id):
+        if self.fail_identity:
+            raise RuntimeError("database down")
+        return copy.deepcopy(self.cloud_identity.get(str(user_id), {}))
 
     def root(self, user_id: str = ANN) -> dict[str, Any]:
         [row] = [
@@ -457,6 +471,7 @@ class TestCompleteConnect:
         [
             ("uid-eve", "wrong_account"),
             ("uid-root", "admin_account"),
+            ("uid-svc", "service_account"),
             ("uid-off", "account_disabled"),
         ],
     )
@@ -483,6 +498,80 @@ class TestCompleteConnect:
         assert event["event_type"] == "cloud_root_rejected"
         assert reason in event["detail"]
         _secrets_absent(row["config"], store.events)
+
+    @pytest.mark.asyncio
+    async def test_the_account_srw_knows_as_the_users_is_the_only_one(
+        self, store, cloud
+    ):
+        """Same e-mail is not enough once SRW resolved the user's account in
+        this installation: any other account is refused."""
+        await cloud_user_root.ensure_user_root_connector(store, FakeRouter(cloud), ANN)
+        store.cloud_identity[ANN] = {"acme-cloud": {"user_id": "uid-ann"}}
+        grant = cloud.issue(STRANGER_TOKEN, "uid-ann-2")
+        assert (
+            await cloud_user_root.complete_connect(
+                store, cloud, store.users[ANN], grant
+            )
+            == "identity_mismatch"
+        )
+        assert store.root()["credentials"] == {}
+        assert cloud.revoked == [STRANGER_TOKEN]
+        assert "identity_mismatch" in store.events[-1]["detail"]
+        assert store.identities == []
+
+        # The known account connects, and the entry now names this
+        # installation.
+        grant = cloud.issue(TOKEN, "uid-ann")
+        assert (
+            await cloud_user_root.complete_connect(
+                store, cloud, store.users[ANN], grant
+            )
+            == "connected"
+        )
+        entry = store.cloud_identity[ANN]["acme-cloud"]
+        assert entry["user_id"] == "uid-ann"
+        assert entry["backend_instance_id"] == INSTANCE
+
+        # A reconnect as another account with the same e-mail is refused,
+        # and the working connection stays.
+        grant = cloud.issue(STRANGER_TOKEN, "uid-ann-2")
+        assert (
+            await cloud_user_root.complete_connect(
+                store, cloud, store.users[ANN], grant
+            )
+            == "identity_mismatch"
+        )
+        assert store.root()["credentials"]["password"] == TOKEN
+
+    @pytest.mark.asyncio
+    async def test_an_identity_of_another_installation_does_not_bind(
+        self, store, cloud
+    ):
+        await cloud_user_root.ensure_user_root_connector(store, FakeRouter(cloud), ANN)
+        store.cloud_identity[ANN] = {
+            "acme-cloud": {"user_id": "uid-old", "backend_instance_id": OTHER_INSTANCE}
+        }
+        grant = cloud.issue(TOKEN, "uid-ann")
+        assert (
+            await cloud_user_root.complete_connect(
+                store, cloud, store.users[ANN], grant
+            )
+            == "connected"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_identity_refuses_and_revokes(self, store, cloud):
+        await cloud_user_root.ensure_user_root_connector(store, FakeRouter(cloud), ANN)
+        store.fail_identity = True
+        grant = cloud.issue(TOKEN, "uid-ann")
+        assert (
+            await cloud_user_root.complete_connect(
+                store, cloud, store.users[ANN], grant
+            )
+            == "error"
+        )
+        assert cloud.revoked == [TOKEN]
+        assert store.root()["credentials"] == {}
 
     @pytest.mark.asyncio
     async def test_a_user_without_an_email_matches_no_account(self, store, cloud):

@@ -51,6 +51,10 @@ GRANT_MODE_ENV = "NEXTCLOUD_USER_ROOT_GRANT_MODE"
 CLIENT_NAME = "Superhuman Remote Worker"
 #: The Nextcloud group whose members administer the instance.
 _ADMIN_GROUP = "admin"
+#: What SRW's own accounts and groups are named with: ``srw-agents`` (the
+#: agent service account's group) and every principal and group SRW
+#: creates (``srw-reader-f-…``, ``srw-rog-a-…``).
+_SERVICE_PREFIX = "srw-"
 
 _LOGIN_FLOW_INIT = "/index.php/login/v2"
 _LOGIN_FLOW_POLL = "/index.php/login/v2/poll"
@@ -68,8 +72,9 @@ def _root_path(account_id: str) -> str:
 class NextcloudUserRootGrant:
     """``SupportsUserRootGrant`` for ``NextcloudBackend``.
 
-    Reads ``_base_url``, ``_public_url``, ``_client`` (the administrator's)
-    and ``_ensure_ready`` from the backend it is mixed into.
+    Reads ``_base_url``, ``_public_url``, ``_client`` (the administrator's),
+    ``_agent_user`` (when it has one) and ``_ensure_ready`` from the backend
+    it is mixed into.
     """
 
     backend_id: str
@@ -268,14 +273,24 @@ class NextcloudUserRootGrant:
         data = self._ocs_data(resp)
         if not data.get("id"):
             return None
+        account = str(data["id"])
         groups = data.get("groups")
         groups = [str(group) for group in groups] if isinstance(groups, list) else []
+        # The groups the account is a group admin of (Nextcloud lists their
+        # ids); any one makes it an administrator of other accounts.
+        subadmin = data.get("subadmin")
         email = data.get("email")
+        agent_user = str(getattr(self, "_agent_user", "") or "")
         return CloudAccount(
-            account_id=str(data["id"]),
+            account_id=account,
             email=str(email) if email else None,
             enabled=data.get("enabled") is not False,
-            administrator=_ADMIN_GROUP in groups,
+            administrator=_ADMIN_GROUP in groups or bool(subadmin),
+            service_account=(
+                account.casefold().startswith(_SERVICE_PREFIX)
+                or (bool(agent_user) and account.casefold() == agent_user.casefold())
+                or any(group.casefold().startswith(_SERVICE_PREFIX) for group in groups)
+            ),
         )
 
     def user_root_handle(self, account_id: str) -> ProjectFolderHandle:

@@ -160,11 +160,16 @@ shows **My cloud** above the connector list:
    access. The page updates on its own; the flow lasts up to 20 minutes and
    survives an orchestrator restart.
 2. SRW checks the account before it keeps anything: its e-mail must be your
-   SRW account's, it must not administer the cloud, it must be enabled, and
-   the new app password must read its files. Otherwise SRW revokes the app
-   password at once and says why (another person's account, a cloud
-   administrator, a disabled account, an account with no files yet: open
-   Files in the cloud once, then connect again).
+   SRW account's, it must not administer the cloud or any of its groups, it
+   must not be one of SRW's own service accounts (`agent-service`, the
+   per-folder accounts, anything in an `srw-` group), it must be the
+   account SRW already knows as yours when it knows one (from an earlier
+   connection or your project memberships), it must be enabled, and the new
+   app password must read its files. Otherwise SRW revokes the app password
+   at once and says why (another person's account, a cloud or group
+   administrator, a service account, not your known account, a disabled
+   account, an account with no files yet: open Files in the cloud once,
+   then connect again).
 3. Connected: Sessions of your personal project preselect My cloud and mount
    it at their next start.
 

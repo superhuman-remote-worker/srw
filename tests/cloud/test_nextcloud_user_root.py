@@ -229,10 +229,44 @@ async def test_whose_account_is_asked_with_the_credential_and_as_admin(
         UID, "ann@example.com", False, True
     )
     assert await host.user_root_account("nobody") is None
+    # A group admin administers other people's accounts.
+    fake.accounts[UID] = {**fake.accounts[UID], "groups": ["staff"], "enabled": True}
+    fake.accounts[UID]["subadmin"] = ["project-x"]
+    assert (await host.user_root_account(UID)).administrator is True
+    fake.accounts[UID]["subadmin"] = []
+    assert (await host.user_root_account(UID)).administrator is False
     # The user's calls carry their own credential and no session cookie.
     user_calls = [r for r in fake.log if r.url.path == "/ocs/v2.php/cloud/user"]
     assert user_calls and all("cookie" not in r.headers for r in user_calls)
     assert all(r.headers["ocs-apirequest"] == "true" for r in user_calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("account_id", "groups"),
+    [
+        ("agent-service", ["staff"]),
+        ("Agent-Service", []),
+        ("srw-writer-f-" + "1" * 32, []),
+        ("srw-reader-a-" + "2" * 32, ["srw-rog-a-" + "2" * 32]),
+        ("bob", ["srw-agents"]),
+        ("bob", ["staff", "SRW-ops"]),
+    ],
+)
+async def test_srws_own_accounts_are_service_accounts(
+    host: Host, fake: FakeNc, account_id: str, groups: list[str]
+) -> None:
+    host._agent_user = "agent-service"
+    fake.accounts[account_id] = {
+        "id": account_id,
+        "email": "ann@example.com",
+        "groups": groups,
+        "enabled": True,
+    }
+    account = await host.user_root_account(account_id)
+    assert account.service_account is True and account.administrator is False
+    # A person's account is none of them.
+    assert (await host.user_root_account(UID)).service_account is False
 
 
 @pytest.mark.asyncio

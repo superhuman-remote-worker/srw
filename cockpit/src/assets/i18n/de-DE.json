@@ -2754,7 +2754,9 @@
     },
     "failure": {
       "wrong_account": "Die E-Mail dieses Cloud-Kontos ist nicht deine. Melde dich mit deinem eigenen Konto an und verbinde erneut.",
-      "admin_account": "Cloud-Administratorkonten können nicht verbunden werden. Melde dich mit deinem eigenen Konto an.",
+      "admin_account": "Cloud-Administratorkonten können nicht verbunden werden, auch nicht die von Gruppenadministratoren. Melde dich mit deinem eigenen Konto an.",
+      "service_account": "Das ist eines der eigenen Dienstkonten von SRW. Melde dich mit deinem eigenen Konto an.",
+      "identity_mismatch": "Das ist nicht das Cloud-Konto, das SRW bereits als deines kennt. Melde dich mit diesem Konto an oder wende dich an deine Administration.",
       "account_disabled": "Dieses Cloud-Konto ist deaktiviert.",
       "verify_failed": "Die Verbindung konnte deine Dateien nicht lesen. Verbinde erneut.",
       "expired": "Die Anmeldung wurde nicht rechtzeitig abgeschlossen. Verbinde erneut.",

@@ -239,8 +239,13 @@ guarantees it.
 - **My cloud is one user's app password with full access.** Nextcloud's
   Login Flow v2 has the user sign in to their own cloud and grant SRW an app
   password. SRW keeps it only when the account's e-mail is the user's, the
-  account is enabled and doesn't administer the cloud, and the password reads
-  its files; any refusal revokes it at once. It can be limited neither to
+  account is enabled, administers neither the cloud nor any of its groups,
+  isn't one of SRW's own service accounts, and is the account SRW already
+  resolved as the user's in that installation when it has resolved one,
+  and the password reads its files; any refusal revokes it at once. The
+  e-mail check trusts the cloud's e-mail field, which Nextcloud by default
+  lets the account's own user (and its group admins) change; the
+  known-account check is what pins a reconnect. It can be limited neither to
   read-only nor to one folder, so it is offered at full access only, and
   only the owner's own Sessions attach it: no administrator or other member
   of the personal project can. It is stored encrypted on the connector and

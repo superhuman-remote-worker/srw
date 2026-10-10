@@ -2754,7 +2754,9 @@
     },
     "failure": {
       "wrong_account": "That cloud account's e-mail isn't yours. Sign in with your own account and connect again.",
-      "admin_account": "Cloud administrator accounts can't be connected. Sign in with your own account.",
+      "admin_account": "Cloud administrator accounts can't be connected, group admins included. Sign in with your own account.",
+      "service_account": "That is one of SRW's own service accounts. Sign in with your own account.",
+      "identity_mismatch": "That isn't the cloud account SRW already knows as yours. Sign in with that account, or ask your administrator.",
       "account_disabled": "That cloud account is disabled.",
       "verify_failed": "The connection could not read your files. Connect again.",
       "expired": "You didn't finish signing in in time. Connect again.",

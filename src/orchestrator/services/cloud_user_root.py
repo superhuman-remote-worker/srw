@@ -124,13 +124,18 @@ UNSUPPORTED_REASONS: tuple[str, ...] = (
 )
 #: Why a connect attempt stored nothing (``config.connect_failure.reason``):
 #: the account is another person's (its e-mail is not the user's, or
-#: either has none), it administers the cloud, it is disabled, its
-#: credential could not read its files, the user did not finish in time,
-#: the cloud could not be asked, or anything else went wrong. A probe at a
-#: Pod's start records ``account_missing`` when the account has no files.
+#: either has none), it administers the cloud or one of its groups, it is
+#: one of SRW's own service accounts, it is not the account SRW already
+#: knows as the user's in this installation (``users.cloud_identity``), it
+#: is disabled, its credential could not read its files, the user did not
+#: finish in time, the cloud could not be asked, or anything else went
+#: wrong. A probe at a Pod's start records ``account_missing`` when the
+#: account has no files.
 CONNECT_FAILURES: tuple[str, ...] = (
     "wrong_account",
     "admin_account",
+    "service_account",
+    "identity_mismatch",
     "account_disabled",
     "verify_failed",
     "expired",
@@ -542,6 +547,26 @@ def _same_email(left: Any, right: Any) -> bool:
     return bool(left) and bool(right) and left.casefold() == right.casefold()
 
 
+async def _known_account_id(store: Any, user_id: str, backend: Any) -> str | None:
+    """The cloud account SRW already resolved as ``user_id``'s in this
+    installation (``users.cloud_identity``), or ``None``.
+
+    The cache is keyed by provider; an entry that names another
+    installation is not this one's. One that names none (resolved before
+    entries carried it) is taken as this installation's, as every other
+    reader of the cache takes it.
+    """
+    identity = await store.get_user_cloud_identity(user_id)
+    entry = identity.get(backend.backend_id) if isinstance(identity, Mapping) else None
+    if not isinstance(entry, Mapping) or not entry.get("user_id"):
+        return None
+    instance = entry.get("backend_instance_id")
+    current = getattr(backend, "backend_instance_id", None)
+    if instance and current and str(instance) != str(current):
+        return None
+    return str(entry["user_id"])
+
+
 async def complete_connect(
     store: Any,
     backend: SupportsUserRootGrant,
@@ -553,8 +578,10 @@ async def complete_connect(
     :data:`CONNECT_FAILURES` reason; a refused credential is revoked.
 
     The order matters: whose account (asked with the credential itself,
-    then the cloud's own record as its administrator), then a probe of its
-    files, then stored, then the previous credential revoked.
+    then the cloud's own record as its administrator: no administrator or
+    group admin, none of SRW's service accounts, the user's e-mail, and the
+    account SRW already knows as theirs when it knows one), then a probe of
+    its files, then stored, then the previous credential revoked.
     """
     user_id = str(user["id"])
     key = user_root_key(user_id)
@@ -592,8 +619,19 @@ async def complete_connect(
         return await refuse("verify_failed")
     if account.administrator:
         return await refuse("admin_account")
+    if account.service_account:
+        return await refuse("service_account")
     if not _same_email(account.email, current_user.get("email")):
         return await refuse("wrong_account")
+    # An e-mail can be set on any account (by its user, or a group admin):
+    # once SRW knows which account is the user's here, only that one is.
+    try:
+        known = await _known_account_id(store, user_id, backend)
+    except Exception:
+        logger.warning("Cloud root %s: the user's cloud identity was not read", row_id)
+        return await refuse("error")
+    if known is not None and known != account.account_id:
+        return await refuse("identity_mismatch")
     if not account.enabled:
         return await refuse("account_disabled")
     if (
@@ -651,6 +689,10 @@ async def complete_connect(
                 "user_id": account.account_id,
                 "resolved_at": _iso(_now()),
                 "verified_by": "user_root_grant",
+                "backend_instance_id": str(
+                    getattr(backend, "backend_instance_id", "") or ""
+                )
+                or None,
             },
         )
     except Exception:

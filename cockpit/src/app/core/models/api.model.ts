@@ -2095,6 +2095,8 @@ export type CloudRootUnsupportedReason =
 export type CloudRootFailureReason =
   | 'wrong_account'
   | 'admin_account'
+  | 'service_account'
+  | 'identity_mismatch'
   | 'account_disabled'
   | 'verify_failed'
   | 'expired'

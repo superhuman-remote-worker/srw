@@ -9,6 +9,8 @@ import {CloudRootStatus} from '../../core/models/api.model';
 const FAILURES = new Set([
   'wrong_account',
   'admin_account',
+  'service_account',
+  'identity_mismatch',
   'account_disabled',
   'verify_failed',
   'expired',
