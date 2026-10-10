@@ -213,6 +213,7 @@ same.
 | the cloud no longer accepts your connection | `cloud_grant_revoked` | Reconnect it under **Settings → Connectors**. |
 | the session has more cloud folders than a workspace mounts | `too_many_mounts` | Detach some; the limit is `connectors.inPodPlane.maxMounts`. |
 | this deployment syncs files instead of mounting them; cloud folders aren't delivered here | `delivery_unsupported` | The deployment syncs instead of mounting; see [below](#known-limitation-sync-instead-of-mount). |
+| this workspace can't mount cloud folders; they aren't delivered here | `mount_unsupported` | The workspace refuses mounts (`cloud.rcloneMount.allowContainer: false`, or FUSE denied); see [below](#known-limitation-sync-instead-of-mount). |
 | it could not be prepared for this session | `unbuildable` | The cloud could not build this mount; start a new Session, and tell your operator if it persists. |
 
 A folder that was attached but did not come up (the cloud refused its
@@ -225,9 +226,10 @@ Project folders and My cloud are delivered as mounts only. A deployment
 that sets `cloud.workspaceDriver: sync` delivers none of them: each attached
 one is left out as `delivery_unsupported`. Its Sessions keep only their
 outbox, which the sync mirrors the workspace into. With
-`cloud.rcloneMount.allowContainer: false` a Container Session gets the same
-outbox-only delivery, and in this release its missing folders are not
-named. Keep the defaults (`rclone_mount`, `true`).
+`cloud.rcloneMount.allowContainer: false`, or a workspace that denies FUSE,
+a Container Session gets the same outbox-only delivery, and each missing
+folder is left out as `mount_unsupported`. Keep the defaults
+(`rclone_mount`, `true`).
 
 ## For operators
 
