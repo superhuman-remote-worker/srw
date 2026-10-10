@@ -48,11 +48,15 @@ async def test_custom_image_is_denied_unless_the_switch_allows_it(
 
 
 def _gate_test_fixture():
-    """Inputs shared by the denied/allowed cases below: a real mount target
-    (``nc_session_folder``) and a mocked session-mount builder, so a payload
-    is possible at all. Only ``container_denies_fuse``'s mocked answer varies
-    between the two parametrize cases — nothing else."""
-    session_mount = AsyncMock(return_value={"mount_kind": "session_folder"})
+    """Inputs shared by the denied/allowed cases below: a mocked connector
+    mount set with one mount (main cloud slice 3), so a payload is possible
+    at all. Only ``container_denies_fuse``'s mocked answer varies between
+    the two parametrize cases — nothing else."""
+    session_mount = AsyncMock(
+        return_value=agent_cloud_mounts.LiveMountSet(
+            mounts=[{"mount_kind": "cloud_outbox"}]
+        )
+    )
     dependencies = agent_cloud_mounts.AgentCloudMountDependencies(
         store=SimpleNamespace(),
         cloud_router=None,
@@ -61,11 +65,13 @@ def _gate_test_fixture():
         cloud_workspace_driver=lambda: "rclone_mount",
         slugify_mount_name=lambda name: name,
     )
-    metadata = {"workspace_container": {"status": "ready", "pod_ip": "10.0.0.5"}}
+    metadata = {
+        "workspace_container": {"status": "ready", "pod_ip": "10.0.0.5"},
+        "cloud_mount_rule": "connectors",
+    }
     thread = {
         "id": THREAD_ID,
         "execution_harness_adapter": "srw/v1",
-        "nc_session_folder": "nextcloud:1",
     }
     return session_mount, dependencies, metadata, thread
 
@@ -85,9 +91,7 @@ async def test_fuse_gate_alone_decides_the_cloud_mount(monkeypatch, denies_fuse)
         "container_denies_fuse",
         AsyncMock(return_value=denies_fuse),
     )
-    monkeypatch.setattr(
-        agent_cloud_mounts, "_build_rclone_session_mount", session_mount
-    )
+    monkeypatch.setattr(agent_cloud_mounts, "_resolve_live_mount_set", session_mount)
 
     payload = await agent_cloud_mounts._build_agent_cloud_mount(
         thread, mount_rows=[], metadata=metadata, dependencies=dependencies
@@ -98,5 +102,5 @@ async def test_fuse_gate_alone_decides_the_cloud_mount(monkeypatch, denies_fuse)
         session_mount.assert_not_awaited()
     else:
         assert payload is not None
-        assert payload["mounts"] == [{"mount_kind": "session_folder"}]
+        assert payload["mounts"] == [{"mount_kind": "cloud_outbox"}]
         session_mount.assert_awaited_once()
