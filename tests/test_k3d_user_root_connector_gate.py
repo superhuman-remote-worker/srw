@@ -184,3 +184,15 @@ def test_the_hygiene_query_refuses_anything_but_a_plain_needle(no_cluster):
         gate.sql_count_containing("threads", "metadata", "a'; DROP TABLE x; --")
     with pytest.raises(gate.GateError):
         gate.sql_count_containing("threads; x", "metadata", "abcdefgh")
+
+
+def test_the_workspace_mount_table_is_read_top_of_stack():
+    mountinfo = (
+        "36 25 0:32 / /cloud rw,relatime - tmpfs tmpfs rw\n"
+        "41 36 0:40 / /cloud/my_cloud rw,nosuid - fuse.rclone m0: rw\n"
+        "42 36 0:41 / /cloud/my\\040cloud rw - fuse.rclone m1: rw\n"
+    )
+    tops = gate.top_mounts(mountinfo)
+    assert tops["/cloud/my_cloud"][0] == "fuse.rclone"
+    assert tops["/cloud/my cloud"][0] == "fuse.rclone"
+    assert tops["/cloud"][0] == "tmpfs"

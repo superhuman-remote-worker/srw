@@ -87,6 +87,12 @@ mutating gate.
   .venv/bin/python scripts/k3d-user-root-connector-gate.py           # plan
   .venv/bin/python scripts/k3d-user-root-connector-gate.py \\
       --run --confirm LOCAL-K3D-DISPOSABLE
+
+A run that was interrupted, or whose cleanup did not finish, is swept by its
+id:
+
+  .venv/bin/python scripts/k3d-user-root-connector-gate.py \\
+      --run --confirm LOCAL-K3D-DISPOSABLE --sweep --gate-id ur-0123456789
 """
 
 from __future__ import annotations
@@ -421,6 +427,21 @@ elif action == "create-user":
         ],
     })
     print(json.dumps({"status": status, "found": [u["id"] for u in users(name)]}))
+elif action == "reset-password":
+    # A sweep logs in as the run's account to end its sessions: only an
+    # account with this run's name and e-mail gets a new password.
+    found = [
+        u for u in users(request["username"]) if u.get("email") == request["email"]
+    ]
+    if len(found) != 1:
+        print(json.dumps({"reset": False}))
+        raise SystemExit(0)
+    status, _t, _l = call(
+        "PUT",
+        admin_api + "/users/" + found[0]["id"] + "/reset-password",
+        {"type": "password", "value": request["password"], "temporary": False},
+    )
+    print(json.dumps({"reset": status == 204}))
 elif action == "delete":
     deleted, refused = [], []
     for spec in request["users"]:
@@ -483,9 +504,18 @@ def in_pod(
 
 
 def in_orchestrator(program: str, payload: Any, *, timeout: int = 300) -> dict:
-    return in_pod(
-        ORCHESTRATOR, ORCHESTRATOR_CONTAINER, program, payload, timeout=timeout
-    )
+    """``program`` in the orchestrator pod; retried while the pod is being
+    replaced (a Tilt rollout), never on an answer the program printed."""
+    for attempt in range(6):
+        try:
+            return in_pod(
+                ORCHESTRATOR, ORCHESTRATOR_CONTAINER, program, payload, timeout=timeout
+            )
+        except GateError:
+            if attempt == 5:
+                raise
+            time.sleep(10)
+    raise GateError("unreachable")
 
 
 class Api:
@@ -594,6 +624,21 @@ def picker_action(page: str) -> str | None:
     """The "Log in" form's target on the login flow's picker page."""
     match = re.search(r'id="login-form"\s+action="([^"]+)"', page)
     return html.unescape(match.group(1)) if match else None
+
+
+def top_mounts(mountinfo: str) -> dict[str, tuple[str, str]]:
+    """``{mountpoint: (fstype, per-mount options)}`` for the top of each stack
+    (the D7 gate's reader)."""
+    tops: dict[str, tuple[str, str]] = {}
+    for line in mountinfo.splitlines():
+        fields = line.split()
+        if len(fields) < 7 or "-" not in fields[6:]:
+            continue
+        separator = fields.index("-", 6)
+        if separator + 1 < len(fields):
+            point = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), fields[4])
+            tops[point] = (fields[separator + 1], fields[5])
+    return tops
 
 
 def recorded_plan(pod: dict) -> dict[str, Any] | None:
@@ -746,6 +791,8 @@ class UserRootGate:
         self.token = ""
         self.token_id: Any = None
         self.threads: list[str] = []
+        #: Whose session each one is (only its user may end it).
+        self.thread_account: dict[str, Account] = {}
         self.b_member = False
         self.a_deleted = False
 
@@ -784,6 +831,17 @@ class UserRootGate:
                 problems.append(f"{name} stale: {found['stale'][:6]}")
         return problems
 
+    def workspace_fstype(self, pod: str, point: str) -> str:
+        """The file system on top of ``point`` in the workspace container."""
+        rc, out, _err = run(
+            K
+            + ["exec", pod, "-c", WORKSPACE_CONTAINER, "--"]
+            + ["cat", "/proc/self/mountinfo"],
+            data="",
+            timeout=60,
+        )
+        return top_mounts(out).get(point, ("", ""))[0] if rc == 0 else ""
+
     def workspace_pod(self, thread: str) -> dict:
         def probe() -> dict | None:
             items = json.loads(
@@ -810,17 +868,25 @@ class UserRootGate:
 
     # -- Nextcloud -------------------------------------------------------------
     def nc(self, script: str, *args: str, data: str | None = None) -> tuple[int, str]:
+        """``script`` as www-data in the Nextcloud container; stdin is always
+        given (empty without ``data``), never this process's own."""
         for value in args:
             if value.startswith("-"):
                 raise GateError("refusing an occ value that reads as an option")
-        rc, out, _err = run(
-            K
-            + ["exec", "-i", NEXTCLOUD, "-c", NEXTCLOUD_CONTAINER, "--"]
-            + ["su", "-s", "/bin/sh", "www-data", "-c", script, "occ", *args],
-            data=data,
-            timeout=180,
-        )
-        return rc, out
+        for _attempt in range(5):
+            rc, out, err = run(
+                K
+                + ["exec", "-i", NEXTCLOUD, "-c", NEXTCLOUD_CONTAINER, "--"]
+                + ["su", "-s", "/bin/sh", "www-data", "-c", script, "occ", *args],
+                data=data if data is not None else "",
+                timeout=180,
+            )
+            # A silent failure is the exec's or the bundled Nextcloud's SQLite
+            # ("database is locked", logged, not printed): asked again.
+            if rc == 0 or out.strip() or err.strip():
+                break
+            time.sleep(5)
+        return rc, out if rc == 0 else (out + "\n" + err).strip()
 
     def nc_tokens(self, uid: str) -> list[dict[str, Any]]:
         if not _NC_UID_RE.fullmatch(uid):
@@ -841,9 +907,13 @@ class UserRootGate:
             raise GateError(f"a Nextcloud user {uid} already exists")
         self.nc_users.append(uid)
         rc, out = self.nc(_OCC_ADD_USER, uid, f"UR gate {uid[:12]}", data=password)
-        if rc:
+        if rc and not self.nc(_OCC_USER_INFO, uid)[1].strip().startswith("{"):
             raise GateError(f"occ user:add {uid} failed: {out[-200:]}")
-        rc, out = self.nc(_OCC_SET_EMAIL, uid, email)
+        for _attempt in range(3):
+            rc, out = self.nc(_OCC_SET_EMAIL, uid, email)
+            if rc == 0:
+                break
+            time.sleep(3)
         if rc:
             raise GateError(f"occ user:setting {uid} failed: {out[-200:]}")
 
@@ -947,6 +1017,9 @@ class UserRootGate:
         if created.get("exists"):
             self.client_started = False
             raise GateError(f"a Keycloak client {self.oauth_client} already exists")
+        # Everyone logs in through the run's client: its ID token carries the
+        # e-mail and the realm roles (admin-cli's does not, and a login
+        # without them would demote the owner and give an account a new row).
         self.owner.client_id = self.oauth_client
         owner = self.owner.ok("GET", "/api/auth/me")["user"]
         if not owner.get("is_admin"):
@@ -1028,6 +1101,7 @@ class UserRootGate:
         )
         thread = str(created.get("thread_id") or created["id"])
         self.threads.append(thread)
+        self.thread_account[thread] = account
         print(f"session {label} {thread}", flush=True)
         return thread
 
@@ -1040,7 +1114,9 @@ class UserRootGate:
 
     def end_session(self, thread: str) -> bool:
         def gone() -> bool:
-            status, _body = self.a.api.call(
+            # Only a session's own user may end it.
+            account = self.thread_account.get(thread, self.a)
+            status, _body = account.api.call(
                 "DELETE", f"/api/persistent/threads/{thread}?force=true&permanent=true"
             )
             if status == 404:
@@ -1190,12 +1266,25 @@ class UserRootGate:
             secret_name,
         )
         name = f"ur-gate-{self.gate_id[3:]}.txt"
-        content = f"user root gate {self.gate_id}\n"
+        content = f"user root gate {self.gate_id}"
+        pod_name = pod["metadata"]["name"]
+        try:
+            wait_for(
+                "my_cloud mounted in the workspace",
+                lambda: self.workspace_fstype(pod_name, f"/cloud/{MOUNT_NAME}")
+                == "fuse.rclone",
+                timeout=180,
+                interval=5,
+            )
+        except GateError:
+            pass
+        # The gate id and the name are [a-z0-9-.] only: nothing to quote.
         rc, _out, err = run(
             K
-            + ["exec", pod["metadata"]["name"], "-c", WORKSPACE_CONTAINER, "--"]
+            + ["exec", pod_name, "-c", WORKSPACE_CONTAINER, "--"]
             + ["sh", "-c", _AS_AGENT, "gate"]
-            + [f"printf %s {json.dumps(content)} > /cloud/{MOUNT_NAME}/{name}"],
+            + [f"printf %s '{content}' > /cloud/{MOUNT_NAME}/{name}"],
+            data="",
             timeout=180,
         )
         digest = hashlib.sha256(content.encode()).hexdigest()
@@ -1336,7 +1425,9 @@ class UserRootGate:
             },
         )
         if status in (200, 201):
-            self.threads.append(str(body.get("thread_id") or body.get("id")))
+            forced = str(body.get("thread_id") or body.get("id"))
+            self.threads.append(forced)
+            self.thread_account[forced] = self.b
         self.report.check(
             "owner: a session B creates there naming A's root is refused",
             400 <= status < 500,
@@ -1461,6 +1552,84 @@ class UserRootGate:
                 left.append(f"Nextcloud user {uid[:16]}")
         return left
 
+    def relogin(self, account: Account) -> None:
+        """Log in as one of the run's accounts again, with a fresh password.
+        If its Keycloak user is already gone, a new one is created under the
+        same name and e-mail and its app row relinked by e-mail (the first
+        login of a fresh Keycloak user links a row without a sub)."""
+        account.api.password = secret(secrets.token_urlsafe(18))
+        payload = {
+            "username": account.api.username,
+            "email": account.email,
+            "password": account.api.password,
+        }
+        if not self.keycloak({"action": "reset-password", **payload}).get("reset"):
+            if not account.user_id:
+                return
+            sql(
+                f"UPDATE users SET keycloak_sub = NULL WHERE id = {lit(account.user_id)}"
+            )
+            self.keycloak({"action": "create-user", **payload})
+        account.api.client_id = self.oauth_client
+        me = account.api.ok("GET", "/api/auth/me")["user"]
+        if str(me.get("id")) != account.user_id:
+            raise GateError(
+                f"account {account.label} logged in as {me.get('id')}, not its row"
+            )
+
+    def threads_left(self) -> bool:
+        prefix = f"User root gate {self.gate_id} %"
+        count = sql(f"SELECT count(*) FROM threads WHERE title LIKE {lit(prefix)}")
+        return count not in ("", "0")
+
+    def sweep(self) -> int:
+        """Remove what an earlier run of this gate id left behind, found by
+        name: its sessions, app rows, Nextcloud users, Keycloak users and
+        client."""
+        self.client_started = True
+        for account in (self.a, self.b):
+            account.keycloak_started = True
+            found = sql(
+                f"SELECT id FROM users WHERE lower(email) = lower({lit(account.email)})"
+            )
+            account.user_id = found if _UUID_RE.fullmatch(found or "") else ""
+            if account.user_id:
+                account.default_project = sql(
+                    "SELECT default_project_id FROM users WHERE id = "
+                    f"{lit(account.user_id)}"
+                )
+        # The run's client, made again if it is gone: every login goes
+        # through it.
+        self.keycloak({"action": "create-client"})
+        self.owner.client_id = self.oauth_client
+        if self.threads_left():
+            # Its sessions end only as their user: fresh passwords, this run's.
+            for account in (self.a, self.b):
+                self.relogin(account)
+        prefix = f"User root gate {self.gate_id} %"
+        for line in sql(
+            f"SELECT id || '|' || user_id FROM threads WHERE title LIKE {lit(prefix)}"
+        ).splitlines():
+            thread, _, user_id = line.partition("|")
+            if _UUID_RE.fullmatch(thread):
+                self.threads.append(thread)
+                self.thread_account[thread] = (
+                    self.b if user_id == self.b.user_id else self.a
+                )
+        for uid in (self.uid, self.eve):
+            rc, out = self.nc(_OCC_USER_INFO, uid)
+            if rc == 0 and out.strip().startswith("{"):
+                self.nc_users.append(uid)
+        self.b_member = bool(self.a.default_project and self.b.user_id)
+        problems = self.cleanup()
+        left = self.residue()
+        self.report.check(
+            "sweep: nothing of this gate id is left",
+            not problems and not left,
+            "; ".join(problems + left),
+        )
+        return 0 if self.report.passed else 1
+
     # -- run ---------------------------------------------------------------
     def run(self) -> int:
         try:
@@ -1509,6 +1678,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nextcloud-url", default="https://cloud.localhost")
     parser.add_argument("--pod-timeout", type=int, default=420)
     parser.add_argument("--keep", action="store_true", help="skip cleanup")
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="only remove what an earlier run of --gate-id left behind",
+    )
     return parser
 
 
@@ -1521,6 +1695,8 @@ def validate(args: argparse.Namespace) -> None:
         raise SafetyError("--confirm is accepted only with --run")
     if args.gate_id is not None and not _GATE_ID_RE.fullmatch(args.gate_id):
         raise SafetyError("--gate-id must be ur- followed by 10 hex digits")
+    if args.sweep and (not args.run or args.gate_id is None or args.keep):
+        raise SafetyError("--sweep needs --run, --confirm and --gate-id, not --keep")
     if not _MODEL_RE.fullmatch(args.model):
         raise SafetyError("model id is malformed")
     if not _USER_RE.fullmatch(args.user):
@@ -1546,7 +1722,8 @@ def main(argv: list[str] | None = None) -> int:
         for line in PLAN:
             print(f"  - {line}")
         return 0
-    return UserRootGate(args).run()
+    gate = UserRootGate(args)
+    return gate.sweep() if args.sweep else gate.run()
 
 
 if __name__ == "__main__":
