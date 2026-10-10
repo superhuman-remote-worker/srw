@@ -57040,7 +57040,7 @@ class PostgresDB:
                     VALUES ($1, $2, TRUE)
                     RETURNING id, name, description, goal, status, is_default,
                               default_config_name, default_config_override,
-                              nextcloud_folder_id, cloud_storage_read_only,
+                              nextcloud_folder_id,
                               main_cloud_backend,
                               main_cloud_backend_instance_id,
                               main_cloud_folder_handle,
@@ -57432,7 +57432,7 @@ class PostgresDB:
                     VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::uuid, gen_random_uuid()))
                     RETURNING id, name, description, goal, status, is_default,
                               default_config_name, default_config_override,
-                              nextcloud_folder_id, cloud_storage_read_only,
+                              nextcloud_folder_id,
                               main_cloud_backend,
                               main_cloud_backend_instance_id,
                               main_cloud_folder_handle,
@@ -57479,7 +57479,7 @@ class PostgresDB:
                 """
                 SELECT id, name, description, goal, status, is_default, manifest_resource_id,
                        default_config_name, default_config_override,
-                       nextcloud_folder_id, cloud_storage_read_only,
+                       nextcloud_folder_id,
                        main_cloud_backend, main_cloud_backend_instance_id,
                        main_cloud_folder_handle,
                        network_tier,
@@ -57578,7 +57578,7 @@ class PostgresDB:
                 f"""
                 SELECT p.id, p.name, p.description, p.goal, p.status,
                        p.is_default, p.default_config_name, p.manifest_resource_id,
-                       p.nextcloud_folder_id, p.cloud_storage_read_only,
+                       p.nextcloud_folder_id,
                        p.main_cloud_backend, p.main_cloud_backend_instance_id,
                        p.main_cloud_folder_handle,
                        p.created_at, p.updated_at,
@@ -57657,7 +57657,7 @@ class PostgresDB:
             project_id: Project UUID
             **kwargs: Fields to update (name, description, goal, status,
                       default_config_name, default_config_override,
-                      nextcloud_folder_id, cloud_storage_read_only)
+                      nextcloud_folder_id)
 
         Returns:
             True if updated, False if not found
@@ -57675,7 +57675,6 @@ class PostgresDB:
             "default_config_name",
             "default_config_override",
             "nextcloud_folder_id",
-            "cloud_storage_read_only",
             "main_cloud_backend",
             "main_cloud_backend_instance_id",
             "main_cloud_folder_handle",
@@ -61266,7 +61265,7 @@ class PostgresDB:
                     VALUES ($1, $2, TRUE)
                     RETURNING id, name, description, goal, status, is_default,
                               default_config_name, default_config_override,
-                              nextcloud_folder_id, cloud_storage_read_only,
+                              nextcloud_folder_id,
                               main_cloud_backend,
                               main_cloud_backend_instance_id,
                               main_cloud_folder_handle,

@@ -659,7 +659,6 @@ async def update_project(
     and reports what it stopped (§4.5).
     """
     store = dependencies.store
-    logger = dependencies.logger
 
     kwargs = {k: v for k, v in body.model_dump().items() if v is not None}
     if not kwargs:
@@ -719,24 +718,6 @@ async def update_project(
     success = await store.update_project(project_id, **kwargs)
     if not success:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
-
-    # Sync cloud_storage_read_only to the project-scoped WebDAV datasource
-    if body.cloud_storage_read_only is not None:
-        try:
-            project_ds = await store.list_project_datasources(project_id)
-            for ds in project_ds:
-                if ds["type"] == "webdav":
-                    await store.link_datasource_to_project(
-                        project_id=project_id,
-                        datasource_id=str(ds["id"]),
-                        read_only=body.cloud_storage_read_only,
-                    )
-                    break
-        except Exception as e:
-            logger.warning(
-                f"Failed to sync cloud_storage_read_only to datasource "
-                f"for project {project_id}: {e}"
-            )
 
     # Archiving quiesces the children and says so (§4.5). Only on the
     # transition INTO archived: re-PATCHing an already-archived project must

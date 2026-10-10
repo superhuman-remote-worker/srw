@@ -114,7 +114,6 @@ class ProjectUpdate(BaseModel):
     status: Literal["active", "archived"] | None = None
     default_config_name: str | None = None
     default_config_override: dict[str, Any] | None = None
-    cloud_storage_read_only: bool | None = None
     # Workspace egress tier. Admin-only — see PATCH /api/projects/{id}.
     network_tier: str | None = None
 

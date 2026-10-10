@@ -1332,3 +1332,40 @@ class TestArchivedProjectStaysReadableAndTearableDown:
                     dependencies=_proj_deps(user_b, fake_db),
                 )
         assert exc.value.status_code == 409
+
+
+class TestCloudStorageReadOnlyIsGone:
+    """Main cloud slice 8: a project's access to its cloud folder is its
+    connector's level; the ``cloud_storage_read_only`` field and its sync to
+    the first WebDAV link are gone (the column goes next release)."""
+
+    def test_the_field_is_no_longer_part_of_an_update(self):
+        assert "cloud_storage_read_only" not in ProjectUpdate.model_fields
+        # An older client's field is ignored, never stored.
+        assert (
+            ProjectUpdate(cloud_storage_read_only=True).model_dump(exclude_none=True)
+            == {}
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_update_naming_it_links_nothing(
+        self, user_b, project_b, fake_db, fake_request
+    ):
+        fake_db.update_project = AsyncMock(return_value=True)
+        fake_db.list_project_datasources = AsyncMock(
+            return_value=[{"id": "d1", "type": "webdav"}]
+        )
+        fake_db.link_datasource_to_project = AsyncMock(return_value=True)
+        with _patch_caller(user_b):
+            await update_project(
+                str(project_b["id"]),
+                ProjectUpdate(name="renamed", cloud_storage_read_only=True),
+                fake_request,
+                dependencies=_proj_deps(
+                    user_b,
+                    fake_db,
+                    require_project_owner=AsyncMock(return_value=(user_b, project_b)),
+                ),
+            )
+        assert fake_db.update_project.await_args.kwargs == {"name": "renamed"}
+        fake_db.link_datasource_to_project.assert_not_awaited()
