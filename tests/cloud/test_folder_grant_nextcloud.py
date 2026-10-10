@@ -81,8 +81,8 @@ class FakeNc:
             return self._ocs(200)
         m = re.fullmatch(r"/ocs/v2\.php/cloud/users/([^/]+)", path)
         if m and method == "PUT":
-            assert form["key"] == "password"
-            self.users[m.group(1)]["password"] = form["value"]
+            assert form["key"] in {"password", "quota"}
+            self.users[m.group(1)][form["key"]] = form["value"]
             return self._ocs(100)
         if m and method == "DELETE":
             if self.users.pop(m.group(1), None) is None:
@@ -204,7 +204,11 @@ async def test_ensure_sets_permissions_before_membership(
         _handle(), principal_id=principal, group_id=group, password="pw-1", kind=kind
     )
 
-    assert fake.users[principal] == {"password": "pw-1", "groups": [group]}
+    assert fake.users[principal] == {
+        "password": "pw-1",
+        "groups": [group],
+        "quota": "0 B",
+    }
     assert fake.folder_groups[FOLDER_ID] == {"srw-agents": 31, group: permissions}
     steps = [
         (method, path)
@@ -213,6 +217,8 @@ async def test_ensure_sets_permissions_before_membership(
     ]
     assert steps == [
         ("POST", "/ocs/v2.php/cloud/users"),
+        # No room of its own before it is granted anything.
+        ("PUT", f"/ocs/v2.php/cloud/users/{principal}"),
         ("POST", "/ocs/v2.php/cloud/groups"),
         ("POST", f"/index.php/apps/groupfolders/folders/{FOLDER_ID}/groups"),
         ("POST", f"/index.php/apps/groupfolders/folders/{FOLDER_ID}/groups/{group}"),
@@ -243,10 +249,29 @@ async def test_ensure_completes_a_crashed_attempt_without_a_second_attach() -> N
 
     assert fake.folder_groups[FOLDER_ID][WRITER_GROUP] == 15
     assert fake.users[WRITER]["groups"] == [WRITER_GROUP]
+    # A principal made before quotas were set gets one at its next ensure.
+    assert fake.users[WRITER]["quota"] == "0 B"
     assert (
         "POST",
         f"/index.php/apps/groupfolders/folders/{FOLDER_ID}/groups",
     ) not in fake.log
+
+
+@pytest.mark.asyncio
+async def test_a_refused_quota_fails_the_principal_before_any_grant() -> None:
+    backend, fake = _backend()
+    fake.fail[("PUT", f"/ocs/v2.php/cloud/users/{WRITER}")] = FakeNc._ocs(101, 400)
+
+    with pytest.raises(CloudBackendError, match="set folder grant principal quota"):
+        await backend.ensure_folder_principal(
+            _handle(),
+            principal_id=WRITER,
+            group_id=WRITER_GROUP,
+            password="pw-1",
+            kind="writer",
+        )
+    assert WRITER_GROUP not in fake.groups
+    assert fake.folder_groups[FOLDER_ID] == {"srw-agents": 31}
 
 
 @pytest.mark.asyncio
@@ -263,7 +288,8 @@ async def test_ensure_resets_a_refused_password_once() -> None:
     )
 
     assert fake.users[WRITER]["password"] == "pw-1"
-    assert ("PUT", f"/ocs/v2.php/cloud/users/{WRITER}") in fake.log
+    # The quota, then the password reset.
+    assert fake.log.count(("PUT", f"/ocs/v2.php/cloud/users/{WRITER}")) == 2
 
 
 @pytest.mark.asyncio

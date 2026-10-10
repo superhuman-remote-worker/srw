@@ -207,13 +207,24 @@ guarantees it.
     Keycloak service account, a member of every project Space. A Session's
     workspace holds its short-lived tokens, which reach every project Space
     while they last.
+- **A per-folder account is a full Nextcloud user.** Each reader and writer
+  is an ordinary account with a password only SRW sets, and it lasts until
+  SRW revokes it. Whoever holds the password can sign in as it everywhere a
+  user can (WebDAV, the OCS API, the web UI), not only mount its folder. It
+  is granted that one folder and no other, and SRW sets its quota to 0 B, so
+  it can't store files of its own. What else it can do follows the
+  installation's global settings like any user's: it may share only what it
+  may share (its folder's grant has no share permission), find other users
+  as far as the sharing settings allow, and use the apps enabled for
+  everyone. Nextcloud can restrict sharing and user lookup only
+  installation-wide, so SRW does not restrict them per account.
 - **Where a credential sits.** With the in-pod plane, a folder's credential
   reaches only the mount sidecar. On a VM (Nextcloud `read_only` only) the
-  reader's password is in the guest's rclone config, where it can read that
-  one folder. Where a Session mounts inside its workspace (the plane off, an
-  officer Session, OpenCloud), every folder's credential is in the
-  workspace; on Nextcloud that includes the outbox's `agent-service`
-  password.
+  reader's password is in the guest's rclone config: anyone in the guest
+  can use that account as above, which reads that one folder. Where a
+  Session mounts inside its workspace (the plane off, an officer Session,
+  OpenCloud), every folder's credential is in the workspace; on Nextcloud
+  that includes the outbox's `agent-service` password.
 - **Protected is a connector level.** At most one folder per Session is
   bound at `protected`, and that Session mounts only it: every other
   attached cloud folder is left out as `beside_protected`, never mounted

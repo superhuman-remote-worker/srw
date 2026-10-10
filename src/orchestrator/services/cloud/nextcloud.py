@@ -97,6 +97,12 @@ _FOLDER_GRANT_PERMISSIONS = {"reader": _READ_PERMISSION, "writer": 15}
 _FOLDER_PRINCIPAL_RE = re.compile(r"srw-(reader|writer)-f-([0-9a-f]{32})\Z")
 _FOLDER_GROUP_RE = re.compile(r"srw-(rog|rwg)-f-([0-9a-f]{32})\Z")
 _FOLDER_GROUP_KIND = {"rog": "reader", "rwg": "writer"}
+#: A per-folder principal's own quota: it is an ordinary Nextcloud user,
+#: but stores nothing of its own (its folder's Group Folder quota is apart).
+#: Nextcloud has no per-user or per-group switch for sharing or user
+#: lookup, only the installation-wide sharing settings, which SRW leaves
+#: to the operator.
+_FOLDER_PRINCIPAL_QUOTA = "0 B"
 
 # Nextcloud 30.0.10+ enforces 20 new user shares per 10 minutes per user on
 # /ocs/v2.php/apps/files_sharing/api/v1/shares. The client-side bucket sits
@@ -2127,15 +2133,15 @@ class NextcloudBackend(NextcloudUserRootGrant):
 
         The order is ``grant_protected_reader_attempt``'s, through the plain
         admin client (the signed lane accepts only protected attempts): the
-        user with its stored password, its group, the group's grant on the
-        folder, the grant's permissions, and only then the membership, so
-        the principal never observes Group Folders' broad default. Every step
-        accepts "already done", so a retry completes a crashed attempt.
-        Then the principal must read the folder; a refused password is reset
-        to the stored one once (a principal a lost attempt created with
-        another). A folder not at its path (404 while the principal's own
-        groupfolders root reads) does not fail the grant: its mount reports
-        not_found, as any folder that went missing does.
+        user with its stored password and a 0 B quota, its group, the
+        group's grant on the folder, the grant's permissions, and only then
+        the membership, so the principal never observes Group Folders' broad
+        default. Every step accepts "already done", so a retry completes a
+        crashed attempt. Then the principal must read the folder; a refused
+        password is reset to the stored one once (a principal a lost attempt
+        created with another). A folder not at its path (404 while the
+        principal's own groupfolders root reads) does not fail the grant: its
+        mount reports not_found, as any folder that went missing does.
         """
         self._ensure_ready()
         grant_kind = self._folder_principal_ids(principal_id, group_id, kind)
@@ -2160,6 +2166,18 @@ class NextcloudBackend(NextcloudUserRootGrant):
             )
             self._require_ocs_status(
                 resp, ok={100, 200, 102}, op="create folder grant principal"
+            )
+            # A full Nextcloud user, but with no room of its own: what it
+            # writes lands in its folder (the Group Folder's own quota).
+            # Set on every ensure, so a principal made before this gets it
+            # at its next one.
+            resp = await self._client.put(
+                f"/ocs/v2.php/cloud/users/{principal_id}",
+                params={"format": "json"},
+                data={"key": "quota", "value": _FOLDER_PRINCIPAL_QUOTA},
+            )
+            self._require_ocs_status(
+                resp, ok={100, 200}, op="set folder grant principal quota"
             )
             resp = await self._client.post(
                 "/ocs/v2.php/cloud/groups",
