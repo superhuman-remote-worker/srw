@@ -217,7 +217,15 @@ describe('ProjectDetailPageComponent connector candidates', () => {
           is_global: true,
           scope_mode: 'projects',
         }),
-        datasource('native', {config: {native_project_id: 'project-b'}}),
+        datasource('native', {type: 'kb', config: {native_project_id: 'project-b'}}),
+        datasource('native-folder', {
+          type: 'cloud_folder',
+          managed_key: 'project-cloud:22222222-2222-2222-2222-222222222222',
+        }),
+        datasource('my-outbox', {
+          type: 'cloud_outbox',
+          managed_key: 'cloud-outbox:33333333-3333-3333-3333-333333333333',
+        }),
         datasource('already-linked'),
       ],
       next_cursor: null,
@@ -944,5 +952,67 @@ describe('ProjectDetailPageComponent link access from the capability matrix', ()
     const {component, connectorDrivers} = createComponent({drivers: BUILTIN_DRIVERS});
     component.loadProjectDatasources();
     expect(connectorDrivers.load).toHaveBeenCalled();
+  });
+});
+
+describe("ProjectDetailPageComponent the project's own connectors", () => {
+  const PROJECT = '11111111-1111-1111-1111-111111111111';
+
+  function linked(id: string, overrides: Partial<Datasource> = {}): ProjectDatasource {
+    return {
+      ...datasource(id, overrides),
+      linked_at: '',
+      project_read_only: null,
+      project_description: null,
+    };
+  }
+
+  const FOLDER = linked('folder', {
+    type: 'cloud_folder',
+    connection_url: null,
+    config: {},
+    managed_key: `project-cloud:${PROJECT}`,
+  });
+
+  it('keeps the link: no Unlink, the project manages it', () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    expect(component.managedLabelKey(FOLDER)).toBe('datasources.platform.managedByProject');
+    // Written before the key: the older marker on the knowledge base.
+    expect(
+      component.managedLabelKey(linked('kb', {type: 'kb', config: {native_project_id: PROJECT}})),
+    ).toBe('datasources.platform.managedByProject');
+    expect(component.managedLabelKey(linked('pg'))).toBeNull();
+  });
+
+  it('shows the level the folder binds at instead of the read-only switch', () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    // A cloud folder's driver offers read-only and read-write ...
+    expect(component.linkAccessShown(FOLDER)).toBe('choice');
+    // ... but the project's own link is not this table's to set.
+    expect(component.linkAccessManaged(FOLDER)).toBe(true);
+    expect(component.linkAccessLevel(FOLDER)?.id).toBe('read_write');
+    expect(component.accessLevelKey('read_write')).toBe('datasources.accessLevel.read_write');
+    expect(en.datasources.accessLevel.read_write).toBe('Read-write');
+    // A user's own link keeps its switch, and the KB its fixed level.
+    expect(component.linkAccessManaged(linked('pg'))).toBe(false);
+    expect(
+      component.linkAccessManaged(linked('kb', {type: 'kb', managed_key: `project-kb:${PROJECT}`})),
+    ).toBe(false);
+  });
+
+  it('shows no switch before the matrix loads either', () => {
+    const {component} = createComponent({drivers: null});
+    expect(component.linkAccessManaged(FOLDER)).toBe(true);
+    expect(component.linkAccessLevel(FOLDER)).toBeNull();
+  });
+
+  it('never sends a link access change for it', () => {
+    const {api, component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const updateProjectDatasource = vi.fn().mockReturnValue(of({status: 'updated'}));
+    (api as unknown as {updateProjectDatasource: unknown}).updateProjectDatasource =
+      updateProjectDatasource;
+    component.projectDatasources.set([FOLDER]);
+    component.updateDatasourceReadOnly('folder', 'true');
+    expect(updateProjectDatasource).not.toHaveBeenCalled();
   });
 });

@@ -15,6 +15,11 @@ import {
   strictAccess,
   strictAccessLevel,
 } from '../../core/models/connector-driver.model';
+import {
+  accessLevelLabelKey,
+  isPlatformOwned,
+  platformManagedLabelKey,
+} from '../../core/models/platform-connector';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
@@ -666,6 +671,20 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                                link and the creator's read-only tag, so the
                                bound level's line shows here; a tag the link
                                cannot lift replaces the switch and says why. -->
+                          @if (linkAccessManaged(ds)) {
+                            <!-- A platform-owned link (the project's own
+                                 cloud folder) is not this table's to set: it
+                                 shows the level it binds at. -->
+                            @if (linkAccessLevel(ds); as level) {
+                              <app-badge tone="neutral" size="sm" data-managed-access [attr.data-level]="level.id">
+                                @if (accessLevelKey(level.id); as key) {
+                                  {{ key | transloco }}
+                                } @else {
+                                  {{ level.id }}
+                                }
+                              </app-badge>
+                            }
+                          } @else {
                           @switch (linkAccessShown(ds)) {
                             @case ('read_only') {
                               <app-badge
@@ -698,6 +717,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                               </app-select>
                             }
                           }
+                          }
                           @if (linkAccessLevel(ds); as level) {
                             <div class="link-enforced" [class.link-advisory]="level.advisory" [attr.data-level]="level.id">
                               <strong>{{ (level.advisory ? 'projectDetail.datasources.accessAdvisory' : 'projectDetail.datasources.accessEnforcedBy') | transloco }}</strong>
@@ -710,9 +730,16 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                           }
                         </td>
                         <td>
-                          <app-button variant="danger" size="sm" (clicked)="unlinkDatasource(ds.id)">
-                            {{ 'projectDetail.datasources.unlink' | transloco }}
-                          </app-button>
+                          @if (managedLabelKey(ds); as managedKey) {
+                            <span class="link-managed" data-managed>
+                              <app-icon size="xs">lock</app-icon>
+                              {{ managedKey | transloco }}
+                            </span>
+                          } @else {
+                            <app-button variant="danger" size="sm" (clicked)="unlinkDatasource(ds.id)">
+                              {{ 'projectDetail.datasources.unlink' | transloco }}
+                            </app-button>
+                          }
                         </td>
                       </tr>
                     }
@@ -1555,6 +1582,16 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     }
 
     .link-enforced.link-advisory { color: var(--warning); }
+
+    /* A platform-owned link: SRW keeps it, so no Unlink. */
+    .link-managed {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 12px;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
 
     /* Inline form */
     .inline-form {
@@ -2523,7 +2560,8 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
    * authoritative, while the legacy list was only visibility-filtered. These
    * mirror the connector-side link rules before a row becomes selectable. */
   private canLinkDatasourceCandidate(datasource: Datasource): boolean {
-    if (datasource.config?.native_project_id) return false;
+    // A project's own connector (or a user's) is never linked anywhere else.
+    if (isPlatformOwned(datasource)) return false;
     const user = this.userService.currentUser();
     if (!user) return false;
     if (user.is_admin || datasource.created_by === user.id) return true;
@@ -2553,6 +2591,25 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
         this.loadProjectDatasources();
       }
     });
+  }
+
+  /** Who keeps a platform-owned link (its project, or SRW for a user), or
+   *  null for a link the project's members may remove. */
+  managedLabelKey(ds: Datasource): string | null {
+    return platformManagedLabelKey(ds, this.userService.currentUser()?.id ?? null);
+  }
+
+  /** Whether a link's access is the platform's, not this table's: a
+   *  platform-owned row whose driver would otherwise offer the read-only
+   *  switch (a cloud folder). It shows the level it binds at instead.
+   *  Slice 5 of main_cloud_as_connectors gives the project folder a
+   *  default-access select of its own. */
+  linkAccessManaged(ds: Datasource): boolean {
+    return isPlatformOwned(ds) && this.linkAccessShown(ds) === 'choice';
+  }
+
+  accessLevelKey(level: string): string | null {
+    return accessLevelLabelKey(level);
   }
 
   /** A link's access choice: one fixed level, or the read-only switch.
@@ -2640,7 +2697,9 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   updateDatasourceReadOnly(datasourceId: string, value: string): void {
     if (
       this.projectDatasources().some(
-        (ds) => ds.id === datasourceId && this.linkAccessShown(ds) !== 'choice',
+        (ds) =>
+          ds.id === datasourceId &&
+          (this.linkAccessShown(ds) !== 'choice' || this.linkAccessManaged(ds)),
       )
     ) {
       return;

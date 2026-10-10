@@ -44,6 +44,12 @@ import {
   offeredAccess,
   publicReadWrite,
 } from '../../core/models/connector-driver.model';
+import {
+  isPlatformOwned,
+  PROJECT_KB,
+  platformManagedLabelKey,
+  platformOwnedKind,
+} from '../../core/models/platform-connector';
 import {GenericConnectorFormComponent} from './connector-forms/generic-connector-form.component';
 import {bespokeFormFor} from './connector-forms/connector-form-registry';
 import {
@@ -1597,12 +1603,16 @@ type KeyValueRow = {key: string; value: string};
                               {{ 'datasources.table.fullReindexTooltip' | transloco }}
                             </app-menu-item>
                           }
-                          <app-menu-item (activated)="openEditForm(ds)">
-                            {{ 'datasources.table.editTooltip' | transloco }}
-                          </app-menu-item>
-                          <app-menu-item tone="danger" (activated)="deleteDatasource(ds)">
-                            {{ 'datasources.table.deleteTooltip' | transloco }}
-                          </app-menu-item>
+                          @if (canEditRow(ds)) {
+                            <app-menu-item (activated)="openEditForm(ds)">
+                              {{ 'datasources.table.editTooltip' | transloco }}
+                            </app-menu-item>
+                          }
+                          @if (canDeleteRow(ds)) {
+                            <app-menu-item tone="danger" (activated)="deleteDatasource(ds)">
+                              {{ 'datasources.table.deleteTooltip' | transloco }}
+                            </app-menu-item>
+                          }
                         </app-menu>
                       } @else if (canManage(ds)) {
                         <app-icon-button
@@ -1637,24 +1647,37 @@ type KeyValueRow = {key: string; value: string};
                             <app-icon size="sm">restart_alt</app-icon>
                           </app-icon-button>
                         }
-                        <app-icon-button
-                          variant="ghost"
-                          size="sm"
-                          [ariaLabel]="'datasources.table.editTooltip' | transloco"
-                          [tooltip]="'datasources.table.editTooltip' | transloco"
-                          (clicked)="openEditForm(ds)"
-                        >
-                          <app-icon size="sm">edit</app-icon>
-                        </app-icon-button>
-                        <app-icon-button
-                          variant="danger"
-                          size="sm"
-                          [ariaLabel]="'datasources.table.deleteTooltip' | transloco"
-                          [tooltip]="'datasources.table.deleteTooltip' | transloco"
-                          (clicked)="deleteDatasource(ds)"
-                        >
-                          <app-icon size="sm">delete</app-icon>
-                        </app-icon-button>
+                        @if (canEditRow(ds)) {
+                          <app-icon-button
+                            variant="ghost"
+                            size="sm"
+                            [ariaLabel]="'datasources.table.editTooltip' | transloco"
+                            [tooltip]="'datasources.table.editTooltip' | transloco"
+                            (clicked)="openEditForm(ds)"
+                          >
+                            <app-icon size="sm">edit</app-icon>
+                          </app-icon-button>
+                        }
+                        @if (canDeleteRow(ds)) {
+                          <app-icon-button
+                            variant="danger"
+                            size="sm"
+                            [ariaLabel]="'datasources.table.deleteTooltip' | transloco"
+                            [tooltip]="'datasources.table.deleteTooltip' | transloco"
+                            (clicked)="deleteDatasource(ds)"
+                          >
+                            <app-icon size="sm">delete</app-icon>
+                          </app-icon-button>
+                        }
+                      }
+                      <!-- SRW provisions and manages a platform-owned row
+                           (a project's knowledge base or cloud folder, a
+                           user's own): nobody deletes or re-points it here. -->
+                      @if (managedLabelKey(ds); as managedKey) {
+                        <span class="managed-note" data-managed>
+                          <app-icon size="xs">lock</app-icon>
+                          {{ managedKey | transloco }}
+                        </span>
                       }
 
                       @if (canManage(ds) && testResults()[ds.id]; as result) {
@@ -2477,6 +2500,16 @@ type KeyValueRow = {key: string; value: string};
 
       .inline-test {
         margin-left: 4px;
+      }
+
+      .managed-note {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        margin-left: 4px;
+        font-size: 12px;
+        color: var(--text-muted);
+        vertical-align: middle;
       }
 
       .inline-test.test-ok { color: var(--success); }
@@ -3450,6 +3483,9 @@ export class DatasourceListComponent implements OnInit {
   }
 
   openEditForm(ds: Datasource): void {
+    // Nothing on the form may change a platform-owned row but a project's
+    // knowledge base; the server would refuse the save.
+    if (isPlatformOwned(ds) && platformOwnedKind(ds) !== PROJECT_KB) return;
     this.editingOriginal = ds;
     this.resetGenericForm({
       connection_url: ds.connection_url,
@@ -3568,8 +3604,10 @@ export class DatasourceListComponent implements OnInit {
     this.formData.scope_mode = mode;
   }
 
+  /** A platform-owned connector (a project's own knowledge base or cloud
+   *  folder, a user's own): its policy is SRW's, never the form's. */
   isNativeProjectConnector(ds: Datasource | null = this.editingOriginal): boolean {
-    return !!ds?.config?.native_project_id;
+    return isPlatformOwned(ds);
   }
 
   onProjectSearch(value: string): void {
@@ -4318,6 +4356,9 @@ export class DatasourceListComponent implements OnInit {
       kubeconfig: 'rocket_launch',
       ssh_key: 'key',
       generic_file: 'description',
+      cloud_folder: 'folder',
+      cloud_folder_checkout: 'folder_copy',
+      cloud_outbox: 'outbox',
     };
     return icons[type] || 'storage';
   }
@@ -4333,6 +4374,24 @@ export class DatasourceListComponent implements OnInit {
   canManage(ds: Datasource): boolean {
     const user = this.userService.currentUser();
     return !!user && (user.is_admin === true || ds.created_by === user.id);
+  }
+
+  /** Edit: a manager's own rows, and of the platform-owned ones only a
+   *  project's knowledge base, whose metadata and root path stay editable
+   *  (the server refuses every other edit of a platform-owned row). */
+  canEditRow(ds: Datasource): boolean {
+    if (!this.canManage(ds)) return false;
+    return !isPlatformOwned(ds) || platformOwnedKind(ds) === PROJECT_KB;
+  }
+
+  /** Delete: never a platform-owned row, which goes with its project or user. */
+  canDeleteRow(ds: Datasource): boolean {
+    return this.canManage(ds) && !isPlatformOwned(ds);
+  }
+
+  /** Who manages a platform-owned row ("Managed by its project"), or null. */
+  managedLabelKey(ds: Datasource): string | null {
+    return platformManagedLabelKey(ds, this.userService.currentUser()?.id ?? null);
   }
 
   indexStatusTone(status: DatasourceIndexStatus['status']): BadgeTone {

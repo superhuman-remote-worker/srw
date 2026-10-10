@@ -31,6 +31,7 @@ import {
 } from '../../core/services/persistent-chat.service';
 import {ApiService, SessionToolGroupsResponse} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
+import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
 import {ModelService} from '../../core/services/model.service';
 import {Datasource} from '../../core/models/api.model';
 import {AppIconComponent} from '../../ui/icon';
@@ -56,6 +57,17 @@ const TOOL_ADDITIONS_PREFIX = 'tools+';
  *  user flips in quick succession (live_session_settings.md, principle 4).
  *  Also debounces the per-tick temperature slider. */
 const APPLY_DEBOUNCE_MS = 400;
+
+/** The connector types whose driver refuses a live attach (`live_attach:
+ *  false` in the capability matrix): a copy, used only until the matrix
+ *  loads. A knowledge base binds when the session starts; the main cloud's
+ *  folders are mounted then. */
+const LIVE_ATTACH_REFUSED_TYPES: ReadonlySet<string> = new Set([
+    'kb',
+    'cloud_folder',
+    'cloud_folder_checkout',
+    'cloud_outbox',
+]);
 
 /**
  * Live session settings pane (live_session_settings.md, Slice A).
@@ -190,6 +202,7 @@ export class SettingsPaneComponent {
     readonly capabilities = inject(CapabilitiesService);
     private readonly api = inject(ApiService);
     private readonly modelService = inject(ModelService);
+    private readonly connectorDrivers = inject(ConnectorDriversService);
     private readonly destroyRef = inject(DestroyRef);
 
     /** Whether the pane is currently shown (drives the lazy thread fetch). */
@@ -215,16 +228,54 @@ export class SettingsPaneComponent {
     /** The session's currently attached datasource ids (durable selection;
      *  optimistically advanced when the pane dispatches a change). */
     readonly attachedIds = signal<string[]>([]);
-    /** Eligible datasources shown in the picker: the create-flow eligible
-     *  union, minus unattached kb entries (not addable live — v1). */
-    readonly pickerDatasources = signal<Datasource[]>([]);
+    /** The last eligible answer, with the attached ids it was read against;
+     *  null while there is none. */
+    private readonly eligibleAnswer = signal<{eligible: Datasource[]; attachedIds: string[]} | null>(null);
+    /** Eligible datasources shown in the picker: the session's eligible
+     *  list, minus unattached rows whose driver refuses a live attach (a
+     *  knowledge base, a cloud folder: adding one here would only take
+     *  effect at the next start), plus a placeholder per attached id that
+     *  fell out of eligibility. */
+    readonly pickerDatasources = computed<Datasource[]>(() => {
+        const answer = this.eligibleAnswer();
+        if (!answer) return [];
+        const {eligible, attachedIds} = answer;
+        const shown = eligible.filter(
+            (ds) => !this.liveAttachRefused(ds) || attachedIds.includes(ds.id),
+        );
+        const visibleIds = new Set(shown.map((ds) => ds.id));
+        // A stored attachment that fell out of eligibility is a live
+        // fail-closed conflict, not something to silently preserve
+        // forever. Render a non-enumerating placeholder so the user
+        // can explicitly detach it without leaking its former name or
+        // project association.
+        const unavailable: Datasource[] = attachedIds
+            .filter((id) => !visibleIds.has(id))
+            .map((id) => ({
+                id,
+                name: id,
+                description: null,
+                type: 'generic',
+                connection_url: null,
+                cli_hint: null,
+                default_branch: null,
+                job_id: null,
+                created_at: '',
+                updated_at: '',
+                unavailable: true,
+            }));
+        return [...shown, ...unavailable];
+    });
     readonly loadingDatasources = signal(false);
     readonly datasourceLoadError = signal(false);
     private datasourceProjectIds: string[] = [];
     private datasourceRequestSerial = 0;
-    /** kb entries render frozen: knowledge bindings only rewire on attach. */
+    /** Rows whose driver refuses a live attach render frozen at their
+     *  current state, with a hint that they change only at the next start
+     *  (a knowledge base's bindings rewire on attach; a cloud folder is
+     *  mounted at start). */
     readonly lockedDatasourceIds = computed(() =>
-        this.pickerDatasources().filter((ds) => ds.type === 'kb').map((ds) => ds.id),
+        this.pickerDatasources().filter((ds) => this.liveAttachRefused(ds)).map((ds) => ds.id),
     );
     /** Set-at-creation facts the pane shows locked (criterion 7): the
      *  session's Expert and project names, and its frozen resolved config so
@@ -410,7 +461,7 @@ export class SettingsPaneComponent {
         this.lastApplied = null;
         this.threadOverride.set({});
         this.attachedIds.set([]);
-        this.pickerDatasources.set([]);
+        this.eligibleAnswer.set(null);
         this.expertLabel.set('');
         this.projectLabel.set('');
         this.lockedConfig.set(null);
@@ -521,43 +572,31 @@ export class SettingsPaneComponent {
         const serial = ++this.datasourceRequestSerial;
         this.loadingDatasources.set(true);
         this.datasourceLoadError.set(false);
-        this.api.getEligibleDatasources(projectIds).subscribe({
+        // Which rows refuse a live attach is the matrix's answer.
+        this.connectorDrivers.load();
+        this.api.getEligibleDatasources(projectIds, 'session').subscribe({
             next: (eligible) => {
                 if (serial !== this.datasourceRequestSerial || this.chat.threadId() !== threadId) return;
-                const shown = eligible.filter(
-                    ds => ds.type !== 'kb' || attachedIds.includes(ds.id),
-                );
-                const visibleIds = new Set(shown.map(ds => ds.id));
-                // A stored attachment that fell out of eligibility is a live
-                // fail-closed conflict, not something to silently preserve
-                // forever. Render a non-enumerating placeholder so the user
-                // can explicitly detach it without leaking its former name or
-                // project association.
-                const unavailable: Datasource[] = attachedIds
-                    .filter(id => !visibleIds.has(id))
-                    .map(id => ({
-                        id,
-                        name: id,
-                        description: null,
-                        type: 'generic',
-                        connection_url: null,
-                        cli_hint: null,
-                        default_branch: null,
-                        job_id: null,
-                        created_at: '',
-                        updated_at: '',
-                        unavailable: true,
-                    }));
-                this.pickerDatasources.set([...shown, ...unavailable]);
+                this.eligibleAnswer.set({eligible, attachedIds});
                 this.loadingDatasources.set(false);
             },
             error: () => {
                 if (serial !== this.datasourceRequestSerial || this.chat.threadId() !== threadId) return;
-                this.pickerDatasources.set([]);
+                this.eligibleAnswer.set(null);
                 this.datasourceLoadError.set(true);
                 this.loadingDatasources.set(false);
             },
         });
+    }
+
+    /** Whether a row's driver refuses a live attach: the matrix's
+     *  `live_attach: false`, or, until it loads, the built-in copy. A
+     *  placeholder for an attachment that fell out of eligibility is never
+     *  frozen: it must stay detachable. */
+    private liveAttachRefused(ds: Datasource): boolean {
+        if (ds.unavailable) return false;
+        const driver = this.connectorDrivers.forType(ds.type);
+        return driver ? driver.live_attach === false : LIVE_ATTACH_REFUSED_TYPES.has(ds.type);
     }
 
     /** The full desired selection: the picker's checked set plus attached ids

@@ -1325,6 +1325,91 @@ describe('DatasourceListComponent availability policy', () => {
 });
 
 
+describe('DatasourceListComponent platform-owned connectors', () => {
+  const PROJECT = '11111111-1111-1111-1111-111111111111';
+
+  function cloudFolder(overrides: Partial<Datasource> = {}): Datasource {
+    return {
+      id: 'folder-1',
+      name: 'Acme cloud folder',
+      description: null,
+      type: 'cloud_folder',
+      connection_url: null,
+      cli_hint: null,
+      default_branch: null,
+      config: {},
+      job_id: null,
+      created_by: 'user-1',
+      managed_key: `project-cloud:${PROJECT}`,
+      scope_mode: 'projects',
+      project_ids: [PROJECT],
+      auto_attach: true,
+      created_at: '',
+      updated_at: '',
+      ...overrides,
+    };
+  }
+
+  it("treats a project's cloud folder as managed: no edit, no delete, no policy", () => {
+    const {component} = createComponent();
+    const folder = cloudFolder();
+    expect(component.isNativeProjectConnector(folder)).toBe(true);
+    // Its creator (the project's owner) can still not change it.
+    expect(component.canManage(folder)).toBe(true);
+    expect(component.canEditRow(folder)).toBe(false);
+    expect(component.canDeleteRow(folder)).toBe(false);
+    expect(component.managedLabelKey(folder)).toBe('datasources.platform.managedByProject');
+    expect(en.datasources.platform.managedByProject).toBe('Managed by its project');
+    // The form never opens for it: the server would refuse the save.
+    component.openEditForm(folder);
+    expect(component.showForm()).toBe(false);
+  });
+
+  it("keeps a project's knowledge base editable but never deletable", () => {
+    const {component, ds} = createComponent();
+    for (const kb of [
+      {...ds, managed_key: `project-kb:${PROJECT}`},
+      // Written before the key: the older marker alone.
+      {...ds, config: {root_path: 'vault', native_project_id: PROJECT}},
+    ]) {
+      expect(component.isNativeProjectConnector(kb)).toBe(true);
+      expect(component.canEditRow(kb)).toBe(true);
+      expect(component.canDeleteRow(kb)).toBe(false);
+      expect(component.managedLabelKey(kb)).toBe('datasources.platform.managedByProject');
+    }
+    component.openEditForm({...ds, managed_key: `project-kb:${PROJECT}`});
+    expect(component.showForm()).toBe(true);
+    // Its policy block stays the project's.
+    expect(component.isNativeProjectConnector()).toBe(true);
+  });
+
+  it("says SRW manages a user's own connector, for that user", () => {
+    const {component, currentUser} = createComponent();
+    const outbox = cloudFolder({type: 'cloud_outbox', managed_key: 'cloud-outbox:user-1'});
+    expect(component.managedLabelKey(outbox)).toBe('datasources.platform.managedForYou');
+    expect(en.datasources.platform.managedForYou).toBe('Managed by SRW for you');
+    currentUser.set({id: 'admin-1', is_admin: true});
+    expect(component.managedLabelKey(outbox)).toBe('datasources.platform.managedForItsUser');
+    // An administrator manages ordinary rows, never a platform-owned one.
+    expect(component.canEditRow(outbox)).toBe(false);
+    expect(component.canDeleteRow(outbox)).toBe(false);
+  });
+
+  it('leaves a user-created row as it was', () => {
+    const {component, ds} = createComponent();
+    expect(component.isNativeProjectConnector(ds)).toBe(false);
+    expect(component.canEditRow(ds)).toBe(true);
+    expect(component.canDeleteRow(ds)).toBe(true);
+    expect(component.managedLabelKey(ds)).toBeNull();
+    // The cloud types have type labels in both catalogues.
+    for (const type of ['cloud_folder', 'cloud_folder_checkout', 'cloud_outbox'] as const) {
+      expect(en.datasources.filter[type]).toBeTruthy();
+      expect(de.datasources.filter[type]).toBeTruthy();
+      expect(component.getTypeIcon(type)).not.toBe('storage');
+    }
+  });
+});
+
 describe('DatasourceListComponent token permission guidance', () => {
   // A PAT with the wrong permissions fails at first use, in an agent run,
   // with a forge error nobody sees. The form is where that is cheap to fix.

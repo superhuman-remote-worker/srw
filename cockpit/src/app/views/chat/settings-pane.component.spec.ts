@@ -14,6 +14,26 @@ import type {
 } from '../../core/services/api.service';
 import {ToolsGroupComponent} from '../agent-settings/tools-group.component';
 import {SettingsPaneComponent} from './settings-pane.component';
+import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
+import {
+  ConnectorDriver,
+  ConnectorDriverMatrix,
+  driverForType,
+} from '../../core/models/connector-driver.model';
+// The API's own capability matrix for the built-in drivers.
+import driversFixture from '../../core/models/fixtures/connector-drivers.json';
+
+const BUILTIN_DRIVERS = (driversFixture as unknown as ConnectorDriverMatrix).drivers;
+
+/** The capability matrix as the pane reads it; null = not loaded (yet). */
+function driversStub(drivers: ConnectorDriver[] | null = null) {
+  const current = signal(drivers);
+  return {
+    drivers: current,
+    load: vi.fn(),
+    forType: (type: string) => driverForType(current(), type),
+  };
+}
 
 /** Build the resolved tool-groups answer the pane now reads. */
 function toolsetAnswer(
@@ -62,6 +82,8 @@ function createPane(options: {
   toolGroups$?: Observable<SessionToolGroupsResponse | null>;
   /** Thread ids whose metadata differs, for the thread-switch test. */
   threadsById?: Record<string, Record<string, unknown>>;
+  /** The capability matrix; null (the default) = not loaded yet. */
+  drivers?: ConnectorDriver[] | null;
 } = {}) {
   const chat = {
     threadId: signal<string | null>('thread-1'),
@@ -108,6 +130,7 @@ function createPane(options: {
     datasourceScopeAutoAttachAvailable: () => true,
   };
   const modelService = {load: vi.fn()};
+  const connectorDrivers = driversStub(options.drivers ?? null);
 
   TestBed.configureTestingModule({
     providers: [
@@ -116,6 +139,7 @@ function createPane(options: {
       {provide: ApiService, useValue: api},
       {provide: CapabilitiesService, useValue: capabilities},
       {provide: ModelService, useValue: modelService},
+      {provide: ConnectorDriversService, useValue: connectorDrivers},
     ],
   });
   const component = TestBed.inject(SettingsPaneComponent);
@@ -134,7 +158,7 @@ function createPane(options: {
   };
   Object.defineProperty(component, 'settings', {value: () => fakeSettings});
   TestBed.tick(); // fire the load effect
-  return {component, chat, api, fakeSettings};
+  return {component, chat, api, fakeSettings, connectorDrivers};
 }
 
 /** `shell` bound to exactly the code-granted `srw_cloud_status` — the default
@@ -222,6 +246,7 @@ function createPaneWithRealToolsGroup(toolGroups: SessionToolGroupsResponse) {
       {provide: ApiService, useValue: api},
       {provide: CapabilitiesService, useValue: capabilities},
       {provide: ModelService, useValue: modelService},
+      {provide: ConnectorDriversService, useValue: driversStub()},
     ],
   });
   const component = TestBed.inject(SettingsPaneComponent);
@@ -405,6 +430,7 @@ describe('SettingsPaneComponent locked-on categories, from the DOM', () => {
           useValue: {grants: signal(null), datasourceScopeAutoAttachAvailable: () => true},
         },
         {provide: ModelService, useValue: {load: vi.fn()}},
+        {provide: ConnectorDriversService, useValue: driversStub()},
       ],
     });
 
@@ -862,6 +888,60 @@ describe('SettingsPaneComponent datasources (Slice B)', () => {
 
     expect(component.pickerDatasources().map((d) => d.id)).toEqual(['ds-pg', 'kb-1']);
     expect(component.lockedDatasourceIds()).toEqual(['kb-1']);
+  });
+
+  it("asks for a session's eligible connectors and loads the matrix", () => {
+    const {api, connectorDrivers} = createPane({attachedIds: [], eligible: [PG]});
+    expect(api.getEligibleDatasources).toHaveBeenCalledWith([], 'session');
+    expect(connectorDrivers.load).toHaveBeenCalled();
+  });
+
+  it('freezes what its driver cannot attach live, and hides it unattached', () => {
+    const FOLDER = {id: 'folder-1', type: 'cloud_folder', name: 'Project folder'};
+    const OTHER_FOLDER = {id: 'folder-2', type: 'cloud_folder', name: 'Other folder'};
+    const KB = {id: 'kb-1', type: 'kb', name: 'Docs KB'};
+    const {component} = createPane({
+      attachedIds: ['folder-1', 'kb-1'],
+      eligible: [PG, FOLDER, OTHER_FOLDER, KB],
+      drivers: BUILTIN_DRIVERS,
+    });
+    // The matrix says live_attach: false for both: a cloud folder is
+    // mounted when the session starts.
+    expect(component.pickerDatasources().map((d) => d.id)).toEqual(['ds-pg', 'folder-1', 'kb-1']);
+    expect(component.lockedDatasourceIds()).toEqual(['folder-1', 'kb-1']);
+  });
+
+  it('follows the matrix once it loads, and the built-in copy before', () => {
+    const FOLDER = {id: 'folder-1', type: 'cloud_folder', name: 'Project folder'};
+    const KB = {id: 'kb-1', type: 'kb', name: 'Docs KB'};
+    const {component, connectorDrivers} = createPane({
+      attachedIds: ['folder-1', 'kb-1', 'ds-pg'],
+      eligible: [PG, FOLDER, KB],
+      drivers: null,
+    });
+    // Before the matrix: the copy (the KB rule, and the cloud folders).
+    expect(component.lockedDatasourceIds()).toEqual(['folder-1', 'kb-1']);
+    // A driver that turns live attach on is followed; one that turns it off too.
+    connectorDrivers.drivers.set(
+      BUILTIN_DRIVERS.map((driver) =>
+        driver.legacy_type === 'cloud_folder'
+          ? {...driver, live_attach: true}
+          : driver.legacy_type === 'postgresql'
+            ? {...driver, live_attach: false}
+            : driver,
+      ),
+    );
+    expect(component.lockedDatasourceIds()).toEqual(['ds-pg', 'kb-1']);
+  });
+
+  it('never freezes the placeholder of an attachment that fell out of eligibility', () => {
+    const {component} = createPane({
+      attachedIds: ['gone'],
+      eligible: [PG],
+      drivers: BUILTIN_DRIVERS,
+    });
+    expect(component.pickerDatasources().find((d) => d.id === 'gone')?.unavailable).toBe(true);
+    expect(component.lockedDatasourceIds()).toEqual([]);
   });
 });
 
