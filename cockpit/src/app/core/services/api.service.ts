@@ -109,6 +109,8 @@ import {
 } from '../models/api.model';
 import type {
   AdminCapacity,
+  CloudRootConnectStart,
+  CloudRootStatus,
   SessionQueueState,
   SessionQueueRetryOutcome,
   RunQueueUnparkResult,
@@ -1291,6 +1293,33 @@ export class ApiService {
         return of(null);
       }),
     );
+  }
+
+  // ===== My cloud: the caller's own cloud root (main cloud slice 4) =====
+  // Every call acts on the caller's own root; errors reach the caller.
+
+  /** The caller's cloud root and its state (the row is ensured first). */
+  getCloudRoot(): Observable<CloudRootStatus> {
+    return this.http.get<CloudRootStatus>(`${this.baseUrl}/me/cloud-root`);
+  }
+
+  /** Start "Connect your cloud": the page to open (`login_url`). 409 with
+   *  the unsupported reason as `detail` when there is no root to connect. */
+  connectCloudRoot(): Observable<CloudRootConnectStart> {
+    return this.http.post<CloudRootConnectStart>(`${this.baseUrl}/me/cloud-root/connect`, {});
+  }
+
+  /** Cancel the caller's connect flow; answers the state after it. */
+  cancelCloudRootConnect(): Observable<CloudRootStatus & {cancelled?: boolean}> {
+    return this.http.delete<CloudRootStatus & {cancelled?: boolean}>(
+      `${this.baseUrl}/me/cloud-root/connect`,
+    );
+  }
+
+  /** Disconnect: the cloud is asked to revoke the credential
+   *  (`provider_revoked`) and SRW forgets it. */
+  disconnectCloudRoot(): Observable<CloudRootStatus> {
+    return this.http.delete<CloudRootStatus>(`${this.baseUrl}/me/cloud-root`);
   }
 
   /** Set a project link's default access level, for a connector whose

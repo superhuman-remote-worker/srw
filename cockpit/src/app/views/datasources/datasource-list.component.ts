@@ -51,6 +51,7 @@ import {
   platformOwnedKind,
 } from '../../core/models/platform-connector';
 import {GenericConnectorFormComponent} from './connector-forms/generic-connector-form.component';
+import {CloudRootCardComponent} from './cloud-root-card.component';
 import {bespokeFormFor} from './connector-forms/connector-form-registry';
 import {
   ConnectorFormError,
@@ -87,6 +88,7 @@ type KeyValueRow = {key: string; value: string};
     AppMenuTriggerDirective,
     GenericConnectorFormComponent,
     RouterLink,
+    CloudRootCardComponent,
   ],
   template: `
     <div class="ds-container" [class.form-open]="showForm()">
@@ -132,6 +134,10 @@ type KeyValueRow = {key: string; value: string};
           </a>
         </div>
       </div>
+
+      <!-- The user's own cloud root, a connector SRW keeps for them: its
+           connection is theirs to make, here (main cloud slice 4). -->
+      <app-cloud-root-card />
 
       @if (capabilities.datasourceScopeAutoAttachAvailable()) {
         <div class="catalog-filter-bar">

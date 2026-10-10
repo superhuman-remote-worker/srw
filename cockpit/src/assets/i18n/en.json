@@ -2735,6 +2735,59 @@
       "moreActions": "More actions"
     }
   },
+  "cloudRoot": {
+    "description": "Your own files in the main cloud: everything you see in Files, project folders you belong to included. Connect it once, and your personal project's sessions mount it at cloud/my_cloud with full access.",
+    "state": {
+      "unsupported": "Not available",
+      "not_connected": "Not connected",
+      "connecting": "Connecting",
+      "connected": "Connected",
+      "revoked": "Disconnected",
+      "failed": "Not connected"
+    },
+    "detail": {
+      "connected": "Connected.",
+      "connectedAs": "Connected as {{account}}.",
+      "connecting": "Sign in to your cloud in the tab that opened and allow SRW access. This page updates on its own.",
+      "notConnected": "Connect it once to mount your own files in your personal project's sessions."
+    },
+    "failure": {
+      "wrong_account": "That cloud account's e-mail isn't yours. Sign in with your own account and connect again.",
+      "admin_account": "Cloud administrator accounts can't be connected. Sign in with your own account.",
+      "account_disabled": "That cloud account is disabled.",
+      "verify_failed": "The connection could not read your files. Connect again.",
+      "expired": "You didn't finish signing in in time. Connect again.",
+      "provider_error": "The cloud could not be reached. Try again later.",
+      "account_missing": "Your cloud account has no files yet: open Files in the cloud once, then connect again.",
+      "error": "Something went wrong. Connect again."
+    },
+    "revoked": {
+      "user": "You disconnected it. Sessions don't mount it until you connect it again.",
+      "rejected_by_cloud": "The cloud no longer accepts this connection (it was removed from your devices, or the account was disabled). Reconnect it."
+    },
+    "unsupported": {
+      "provider_unsupported": "This deployment's cloud doesn't offer personal cloud roots.",
+      "grant_mode_off": "Personal cloud roots are turned off on this deployment.",
+      "no_personal_project": "You have no personal project yet, so no session would mount it."
+    },
+    "actions": {
+      "connect": "Connect",
+      "reconnect": "Reconnect",
+      "cancel": "Cancel",
+      "disconnect": "Disconnect"
+    },
+    "openLogin": "Open the cloud's sign-in page",
+    "disconnectConfirm": "Disconnect My cloud? The cloud is asked to revoke SRW's access, and sessions stop mounting it at their next start.",
+    "revokeIncomplete": "SRW forgot the connection, but the cloud could not be asked to revoke it: remove “{{client}}” from your cloud's devices and sessions.",
+    "connectLink": "Connect your cloud",
+    "reconnectLink": "Reconnect your cloud",
+    "errors": {
+      "unsupported": "There is no cloud root to connect on this deployment.",
+      "startFailed": "The cloud could not start the connection. Try again later.",
+      "cancelFailed": "The connection could not be cancelled.",
+      "disconnectFailed": "My cloud could not be disconnected. Try again."
+    }
+  },
   "datasources": {
     "driversLink": "Driver capabilities",
     "driversLinkHint": "What each connector driver offers, and what enforces it",

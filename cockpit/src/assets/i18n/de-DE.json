@@ -2735,6 +2735,59 @@
       "moreActions": "Weitere Aktionen"
     }
   },
+  "cloudRoot": {
+    "description": "Deine eigenen Dateien in der Haupt-Cloud: alles, was du in Files siehst, auch die Projektordner, zu denen du gehörst. Einmal verbinden, dann binden die Sessions deines persönlichen Projekts sie unter cloud/my_cloud mit vollem Zugriff ein.",
+    "state": {
+      "unsupported": "Nicht verfügbar",
+      "not_connected": "Nicht verbunden",
+      "connecting": "Wird verbunden",
+      "connected": "Verbunden",
+      "revoked": "Getrennt",
+      "failed": "Nicht verbunden"
+    },
+    "detail": {
+      "connected": "Verbunden.",
+      "connectedAs": "Verbunden als {{account}}.",
+      "connecting": "Melde dich im geöffneten Tab bei deiner Cloud an und erlaube SRW den Zugriff. Diese Seite aktualisiert sich von selbst.",
+      "notConnected": "Einmal verbinden, um deine eigenen Dateien in den Sessions deines persönlichen Projekts einzubinden."
+    },
+    "failure": {
+      "wrong_account": "Die E-Mail dieses Cloud-Kontos ist nicht deine. Melde dich mit deinem eigenen Konto an und verbinde erneut.",
+      "admin_account": "Cloud-Administratorkonten können nicht verbunden werden. Melde dich mit deinem eigenen Konto an.",
+      "account_disabled": "Dieses Cloud-Konto ist deaktiviert.",
+      "verify_failed": "Die Verbindung konnte deine Dateien nicht lesen. Verbinde erneut.",
+      "expired": "Die Anmeldung wurde nicht rechtzeitig abgeschlossen. Verbinde erneut.",
+      "provider_error": "Die Cloud war nicht erreichbar. Versuche es später erneut.",
+      "account_missing": "Dein Cloud-Konto hat noch keine Dateien: öffne einmal Files in der Cloud und verbinde dann erneut.",
+      "error": "Etwas ist schiefgegangen. Verbinde erneut."
+    },
+    "revoked": {
+      "user": "Du hast sie getrennt. Sessions binden sie erst wieder ein, wenn du sie neu verbindest.",
+      "rejected_by_cloud": "Die Cloud akzeptiert diese Verbindung nicht mehr (sie wurde aus deinen Geräten entfernt oder das Konto deaktiviert). Verbinde sie neu."
+    },
+    "unsupported": {
+      "provider_unsupported": "Die Cloud dieser Installation bietet keine persönlichen Cloud-Roots an.",
+      "grant_mode_off": "Persönliche Cloud-Roots sind auf dieser Installation ausgeschaltet.",
+      "no_personal_project": "Du hast noch kein persönliches Projekt, also würde keine Session sie einbinden."
+    },
+    "actions": {
+      "connect": "Verbinden",
+      "reconnect": "Neu verbinden",
+      "cancel": "Abbrechen",
+      "disconnect": "Trennen"
+    },
+    "openLogin": "Anmeldeseite der Cloud öffnen",
+    "disconnectConfirm": "Meine Cloud trennen? Die Cloud wird gebeten, den Zugriff von SRW zu widerrufen, und Sessions binden sie ab ihrem nächsten Start nicht mehr ein.",
+    "revokeIncomplete": "SRW hat die Verbindung vergessen, aber die Cloud konnte nicht gebeten werden, sie zu widerrufen: entferne „{{client}}“ aus den Geräten und Sitzungen deiner Cloud.",
+    "connectLink": "Cloud verbinden",
+    "reconnectLink": "Cloud neu verbinden",
+    "errors": {
+      "unsupported": "Auf dieser Installation gibt es keinen Cloud-Root zum Verbinden.",
+      "startFailed": "Die Cloud konnte die Verbindung nicht starten. Versuche es später erneut.",
+      "cancelFailed": "Die Verbindung konnte nicht abgebrochen werden.",
+      "disconnectFailed": "Meine Cloud konnte nicht getrennt werden. Versuche es erneut."
+    }
+  },
   "datasources": {
     "driversLink": "Treiber-Fähigkeiten",
     "driversLinkHint": "Was jeder Konnektortreiber anbietet und was es durchsetzt",

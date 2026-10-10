@@ -2075,6 +2075,66 @@ export interface ThreadMount {
   backend_id: string | null;
 }
 
+/** What `GET /api/me/cloud-root` says of the caller's own cloud root
+ *  ("My cloud", main cloud slice 4): whether their main cloud has one, and
+ *  where its connection stands. Never a credential. */
+export type CloudRootState =
+  | 'unsupported'
+  | 'not_connected'
+  | 'connecting'
+  | 'connected'
+  | 'revoked'
+  | 'failed';
+
+/** Why there is no root to connect. */
+export type CloudRootUnsupportedReason =
+  | 'no_main_cloud'
+  | 'provider_unsupported'
+  | 'grant_mode_off'
+  | 'no_personal_project';
+
+/** Why a connect attempt stored nothing. */
+export type CloudRootFailureReason =
+  | 'wrong_account'
+  | 'admin_account'
+  | 'account_disabled'
+  | 'verify_failed'
+  | 'expired'
+  | 'provider_error'
+  | 'account_missing'
+  | 'error';
+
+export interface CloudRootStatus {
+  supported: boolean;
+  reason: CloudRootUnsupportedReason | string | null;
+  state: CloudRootState;
+  connector_id: string | null;
+  name: string;
+  /** The cloud account it is connected as (connected only). */
+  account_id: string | null;
+  granted_at: string | null;
+  /** The name the credential carries in the cloud's device list. */
+  client_name: string | null;
+  revoked_at: string | null;
+  /** `user`: its user disconnected it; `rejected_by_cloud`: the cloud
+   *  refused it (revoked in its device list, the account disabled). */
+  revoked_reason: 'user' | 'rejected_by_cloud' | string | null;
+  failure: {reason: CloudRootFailureReason | string; at: string | null} | null;
+  /** The running "Connect your cloud" flow, when there is one. */
+  connecting: {login_url: string; expires_at: string} | null;
+  /** A disconnect's answer only: whether the cloud revoked the credential
+   *  (false: it could not be asked; null: there was none). */
+  provider_revoked?: boolean | null;
+}
+
+/** `POST /api/me/cloud-root/connect`. */
+export interface CloudRootConnectStart {
+  state: 'connecting';
+  connector_id: string;
+  login_url: string;
+  expires_at: string;
+}
+
 /** `Thread.protected_source`. */
 export interface ThreadProtectedSource {
   datasource_id: string | null;
