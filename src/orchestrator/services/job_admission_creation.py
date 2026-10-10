@@ -70,6 +70,18 @@ class ProvisionJobRepo(Protocol):
     async def __call__(self, *, job_row: dict[str, Any]) -> dict[str, Any]: ...
 
 
+class StampCloudConnectors(Protocol):
+    async def __call__(
+        self,
+        *,
+        datasource_ids: list[str],
+        project_id: str | None,
+        user_id: str | None,
+        workspace_backend: str | None,
+        outbox_allowed: bool,
+    ) -> dict[str, Any]: ...
+
+
 class ResolveJobOrigin(Protocol):
     def __call__(
         self,
@@ -93,6 +105,9 @@ class JobAdmissionCreationDependencies:
     ]
     resolve_origin: ResolveJobOrigin
     trigger_dispatch: Callable[[], None]
+    # The main cloud's checkout and outbox for a root job, decided before the
+    # row exists (services.job_cloud_checkout.admission_stamp). None: none.
+    stamp_cloud_connectors: StampCloudConnectors | None = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +148,25 @@ async def create_admitted_job(
         str(command.thread_id) if (command.thread_id and inputs.root_creation) else None
     )
 
+    # A root job's project-folder copy and outbox are on the row from its
+    # first instant: the copy's ``cloud_baseline: seeding`` holds dispatch
+    # until provisioning's seed lands. An officer's ticket is unattended work
+    # and gets no outbox; a subjob gets neither (its branch holds its
+    # parent's copy).
+    context = inputs.context
+    if dependencies.stamp_cloud_connectors is not None and not command.parent_job_id:
+        stamp = await dependencies.stamp_cloud_connectors(
+            datasource_ids=list(inputs.datasource_ids),
+            project_id=str(inputs.project_id) if inputs.project_id else None,
+            user_id=(
+                str(inputs.effective_user_id) if inputs.effective_user_id else None
+            ),
+            workspace_backend=inputs.requested_workspace_backend,
+            outbox_allowed=inputs.officer_preparation is None,
+        )
+        if stamp:
+            context = {**(context or {}), **stamp}
+
     create_kwargs = {
         "description": command.description,
         "document_path": command.document_path,
@@ -140,7 +174,7 @@ async def create_admitted_job(
         "config_name": inputs.config_name,
         "expert_id": inputs.expert_id,
         "config_override": inputs.config_override,
-        "context": inputs.context if inputs.context else None,
+        "context": context if context else None,
         "user_id": inputs.effective_user_id,
         "project_id": inputs.project_id,
         "parent_job_id": command.parent_job_id,

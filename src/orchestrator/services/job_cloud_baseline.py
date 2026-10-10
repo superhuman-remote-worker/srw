@@ -99,6 +99,12 @@ _BASELINE_COMMIT_MESSAGE = (
 )
 
 
+#: What a finished seed walk records in ``context.cloud_baseline``: files
+#: copied into the job's repository, binary files left out (a text-only
+#: legacy copy), and files that could not be read or written.
+SEED_COUNT_KEYS: tuple[str, ...] = ("seeded", "skipped_binary", "failed")
+
+
 async def seed_project_folder_baseline(
     *,
     job_id: str,
@@ -109,6 +115,7 @@ async def seed_project_folder_baseline(
     gitea_client: Any,
     main_cloud_router: MainCloudRouter,
     require_complete: bool = False,
+    include_binary: bool = False,
     authority_check: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Walk the project's cloud folder, push files into Gitea, stamp baseline.
@@ -116,7 +123,15 @@ async def seed_project_folder_baseline(
     Sets ``jobs.cloud_diff_baseline_commit`` on success.
     Updates ``jobs.context.cloud_baseline.state`` to ``'seeding'`` while
     running, then ``'ready'`` or ``'failed'`` at termination. The
-    dispatcher gate watches that field.
+    dispatcher gate watches that field. A finished walk also records what it
+    did (``seeded``, ``skipped_binary``, ``failed``), which the agent's task
+    brief shows: a copy that silently lacks files is a copy the agent cannot
+    be held to.
+
+    ``include_binary`` seeds binary files byte for byte, as a loop does
+    (``require_complete``), without failing the seed on a file it cannot
+    copy: the project-folder checkout connector's copy. Without either, a
+    human-reviewed legacy job keeps its text-only copy.
 
     Idempotency: if ``cloud_diff_baseline_commit`` is already set, this
     is a no-op (already seeded). Safe to invoke twice (e.g. on a retry).
@@ -132,10 +147,12 @@ async def seed_project_folder_baseline(
         error: str | None = None,
         entries: dict[str, str] | None = None,
         project_slug: str | None = None,
+        counts: dict[str, int] | None = None,
     ) -> None:
         """Merge ``cloud_baseline`` state at the top level. The merge is
         a JSONB ``||`` so we replace the whole ``cloud_baseline`` object
-        each call; pass ``entries`` to persist the path→etag map.
+        each call; pass ``entries`` to persist the path→etag map and
+        ``counts`` (:data:`SEED_COUNT_KEYS`) for what a walk did.
         """
         payload: dict[str, Any] = {
             "state": state,
@@ -145,6 +162,8 @@ async def seed_project_folder_baseline(
             payload["error"] = error
         if entries is not None:
             payload["entries"] = entries
+        if counts is not None:
+            payload.update({key: int(counts.get(key) or 0) for key in SEED_COUNT_KEYS})
         await _permit(authority_check)
         try:
             await postgres_db.merge_job_context(job_id, {"cloud_baseline": payload})
@@ -163,10 +182,16 @@ async def seed_project_folder_baseline(
             existing_baseline = _job_context(existing).get("cloud_baseline") or {}
             if not isinstance(existing_baseline, dict):
                 existing_baseline = {}
+            recorded = {
+                key: existing_baseline[key]
+                for key in SEED_COUNT_KEYS
+                if isinstance(existing_baseline.get(key), int)
+            }
             await _set_state(
                 "ready",
                 entries=existing_baseline.get("entries") or {},
                 project_slug=existing_baseline.get("project_slug") or slug,
+                counts=recorded or None,
             )
             return
 
@@ -247,7 +272,7 @@ async def seed_project_folder_baseline(
                 await _set_state("failed", error="could not read empty baseline HEAD")
                 return
             await postgres_db.update_job_cloud_diff(job_id, baseline_commit=head_sha)
-            await _set_state("ready", entries=entries_map)
+            await _set_state("ready", entries=entries_map, counts={})
             return
 
         seeded = 0
@@ -277,7 +302,7 @@ async def seed_project_folder_baseline(
             try:
                 content_text = blob.decode("utf-8")
             except UnicodeDecodeError:
-                if require_complete:
+                if require_complete or include_binary:
                     await _permit(authority_check)
                     ok = await gitea_client.change_files(
                         repo_name,
@@ -333,6 +358,11 @@ async def seed_project_folder_baseline(
                 )
                 failed_files += 1
 
+        counts = {
+            "seeded": seeded,
+            "skipped_binary": skipped_binary,
+            "failed": failed_files,
+        }
         if require_complete and failed_files:
             await _set_state(
                 "failed",
@@ -341,6 +371,7 @@ async def seed_project_folder_baseline(
                     f"{failed_files} file read/write failure(s)"
                 ),
                 entries=entries_map,
+                counts=counts,
             )
             return
 
@@ -354,20 +385,24 @@ async def seed_project_folder_baseline(
                 "baseline commit hash not recorded",
                 job_short,
             )
-            await _set_state("failed", error="could not read HEAD after seed")
+            await _set_state(
+                "failed", error="could not read HEAD after seed", counts=counts
+            )
             return
 
         await _permit(authority_check)
         await postgres_db.update_job_cloud_diff(job_id, baseline_commit=baseline_sha)
         await _permit(authority_check)
         logger.info(
-            "Mode A: job %s — seeded %d file(s), skipped %d binary, baseline=%s",
+            "Mode A: job %s — seeded %d file(s), skipped %d binary, "
+            "failed %d, baseline=%s",
             job_short,
             seeded,
             skipped_binary,
+            failed_files,
             baseline_sha[:8],
         )
-        await _set_state("ready", entries=entries_map)
+        await _set_state("ready", entries=entries_map, counts=counts)
     except Exception as e:
         if authority_check is not None:
             # Durable project-loop handoff authority failures are fail-closed:
@@ -408,6 +443,7 @@ def fire_baseline_seed(
     gitea_client: Any,
     main_cloud_router: MainCloudRouter,
     require_complete: bool = False,
+    include_binary: bool = False,
 ) -> asyncio.Task:
     """Fire-and-forget wrapper around :func:`seed_project_folder_baseline`.
 
@@ -425,6 +461,7 @@ def fire_baseline_seed(
             gitea_client=gitea_client,
             main_cloud_router=main_cloud_router,
             require_complete=require_complete,
+            include_binary=include_binary,
         )
     )
 
@@ -481,69 +518,110 @@ async def _diff_files_by_tree(
     return files
 
 
-async def capture_diff_for_mode_a_job(
+#: What a completion-time capture found, recorded in
+#: ``context.cloud_checkout.capture.state``: a diff under the copy is waiting
+#: for review (``captured``), the copy is unchanged (``no_changes``), the job
+#: has no baseline to compare with (``no_baseline``: its seed failed or never
+#: ran), or Gitea could not be read (``head_unreadable``).
+CAPTURE_STATES: tuple[str, ...] = (
+    "captured",
+    "no_changes",
+    "no_baseline",
+    "head_unreadable",
+)
+
+
+async def capture_checkout_diff(
     *,
     job: dict[str, Any],
     postgres_db: Any,
     gitea_client: Any,
-) -> bool:
-    """At job completion, compute the Mode A diff.
+) -> dict[str, Any]:
+    """At job completion, compute the project-folder copy's diff.
 
-    Reads the job's ``cloud_diff_baseline_commit`` and the current HEAD
-    of its branch, asks Gitea for tree listings at both ends, and
-    decides whether the job should land in ``pending_review`` (any
-    file under ``projects/`` changed) or proceed to ``completed``
-    (empty diff or not a Mode A job).
+    Reads the job's ``cloud_diff_baseline_commit`` and the current HEAD of
+    its branch, asks Gitea for tree listings at both ends, and sets
+    ``jobs.diff_status = 'pending'`` when any file under the copy changed.
+    The copy is ``projects/<seed-time slug>/`` when the baseline recorded
+    its slug (every baseline since the slug was stamped), else any path
+    under ``projects/`` (an older baseline): only paths an accept can write
+    back count as a change.
 
-    Returns ``True`` if a non-empty diff was captured and
-    ``jobs.diff_status`` was set to ``'pending'``; ``False`` otherwise.
-    The caller is responsible for the status transition itself — this
-    helper only flips the ``diff_status`` flag, which the caller uses
-    to override the new_status returned by ``determine_job_status``.
+    Returns ``{"state": <one of CAPTURE_STATES>, "files": <count>}``. The
+    caller is responsible for the status transition itself — this helper
+    only flips the ``diff_status`` flag.
     """
     job_id = str(job["id"])
     baseline = job.get("cloud_diff_baseline_commit")
-    if not baseline:
-        return False
     repo_name = job.get("repo_name")
     branch = job.get("branch_name")
-    if not repo_name:
+    if not baseline or not repo_name:
         logger.debug(
-            "Mode A: job %s has baseline but no repo_name; skipping diff capture",
+            "Mode A: job %s has no baseline or no repo_name; skipping diff capture",
             job_id,
         )
-        return False
+        return {"state": "no_baseline", "files": 0}
     head = await _read_head_commit(gitea_client, repo_name, branch)
     if not head:
         logger.warning("Mode A: job %s — couldn't read HEAD for diff capture", job_id)
-        return False
+        return {"state": "head_unreadable", "files": 0}
     if head == baseline:
-        return False
+        return {"state": "no_changes", "files": 0}
     files = await _diff_files_by_tree(
         gitea_client=gitea_client,
         repo_name=repo_name,
         baseline=baseline,
         head=head,
     )
+    if files is None:
+        logger.warning(
+            "Mode A: job %s — couldn't compare baseline=%s with head=%s",
+            job_id,
+            str(baseline)[:8],
+            head[:8],
+        )
+        return {"state": "head_unreadable", "files": 0}
+    recorded = _job_context(job).get("cloud_baseline") or {}
+    slug = recorded.get("project_slug") if isinstance(recorded, dict) else None
+    if slug:
+        files = [
+            entry
+            for entry in files
+            if _strip_project_prefix(entry["path"], str(slug)) is not None
+        ]
     if not files:
         logger.info(
             "Mode A: job %s — no project-folder changes between baseline=%s "
             "and head=%s; skipping diff capture",
             job_id,
-            baseline[:8],
+            str(baseline)[:8],
             head[:8],
         )
-        return False
+        return {"state": "no_changes", "files": 0}
     await postgres_db.update_job_cloud_diff(job_id, diff_status="pending")
     logger.info(
         "Mode A: job %s — captured %d-file diff baseline=%s head=%s; "
         "status -> pending_review",
         job_id,
         len(files),
-        baseline[:8],
+        str(baseline)[:8],
         head[:8],
     )
-    return True
+    return {"state": "captured", "files": len(files)}
+
+
+async def capture_diff_for_mode_a_job(
+    *,
+    job: dict[str, Any],
+    postgres_db: Any,
+    gitea_client: Any,
+) -> bool:
+    """:func:`capture_checkout_diff`, as whether a non-empty diff was
+    captured (``jobs.diff_status`` set to ``'pending'``)."""
+    captured = await capture_checkout_diff(
+        job=job, postgres_db=postgres_db, gitea_client=gitea_client
+    )
+    return captured["state"] == "captured"
 
 
 async def get_diff_summary(

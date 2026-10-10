@@ -49,6 +49,16 @@ def _string_or_none(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _checkout_capture_applies(job: dict[str, Any]) -> bool:
+    """Whether completion captures the project folder copy's diff: a
+    checkout at reviewed write-back, or an older job's implicit copy
+    (``job_cloud_checkout.capture_applies``). A read-only copy's changes are
+    never captured."""
+    from orchestrator.services.job_cloud_checkout import capture_applies
+
+    return capture_applies(job)
+
+
 @dataclass(frozen=True, slots=True)
 class LegacyPersistenceDependencies:
     store: Any
@@ -1760,18 +1770,27 @@ async def complete_job_legacy(
             actions.append(str(loop_delivery_result["action"]))
         elif (
             job.get("cloud_diff_baseline_commit")
-            and new_status in ("completed", "pending_review")
+            # ``reviewing``: a job whose critic runs first is captured now; the
+            # critic's approval then lands on pending_review while the diff
+            # waits (verification_workflow.critic_verdict_transition).
+            and new_status in ("completed", "pending_review", "reviewing")
             and gitea_client.is_initialized
             and not _completion_loop_id
+            and _checkout_capture_applies(job)
         ):
 
             async def _capture_mode_a_diff() -> dict[str, Any]:
+                from orchestrator.services.job_cloud_checkout import (
+                    CHECKOUT_CONTEXT_KEY,
+                    checkout_context,
+                )
+
                 try:
                     from orchestrator.services.job_cloud_baseline import (
-                        capture_diff_for_mode_a_job,
+                        capture_checkout_diff,
                     )
 
-                    captured = await capture_diff_for_mode_a_job(
+                    capture = await capture_checkout_diff(
                         job=job,
                         postgres_db=postgres_db,
                         gitea_client=gitea_client,
@@ -1784,7 +1803,30 @@ async def complete_job_legacy(
                         exc,
                     )
                     return {"captured": False, "error": str(exc)}
-                return {"captured": bool(captured)}
+                # What the capture found, beside the checkout it belongs to.
+                # An older job's implicit copy was reviewed write-back.
+                checkout = checkout_context(job) or {
+                    "access": "reviewed_write_back",
+                    "origin": "legacy",
+                }
+                checkout["capture"] = {
+                    "state": capture["state"],
+                    "files": capture["files"],
+                }
+                try:
+                    await postgres_db.merge_job_context(
+                        job_id, {CHECKOUT_CONTEXT_KEY: checkout}
+                    )
+                except Exception:
+                    logger.warning(
+                        "Mode A: could not record job %s's capture state",
+                        job_id,
+                        exc_info=True,
+                    )
+                return {
+                    "captured": capture["state"] == "captured",
+                    "state": capture["state"],
+                }
 
             mode_a_capture = await _run_completion_effect(
                 _effect_runner,

@@ -524,7 +524,13 @@ async def test_internal_brief_retains_jsonb_and_missing_defaults(
     assert response.status_code == 200
     payload = response.json()
     assert payload["description"] == ""
-    assert set(payload) == {"description", "required_deliverables", "kickoff_message"}
+    assert set(payload) == {
+        "description",
+        "required_deliverables",
+        "kickoff_message",
+        "cloud_connectors",
+        "cloud_baseline",
+    }
     assert inspection_wire.events == ["internal"]
 
 

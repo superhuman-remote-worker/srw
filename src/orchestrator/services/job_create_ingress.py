@@ -77,6 +77,12 @@ _SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS = (
         # it; a seeded one would park a job (or an agent's child) forever.
         OPERATOR_PAUSE_HOLD_CONTEXT_KEY,
         LAST_OPERATOR_PAUSE_HOLD_CONTEXT_KEY,
+        # The main cloud's checkout and outbox are decided by admission from
+        # the attached connectors (services.job_cloud_checkout); a seeded
+        # checkout would copy and capture a folder no connector granted.
+        "cloud_checkout",
+        "cloud_connectors",
+        "job_outbox",
     }
 )
 
@@ -100,6 +106,11 @@ PUBLIC_JOB_CONTEXT_RESERVED_KEYS = {
     "automation_name",
     "automation_trigger",
     "cloud_baseline",
+    # Admission's main-cloud decision and the completion copy's record
+    # (services.job_cloud_checkout).
+    "cloud_checkout",
+    "cloud_connectors",
+    "job_outbox",
     "delegation_results",
     "datasource_selection",
     "delegation_timed_out",

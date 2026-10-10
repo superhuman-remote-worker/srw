@@ -975,6 +975,50 @@ class TestTaskBriefHydration:
         assert "output/a.md" in brief
 
     @pytest.mark.asyncio
+    async def test_hydration_backfills_the_cloud_connectors_block(self, tmp_path):
+        # A resumed job is told about its project folder's copy as a fresh
+        # dispatch is: the orchestrator's /brief carries both keys.
+        ws = WorkspaceManager(job_id="t", backend=RemoteLikeBackend(tmp_path))
+        agent = _bare_agent(ws)
+        agent._job_metadata = {}
+        agent._orchestrator_client = SimpleNamespace(
+            get_job_brief=AsyncMock(
+                return_value={
+                    "description": "Edit the handbook",
+                    "cloud_connectors": [
+                        {
+                            "kind": "cloud_folder_checkout",
+                            "path": "projects/hand_book/",
+                            "folder": "Hand Book",
+                            "edits": "reviewed",
+                            "access": "reviewed_write_back",
+                        }
+                    ],
+                    "cloud_baseline": {
+                        "state": "ready",
+                        "project_slug": "hand_book",
+                        "seeded": 2,
+                        "skipped_binary": 0,
+                        "failed": 0,
+                    },
+                }
+            )
+        )
+        agent.postgres_conn = None
+
+        await agent._hydrate_job_brief("job-1")
+        agent._deploy_instruction_files([])
+
+        brief = ws.read_file("task_brief.md")
+        assert "## Project Cloud Folder" in brief
+        assert (
+            '`projects/hand_book/` in this workspace is a copy of the cloud folder "Hand Book"'
+            in brief
+        )
+        assert "2 file(s) were copied." in brief
+        assert "Only a diff the owner accepts is written back" in brief
+
+    @pytest.mark.asyncio
     async def test_hydration_never_overwrites_present_fields(self):
         agent = _bare_agent(MagicMock())
         agent._job_metadata = {"description": "fresh dispatch text"}

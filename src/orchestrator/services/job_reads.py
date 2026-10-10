@@ -85,10 +85,16 @@ async def read_project_jobs(
         )
     try:
         async with dependencies.store.acquire() as conn:
+            # The review mode reads the diff, the baseline and the checkout's
+            # level (job_projection.cloud_review_mode); the summary view has
+            # none of them.
             query = (
                 "SELECT js.*, jcr.delivery_status, jcr.delivery_ref, "
-                "jcr.delivery_sha, jcr.record_type AS change_record_type "
+                "jcr.delivery_sha, jcr.record_type AS change_record_type, "
+                "j.diff_status, j.cloud_diff_baseline_commit, "
+                "j.context->'cloud_checkout' AS cloud_checkout "
                 "FROM job_summary js "
+                "JOIN jobs j ON j.id = js.id "
                 "LEFT JOIN job_change_records jcr ON jcr.job_id = js.id "
                 "WHERE js.project_id = $1"
             )

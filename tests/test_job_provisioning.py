@@ -431,13 +431,19 @@ class TestProvisionJobRepo:
         assert isinstance(db.get_job.await_args.args[0], str)
 
     @pytest.mark.asyncio
-    async def test_cloud_seed_fires_when_project_has_folder(self, patched_seed) -> None:
+    async def test_cloud_seed_fires_when_the_job_carries_the_checkout(
+        self, patched_seed
+    ) -> None:
         g = _make_gitea()
         mcr = MagicMock()
         db = _make_db(
             user=_creator(),
             project_repos=[{"name": "p-jobs", "repo_url": "http://x/y.git"}],
-            project={"main_cloud_folder_handle": "personal/Projects/X"},
+            project={
+                "name": "X",
+                "main_cloud_folder_handle": "personal/Projects/X",
+                "main_cloud_backend": "nextcloud",
+            },
         )
         row = {
             "id": uuid.uuid4(),
@@ -445,6 +451,15 @@ class TestProvisionJobRepo:
             "project_id": uuid.uuid4(),
             "user_id": uuid.uuid4(),
             "config_name": "default",
+        }
+        # Admission stamped the checkout and its seeding state; create_job's
+        # RETURNING row carries no context, so provisioning reads it back.
+        db.get_job.return_value = {
+            "context": {
+                "cloud_checkout": {"datasource_id": "d", "access": "read_only"},
+                "cloud_baseline": {"state": "seeding"},
+                "cloud_connectors": [{"kind": "cloud_folder_checkout"}],
+            }
         }
 
         await provision_job_repo(
@@ -458,6 +473,164 @@ class TestProvisionJobRepo:
         kwargs = patched_seed.call_args.kwargs
         assert kwargs["repo_name"].startswith("job-")
         assert kwargs["main_cloud_router"] is mcr
+        # A checkout's copy is complete: binary files too.
+        assert kwargs["include_binary"] is True
+        db.merge_job_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_checkout_no_copy_even_with_a_folder(self, patched_seed) -> None:
+        g = _make_gitea()
+        db = _make_db(
+            user=_creator(),
+            project_repos=[{"name": "p-jobs", "repo_url": "http://x/y.git"}],
+            project={
+                "main_cloud_folder_handle": "personal/Projects/X",
+                "main_cloud_backend": "nextcloud",
+            },
+        )
+        conn = db.acquire.return_value._value
+        conn.fetch = AsyncMock(return_value=[])
+        row = {
+            "id": uuid.uuid4(),
+            "parent_job_id": None,
+            "project_id": uuid.uuid4(),
+            "user_id": uuid.uuid4(),
+            "config_name": "default",
+            "context": {},
+        }
+
+        await provision_job_repo(
+            job_row=row, gitea_client=g, postgres_db=db, main_cloud_router=MagicMock()
+        )
+
+        patched_seed.assert_not_called()
+        db.merge_job_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_work_admitted_elsewhere_gets_its_attached_checkout(
+        self, patched_seed
+    ) -> None:
+        project_id = uuid.uuid4()
+        g = _make_gitea()
+        db = _make_db(
+            user=_creator(),
+            project_repos=[{"name": "p-jobs", "repo_url": "http://x/y.git"}],
+            project={
+                "name": "My Proj",
+                "main_cloud_folder_handle": "7",
+                "main_cloud_backend": "nextcloud",
+            },
+        )
+        conn = db.acquire.return_value._value
+        checkout_id = str(uuid.uuid4())
+        conn.fetch = AsyncMock(
+            return_value=[
+                {
+                    "id": checkout_id,
+                    "name": "Project folder copy",
+                    "type": "cloud_folder_checkout",
+                    "config": {"project_id": str(project_id)},
+                    "managed_key": f"project-cloud-checkout:{project_id}",
+                    "read_only": None,
+                    "is_global": False,
+                    "created_by": None,
+                    "project_read_only": None,
+                }
+            ]
+        )
+        row = {
+            "id": uuid.uuid4(),
+            "parent_job_id": None,
+            "project_id": project_id,
+            "user_id": uuid.uuid4(),
+            "config_name": "default",
+            "context": {"automation_id": "a1"},
+        }
+
+        await provision_job_repo(
+            job_row=row, gitea_client=g, postgres_db=db, main_cloud_router=MagicMock()
+        )
+
+        stamp = db.merge_job_context.await_args.args[1]
+        assert stamp["cloud_checkout"] == {
+            "datasource_id": checkout_id,
+            "access": "read_only",
+        }
+        assert stamp["cloud_baseline"] == {"state": "seeding"}
+        assert stamp["cloud_connectors"] == [
+            {
+                "kind": "cloud_folder_checkout",
+                "path": "projects/my_proj/",
+                "folder": "My Proj",
+                "edits": "discarded",
+                "access": "read_only",
+                "datasource_id": checkout_id,
+            }
+        ]
+        patched_seed.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_subjob_gets_no_copy_of_its_own(self, patched_seed) -> None:
+        g = _make_gitea()
+        parent_id = uuid.uuid4()
+        db = _make_db(
+            user=_creator(),
+            project={
+                "main_cloud_folder_handle": "7",
+                "main_cloud_backend": "nextcloud",
+            },
+            parent={
+                "id": parent_id,
+                "repo_name": "job-parent",
+                "branch_name": None,
+                "context": {"cloud_checkout": {"access": "read_only"}},
+            },
+        )
+        db.get_job_managed_repository_authority = AsyncMock(return_value=None)
+        row = {
+            "id": uuid.uuid4(),
+            "parent_job_id": parent_id,
+            "project_id": uuid.uuid4(),
+            "user_id": uuid.uuid4(),
+            "config_name": "critic",
+            "repo_name": "job-parent",
+            "context": {"cloud_checkout": {"access": "read_only"}},
+        }
+
+        await provision_job_repo(
+            job_row=row, gitea_client=g, postgres_db=db, main_cloud_router=MagicMock()
+        )
+
+        patched_seed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_admitted_copy_no_seed_makes_is_released(
+        self, patched_seed
+    ) -> None:
+        # Gitea is down: no repository, so no seed; the admitted ``seeding``
+        # must not hold the job back from dispatch forever.
+        g = _make_gitea(initialized=False)
+        db = _make_db(user=_creator())
+        row = {
+            "id": uuid.uuid4(),
+            "parent_job_id": None,
+            "project_id": uuid.uuid4(),
+            "user_id": uuid.uuid4(),
+            "config_name": "default",
+            "context": {
+                "cloud_checkout": {"access": "read_only"},
+                "cloud_baseline": {"state": "seeding"},
+            },
+        }
+
+        await provision_job_repo(
+            job_row=row, gitea_client=g, postgres_db=db, main_cloud_router=MagicMock()
+        )
+
+        patched_seed.assert_not_called()
+        released = db.merge_job_context.await_args.args[1]["cloud_baseline"]
+        assert released["state"] == "failed"
+        assert "Gitea" in released["error"]
 
     @pytest.mark.asyncio
     async def test_cloud_seed_skipped_without_folder(self, patched_seed) -> None:

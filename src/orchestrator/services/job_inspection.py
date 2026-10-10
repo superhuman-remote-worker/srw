@@ -191,6 +191,10 @@ async def get_job_brief(
         "description": job.get("description") or "",
         "required_deliverables": context.get("required_deliverables"),
         "kickoff_message": context.get("kickoff_message"),
+        # The task brief's cloud connectors block: what the job was told about
+        # the project folder's copy and its outbox, and the seed's record.
+        "cloud_connectors": context.get("cloud_connectors"),
+        "cloud_baseline": context.get("cloud_baseline"),
     }
 
 

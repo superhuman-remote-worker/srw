@@ -154,3 +154,126 @@ def format_deliverable_contract_block(deliverables: Any) -> str:
         "  forge-verifiable pull request for that exact attached repository.",
     ]
     return "\n".join(lines)
+
+
+def _seed_record(baseline: Any) -> dict:
+    if isinstance(baseline, str):
+        import json
+
+        try:
+            baseline = json.loads(baseline)
+        except (TypeError, ValueError):
+            return {}
+    return baseline if isinstance(baseline, dict) else {}
+
+
+def _count(record: dict, key: str) -> Optional[int]:
+    value = record.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _checkout_lines(entry: dict, baseline: Any) -> List[str]:
+    from shared.job_cloud_connectors import (
+        EDITS_APPLIED,
+        EDITS_DISCARDED,
+        checkout_path,
+    )
+
+    record = _seed_record(baseline)
+    # The seed's slug is the copy's truth: the path the files actually went to.
+    slug = record.get("project_slug")
+    path = checkout_path(str(slug)) if slug else str(entry["path"])
+    folder = str(entry.get("folder") or "the project's cloud folder")
+    lines = [
+        "\n\n## Project Cloud Folder",
+        "",
+        f'`{path}` in this workspace is a copy of the cloud folder "{folder}", '
+        "made when this job started.",
+    ]
+    state = record.get("state")
+    seeded = _count(record, "seeded")
+    if state == "failed":
+        error = str(record.get("error") or "unknown error")
+        lines.append(
+            f"The copy could not be completed ({error}): files may be missing "
+            "from it, or the directory may not exist."
+        )
+    elif seeded is not None:
+        copied = (
+            "It holds no files: the cloud folder was empty."
+            if seeded == 0
+            and not _count(record, "skipped_binary")
+            and not _count(record, "failed")
+            else f"{seeded} file(s) were copied."
+        )
+        lines.append(copied)
+        skipped = _count(record, "skipped_binary")
+        if skipped:
+            lines.append(
+                f"{skipped} binary file(s) of the cloud folder were not copied "
+                "and are not in it."
+            )
+        failed = _count(record, "failed")
+        if failed:
+            lines.append(f"{failed} file(s) could not be copied and are missing.")
+    edits = entry.get("edits")
+    lines.append("")
+    if edits == EDITS_DISCARDED:
+        lines += [
+            "What happens to your edits there: nothing. SRW never applies the "
+            "copy's changes to the cloud folder. Read it, and edit it as scratch "
+            "if that helps, but deliver your results as this job's deliverables.",
+        ]
+    elif edits == EDITS_APPLIED:
+        lines += [
+            f"What happens to your edits there: when this job completes, SRW "
+            f"applies the changes you commit under `{path}` to the cloud folder, "
+            "if none of the files they touch changed in the cloud since the copy "
+            "was made; otherwise the job waits for review instead of overwriting "
+            "the newer cloud state.",
+        ]
+    else:
+        lines += [
+            f"What happens to your edits there: when this job completes, the "
+            f"changes you commit under `{path}` are shown to the job's owner as "
+            "a diff. Only a diff the owner accepts is written back to the cloud "
+            "folder; nothing reaches it before that.",
+        ]
+    if edits != EDITS_DISCARDED:
+        lines.append(
+            "Only paths under that directory map to the cloud folder; job "
+            "scratch stays outside it."
+        )
+    return lines
+
+
+def format_cloud_connectors_block(cloud_connectors: Any, baseline: Any = None) -> str:
+    """Render the job's main-cloud connectors for the task brief.
+
+    ``cloud_connectors`` is the orchestrator's ``context.cloud_connectors``
+    (``shared.job_cloud_connectors``); ``baseline`` its
+    ``context.cloud_baseline``, the seed's record of what the copy holds.
+    Returns ``""`` when the job has none, so callers can append
+    unconditionally.
+    """
+    from shared.job_cloud_connectors import (
+        CHECKOUT_KIND,
+        OUTBOX_KIND,
+        parse_cloud_connectors,
+    )
+
+    entries = parse_cloud_connectors(cloud_connectors)
+    lines: List[str] = []
+    checkout = next((e for e in entries if e["kind"] == CHECKOUT_KIND), None)
+    if checkout is not None:
+        lines += _checkout_lines(checkout, baseline)
+    if any(e["kind"] == OUTBOX_KIND for e in entries):
+        lines += [
+            "\n\n## Cloud Outbox",
+            "",
+            "When this job completes, SRW copies its declared deliverables (or, "
+            "without a list, everything under `output/`) into a cloud folder "
+            "shared with the job's owner. Nothing else you write reaches that "
+            "folder.",
+        ]
+    return "\n".join(lines)

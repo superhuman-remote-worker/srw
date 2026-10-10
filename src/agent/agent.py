@@ -4927,7 +4927,9 @@ class UniversalAgent:
             logger.warning(f"Failed to initialize Neo4j Graph tier (non-fatal): {e}")
 
     async def _hydrate_job_brief(self, job_id: str) -> None:
-        """Backfill description/required_deliverables/kickoff_message.
+        """Backfill description/required_deliverables/kickoff_message and
+        the cloud connectors block's two keys (cloud_connectors,
+        cloud_baseline).
 
         ``JobResumeRequest`` carries none of them, so a resumed job would
         serve an empty virtual ``task_brief.md`` for the rest of its life.
@@ -4957,6 +4959,8 @@ class UniversalAgent:
                     "description": (job or {}).get("description"),
                     "required_deliverables": ctx.get("required_deliverables"),
                     "kickoff_message": ctx.get("kickoff_message"),
+                    "cloud_connectors": ctx.get("cloud_connectors"),
+                    "cloud_baseline": ctx.get("cloud_baseline"),
                 }
             except Exception as e:
                 logger.warning(f"[{job_id}] brief hydration via DB failed: {e}")
@@ -4969,7 +4973,7 @@ class UniversalAgent:
             return
         if self._job_metadata is None:
             self._job_metadata = {}
-        for key in keys:
+        for key in (*keys, "cloud_connectors", "cloud_baseline"):
             if row.get(key) and not self._job_metadata.get(key):
                 self._job_metadata[key] = row[key]
         logger.info(
@@ -5057,7 +5061,10 @@ class UniversalAgent:
         # the exists()-probe precedence dance and the "rewrite if it vanished"
         # repair path — a virtual file cannot go missing.
         from agent.core.virtual_dirs import build_instruction_providers
-        from agent.core.deliverables import format_deliverable_contract_block
+        from agent.core.deliverables import (
+            format_cloud_connectors_block,
+            format_deliverable_contract_block,
+        )
 
         # Providers read self._job_metadata LIVE (not a bound alias): resume
         # hydration may replace or backfill it after these closures are
@@ -5095,6 +5102,14 @@ class UniversalAgent:
             )
             if contract_block:
                 parts.append(contract_block)
+            # The job's main-cloud connectors: where the project folder's copy
+            # is and what happens to edits there, and whether the deliverables
+            # reach a shared folder. Empty string when the job has none.
+            cloud_block = format_cloud_connectors_block(
+                meta.get("cloud_connectors"), meta.get("cloud_baseline")
+            )
+            if cloud_block:
+                parts.append(cloud_block)
             return "".join(parts)
 
         instruction_providers = build_instruction_providers(

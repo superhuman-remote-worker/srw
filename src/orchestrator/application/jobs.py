@@ -519,6 +519,11 @@ def job_admission_datasources_dependencies(
         resolve_connector_refs=partial(
             resolve_execution_connectors, resources.postgres_db
         ),
+        filter_execution_kind_ids=bound(
+            job_datasource_selection.filter_execution_kind_datasource_ids,
+            preparation_composition.job_datasource_selection_dependencies,
+            resources,
+        ),
     )
 
 
@@ -571,6 +576,11 @@ def job_admission_creation_dependencies(
             main_cloud_router=cloud,
         )
 
+    async def stamp_cloud_connectors(**kwargs):
+        from orchestrator.services.job_cloud_checkout import admission_stamp
+
+        return await admission_stamp(db, **kwargs)
+
     return JobAdmissionCreationDependencies(
         store=db,
         admit_officer=admit_officer,
@@ -594,6 +604,7 @@ def job_admission_creation_dependencies(
         trigger_dispatch=bound(
             job_dispatcher.trigger_dispatch, job_dispatch_dependencies, resources
         ),
+        stamp_cloud_connectors=stamp_cloud_connectors,
     )
 
 

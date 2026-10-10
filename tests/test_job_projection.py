@@ -490,7 +490,9 @@ def test_browser_url_failure_degrades_to_no_url():
 
 @pytest.mark.parametrize(
     "project_folder, expected",
-    [(None, "open_folder"), (False, "open_folder"), (True, "diff")],
+    # A read without the context or the checkout column answers from
+    # diff_status alone: no diff, the folder affordance.
+    [(None, "open_folder"), (False, "open_folder"), (True, "open_folder")],
 )
 def test_cloud_projection_removes_join_field_and_keeps_extensions(
     project_folder, expected
@@ -513,3 +515,49 @@ def test_cloud_projection_removes_join_field_and_keeps_extensions(
         "exported_folder_url": "https://cloud.test/folder",
     }
     resolve.assert_called_once_with("opaque")
+
+
+_REVIEWED = {"datasource_id": "d", "access": "reviewed_write_back"}
+_READ_ONLY = {"datasource_id": "d", "access": "read_only"}
+
+
+@pytest.mark.parametrize(
+    "job, has_folder, expected",
+    [
+        # A captured diff is reviewed, whatever else the job says.
+        ({"diff_status": "pending"}, False, "diff"),
+        ({"diff_status": "accepted", "context": {}}, True, "diff"),
+        # A checkout at reviewed write-back may still bring one.
+        ({"context": {"cloud_checkout": _REVIEWED}}, True, "diff"),
+        ({"context": json.dumps({"cloud_checkout": _REVIEWED})}, True, "diff"),
+        ({"cloud_checkout": json.dumps(_REVIEWED)}, True, "diff"),
+        # A read-only copy never does: its outbox is the delivery.
+        (
+            {
+                "context": {"cloud_checkout": _READ_ONLY},
+                "cloud_diff_baseline_commit": "b",
+            },
+            True,
+            "open_folder",
+        ),
+        ({"cloud_checkout": _READ_ONLY}, True, "open_folder"),
+        # An older job: no checkout key, a baseline, a project with a folder.
+        ({"context": {}, "cloud_diff_baseline_commit": "b"}, True, "diff"),
+        ({"cloud_checkout": None, "cloud_diff_baseline_commit": "b"}, True, "diff"),
+        ({"context": {}, "cloud_diff_baseline_commit": "b"}, False, "open_folder"),
+        ({"context": {}}, True, "open_folder"),
+        # Without the context or the column, only diff_status speaks.
+        ({"cloud_diff_baseline_commit": "b"}, True, "open_folder"),
+    ],
+)
+def test_review_mode_follows_the_checkout(job, has_folder, expected):
+    assert projection.cloud_review_mode(job, has_cloud_folder=has_folder) == expected
+
+
+def test_the_checkout_column_never_leaves_over_rest():
+    result = projection.with_cloud_review_mode(
+        {"id": "job", "project_has_cloud_folder": True, "cloud_checkout": None},
+        resolve_folder_url=Mock(return_value=None),
+    )
+    assert "cloud_checkout" not in result
+    assert "project_has_cloud_folder" not in result

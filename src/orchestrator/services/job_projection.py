@@ -369,27 +369,79 @@ def resolve_exported_folder_url(
         return None
 
 
+def _review_context(job: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The job's context when the read carried it, else ``None``."""
+    context = job.get("context")
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return context if isinstance(context, dict) else None
+
+
+def cloud_review_mode(job: Mapping[str, Any], *, has_cloud_folder: bool) -> str:
+    """``diff`` when the job has a project-folder diff to review, or one may
+    still come; ``open_folder`` otherwise.
+
+    A diff to review: ``diff_status`` is set. One that may still come: the
+    job's checkout is at ``reviewed_write_back`` (``context.cloud_checkout``,
+    or a read's ``cloud_checkout`` column), or the job is an older one whose
+    copy was implicit (no checkout key, a baseline, a project with a
+    folder). A read-only copy, a job without one and a loose job get the
+    folder affordance: their deliverables are what the outbox delivers. A
+    read that carries neither the context nor the column (the global job
+    list) can only answer from ``diff_status``.
+    """
+    if job.get("diff_status"):
+        return "diff"
+    context = _review_context(job)
+    if context is not None:
+        known, checkout = True, context.get("cloud_checkout")
+    elif "cloud_checkout" in job:
+        known, checkout = True, job.get("cloud_checkout")
+        if isinstance(checkout, str):
+            try:
+                checkout = json.loads(checkout)
+            except (json.JSONDecodeError, TypeError):
+                checkout = None
+    else:
+        known, checkout = False, None
+    if isinstance(checkout, dict):
+        return (
+            "diff" if checkout.get("access") == "reviewed_write_back" else "open_folder"
+        )
+    if (
+        known
+        and checkout is None
+        and job.get("cloud_diff_baseline_commit")
+        and has_cloud_folder
+    ):
+        return "diff"
+    return "open_folder"
+
+
 def with_cloud_review_mode(
     job: dict[str, Any], *, resolve_folder_url: Callable[[str | None], str | None]
 ) -> dict[str, Any]:
     """Attach the computed ``cloud_review_mode`` and drop the raw join column.
 
-    Routing signal for the cockpit's job-review UI: a job whose project has a
-    main-cloud folder goes through the Mode A diff-review flow (``'diff'``);
-    everything else — loose jobs and projects without a cloud folder, including
-    the auto-assigned default project — gets the Mode B "Open cloud folder"
-    affordance (``'open_folder'``). Mirrors the seed-time gate in
-    ``services/job_cloud_baseline.py``. ``project_has_cloud_folder`` is computed
-    by the ``LEFT JOIN projects`` in the postgres read queries; we pop it so the
-    raw column never leaves over REST.
+    Routing signal for the cockpit's job-review UI (:func:`cloud_review_mode`):
+    a job with a project-folder diff to review, or one that may still come,
+    goes through the diff-review flow (``'diff'``); everything else gets the
+    "Open cloud folder" affordance (``'open_folder'``), whose export is the
+    job's outbox re-synced. ``project_has_cloud_folder`` is computed by the
+    ``LEFT JOIN projects`` in the postgres read queries, and a list read may
+    carry ``cloud_checkout`` as a column; both are popped so neither raw
+    column leaves over REST.
 
     Also resolves ``exported_folder_handle`` into a ready-to-open
     ``exported_folder_url`` for the same reason: handles are opaque to
     everything outside the owning backend, so the cockpit can't derive it.
     """
     job = dict(job)
-    job["cloud_review_mode"] = (
-        "diff" if job.pop("project_has_cloud_folder", False) else "open_folder"
-    )
+    has_folder = bool(job.pop("project_has_cloud_folder", False))
+    job["cloud_review_mode"] = cloud_review_mode(job, has_cloud_folder=has_folder)
+    job.pop("cloud_checkout", None)
     job["exported_folder_url"] = resolve_folder_url(job.get("exported_folder_handle"))
     return job

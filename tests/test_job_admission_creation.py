@@ -663,3 +663,50 @@ async def test_an_inline_expert_row_reaches_the_insert_on_both_funnels(
 
     await create(replace(officer, expert_id=None, expert_row=row), deps)
     assert deps.admit_officer.await_args.kwargs["job_kwargs"]["expert_row"] is row
+
+
+CLOUD_STAMP = {
+    "cloud_checkout": {"datasource_id": "copy", "access": "read_only"},
+    "cloud_baseline": {"state": "seeding"},
+    "cloud_connectors": [{"kind": "cloud_folder_checkout"}],
+}
+
+
+@pytest.mark.asyncio
+async def test_a_root_jobs_cloud_connectors_are_on_the_row_from_its_insert(
+    inputs, deps
+):
+    stamp = AsyncMock(return_value=CLOUD_STAMP)
+    deps = replace(deps, stamp_cloud_connectors=stamp)
+
+    await create(inputs, deps)
+
+    stamp.assert_awaited_once_with(
+        datasource_ids=["selected-connector"],
+        project_id=PROJECT,
+        user_id=USER,
+        workspace_backend="sandbox",
+        outbox_allowed=True,
+    )
+    created = deps.store.create_job.await_args.kwargs["context"]
+    assert created == {"instructions": "Prepared instructions", **CLOUD_STAMP}
+    # The prepared context itself is not changed: a scholar never inherits it.
+    assert inputs.context == {"instructions": "Prepared instructions"}
+
+
+@pytest.mark.asyncio
+async def test_an_officer_ticket_gets_no_outbox_and_a_subjob_nothing(
+    officer, inputs, deps
+):
+    stamp = AsyncMock(return_value={})
+    deps = replace(deps, stamp_cloud_connectors=stamp)
+    await create(officer, deps)
+    assert stamp.await_args.kwargs["outbox_allowed"] is False
+
+    stamp.reset_mock()
+    await create(
+        inputs,
+        deps,
+        command=JobCreate(description="child", parent_job_id=JOB),
+    )
+    stamp.assert_not_awaited()
