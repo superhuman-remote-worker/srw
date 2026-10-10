@@ -76,6 +76,7 @@ class PublicJobListItem(BaseModel):
     branch_name: str | None
     merge_status: str | None
     diff_status: str | None
+    cloud_diff_baseline_commit: str | None
     exported_at: datetime | None
     exported_folder_handle: str | None
     error_message: str | None

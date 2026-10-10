@@ -390,8 +390,8 @@ def cloud_review_mode(job: Mapping[str, Any], *, has_cloud_folder: bool) -> str:
     copy was implicit (no checkout key, a baseline, a project with a
     folder). A read-only copy, a job without one and a loose job get the
     folder affordance: their deliverables are what the outbox delivers. A
-    read that carries neither the context nor the column (the global job
-    list) can only answer from ``diff_status``.
+    read that carries neither the context nor the column can only answer
+    from ``diff_status``; both job lists carry the column.
     """
     if job.get("diff_status"):
         return "diff"

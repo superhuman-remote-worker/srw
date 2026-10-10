@@ -395,9 +395,11 @@ class TestListWirePagination:
         )
         # Real SQL must discard its private workspace join columns before the
         # public model sees them. Synthetic data only; no provider/workspace.
+        # The checkout's level decides the review mode, as on the project list.
         async with db.acquire() as conn:
             await conn.execute(
-                """UPDATE jobs SET context = '{"vm":{"ssh_host":"synthetic-private"}}',
+                """UPDATE jobs SET context = '{"vm":{"ssh_host":"synthetic-private"},
+                   "cloud_checkout":{"access":"reviewed_write_back"}}',
                    config_override = '{"llm":{"api_key":"synthetic-private"}}'
                    WHERE id = $1""",
                 uuid.UUID(first_root),
@@ -415,11 +417,13 @@ class TestListWirePagination:
         assert [j["id"] for j in page["jobs"]] == [first_root, child]
         assert page["limit"] == 1 and page["total"] == 2 and page["has_more"] is True
         assert page["jobs"][0]["config_name"] is None
+        assert [j["cloud_review_mode"] for j in page["jobs"]] == ["diff", "open_folder"]
         for private in (
             "synthetic-private",
             "_workspace_context",
             "_workspace_config_override",
             "project_has_cloud_folder",
+            "cloud_checkout",
         ):
             assert private not in first.text
 

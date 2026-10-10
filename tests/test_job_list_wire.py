@@ -56,11 +56,13 @@ def row(**fields):
         "branch_name": None,
         "merge_status": None,
         "diff_status": None,
+        "cloud_diff_baseline_commit": None,
         "exported_at": None,
         "exported_folder_handle": None,
         "error_message": None,
         "created_at": STAMP,
         "created_by_thread_id": None,
+        "cloud_checkout": None,
         "snapshot_status": None,
         "project_name": "Contract project",
         "project_has_cloud_folder": False,
@@ -362,6 +364,38 @@ async def test_redaction_preserves_jsonb_shape_and_unmodeled_public_extensions(
         "id": CHILD,
         "at": "2026-09-06T08:00:00Z",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        ({"cloud_checkout": {"access": "reviewed_write_back"}}, "diff"),
+        ({"cloud_checkout": json.dumps({"access": "reviewed_write_back"})}, "diff"),
+        (
+            {
+                "cloud_checkout": {"access": "read_only"},
+                "cloud_diff_baseline_commit": "b",
+            },
+            "open_folder",
+        ),
+        # An older job whose copy was implicit: a baseline, no checkout key.
+        ({"cloud_diff_baseline_commit": "b"}, "diff"),
+        (
+            {"cloud_diff_baseline_commit": "b", "project_has_cloud_folder": False},
+            "open_folder",
+        ),
+    ],
+)
+async def test_global_list_decides_review_mode_like_the_project_list(
+    wire, fields, expected
+):
+    wire.result.jobs[0].update({"project_has_cloud_folder": True, **fields})
+    response = await get(wire)
+    assert response.status_code == 200, response.text
+    item = response.json()["jobs"][0]
+    assert item["cloud_review_mode"] == expected
+    assert "cloud_checkout" not in item
 
 
 @pytest.mark.asyncio

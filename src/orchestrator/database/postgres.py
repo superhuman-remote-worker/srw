@@ -4232,6 +4232,11 @@ class PostgresDB:
                        j.diff_status, j.exported_at, j.exported_folder_handle,
                        j.error_message,
                        j.created_at, j.created_by_thread_id,
+                       -- The review mode reads the baseline and the
+                       -- checkout's level (job_projection.cloud_review_mode),
+                       -- as the project list does; the checkout is popped.
+                       j.cloud_diff_baseline_commit,
+                       j.context->'cloud_checkout' AS cloud_checkout,
                        j.config_override AS _workspace_config_override,
                        j.context AS _workspace_context,
                        j.context->'snapshot'->>'status' AS snapshot_status,
