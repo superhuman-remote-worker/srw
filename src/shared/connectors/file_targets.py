@@ -1,14 +1,16 @@
 """Where a credential file may land in the workspace home (an allowlist).
 
-A kubeconfig or generic-file connector writes files into the home of the
-workspace the agent's shell runs in, and a connector may be shared: its
-owner is not the person whose agent uses it. This module decides *where* a
-file may land: places tools read credentials from, never a place whose files
-the shell, git, Python, an editor or the session manager execute, source or
-import by path, and never SRW's own namespaces. Anything not listed here is
-refused; the orchestrator refuses it when the connector is saved (with this
-module's reason) and the agent skips it at delivery, for rows saved before
-the rule.
+A kubeconfig or generic-file connector, and a registered image driver's
+bind, write files into the home of the workspace the agent's shell runs in,
+and a connector may be shared: its owner is not the person whose agent uses
+it. This module decides *where* a file may land, for every connector alike
+(connector drivers decision 26; the variable a file sets follows
+:mod:`.env_names`): places tools read credentials from, never a place whose
+files the shell, git, Python, an editor or the session manager execute,
+source or import by path, and never SRW's own namespaces. Anything not
+listed here is refused; the orchestrator refuses it when the connector is
+saved or a driver's binding is checked (with this module's reason) and the
+agent skips it at delivery, for rows saved before the rule.
 
 It does not decide what a file *says*. Several allowed formats run a command
 by design when their CLI is used: a kubeconfig ``exec`` credential plugin, an
