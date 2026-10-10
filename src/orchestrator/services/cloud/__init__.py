@@ -17,9 +17,11 @@ from typing import Any
 
 from orchestrator.services.cloud.base import (
     CloudMountSubject,
+    FolderGrantKind,
     HealthStatus,
     MainCloudBackend,
     RcloneMountSpec,
+    SupportsFolderGrant,
     SupportsProtectedLower,
     SupportsRcloneMount,
     UserHome,
@@ -570,6 +572,7 @@ __all__ = [
     "CloudBackendErrorKind",
     "CloudMountSubject",
     "FeatureNotAvailable",
+    "FolderGrantKind",
     "GroupId",
     "HealthStatus",
     "LeakyBucket",
@@ -589,6 +592,7 @@ __all__ = [
     "RcloneMountSpec",
     "SessionFolderHandle",
     "ShareHandle",
+    "SupportsFolderGrant",
     "SupportsProtectedLower",
     "SupportsRcloneMount",
     "UserHome",

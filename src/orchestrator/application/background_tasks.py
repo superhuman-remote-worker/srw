@@ -74,7 +74,7 @@ from orchestrator.services import (
     workspace_suspension,
 )
 from orchestrator.services.application_tasks import ApplicationTaskSet
-from orchestrator.services.cloud import reload
+from orchestrator.services.cloud import folder_grants, reload
 from orchestrator.services.infrastructure_metering import bootstrap, ingestion
 from orchestrator.services.lifecycle import (
     AgentInstanceManager,
@@ -138,6 +138,7 @@ BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
     "infra_transient",
     "pool_reconciler",
     "ro_reader_reconciler",
+    "cloud_folder_grant_sweep",
     "lifecycle_reconciler",
     "main_cloud_listen",
     "automation_cron",
@@ -786,6 +787,17 @@ async def start_background_tasks(
             ro_reader_reconciler.ro_reader_reconciler_loop,
             store=resources.postgres_db,
             # Read per tick: the application's router can be rebound.
+            router=lambda: resources.main_cloud_router,
+        ),
+    )
+    # Per-folder grants of the main cloud: due revokes, lost mints, and grants
+    # whose connector, project, membership or installation went away. Like
+    # the reader reconciler, it runs whatever admits new grants.
+    tasks.start_leader_gated(
+        "cloud_folder_grant_sweep",
+        functools.partial(
+            folder_grants.folder_grant_sweep_loop,
+            store=resources.postgres_db,
             router=lambda: resources.main_cloud_router,
         ),
     )

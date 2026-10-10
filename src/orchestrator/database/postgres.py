@@ -1128,6 +1128,30 @@ def _thread_datasource_lock_key(thread_id: str) -> int:
     return int.from_bytes(digest, byteorder="big", signed=True)
 
 
+def _cloud_folder_grant_lock_key(datasource_id: str, user_id: str, kind: str) -> int:
+    """Advisory-lock key of one per-folder grant slot (connector, member,
+    kind): a mint runs once per slot across replicas."""
+    digest = hashlib.blake2b(
+        b"cloud_folder_grant:"
+        + _advisory_identity_bytes(datasource_id)
+        + _advisory_identity_bytes(user_id)
+        + str(kind).encode(),
+        digest_size=8,
+    ).digest()
+    return int.from_bytes(digest, byteorder="big", signed=True)
+
+
+#: Moves every live per-folder grant of one user to ``revoking`` (the user's
+#: retirement, inside its delete). Its password goes with it.
+_REQUEST_USER_FOLDER_GRANT_REVOKES_SQL = """
+    UPDATE cloud_folder_grants
+       SET status = 'revoking', credentials = NULL,
+           revoke_requested_at = now(), revoke_reason = 'user_retired',
+           revoke_next_at = now()
+     WHERE user_id = $1 AND status IN ('minting', 'active')
+"""
+
+
 def _stateless_cancel_cleanup_lock_key(job_id: UUID) -> int:
     """Domain-separated session advisory key for one cancel cleanup owner."""
     digest = hashlib.blake2b(
@@ -57044,6 +57068,10 @@ class PostgresDB:
 
                 if not await retire_user_manifests(conn, uuid_val):
                     return False
+                # The user's per-folder grants of the main cloud carry no
+                # foreign key (their revoke outlives the user): request it in
+                # the same transaction; the grant sweep removes them.
+                await conn.execute(_REQUEST_USER_FOLDER_GRANT_REVOKES_SQL, uuid_val)
                 # No FK cascade fires on capability_grants.scope_id (polymorphic);
                 # delete the user's grant rows in-band so removal stays atomic.
                 await self.delete_grants_for_scope(
@@ -63286,6 +63314,322 @@ class PostgresDB:
                     "activation_revision": int(active["activation_revision"]),
                     "activated_at": active["activated_at"],
                 }
+
+    # -- Per-folder grants of the main cloud (cloud_folder_grants, 0520) --
+
+    @staticmethod
+    def _cloud_folder_grant_row(row: Any) -> dict[str, Any]:
+        """A grant row with its ids as text and its password decrypted."""
+        out = dict(row)
+        for key in (
+            "id",
+            "datasource_id",
+            "project_id",
+            "user_id",
+            "backend_instance_id",
+        ):
+            if out.get(key) is not None:
+                out[key] = str(out[key])
+        if "credentials" in out:
+            out["credentials"] = _decrypt_stored(
+                out["credentials"], field="cloud_folder_grants.credentials"
+            )
+        return out
+
+    @asynccontextmanager
+    async def cloud_folder_grant_lock(
+        self,
+        datasource_id: str,
+        user_id: str,
+        kind: str,
+        *,
+        wait_timeout_s: float | None = 60.0,
+    ):
+        """Cross-replica mutex of one grant slot (connector, member, kind),
+        held for a whole mint on a dedicated session, never a pooled one."""
+        async with self._dedicated_session_advisory_lock(
+            _cloud_folder_grant_lock_key(datasource_id, user_id, kind),
+            domain="cloud_folder_grant",
+            wait=True,
+            wait_timeout_s=wait_timeout_s,
+        ) as acquired:
+            yield acquired
+
+    async def get_live_cloud_folder_grant(
+        self, datasource_id: str, user_id: str, kind: str
+    ) -> dict[str, Any] | None:
+        """The slot's minting or active grant, or ``None``."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM cloud_folder_grants
+                 WHERE datasource_id = $1::uuid AND user_id = $2::uuid
+                   AND kind = $3 AND status IN ('minting', 'active')
+                """,
+                str(datasource_id),
+                str(user_id),
+                kind,
+            )
+        return self._cloud_folder_grant_row(row) if row else None
+
+    async def insert_cloud_folder_grant(
+        self,
+        *,
+        grant_id: str,
+        kind: str,
+        datasource_id: str,
+        project_id: str,
+        user_id: str,
+        backend_id: str,
+        backend_instance_id: str,
+        folder_handle_sha256: str,
+        principal_id: str,
+        group_id: str,
+        credentials: str,
+        webdav_url: str,
+    ) -> dict[str, Any] | None:
+        """A new ``minting`` grant with its password stored encrypted, or
+        ``None`` when the slot already has a live one."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO cloud_folder_grants (
+                    id, kind, datasource_id, project_id, user_id, backend_id,
+                    backend_instance_id, folder_handle_sha256, principal_id,
+                    group_id, credentials, webdav_url
+                ) VALUES (
+                    $1::uuid, $2, $3::uuid, $4::uuid, $5::uuid, $6, $7::uuid,
+                    $8, $9, $10, $11, $12
+                )
+                ON CONFLICT DO NOTHING
+                RETURNING *
+                """,
+                str(grant_id),
+                kind,
+                str(datasource_id),
+                str(project_id),
+                str(user_id),
+                backend_id,
+                str(backend_instance_id),
+                folder_handle_sha256,
+                principal_id,
+                group_id,
+                _encrypt_optional(credentials),
+                webdav_url,
+            )
+        return self._cloud_folder_grant_row(row) if row else None
+
+    async def activate_cloud_folder_grant(
+        self, grant_id: str, *, verified: bool
+    ) -> dict[str, Any] | None:
+        """``minting`` -> ``active``; ``verified`` stamps the read-only
+        probe's pass (a reader must have one). ``None`` when the grant is no
+        longer minting (its revoke was requested meanwhile)."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE cloud_folder_grants
+                   SET status = 'active', activated_at = now(),
+                       verified_at = CASE WHEN $2 THEN now() ELSE verified_at END
+                 WHERE id = $1::uuid AND status = 'minting'
+                RETURNING *
+                """,
+                str(grant_id),
+                bool(verified),
+            )
+        return self._cloud_folder_grant_row(row) if row else None
+
+    async def request_cloud_folder_grant_revokes(
+        self,
+        *,
+        reason: str,
+        grant_id: str | None = None,
+        datasource_id: str | None = None,
+        project_id: str | None = None,
+        user_id: str | None = None,
+        failure_code: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Move the matching live grants to ``revoking`` (their passwords
+        dropped: nothing may mount them any more) and return them. At least
+        one selector is required; ``failure_code`` marks a failed mint."""
+        if (
+            grant_id is None
+            and datasource_id is None
+            and project_id is None
+            and (user_id is None)
+        ):
+            raise ValueError("a per-folder grant revoke needs a selector")
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE cloud_folder_grants
+                   SET status = 'revoking', credentials = NULL,
+                       revoke_requested_at = now(), revoke_reason = $5,
+                       revoke_next_at = now(),
+                       failure_code = COALESCE($6, failure_code)
+                 WHERE status IN ('minting', 'active')
+                   AND ($1::uuid IS NULL OR id = $1::uuid)
+                   AND ($2::uuid IS NULL OR datasource_id = $2::uuid)
+                   AND ($3::uuid IS NULL OR project_id = $3::uuid)
+                   AND ($4::uuid IS NULL OR user_id = $4::uuid)
+                RETURNING *
+                """,
+                grant_id,
+                datasource_id,
+                project_id,
+                user_id,
+                reason,
+                failure_code,
+            )
+        return [self._cloud_folder_grant_row(row) for row in rows]
+
+    async def request_abandoned_cloud_folder_grant_mints(
+        self, *, older_than_seconds: float
+    ) -> int:
+        """Revoke the mints a lost process left ``minting`` for longer than
+        ``older_than_seconds`` (a live mint holds its slot's lock and is
+        never that old)."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE cloud_folder_grants
+                   SET status = 'revoking', credentials = NULL,
+                       revoke_requested_at = now(),
+                       revoke_reason = 'mint_abandoned',
+                       revoke_next_at = now(),
+                       failure_code = COALESCE(failure_code, 'mint_abandoned')
+                 WHERE status = 'minting'
+                   AND created_at < now() - make_interval(secs => $1::float8)
+                """,
+                float(older_than_seconds),
+            )
+        return int(str(result).rsplit(" ", 1)[-1] or 0)
+
+    async def list_stale_cloud_folder_grants(
+        self, *, active_instance_id: str | None
+    ) -> list[dict[str, Any]]:
+        """Every active grant that no longer serves, with why (``reason``):
+        its connector is gone (``connector_gone``), its project is
+        (``project_deleted``), its member left the project
+        (``member_removed``), its installation is no longer the active one
+        (``installation_inactive``, only when that one is known), or its
+        project's folder is another now (``repointed``)."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, datasource_id, project_id, user_id, kind, reason
+                  FROM (
+                    SELECT g.id, g.datasource_id, g.project_id, g.user_id,
+                           g.kind,
+                           CASE
+                             WHEN d.id IS NULL THEN 'connector_gone'
+                             WHEN p.id IS NULL THEN 'project_deleted'
+                             WHEN pm.user_id IS NULL THEN 'member_removed'
+                             WHEN $1::uuid IS NOT NULL
+                                  AND g.backend_instance_id <> $1::uuid
+                               THEN 'installation_inactive'
+                             WHEN p.main_cloud_backend_instance_id
+                                    IS DISTINCT FROM g.backend_instance_id
+                                  OR p.main_cloud_folder_handle IS NULL
+                                  OR encode(sha256(convert_to(
+                                       p.main_cloud_folder_handle, 'UTF8')),
+                                       'hex') <> g.folder_handle_sha256
+                               THEN 'repointed'
+                           END AS reason
+                      FROM cloud_folder_grants g
+                      LEFT JOIN datasources d
+                        ON d.id = g.datasource_id
+                       AND d.managed_key = 'project-cloud:' || g.project_id::text
+                      LEFT JOIN projects p ON p.id = g.project_id
+                      LEFT JOIN project_members pm
+                        ON pm.project_id = g.project_id
+                       AND pm.user_id = g.user_id
+                     WHERE g.status = 'active'
+                  ) AS graded
+                 WHERE reason IS NOT NULL
+                 ORDER BY id
+                """,
+                active_instance_id,
+            )
+        return [self._cloud_folder_grant_row(row) for row in rows]
+
+    async def list_due_cloud_folder_grant_revokes(
+        self,
+        *,
+        limit: int,
+        grant_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """``revoking`` grants whose next attempt is due (``grant_ids``
+        narrows them to a hook's own), longest-due first."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM cloud_folder_grants
+                 WHERE status = 'revoking'
+                   AND COALESCE(revoke_next_at, now()) <= now()
+                   AND ($2::uuid[] IS NULL OR id = ANY($2::uuid[]))
+                 ORDER BY revoke_next_at NULLS FIRST, created_at, id
+                 LIMIT $1
+                """,
+                int(limit),
+                [str(grant_id) for grant_id in grant_ids]
+                if grant_ids is not None
+                else None,
+            )
+        return [self._cloud_folder_grant_row(row) for row in rows]
+
+    async def finish_cloud_folder_grant_revoke(
+        self, grant_id: str, *, abandoned: bool = False, error: str | None = None
+    ) -> bool:
+        """``revoking`` -> ``revoked`` (``failed`` for a failed mint), or
+        ``abandoned`` when SRW gives the revoke up."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE cloud_folder_grants
+                   SET status = CASE
+                         WHEN $2 THEN 'abandoned'
+                         WHEN failure_code IS NOT NULL THEN 'failed'
+                         ELSE 'revoked'
+                       END,
+                       revoked_at = now(), credentials = NULL,
+                       revoke_error = $3
+                 WHERE id = $1::uuid AND status = 'revoking'
+                """,
+                str(grant_id),
+                bool(abandoned),
+                error,
+            )
+        return result == "UPDATE 1"
+
+    async def retry_cloud_folder_grant_revoke(
+        self, grant_id: str, *, attempts: int, error: str, delay_seconds: float
+    ) -> bool:
+        """Record a failed revoke attempt and when the next one is due."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE cloud_folder_grants
+                   SET revoke_attempts = $2, revoke_error = $3,
+                       revoke_next_at = now() + make_interval(secs => $4::float8)
+                 WHERE id = $1::uuid AND status = 'revoking'
+                """,
+                str(grant_id),
+                int(attempts),
+                error,
+                float(delay_seconds),
+            )
+        return result == "UPDATE 1"
+
+    async def cloud_folder_grants_pending(self) -> bool:
+        """Whether any grant may still need a provider call."""
+        async with self.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM cloud_folder_grants "
+                    "WHERE status IN ('minting', 'revoking'))"
+                )
+            )
 
     async def get_main_cloud_backend_instance(
         self,

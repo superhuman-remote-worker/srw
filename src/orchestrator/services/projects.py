@@ -52,7 +52,7 @@ from orchestrator.security.access import (
     user_can_access_datasource,
 )
 from orchestrator.services import project_provisioning
-from orchestrator.services.cloud import ProjectFolderHandle
+from orchestrator.services.cloud import ProjectFolderHandle, folder_grants
 from orchestrator.services.cloud.identity import (
     get_home_browser_url_cached,
     peek_home_browser_url,
@@ -716,6 +716,15 @@ async def delete_project(
             "UPDATE datasources SET project_id = NULL WHERE project_id = $1", uuid_val
         )
 
+    # The project's per-folder principals go before its folder does (their
+    # rows outlive the project; what this cannot finish, the sweep does).
+    await folder_grants.revoke_folder_grants(
+        store,
+        dependencies.main_cloud_router,
+        reason="project_deleted",
+        project_id=project_id,
+    )
+
     success = await store.delete_project(project_id)
     if not success:
         raise HTTPException(status_code=500, detail="Failed to delete project")
@@ -894,6 +903,16 @@ async def remove_project_member(
     success = await store.remove_project_member(project_id, user_id)
     if not success:
         raise HTTPException(status_code=404, detail="Member not found")
+
+    # The member's per-folder principals of this project's folder: revoked
+    # now, best effort (the sweep revokes what is left).
+    await folder_grants.revoke_folder_grants(
+        store,
+        dependencies.main_cloud_router,
+        reason="member_removed",
+        project_id=project_id,
+        user_id=user_id,
+    )
 
     # Remove from Keycloak group
     if dependencies.keycloak_groups.is_initialized:

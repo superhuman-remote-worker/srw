@@ -88,6 +88,16 @@ _ALL_PERMISSIONS = 31  # read(1) + update(2) + create(4) + delete(8) + share(16)
 _SESSION_SHARE_PERMISSIONS = 15  # same minus share
 _READ_PERMISSION = 1  # read only — the protected-mode RO reader grant
 
+#: A per-folder grant's Group Folder permissions by kind: the reader reads,
+#: the writer reads, updates, creates and deletes; neither may share.
+_FOLDER_GRANT_PERMISSIONS = {"reader": _READ_PERMISSION, "writer": 15}
+#: The only principals and groups the per-folder grant methods create or
+#: delete (``folder_grants`` names them after the grant row), so a revoke
+#: can never remove any other account.
+_FOLDER_PRINCIPAL_RE = re.compile(r"srw-(reader|writer)-f-([0-9a-f]{32})\Z")
+_FOLDER_GROUP_RE = re.compile(r"srw-(rog|rwg)-f-([0-9a-f]{32})\Z")
+_FOLDER_GROUP_KIND = {"rog": "reader", "rwg": "writer"}
+
 # Nextcloud 30.0.10+ enforces 20 new user shares per 10 minutes per user on
 # /ocs/v2.php/apps/files_sharing/api/v1/shares. The client-side bucket sits
 # at 15/10min to leave headroom for clock skew and concurrent processes.
@@ -1994,6 +2004,219 @@ class NextcloudBackend:
             )
         await self._delete_group(plan.group_id)
         await self._delete_user(plan.reader_id)
+
+    # ------------------------------------------------------ per-folder grants
+
+    def _folder_principal_ids(
+        self, principal_id: str, group_id: str, kind: Optional[str] = None
+    ) -> str:
+        """The grant kind ``principal_id`` and ``group_id`` name, or raise.
+
+        Both must be one per-folder grant's (same kind, same row id), and
+        ``kind``, when given, theirs: these methods create and delete
+        Nextcloud accounts, so they refuse any other name outright.
+        """
+        principal = _FOLDER_PRINCIPAL_RE.fullmatch(str(principal_id or ""))
+        group = _FOLDER_GROUP_RE.fullmatch(str(group_id or ""))
+        if (
+            principal is None
+            or group is None
+            or principal.group(1) != _FOLDER_GROUP_KIND[group.group(1)]
+            or principal.group(2) != group.group(2)
+            or (kind is not None and principal.group(1) != kind)
+        ):
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "per-folder grant principal is malformed",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        return principal.group(1)
+
+    def folder_grant_webdav_url(
+        self, handle: ProjectFolderHandle, principal_id: str
+    ) -> Optional[str]:
+        """The Group Folder's internal WebDAV URL as ``principal_id``.
+
+        The groupfolders namespace, as the service account's mounts use it:
+        it lists only the Group Folders the principal is granted (exactly
+        this one), whatever its own home holds.
+        """
+        mountpoint = handle.vendor_meta.get("mountpoint")
+        if not mountpoint or not principal_id:
+            return None
+        return (
+            f"{self._base_url}/remote.php/dav/groupfolders/"
+            f"{quote(str(principal_id), safe='')}/{quote(str(mountpoint), safe='')}/"
+        )
+
+    async def _folder_group_ids(self, folder_id: int) -> set[str]:
+        """The groups a Group Folder grants (``POST .../groups`` is not
+        idempotent: a second one fails the folder's unique constraint)."""
+        resp = await self._client.get(
+            f"/index.php/apps/groupfolders/folders/{folder_id}",
+            params={"format": "json"},
+        )
+        resp.raise_for_status()
+        self._assert_not_html(resp)
+        data = (resp.json().get("ocs") or {}).get("data") or {}
+        groups = data.get("groups") if isinstance(data, dict) else None
+        if isinstance(groups, dict):
+            return {str(key) for key in groups}
+        if isinstance(groups, list):
+            return {
+                str(item.get("id") or item.get("group_id") or "")
+                for item in groups
+                if isinstance(item, dict)
+            }
+        return set()
+
+    @instrument_backend_op("ensure_folder_principal")
+    async def ensure_folder_principal(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        principal_id: str,
+        group_id: str,
+        password: str,
+        kind: str,
+    ) -> None:
+        """Create (or complete) one per-folder grant's principal.
+
+        The order is ``grant_protected_reader_attempt``'s, through the plain
+        admin client (the signed lane accepts only protected attempts): the
+        user with its stored password, its group, the group's grant on the
+        folder, the grant's permissions, and only then the membership, so
+        the principal never observes Group Folders' broad default. Every step
+        accepts "already done", so a retry completes a crashed attempt.
+        Then the principal must read the folder; a refused password is reset
+        to the stored one once (a principal a lost attempt created with
+        another).
+        """
+        self._ensure_ready()
+        grant_kind = self._folder_principal_ids(principal_id, group_id, kind)
+        webdav_url = self.folder_grant_webdav_url(handle, principal_id)
+        try:
+            folder_id = int(handle.native_id)
+        except (TypeError, ValueError):
+            folder_id = 0
+        if folder_id <= 0 or not webdav_url or not password:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "per-folder grant names no Group Folder or no password",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        permissions = _FOLDER_GRANT_PERMISSIONS[grant_kind]
+        try:
+            resp = await self._client.post(
+                "/ocs/v2.php/cloud/users",
+                params={"format": "json"},
+                data={"userid": principal_id, "password": password},
+            )
+            self._require_ocs_status(
+                resp, ok={100, 200, 102}, op="create folder grant principal"
+            )
+            resp = await self._client.post(
+                "/ocs/v2.php/cloud/groups",
+                params={"format": "json"},
+                data={"groupid": group_id},
+            )
+            self._require_ocs_status(
+                resp, ok={100, 200, 102}, op="create folder grant group"
+            )
+            if group_id not in await self._folder_group_ids(folder_id):
+                resp = await self._client.post(
+                    f"/index.php/apps/groupfolders/folders/{folder_id}/groups",
+                    params={"format": "json"},
+                    data={"group": group_id},
+                )
+                self._require_ocs_status(
+                    resp, ok={100, 200}, op="attach folder grant group"
+                )
+            resp = await self._client.post(
+                f"/index.php/apps/groupfolders/folders/{folder_id}/groups/{group_id}",
+                params={"format": "json"},
+                data={"permissions": str(permissions)},
+            )
+            self._require_ocs_status(
+                resp, ok={100, 200}, op="set folder grant permissions"
+            )
+            resp = await self._client.post(
+                f"/ocs/v2.php/cloud/users/{principal_id}/groups",
+                params={"format": "json"},
+                data={"groupid": group_id},
+            )
+            self._require_ocs_status(
+                resp, ok={100, 200, 102}, op="add folder grant principal to group"
+            )
+            status = await self._principal_reads(webdav_url, principal_id, password)
+            if status == 401:
+                resp = await self._client.put(
+                    f"/ocs/v2.php/cloud/users/{principal_id}",
+                    params={"format": "json"},
+                    data={"key": "password", "value": password},
+                )
+                self._require_ocs_status(
+                    resp, ok={100, 200}, op="reset folder grant password"
+                )
+                status = await self._principal_reads(webdav_url, principal_id, password)
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        if status != 207:
+            raise CloudBackendError(
+                CloudBackendErrorKind.AUTHENTICATION_FAILED
+                if status == 401
+                else CloudBackendErrorKind.UNKNOWN,
+                f"folder grant principal cannot read its folder: HTTP {status}",
+                backend=self.backend_id,
+                status_code=status,
+            )
+
+    async def _principal_reads(
+        self, webdav_url: str, principal_id: str, password: str
+    ) -> int:
+        """The status of a ``Depth: 0`` PROPFIND of the folder as the
+        principal (207 when it reads it)."""
+        resp = await self._client.request(
+            "PROPFIND",
+            webdav_url,
+            headers={"Depth": "0"},
+            auth=(principal_id, password),
+        )
+        return resp.status_code
+
+    @instrument_backend_op("revoke_folder_principal")
+    async def revoke_folder_principal(
+        self, *, principal_id: str, group_id: str
+    ) -> None:
+        """Remove one per-folder grant: its group first (which drops the
+        folder grant with it), then its principal. Idempotent."""
+        self._ensure_ready()
+        self._folder_principal_ids(principal_id, group_id)
+        try:
+            await self._delete_group(group_id)
+            await self._delete_user(principal_id)
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+
+    def folder_principal_client(
+        self, principal_id: str, password: str
+    ) -> httpx.AsyncClient:
+        """A client authenticated as a per-folder principal (the read-only
+        probe's). The caller closes it."""
+        if _FOLDER_PRINCIPAL_RE.fullmatch(str(principal_id or "")) is None:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "per-folder grant principal is malformed",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        return httpx.AsyncClient(
+            base_url=self._base_url,
+            auth=(principal_id, password),
+            timeout=30.0,
+        )
 
     async def seed_canary_fixture(self, handle: ProjectFolderHandle) -> CanaryFixture:
         """Write a real canary file with the WRITE identity and discover REAL
