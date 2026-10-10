@@ -26607,6 +26607,64 @@ COMMENT ON TABLE public.capability_grants IS 'Scoped capability entitlements (Sl
 
 
 --
+-- Name: cloud_folder_grants; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.cloud_folder_grants (
+    id uuid NOT NULL,
+    kind text NOT NULL,
+    datasource_id uuid NOT NULL,
+    project_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    backend_id text NOT NULL,
+    backend_instance_id uuid NOT NULL,
+    folder_handle_sha256 text NOT NULL,
+    principal_id text NOT NULL,
+    group_id text NOT NULL,
+    credentials text,
+    webdav_url text NOT NULL,
+    status text DEFAULT 'minting'::text NOT NULL,
+    failure_code text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    verified_at timestamp with time zone,
+    activated_at timestamp with time zone,
+    revoke_requested_at timestamp with time zone,
+    revoke_reason text,
+    revoke_attempts integer DEFAULT 0 NOT NULL,
+    revoke_next_at timestamp with time zone,
+    revoke_error text,
+    revoked_at timestamp with time zone,
+    CONSTRAINT cloud_folder_grants_active_check CHECK (((status <> 'active'::text) OR ((activated_at IS NOT NULL) AND ((kind <> 'reader'::text) OR (verified_at IS NOT NULL))))),
+    CONSTRAINT cloud_folder_grants_attempts_check CHECK ((revoke_attempts >= 0)),
+    CONSTRAINT cloud_folder_grants_credentials_check CHECK (((status <> ALL (ARRAY['minting'::text, 'active'::text])) OR (NULLIF(credentials, ''::text) IS NOT NULL))),
+    CONSTRAINT cloud_folder_grants_done_check CHECK (((status <> ALL (ARRAY['revoked'::text, 'failed'::text, 'abandoned'::text])) OR (credentials IS NULL))),
+    CONSTRAINT cloud_folder_grants_failure_check CHECK ((((status <> 'failed'::text) OR (failure_code IS NOT NULL)) AND ((failure_code IS NULL) OR (failure_code ~ '^[a-z][a-z0-9_]{0,63}$'::text)))),
+    CONSTRAINT cloud_folder_grants_folder_check CHECK ((folder_handle_sha256 ~ '^[0-9a-f]{64}$'::text)),
+    CONSTRAINT cloud_folder_grants_group_check CHECK ((group_id = (
+CASE kind
+    WHEN 'reader'::text THEN 'srw-rog-f-'::text
+    ELSE 'srw-rwg-f-'::text
+END || replace((id)::text, '-'::text, ''::text)))),
+    CONSTRAINT cloud_folder_grants_kind_check CHECK ((kind = ANY (ARRAY['reader'::text, 'writer'::text]))),
+    CONSTRAINT cloud_folder_grants_principal_check CHECK ((principal_id = (
+CASE kind
+    WHEN 'reader'::text THEN 'srw-reader-f-'::text
+    ELSE 'srw-writer-f-'::text
+END || replace((id)::text, '-'::text, ''::text)))),
+    CONSTRAINT cloud_folder_grants_revoke_check CHECK ((((status <> ALL (ARRAY['revoking'::text, 'revoked'::text, 'failed'::text, 'abandoned'::text])) OR ((revoke_requested_at IS NOT NULL) AND (revoke_reason IS NOT NULL))) AND ((status = ANY (ARRAY['revoked'::text, 'failed'::text, 'abandoned'::text])) = (revoked_at IS NOT NULL)))),
+    CONSTRAINT cloud_folder_grants_status_check CHECK ((status = ANY (ARRAY['minting'::text, 'active'::text, 'revoking'::text, 'revoked'::text, 'failed'::text, 'abandoned'::text]))),
+    CONSTRAINT cloud_folder_grants_webdav_check CHECK ((webdav_url <> ''::text))
+);
+
+
+--
+-- Name: TABLE cloud_folder_grants; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.cloud_folder_grants IS 'Per-folder Nextcloud principals SRW creates for one project folder connector, member and kind (reader or writer); project mounts use them instead of agent-service. Passwords are APP_ENCRYPTION_KEY ciphertexts, dropped once revoked. No foreign keys to connector, project or user: the revoke outlives them.';
+
+
+--
 -- Name: cloud_ro_effect_intents; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -34091,6 +34149,14 @@ ALTER TABLE ONLY public.capability_grants
 
 
 --
+-- Name: cloud_folder_grants cloud_folder_grants_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.cloud_folder_grants
+    ADD CONSTRAINT cloud_folder_grants_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: cloud_ro_effect_intents cloud_ro_effect_intents_attempt_request; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -37417,6 +37483,27 @@ CREATE INDEX idx_canvas_view_bootstraps_pending ON public.canvas_view_bootstraps
 
 
 --
+-- Name: idx_cloud_folder_grants_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_cloud_folder_grants_pending ON public.cloud_folder_grants USING btree (status, revoke_next_at) WHERE (status = ANY (ARRAY['minting'::text, 'revoking'::text]));
+
+
+--
+-- Name: idx_cloud_folder_grants_project; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_cloud_folder_grants_project ON public.cloud_folder_grants USING btree (project_id, user_id) WHERE (status = ANY (ARRAY['minting'::text, 'active'::text, 'revoking'::text]));
+
+
+--
+-- Name: idx_cloud_folder_grants_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_cloud_folder_grants_user ON public.cloud_folder_grants USING btree (user_id) WHERE (status = ANY (ARRAY['minting'::text, 'active'::text, 'revoking'::text]));
+
+
+--
 -- Name: idx_completion_effects_session_drain; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -39080,6 +39167,13 @@ CREATE INDEX storage_volume_incarnations_asset_time_idx ON public.storage_volume
 --
 
 CREATE UNIQUE INDEX uq_canvases_origin_generation ON public.canvases USING btree (origin_generation) WHERE (origin_generation IS NOT NULL);
+
+
+--
+-- Name: uq_cloud_folder_grants_live; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_cloud_folder_grants_live ON public.cloud_folder_grants USING btree (datasource_id, user_id, kind) WHERE (status = ANY (ARRAY['minting'::text, 'active'::text]));
 
 
 --
@@ -42019,6 +42113,14 @@ ALTER TABLE ONLY public.canvases
 
 ALTER TABLE ONLY public.capability_grants
     ADD CONSTRAINT capability_grants_granted_by_fkey FOREIGN KEY (granted_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: cloud_folder_grants cloud_folder_grants_backend_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.cloud_folder_grants
+    ADD CONSTRAINT cloud_folder_grants_backend_fk FOREIGN KEY (backend_instance_id, backend_id) REFERENCES public.main_cloud_backend_instances(id, backend_id) ON DELETE RESTRICT;
 
 
 --
