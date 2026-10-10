@@ -578,7 +578,10 @@ def _review_deps(*, job=None, store=None, create_thread=None, bundle=None):
             return_value=[
                 {"id": DATASOURCE_ID, "connection_url": "https://forge/org/app.git"}
             ]
-        )
+        ),
+        # The review session reads the policy rows of what it attaches; a
+        # connector without one stays and fails closed at admission.
+        get_datasource_policy_rows=AsyncMock(return_value=[]),
     )
     review = job_review_session.JobReviewSessionDependencies(
         store=store,
