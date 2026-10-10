@@ -155,6 +155,7 @@ EXCLUSION_REASONS = frozenset(
         "reader_unavailable",
         "cloud_not_connected",
         "cloud_grant_revoked",
+        "delivery_unsupported",
     }
 )
 _UUID_RE = d7._UUID_RE

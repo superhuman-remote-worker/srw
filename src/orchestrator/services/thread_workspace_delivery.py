@@ -51,7 +51,7 @@ from orchestrator.services.session_workspace_policy import preparation_wait_budg
 
 from orchestrator.security.access import externalize_gitea_url
 from orchestrator.security.access import require_internal as _require_internal
-from orchestrator.services import connector_credential_leases
+from orchestrator.services import cloud_mount_status, connector_credential_leases
 from orchestrator.services.cloud_mount_sidecar import (
     PLAN_CONTEXT_KEY,
     recorded_sidecar_plan,
@@ -165,6 +165,11 @@ class ThreadWorkspaceDeliveryDependencies:
     # (``agent_cloud_mounts.prepare_thread_folder_grants``). A composition
     # without it mints none, and such a folder is left out until one exists.
     prepare_cloud_folder_grants: Any = None
+    # ``(thread, *, mount_rows) -> [excluded]``: the attached cloud folders a
+    # deployment that syncs instead of mounting does not deliver
+    # (``agent_cloud_mounts.sync_delivery_exclusions``). A composition
+    # without it names none.
+    cloud_sync_exclusions: Any = None
 
 
 def agent_canvas_workspace_capabilities(
@@ -550,7 +555,8 @@ async def _settle_cloud_mount_record(
       annotation, the plan's source of truth. A Pod that records none is
       remembered, so it costs one read, not one per poll.
     - A sandbox upgraded to a VM drops the Pod's folder state: the VM's
-      folders are its own, and the cockpit must not show the Pod's.
+      folders are its own, and the cockpit must not show the Pod's. A
+      record of no Pod (the sync driver's, ``fingerprint: null``) stays.
     """
     if InPodPlaneSettings.from_env() is None:
         return
@@ -561,7 +567,8 @@ async def _settle_cloud_mount_record(
         vm = metadata.get("vm") or {}
         vm_ready = isinstance(vm, Mapping) and vm.get("status") == "ready"
         if vm_ready:
-            if isinstance(metadata.get("cloud_mount_status"), Mapping):
+            status = metadata.get("cloud_mount_status")
+            if isinstance(status, Mapping) and status.get("fingerprint"):
                 clear = getattr(
                     type(dependencies.store), "set_thread_cloud_mount_status", None
                 )
@@ -1059,6 +1066,8 @@ async def agent_get_thread_workspace_locked(
         )
     mount_rows = await postgres_db.list_thread_mounts(thread_id)
     cloud_mount_sidecar_cfg: dict[str, Any] | None = None
+    # The attached cloud folders this deployment's sync does not deliver.
+    cloud_folders_excluded: list[dict[str, Any]] = []
     suppress_disposable_cloud = bool(
         thread.get("execution_lane") == "stateless" and workspace_backend == "none"
     )
@@ -1097,6 +1106,16 @@ async def agent_get_thread_workspace_locked(
             cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=[])
         else:
             cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=mount_rows)
+            # The sync driver delivers no connector's cloud folder: each one
+            # attached is named, for the agent and the session header,
+            # rather than silently missing (main cloud, fix-up 3).
+            if dependencies.cloud_sync_exclusions is not None:
+                cloud_folders_excluded = await dependencies.cloud_sync_exclusions(
+                    thread, mount_rows=mount_rows
+                )
+                await cloud_mount_status.record_sync_exclusions(
+                    postgres_db, thread_id, metadata, cloud_folders_excluded
+                )
     # Issue 13 follow-up: if the main cloud is up but this thread resolved NO
     # sync target (session-folder provisioning failed upstream, or user-home /
     # project-mount resolution produced nothing usable), the agent would
@@ -1618,6 +1637,11 @@ async def agent_get_thread_workspace_locked(
         ),
         # True when cloud is up but no sync target resolved (Issue 13 follow-up).
         "cloud_sync_degraded": cloud_sync_degraded,
+        # The attached cloud folders this deployment's sync does not deliver
+        # (``delivery_unsupported``), for the agent's prompt.
+        "cloud_folders_excluded": (
+            cloud_folders_excluded if final_protected_marker == "off" else []
+        ),
         # Protected Cloud Mode marker (F-C1): tells the agent to fail-close
         # the legacy nc_session_folder sync shim and any cloud_sync
         # consumption rather than falling back to a live WebDAV mount.

@@ -20,7 +20,11 @@ Two writers, never more:
 * the **orchestrator**, when it publishes a Pod: every planned mount
   ``pending``, every row the plan left out under ``excluded`` (a Pod on the
   in-workspace path clears the record); and ``notice: agent_outdated`` when
-  an agent image from before the in-pod plane attaches;
+  an agent image from before the in-pod plane attaches. Under the sync
+  driver (``CLOUD_WORKSPACE_DRIVER=sync``), which mounts nothing, the
+  workspace delivery keeps a record of no Pod (``fingerprint: null``) whose
+  ``excluded`` names every attached cloud folder the sync does not deliver
+  (:func:`record_sync_exclusions`);
 * the **agent**, after it reads the supervisor's status files: ``mounted``
   or ``unavailable`` with a reason (:func:`report_entries` checks every
   field against the plan and the closed reason set).
@@ -144,6 +148,64 @@ async def record_pod(
     return bool(await setter(store, thread_id, status))
 
 
+def sync_status(
+    excluded: list[Mapping[str, Any]], *, now: str | None = None
+) -> dict[str, Any]:
+    """The record of a session under the sync driver: no Pod plan, no mount,
+    and every attached cloud folder the sync does not deliver."""
+    return {
+        "version": 1,
+        "fingerprint": None,
+        "runtime_incarnation": None,
+        "updated_at": now or _now(),
+        "notice": None,
+        "mounts": {},
+        "excluded": [
+            {
+                key: entry.get(key)
+                for key in ("source_ref", "mount_kind", "reason", "detail", "title")
+                if entry.get(key)
+            }
+            for entry in excluded
+        ],
+    }
+
+
+async def record_sync_exclusions(
+    store: Any,
+    thread_id: str,
+    metadata: Mapping[str, Any] | None,
+    excluded: list[Mapping[str, Any]],
+) -> None:
+    """Keep a sync-driver session's record current: written only when what
+    it names changed, removed when nothing is left out. Best effort, never
+    raises: the delivery it rides on must not fail."""
+    setter = getattr(type(store), "set_thread_cloud_mount_status", None)
+    if not callable(setter):
+        return
+    current = metadata.get(STATUS_KEY) if isinstance(metadata, Mapping) else None
+    status = sync_status(excluded) if excluded else None
+    if status is None:
+        unchanged = current is None
+    else:
+        unchanged = (
+            isinstance(current, Mapping)
+            and current.get("fingerprint") is None
+            and not current.get("mounts")
+            and current.get("excluded") == status["excluded"]
+        )
+    if unchanged:
+        return
+    try:
+        await setter(store, thread_id, status)
+    except Exception:
+        logger.warning(
+            "Thread %s: could not record the cloud folders its sync does not deliver",
+            thread_id,
+            exc_info=True,
+        )
+
+
 async def record_report(
     store: Any,
     thread_id: str,
@@ -215,5 +277,7 @@ __all__ = [
     "record_agent_outdated",
     "record_pod",
     "record_report",
+    "record_sync_exclusions",
     "report_entries",
+    "sync_status",
 ]

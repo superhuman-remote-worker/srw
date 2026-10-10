@@ -1061,3 +1061,55 @@ def test_a_read_only_folder_tells_the_agent_its_writes_fail():
         "(read-only: its account may only read this folder, writes fail)"
     )
     assert describe_mounted("project", "read_write").endswith("(read-write)")
+
+
+def test_a_sync_deployment_names_the_folders_it_does_not_deliver():
+    """CLOUD_WORKSPACE_DRIVER=sync mounts nothing: each attached cloud folder
+    the orchestrator names is in the prompt, so the agent never says work is
+    saved there. Not for an officer, nor a protected session."""
+    from shared.runtime.core.loader import AgentConfig
+
+    excluded = [
+        {
+            "source_ref": "c-1",
+            "mount_kind": "project",
+            "reason": "delivery_unsupported",
+            "title": "Acme Launch cloud folder",
+        }
+    ]
+
+    def session(**over):
+        values = {
+            "config": AgentConfig(agent_id="a", display_name="A", extra={}),
+            "protected_cloud_required": False,
+            **over,
+        }
+        return SimpleNamespace(**values)
+
+    plain = session()
+    PersistentSession._note_undelivered_cloud_folders(plain, excluded)
+    [row] = plain.config.extra["_cloud_mounts_unavailable"]
+    assert (row["title"], row["reason"]) == (
+        "Acme Launch cloud folder",
+        "delivery_unsupported",
+    )
+    assert "syncs files instead of mounting them" in row["text"]
+    floor = cloud_mount_system_floor(plain.config.extra["_cloud_mounts_unavailable"])
+    assert "Acme Launch cloud folder" in floor
+    assert "syncs files instead of mounting them" in floor
+    for quiet in (
+        session(protected_cloud_required=True),
+        session(
+            config=AgentConfig(
+                agent_id="a",
+                display_name="A",
+                extra={},
+                officer={"enabled": True},
+            )
+        ),
+    ):
+        PersistentSession._note_undelivered_cloud_folders(quiet, excluded)
+        assert "_cloud_mounts_unavailable" not in quiet.config.extra
+    nothing = session()
+    PersistentSession._note_undelivered_cloud_folders(nothing, None)
+    assert nothing.config.extra == {}

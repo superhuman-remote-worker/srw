@@ -1977,7 +1977,8 @@
         "grant_unavailable": "its account for this folder is not ready yet",
         "reader_unavailable": "its read-only account for this folder is not ready yet",
         "cloud_not_connected": "no cloud account yet: connect your cloud under Settings → Connectors",
-        "cloud_grant_revoked": "the cloud no longer accepts your connection: reconnect it under Settings → Connectors"
+        "cloud_grant_revoked": "the cloud no longer accepts your connection: reconnect it under Settings → Connectors",
+        "delivery_unsupported": "this deployment syncs files instead of mounting them; cloud folders aren't delivered here"
       }
     },
     "cloudReview": {

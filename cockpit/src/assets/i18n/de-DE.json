@@ -1977,7 +1977,8 @@
         "grant_unavailable": "sein Konto für diesen Ordner ist noch nicht bereit",
         "reader_unavailable": "sein Nur-Lese-Konto für diesen Ordner ist noch nicht bereit",
         "cloud_not_connected": "noch kein Cloud-Konto: verbinde deine Cloud unter Einstellungen → Konnektoren",
-        "cloud_grant_revoked": "die Cloud akzeptiert deine Verbindung nicht mehr: verbinde sie neu unter Einstellungen → Konnektoren"
+        "cloud_grant_revoked": "die Cloud akzeptiert deine Verbindung nicht mehr: verbinde sie neu unter Einstellungen → Konnektoren",
+        "delivery_unsupported": "diese Installation synchronisiert Dateien, statt sie einzubinden; Cloud-Ordner werden hier nicht bereitgestellt"
       }
     },
     "cloudReview": {

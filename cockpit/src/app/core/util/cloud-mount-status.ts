@@ -85,6 +85,9 @@ export const CLOUD_FOLDER_REASONS = [
   'reader_unavailable',
   'cloud_not_connected',
   'cloud_grant_revoked',
+  // A deployment that syncs files instead of mounting them delivers no
+  // cloud folder (CLOUD_WORKSPACE_DRIVER=sync).
+  'delivery_unsupported',
 ] as const;
 
 /** What a cloud folder is, as the notice names it: a project's folder, the

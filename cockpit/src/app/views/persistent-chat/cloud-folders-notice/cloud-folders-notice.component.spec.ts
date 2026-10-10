@@ -126,6 +126,21 @@ describe('cloud folder state', () => {
     expect(state.folders[1].reason).toBe('beside_protected');
   });
 
+  it("names a sync deployment's folders it does not deliver, by their connector", () => {
+    // CLOUD_WORKSPACE_DRIVER=sync: a record of no Pod, nothing mounted.
+    const state = cloudFolderStateFromStatus({
+      fingerprint: null,
+      mounts: {},
+      excluded: [
+        { source_ref: 'ds-a', mount_kind: 'project', reason: 'delivery_unsupported', title: 'Acme cloud folder' },
+      ],
+    });
+    expect(state.folders).toEqual([
+      { name: '', path: '', kind: 'project', level: '', state: 'excluded', reason: 'delivery_unsupported', connectorId: 'ds-a', title: 'Acme cloud folder' },
+    ]);
+    expect(state.protected).toBe(false);
+  });
+
   it("keeps what each folder is from the thread's record when the agent reports", () => {
     const before = cloudFolderStateFromStatus({
       mounts: {

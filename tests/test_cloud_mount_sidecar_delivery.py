@@ -304,9 +304,17 @@ def test_attach_accepts_a_protected_sidecar_pod_only_with_the_grant_it_holds():
 # --------------------------------------------------------------------------- #
 
 
-async def _poll(header: str | None) -> dict:
+async def _poll(
+    header: str | None,
+    *,
+    driver: str = "rclone_mount",
+    exclusions: list | None = None,
+    status_writes: list | None = None,
+) -> dict:
     """The real delivery under the application's composition, with the cloud
-    payload of a sidecar Pod."""
+    payload of a sidecar Pod; under the sync driver, with no mount, the
+    connector folders it does not deliver (``exclusions``), and the status
+    record writes in ``status_writes``."""
     import orchestrator.main as orch_main
     from orchestrator.application import preparation as preparation_composition
     from orchestrator.services import (
@@ -318,7 +326,17 @@ async def _poll(header: str | None) -> dict:
         workspace_tier_policy,
     )
 
-    sidecar = agent_cloud_mounts.agent_payload(_plan().recorded())
+    sidecar = (
+        agent_cloud_mounts.agent_payload(_plan().recorded())
+        if driver == "rclone_mount"
+        else None
+    )
+
+    async def write_status(_store, thread_id, status):
+        if status_writes is not None:
+            status_writes.append((thread_id, status))
+        return True
+
     thread = {
         "id": THREAD_ID,
         "user_id": None,
@@ -372,9 +390,19 @@ async def _poll(header: str | None) -> dict:
             return_value={"version": 2, "mounts": []},
         ),
         patch.object(
+            agent_cloud_mounts,
+            "sync_delivery_exclusions",
+            AsyncMock(return_value=list(exclusions or [])),
+        ),
+        patch.object(
+            type(resources.postgres_db),
+            "set_thread_cloud_mount_status",
+            write_status,
+        ),
+        patch.object(
             preparation_composition,
             "cloud_workspace_driver",
-            return_value="rclone_mount",
+            return_value=driver,
         ),
         patch.object(
             resources,
@@ -419,6 +447,76 @@ async def test_a_new_agent_gets_the_sidecar_payload_and_nothing_else_for_the_clo
     assert response["nc_session_folder"] is None
     assert response["cloud_sync_degraded"] is False
     assert response["cloud_mount_agent_outdated"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_sync_driver_names_the_folders_it_does_not_deliver():
+    """CLOUD_WORKSPACE_DRIVER=sync mounts nothing: the agent's payload and
+    the session's record name each attached cloud folder it does not
+    deliver, instead of leaving it silently missing."""
+    excluded = [
+        {
+            "source_ref": "00000000-0000-4000-8000-0000000000f1",
+            "mount_kind": "project",
+            "reason": "delivery_unsupported",
+            "name": "",
+            "title": "Acme Launch cloud folder",
+        }
+    ]
+    writes: list = []
+    response = await _poll(
+        "sidecar", driver="sync", exclusions=excluded, status_writes=writes
+    )
+    assert response["cloud_mount"] is None and response["cloud_mount_sidecar"] is None
+    assert response["cloud_sync"] == {"version": 2, "mounts": []}
+    assert response["cloud_folders_excluded"] == excluded
+    [(thread_id, status)] = writes
+    assert thread_id == THREAD_ID
+    assert (status["fingerprint"], status["mounts"]) == (None, {})
+    assert status["excluded"] == [
+        {
+            "source_ref": "00000000-0000-4000-8000-0000000000f1",
+            "mount_kind": "project",
+            "reason": "delivery_unsupported",
+            "title": "Acme Launch cloud folder",
+        }
+    ]
+    # The mounting driver names nothing this way and writes no such record.
+    writes.clear()
+    response = await _poll("sidecar", status_writes=writes)
+    assert response["cloud_folders_excluded"] == [] and writes == []
+
+
+def test_the_sync_record_is_written_only_when_it_changes():
+    import asyncio
+
+    excluded = [{"source_ref": "c", "mount_kind": "project", "reason": "r"}]
+    writes: list = []
+
+    class _Store:
+        async def set_thread_cloud_mount_status(self, thread_id, status):
+            writes.append(status)
+            return True
+
+    async def record(current):
+        await cloud_mount_status.record_sync_exclusions(
+            _Store(), THREAD_ID, {"cloud_mount_status": current}, excluded
+        )
+
+    same = cloud_mount_status.sync_status(excluded, now="t0")
+    asyncio.run(record(same))
+    assert writes == []
+    asyncio.run(record({"fingerprint": "f" * 64, "mounts": {"a": {}}}))
+    assert [w["excluded"] for w in writes] == [excluded]
+    # Nothing left out: the record goes, once.
+    writes.clear()
+    asyncio.run(
+        cloud_mount_status.record_sync_exclusions(
+            _Store(), THREAD_ID, {"cloud_mount_status": same}, []
+        )
+    )
+    asyncio.run(cloud_mount_status.record_sync_exclusions(_Store(), THREAD_ID, {}, []))
+    assert writes == [None]
 
 
 @pytest.mark.asyncio

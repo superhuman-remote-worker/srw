@@ -82,6 +82,11 @@ REASON_TEXT = {
     # A project folder mounts only as its own per-folder account (slices 5, 7).
     "grant_unavailable": "its account for this folder is not ready",
     "reader_unavailable": "its read-only account for this folder is not ready",
+    # A deployment that syncs files instead of mounting them.
+    "delivery_unsupported": (
+        "this deployment syncs files instead of mounting them; cloud folders "
+        "aren't delivered here"
+    ),
 }
 
 #: What each kind of mounted folder is, for the agent's prompt.

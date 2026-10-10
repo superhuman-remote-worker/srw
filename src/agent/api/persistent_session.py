@@ -568,6 +568,12 @@ class PersistentSession:
         # 2. Set up lazy cloud mounts before shell/tools so `/workspace/cloud`
         #    exists when the agent starts using the workspace.
         await self._setup_cloud_mount(cloud_mount_cfg)
+        if not cloud_mount_cfg:
+            # A deployment that syncs files instead of mounting them delivers
+            # no cloud folder; the orchestrator names each one attached.
+            self._note_undelivered_cloud_folders(
+                (workspace_override or {}).get("cloud_folders_excluded")
+            )
         _steps["cloud_mount"] = time.perf_counter() - _t
         _t = time.perf_counter()
 
@@ -1220,6 +1226,29 @@ class PersistentSession:
                 *_in_workspace_cloud_folders(cloud_mount_cfg, self.cloud_mount_manager),
             )
         await self._finish_protected_cloud(cloud_mount_cfg)
+
+    def _note_undelivered_cloud_folders(self, excluded: Any) -> None:
+        """Name in the prompt each attached cloud folder this deployment's
+        sync does not deliver (``delivery_unsupported``, main cloud), so the
+        agent never says work is saved where nothing is mounted. Not for a
+        background officer, whose cloud is object plane, nor a protected
+        session, whose cloud has its own contract."""
+        if (
+            not isinstance(excluded, list)
+            or not excluded
+            or self.protected_cloud_required
+        ):
+            return
+        from agent.tools.registry import officer_ceiling_active
+        from shared.runtime.services.cloud_mount.sidecar import excluded_row
+
+        if officer_ceiling_active(getattr(self.config, "officer", None)):
+            return
+        self.config = _config_with_cloud_folders(
+            self.config,
+            [],
+            [excluded_row(entry) for entry in excluded if isinstance(entry, dict)],
+        )
 
     async def _finish_protected_cloud(self, cloud_mount_cfg: Dict[str, Any]) -> None:
         """Mount the capture overlay on the protected lower and prove both.

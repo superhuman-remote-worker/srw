@@ -1214,6 +1214,54 @@ async def beside_protected_exclusions(
     ]
 
 
+async def sync_delivery_exclusions(
+    thread: dict[str, Any],
+    *,
+    mount_rows: list[dict[str, Any]] | None,
+    dependencies: AgentCloudMountDependencies,
+) -> list[dict[str, str]]:
+    """Every attached cloud folder a deployment that syncs files instead of
+    mounting them (``CLOUD_WORKSPACE_DRIVER=sync``) does not deliver.
+
+    Under that driver only the old rule's sync runs: the session folder,
+    and an older session's ``thread_mounts`` rows, which keep what the sync
+    did for them. A session under the connector rule has no rows, so each
+    ``cloud_folder`` connector it attached (a project's folder, the owner's
+    root) is named ``delivery_unsupported`` instead of silently missing.
+    Its outbox is the session folder the sync already carries, so it is not
+    named. A protected session has no sync at all and says so its own way.
+    """
+    metadata = thread_metadata_object(thread)
+    if (
+        not uses_connector_rule(metadata)
+        or protected_cloud_marker_state(metadata) != "off"
+    ):
+        return []
+    try:
+        selected = await selected_cloud_connectors(
+            thread,
+            datasource_ids=selected_ids(metadata),
+            project_ids=_project_scope(thread, mount_rows),
+            store=dependencies.store,
+        )
+    except Exception:
+        # Naming them is the report; it never holds the workspace up.
+        logger.warning(
+            "Thread %s: could not list the cloud folders its sync does not deliver",
+            thread.get("id"),
+            exc_info=True,
+        )
+        return []
+    return [
+        {
+            **excluded_entry(connector, "delivery_unsupported"),
+            "title": str(connector.row.get("name") or ""),
+        }
+        for connector in selected
+        if not isinstance(connector.driver, CloudOutboxDriver)
+    ]
+
+
 async def _legacy_live_mount_set(
     thread: dict[str, Any],
     *,

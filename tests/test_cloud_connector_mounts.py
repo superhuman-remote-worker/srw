@@ -834,6 +834,46 @@ async def test_cloud_sync_sends_the_session_folder_only_with_the_outbox(denied):
     assert mounts._build_agent_cloud_sync(legacy, dependencies=deps)["session_folder"]
 
 
+@pytest.mark.asyncio
+async def test_the_sync_driver_names_each_cloud_folder_it_does_not_deliver(denied):
+    # CLOUD_WORKSPACE_DRIVER=sync mounts nothing: the project's folder and
+    # the owner's root are named, never silently missing; the outbox is the
+    # session folder the sync already carries.
+    store = Store([_folder_row(), _outbox_row(), _root_row()])
+    deps = dataclasses.replace(_deps(store), cloud_workspace_driver=lambda: "sync")
+    excluded = await mounts.sync_delivery_exclusions(
+        _thread([FOLDER, OUTBOX, ROOT]), mount_rows=[], dependencies=deps
+    )
+    assert excluded == [
+        {
+            "source_ref": FOLDER,
+            "mount_kind": "project",
+            "reason": "delivery_unsupported",
+            "name": "",
+            "title": "Acme Launch cloud folder",
+        },
+        {
+            "source_ref": ROOT,
+            "mount_kind": "user_root",
+            "reason": "delivery_unsupported",
+            "name": "",
+            "title": "My cloud",
+        },
+    ]
+    assert "delivery_unsupported" in rule.EXCLUSION_REASONS
+    # An older session keeps what the sync did for it from its rows; a
+    # protected session has no sync at all; an explicit [] reads nothing.
+    old_rule = _thread([FOLDER], metadata={"cloud_mount_rule": None})
+    protected = _thread([FOLDER], metadata={"protected_cloud": True})
+    for thread in (old_rule, protected, _thread([])):
+        assert (
+            await mounts.sync_delivery_exclusions(
+                thread, mount_rows=[], dependencies=deps
+            )
+            == []
+        )
+
+
 # --------------------------------------------------------------------------- #
 # End's reconstruction (R1)
 # --------------------------------------------------------------------------- #

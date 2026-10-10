@@ -743,6 +743,7 @@ async def poll_workspace_ready(
                 "cloud_mount": ws.get("cloud_mount"),
                 "cloud_mount_sidecar": ws.get("cloud_mount_sidecar"),
                 "cloud_sync_degraded": ws.get("cloud_sync_degraded"),
+                "cloud_folders_excluded": ws.get("cloud_folders_excluded"),
                 # F-C1: carried through so the attach can fail-close the
                 # legacy nc_session_folder sync shim for protected threads.
                 "protected_cloud": ws.get("protected_cloud"),
@@ -865,6 +866,7 @@ async def poll_workspace_ready(
                 "cloud_mount": ws.get("cloud_mount"),
                 "cloud_mount_sidecar": ws.get("cloud_mount_sidecar"),
                 "cloud_sync_degraded": ws.get("cloud_sync_degraded"),
+                "cloud_folders_excluded": ws.get("cloud_folders_excluded"),
                 # F-C1: see comment above (vm branch).
                 "protected_cloud": ws.get("protected_cloud"),
                 "protected_cloud_state": ws.get("protected_cloud_state"),
