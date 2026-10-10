@@ -57,6 +57,17 @@ def _args(*extra: str):
         ["--user", "Robert'); DROP"],
         ["--pod-timeout", "5"],
         ["--turn-timeout", "99999"],
+        ["--sweep"],
+        ["--run", "--confirm", gate.LOCAL_CONFIRMATION, "--sweep"],
+        [
+            "--run",
+            "--confirm",
+            gate.LOCAL_CONFIRMATION,
+            "--sweep",
+            "--keep",
+            "--gate-id",
+            "d7-0123456789",
+        ],
     ],
 )
 def test_refuses_anything_outside_the_local_disposable_boundary(argv, no_cluster):
@@ -347,3 +358,69 @@ def test_a_pinned_session_gets_the_reader_disabled_before_its_attach(monkeypatch
     g.enable_reader()
     assert calls[-1] == ["user:enable", "srw-reader-a-17aefa77"]
     assert g.disabled_reader is None
+
+
+# The answers the k3d run met while a pinned session was still attaching.
+_PROTECTED_502 = {
+    "detail": 'Agent error: 503 {"error":"protected_cloud_unavailable",'
+    '"retryable":true,"message":"Protected cloud is temporarily unavailable; '
+    'retry when it recovers."}'
+}
+_BINDING_409 = {
+    "detail": {
+        "code": "session_binding_invalid",
+        "message": "This session binding is no longer authoritative.",
+        "pinned_runtime_generation_contract": 1,
+        "session_runtime_generation": "9f93f9af-cd1d-4f1d-bb43-5628003eeb16",
+    }
+}
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "retry"),
+    [
+        (502, _PROTECTED_502, True),
+        (409, _BINDING_409, True),
+        (503, {"detail": "Session not active"}, True),
+        (425, {}, True),
+        (502, {"detail": "Agent error: 500 boom"}, False),
+        (409, {"detail": "Thread runtime changed"}, False),
+        (404, {"detail": "Thread not found"}, False),
+        (400, {"detail": "bad"}, False),
+    ],
+)
+def test_only_an_attach_in_flight_is_retried(status, body, retry):
+    assert gate.input_retryable(status, body) is retry
+
+
+def test_a_pinned_turn_waits_for_the_attach_and_retries_it(monkeypatch):
+    g = gate.CloudMountSidecarGate(_args("--gate-id", "d7-0123456789"))
+    session = gate.Session("prot", "p", "1", thread="t", lane="pinned")
+    answers = iter(
+        [
+            (409, {}),  # /connection: still attaching
+            (200, {"state": "ready"}),
+            (502, _PROTECTED_502),  # input: protected cloud coming up
+            (409, _BINDING_409),
+            (200, {"accepted": True}),
+        ]
+    )
+    calls: list[tuple[str, str]] = []
+
+    def call(method, path, body=None, **_kw):
+        calls.append((method, path))
+        return next(answers)
+
+    monkeypatch.setattr(g.api, "call", call)
+    monkeypatch.setattr(gate.time, "sleep", lambda _s: None)
+    g.turn(session)
+    assert [m for m, _ in calls] == ["GET", "GET", "POST", "POST", "POST"]
+    assert calls[0][1] == "/api/sessions/t/connection"
+
+
+def test_a_turn_fails_on_an_answer_no_retry_cures(monkeypatch):
+    g = gate.CloudMountSidecarGate(_args("--gate-id", "d7-0123456789"))
+    session = gate.Session("rw", "p", "1", thread="t", lane="stateless")
+    monkeypatch.setattr(g.api, "call", lambda *a, **k: (404, {"detail": "gone"}))
+    with pytest.raises(gate.GateError, match="HTTP 404"):
+        g.turn(session)

@@ -90,6 +90,12 @@ mutating gate.
   .venv/bin/python scripts/k3d-cloud-mount-sidecar-gate.py           # plan
   .venv/bin/python scripts/k3d-cloud-mount-sidecar-gate.py \\
       --run --confirm LOCAL-K3D-DISPOSABLE [--require-protected]
+
+A run that was interrupted, or whose cleanup did not finish, is swept by its
+id (sessions titled with it, projects named after it, its jobs):
+
+  .venv/bin/python scripts/k3d-cloud-mount-sidecar-gate.py \\
+      --run --confirm LOCAL-K3D-DISPOSABLE --sweep --gate-id d7-0123456789
 """
 
 from __future__ import annotations
@@ -684,6 +690,19 @@ PLAN = [
 ]
 
 
+def input_retryable(status: int, body: Any) -> bool:
+    """Whether an input answer means "the session is still attaching": the
+    pinned binding not yet authoritative (409 session_binding_invalid), or
+    the agent's retryable 503 (protected cloud still coming up, a runtime
+    replacing itself) that the orchestrator relays as 502."""
+    text = json.dumps(body) if not isinstance(body, str) else body
+    if status == 409:
+        return "session_binding_invalid" in text
+    if status in (425, 503):
+        return True
+    return status == 502 and '"retryable\\":true' in text.replace(" ", "")
+
+
 def expected_lane(*, protected: bool) -> str:
     """The execution lane thread admission gives a gate session: a
     protected session always runs pinned (its overlay staging is not fenced
@@ -720,6 +739,7 @@ class CloudMountSidecarGate:
         self.objects: set[str] = set()  # plan ConfigMap / credential Secret names
         self.disabled_reader: str | None = None
         self.moved_folders: dict[str, str] = {}  # group folder id -> mountpoint
+        self.swept_threads: list[str] = []
 
     # -- naming ------------------------------------------------------------
     def name(self, label: str) -> str:
@@ -1028,12 +1048,44 @@ class CloudMountSidecarGate:
             session.mount = str(mounts[0].get("name") or "")
         return session
 
-    def turn(self, session: Session) -> None:
-        self.api.ok(
-            "POST",
-            f"/api/persistent/threads/{session.thread}/input",
-            {"content": TURN_PROMPT},
+    def session_ready(self, session: Session) -> bool:
+        """Whether /connection admits a pinned session (409/425: its agent
+        is still attaching), as the D6 gate waits."""
+        status, body = self.api.call(
+            "GET", f"/api/sessions/{session.thread}/connection"
         )
+        if status == 200:
+            return True
+        if status in (409, 425):
+            return False
+        raise GateError(f"/connection answered HTTP {status}: {str(body)[:200]}")
+
+    def turn(self, session: Session) -> None:
+        """One cheap turn. A pinned session is first waited for until its
+        agent has attached; an input that still meets an attach in flight
+        (a binding not yet authoritative, a protected cloud still coming up)
+        is retried, anything else fails."""
+        if session.lane == "pinned":
+            wait_for(
+                f"the {session.label} session admitted by /connection",
+                lambda: self.session_ready(session),
+                timeout=self.args.turn_timeout,
+                interval=5,
+            )
+        deadline = time.monotonic() + self.args.turn_timeout
+        while True:
+            status, body = self.api.call(
+                "POST",
+                f"/api/persistent/threads/{session.thread}/input",
+                {"content": TURN_PROMPT},
+            )
+            if status in (200, 201, 202, 204):
+                return
+            if not input_retryable(status, body) or time.monotonic() > deadline:
+                raise GateError(
+                    f"input to {session.label} -> HTTP {status}: {str(body)[:300]}"
+                )
+            time.sleep(5)
 
     def wait_thread_state(
         self, session: Session, state: str, reason: str | None = None
@@ -1634,13 +1686,21 @@ class CloudMountSidecarGate:
                 return True
             return sql(f"SELECT count(*) FROM threads WHERE id = {lit(thread)}") == "0"
 
-        # A pinned session retires its dedicated agent first, and one still
-        # being created (an engage, a Pod) finishes that before it ends.
+        # A pinned session retires its dedicated agent first, one still
+        # being created (an engage, a Pod) finishes that before it ends, and
+        # a stateless End waits for its folders' drain.
         try:
-            wait_for("session deleted", gone, timeout=600, interval=10)
+            wait_for("session deleted", gone, timeout=900, interval=10)
         except GateError:
             return False
         return True
+
+    def named_projects(self) -> list[str]:
+        # A gate id is d7- and hex digits: no LIKE wildcard in it.
+        rows = sql(
+            f"SELECT id FROM projects WHERE name LIKE {lit(self.gate_id + ' %')}"
+        )
+        return [row for row in rows.splitlines() if _UUID_RE.fullmatch(row)]
 
     def delete_job(self, job: str) -> bool:
         self.api.call("PUT", f"/api/jobs/{job}/cancel")
@@ -1685,16 +1745,18 @@ class CloudMountSidecarGate:
             step(f"move group folder {folder_id} back", moved_back)
         for job in dict.fromkeys([*self.jobs.values(), *self.described_jobs()]):
             step(f"delete job {job}", lambda j=job: self.delete_job(j))
-        for label, project in list(self.projects.items()):
+        labels = {project: label for label, project in self.projects.items()}
+        for project in dict.fromkeys([*self.projects.values(), *self.named_projects()]):
 
             def project_deleted(project=project) -> bool:
                 status, _body = self.api.call("DELETE", f"/api/projects/{project}")
                 return status in (200, 204, 404)
 
+            # A project deletes once no session row names it any more.
             step(
-                f"delete project {label}",
+                f"delete project {labels.get(project, project)}",
                 lambda p=project_deleted: bool(
-                    wait_for("project deleted", p, timeout=300, interval=10)
+                    wait_for("project deleted", p, timeout=600, interval=10)
                 ),
             )
         for problem in problems:
@@ -1715,6 +1777,7 @@ class CloudMountSidecarGate:
         if count != "0":
             left.append(f"{count} projects")
         threads = [s.thread for s in self.sessions.values() if s.thread]
+        threads += [t for t in self.swept_threads if t not in threads]
         selectors = [
             *(f"srw/thread-id={thread}" for thread in threads),
             *(f"srw/job-id={job}" for job in self.jobs.values()),
@@ -1741,6 +1804,21 @@ class CloudMountSidecarGate:
         if self.moved_folders:
             left.append(f"group folders not moved back: {sorted(self.moved_folders)}")
         return left
+
+    def sweep(self) -> int:
+        """Remove what an earlier run of this gate id left behind."""
+        self.swept_threads = self.titled_threads()
+        problems = self.cleanup()
+        try:
+            left = self.residue()
+        except GateError as exc:
+            left = [f"residue check failed: {exc}"]
+        ok = self.report.check(
+            f"sweep {self.gate_id}: nothing is left",
+            not problems and not left,
+            "; ".join([*problems, *left]),
+        )
+        return 0 if ok else 1
 
     # -- run -------------------------------------------------------------------
     def run(self) -> int:
@@ -1820,6 +1898,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="fail when protected cloud mode is off instead of skipping",
     )
     parser.add_argument("--keep", action="store_true", help="skip cleanup")
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="only remove what an earlier run of --gate-id left behind",
+    )
     return parser
 
 
@@ -1832,6 +1915,8 @@ def validate(args: argparse.Namespace) -> None:
         raise SafetyError("--confirm is accepted only with --run")
     if args.gate_id is not None and not _GATE_ID_RE.fullmatch(args.gate_id):
         raise SafetyError("--gate-id must be d7- followed by 10 hex digits")
+    if args.sweep and (not args.run or args.gate_id is None or args.keep):
+        raise SafetyError("--sweep needs --run, --confirm and --gate-id, not --keep")
     if not _MODEL_RE.fullmatch(args.model):
         raise SafetyError("model id is malformed")
     if not _USER_RE.fullmatch(args.user):
@@ -1854,7 +1939,8 @@ def main(argv: list[str] | None = None) -> int:
         for step in PLAN:
             print(f"  - {step}")
         return 0
-    return CloudMountSidecarGate(args).run()
+    gate = CloudMountSidecarGate(args)
+    return gate.sweep() if args.sweep else gate.run()
 
 
 if __name__ == "__main__":
