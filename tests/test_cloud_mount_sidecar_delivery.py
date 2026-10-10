@@ -1,0 +1,432 @@
+"""After a sidecar Pod is created: what attach, End and the owner see (D7).
+
+* the cloud payload of a Pod with a recorded plan is the sidecar payload,
+  never an in-workspace mount, whatever the thread's rows say now;
+* an agent image from before the in-pod plane gets no cloud payload it
+  would misread (no in-workspace mount, sync or legacy session folder, and
+  no degraded flag that would stop a stateless turn), and the state says so;
+* the mount state is checked against the plan and the closed sets, merged
+  only into the record of the same plan, and never shows the plan's remotes
+  to the owner.
+"""
+
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+from uuid import uuid4
+
+import pytest
+
+from orchestrator.services import agent_cloud_mounts, cloud_mount_status
+from orchestrator.services.cloud_mount_plan import CloudMountPlan, SidecarMount
+from orchestrator.services.cloud_mount_sidecar import PLAN_CONTEXT_KEY
+from orchestrator.services.thread_projection import redact_thread_metadata
+from tests import test_persistent_recycler_real_postgres as authority
+
+db = authority.db
+pg_dsn = authority.pg_dsn
+_schema_applied = authority._schema_applied
+
+THREAD_ID = "88888888-8888-4888-8888-888888888888"
+POD_UID = "99999999-9999-4999-8999-999999999999"
+
+
+def _plan() -> CloudMountPlan:
+    mount = SidecarMount(
+        index=0,
+        name="project",
+        mount_id="row-project",
+        mount_kind="project",
+        source_ref="project-1",
+        backend="nextcloud",
+        access="read_write",
+        source_type="webdav",
+        source_config=(
+            ("url", "http://srw-nextcloud/remote.php/dav/files/agent/project/"),
+            ("user", "agent-service"),
+        ),
+        root="",
+        flags=(),
+    )
+    return CloudMountPlan(
+        mounts=(mount,),
+        excluded=(
+            {"source_ref": "row-x", "mount_kind": "project", "reason": "set_fallback"},
+        ),
+        drain_seconds=60,
+        cache_size="10Gi",
+        passwords={0: "secret"},
+    )
+
+
+def _metadata(status: str = "ready", incarnation: str = POD_UID) -> dict:
+    return {
+        "workspace_container": {
+            "status": status,
+            "pod_ip": "10.0.0.9",
+            "_runtime_incarnation": POD_UID,
+            PLAN_CONTEXT_KEY: {
+                **_plan().recorded(),
+                "runtime_incarnation": incarnation,
+            },
+        }
+    }
+
+
+def _deps() -> agent_cloud_mounts.AgentCloudMountDependencies:
+    return agent_cloud_mounts.AgentCloudMountDependencies(
+        store=SimpleNamespace(),
+        cloud_router=SimpleNamespace(),
+        cloud_tasks=SimpleNamespace(),
+        is_protected_cloud_mode_enabled=lambda: True,
+        cloud_workspace_driver=lambda: "rclone_mount",
+        slugify_mount_name=lambda name: name,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The attach payload
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_sidecar_pod_gets_the_sidecar_payload_whatever_the_rows_say(
+    monkeypatch,
+):
+    rows_builder = AsyncMock()
+    monkeypatch.setattr(agent_cloud_mounts, "_resolve_live_mount_set", rows_builder)
+    payload = await agent_cloud_mounts._build_agent_cloud_mount(
+        {"id": THREAD_ID},
+        mount_rows=[{"backend_id": "nextcloud", "cloud_handle": "h"}],
+        metadata=_metadata(),
+        dependencies=_deps(),
+    )
+    assert payload["delivery"] == "sidecar"
+    assert [m["workspace_name"] for m in payload["mounts"]] == ["project"]
+    assert "secret" not in json.dumps(payload)
+    rows_builder.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_sidecar_pod_not_ready_gets_nothing_and_another_pods_plan_is_ignored(
+    monkeypatch,
+):
+    assert (
+        await agent_cloud_mounts._build_agent_cloud_mount(
+            {"id": THREAD_ID},
+            mount_rows=[],
+            metadata=_metadata(status="creating"),
+            dependencies=_deps(),
+        )
+        is None
+    )
+    # A plan recorded for an earlier Pod: this Pod is on the in-workspace path.
+    monkeypatch.setattr(
+        agent_cloud_mounts,
+        "_runtime_supports_rclone_mount",
+        lambda metadata, dependencies: True,
+    )
+    monkeypatch.setattr(
+        agent_cloud_mounts, "container_denies_fuse", AsyncMock(return_value=False)
+    )
+    live = agent_cloud_mounts.LiveMountSet(
+        mounts=[{"workspace_name": "x"}], fallback=False, excluded=[]
+    )
+    monkeypatch.setattr(
+        agent_cloud_mounts, "_resolve_live_mount_set", AsyncMock(return_value=live)
+    )
+    payload = await agent_cloud_mounts._build_agent_cloud_mount(
+        {"id": THREAD_ID},
+        mount_rows=[],
+        metadata=_metadata(incarnation="00000000-0000-4000-8000-000000000000"),
+        dependencies=_deps(),
+    )
+    assert payload["driver"] == "rclone" and "delivery" not in payload
+
+
+@pytest.mark.asyncio
+async def test_end_reconstructs_the_sidecar_payload_only_for_the_exact_retiring_runtime(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        agent_cloud_mounts,
+        "_runtime_supports_terminal_rclone_retirement",
+        lambda *args, **kwargs: False,
+    )
+    assert (
+        await agent_cloud_mounts._build_agent_cloud_mount(
+            {"id": THREAD_ID},
+            mount_rows=[],
+            metadata=_metadata(),
+            terminal_retirement_token=7,
+            dependencies=_deps(),
+        )
+        is None
+    )
+    monkeypatch.setattr(
+        agent_cloud_mounts,
+        "_runtime_supports_terminal_rclone_retirement",
+        lambda *args, **kwargs: True,
+    )
+    payload = await agent_cloud_mounts._build_agent_cloud_mount(
+        {"id": THREAD_ID},
+        mount_rows=[],
+        metadata=_metadata(),
+        terminal_retirement_token=7,
+        dependencies=_deps(),
+    )
+    assert payload["delivery"] == "sidecar"
+
+
+# --------------------------------------------------------------------------- #
+# The workspace poll, new agent and old agent
+# --------------------------------------------------------------------------- #
+
+
+async def _poll(header: str | None) -> dict:
+    """The real delivery under the application's composition, with the cloud
+    payload of a sidecar Pod."""
+    import orchestrator.main as orch_main
+    from orchestrator.application import preparation as preparation_composition
+    from orchestrator.services import (
+        dispatch_credentials,
+        session_config_resolution,
+        thread_mount_rows,
+        thread_project_authorization,
+        thread_workspace_delivery,
+        workspace_tier_policy,
+    )
+
+    sidecar = agent_cloud_mounts.agent_payload(_plan().recorded())
+    thread = {
+        "id": THREAD_ID,
+        "user_id": None,
+        "project_id": None,
+        "status": "active",
+        "execution_lane": "stateless",
+        "runtime_generation": str(uuid4()),
+        "runtime_retirement_token": None,
+        "nc_session_folder": 'nextcloud:{"path": "sessions/x"}',
+        "metadata": {"workspace_container": {"status": "ready", "pod_ip": "10.0.0.9"}},
+    }
+    resources = orch_main.app.state.resources
+    with (
+        patch.object(
+            resources.postgres_db, "get_thread", AsyncMock(return_value=thread)
+        ),
+        patch.object(
+            resources.postgres_db, "list_thread_mounts", AsyncMock(return_value=[])
+        ),
+        patch.object(
+            thread_mount_rows, "thread_project_ids", AsyncMock(return_value=[])
+        ),
+        patch.object(
+            thread_project_authorization,
+            "revalidate_thread_project_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch.object(
+            thread_mount_rows,
+            "resolve_thread_datasources",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(
+            thread_mount_rows,
+            "resolve_thread_repositories",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(
+            thread_workspace_delivery,
+            "agent_canvas_workspace_capabilities",
+            return_value=(False, False, False),
+        ),
+        patch.object(
+            agent_cloud_mounts,
+            "_build_agent_cloud_mount",
+            AsyncMock(return_value=sidecar),
+        ),
+        patch.object(
+            agent_cloud_mounts,
+            "_build_agent_cloud_sync",
+            return_value={"version": 2, "mounts": []},
+        ),
+        patch.object(
+            preparation_composition,
+            "cloud_workspace_driver",
+            return_value="rclone_mount",
+        ),
+        patch.object(
+            resources,
+            "main_cloud_router",
+            SimpleNamespace(active=SimpleNamespace(is_initialized=True)),
+        ),
+        patch.object(
+            session_config_resolution,
+            "resolve_session_config",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(
+            dispatch_credentials,
+            "inject_thread_dispatch_credentials",
+            AsyncMock(side_effect=lambda value, **_kwargs: value),
+        ),
+        patch.object(
+            workspace_tier_policy,
+            "inject_lite_workspace_config",
+            side_effect=lambda value, **_kwargs: value,
+        ),
+        patch(
+            "orchestrator.services.thread_workspace_delivery.thread_runtime_refusal_detail",
+            return_value=None,
+        ),
+    ):
+        return await thread_workspace_delivery.agent_get_thread_workspace_locked(
+            THREAD_ID,
+            presented_cloud_mount_delivery=header,
+            dependencies=preparation_composition.thread_workspace_delivery_dependencies(
+                resources
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_new_agent_gets_the_sidecar_payload_and_nothing_else_for_the_cloud():
+    response = await _poll("sidecar")
+    assert response["cloud_mount_sidecar"]["delivery"] == "sidecar"
+    assert response["cloud_mount"] is None
+    assert response["cloud_sync"] is None
+    assert response["nc_session_folder"] is None
+    assert response["cloud_sync_degraded"] is False
+    assert response["cloud_mount_agent_outdated"] is False
+
+
+@pytest.mark.asyncio
+async def test_an_older_agent_gets_no_cloud_payload_it_would_misread():
+    """What an agent image from before D7 receives. Its attach code reads
+    cloud_mount, cloud_sync, nc_session_folder and cloud_sync_degraded and
+    ignores unknown keys: with all four empty it builds no mount manager and
+    no sync coordinator, and (no degraded flag) a stateless turn is not
+    refused. The folders stay usable under /cloud; the state says why the
+    agent does not manage them."""
+    response = await _poll(None)
+    assert response["cloud_mount"] is None
+    assert response["cloud_sync"] is None
+    assert response["nc_session_folder"] is None
+    assert response["cloud_sync_degraded"] is False
+    assert response["cloud_mount_agent_outdated"] is True
+
+
+@pytest.mark.asyncio
+async def test_an_older_agent_is_recorded_and_the_poll_never_fails():
+    merges: list[dict] = []
+
+    class _Store:
+        async def merge_thread_cloud_mount_status(self, thread_id, **kwargs):
+            merges.append(kwargs)
+            raise RuntimeError("database away")
+
+    await cloud_mount_status.record_agent_outdated(
+        _Store(), THREAD_ID, {"fingerprint": "f" * 64}
+    )
+    assert merges[0]["notice"] == "agent_outdated" and merges[0]["mounts"] == {}
+    await cloud_mount_status.record_agent_outdated(SimpleNamespace(), THREAD_ID, {})
+
+
+# --------------------------------------------------------------------------- #
+# The state
+# --------------------------------------------------------------------------- #
+
+
+def test_a_new_pods_state_is_pending_and_names_what_was_left_out():
+    status = cloud_mount_status.initial_status(_plan().recorded(), POD_UID, now="t")
+    assert status["mounts"] == {
+        "project": {
+            "mount_kind": "project",
+            "target_path": "/cloud/project",
+            "access": "read_write",
+            "state": "pending",
+            "reason": None,
+            "reported_by": "orchestrator",
+            "updated_at": "t",
+        }
+    }
+    assert status["excluded"] == [
+        {"source_ref": "row-x", "mount_kind": "project", "reason": "set_fallback"}
+    ]
+    assert "srw-nextcloud" not in json.dumps(status)
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        [{"name": "other", "state": "mounted"}],
+        [{"name": "project", "state": "broken"}],
+        [{"name": "project", "state": "unavailable", "reason": "401 Unauthorized"}],
+        [{"name": "project", "state": "mounted", "reason": "timeout"}],
+        "not a list",
+    ],
+)
+def test_a_report_outside_the_plan_or_the_closed_sets_is_refused(report):
+    with pytest.raises(ValueError):
+        cloud_mount_status.report_entries(_plan().recorded(), report)
+
+
+def test_a_report_becomes_the_agents_entries():
+    entries = cloud_mount_status.report_entries(
+        _plan().recorded(),
+        [{"name": "project", "state": "unavailable", "reason": "credential_rejected"}],
+        now="t",
+    )
+    assert entries["project"]["state"] == "unavailable"
+    assert entries["project"]["reason"] == "credential_rejected"
+    assert entries["project"]["reported_by"] == "agent"
+
+
+def test_the_owner_never_sees_the_plans_remotes():
+    record = {"metadata": {**_metadata(), "cloud_mount_status": {"version": 1}}}
+    redacted = redact_thread_metadata(record)["metadata"]
+    assert PLAN_CONTEXT_KEY not in redacted["workspace_container"]
+    assert redacted["cloud_mount_status"] == {"version": 1}
+    assert "agent-service" not in json.dumps(redacted)
+
+
+@pytest.mark.asyncio
+async def test_the_state_merges_only_into_the_same_plan_on_postgres(db):
+    thread_id = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO threads (id,status,execution_lane,metadata) "
+            "VALUES ($1,'active','stateless','{\"keep\": 1}'::jsonb)",
+            thread_id,
+        )
+    recorded = _plan().recorded()
+    assert await cloud_mount_status.record_pod(db, str(thread_id), recorded, POD_UID)
+    entries = cloud_mount_status.report_entries(
+        recorded, [{"name": "project", "state": "mounted"}]
+    )
+    assert await cloud_mount_status.record_report(
+        db, str(thread_id), fingerprint=recorded["fingerprint"], entries=entries
+    )
+    assert not await cloud_mount_status.record_report(
+        db, str(thread_id), fingerprint="0" * 64, entries=entries
+    )
+    await cloud_mount_status.record_agent_outdated(
+        db, str(thread_id), {"fingerprint": recorded["fingerprint"]}
+    )
+    async with db.acquire() as conn:
+        metadata = json.loads(
+            await conn.fetchval("SELECT metadata FROM threads WHERE id=$1", thread_id)
+        )
+    status = metadata["cloud_mount_status"]
+    assert metadata["keep"] == 1
+    assert status["mounts"]["project"]["state"] == "mounted"
+    assert status["notice"] == "agent_outdated"
+    assert status["excluded"][0]["reason"] == "set_fallback"
+    assert await cloud_mount_status.record_pod(db, str(thread_id), None, POD_UID)
+    async with db.acquire() as conn:
+        metadata = json.loads(
+            await conn.fetchval("SELECT metadata FROM threads WHERE id=$1", thread_id)
+        )
+    assert "cloud_mount_status" not in metadata and metadata["keep"] == 1

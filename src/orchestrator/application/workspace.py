@@ -11,6 +11,7 @@ import asyncio
 import functools
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from orchestrator.application import (
@@ -40,6 +41,7 @@ from orchestrator.schemas.thread_admission import ThreadCreateRequest, TrustedTh
 from orchestrator.services import (
     agent_cloud_mounts,
     agent_provisioner as agent_provisioner_module,
+    cloud_mount_plan,
     container_provisioner as container_provisioner_module,
     deployment_gates,
     grant_enforcement,
@@ -67,6 +69,7 @@ from orchestrator.services import (
     workspace_suspension,
     workspace_tier_policy,
 )
+from orchestrator.services.in_pod_mount import InPodPlaneSettings
 
 logger = logging.getLogger(__name__)
 
@@ -294,6 +297,30 @@ def agent_cloud_mount_dependencies(
         cloud_workspace_driver=preparation_composition.cloud_workspace_driver,
         slugify_mount_name=thread_mount_rows.slugify_mount_name,
     )
+
+
+def cloud_mount_planner(
+    resources: ApplicationResources,
+) -> Callable[[str], Awaitable[cloud_mount_plan.CloudMountPlan | None]]:
+    """The container provisioner's planner of a new session Pod's cloud
+    mounts (connector drivers D7). It reads the thread and its mount rows at
+    call time and builds the cloud payload's collaborators per call, as
+    every other cloud build does; the in-pod plane's settings are read from
+    the environment each time too."""
+
+    async def plan(thread_id: str) -> cloud_mount_plan.CloudMountPlan | None:
+        store = resources.postgres_db
+        thread = await store.get_thread(thread_id)
+        if not thread:
+            return None
+        return await cloud_mount_plan.resolve_cloud_mount_plan(
+            thread,
+            mount_rows=await store.list_thread_mounts(thread_id),
+            settings=InPodPlaneSettings.from_env(),
+            dependencies=agent_cloud_mount_dependencies(resources),
+        )
+
+    return plan
 
 
 def protected_cloud_engage_dependencies(

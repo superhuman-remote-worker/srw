@@ -14,7 +14,7 @@ container:
       drivers/fuse-opener) opens /dev/fuse, mounts it and hands the
       descriptor to an unprivileged rclone sidecar through rclone's
       fusermount3 (the _FUSE_COMMFD protocol); the Pod is the one
-      src/orchestrator/services/in_pod_mount.py builds
+      src/orchestrator/services/in_pod_mount.py built (frozen below)
   b1  b, but rclone serves the magic /dev/fd/3 mountpoint
       (srw-fuse-opener exec), with and without --allow-non-empty
 
@@ -425,6 +425,163 @@ def pod_a(name: str, upstream_image: str, *, term_delay: int = 0) -> dict:
     return pod
 
 
+# The sidecar pair the prototype builder (in_pod_mount.py, 2026-10-08) made,
+# frozen here: D7 proper replaced that builder with a multi-mount one whose
+# supervisor has no startup probe, so the decision's evidence keeps its own
+# copy of the Pod it measured. The opener's single-target command line is
+# unchanged in the D7 proper binary.
+SOCKET_DIR = "/run/srw-fuse"
+SOCKET_PATH = f"{SOCKET_DIR}/opener.sock"
+PROTOTYPE_CLOUD_ROOT = "/srw/cloud"
+WORKSPACE_CLOUD_ROOT = "/cloud"
+
+
+def prototype_sidecars(
+    pod: dict, *, name: str, secret_name: str, remote: str, opener: str, rclone: str
+) -> None:
+    """Add the prototype's opener and rclone sidecars (read-only mount)."""
+    target = f"{PROTOTYPE_CLOUD_ROOT}/{name}"
+    spec = pod["spec"]
+    spec.setdefault("initContainers", []).extend(
+        [
+            {
+                "name": "srw-fuse-opener",
+                "image": opener,
+                "restartPolicy": "Always",
+                "args": [
+                    "serve",
+                    "--socket",
+                    SOCKET_PATH,
+                    "--target",
+                    target,
+                    "--client-uid",
+                    "65534",
+                    "--read-only",
+                ],
+                "resources": {
+                    "requests": {"cpu": "5m", "memory": "8Mi"},
+                    "limits": {"cpu": "100m", "memory": "32Mi"},
+                },
+                "securityContext": {"privileged": True},
+                "volumeMounts": [
+                    {
+                        "name": "srw-cloud",
+                        "mountPath": PROTOTYPE_CLOUD_ROOT,
+                        "mountPropagation": "Bidirectional",
+                    },
+                    {"name": "srw-fuse-socket", "mountPath": SOCKET_DIR},
+                ],
+                "startupProbe": {
+                    "exec": {
+                        "command": [
+                            "/srw-fuse-opener",
+                            "ping",
+                            "--socket",
+                            SOCKET_PATH,
+                        ]
+                    },
+                    "periodSeconds": 1,
+                    "failureThreshold": 30,
+                },
+            },
+            {
+                "name": "srw-cloud-mount",
+                "image": rclone,
+                "restartPolicy": "Always",
+                "command": ["rclone"],
+                "args": [
+                    "mount2",
+                    remote,
+                    target,
+                    "--config",
+                    "/etc/srw-cloud/rclone.conf",
+                    "--cache-dir",
+                    "/tmp/rclone",
+                    "--allow-other",
+                    "--allow-non-empty",
+                    "--uid",
+                    "1000",
+                    "--gid",
+                    "1000",
+                    "--umask",
+                    "022",
+                    "--read-only",
+                ],
+                "env": [{"name": "HOME", "value": "/tmp"}],
+                "resources": {
+                    "requests": {"cpu": "10m", "memory": "32Mi"},
+                    "limits": {"cpu": "500m", "memory": "256Mi"},
+                },
+                "securityContext": {
+                    "runAsUser": 65534,
+                    "runAsGroup": 65534,
+                    "runAsNonRoot": True,
+                    "allowPrivilegeEscalation": False,
+                    "readOnlyRootFilesystem": True,
+                    "capabilities": {"drop": ["ALL"]},
+                    "seccompProfile": {"type": "RuntimeDefault"},
+                },
+                "volumeMounts": [
+                    {
+                        "name": "srw-cloud",
+                        "mountPath": PROTOTYPE_CLOUD_ROOT,
+                        "readOnly": True,
+                        "mountPropagation": "HostToContainer",
+                    },
+                    {
+                        "name": "srw-fuse-socket",
+                        "mountPath": SOCKET_DIR,
+                        "readOnly": True,
+                    },
+                    {
+                        "name": "srw-cloud-credential",
+                        "mountPath": "/etc/srw-cloud",
+                        "readOnly": True,
+                    },
+                    {"name": "srw-cloud-tmp", "mountPath": "/tmp"},
+                ],
+                "startupProbe": {
+                    "exec": {
+                        "command": ["srw-fuse-opener", "check", "--target", target]
+                    },
+                    "periodSeconds": 1,
+                    "failureThreshold": 60,
+                },
+            },
+        ]
+    )
+    spec.setdefault("volumes", []).extend(
+        [
+            {"name": "srw-cloud", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}},
+            {
+                "name": "srw-fuse-socket",
+                "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"},
+            },
+            {
+                "name": "srw-cloud-credential",
+                "secret": {
+                    "secretName": secret_name,
+                    "items": [{"key": "rclone.conf", "path": "rclone.conf"}],
+                    "defaultMode": 0o444,
+                },
+            },
+            {
+                "name": "srw-cloud-tmp",
+                "emptyDir": {"medium": "Memory", "sizeLimit": "64Mi"},
+            },
+        ]
+    )
+    workspace = next(c for c in spec["containers"] if c["name"] == "workspace")
+    workspace.setdefault("volumeMounts", []).append(
+        {
+            "name": "srw-cloud",
+            "mountPath": WORKSPACE_CLOUD_ROOT,
+            "readOnly": True,
+            "mountPropagation": "HostToContainer",
+        }
+    )
+
+
 def pod_b(
     name: str,
     opener_image: str,
@@ -435,27 +592,23 @@ def pod_b(
     allow_non_empty: bool = True,
     privileged_workspace: bool = False,
 ) -> dict:
-    """Approach b: the Pod SRW's prototype builder makes, plus debug logging."""
-    if str(ROOT / "src") not in sys.path:
-        sys.path.insert(0, str(ROOT / "src"))
-    from orchestrator.services import in_pod_mount as plane
-
-    workspace = workspace_container(
-        plane.WORKSPACE_CLOUD_ROOT, "root", term_delay=term_delay
-    )
+    """Approach b: the Pod the prototype builder made, plus debug logging."""
+    workspace = workspace_container(WORKSPACE_CLOUD_ROOT, "root", term_delay=term_delay)
     pod = base_pod(name, "b1" if devfd else "b", workspace)
-    mount = plane.CloudMountSidecar(
-        name="root", secret_name="cloud-credential", remote="cloud:"
-    )
-    plane.add_cloud_mount_sidecars(
-        pod, mount, plane.InPodPlaneImages(opener=opener_image, rclone=rclone_image)
+    prototype_sidecars(
+        pod,
+        name="root",
+        secret_name="cloud-credential",
+        remote="cloud:",
+        opener=opener_image,
+        rclone=rclone_image,
     )
     if privileged_workspace:
         # Today's FUSE profile, with a root process inside it: what the
         # builder refuses, set afterwards to measure why.
         workspace["securityContext"] = {"privileged": True}
     rclone = next(
-        c for c in pod["spec"]["initContainers"] if c["name"] == plane.RCLONE_CONTAINER
+        c for c in pod["spec"]["initContainers"] if c["name"] == "srw-cloud-mount"
     )
     if not allow_non_empty:
         rclone["args"].remove("--allow-non-empty")
@@ -467,11 +620,12 @@ def pod_b(
             "srw-fuse-opener",
             "exec",
             "--socket",
-            plane.SOCKET_PATH,
+            SOCKET_PATH,
             "--",
             "rclone",
         ]
-        rclone["args"][rclone["args"].index(mount.target)] = "/dev/fd/3"
+        target = f"{PROTOTYPE_CLOUD_ROOT}/root"
+        rclone["args"][rclone["args"].index(target)] = "/dev/fd/3"
     return pod
 
 

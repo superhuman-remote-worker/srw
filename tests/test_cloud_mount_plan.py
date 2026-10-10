@@ -1,0 +1,539 @@
+"""A session Pod's cloud mounts from the in-pod plane (connector drivers D7).
+
+What the plan must hold to: it is the in-pod plane wholesale or not at all,
+it never carries a password outside the credential file, the file is what
+rclone itself would write, every row the set rule left out is named with a
+closed reason, and what the supervisor and the agent receive matches their
+contracts (drivers/cloud-mount, the agent's sidecar payload).
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from orchestrator.services import agent_cloud_mounts, cloud_mount_plan
+from orchestrator.services.cloud_mount_plan import (
+    CloudMountPlan,
+    rclone_obscure,
+    rclone_reveal,
+    resolve_cloud_mount_plan,
+)
+from orchestrator.services.cloud_mount_sidecar import (
+    PLAN_ANNOTATION,
+    PLAN_CONTEXT_KEY,
+    agent_payload,
+    recorded_plan_from_annotations,
+    recorded_sidecar_plan,
+)
+from orchestrator.services.in_pod_mount import InPodPlaneSettings
+
+ROOT = Path(__file__).resolve().parents[1]
+THREAD_ID = "33333333-3333-4333-8333-333333333333"
+POD_UID = "44444444-4444-4444-8444-444444444444"
+SETTINGS = InPodPlaneSettings(
+    opener_image="registry.example/srw-fuse-opener:1@sha256:" + "1" * 64,
+    rclone_image="registry.example/srw-cloud-mount:1@sha256:" + "2" * 64,
+    cache_size="10Gi",
+    drain_seconds=60,
+    max_mounts=8,
+)
+PASSWORD = "-Yi9OE p@ss/wörd"
+
+
+def _deps(
+    driver: str = "rclone_mount",
+) -> agent_cloud_mounts.AgentCloudMountDependencies:
+    return agent_cloud_mounts.AgentCloudMountDependencies(
+        store=SimpleNamespace(),
+        cloud_router=SimpleNamespace(),
+        cloud_tasks=SimpleNamespace(),
+        is_protected_cloud_mode_enabled=lambda: True,
+        cloud_workspace_driver=lambda: driver,
+        slugify_mount_name=lambda name: name.lower(),
+    )
+
+
+def _entry(name: str = "project", **over) -> dict:
+    """A built rclone mount, as _build_rclone_mount_from_row returns it."""
+    entry = {
+        "mount_id": f"row-{name}",
+        "mount_kind": "project",
+        "backend": "nextcloud",
+        "target_path": f"/cloud/{name}",
+        "workspace_name": name,
+        "access": "read_write",
+        "source_ref": f"project-{name}",
+        "source": {
+            "type": "webdav",
+            "config": {
+                "url": f"http://srw-nextcloud/remote.php/dav/files/agent/{name}/",
+                "vendor": "nextcloud",
+                "user": "agent-service",
+            },
+        },
+        "auth": {"type": "basic", "password": PASSWORD},
+        "provider_flags": [],
+        "cache": {"vfs_cache_mode": "full", "vfs_cache_max_size": "10G"},
+        "required_capabilities": ["rclone", "fuse", "rc"],
+    }
+    entry.update(over)
+    return entry
+
+
+def _thread(**metadata) -> dict:
+    return {"id": THREAD_ID, "metadata": metadata}
+
+
+async def _resolve(monkeypatch, entries, excluded=(), thread=None, **kw):
+    live = agent_cloud_mounts.LiveMountSet(
+        mounts=list(entries), fallback=bool(excluded), excluded=list(excluded)
+    )
+    monkeypatch.setattr(
+        agent_cloud_mounts,
+        "_resolve_live_mount_set",
+        AsyncMock(return_value=live),
+    )
+    return await resolve_cloud_mount_plan(
+        thread or _thread(),
+        mount_rows=[],
+        settings=kw.pop("settings", SETTINGS),
+        dependencies=kw.pop("dependencies", _deps()),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Obscuring: what rclone itself writes
+# --------------------------------------------------------------------------- #
+
+
+def test_obscure_matches_rclone_both_ways():
+    # Produced by `rclone obscure -- '-Yi9OE p@ss/wörd'` (rclone 1.74.3).
+    assert rclone_reveal("AZBCWD7iYB3yNtHVaQfCeNBas-2YsKX13CDfQ8OlK2q4") == PASSWORD
+    # `rclone reveal` of this (IV 00..0f) printed the password back.
+    assert (
+        rclone_obscure(PASSWORD, iv=bytes(range(16)))
+        == "AAECAwQFBgcICQoLDA0ODyzGDhxIl2D6jVJ7SnMjeVBU"
+    )
+    first, second = rclone_obscure(PASSWORD), rclone_obscure(PASSWORD)
+    assert first != second and rclone_reveal(first) == rclone_reveal(second) == PASSWORD
+
+
+# --------------------------------------------------------------------------- #
+# Who gets the plane
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_static_password_mounts_get_the_plane(monkeypatch):
+    plan = await _resolve(monkeypatch, [_entry("project"), _entry("home")])
+    assert [m.name for m in plan.mounts] == ["project", "home"]
+    assert [m.remote for m in plan.mounts] == ["m0:", "m1:"]
+    assert [m.target for m in plan.mounts] == ["/srw/cloud/project", "/srw/cloud/home"]
+    assert plan.passwords == {0: PASSWORD, 1: PASSWORD}
+    assert plan.protected is False and plan.excluded == ()
+
+
+@pytest.mark.asyncio
+async def test_an_empty_set_is_still_the_plane(monkeypatch):
+    plan = await _resolve(monkeypatch, [])
+    assert plan is not None and plan.mounts == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("why", "kwargs"),
+    [
+        ("plane off", {"settings": None}),
+        ("sync driver", {"dependencies": _deps(driver="sync")}),
+        ("officer", {"thread": _thread(config_override={"officer": {"post": "x"}})}),
+        ("protected", {"thread": _thread(protected_cloud=True)}),
+        ("malformed protected marker", {"thread": _thread(protected_cloud="yes")}),
+    ],
+)
+async def test_opted_out_sessions_keep_the_old_path(monkeypatch, why, kwargs):
+    assert await _resolve(monkeypatch, [_entry()], **kwargs) is None, why
+
+
+@pytest.mark.asyncio
+async def test_containers_without_rclone_keep_the_old_path(monkeypatch):
+    monkeypatch.setenv("CLOUD_RCLONE_ALLOW_CONTAINER", "false")
+    assert await _resolve(monkeypatch, [_entry()]) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "broken",
+    [
+        # OpenCloud: a bearer token the agent refreshes, not a password.
+        {"auth": {"type": "keycloak_client_credentials", "client_secret": "x"}},
+        {"auth": {"type": "basic", "password": ""}},
+        {"auth": {"type": "basic", "password": "line\nbreak"}},
+        {"source": {"type": "s3", "config": {"url": "http://x"}}},
+        {
+            "source": {
+                "type": "webdav",
+                "config": {"url": "http://x", "bearer_token": "t"},
+            }
+        },
+        {"source": {"type": "webdav", "config": {"url": "http://x\n[evil]"}}},
+        {"min_rclone_version": "1.70.0"},
+        {"provider_flags": ["--rc-addr", ":5572"]},
+        {"provider_flags": ["--config=/tmp/x"]},
+        {"workspace_name": ".hidden"},
+    ],
+)
+async def test_a_mount_needing_more_than_a_password_keeps_the_whole_pod_on_the_old_path(
+    monkeypatch, broken
+):
+    assert await _resolve(monkeypatch, [_entry("ok"), _entry("bad", **broken)]) is None
+
+
+@pytest.mark.asyncio
+async def test_left_out_rows_are_named_and_extra_mounts_capped(monkeypatch):
+    excluded = [
+        {
+            "source_ref": "row-a",
+            "mount_kind": "project",
+            "reason": "unbuildable",
+            "detail": "not_supported",
+        },
+        {"source_ref": "row-b", "mount_kind": "project", "reason": "set_fallback"},
+    ]
+    settings = InPodPlaneSettings(
+        opener_image=SETTINGS.opener_image,
+        rclone_image=SETTINGS.rclone_image,
+        max_mounts=2,
+    )
+    plan = await _resolve(
+        monkeypatch,
+        [_entry("a"), _entry("b"), _entry("c")],
+        excluded=excluded,
+        settings=settings,
+    )
+    assert [m.name for m in plan.mounts] == ["a", "b"]
+    assert [dict(e) for e in plan.excluded] == [
+        *excluded,
+        {
+            "source_ref": "project-c",
+            "mount_kind": "project",
+            "reason": "too_many_mounts",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_shared_cache_keeps_every_mount_under_half_its_limit(monkeypatch):
+    plan = await _resolve(monkeypatch, [_entry("a"), _entry("b")])
+    flags = list(plan.mounts[0].flags)
+    # 10Gi / 2 / 2 mounts = 2560 MiB each, whatever the spec asked for.
+    assert flags[flags.index("--vfs-cache-max-size") + 1] == "2560M"
+    assert flags[flags.index("--vfs-cache-mode") + 1] == "full"
+    assert "10G" not in flags
+
+
+# --------------------------------------------------------------------------- #
+# The two halves: recorded plan and credential file
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_no_password_leaves_the_credential_file(monkeypatch):
+    plan = await _resolve(monkeypatch, [_entry("project")])
+    for public in (
+        json.dumps(plan.recorded()),
+        json.dumps(plan.supervisor_plan()),
+        json.dumps(plan.digest_input(SETTINGS)),
+        repr(plan),
+        cloud_mount_plan.plan_annotation(plan),
+    ):
+        assert PASSWORD not in public
+    config = plan.rclone_config()
+    assert PASSWORD not in config
+    section = dict(
+        line.split(" = ", 1) for line in config.splitlines() if " = " in line
+    )
+    assert config.startswith("[m0]\ntype = webdav\n")
+    assert section["user"] == "agent-service" and section["vendor"] == "nextcloud"
+    assert rclone_reveal(section["pass"]) == PASSWORD
+
+
+@pytest.mark.asyncio
+async def test_the_recorded_plan_is_deterministic_and_fingerprinted(monkeypatch):
+    first = await _resolve(monkeypatch, [_entry("project")])
+    second = await _resolve(
+        monkeypatch, [_entry("project", auth={"type": "basic", "password": "rotated"})]
+    )
+    # A rotated credential is not a different Pod; a changed source is.
+    assert first.recorded() == second.recorded()
+    third = await _resolve(monkeypatch, [_entry("other")])
+    assert third.recorded()["fingerprint"] != first.recorded()["fingerprint"]
+    other_images = InPodPlaneSettings(
+        opener_image="x@sha256:" + "3" * 64, rclone_image="y"
+    )
+    assert first.digest_input(SETTINGS) != first.digest_input(other_images)
+
+
+@pytest.mark.asyncio
+async def test_the_supervisor_plan_matches_its_go_contract(monkeypatch):
+    plan = await _resolve(monkeypatch, [_entry("project", access="read_only")])
+    supervisor = plan.supervisor_plan()
+    assert set(supervisor) == {"version", "uid", "gid", "drain_seconds", "mounts"}
+    (mount,) = supervisor["mounts"]
+    assert set(mount) == {
+        "index",
+        "name",
+        "remote",
+        "target",
+        "read_only",
+        "flags",
+        "ignore",
+        "cloudignore",
+    }
+    assert mount["read_only"] is True and mount["remote"] == "m0:"
+    # The flag allowlist is the supervisor's own (drivers/cloud-mount/plan.go).
+    go = (ROOT / "drivers/cloud-mount/plan.go").read_text()
+    go_flags = re.search(r"flagRE = regexp.MustCompile\(`\^(.*)\$`\)", go).group(1)
+    assert cloud_mount_plan._FLAG.pattern == go_flags
+
+
+def test_the_sidecar_spec_marks_read_only_targets():
+    mount = cloud_mount_plan.SidecarMount(
+        index=0,
+        name="lower",
+        mount_id="m",
+        mount_kind="protected_lower",
+        source_ref=None,
+        backend="nextcloud",
+        access="read_only",
+        source_type="webdav",
+        source_config=(("url", "http://x"),),
+        root="",
+        flags=(),
+    )
+    plan = CloudMountPlan(
+        mounts=(mount,),
+        excluded=(),
+        drain_seconds=60,
+        cache_size="10Gi",
+        passwords={0: "p"},
+        protected=True,
+        overlay={"merged": "/cloud/merged", "lower": "/cloud/lower"},
+    )
+    spec = plan.sidecar_spec("ws-cloud-x")
+    assert spec.targets == (("/srw/cloud/lower", True),)
+    assert spec.dirs == ("/srw/cloud/merged",) and spec.protected is True
+
+
+# --------------------------------------------------------------------------- #
+# Reading it back
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_pods_annotation_reads_back_only_when_intact(monkeypatch):
+    plan = await _resolve(monkeypatch, [_entry("project")])
+    annotations = {PLAN_ANNOTATION: cloud_mount_plan.plan_annotation(plan)}
+    assert recorded_plan_from_annotations(annotations) == plan.recorded()
+    tampered = json.loads(annotations[PLAN_ANNOTATION])
+    tampered["mounts"][0]["access"] = "read_only"
+    for broken in (
+        {PLAN_ANNOTATION: json.dumps(tampered)},
+        {PLAN_ANNOTATION: "not json"},
+        {},
+        None,
+    ):
+        assert recorded_plan_from_annotations(broken) is None
+
+
+@pytest.mark.asyncio
+async def test_a_recorded_plan_belongs_to_its_pod_only(monkeypatch):
+    plan = await _resolve(monkeypatch, [_entry("project")])
+    recorded = {**plan.recorded(), "runtime_incarnation": POD_UID}
+    metadata = {
+        "workspace_container": {
+            "_runtime_incarnation": POD_UID,
+            PLAN_CONTEXT_KEY: recorded,
+        }
+    }
+    assert recorded_sidecar_plan(metadata) == recorded
+    metadata["workspace_container"]["_runtime_incarnation"] = (
+        "55555555-5555-4555-8555-555555555555"
+    )
+    assert recorded_sidecar_plan(metadata) is None
+    assert recorded_sidecar_plan({"workspace_container": {}}) is None
+
+
+@pytest.mark.asyncio
+async def test_the_agent_payload_carries_no_credential_and_no_remote(monkeypatch):
+    plan = await _resolve(
+        monkeypatch,
+        [_entry("project")],
+        excluded=[
+            {"source_ref": "row-x", "mount_kind": "project", "reason": "set_fallback"}
+        ],
+    )
+    payload = agent_payload(plan.recorded())
+    text = json.dumps(payload)
+    assert (
+        PASSWORD not in text
+        and "agent-service" not in text
+        and "remote.php" not in text
+    )
+    assert payload["delivery"] == "sidecar"
+    assert payload["status_dir"] == "/srw/cloud-status"
+    assert payload["control_dir"] == "/srw/cloud-control"
+    assert payload["mounts"] == [
+        {
+            "index": 0,
+            "mount_id": "row-project",
+            "mount_kind": "project",
+            "target_path": "/cloud/project",
+            "workspace_name": "project",
+            "access": "read_write",
+        }
+    ]
+    assert payload["excluded"][0]["reason"] == "set_fallback"
+
+
+# --------------------------------------------------------------------------- #
+# .cloudignore parity with the workspace manager
+# --------------------------------------------------------------------------- #
+
+
+def test_the_awk_compiler_matches_the_supervisors_vectors(tmp_path):
+    from shared.runtime.services.cloud_mount import _CLOUDIGNORE_HELPERS
+
+    lines = [
+        "# a comment",
+        "",
+        "!keep.txt",
+        "../escape",
+        "a/../b",
+        "/build/",
+        "node_modules",
+        "*.log",
+        "docs/tmp",
+        "/",
+        "dir//",
+        "  spaced  \r",
+        "\tcache/",
+        "/root.txt",
+        "x[0-9]",
+        "sub/dir/",
+    ]
+    source, dest = tmp_path / "in", tmp_path / "out"
+    source.write_text("\n".join(lines) + "\n")
+    dest.write_text("")
+    subprocess.run(
+        [
+            "bash",
+            "-c",
+            _CLOUDIGNORE_HELPERS + f'\ncompile_cloudignore "{source}" "{dest}"\n',
+        ],
+        check=True,
+    )
+    # The same expectation as drivers/cloud-mount's TestCloudignoreCompilesLikeTheWorkspaceManager.
+    assert dest.read_text().splitlines() == [
+        "build/**",
+        "**/build/**",
+        "node_modules",
+        "**/node_modules",
+        "*.log",
+        "docs/tmp",
+        "dir/**",
+        "**/dir/**",
+        "spaced",
+        "**/spaced",
+        "cache/**",
+        "**/cache/**",
+        "root.txt",
+        "**/root.txt",
+        "x[0-9]",
+        "sub/dir/**",
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# The set rule names what it leaves out
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_the_set_rule_names_every_row_it_left_out(monkeypatch):
+    rows = [
+        {
+            "id": f"row-{x}",
+            "backend_id": "nextcloud",
+            "cloud_handle": "h",
+            "mount_kind": "project",
+            "target_path": x,
+        }
+        for x in "abc"
+    ]
+
+    async def build(row, *, workspace_name, runtime_is_vm, dependencies, failures=None):
+        if row["id"] == "row-b":
+            failures.append("not_supported")
+            return None
+        return _entry(workspace_name)
+
+    monkeypatch.setattr(agent_cloud_mounts, "_build_rclone_mount_from_row", build)
+    monkeypatch.setattr(
+        agent_cloud_mounts,
+        "_build_rclone_session_mount",
+        AsyncMock(return_value=_entry("home", mount_kind="session_folder")),
+    )
+    live = await agent_cloud_mounts._resolve_live_mount_set(
+        {"id": THREAD_ID}, mount_rows=rows, runtime_is_vm=False, dependencies=_deps()
+    )
+    assert [m["workspace_name"] for m in live.mounts] == ["home"] and live.fallback
+    assert live.excluded == [
+        {"source_ref": "row-a", "mount_kind": "project", "reason": "set_fallback"},
+        {
+            "source_ref": "row-b",
+            "mount_kind": "project",
+            "reason": "unbuildable",
+            "detail": "not_supported",
+        },
+        {"source_ref": "row-c", "mount_kind": "project", "reason": "set_fallback"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_row_that_cannot_build_says_why_in_a_closed_code():
+    failures: list[str] = []
+    assert (
+        await agent_cloud_mounts._build_rclone_mount_from_row(
+            {"id": "r"}, workspace_name="x", dependencies=_deps(), failures=failures
+        )
+        is None
+    )
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError("secret detail that must not be recorded")
+
+    deps = agent_cloud_mounts.AgentCloudMountDependencies(
+        store=SimpleNamespace(),
+        cloud_router=SimpleNamespace(for_backend_instance=refuse),
+        cloud_tasks=SimpleNamespace(),
+        is_protected_cloud_mode_enabled=lambda: True,
+        cloud_workspace_driver=lambda: "rclone_mount",
+        slugify_mount_name=lambda name: name,
+    )
+    assert (
+        await agent_cloud_mounts._build_rclone_mount_from_row(
+            {"id": "r", "backend_id": "nextcloud", "cloud_handle": "h"},
+            workspace_name="x",
+            dependencies=deps,
+            failures=failures,
+        )
+        is None
+    )
+    assert failures == ["no_transport", "backend_unavailable"]

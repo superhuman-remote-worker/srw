@@ -69,10 +69,20 @@ from orchestrator.services.ssh_helpers import (
 )
 from orchestrator.services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 from orchestrator.services.ide_credentials import IDE_CREDENTIAL_ENV, ide_credential
+from orchestrator.services import cloud_mount_status
+from orchestrator.services.cloud_mount_plan import CloudMountPlan, plan_annotation
+from orchestrator.services.cloud_mount_sidecar import (
+    PLAN_ANNOTATION,
+    PLAN_CONTEXT_KEY,
+    recorded_plan_from_annotations,
+)
 from orchestrator.services.in_pod_mount import (
-    CloudMountSidecar,
-    InPodPlaneImages,
+    CREDENTIAL_KEY,
+    PLAN_KEY,
+    InPodPlaneSettings,
     add_cloud_mount_sidecars,
+    objects_name_for,
+    objects_name_from_pod,
 )
 from orchestrator.services.workspace_lifecycle import (
     SessionWorkspaceObservationYielded,
@@ -705,9 +715,13 @@ class ContainerProvisioner:
         # custom image may take to pull. See sandbox_workspace_settings.
         self._custom_image_policy = SandboxImagePolicy.from_env()
         self._image_pull_timeout: int = self._custom_image_policy.pull_timeout_seconds
-        # Connector drivers D7 (spike prototype): the in-pod plane's mount
-        # sidecar images, None unless connectors.inPodPlane is on.
-        self._in_pod_plane_images = InPodPlaneImages.from_env()
+        # Connector drivers D7: the in-pod plane's settings (None unless
+        # connectors.inPodPlane is on) and the application's planner of a
+        # session Pod's cloud mounts (bound at connect).
+        self._in_pod_plane = InPodPlaneSettings.from_env()
+        self._cloud_mount_planner: (
+            Callable[[str], Awaitable[CloudMountPlan | None]] | None
+        ) = None
 
     @property
     def is_available(self) -> bool:
@@ -758,6 +772,176 @@ class ContainerProvisioner:
             image=image,
         )
 
+    async def _cloud_mount_plan_for(
+        self, owner: WorkspaceOwner
+    ) -> CloudMountPlan | None:
+        """A new session Pod's cloud mounts from the in-pod plane, or ``None``
+        for the in-workspace path (the plane off, a job, an opted-out session,
+        or a planning error: today's behaviour is the safe fallback)."""
+        if (
+            owner.kind != "session"
+            or self._in_pod_plane is None
+            or self._cloud_mount_planner is None
+        ):
+            return None
+        try:
+            return await self._cloud_mount_planner(owner.id)
+        except Exception:
+            logger.exception(
+                "Could not plan the cloud mounts of session %s; it keeps the "
+                "in-workspace mount path",
+                owner.id,
+            )
+            return None
+
+    @staticmethod
+    def _profile_for_cloud_plan(
+        profile: SandboxPodProfile, plan: CloudMountPlan | None
+    ) -> SandboxPodProfile:
+        """A Pod whose cloud mounts all come from the sidecars needs no FUSE in
+        its workspace. A protected Pod keeps it for its capture overlay."""
+        if plan is None or plan.protected:
+            return profile
+        return replace(profile, fuse_enabled=False, fuse_privileged=False)
+
+    def _cloud_plan_digest_input(
+        self, plan: CloudMountPlan | None
+    ) -> dict[str, Any] | None:
+        if plan is None or self._in_pod_plane is None:
+            return None
+        return plan.digest_input(self._in_pod_plane)
+
+    async def _ensure_cloud_mount_objects(
+        self,
+        pod: Any,
+        plan: CloudMountPlan | None,
+        *,
+        owner: WorkspaceOwner,
+    ) -> bool:
+        """Create the plan ConfigMap and the credential Secret, owned by the
+        Pod from birth, so they never outlive it and need no cleanup.
+
+        The Pod references both (not optional): the kubelet retries the
+        volumes until they exist, a second or so. A Pod adopted from another
+        plan keeps the objects its own attempt made. Only ``create`` on
+        Secrets is needed; a 409 is this attempt's own earlier create. The
+        credential is never logged.
+        """
+        if plan is None or not plan.mounts:
+            return True
+        metadata = getattr(pod, "metadata", None)
+        recorded = recorded_plan_from_annotations(
+            getattr(metadata, "annotations", None)
+        )
+        if recorded is None or recorded.get("fingerprint") != plan.recorded().get(
+            "fingerprint"
+        ):
+            return True
+        name = objects_name_from_pod(pod)
+        pod_uid = str(getattr(metadata, "uid", "") or "")
+        if not name or not pod_uid:
+            return False
+        object_metadata = {
+            "name": name,
+            "namespace": self._namespace,
+            "labels": {
+                "app": "srw-workspace",
+                "srw.io/component": "cloud-mount",
+                owner.label_key: owner.id,
+            },
+            "ownerReferences": [
+                {
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "name": str(getattr(metadata, "name", "") or owner.pod_name),
+                    "uid": pod_uid,
+                    "controller": False,
+                    "blockOwnerDeletion": False,
+                }
+            ],
+        }
+        objects = (
+            (
+                "ConfigMap",
+                self._core_api.create_namespaced_config_map,
+                {
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": object_metadata,
+                    "data": {
+                        PLAN_KEY: json.dumps(plan.supervisor_plan(), sort_keys=True)
+                    },
+                },
+            ),
+            (
+                "Secret",
+                self._core_api.create_namespaced_secret,
+                {
+                    "apiVersion": "v1",
+                    "kind": "Secret",
+                    "type": "Opaque",
+                    "immutable": True,
+                    "metadata": object_metadata,
+                    "stringData": {CREDENTIAL_KEY: plan.rclone_config()},
+                },
+            ),
+        )
+        for kind, create, body in objects:
+            try:
+                await self._bounded_kubernetes_mutation(
+                    create, namespace=self._namespace, body=body
+                )
+            except Exception as exc:
+                if getattr(exc, "status", None) == 409:
+                    continue
+                logger.error(
+                    "Could not create the cloud mount %s %s for %s %s (%s %s)",
+                    kind,
+                    name,
+                    owner.kind,
+                    owner.id,
+                    type(exc).__name__,
+                    getattr(exc, "status", ""),
+                )
+                return False
+        return True
+
+    async def _publish_cloud_mount_plan(
+        self, owner: WorkspaceOwner, pod: Any, runtime_incarnation: str
+    ) -> bool:
+        """Record the Pod's own plan (its annotation) on the session, tied to
+        the Pod's UID, before it is published Ready; a Pod without one clears
+        any earlier Pod's plan, so attach never mistakes the delivery."""
+        if owner.kind != "session":
+            return True
+        recorded = recorded_plan_from_annotations(
+            getattr(getattr(pod, "metadata", None), "annotations", None)
+        )
+        if recorded is None and self._in_pod_plane is None:
+            # The plane is off: nothing to record, nothing earlier to clear
+            # (a stale plan never matches this Pod's UID anyway).
+            return True
+        value = (
+            {**recorded, "runtime_incarnation": runtime_incarnation}
+            if recorded is not None
+            else None
+        )
+        if not await self._set_context(owner, {PLAN_CONTEXT_KEY: value}):
+            return False
+        try:
+            # Every planned mount starts pending, every row the plan left out
+            # is named; an in-workspace Pod clears an earlier Pod's record.
+            await cloud_mount_status.record_pod(
+                self._db, owner.id, recorded, runtime_incarnation
+            )
+        except Exception:
+            logger.warning(
+                "Could not record the cloud mount state of session %s",
+                owner.id,
+                exc_info=True,
+            )
+        return True
+
     # =========================================================================
     # Lifecycle
     # =========================================================================
@@ -768,6 +952,7 @@ class ContainerProvisioner:
         *,
         profile: SandboxPodProfile,
         stateless_creation_generation: str | None,
+        cloud_plan: CloudMountPlan | None = None,
     ) -> dict[str, Any]:
         """Resolve every physical input before reserving a generation."""
 
@@ -811,6 +996,11 @@ class ContainerProvisioner:
         extension = profile.plan_extension()
         if extension is not None:
             plan["sandbox"] = extension
+        # Present only for a Pod with the in-pod plane, so every other Pod's
+        # digest stays byte-identical (as plan_extension does for A1).
+        cloud_mounts = self._cloud_plan_digest_input(cloud_plan)
+        if cloud_mounts is not None:
+            plan["cloud_mounts"] = cloud_mounts
         plan["digest"] = _canonical_manifest_digest(plan)
         return plan
 
@@ -853,15 +1043,22 @@ class ContainerProvisioner:
         self,
         db: Any,
         snapshot_service: Optional[Any] = None,
+        cloud_mount_planner: (
+            Callable[[str], Awaitable[CloudMountPlan | None]] | None
+        ) = None,
     ) -> None:
         """Initialize the provisioner.
 
         Args:
             db: PostgresDB instance for job context updates.
             snapshot_service: Optional SnapshotService for archival before deletion.
+            cloud_mount_planner: Resolves a session's cloud mounts for a new
+                Pod (connector drivers D7); ``None`` keeps every Pod on the
+                in-workspace mount path.
         """
         self._db = db
         self._snapshot_service = snapshot_service
+        self._cloud_mount_planner = cloud_mount_planner
         self._init_k8s()
 
         if self._k8s_available:
@@ -1256,10 +1453,13 @@ class ContainerProvisioner:
                 owner.id,
             )
             return False
+        cloud_plan = await self._cloud_mount_plan_for(owner)
+        profile = self._profile_for_cloud_plan(profile, cloud_plan)
         creation_plan = await self._workspace_creation_plan(
             owner,
             profile=profile,
             stateless_creation_generation=stateless_creation_generation,
+            cloud_plan=cloud_plan,
         )
         reservation = await reserve(
             self._db,
@@ -1313,6 +1513,7 @@ class ContainerProvisioner:
                     _creation_reservation=reservation,
                     _creation_plan=creation_plan,
                     _creation_profile=profile,
+                    _creation_cloud_plan=cloud_plan,
                 )
                 if (
                     created
@@ -2604,6 +2805,7 @@ class ContainerProvisioner:
         _creation_reservation: dict[str, Any] | None = None,
         _creation_plan: dict[str, Any] | None = None,
         _creation_profile: SandboxPodProfile | None = None,
+        _creation_cloud_plan: CloudMountPlan | None = None,
     ) -> _PreparedWorkspaceCreation | bool:
         """Create a workspace container for a job or persistent thread.
 
@@ -2938,6 +3140,7 @@ class ContainerProvisioner:
             stateless_creation_generation=stateless_creation_generation,
             creation_reservation_id=str(_creation_reservation["id"]),
             profile=_creation_profile,
+            cloud_plan=_creation_cloud_plan,
         )
 
         # Once the durable false->true attempt CAS is submitted, its outcome is
@@ -3137,6 +3340,19 @@ class ContainerProvisioner:
                     creation_reservation_id=str(_creation_reservation["id"]),
                     mutation_authority=mutation_authority,
                 )
+                if (
+                    adopted_seed is True
+                    and owner.kind == "session"
+                    and (
+                        not await self._ensure_cloud_mount_objects(
+                            created_pod, _creation_cloud_plan, owner=owner
+                        )
+                        or not await self._publish_cloud_mount_plan(
+                            owner, created_pod, runtime_incarnation
+                        )
+                    )
+                ):
+                    return False
                 if adopted_seed is not True:
                     return False
             # PVC-backed workspaces (jobs AND sessions) get a stable headless
@@ -3866,6 +4082,8 @@ class ContainerProvisioner:
                 owner.id,
             )
             return False
+        cloud_plan = await self._cloud_mount_plan_for(owner)
+        profile = self._profile_for_cloud_plan(profile, cloud_plan)
         workspace_image = profile.image
         cpu, memory = profile.cpu, profile.memory
         cpu_limit, memory_limit = profile.cpu_limit, profile.memory_limit
@@ -3905,6 +4123,7 @@ class ContainerProvisioner:
             seed_extensions=seed_exts,
             seed_needs_state=seed_needs_state,
             profile=profile,
+            cloud_plan=cloud_plan,
         )
         pinned_intent: dict[str, Any] | None = None
         pinned_attempt_id: str | None = None
@@ -4239,6 +4458,7 @@ class ContainerProvisioner:
             ),
             pinned_provision_attempt=(pinned_attempt_id if strict_pinned else None),
             profile=profile,
+            cloud_plan=cloud_plan,
         )
 
         # Once the durable false->true attempt CAS is submitted, its outcome is
@@ -4426,6 +4646,12 @@ class ContainerProvisioner:
                     ),
                 )
                 if adopted_seed is not True:
+                    return False
+                if not await self._ensure_cloud_mount_objects(
+                    created_pod, cloud_plan, owner=owner
+                ) or not await self._publish_cloud_mount_plan(
+                    owner, created_pod, runtime_incarnation
+                ):
                     return False
             # PVC-backed workspaces (jobs AND sessions) get a stable headless
             # Service so the agent dials a constant DNS name that survives pod
@@ -14572,6 +14798,7 @@ class ContainerProvisioner:
         seed_extensions: Mapping[str, Any],
         seed_needs_state: bool,
         profile: SandboxPodProfile | None = None,
+        cloud_plan: CloudMountPlan | None = None,
     ) -> str:
         """Digest the complete deterministic pinned create rendering contract.
 
@@ -14633,6 +14860,11 @@ class ContainerProvisioner:
         extension = profile.plan_extension() if profile else None
         if extension is not None:
             contract["sandbox"] = extension
+        # Present only for a Pod with the in-pod plane: every other pinned
+        # fingerprint stays byte-identical and in-flight creations replay.
+        cloud_mounts = self._cloud_plan_digest_input(cloud_plan)
+        if cloud_mounts is not None:
+            contract["cloud_mounts"] = cloud_mounts
         return hashlib.sha256(
             json.dumps(
                 contract,
@@ -15838,7 +16070,7 @@ class ContainerProvisioner:
         pinned_runtime_generation: str | None = None,
         pinned_provision_attempt: str | None = None,
         profile: SandboxPodProfile | None = None,
-        cloud_mount: CloudMountSidecar | None = None,
+        cloud_plan: CloudMountPlan | None = None,
     ) -> dict:
         """Build the Kubernetes Pod manifest for a workspace container.
 
@@ -15847,8 +16079,9 @@ class ContainerProvisioner:
         ``/mnt/code-server-config`` so the entrypoint can apply it before
         code-server starts.
 
-        ``cloud_mount`` (connector drivers D7, spike prototype) adds the
-        in-pod plane's mount sidecars; no caller passes one yet.
+        ``cloud_plan`` (connector drivers D7) annotates the Pod with its
+        recorded cloud mount plan and, when it has mounts, adds the in-pod
+        plane's mount sidecars; the caller passes a profile without FUSE.
         """
         code_server_credential = ide_credential(
             namespace=self._namespace,
@@ -16131,12 +16364,25 @@ class ContainerProvisioner:
             workspace_container["resources"]["requests"]["ephemeral-storage"] = (
                 profile.storage
             )
-        if cloud_mount is not None:
-            if self._in_pod_plane_images is None:
+        if cloud_plan is not None:
+            if self._in_pod_plane is None:
                 raise ValueError(
                     "a cloud mount sidecar needs connectors.inPodPlane enabled"
                 )
-            add_cloud_mount_sidecars(manifest, cloud_mount, self._in_pod_plane_images)
+            manifest["metadata"]["annotations"][PLAN_ANNOTATION] = plan_annotation(
+                cloud_plan
+            )
+            if cloud_plan.mounts:
+                attempt = (
+                    pinned_provision_attempt
+                    or creation_reservation_id
+                    or stateless_creation_generation
+                )
+                add_cloud_mount_sidecars(
+                    manifest,
+                    cloud_plan.sidecar_spec(objects_name_for(pod_name, attempt)),
+                    self._in_pod_plane,
+                )
         return manifest
 
     def _workspace_capabilities(self, fuse_enabled: bool | None = None) -> list[str]:

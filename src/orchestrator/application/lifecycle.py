@@ -26,6 +26,7 @@ from orchestrator.application import (
     catalogue as catalogue_composition,
     jobs as jobs_composition,
     workflows as workflows_composition,
+    workspace as workspace_composition,
 )
 from orchestrator.application.resources import ApplicationResources, bound
 from orchestrator.services import (
@@ -433,6 +434,7 @@ async def bind_services(resources: ApplicationResources) -> None:
     container_provisioner_module.container_provisioner.connect(
         db=resources.postgres_db,
         snapshot_service=snapshot_service_module.snapshot_service,
+        cloud_mount_planner=workspace_composition.cloud_mount_planner(resources),
     )
 
     # Initialize Docker Compose provisioner (static workspace pool, used when k8s unavailable)

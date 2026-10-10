@@ -14,7 +14,8 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from orchestrator.services import thread_workspace_delivery
+from orchestrator.services import cloud_mount_status, thread_workspace_delivery
+from orchestrator.services.cloud_mount_sidecar import DELIVERY_HEADER
 
 # No `tags=`: the declaration this replaces carried none, and a tag would
 # change the published OpenAPI operation for a route whose identity this
@@ -54,13 +55,21 @@ async def agent_get_thread_workspace(
         thread_id, dependencies=dependencies
     )
     async with dependencies.store.thread_datasource_lock(thread_id):
-        return await thread_workspace_delivery.agent_get_thread_workspace_locked(
+        payload = await thread_workspace_delivery.agent_get_thread_workspace_locked(
             thread_id,
             presented_agent_id=presented_agent_id,
             presented_runtime_generation=presented_runtime_generation,
             presented_attach_token=presented_attach_token,
+            presented_cloud_mount_delivery=request_headers.get(DELIVERY_HEADER),
             dependencies=dependencies,
         )
+    if payload.get("cloud_mount_agent_outdated"):
+        # An agent image from before the in-pod plane attached to a Pod whose
+        # mounts come from its sidecars: say so where the user looks.
+        await cloud_mount_status.record_agent_outdated(
+            dependencies.store, thread_id, payload.get("cloud_mount_sidecar") or {}
+        )
+    return payload
 
 
 __all__ = ["agent_get_thread_workspace", "get_thread_workspace_dependencies", "router"]

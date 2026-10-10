@@ -16,6 +16,7 @@ from typing import Any
 from uuid import UUID
 
 from orchestrator.security.access import redact_config_override
+from orchestrator.services.cloud_mount_sidecar import PLAN_CONTEXT_KEY
 from orchestrator.services.container_provisioner import (
     WORKSPACE_RUNTIME_INCARNATION_KEY,
 )
@@ -111,6 +112,13 @@ def redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
     # The agent's pending memory set (append-only context injection WP4):
     # internal turn-to-turn state of up to 32 KiB, never an owner field.
     md.pop(SESSION_PENDING_MEMORY_KEY, None)
+    workspace = md.get("workspace_container")
+    if isinstance(workspace, dict) and PLAN_CONTEXT_KEY in workspace:
+        # The Pod's recorded cloud mount plan names internal remotes and the
+        # account they use; the owner reads cloud_mount_status instead.
+        md["workspace_container"] = {
+            key: value for key, value in workspace.items() if key != PLAN_CONTEXT_KEY
+        }
     thread["metadata"] = md
     # A stateless End or permanent Delete holds its marker until the exact
     # retirement settles; a retryable 503 leaves it pending until End,

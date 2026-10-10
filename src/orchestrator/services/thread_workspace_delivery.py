@@ -494,9 +494,18 @@ async def agent_get_thread_workspace_locked(
     presented_agent_id: str | None = None,
     presented_runtime_generation: str | None = None,
     presented_attach_token: str | None = None,
+    presented_cloud_mount_delivery: str | None = None,
     dependencies: ThreadWorkspaceDeliveryDependencies,
 ) -> dict[str, Any]:
-    """Build a cold-session payload from state fetched under the DS lock."""
+    """Build a cold-session payload from state fetched under the DS lock.
+
+    ``presented_cloud_mount_delivery`` is what the agent sent in
+    ``X-SRW-Cloud-Mount-Delivery``: ``"sidecar"`` from an agent that attaches
+    to in-pod plane mounts (D7). Without it, a Pod whose mounts come from its
+    sidecars gets no cloud payload the agent would misread: no in-workspace
+    mount, no sync and no legacy session folder (the folders are still under
+    /cloud), and ``cloud_mount_agent_outdated`` for the route to record.
+    """
 
     # Bind every collaborator to the name the moved body already uses, so
     # the body below is byte-for-byte what `main` ran.  Two of them are
@@ -934,6 +943,7 @@ async def agent_get_thread_workspace_locked(
             thread, metadata, project_ids=project_ids
         )
     mount_rows = await postgres_db.list_thread_mounts(thread_id)
+    cloud_mount_sidecar_cfg: dict[str, Any] | None = None
     suppress_disposable_cloud = bool(
         thread.get("execution_lane") == "stateless" and workspace_backend == "none"
     )
@@ -951,7 +961,12 @@ async def agent_get_thread_workspace_locked(
             mount_rows=mount_rows,
             metadata=metadata,
         )
-        if cloud_mount_cfg:
+        if (
+            isinstance(cloud_mount_cfg, dict)
+            and cloud_mount_cfg.get("delivery") == "sidecar"
+        ):
+            cloud_mount_sidecar_cfg, cloud_mount_cfg = cloud_mount_cfg, None
+        if cloud_mount_cfg or cloud_mount_sidecar_cfg:
             cloud_sync_cfg = None
         elif metadata.get("protected_cloud"):
             # Protected thread with no engageable protected mount (flag off,
@@ -981,6 +996,7 @@ async def agent_get_thread_workspace_locked(
         not suppress_disposable_cloud
         and _cloud_up
         and not cloud_mount_cfg
+        and not cloud_mount_sidecar_cfg
         and not cloud_sync_cfg
         and (metadata.get("protected_cloud") or not thread.get("nc_session_folder"))
     )
@@ -1454,7 +1470,9 @@ async def agent_get_thread_workspace_locked(
         # Nextcloud session folder (legacy; preserved one release for back-compat)
         "nc_session_folder": (
             None
-            if suppress_disposable_cloud or final_protected_marker != "off"
+            if suppress_disposable_cloud
+            or final_protected_marker != "off"
+            or cloud_mount_sidecar_cfg is not None
             else final_thread.get("nc_session_folder")
         ),
         # Structured cloud-sync config (backend + webdav URL + auth).
@@ -1463,6 +1481,15 @@ async def agent_get_thread_workspace_locked(
         # Structured lazy cloud mount config. Mutually exclusive with
         # cloud_sync for the same thread response.
         "cloud_mount": cloud_mount_cfg,
+        # The in-pod plane's mounts (D7): no credential, only where each
+        # mount is and how to read its state. An older agent ignores the key
+        # and, seeing no cloud_mount, cloud_sync or session folder, runs with
+        # the folders it finds under /cloud.
+        "cloud_mount_sidecar": cloud_mount_sidecar_cfg,
+        "cloud_mount_agent_outdated": bool(
+            cloud_mount_sidecar_cfg is not None
+            and presented_cloud_mount_delivery != "sidecar"
+        ),
         # True when cloud is up but no sync target resolved (Issue 13 follow-up).
         "cloud_sync_degraded": cloud_sync_degraded,
         # Protected Cloud Mode marker (F-C1): tells the agent to fail-close

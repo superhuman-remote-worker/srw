@@ -41,6 +41,10 @@ from orchestrator.services.cloud import (
     provider_adapter,
     provider_offers,
 )
+from orchestrator.services.cloud_mount_sidecar import (
+    agent_payload,
+    recorded_sidecar_plan,
+)
 from orchestrator.services.sandbox_workspace_settings import container_denies_fuse
 from orchestrator.services.session_runtime_admission import (
     protected_cloud_marker_state,
@@ -347,10 +351,20 @@ async def _build_rclone_mount_from_row(
     workspace_name: str,
     runtime_is_vm: bool = False,
     dependencies: AgentCloudMountDependencies,
+    failures: list[str] | None = None,
 ) -> Optional[dict[str, Any]]:
+    """One row's rclone mount, or ``None``; ``failures`` gets why, as a
+    closed code (``no_transport``, ``backend_unavailable``, a
+    ``CloudBackendErrorKind`` value, or ``error``), never the error text."""
+
+    def refused(reason: str) -> None:
+        if failures is not None:
+            failures.append(reason)
+
     backend_id = row.get("backend_id")
     handle_str = row.get("cloud_handle")
     if not backend_id or not handle_str:
+        refused("no_transport")
         return None
     try:
         backend = dependencies.cloud_router.for_backend_instance(
@@ -358,8 +372,10 @@ async def _build_rclone_mount_from_row(
             expected_backend_id=str(backend_id),
         )
     except Exception:
+        refused("backend_unavailable")
         return None
     if not backend.is_initialized or not isinstance(backend, SupportsRcloneMount):
+        refused("backend_unavailable")
         return None
     try:
         handle = ProjectFolderHandle.from_db(handle_str, backend=backend.backend_id)
@@ -386,6 +402,7 @@ async def _build_rclone_mount_from_row(
             row.get("id") or row.get("source_ref") or row.get("mount_kind"),
             e.kind.value,
         )
+        refused(str(e.kind.value))
         return None
     except Exception as e:
         logger.warning(
@@ -393,6 +410,7 @@ async def _build_rclone_mount_from_row(
             row.get("id") or row.get("source_ref") or row.get("mount_kind"),
             e,
         )
+        refused("error")
         return None
 
     return {
@@ -521,6 +539,76 @@ def _build_protected_cloud_mount(
     }
 
 
+@dataclass(frozen=True)
+class LiveMountSet:
+    """The ordinary (non-protected) mounts a thread gets, credentials included.
+
+    ``excluded`` names every ``thread_mounts`` row the all-or-fallback rule
+    left out, with a closed reason: ``unbuildable`` (``detail`` says why) for
+    the row that could not be built, ``set_fallback`` for the rows dropped
+    with it. Main-cloud slice 3 replaces the rule with per-connector binding.
+    """
+
+    mounts: list[dict[str, Any]]
+    fallback: bool
+    excluded: list[dict[str, Any]]
+
+
+async def _resolve_live_mount_set(
+    thread: dict[str, Any],
+    *,
+    mount_rows: list[dict[str, Any]] | None,
+    runtime_is_vm: bool,
+    dependencies: AgentCloudMountDependencies,
+) -> LiveMountSet:
+    """Every requested ``thread_mounts`` row, or the session folder instead."""
+    rows = [
+        row
+        for row in (mount_rows or [])
+        if row.get("backend_id") and row.get("cloud_handle")
+    ]
+    used_names: set[str] = set()
+    mounted_rows: list[dict[str, Any]] = []
+    failures: list[str] = []
+    failed_row: dict[str, Any] | None = None
+    for row in rows:
+        workspace_name = _cloud_mount_name(row, used_names, dependencies=dependencies)
+        mounted = await _build_rclone_mount_from_row(
+            row,
+            workspace_name=workspace_name,
+            runtime_is_vm=runtime_is_vm,
+            dependencies=dependencies,
+            failures=failures,
+        )
+        if mounted is None:
+            mounted_rows = []
+            failed_row = row
+            break
+        mounted_rows.append(mounted)
+
+    fallback = False
+    mounts_out = mounted_rows
+    excluded: list[dict[str, Any]] = []
+    if not mounts_out or len(mounts_out) != len(rows):
+        session_mount = await _build_rclone_session_mount(
+            thread, runtime_is_vm=runtime_is_vm, dependencies=dependencies
+        )
+        if session_mount:
+            mounts_out = [session_mount]
+            fallback = bool(rows)
+        for row in rows:
+            entry: dict[str, Any] = {
+                "source_ref": str(row.get("id") or row.get("source_ref") or ""),
+                "mount_kind": str(row.get("mount_kind") or "project"),
+                "reason": "set_fallback",
+            }
+            if row is failed_row:
+                entry["reason"] = "unbuildable"
+                entry["detail"] = failures[-1] if failures else "error"
+            excluded.append(entry)
+    return LiveMountSet(mounts=mounts_out, fallback=fallback, excluded=excluded)
+
+
 async def _build_agent_cloud_mount(
     thread: dict[str, Any],
     *,
@@ -537,7 +625,28 @@ async def _build_agent_cloud_mount(
     user-home row from falling back to the eager clone path. A terminal token
     selects the narrower End-only reconstruction gate; it does not widen
     normal runtime delivery.
+
+    A Pod created with the in-pod plane (connector drivers D7) records its
+    plan; its mounts come from its sidecars, so this returns the sidecar
+    payload (``delivery: "sidecar"``, no credential) and never an
+    in-workspace one, whatever the thread's rows say now: mounts are fixed
+    when the Pod is created.
     """
+    sidecar_plan = recorded_sidecar_plan(metadata)
+    if sidecar_plan is not None:
+        if terminal_retirement_token is None:
+            workspace = metadata.get("workspace_container") or {}
+            ready = workspace.get("status") == "ready" and bool(
+                workspace.get("pod_ip") or workspace.get("host")
+            )
+        else:
+            ready = _runtime_supports_terminal_rclone_retirement(
+                thread,
+                metadata,
+                terminal_token=terminal_retirement_token,
+                dependencies=dependencies,
+            )
+        return agent_payload(sidecar_plan) if ready else None
     if terminal_retirement_token is None:
         runtime_supported = _runtime_supports_rclone_mount(
             metadata, dependencies=dependencies
@@ -636,37 +745,13 @@ async def _build_agent_cloud_mount(
     vm_ctx = metadata.get("vm") or {}
     runtime_is_vm = vm_ctx.get("status") == "ready" and bool(vm_ctx.get("ssh_host"))
 
-    rows = [
-        row
-        for row in (mount_rows or [])
-        if row.get("backend_id") and row.get("cloud_handle")
-    ]
-    used_names: set[str] = set()
-    mounted_rows: list[dict[str, Any]] = []
-    for row in rows:
-        workspace_name = _cloud_mount_name(row, used_names, dependencies=dependencies)
-        mounted = await _build_rclone_mount_from_row(
-            row,
-            workspace_name=workspace_name,
-            runtime_is_vm=runtime_is_vm,
-            dependencies=dependencies,
-        )
-        if mounted is None:
-            mounted_rows = []
-            break
-        mounted_rows.append(mounted)
-
-    fallback = False
-    mounts_out = mounted_rows
-    if not mounts_out or len(mounts_out) != len(rows):
-        session_mount = await _build_rclone_session_mount(
-            thread, runtime_is_vm=runtime_is_vm, dependencies=dependencies
-        )
-        if session_mount:
-            mounts_out = [session_mount]
-            fallback = bool(rows)
-
-    if not mounts_out:
+    live = await _resolve_live_mount_set(
+        thread,
+        mount_rows=mount_rows,
+        runtime_is_vm=runtime_is_vm,
+        dependencies=dependencies,
+    )
+    if not live.mounts:
         return None
 
     return {
@@ -674,7 +759,7 @@ async def _build_agent_cloud_mount(
         "driver": "rclone",
         "cloud_root": "/cloud",
         "workspace_entry": "cloud",
-        "fallback": fallback,
+        "fallback": live.fallback,
         "required": False,
-        "mounts": mounts_out,
+        "mounts": live.mounts,
     }

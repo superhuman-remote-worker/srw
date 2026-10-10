@@ -15202,6 +15202,80 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def set_thread_cloud_mount_status(
+        self, thread_id: str, status: Optional[Dict[str, Any]]
+    ) -> bool:
+        """Replace threads.metadata.cloud_mount_status (``None`` removes it).
+
+        The orchestrator's record of a newly published workspace Pod's cloud
+        mounts (connector drivers D7, ``services/cloud_mount_status.py``).
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(thread_id)
+        except ValueError:
+            return False
+        if status is None:
+            query = (
+                "UPDATE threads SET metadata = COALESCE(metadata, '{}'::jsonb) "
+                "- 'cloud_mount_status' WHERE id = $1"
+            )
+            args: tuple[Any, ...] = (uuid_val,)
+        else:
+            query = (
+                "UPDATE threads SET metadata = jsonb_set("
+                "COALESCE(metadata, '{}'::jsonb), '{cloud_mount_status}', $2::jsonb"
+                ") WHERE id = $1"
+            )
+            args = (uuid_val, json_module.dumps(status))
+        async with self.acquire() as conn:
+            result = await conn.execute(query, *args)
+        return result == "UPDATE 1"
+
+    async def merge_thread_cloud_mount_status(
+        self,
+        thread_id: str,
+        *,
+        fingerprint: str,
+        mounts: Dict[str, Any],
+        notice: Optional[str],
+        updated_at: str,
+    ) -> bool:
+        """Merge mount entries (and a notice) into the cloud mount record of
+        the plan ``fingerprint`` only; a report about another Pod's plan
+        changes nothing and returns False."""
+        import json as json_module
+
+        try:
+            uuid_val = UUID(thread_id)
+        except ValueError:
+            return False
+        query = (
+            "UPDATE threads SET metadata = jsonb_set("
+            "    metadata, '{cloud_mount_status}', "
+            "    (metadata->'cloud_mount_status') "
+            "    || jsonb_build_object('updated_at', $4::text) "
+            "    || CASE WHEN $5::text IS NULL THEN '{}'::jsonb "
+            "            ELSE jsonb_build_object('notice', $5::text) END "
+            "    || jsonb_build_object('mounts', "
+            "         COALESCE(metadata->'cloud_mount_status'->'mounts', "
+            "                  '{}'::jsonb) || $3::jsonb)"
+            ") "
+            "WHERE id = $1 "
+            "AND metadata->'cloud_mount_status'->>'fingerprint' = $2"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                query,
+                uuid_val,
+                fingerprint,
+                json_module.dumps(mounts),
+                updated_at,
+                notice,
+            )
+        return result == "UPDATE 1"
+
     async def clear_pinned_attach_abort_workspace_endpoint(
         self,
         thread_id: str,
