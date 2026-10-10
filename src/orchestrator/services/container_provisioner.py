@@ -497,10 +497,111 @@ def _deleting_pod_was_never_scheduled(pod: Any) -> bool:
     return True
 
 
+def _deleted_pod_stopped_before_its_containers_started(pod: Any) -> bool:
+    """Prove a deleted Pod that its kubelet stopped mid-start runs nothing.
+
+    A Pod deleted while it starts (an End seconds after the create, while a
+    cloud-mount sidecar still comes up) is stopped by its kubelet with some
+    containers never created: they stay ``waiting`` in the final status, so
+    "every container terminated" never comes and the finalizer would hold
+    the Pod forever.  What proves them done instead:
+
+    - the Pod is being deleted and reports a terminal phase.  The kubelet
+      reports one only after its pod worker stopped every container, and it
+      starts none afterwards; PodGC, which marks Pods terminal without a
+      kubelet (a node that is gone), records ``DisruptionTarget`` with
+      reason ``DeletionByPodGC``, and such a Pod is refused here;
+    - its status names every declared container, as the terminated proof
+      requires;
+    - an init container (SRW's cloud-mount opener and supervisor) is
+      terminated or provably never created: no container ID, never running,
+      terminated, started or ready, no restart and no ``lastState``;
+    - a regular container (the tenant's workspace) is terminated, or never
+      created *and* the Pod never initialized: the ``Initialized`` condition
+      is False and an init container was never created, so the kubelet could
+      not have started any regular container.  A Pod without init
+      containers gets no such exception;
+    - an ephemeral (debug) container is terminated.
+    """
+
+    metadata = getattr(pod, "metadata", None)
+    spec = getattr(pod, "spec", None)
+    status = getattr(pod, "status", None)
+    if getattr(metadata, "deletion_timestamp", None) is None:
+        return False
+    if getattr(status, "phase", None) not in {"Failed", "Succeeded"}:
+        return False
+    if _resource_field(spec, "node_name", "nodeName") in (None, ""):
+        return False
+    conditions = getattr(status, "conditions", None) or ()
+    if not isinstance(conditions, (list, tuple)):
+        return False
+    initialized = None
+    for condition in conditions:
+        kind = getattr(condition, "type", None)
+        if (
+            kind == "DisruptionTarget"
+            and getattr(condition, "reason", None) == "DeletionByPodGC"
+        ):
+            return False
+        if kind == "Initialized":
+            initialized = getattr(condition, "status", None)
+
+    arrays: dict[str, list[Any]] = {}
+    for status_field, spec_field in (
+        ("container_statuses", "containers"),
+        ("init_container_statuses", "init_containers"),
+        ("ephemeral_container_statuses", "ephemeral_containers"),
+    ):
+        raw_statuses = getattr(status, status_field, None)
+        if raw_statuses is None:
+            statuses: list[Any] = []
+        elif isinstance(raw_statuses, (list, tuple)):
+            statuses = list(raw_statuses)
+        else:
+            return False
+        raw_declared = getattr(spec, spec_field, None)
+        declared = list(raw_declared) if isinstance(raw_declared, (list, tuple)) else []
+        declared_names = {str(getattr(item, "name", "") or "") for item in declared}
+        observed_names = {str(getattr(item, "name", "") or "") for item in statuses}
+        if "" in declared_names or declared_names != observed_names:
+            return False
+        arrays[spec_field] = statuses
+
+    def terminated(container: Any) -> bool:
+        return (
+            getattr(getattr(container, "state", None), "terminated", None) is not None
+        )
+
+    if not arrays["containers"]:
+        return False
+    if not all(terminated(item) for item in arrays["ephemeral_containers"]):
+        return False
+    init_never_created = False
+    for item in arrays["init_containers"]:
+        if terminated(item):
+            continue
+        if not _container_never_started(item):
+            return False
+        init_never_created = True
+    for item in arrays["containers"]:
+        if terminated(item):
+            continue
+        if not (
+            _container_never_started(item)
+            and initialized == "False"
+            and init_never_created
+        ):
+            return False
+    return True
+
+
 def _pod_has_exact_process_zero(pod: Any) -> bool:
-    return _all_pod_container_statuses_terminated(
-        pod
-    ) or _deleting_pod_was_never_scheduled(pod)
+    return (
+        _all_pod_container_statuses_terminated(pod)
+        or _deleting_pod_was_never_scheduled(pod)
+        or _deleted_pod_stopped_before_its_containers_started(pod)
+    )
 
 
 def _pod_is_terminal_before_first_ready(pod: Any) -> bool:

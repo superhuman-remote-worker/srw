@@ -4006,6 +4006,59 @@ class TestStrictStatelessWorkspaceCreation:
         )
 
     @pytest.mark.asyncio
+    async def test_process_zero_finalizer_releases_a_pod_ended_while_it_started(
+        self,
+    ):
+        """An End seconds after the create meets a sidecar Pod still starting:
+        the kubelet stops it with the supervisor and the workspace never
+        created, and the release must not wait for them forever."""
+        p = self._provisioner()
+        pod = self._pod()
+        pod.metadata.deletion_timestamp = "now"
+        pod.metadata.finalizers = ["lifecycle.srw.dev/stateless-process-zero"]
+        pod.spec.node_name = "k3d-srw-server-0"
+        pod.spec.init_containers = [
+            SimpleNamespace(name="srw-fuse-opener"),
+            SimpleNamespace(name="srw-cloud-mount"),
+        ]
+        never = dict(
+            state=SimpleNamespace(
+                waiting=SimpleNamespace(reason="PodInitializing"),
+                running=None,
+                terminated=None,
+            ),
+            last_state=SimpleNamespace(waiting=None, running=None, terminated=None),
+            container_id=None,
+            started=False,
+            ready=False,
+            restart_count=0,
+        )
+        pod.status.phase = "Failed"
+        pod.status.conditions = [
+            SimpleNamespace(type="Initialized", status="False", reason=None)
+        ]
+        pod.status.container_statuses = [SimpleNamespace(name="workspace", **never)]
+        pod.status.init_container_statuses = [
+            SimpleNamespace(
+                name="srw-fuse-opener",
+                state=SimpleNamespace(
+                    terminated=SimpleNamespace(exit_code=0, reason="Completed"),
+                    running=None,
+                    waiting=None,
+                ),
+                container_id="containerd://opener",
+            ),
+            SimpleNamespace(name="srw-cloud-mount", **never),
+        ]
+        p._core_api.read_namespaced_pod.return_value = pod
+
+        assert await p.release_stateless_workspace_process_zero_finalizer(
+            self._owner(),
+            expected_runtime_incarnation=self.RUNTIME,
+        )
+        p._core_api.patch_namespaced_pod.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_process_zero_finalizer_refuses_without_durable_receipt(self):
         db = _StrictCreationDB()
         db.process_zero_recorded = False
@@ -8536,3 +8589,203 @@ class TestIdePodResourceAuthority:
         assert outcome.state == "refused"
         p._core_api.delete_namespaced_pod.assert_not_called()
         p._delete_seed_configmap.assert_not_awaited()
+
+
+_DROP = object()
+
+
+class TestDeletedPodStoppedMidStart:
+    """``_deleted_pod_stopped_before_its_containers_started`` on the status
+    shape the k3d main-cloud gate left: a stateless session ended four
+    seconds after its sidecar Pod was created (real client models)."""
+
+    @staticmethod
+    def _raw(**over):
+        never = {
+            "state": {"waiting": {"reason": "PodInitializing"}},
+            "lastState": {},
+            "ready": False,
+            "restartCount": 0,
+            "started": False,
+            "image": "x",
+            "imageID": "",
+        }
+        raw = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "ws-thread-02346676-bb5",
+                "uid": "236673c7-cffd-47c6-b015-0c23f5f275ec",
+                "deletionTimestamp": "2026-10-10T15:32:17Z",
+                "deletionGracePeriodSeconds": 0,
+                "finalizers": ["lifecycle.srw.dev/stateless-process-zero"],
+            },
+            "spec": {
+                "nodeName": "k3d-srw-server-0",
+                "containers": [{"name": "workspace", "image": "x"}],
+                "initContainers": [
+                    {
+                        "name": "srw-fuse-opener",
+                        "image": "x",
+                        "restartPolicy": "Always",
+                    },
+                    {
+                        "name": "srw-cloud-mount",
+                        "image": "x",
+                        "restartPolicy": "Always",
+                    },
+                ],
+            },
+            "status": {
+                "phase": "Failed",
+                "conditions": [
+                    {"type": "PodReadyToStartContainers", "status": "False"},
+                    {
+                        "type": "Initialized",
+                        "status": "False",
+                        "reason": "ContainersNotInitialized",
+                    },
+                    {"type": "Ready", "status": "False"},
+                    {"type": "PodScheduled", "status": "True"},
+                ],
+                "initContainerStatuses": [
+                    {
+                        "name": "srw-fuse-opener",
+                        "containerID": "containerd://69903a76",
+                        "state": {
+                            "terminated": {
+                                "exitCode": 0,
+                                "reason": "Completed",
+                                "startedAt": "2026-10-10T15:32:18Z",
+                                "finishedAt": "2026-10-10T15:32:18Z",
+                            }
+                        },
+                        "lastState": {},
+                        "ready": False,
+                        "restartCount": 0,
+                        "started": False,
+                        "image": "x",
+                        "imageID": "",
+                    },
+                    {"name": "srw-cloud-mount", **never},
+                ],
+                "containerStatuses": [{"name": "workspace", **never}],
+            },
+        }
+        for path, value in over.items():
+            node = raw
+            *parents, leaf = path.split(".")
+            for key in parents:
+                node = node[int(key)] if isinstance(node, list) else node[key]
+            if value is _DROP:
+                if isinstance(node, list):
+                    node.pop(int(leaf))
+                else:
+                    node.pop(leaf)
+            elif isinstance(node, list):
+                node[int(leaf)] = value
+            else:
+                node[leaf] = value
+        return raw
+
+    @staticmethod
+    def _pod(raw):
+        from kubernetes.client import ApiClient
+
+        return ApiClient()._ApiClient__deserialize(raw, "V1Pod")
+
+    def test_the_gate_s_stuck_pod_is_process_zero(self):
+        from orchestrator.services import container_provisioner as cp
+
+        pod = self._pod(self._raw())
+        assert not cp._all_pod_container_statuses_terminated(pod)
+        assert cp._deleted_pod_stopped_before_its_containers_started(pod)
+        assert cp._pod_has_exact_process_zero(pod)
+
+    @pytest.mark.parametrize(
+        ("why", "over"),
+        [
+            ("not deleted", {"metadata.deletionTimestamp": None}),
+            ("not terminal", {"status.phase": "Running"}),
+            (
+                "PodGC marked it, not its kubelet",
+                {
+                    "status.conditions.3": {
+                        "type": "DisruptionTarget",
+                        "status": "True",
+                        "reason": "DeletionByPodGC",
+                    }
+                },
+            ),
+            (
+                "initialized: the workspace may have run",
+                {"status.conditions.1": {"type": "Initialized", "status": "True"}},
+            ),
+            (
+                "a created supervisor, not terminated",
+                {"status.initContainerStatuses.1.containerID": "containerd://x"},
+            ),
+            (
+                "a supervisor that restarted",
+                {"status.initContainerStatuses.1.restartCount": 1},
+            ),
+            (
+                "a supervisor with a last state",
+                {
+                    "status.initContainerStatuses.1.lastState": {
+                        "terminated": {"exitCode": 1}
+                    }
+                },
+            ),
+            (
+                "a running supervisor",
+                {
+                    "status.initContainerStatuses.1.state": {
+                        "running": {"startedAt": "2026-10-10T15:32:18Z"}
+                    }
+                },
+            ),
+            ("a started workspace", {"status.containerStatuses.0.started": True}),
+            (
+                "a workspace with an ID",
+                {"status.containerStatuses.0.containerID": "containerd://w"},
+            ),
+            ("a status missing", {"status.initContainerStatuses.1": _DROP}),
+            ("not scheduled (the other proof's case)", {"spec.nodeName": None}),
+        ],
+    )
+    def test_anything_less_than_proof_is_refused(self, why, over):
+        from orchestrator.services import container_provisioner as cp
+
+        pod = self._pod(self._raw(**over))
+        assert not cp._deleted_pod_stopped_before_its_containers_started(pod), why
+
+    def test_a_pod_without_init_containers_keeps_the_strict_workspace_proof(self):
+        """No init container: nothing proves the workspace never ran but its
+        own status, which is not enough for the tenant's container."""
+        from orchestrator.services import container_provisioner as cp
+
+        raw = self._raw()
+        raw["spec"]["initContainers"] = []
+        raw["status"]["initContainerStatuses"] = []
+        pod = self._pod(raw)
+        assert not cp._deleted_pod_stopped_before_its_containers_started(pod)
+
+    def test_a_waiting_debug_container_is_refused(self):
+        from orchestrator.services import container_provisioner as cp
+
+        raw = self._raw()
+        raw["spec"]["ephemeralContainers"] = [{"name": "debugger", "image": "x"}]
+        raw["status"]["ephemeralContainerStatuses"] = [
+            {
+                "name": "debugger",
+                "state": {"waiting": {"reason": "PodInitializing"}},
+                "lastState": {},
+                "ready": False,
+                "restartCount": 0,
+                "image": "x",
+                "imageID": "",
+            }
+        ]
+        pod = self._pod(raw)
+        assert not cp._deleted_pod_stopped_before_its_containers_started(pod)
