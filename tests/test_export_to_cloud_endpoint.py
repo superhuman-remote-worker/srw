@@ -124,6 +124,7 @@ def _patch_endpoint(*, user, job, backend, gitea_files, repo=("job-682baab8", "m
 
     db = MagicMock()
     db.update_job_exported_folder = AsyncMock(return_value=True)
+    db.merge_job_context = AsyncMock(return_value=True)
     stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
 
     return stack, backend, db
@@ -164,13 +165,27 @@ class TestCloudReviewMode:
         assert out["cloud_review_mode"] == "open_folder"
         assert "project_has_cloud_folder" not in out
 
-    def test_diff_when_project_has_cloud_folder(self):
+    def test_a_cloud_folder_alone_is_no_diff_to_review(self):
+        # Slice 6.3: only a captured diff, a reviewed checkout or an older
+        # job's implicit copy is reviewed; a cloud folder by itself is not.
         out = jobs_composition.with_cloud_review_mode(
             orchestrator.main.app.state.resources,
             {"id": "x", "project_has_cloud_folder": True},
         )
-        assert out["cloud_review_mode"] == "diff"
+        assert out["cloud_review_mode"] == "open_folder"
         assert "project_has_cloud_folder" not in out
+
+    def test_diff_when_an_older_job_has_its_implicit_copy(self):
+        out = jobs_composition.with_cloud_review_mode(
+            orchestrator.main.app.state.resources,
+            {
+                "id": "x",
+                "project_has_cloud_folder": True,
+                "context": {},
+                "cloud_diff_baseline_commit": "base",
+            },
+        )
+        assert out["cloud_review_mode"] == "diff"
 
     def test_open_folder_when_column_absent(self):
         # Loose jobs / rows without the join column default to open_folder.
@@ -195,18 +210,34 @@ class TestCloudReviewMode:
 
 class TestExportRoutingGate:
     @pytest.mark.asyncio
-    async def test_rejects_project_with_cloud_folder(self, fake_request):
+    async def test_a_project_with_a_cloud_folder_resyncs_too(self, fake_request):
+        # The outbox is the job's deliverables, never the project folder's
+        # copy: a cloud project's job is re-synced like any other (no 409).
         user = _make_user()
-        job = _make_job(project_id="p1", project_has_cloud_folder=True)
-        stack, *_ = _patch_endpoint(
-            user=user, job=job, backend=FakeMainCloudBackend(), gitea_files={}
+        job = _make_job(
+            project_id="p1",
+            project_has_cloud_folder=True,
+            freeze_data={"deliverables": ["output/r.md"]},
         )
-        with stack, pytest.raises(HTTPException) as ei:
-            await job_review_routes.export_job_to_shared_folder(
+        stack, backend, db = _patch_endpoint(
+            user=user,
+            job=job,
+            backend=FakeMainCloudBackend(),
+            gitea_files={"output/r.md": b"report"},
+        )
+        with stack:
+            result = await job_review_routes.export_job_to_shared_folder(
                 fake_request, job["id"], dependencies=_deps(user, job)
             )
-        assert ei.value.status_code == 409
-        assert "diff-review" in ei.value.detail
+        assert result["files_copied"] == 1
+        assert "handle" not in result
+        assert db.update_job_exported_folder.await_count == 1
+        record = db.merge_job_context.await_args.args[1]["job_outbox"]
+        assert (record["state"], record["trigger"], record["files"]) == (
+            "delivered",
+            "resync",
+            1,
+        )
 
     @pytest.mark.asyncio
     async def test_rejects_wrong_status(self, fake_request):

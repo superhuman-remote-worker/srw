@@ -1,0 +1,181 @@
+"""The job outbox's completion copy (S16b, main cloud slice 6.2).
+
+``run_job_outbox_effect`` copies a root job's deliverables into its owner's
+shared folder, records what happened in ``context.job_outbox`` and never
+waits on Nextcloud's share bucket; the completion path that calls it is
+pinned in ``tests/test_completion_class_a.py`` (``TestJobOutboxDelivery``).
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from orchestrator.services import job_export
+from orchestrator.services.cloud import SessionFolderHandle
+from orchestrator.services.cloud.retry import LeakyBucket
+
+JOB_ID = "682baab8-7864-4f3b-9298-4134294f703e"
+OWNER = {
+    "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    "keycloak_sub": "sub-1",
+    "email": "owner@example.test",
+}
+FOLDER = SessionFolderHandle(backend="nextcloud", native_id="sessions/report-682baab8")
+
+
+def _job(**over):
+    job = {
+        "id": JOB_ID,
+        "status": "completed",
+        "user_id": OWNER["id"],
+        "description": "Write the report",
+        "freeze_data": {"deliverables": ["output/report.md"]},
+        "exported_folder_handle": None,
+        "context": {},
+    }
+    job.update(over)
+    return job
+
+
+def _backend(**over):
+    backend = MagicMock()
+    backend.backend_id = "nextcloud"
+    backend.is_initialized = True
+    backend.ensure_session_folder = AsyncMock(return_value=FOLDER)
+    backend.ensure_user = AsyncMock(return_value="owner")
+    backend.share_session_folder = AsyncMock()
+    backend.put_session_file = AsyncMock()
+    backend.get_session_folder_browser_url = MagicMock(return_value="https://c/f")
+    backend.get_session_folder_webdav_url = MagicMock(return_value="https://c/dav")
+    for key, value in over.items():
+        setattr(backend, key, value)
+    return backend
+
+
+def _deps(*, job=None, owner=OWNER, backend=None):
+    store = SimpleNamespace(
+        get_job=AsyncMock(return_value=job if job is not None else _job()),
+        get_user=AsyncMock(return_value=owner),
+        update_job_exported_folder=AsyncMock(return_value=True),
+        merge_job_context=AsyncMock(return_value=True),
+    )
+    forge = SimpleNamespace(
+        is_initialized=True,
+        list_contents=AsyncMock(return_value=[]),
+        get_file_bytes=AsyncMock(return_value=b"# report"),
+    )
+    backend = backend if backend is not None else _backend()
+    return (
+        job_export.JobExportDependencies(
+            store=store,
+            forge=forge,
+            cloud_router=SimpleNamespace(for_owner=lambda _user: backend),
+            resolve_job_repo=AsyncMock(return_value=("job-682baab8", None)),
+        ),
+        store,
+        backend,
+    )
+
+
+def _record(store):
+    return store.merge_job_context.await_args.args[1]["job_outbox"]
+
+
+@pytest.mark.asyncio
+async def test_the_deliverables_land_shared_and_the_job_is_stamped():
+    deps, store, backend = _deps()
+
+    result = await job_export.run_job_outbox_effect(job_id=JOB_ID, dependencies=deps)
+
+    assert result == {
+        "state": "delivered",
+        "files": 1,
+        "shared": True,
+        "unshared": None,
+    }
+    assert backend.put_session_file.await_args.kwargs["path"] == "report.md"
+    store.update_job_exported_folder.assert_awaited_once_with(
+        JOB_ID, handle=FOLDER.to_db()
+    )
+    record = _record(store)
+    assert {key: record[key] for key in ("state", "trigger", "files", "shared")} == {
+        "state": "delivered",
+        "trigger": "completion",
+        "files": 1,
+        "shared": True,
+    }
+    assert record["handle"] == FOLDER.to_db()
+
+
+@pytest.mark.asyncio
+async def test_a_full_share_bucket_never_blocks_the_completion():
+    # The real bucket, full: bounded_wait(0) turns its wait into BucketFull.
+    bucket = LeakyBucket(max_events=1, window_seconds=600)
+    await bucket.acquire()
+
+    async def share(_handle, _user):
+        await bucket.acquire()
+
+    deps, store, _backend_ = _deps(backend=_backend(share_session_folder=share))
+
+    result = await job_export.run_job_outbox_effect(job_id=JOB_ID, dependencies=deps)
+
+    assert (result["state"], result["shared"], result["unshared"]) == (
+        "delivered",
+        False,
+        "rate_limited",
+    )
+    assert _record(store)["unshared"] == "rate_limited"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_copy_is_recorded_with_its_reason():
+    from orchestrator.services.cloud import CloudBackendError, CloudBackendErrorKind
+
+    backend = _backend(
+        ensure_session_folder=AsyncMock(
+            side_effect=CloudBackendError(
+                CloudBackendErrorKind.UNKNOWN, "nope", backend="nextcloud"
+            )
+        )
+    )
+    deps, store, _ = _deps(backend=backend)
+
+    result = await job_export.run_job_outbox_effect(job_id=JOB_ID, dependencies=deps)
+
+    assert (result["state"], result["reason"]) == ("failed", "folder_failed")
+    assert _record(store)["reason"] == "folder_failed"
+    store.update_job_exported_folder.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_without_an_owner_nothing_is_copied():
+    deps, store, backend = _deps(owner=None)
+
+    result = await job_export.run_job_outbox_effect(job_id=JOB_ID, dependencies=deps)
+
+    assert result == {"state": "failed", "reason": "owner_unavailable"}
+    backend.ensure_session_folder.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_resync_reuses_the_folder_and_its_share():
+    handle = FOLDER.to_db()
+    job = _job(
+        exported_folder_handle=handle,
+        context={
+            "job_outbox": {"state": "delivered", "shared": True, "handle": handle}
+        },
+    )
+    deps, store, backend = _deps(job=job)
+
+    result = await job_export.run_job_outbox_effect(job_id=JOB_ID, dependencies=deps)
+
+    assert result["shared"] is True
+    assert backend.ensure_session_folder.await_args.kwargs == {
+        "session_id": "report-682baab8"
+    }
+    backend.share_session_folder.assert_not_awaited()

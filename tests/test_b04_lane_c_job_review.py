@@ -222,17 +222,67 @@ class TestExportToSharedFolder:
         )
 
     @pytest.mark.asyncio
-    async def test_a_cloud_folder_project_is_routed_to_the_diff_flow(self):
+    async def test_a_cloud_folder_project_resyncs_its_outbox_too(self):
         deps = _export_deps(job=_job(project_has_cloud_folder=True))
 
-        with pytest.raises(HTTPException) as exc:
-            await export_job_to_shared_folder(_request(), JOB_ID, dependencies=deps)
-
-        assert exc.value.status_code == 409
-        assert exc.value.detail == (
-            "Job's project has a cloud folder — use the diff-review "
-            "(accept/reject) flow instead of shared-folder export."
+        result = await export_job_to_shared_folder(
+            _request(), JOB_ID, dependencies=deps
         )
+
+        assert result["files_copied"] == 1
+        assert result["shared"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_job_in_review_is_exported(self):
+        deps = _export_deps(job=_job(status="reviewing"))
+        result = await export_job_to_shared_folder(
+            _request(), JOB_ID, dependencies=deps
+        )
+        assert result["files_copied"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_full_share_bucket_leaves_the_copy_unshared(self):
+        from orchestrator.services.cloud.retry import BucketFull
+
+        backend = _backend(share_session_folder=AsyncMock(side_effect=BucketFull(90)))
+        deps = _export_deps(backend=backend)
+
+        result = await export_job_to_shared_folder(
+            _request(), JOB_ID, dependencies=deps
+        )
+
+        assert (result["shared"], result["unshared"]) == (False, "rate_limited")
+        assert result["files_copied"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_share_error_after_the_copy_is_unshared_not_a_502(self):
+        backend = _backend(
+            share_session_folder=AsyncMock(side_effect=_cloud_error("dup"))
+        )
+        deps = _export_deps(backend=backend)
+
+        result = await export_job_to_shared_folder(
+            _request(), JOB_ID, dependencies=deps
+        )
+
+        assert (result["shared"], result["unshared"]) == (False, "share_failed")
+
+    @pytest.mark.asyncio
+    async def test_a_folder_an_earlier_copy_shared_is_not_shared_again(self):
+        handle = SessionFolderHandle(backend="nextcloud", native_id="/folder/17")
+        backend = _backend()
+        job = _job(
+            exported_folder_handle=handle.to_db(),
+            context={"job_outbox": {"shared": True, "handle": handle.to_db()}},
+        )
+        deps = _export_deps(job=job, backend=backend)
+
+        result = await export_job_to_shared_folder(
+            _request(), JOB_ID, dependencies=deps
+        )
+
+        assert result["shared"] is True
+        backend.share_session_folder.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_an_uninitialized_backend_refuses_before_the_forge_check(self):

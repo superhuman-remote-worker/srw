@@ -49,6 +49,15 @@ def _string_or_none(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _job_outbox_attached(job: dict[str, Any]) -> bool:
+    """Whether admission named the owner's outbox among the job's cloud
+    connectors (``context.cloud_connectors``)."""
+    from orchestrator.services.job_cloud_checkout import job_context
+    from shared.job_cloud_connectors import OUTBOX_KIND, connector_entry
+
+    return connector_entry(job_context(job), OUTBOX_KIND) is not None
+
+
 def _checkout_capture_applies(job: dict[str, Any]) -> bool:
     """Whether completion captures the project folder copy's diff: a
     checkout at reviewed write-back, or an older job's implicit copy
@@ -1839,6 +1848,75 @@ async def complete_job_legacy(
             if mode_a_capture["captured"] and new_status == "completed":
                 new_status = "pending_review"
                 actions.append("mode A diff captured -> pending_review")
+
+        # 1b. The job outbox (S16b): a root job whose owner's outbox is
+        # attached gets its deliverables copied into a folder shared with the
+        # owner, at completion and in review alike. Best-effort: the copy's
+        # outcome lands in context.job_outbox and never changes the status; a
+        # failure or an unshared folder is re-synced from the job's page.
+        if (
+            not job.get("parent_job_id")
+            and not _completion_loop_id
+            and new_status in ("completed", "pending_review", "reviewing")
+            and _job_outbox_attached(job)
+        ):
+
+            async def _deliver_job_outbox() -> dict[str, Any]:
+                if delivery_control_claim_id is not None:
+                    await _effect_runner.assert_delivery_control(
+                        completion_entry_status
+                    )
+                try:
+                    from orchestrator.services.job_export import (
+                        JobExportDependencies,
+                        run_job_outbox_effect,
+                    )
+                    from orchestrator.services.subjob_output import (
+                        SubjobOutputDependencies,
+                        resolve_job_repo,
+                    )
+
+                    repo_dependencies = SubjobOutputDependencies(
+                        store=postgres_db, forge=gitea_client
+                    )
+
+                    async def _resolve_repo(target: str) -> tuple[str, str | None]:
+                        return await resolve_job_repo(
+                            target, dependencies=repo_dependencies
+                        )
+
+                    return await run_job_outbox_effect(
+                        job_id=job_id,
+                        dependencies=JobExportDependencies(
+                            store=postgres_db,
+                            forge=gitea_client,
+                            cloud_router=main_cloud_router,
+                            resolve_job_repo=_resolve_repo,
+                        ),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Job outbox delivery failed for job %s (%s); the status "
+                        "is unchanged",
+                        job_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    return {"state": "failed", "error": str(exc)[:500]}
+
+            outbox_delivery = await _run_completion_effect(
+                _effect_runner,
+                "job_outbox_delivery",
+                "delivery",
+                _deliver_job_outbox,
+            )
+            if outbox_delivery.get("state") == "delivered":
+                actions.append(
+                    f"job outbox delivered ({outbox_delivery.get('files', 0)} "
+                    f"file(s), shared={bool(outbox_delivery.get('shared'))})"
+                )
+            else:
+                actions.append("job outbox delivery failed (status unchanged)")
 
         # A job whose deliverable is a pull request is not done while that PR is
         # open. Routed to human review rather than refused, because refusing a

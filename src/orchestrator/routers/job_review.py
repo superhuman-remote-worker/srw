@@ -1,4 +1,4 @@
-"""HTTP adapters for job delivery review — Mode B export, PR status, review session.
+"""HTTP adapters for job delivery review — outbox re-sync, PR status, review session.
 
 All three routes are gated by ``require_job_access``, which enforces both user
 visibility AND the MCP/officer ``project:<uuid>`` scope. The export needs the
@@ -43,29 +43,22 @@ async def export_job_to_shared_folder(
     *,
     dependencies: JobReviewDependencies = Depends(get_job_review_dependencies),
 ) -> dict[str, Any]:
-    """Mode B of the job cloud workflow — copy a job's deliverables into a
-    shared cloud folder ("Open cloud folder") and return its browser URL.
+    """Re-sync the job's outbox now: copy its deliverables into a shared
+    cloud folder ("Open cloud folder") and return its browser URL.
 
-    Valid for ``completed`` or ``pending_review`` jobs whose project has **no**
-    main-cloud folder (loose jobs and default-project / no-cloud-folder jobs);
-    jobs whose project *does* have a cloud folder go through the Mode A
-    diff-review flow instead. Copies the agent's declared deliverables (from
-    ``freeze_data.deliverables``; falls back to ``output/`` for jobs without a
-    deliverables list) into a per-job session-style cloud folder shared with the
-    calling user. Workspace-relative paths are kept **except** for the leading
-    directories every deliverable shares, which are collapsed
-    (``_common_dir_prefix``) so a lone ``output/digest.md`` opens as
-    ``digest.md`` instead of hiding a level down.
+    Valid for any ``completed``, ``pending_review`` or ``reviewing`` job,
+    whether or not its project has a cloud folder: the outbox is the job's
+    deliverables, while the project folder's copy has its own diff review.
+    A job whose owner's outbox is attached is copied at completion already
+    (the ``job_outbox_delivery`` effect); this repeats the copy for the
+    calling user, overwriting the same folder, re-stamping ``exported_at``
+    as "last synced at", and sharing a folder the completion copy could not
+    share yet (``unshared``). Workspace-relative paths are kept **except**
+    for the leading directories every deliverable shares, which are
+    collapsed (``_common_dir_prefix``).
 
-    Re-syncable: a repeat call overwrites the same folder and re-stamps
-    ``exported_at`` as "last synced at" (e.g. after resume-with-feedback). The
-    folder name is derived deterministically from the job, and a job that has
-    been exported before reuses its stored handle. v1 overwrites in place and
-    does not prune files removed between syncs — note that a re-sync after the
-    deliverable set changes can therefore leave files from the previous shape
-    behind, since the collapsed prefix is recomputed per call.
-
-    See knowledge-history/done/job_cloud_export.md §3.2.
+    See knowledge-history/done/job_cloud_export.md §3.2 and
+    main_cloud_as_connectors.md, slice 6.2.
     """
     user, job = await dependencies.require_job_access(
         request, dependencies.store, job_id

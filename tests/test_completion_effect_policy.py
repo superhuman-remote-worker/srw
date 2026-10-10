@@ -48,6 +48,14 @@ def test_product_delivery_set_and_gated_groups_are_the_step_four_decision() -> N
     assert mode_a.group == "delivery"
     assert mode_a.product_delivery is False
 
+    # The job outbox (S16b) runs right after the capture, in its group, and is
+    # best-effort: no product delivery, so the step-four set is unchanged.
+    names = [effect.name for effect in COMPLETION_EFFECT_PLAN]
+    outbox = COMPLETION_EFFECT_PLAN[names.index("job_outbox_delivery")]
+    assert names.index("job_outbox_delivery") == names.index("mode_a_diff_capture") + 1
+    assert (outbox.group, outbox.inventory_id) == ("delivery", "S16b")
+    assert outbox.product_delivery is False
+
 
 @pytest.mark.parametrize("status", sorted(REORDERED_TERMINAL_STATUSES))
 def test_persisted_true_reorders_only_the_exact_terminal_set(status: str) -> None:

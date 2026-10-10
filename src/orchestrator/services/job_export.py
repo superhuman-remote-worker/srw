@@ -1,21 +1,29 @@
-"""Mode B job export — copy a job's deliverables into a shared cloud folder.
+"""The job outbox — copy a job's deliverables into a shared cloud folder.
 
-Extracted verbatim from ``orchestrator.main`` (R1.B04 lane C). Four
-properties are load-bearing and moved unchanged:
+Mode B of the job cloud workflow, extracted from ``orchestrator.main``
+(R1.B04 lane C), became the ``cloud_outbox`` connector's job delivery (main
+cloud slice 6.2): :func:`deliver_job_outbox` is the copy itself, which the
+completion effect ``job_outbox_delivery`` (S16b, :func:`run_job_outbox_effect`)
+runs for a root job with its owner's outbox attached, and the "re-sync"
+endpoint (:func:`export_job_to_shared_folder`) runs on demand for any job,
+whether or not its project has a cloud folder. Properties that are
+load-bearing:
 
 * **The folder name is deterministic.** ``_job_export_folder_name`` must map
-  a job to the same segment forever, because the endpoint is re-syncable and
+  a job to the same segment forever, because the copy is re-syncable and
   re-derives the name to find the folder again. A job that already carries a
   handle reuses it instead, so a naming-scheme change cannot strand an
   existing share.
 * **Copy failures are fail-soft only where the original made them so.** A
   declared-but-missing deliverable is logged and skipped; a missing file in
-  the ``output/`` fallback is a 502. Everything else — an unexpected error,
-  a cloud error — is a 502 with the count that actually landed.
+  the ``output/`` fallback fails the copy. Everything else — an unexpected
+  error, a cloud error — fails it with the count that actually landed.
 * **The job is stamped only after a successful copy**, so a retry is safe.
-* **An unshared folder is still a success.** ``ensure_user`` returning no id
-  is loud in the log and reported as ``shared: false``, not raised: the files
-  did land, and the user's first cloud login makes them visible.
+* **An unshared folder is still a success.** The files landed; ``shared:
+  false`` says why the owner cannot see them yet (``unshared``: no cloud
+  account yet, the share rate limit, a share error), and a re-sync shares
+  it. The share never blocks: Nextcloud's share bucket is waited on for a
+  bounded time only (``cloud.retry.bounded_wait``).
 """
 
 from __future__ import annotations
@@ -26,16 +34,35 @@ import re
 import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import HTTPException
 
 from orchestrator.services.cloud import CloudBackendError, SessionFolderHandle
+from orchestrator.services.cloud.retry import BucketFull, bounded_wait
 
 logger = logging.getLogger(__name__)
 
 _EXPORT_SLUG_STRIP = re.compile(r"[^a-z0-9]+")
 _EXPORT_SLUG_MAX = 40
+#: The statuses whose output is stable enough to copy.
+EXPORTABLE_STATUSES: tuple[str, ...] = ("completed", "pending_review", "reviewing")
+#: Why a copy failed, as closed codes (``context.job_outbox.reason``).
+FAILURE_REASONS: tuple[str, ...] = (
+    "backend_unavailable",
+    "forge_unavailable",
+    "folder_failed",
+    "file_missing",
+    "copy_failed",
+    "owner_unavailable",
+)
+#: Why a copied folder is not shared with the owner yet
+#: (``context.job_outbox.unshared``).
+UNSHARED_REASONS: tuple[str, ...] = ("no_account", "rate_limited", "share_failed")
+#: How long the re-sync endpoint waits on Nextcloud's share bucket; the
+#: completion effect does not wait at all.
+RESYNC_SHARE_WAIT_SECONDS = 15.0
 
 
 @dataclass(frozen=True)
@@ -115,82 +142,154 @@ def _common_dir_prefix(paths: list[str]) -> str:
     return "/".join(common)
 
 
-async def export_job_to_shared_folder(
-    *,
-    job_id: str,
-    user: dict[str, Any],
-    authorized_job: dict[str, Any],
-    dependencies: JobExportDependencies,
-) -> dict[str, Any]:
-    """Mode B of the job cloud workflow — copy a job's deliverables into a
-    shared cloud folder ("Open cloud folder") and return its browser URL.
+class JobOutboxError(Exception):
+    """A copy that did not land. ``reason`` is one of
+    :data:`FAILURE_REASONS`; ``status_code`` and ``detail`` are what the
+    re-sync endpoint answers with."""
 
-    Valid for ``completed`` or ``pending_review`` jobs whose project has **no**
-    main-cloud folder (loose jobs and default-project / no-cloud-folder jobs);
-    jobs whose project *does* have a cloud folder go through the Mode A
-    diff-review flow instead. Copies the agent's declared deliverables (from
-    ``freeze_data.deliverables``; falls back to ``output/`` for jobs without a
-    deliverables list) into a per-job session-style cloud folder shared with the
-    calling user. Workspace-relative paths are kept **except** for the leading
-    directories every deliverable shares, which are collapsed
+    def __init__(self, reason: str, status_code: int, detail: str) -> None:
+        super().__init__(detail)
+        self.reason = reason
+        self.status_code = status_code
+        self.detail = detail
+
+
+def _job_context(job: dict[str, Any]) -> dict[str, Any]:
+    context = job.get("context")
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return context if isinstance(context, dict) else {}
+
+
+def _already_shared(job: dict[str, Any]) -> bool:
+    """Whether an earlier copy shared this job's stored folder already."""
+    record = _job_context(job).get("job_outbox")
+    return bool(
+        isinstance(record, dict)
+        and record.get("shared") is True
+        and job.get("exported_folder_handle")
+        and record.get("handle") == job.get("exported_folder_handle")
+    )
+
+
+async def _share_with_owner(
+    backend: Any,
+    folder_handle: SessionFolderHandle,
+    owner: dict[str, Any],
+    *,
+    share_wait_seconds: float,
+    folder_session_id: str,
+) -> str | None:
+    """Share the folder with the owner; ``None`` when shared, else why not
+    (:data:`UNSHARED_REASONS`)."""
+    try:
+        resolved_user_id = await backend.ensure_user(
+            sub=owner.get("keycloak_sub") or "",
+            issuer=getattr(backend, "_keycloak_issuer", "") or "",
+            email=owner.get("email"),
+            display_name=owner.get("display_name"),
+            preferred_username=owner.get("preferred_username"),
+        )
+    except CloudBackendError:
+        logger.warning(
+            "Job outbox: could not resolve %s's %s account for folder %s",
+            owner.get("id"),
+            backend.backend_id,
+            folder_session_id,
+            exc_info=True,
+        )
+        return "share_failed"
+    if not resolved_user_id:
+        # Not fatal — the files still land in the agent's cloud home and a
+        # later re-sync shares them once the account exists. But it IS the
+        # difference between "the folder opens" and "the folder 404s", so
+        # say so loudly here and hand the caller a `shared: false` it can
+        # surface. Backends that cannot provision accounts themselves
+        # (Nextcloud: user_oidc materialises the account on the user's
+        # first browser login) resolve to None until the user has signed
+        # in to the cloud at least once.
+        logger.warning(
+            "Job outbox: no %s account for user %s (email=%r) — folder "
+            "%s created but NOT shared; the user must sign in to the cloud "
+            "once before it becomes visible to them",
+            backend.backend_id,
+            owner.get("id"),
+            owner.get("email"),
+            folder_session_id,
+        )
+        return "no_account"
+    try:
+        with bounded_wait(share_wait_seconds):
+            await backend.share_session_folder(folder_handle, resolved_user_id)
+    except BucketFull as exc:
+        logger.info(
+            "Job outbox: share of folder %s is rate limited (capacity again "
+            "in %.0fs); a re-sync shares it",
+            folder_session_id,
+            exc.retry_after,
+        )
+        return "rate_limited"
+    except CloudBackendError:
+        logger.warning(
+            "Job outbox: sharing folder %s with user %s failed",
+            folder_session_id,
+            owner.get("id"),
+            exc_info=True,
+        )
+        return "share_failed"
+    return None
+
+
+async def deliver_job_outbox(
+    *,
+    job: dict[str, Any],
+    owner: dict[str, Any],
+    dependencies: JobExportDependencies,
+    share_wait_seconds: float = 0.0,
+) -> dict[str, Any]:
+    """Copy a job's deliverables into its outbox folder and share it with
+    its owner; return what landed.
+
+    Copies the agent's declared deliverables (from
+    ``freeze_data.deliverables``; falls back to ``output/`` for jobs without
+    a deliverables list) into a per-job session-style cloud folder shared
+    with ``owner``. Workspace-relative paths are kept **except** for the
+    leading directories every deliverable shares, which are collapsed
     (``_common_dir_prefix``) so a lone ``output/digest.md`` opens as
     ``digest.md`` instead of hiding a level down.
 
     Re-syncable: a repeat call overwrites the same folder and re-stamps
     ``exported_at`` as "last synced at" (e.g. after resume-with-feedback). The
     folder name is derived deterministically from the job, and a job that has
-    been exported before reuses its stored handle. v1 overwrites in place and
-    does not prune files removed between syncs — note that a re-sync after the
-    deliverable set changes can therefore leave files from the previous shape
-    behind, since the collapsed prefix is recomputed per call.
+    been exported before reuses its stored handle (and its share, when an
+    earlier copy recorded one). v1 overwrites in place and does not prune
+    files removed between syncs — note that a re-sync after the deliverable
+    set changes can therefore leave files from the previous shape behind,
+    since the collapsed prefix is recomputed per call.
+
+    Returns ``{job_id, files_copied, shared, unshared?, folder, handle}``;
+    raises :class:`JobOutboxError` when the copy did not land. Neither the
+    status nor anything else of the job changes, apart from its exported
+    folder stamp.
 
     See knowledge-history/done/job_cloud_export.md §3.2.
     """
-    job = authorized_job
-
-    # Status gate — completed or in-review. In-review (pending_review) export
-    # lets the user preview the deliverables in the cloud before approving;
-    # failed/cancelled/in-flight jobs have no stable output to copy.
-    if job.get("status") not in ("completed", "pending_review"):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Job is in status '{job.get('status')}'; "
-                "only completed or in-review jobs can be exported."
-            ),
-        )
-
-    # Routing gate — only jobs whose project has a main-cloud folder use the
-    # Mode A diff flow. Loose jobs AND default-project / no-cloud-folder jobs
-    # fall through to Mode B here (mirrors the seed gate in
-    # services/job_cloud_baseline.py). ``project_has_cloud_folder`` is computed
-    # by the projects LEFT JOIN in postgres.get_job.
-    if job.get("project_has_cloud_folder"):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Job's project has a cloud folder — use the diff-review "
-                "(accept/reject) flow instead of shared-folder export."
-            ),
-        )
-
-    # No idempotency refusal: this endpoint is re-syncable. The folder id is
-    # derived deterministically from the job id below, so a repeat call
-    # overwrites the same folder (e.g. after resume-with-feedback) and
-    # re-stamps ``exported_at`` as "last synced at".
-
-    # Fresh loose-job export folder — no project/thread row to pin to yet,
-    # so resolve via the owner seam (returns the active backend today;
-    # per-org under multi-tenancy). Issue 16, knowledge-base/knowledge/issues/main_cloud.md.
-    backend = dependencies.cloud_router.for_owner(user)
+    job_id = str(job["id"])
+    # Fresh export folder — no project/thread row to pin to, so resolve via
+    # the owner seam (returns the active backend today; per-org under
+    # multi-tenancy). Issue 16, knowledge-base/knowledge/issues/main_cloud.md.
+    backend = dependencies.cloud_router.for_owner(owner)
     if not backend.is_initialized:
-        raise HTTPException(status_code=503, detail="Cloud backend not available.")
+        raise JobOutboxError("backend_unavailable", 503, "Cloud backend not available.")
     if not dependencies.forge.is_initialized:
-        raise HTTPException(status_code=503, detail="Gitea not available.")
+        raise JobOutboxError("forge_unavailable", 503, "Gitea not available.")
 
     repo_name, branch = await dependencies.resolve_job_repo(job_id)
 
-    # 1) Provision shared folder. A job that has been exported before keeps the
+    # 1) Provision the folder. A job that has been exported before keeps the
     #    folder it already has — re-deriving the name would strand the old
     #    folder (and its share) whenever the naming scheme changes, which it did
     #    once already when these went from `job-<uuid>` to slugged names.
@@ -207,38 +306,10 @@ async def export_job_to_shared_folder(
         folder_handle = await backend.ensure_session_folder(
             session_id=folder_session_id
         )
-        resolved_user_id = await backend.ensure_user(
-            sub=user.get("keycloak_sub") or "",
-            issuer=getattr(backend, "_keycloak_issuer", "") or "",
-            email=user.get("email"),
-            display_name=user.get("display_name"),
-            preferred_username=user.get("preferred_username"),
-        )
-        if resolved_user_id:
-            await backend.share_session_folder(folder_handle, resolved_user_id)
-        else:
-            # Not fatal — the files still land in the agent's cloud home and a
-            # later re-sync shares them once the account exists. But it IS the
-            # difference between "the folder opens" and "the folder 404s", so
-            # say so loudly here and hand the caller a `shared: false` it can
-            # surface. Backends that cannot provision accounts themselves
-            # (Nextcloud: user_oidc materialises the account on the user's
-            # first browser login) resolve to None until the user has signed
-            # in to the cloud at least once.
-            logger.warning(
-                "Mode B export: no %s account for user %s (email=%r) — folder "
-                "%s created but NOT shared; the user must sign in to the cloud "
-                "once before it becomes visible to them",
-                backend.backend_id,
-                user.get("id"),
-                user.get("email"),
-                folder_session_id,
-            )
     except CloudBackendError as e:
-        logger.exception("Mode B export: folder provisioning failed for job %s", job_id)
-        raise HTTPException(
-            status_code=502,
-            detail=f"Cloud folder provisioning failed: {e}",
+        logger.exception("Job outbox: folder provisioning failed for job %s", job_id)
+        raise JobOutboxError(
+            "folder_failed", 502, f"Cloud folder provisioning failed: {e}"
         ) from e
 
     # 2) Copy the job's deliverables from Gitea → cloud, bytes-faithful via
@@ -285,14 +356,13 @@ async def export_job_to_shared_folder(
         file_bytes = await dependencies.forge.get_file_bytes(repo_name, rel, ref=branch)
         if file_bytes is None:
             if required:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Failed to read '{rel}' from Gitea.",
+                raise JobOutboxError(
+                    "file_missing", 502, f"Failed to read '{rel}' from Gitea."
                 )
             # Declared but absent from the repo (e.g. a directory entry or a
-            # workspace-only artifact). Skip fail-soft rather than 502.
+            # workspace-only artifact). Skip fail-soft rather than fail.
             logger.warning(
-                "Mode B export: deliverable %r not found in repo %s; skipping",
+                "Job outbox: deliverable %r not found in repo %s; skipping",
                 rel,
                 repo_name,
             )
@@ -309,7 +379,7 @@ async def export_job_to_shared_folder(
                 rel = declared.lstrip("/")
                 if not rel or ".." in rel.split("/"):
                     logger.warning(
-                        "Mode B export: skipping unsafe deliverable path %r", declared
+                        "Job outbox: skipping unsafe deliverable path %r", declared
                     )
                     continue
                 sources.append(rel)
@@ -331,44 +401,190 @@ async def export_job_to_shared_folder(
                 rel[len(prefix) + 1 :] if prefix else rel,
                 required=required,
             )
-    except HTTPException:
+    except JobOutboxError:
         raise
     except CloudBackendError as e:
         logger.exception(
-            "Mode B export: cloud upload failed for job %s (copied %d)",
+            "Job outbox: cloud upload failed for job %s (copied %d)",
             job_id,
             files_copied,
         )
-        raise HTTPException(
-            status_code=502,
-            detail=f"File copy to cloud failed after {files_copied} files: {e}",
+        raise JobOutboxError(
+            "copy_failed",
+            502,
+            f"File copy to cloud failed after {files_copied} files: {e}",
         ) from e
     except Exception as e:
-        logger.exception("Mode B export: unexpected failure for job %s", job_id)
-        raise HTTPException(
-            status_code=502,
-            detail=f"Export failed: {e}",
-        ) from e
+        logger.exception("Job outbox: unexpected failure for job %s", job_id)
+        raise JobOutboxError("copy_failed", 502, f"Export failed: {e}") from e
 
     # 3) Stamp the job — only on success so retries are safe.
-    await dependencies.store.update_job_exported_folder(
-        job_id, handle=folder_handle.to_db()
+    handle_db = folder_handle.to_db()
+    await dependencies.store.update_job_exported_folder(job_id, handle=handle_db)
+
+    # 4) Share the folder with the owner, after the files landed: a folder
+    #    that cannot be shared yet still holds them, and a re-sync shares it.
+    unshared = (
+        None
+        if _already_shared({**job, "exported_folder_handle": handle_db})
+        else await _share_with_owner(
+            backend,
+            folder_handle,
+            owner,
+            share_wait_seconds=share_wait_seconds,
+            folder_session_id=folder_session_id,
+        )
     )
 
-    return {
+    result: dict[str, Any] = {
         "job_id": job_id,
         "files_copied": files_copied,
-        # False = copied, but the folder is not visible to the caller yet (see
-        # the ensure_user miss above). The cockpit turns this into a distinct
+        # False = copied, but the folder is not visible to the owner yet
+        # (``unshared`` says why). The cockpit turns this into a distinct
         # toast instead of claiming an unqualified success.
-        "shared": bool(resolved_user_id),
+        "shared": unshared is None,
         "folder": {
             "name": folder_session_id,
-            # Where the caller will actually find it: the share lands at the
+            # Where the owner will actually find it: the share lands at the
             # root of their own cloud drive, so the folder name IS the path.
             # Sent explicitly so the cockpit doesn't have to assume that.
             "path": f"/{folder_session_id}",
             "browser_url": backend.get_session_folder_browser_url(folder_handle),
             "webdav_url": backend.get_session_folder_webdav_url(folder_handle),
         },
+        "handle": handle_db,
+    }
+    if unshared is not None:
+        result["unshared"] = unshared
+    return result
+
+
+def outbox_record(
+    result: dict[str, Any] | None = None,
+    *,
+    error: JobOutboxError | None = None,
+    trigger: str,
+) -> dict[str, Any]:
+    """``context.job_outbox``: what the latest copy did, bounded."""
+    record: dict[str, Any] = {
+        "trigger": trigger,
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    if error is not None:
+        record.update(
+            state="failed", reason=error.reason, detail=str(error.detail)[:500]
+        )
+        return record
+    if result is None:
+        raise ValueError("an outbox record needs a result or an error")
+    record.update(
+        state="delivered",
+        files=int(result["files_copied"]),
+        shared=bool(result["shared"]),
+        folder=result["folder"]["name"],
+        handle=result["handle"],
+    )
+    if result.get("unshared"):
+        record["unshared"] = result["unshared"]
+    return record
+
+
+async def _record(store: Any, job_id: str, record: dict[str, Any]) -> None:
+    try:
+        await store.merge_job_context(job_id, {"job_outbox": record})
+    except Exception:
+        logger.warning(
+            "Job outbox: could not record job %s's copy", job_id, exc_info=True
+        )
+
+
+async def export_job_to_shared_folder(
+    *,
+    job_id: str,
+    user: dict[str, Any],
+    authorized_job: dict[str, Any],
+    dependencies: JobExportDependencies,
+) -> dict[str, Any]:
+    """Re-sync a job's outbox now: :func:`deliver_job_outbox` for the
+    calling user, as an HTTP answer ("Open cloud folder").
+
+    Valid for any job whose output is stable (``completed``,
+    ``pending_review`` or ``reviewing``), whether or not its project has a
+    cloud folder: the outbox is the job's deliverables, never the project
+    folder's copy, which goes through the diff review. A failed copy is the
+    HTTP error :class:`JobOutboxError` carries.
+    """
+    job = authorized_job
+
+    # Status gate — in-flight, failed or cancelled jobs have no stable
+    # output to copy. In-review (pending_review, reviewing) export lets the
+    # user preview the deliverables in the cloud before approving.
+    if job.get("status") not in EXPORTABLE_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Job is in status '{job.get('status')}'; "
+                "only completed or in-review jobs can be exported."
+            ),
+        )
+
+    # No idempotency refusal: this endpoint is re-syncable. The folder id is
+    # derived deterministically from the job id, so a repeat call overwrites
+    # the same folder and re-stamps ``exported_at`` as "last synced at".
+    try:
+        result = await deliver_job_outbox(
+            job={**job, "id": job_id},
+            owner=user,
+            dependencies=dependencies,
+            share_wait_seconds=RESYNC_SHARE_WAIT_SECONDS,
+        )
+    except JobOutboxError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    await _record(dependencies.store, job_id, outbox_record(result, trigger="resync"))
+    result = dict(result)
+    result.pop("handle", None)
+    return result
+
+
+async def run_job_outbox_effect(
+    *, job_id: str, dependencies: JobExportDependencies
+) -> dict[str, Any]:
+    """The completion effect ``job_outbox_delivery`` (S16b): copy a root
+    job's deliverables into its owner's outbox.
+
+    Best-effort: the job's status never depends on it. What happened goes
+    into ``context.job_outbox`` and the effect's small output; a failure is
+    recorded with its closed reason, and the re-sync endpoint retries it.
+    The share does not wait on Nextcloud's bucket: a full one leaves the
+    folder ``unshared: rate_limited``.
+    """
+    job = await dependencies.store.get_job(job_id)
+    owner = (
+        await dependencies.store.get_user(str(job["user_id"]))
+        if job and job.get("user_id")
+        else None
+    )
+    if not job or not owner:
+        error = JobOutboxError("owner_unavailable", 409, "The job or its owner is gone")
+        await _record(
+            dependencies.store, job_id, outbox_record(error=error, trigger="completion")
+        )
+        return {"state": "failed", "reason": error.reason}
+    try:
+        result = await deliver_job_outbox(
+            job=job, owner=owner, dependencies=dependencies, share_wait_seconds=0.0
+        )
+    except JobOutboxError as exc:
+        await _record(
+            dependencies.store, job_id, outbox_record(error=exc, trigger="completion")
+        )
+        return {"state": "failed", "reason": exc.reason, "error": exc.detail}
+    await _record(
+        dependencies.store, job_id, outbox_record(result, trigger="completion")
+    )
+    return {
+        "state": "delivered",
+        "files": int(result["files_copied"]),
+        "shared": bool(result["shared"]),
+        "unshared": result.get("unshared"),
     }

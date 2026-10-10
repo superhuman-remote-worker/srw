@@ -233,6 +233,7 @@ _DIAGNOSTIC_OUTPUT_PATHS: dict[str, tuple[tuple[str, ...], ...]] = {
     "deliverable_contract_gate": (("actions",),),
     "loop_project_cloud_delivery": (("action",),),
     "mode_a_diff_capture": (("error",),),
+    "job_outbox_delivery": (("error",),),
     "drain_stall_counter_alert": (("error",),),
     "drain_stall_operator_alert": (("error",),),
     "sudo_approval_request": (("error",),),

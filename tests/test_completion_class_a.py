@@ -1034,6 +1034,67 @@ class TestCompleteJobClassA:
         assert job["freeze_data"] == freeze
 
 
+class TestJobOutboxDelivery:
+    """S16b: a root job with its owner's outbox gets its deliverables copied
+    at completion, best-effort; the copy never changes the status."""
+
+    _OUTBOX = {"cloud_connectors": [{"kind": "cloud_outbox", "datasource_id": "o"}]}
+
+    async def _complete(self, job, *, effect):
+        db = _EndpointDB(job)
+        body = job_runtime_module.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=True,
+            freeze_data={"status": "job_completed", "summary": "done"},
+        )
+        with ExitStack() as stack:
+            _patch_completion(stack, db)
+            stack.enter_context(
+                patch("orchestrator.services.job_export.run_job_outbox_effect", effect)
+            )
+            return await b08_helpers.complete_job(MagicMock(), JOB_ID, body)
+
+    @pytest.mark.asyncio
+    async def test_a_root_job_with_its_outbox_is_copied_and_completes(self):
+        effect = AsyncMock(
+            return_value={"state": "delivered", "files": 2, "shared": False}
+        )
+        handled = await self._complete(_job(context=dict(self._OUTBOX)), effect=effect)
+
+        effect.assert_awaited_once()
+        assert effect.await_args.kwargs["job_id"] == JOB_ID
+        assert handled["new_status"] == "completed"
+        assert "job outbox delivered (2 file(s), shared=False)" in handled["actions"]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_copy_leaves_the_status_alone(self):
+        effect = AsyncMock(side_effect=RuntimeError("cloud down"))
+        handled = await self._complete(_job(context=dict(self._OUTBOX)), effect=effect)
+
+        assert handled["new_status"] == "completed"
+        assert "job outbox delivery failed (status unchanged)" in handled["actions"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"context": {}},
+            {
+                "context": dict(_OUTBOX),
+                "parent_job_id": "55555555-5555-4555-8555-555555555555",
+            },
+            {"context": {**_OUTBOX, "loop_id": "l1"}},
+        ],
+        ids=["no-outbox", "subjob", "loop"],
+    )
+    async def test_no_outbox_a_subjob_or_a_loop_is_not_copied(self, overrides):
+        effect = AsyncMock()
+
+        await self._complete(_job(**overrides), effect=effect)
+
+        effect.assert_not_awaited()
+
+
 class TestDiffDecisionClassA:
     @pytest.mark.asyncio
     async def test_accept_uses_one_status_and_timestamp_update(self):
