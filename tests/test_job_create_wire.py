@@ -1067,9 +1067,12 @@ async def test_datasource_wire_presence_preserves_selection_intent(
     resolved = origin in {"default", "native_default"}
     assert wire.defaults.await_count == resolved
     if resolved:
+        # A REST create is started by hand: never the unattended defaults
+        # (which withhold the owner's outbox from an officer's ticket).
         assert wire.defaults.await_args.kwargs == {
             "execution_kind": "job",
             "native_only": origin == "native_default",
+            "unattended": False,
         }
 
 
