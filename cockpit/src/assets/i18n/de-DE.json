@@ -1714,7 +1714,16 @@
       "accessAdvisory": "Nur ein Hinweis:",
       "githubAppReadOnly": "das GitHub-App-Token, das SRW für jede Ausführung erzeugt, hat contents: read, daher lehnt GitHub Pushes mit diesem Token ab.",
       "accessCreatorReadOnly": "Nur Lesen für alle, die ihn nutzen: Sein Ersteller hat ihn so markiert, und ein Projekt-Link kann das nicht aufheben.",
-      "unlink": "Trennen"
+      "unlink": "Trennen",
+      "cloudFolders": {
+        "title": "Cloud-Ordner",
+        "hint": "Die eigenen Ordner des Projekts in der Haupt-Cloud. Seine Arbeit bindet jeden mit seinem Standardzugriff ein, sofern eine Sitzung keine andere Stufe wählt.",
+        "colAccess": "Standardzugriff",
+        "defaultOption": "Standard ({{level}})",
+        "notOffered": "von dieser Cloud nicht angeboten",
+        "noLevel": "keine",
+        "saveFailed": "Der Standardzugriff konnte nicht gespeichert werden."
+      }
     },
     "repos": {
       "namePlaceholder": "Repo-Name",

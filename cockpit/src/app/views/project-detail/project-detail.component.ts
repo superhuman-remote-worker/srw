@@ -17,7 +17,9 @@ import {
 } from '../../core/models/connector-driver.model';
 import {
   accessLevelLabelKey,
+  isCloudConnectorType,
   isPlatformOwned,
+  platformKindLabelKey,
   platformManagedLabelKey,
 } from '../../core/models/platform-connector';
 import {ErrorMessageService} from '../../core/services/error-message.service';
@@ -41,6 +43,7 @@ import {ProjectOfficerComponent} from './project-officer.component';
 import {ProjectBacklogComponent} from './project-backlog.component';
 import {ExternalImageDirective} from '../../ui/external-image';
 import {
+    ConnectorAccessChoiceLevel,
     Datasource,
     Expert,
     Job,
@@ -633,9 +636,83 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 </div>
               }
 
+              <!-- The project's own cloud folders, and any link whose driver
+                   has strict levels: the link holds a default level its
+                   work binds at when it chooses none (main cloud slice 5),
+                   never the read-only switch. -->
+              @if (cloudFolderLinks().length) {
+                <div class="cloud-folder-links" data-cloud-folders>
+                  <h3 class="settings-heading">{{ 'projectDetail.datasources.cloudFolders.title' | transloco }}</h3>
+                  <p class="cloud-folder-hint">{{ 'projectDetail.datasources.cloudFolders.hint' | transloco }}</p>
+                  @if (cloudFolderError(); as message) {
+                    <div class="cloud-folder-error" role="alert">{{ message }}</div>
+                  }
+                  <div class="table-scroll">
+                  <table class="data-table app-table">
+                    <thead>
+                      <tr>
+                        <th>{{ 'projectDetail.datasources.colName' | transloco }}</th>
+                        <th>{{ 'projectDetail.datasources.colType' | transloco }}</th>
+                        <th>{{ 'projectDetail.datasources.cloudFolders.colAccess' | transloco }}</th>
+                        <th>{{ 'projectDetail.datasources.colActions' | transloco }}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      @for (ds of cloudFolderLinks(); track ds.id + ':' + linkAccessRevision()) {
+                        <tr data-cloud-folder-link>
+                          <td>{{ ds.name }}</td>
+                          <td>
+                            <span class="role-badge" [class]="'role-' + ds.type">
+                              {{ linkKindLabelKey(ds) | transloco }}
+                            </span>
+                          </td>
+                          <td>
+                            <app-select
+                              size="sm"
+                              [value]="ds.project_access ?? ''"
+                              [disabled]="savingLinkAccess() === ds.id"
+                              (changed)="updateLinkAccess(ds.id, $event ?? '')"
+                            >
+                              <option value="">{{ 'projectDetail.datasources.cloudFolders.defaultOption' | transloco:{ level: levelLabel(linkDefaultLevel(ds)) | transloco } }}</option>
+                              @for (level of linkLevels(ds); track level.id) {
+                                <option [value]="level.id" [disabled]="!level.offered" [attr.title]="level.detail || null">
+                                  {{ levelLabel(level.id) | transloco }}
+                                  @if (!level.offered) {
+                                    · {{ 'projectDetail.datasources.cloudFolders.notOffered' | transloco }}
+                                  }
+                                </option>
+                              }
+                            </app-select>
+                            @if (linkLevelEnforcedBy(ds); as line) {
+                              <div class="link-enforced" [attr.data-level]="linkLevel(ds)">
+                                <strong>{{ 'projectDetail.datasources.accessEnforcedBy' | transloco }}</strong>
+                                {{ line }}
+                              </div>
+                            }
+                          </td>
+                          <td>
+                            @if (managedLabelKey(ds); as managedKey) {
+                              <span class="link-managed" data-managed>
+                                <app-icon size="xs">lock</app-icon>
+                                {{ managedKey | transloco }}
+                              </span>
+                            } @else {
+                              <app-button variant="danger" size="sm" (clicked)="unlinkDatasource(ds.id)">
+                                {{ 'projectDetail.datasources.unlink' | transloco }}
+                              </app-button>
+                            }
+                          </td>
+                        </tr>
+                      }
+                    </tbody>
+                  </table>
+                  </div>
+                </div>
+              }
+
               @if (projectDatasources().length === 0) {
                 <div class="empty-inline">{{ 'projectDetail.datasources.empty' | transloco }}</div>
-              } @else {
+              } @else if (otherLinks().length) {
                 <div class="table-scroll">
                 <table class="data-table app-table">
                   <thead>
@@ -648,7 +725,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                     </tr>
                   </thead>
                   <tbody>
-                    @for (ds of projectDatasources(); track ds.id) {
+                    @for (ds of otherLinks(); track ds.id) {
                       <tr>
                         <td>{{ ds.name }}</td>
                         <td>
@@ -1583,6 +1660,25 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
 
     .link-enforced.link-advisory { color: var(--warning); }
 
+    .cloud-folder-links {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .cloud-folder-links .settings-heading { margin: 0; }
+    .cloud-folder-hint {
+      margin: 0;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .cloud-folder-error {
+      padding: 8px 10px;
+      border-radius: var(--radius-control);
+      background: var(--danger-tint);
+      color: var(--danger);
+      font-size: 12px;
+    }
+
     /* A platform-owned link: SRW keeps it, so no Unlink. */
     .link-managed {
       display: inline-flex;
@@ -2184,6 +2280,23 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   // Datasources tab
   readonly projectDatasources = signal<ProjectDatasource[]>([]);
+  /** Links whose driver has strict levels (the project's cloud folder and
+   *  its copy for jobs): a default level each, listed on their own. */
+  readonly cloudFolderLinks = computed(() =>
+    this.projectDatasources().filter((ds) => this.strictLink(ds)),
+  );
+  /** Every other link, with the read-only switch where its driver has one. */
+  readonly otherLinks = computed(() =>
+    this.projectDatasources().filter((ds) => !this.strictLink(ds)),
+  );
+  /** The levels each strict link may default to, as the eligible list
+   *  offers them for this project (its provider's, on any tier); a link
+   *  missing here falls back to its driver's levels. */
+  readonly linkLevelOffers = signal<Record<string, ConnectorAccessChoiceLevel[]>>({});
+  readonly cloudFolderError = signal<string | null>(null);
+  /** The link whose default level is being saved. */
+  readonly savingLinkAccess = signal<string | null>(null);
+  readonly linkAccessRevision = signal(0);
   readonly allDatasources = signal<Datasource[]>([]);
   readonly dsLinkId = signal('');
   readonly datasourceCandidateSearch = signal('');
@@ -2445,8 +2558,104 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     this.api.getProjectDatasources(this.projectId).subscribe((ds) => {
       this.projectDatasources.set(ds);
       this.reconcileDatasourceSelection();
+      if (ds.some((row) => this.strictLink(row))) this.loadLinkLevelOffers();
     });
     this.loadDatasourceCandidates();
+  }
+
+  /** Which levels a strict link may default to here: the eligible list's
+   *  access object for this project (no execution kind, any tier). */
+  private loadLinkLevelOffers(): void {
+    this.api.getEligibleDatasources([this.projectId]).subscribe({
+      next: (rows) => {
+        const offers: Record<string, ConnectorAccessChoiceLevel[]> = {};
+        for (const row of rows) {
+          if (row.access?.levels?.length) offers[row.id] = row.access.levels;
+        }
+        this.linkLevelOffers.set(offers);
+      },
+      // The driver's own levels then; the server refuses one it does not offer.
+      error: () => this.linkLevelOffers.set({}),
+    });
+  }
+
+  /** Whether a link holds a default level rather than the read-only switch:
+   *  its driver's levels say what they let through. Before the matrix
+   *  loads, the main cloud's types. */
+  strictLink(ds: Pick<Datasource, 'type'>): boolean {
+    const driver = this.connectorDrivers.forType(ds.type);
+    return driver ? strictAccess(driver) : isCloudConnectorType(ds.type);
+  }
+
+  /** The levels a strict link's select offers, lowest first. */
+  linkLevels(ds: Pick<Datasource, 'id' | 'type'>): ConnectorAccessChoiceLevel[] {
+    const offered = this.linkLevelOffers()[ds.id];
+    if (offered?.length) return [...offered].sort((a, b) => a.rank - b.rank);
+    const driver = this.connectorDrivers.forType(ds.type);
+    return [...(driver?.access_levels ?? [])]
+      .sort((a, b) => a.rank - b.rank)
+      .map((level) => ({
+        id: level.id,
+        rank: level.rank,
+        writes: level.writes ?? null,
+        enforced_by: level.enforced_by,
+        offered: true,
+      }));
+  }
+
+  /** The level a strict link binds at when it holds none: its driver's
+   *  default, else its highest offered level. */
+  linkDefaultLevel(ds: Pick<Datasource, 'id' | 'type'>): string | null {
+    const offered = this.linkLevels(ds).filter((level) => level.offered);
+    const fallback = this.connectorDrivers.forType(ds.type)?.default_access ?? null;
+    if (fallback && offered.some((level) => level.id === fallback)) return fallback;
+    return offered.length ? offered[offered.length - 1].id : fallback;
+  }
+
+  /** The level a strict link's work binds at unchosen. */
+  linkLevel(ds: ProjectDatasource): string | null {
+    return ds.project_access ?? this.linkDefaultLevel(ds);
+  }
+
+  /** What makes that level true, in one line. */
+  linkLevelEnforcedBy(ds: ProjectDatasource): string | null {
+    const level = this.linkLevel(ds);
+    return this.linkLevels(ds).find((entry) => entry.id === level)?.enforced_by ?? null;
+  }
+
+  levelLabel(level: string | null): string {
+    return accessLevelLabelKey(level) ?? 'projectDetail.datasources.cloudFolders.noLevel';
+  }
+
+  linkKindLabelKey(ds: Datasource): string {
+    return platformKindLabelKey(ds) ?? 'datasources.filter.' + ds.type;
+  }
+
+  /** Set a strict link's default level (`PATCH {access}`; '' clears it to
+   *  the driver's default). The server refuses a level the connector is
+   *  not offered, and says which ones are. */
+  updateLinkAccess(datasourceId: string, value: string): void {
+    const ds = this.projectDatasources().find((row) => row.id === datasourceId);
+    if (!ds || !this.strictLink(ds)) return;
+    const access = value || null;
+    if ((ds.project_access ?? null) === access) return;
+    this.cloudFolderError.set(null);
+    this.savingLinkAccess.set(datasourceId);
+    this.api.setProjectDatasourceAccess(this.projectId, datasourceId, access).subscribe({
+      next: () => {
+        this.savingLinkAccess.set(null);
+        this.loadProjectDatasources();
+      },
+      error: (err) => {
+        this.savingLinkAccess.set(null);
+        this.cloudFolderError.set(
+          this.errors.translate(err, 'projectDetail.datasources.cloudFolders.saveFailed'),
+        );
+        // Render the row again: its select shows the stored level, not the
+        // refused choice.
+        this.linkAccessRevision.update((n) => n + 1);
+      },
+    });
   }
 
   /** Load connector candidates from the rollout-appropriate contract. V1 is
@@ -2699,7 +2908,9 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
       this.projectDatasources().some(
         (ds) =>
           ds.id === datasourceId &&
-          (this.linkAccessShown(ds) !== 'choice' || this.linkAccessManaged(ds)),
+          (this.linkAccessShown(ds) !== 'choice' ||
+            this.linkAccessManaged(ds) ||
+            this.strictLink(ds)),
       )
     ) {
       return;

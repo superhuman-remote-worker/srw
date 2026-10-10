@@ -284,6 +284,21 @@ describe('ApiService datasource policy endpoints', () => {
     await expect(pending).rejects.toBeTruthy();
   });
 
+  it("sets a project link's default level and lets a refusal reach the caller", async () => {
+    const pending = firstValueFrom(api.setProjectDatasourceAccess('p1', 'ds1', 'protected'));
+    const req = httpMock.expectOne(r => r.url.endsWith('/projects/p1/datasources/ds1'));
+    expect(req.request.method).toBe('PATCH');
+    expect(req.request.body).toEqual({access: 'protected'});
+    req.flush({detail: {code: 'link_access_not_offered'}}, {status: 422, statusText: 'Unprocessable'});
+    await expect(pending).rejects.toBeTruthy();
+
+    const cleared = firstValueFrom(api.setProjectDatasourceAccess('p1', 'ds1', null));
+    const clear = httpMock.expectOne(r => r.url.endsWith('/projects/p1/datasources/ds1'));
+    expect(clear.request.body).toEqual({access: null});
+    clear.flush({status: 'updated'});
+    await cleared;
+  });
+
   it('names the execution kind the eligible list is for', async () => {
     const pending = firstValueFrom(api.getEligibleDatasources(['p1'], 'job'));
     const req = httpMock.expectOne(r => r.url.endsWith('/datasources/eligible'));

@@ -1714,7 +1714,16 @@
       "accessAdvisory": "Advisory only:",
       "githubAppReadOnly": "the GitHub App token SRW mints for each execution has contents: read, so GitHub refuses pushes made with that token.",
       "accessCreatorReadOnly": "Read-only for everyone who uses it: its creator tagged it so, and a project link cannot lift that.",
-      "unlink": "Unlink"
+      "unlink": "Unlink",
+      "cloudFolders": {
+        "title": "Cloud folders",
+        "hint": "The project's own folders in the main cloud. Its work binds each one at its default access unless a session chooses another level.",
+        "colAccess": "Default access",
+        "defaultOption": "Default ({{level}})",
+        "notOffered": "not offered by this cloud",
+        "noLevel": "none",
+        "saveFailed": "The default access could not be saved."
+      }
     },
     "repos": {
       "namePlaceholder": "Repo name",

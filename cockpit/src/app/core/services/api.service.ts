@@ -1293,6 +1293,21 @@ export class ApiService {
     );
   }
 
+  /** Set a project link's default access level, for a connector whose
+   *  driver has strict levels (a cloud folder); null clears it to the
+   *  driver's default. Errors reach the caller: a refused level (422
+   *  `link_access_not_offered`) says which ones are offered. */
+  setProjectDatasourceAccess(
+    projectId: string,
+    datasourceId: string,
+    access: string | null,
+  ): Observable<{ status: string }> {
+    return this.http.patch<{ status: string }>(
+      `${this.baseUrl}/projects/${projectId}/datasources/${datasourceId}`,
+      { access },
+    );
+  }
+
   /**
    * Unlink a datasource from a project.
    */

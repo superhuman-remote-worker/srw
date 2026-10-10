@@ -1006,6 +1006,98 @@ describe("ProjectDetailPageComponent the project's own connectors", () => {
     expect(component.linkAccessLevel(FOLDER)).toBeNull();
   });
 
+  it('lists the cloud folder links on their own, with a default level each', () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const copy = linked('copy', {
+      type: 'cloud_folder_checkout',
+      connection_url: null,
+      config: {},
+      managed_key: `project-cloud-checkout:${PROJECT}`,
+    });
+    component.projectDatasources.set([FOLDER, copy, linked('pg')]);
+    expect(component.cloudFolderLinks().map((ds) => ds.id)).toEqual(['folder', 'copy']);
+    expect(component.otherLinks().map((ds) => ds.id)).toEqual(['pg']);
+    // Without a level of its own, the driver's default, else its highest.
+    expect(component.linkDefaultLevel(FOLDER)).toBe('read_write');
+    expect(component.linkLevel({...FOLDER, project_access: 'protected'})).toBe('protected');
+    expect(component.linkLevelEnforcedBy({...FOLDER, project_access: 'read_only'})).toContain('reader account');
+    expect(component.linkKindLabelKey(FOLDER)).toBe('datasources.platform.kind.projectCloud');
+    expect(component.linkKindLabelKey(copy)).toBe('datasources.platform.kind.projectCloudCheckout');
+  });
+
+  it('offers the levels the eligible list says this cloud offers', () => {
+    const {api, component} = createComponent({drivers: BUILTIN_DRIVERS});
+    api.getProjectDatasources.mockReturnValue(of([FOLDER, linked('pg')]));
+    api.getEligibleDatasources.mockReturnValue(of([
+      {
+        ...FOLDER,
+        default_selected: true,
+        access: {
+          levels: [
+            {id: 'read_only', rank: 10, writes: 'none', offered: false, reason: 'level_not_offered', detail: 'no reader here'},
+            {id: 'protected', rank: 20, writes: 'reviewed', offered: false, reason: 'level_not_offered'},
+            {id: 'read_write', rank: 30, writes: 'direct', offered: true},
+          ],
+          default: 'read_write',
+          default_origin: 'driver_default',
+        },
+      },
+    ]));
+    component.loadProjectDatasources();
+    // One read for the project, no execution kind and any tier.
+    expect(api.getEligibleDatasources).toHaveBeenCalledWith(['project-a']);
+    expect(component.linkLevels(FOLDER).map((level) => [level.id, level.offered])).toEqual([
+      ['read_only', false],
+      ['protected', false],
+      ['read_write', true],
+    ]);
+    expect(component.linkDefaultLevel(FOLDER)).toBe('read_write');
+  });
+
+  it('reads no levels for a project without cloud folders', () => {
+    const {api, component} = createComponent({drivers: BUILTIN_DRIVERS});
+    api.getProjectDatasources.mockReturnValue(of([linked('pg')]));
+    component.loadProjectDatasources();
+    expect(api.getEligibleDatasources).not.toHaveBeenCalled();
+  });
+
+  it('saves a default level, and clears it back to the driver default', () => {
+    const {api, component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const setAccess = vi.fn().mockReturnValue(of({status: 'updated'}));
+    (api as unknown as {setProjectDatasourceAccess: unknown}).setProjectDatasourceAccess = setAccess;
+    component.projectDatasources.set([FOLDER]);
+    component.updateLinkAccess('folder', 'protected');
+    expect(setAccess).toHaveBeenCalledWith('project-a', 'folder', 'protected');
+    expect(api.getProjectDatasources).toHaveBeenCalled();
+    component.projectDatasources.set([{...FOLDER, project_access: 'protected'}]);
+    component.updateLinkAccess('folder', '');
+    expect(setAccess).toHaveBeenLastCalledWith('project-a', 'folder', null);
+    // Nothing to save, and never for a link with the read-only switch.
+    setAccess.mockClear();
+    component.projectDatasources.set([FOLDER, linked('pg')]);
+    component.updateLinkAccess('folder', '');
+    component.updateLinkAccess('pg', 'read_only');
+    expect(setAccess).not.toHaveBeenCalled();
+  });
+
+  it("says why a level was refused, and shows the stored one again", () => {
+    const {api, component} = createComponent({drivers: BUILTIN_DRIVERS});
+    (api as unknown as {setProjectDatasourceAccess: unknown}).setProjectDatasourceAccess = vi
+      .fn()
+      .mockReturnValue(throwError(() => new HttpErrorResponse({
+        status: 422,
+        error: {detail: {code: 'link_access_not_offered', message: "Cloud folder does not offer the access level 'protected'"}},
+      })));
+    component.projectDatasources.set([FOLDER]);
+    const revision = component.linkAccessRevision();
+    component.updateLinkAccess('folder', 'protected');
+    expect(component.cloudFolderError()).toBeTruthy();
+    expect(component.linkAccessRevision()).toBe(revision + 1);
+    expect(component.savingLinkAccess()).toBeNull();
+    expect(en.projectDetail.datasources.cloudFolders.saveFailed).toBeTruthy();
+    expect(de.projectDetail.datasources.cloudFolders.saveFailed).toBeTruthy();
+  });
+
   it('never sends a link access change for it', () => {
     const {api, component} = createComponent({drivers: BUILTIN_DRIVERS});
     const updateProjectDatasource = vi.fn().mockReturnValue(of({status: 'updated'}));
