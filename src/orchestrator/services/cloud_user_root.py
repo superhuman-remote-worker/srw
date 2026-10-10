@@ -1194,9 +1194,11 @@ async def verify_selected_user_root(
     raises.
 
     ``rejected`` revokes the row (``rejected_by_cloud``) at once, which also
-    keeps the cloud's brute-force counter from charging SRW for every Pod;
-    ``missing`` clears it (``account_missing``); ``unreachable`` mounts
-    anyway, and the mount reports the live state.
+    keeps the cloud's brute-force counter from charging SRW for every Pod
+    (the cloud already refuses the credential: nothing to revoke there);
+    ``missing`` has the cloud revoke the credential, best effort, then
+    clears it (``account_missing``); ``unreachable`` mounts anyway, and the
+    mount reports the live state.
     """
     owner_id = thread.get("user_id")
     if not owner_id or not selected_ids:
@@ -1245,6 +1247,16 @@ async def verify_selected_user_root(
                 row["id"],
             )
         elif outcome == "missing":
+            # The cloud still took the credential (it only found no files):
+            # have it revoked before SRW forgets it, best effort, so no app
+            # password is left live that SRW no longer holds.
+            try:
+                revoked = await backend.revoke_user_root(
+                    str(credentials.get("username") or ""),
+                    str(credentials["password"]),
+                )
+            except Exception:
+                revoked = False
             config.pop("grant", None)
             for stale in ("account_id", "folder_handle"):
                 config.pop(stale, None)
@@ -1253,6 +1265,20 @@ async def verify_selected_user_root(
                 "at": _iso(_now()),
             }
             await store.update_datasource(str(row["id"]), credentials={}, config=config)
+            await _security_event(
+                store,
+                "cloud_root_revoked",
+                user_id=str(owner_id),
+                connector_id=str(row["id"]),
+                detail=f"reason=account_missing; provider revoked: {revoked}",
+            )
+            if not revoked:
+                logger.warning(
+                    "Cloud root %s: its account has no files and its credential "
+                    "could not be revoked; it stays in the account's device "
+                    "list until its user removes it",
+                    row["id"],
+                )
         return outcome
     except Exception:
         logger.warning(

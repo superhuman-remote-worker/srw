@@ -831,6 +831,38 @@ class TestProbeBeforeAPod:
         assert row["credentials"] == {}
         assert row["config"]["connect_failure"]["reason"] == "account_missing"
         assert cloud_user_root.root_state(row) == "failed"
+        # The cloud still took it: revoked there before SRW forgot it.
+        assert cloud.revoked == [TOKEN]
+        event = store.events[-1]
+        assert event["event_type"] == "cloud_root_revoked"
+        assert event["detail"] == "reason=account_missing; provider revoked: True"
+        _secrets_absent(row["config"], store.events)
+
+    @pytest.mark.asyncio
+    async def test_a_missing_account_is_cleared_even_when_the_revoke_fails(
+        self, store, cloud
+    ):
+        row = await _connected(store, cloud)
+        cloud.verify_answer = "missing"
+
+        async def unreachable(login_name, credential):
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNAVAILABLE, "down", backend="acme-cloud"
+            )
+
+        cloud.revoke_user_root = unreachable
+        assert (
+            await cloud_user_root.verify_selected_user_root(
+                {"id": "t1", "user_id": ANN},
+                selected_ids=[row["id"]],
+                store=store,
+                cloud_router=FakeRouter(cloud),
+            )
+            == "missing"
+        )
+        row = store.root()
+        assert row["credentials"] == {}
+        assert store.events[-1]["detail"].endswith("provider revoked: False")
 
     @pytest.mark.asyncio
     async def test_only_a_selected_connected_root_is_probed(self, store, cloud):
