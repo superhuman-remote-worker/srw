@@ -112,27 +112,30 @@ class TestSpec:
 
 
 class TestMatrix:
-    def test_both_providers_offer_read_only_and_gate_the_write_back(self):
+    def test_both_providers_offer_both_levels(self):
+        # Write-back was offered once the k3d gate proved it end to end
+        # (scripts/k3d-cloud-outbox-checkout-gate.py).
         assert ("cloud_folder_checkout", "project", "read_only") in MATRIX_ROWS
         for backend_id in REGISTRY:
             declared = provider_capabilities(backend_id)
-            read_only = declared.capability(
-                "cloud_folder_checkout", "project", "read_only"
-            )
-            assert read_only.status == "offered"
-            assert read_only.supported_backends == frozenset({"sandbox", "vm"})
+            for level in ("read_only", "reviewed_write_back"):
+                cap = declared.capability("cloud_folder_checkout", "project", level)
+                assert cap.status == "offered"
+                assert cap.supported_backends == frozenset({"sandbox", "vm"})
+                assert cap.slice is None
             write_back = declared.capability(
                 "cloud_folder_checkout", "project", "reviewed_write_back"
             )
-            assert write_back.status == "planned"
-            assert write_back.slice == 6
-            assert "0 of 432" in write_back.note
+            assert "accepts" in write_back.note
 
     @pytest.mark.parametrize("backend", ["nextcloud", "opencloud", None])
     @pytest.mark.parametrize("tier", ["sandbox", "vm", None])
     def test_a_job_is_offered_what_the_matrix_offers(self, backend, tier):
         driver = CloudFolderCheckoutDriver()
-        assert driver.offered_access(_row(), _job(backend, tier)) == ("read_only",)
+        assert driver.offered_access(_row(), _job(backend, tier)) == (
+            "read_only",
+            "reviewed_write_back",
+        )
 
     def test_a_session_an_unknown_provider_or_a_bad_row_gets_nothing(self):
         driver = CloudFolderCheckoutDriver()
@@ -145,14 +148,23 @@ class TestMatrix:
 
 class TestCheckoutBinding:
     def test_the_projects_own_row_binds_at_its_highest_offered_level(self):
+        # Today's implicit Mode A: the copy's changes reviewed and written back.
         bound = CloudFolderCheckoutDriver().checkout_binding(
             _row(), project_id=PROJECT_ID, ctx=_job()
         )
-        assert bound == CloudFolderCheckout(CONNECTOR_ID, PROJECT_ID, "read_only")
+        assert bound == CloudFolderCheckout(
+            CONNECTOR_ID, PROJECT_ID, "reviewed_write_back"
+        )
         assert bound.context() == {
             "datasource_id": CONNECTOR_ID,
-            "access": "read_only",
+            "access": "reviewed_write_back",
         }
+
+    def test_a_job_may_ask_for_the_read_only_copy(self):
+        bound = CloudFolderCheckoutDriver().checkout_binding(
+            _row(), project_id=PROJECT_ID, ctx=_job(), requested="read_only"
+        )
+        assert bound.access == "read_only"
 
     def test_a_read_only_link_binds_read_only(self):
         bound = CloudFolderCheckoutDriver().checkout_binding(
@@ -162,11 +174,10 @@ class TestCheckoutBinding:
 
     def test_a_level_not_offered_is_refused_not_floored(self):
         bound = CloudFolderCheckoutDriver().checkout_binding(
-            _row(), project_id=PROJECT_ID, ctx=_job(), requested="reviewed_write_back"
+            _row(), project_id=PROJECT_ID, ctx=_job("dropbox")
         )
         assert isinstance(bound, CloudFolderCheckoutUnavailable)
         assert bound.reason == "access_unavailable"
-        assert "reviewed_write_back" in bound.detail
 
     @pytest.mark.parametrize(
         "row",

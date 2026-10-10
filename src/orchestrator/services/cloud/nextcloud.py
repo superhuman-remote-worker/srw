@@ -51,7 +51,7 @@ from orchestrator.services.cloud.backend_instance_authority import (
     main_cloud_installation_proof_sha256,
 )
 from orchestrator.services.cloud.capabilities import (
-    CHECKOUT_WRITE_BACK_GATED,
+    CHECKOUT_WRITE_BACK,
     CloudCapability,
     ProviderCapabilities,
 )
@@ -188,10 +188,9 @@ NEXTCLOUD_CAPABILITIES = ProviderCapabilities(
             "cloud_folder_checkout",
             "project",
             "reviewed_write_back",
-            "planned",
-            CHECKOUT_WRITE_BACK_GATED,
+            "offered",
+            CHECKOUT_WRITE_BACK,
             frozenset({"sandbox", "vm"}),
-            slice=6,
         ),
         CloudCapability(
             "cloud_outbox",

@@ -61,7 +61,7 @@ class TestTheDeclarations:
             ("unsupported", [], None),  # user root · read_only
             ("unsupported", [], None),  # user root · protected
             ("offered", ["sandbox", "vm"], None),  # checkout
-            ("planned", ["sandbox", "vm"], 6),  # checkout · reviewed write-back
+            ("offered", ["sandbox", "vm"], None),  # checkout · reviewed write-back
             ("offered", ["sandbox"], None),  # outbox
         ]
 
@@ -74,7 +74,7 @@ class TestTheDeclarations:
             ("unsupported", [], None),
             ("unsupported", [], None),
             ("offered", ["sandbox", "vm"], None),
-            ("planned", ["sandbox", "vm"], 6),
+            ("offered", ["sandbox", "vm"], None),
             ("offered", ["sandbox"], None),
         ]
 

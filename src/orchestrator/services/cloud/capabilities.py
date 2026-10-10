@@ -63,13 +63,15 @@ ACCESS_RANKS: dict[str, dict[str, int]] = {
 #: The protected review lane: a project folder at the ``protected`` level.
 PROTECTED_PROJECT_FOLDER = ("cloud_folder", "project", "protected")
 
-#: Why a checkout's reviewed write-back is not offered yet, on either
-#: provider: on dev the capture-and-accept path never wrote a file back (0 of
-#: 432 Mode A jobs), and it is offered only once a gate proves it end to end.
-CHECKOUT_WRITE_BACK_GATED = (
-    "write-back has never delivered (0 of 432 on dev); fix gated: the copy's "
-    "changes would become a diff the job's owner reviews, written back only "
-    "on accept"
+#: How a checkout's reviewed write-back is enforced, on either provider: the
+#: same capture, review and accept path for both. It was offered once
+#: scripts/k3d-cloud-outbox-checkout-gate.py proved it end to end (a copy's
+#: commit captured, accepted and found in the folder); on dev it had never
+#: delivered (0 of 432 Mode A jobs) while nothing told jobs where the copy was.
+CHECKOUT_WRITE_BACK = (
+    "the folder is copied into the job's repository; SRW writes back only a "
+    "diff the job's owner accepts, and refuses one whose files changed in the "
+    "cloud since the copy was made"
 )
 
 
@@ -223,7 +225,7 @@ def _cell(cap: CloudCapability | None) -> dict[str, Any]:
 
 __all__ = [
     "ACCESS_RANKS",
-    "CHECKOUT_WRITE_BACK_GATED",
+    "CHECKOUT_WRITE_BACK",
     "MATRIX_ROWS",
     "PROTECTED_PROJECT_FOLDER",
     "STATUSES",

@@ -185,10 +185,11 @@ EXPECTED_MATRIX: dict[tuple[str, str | None, str], dict[str, str]] = {
         "nextcloud": "offered",
         "opencloud": "offered",
     },
-    # Offered once a gate proves write-back end to end (slice 6.3).
+    # Offered once scripts/k3d-cloud-outbox-checkout-gate.py proved write-back
+    # end to end (slice 6.3).
     ("cloud_folder_checkout", "project", "reviewed_write_back"): {
-        "nextcloud": "planned",
-        "opencloud": "planned",
+        "nextcloud": "offered",
+        "opencloud": "offered",
     },
     ("cloud_outbox", None, "read_write"): {
         "nextcloud": "offered",

@@ -121,19 +121,28 @@ class TestAdmission:
     ):
         stamp = await _admit([_checkout_row()])
         assert stamp == {
-            "cloud_checkout": {"datasource_id": CHECKOUT_ID, "access": "read_only"},
+            "cloud_checkout": {
+                "datasource_id": CHECKOUT_ID,
+                "access": "reviewed_write_back",
+            },
             "cloud_baseline": {"state": "seeding"},
             "cloud_connectors": [
                 {
                     "kind": "cloud_folder_checkout",
                     "path": "projects/hand_book/",
                     "folder": "Hand Book",
-                    "edits": "discarded",
-                    "access": "read_only",
+                    "edits": "reviewed",
+                    "access": "reviewed_write_back",
                     "datasource_id": CHECKOUT_ID,
                 }
             ],
         }
+
+    @pytest.mark.asyncio
+    async def test_a_read_only_link_copies_without_write_back(self):
+        stamp = await _admit([_checkout_row(project_read_only=True)])
+        assert stamp["cloud_checkout"]["access"] == "read_only"
+        assert stamp["cloud_connectors"][0]["edits"] == "discarded"
 
     @pytest.mark.asyncio
     async def test_the_owners_outbox_is_named_beside_the_copy(self):

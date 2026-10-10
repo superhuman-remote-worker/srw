@@ -192,22 +192,22 @@
         "access": "reviewed_write_back",
         "cells": {
           "nextcloud": {
-            "status": "planned",
-            "note": "write-back has never delivered (0 of 432 on dev); fix gated: the copy's changes would become a diff the job's owner reviews, written back only on accept",
+            "status": "offered",
+            "note": "the folder is copied into the job's repository; SRW writes back only a diff the job's owner accepts, and refuses one whose files changed in the cloud since the copy was made",
             "workspace_backends": [
               "sandbox",
               "vm"
             ],
-            "slice": 6
+            "slice": null
           },
           "opencloud": {
-            "status": "planned",
-            "note": "write-back has never delivered (0 of 432 on dev); fix gated: the copy's changes would become a diff the job's owner reviews, written back only on accept",
+            "status": "offered",
+            "note": "the folder is copied into the job's repository; SRW writes back only a diff the job's owner accepts, and refuses one whose files changed in the cloud since the copy was made",
             "workspace_backends": [
               "sandbox",
               "vm"
             ],
-            "slice": 6
+            "slice": null
           }
         }
       },

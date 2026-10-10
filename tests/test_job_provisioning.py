@@ -554,7 +554,7 @@ class TestProvisionJobRepo:
         stamp = db.merge_job_context.await_args.args[1]
         assert stamp["cloud_checkout"] == {
             "datasource_id": checkout_id,
-            "access": "read_only",
+            "access": "reviewed_write_back",
         }
         assert stamp["cloud_baseline"] == {"state": "seeding"}
         assert stamp["cloud_connectors"] == [
@@ -562,8 +562,8 @@ class TestProvisionJobRepo:
                 "kind": "cloud_folder_checkout",
                 "path": "projects/my_proj/",
                 "folder": "My Proj",
-                "edits": "discarded",
-                "access": "read_only",
+                "edits": "reviewed",
+                "access": "reviewed_write_back",
                 "datasource_id": checkout_id,
             }
         ]

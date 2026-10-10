@@ -111,14 +111,12 @@ describe('MainCloudSettingsComponent', () => {
     expect(readerNc.getAttribute('data-status')).toBe('offered');
     expect(text(readerNc)).toContain('reader account');
     expect(text(readerNc)).toContain('vm');
-    expect(text(cell(host, 'cloud_folder_checkout/project/reviewed_write_back', 'nextcloud')))
-      .toContain('planned (slice 6)');
 
-    // A checkout's write-back waits for its gate on both providers.
+    // A checkout is offered at both levels on both providers.
     for (const provider of ['nextcloud', 'opencloud']) {
       const writeBack = cell(host, 'cloud_folder_checkout/project/reviewed_write_back', provider);
-      expect(writeBack.getAttribute('data-status')).toBe('planned');
-      expect(text(writeBack)).toContain('0 of 432');
+      expect(writeBack.getAttribute('data-status')).toBe('offered');
+      expect(text(writeBack)).toContain('accepts');
       expect(cell(host, 'cloud_folder_checkout/project/read_only', provider)
         .getAttribute('data-status')).toBe('offered');
     }
