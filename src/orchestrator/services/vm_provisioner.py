@@ -2469,7 +2469,43 @@ class VMProvisioner:
         )
         if classification == "superseded":
             return VMTeardownResult("identity_superseded", False)
+        policy1_retention = "other"
+        if (
+            entity_type == "job"
+            and self.mode == "same-cluster"
+            and purge_disk is False
+            and _provision_generation(job_id) is not None
+        ):
+            from orchestrator.services.vm_job_cancel_retention import (
+                current_policy1_retention_parent,
+            )
+
+            policy1_retention = await current_policy1_retention_parent(
+                self._db,
+                parent_cleanup,
+                job_id=job_id,
+                generation=generation,
+                vm_uid=identity.vm_uid,
+                pvc_uid=identity.rootdisk_pvc_uid,
+            )
+            if policy1_retention is None:
+                return VMTeardownResult("retention_preflight_unproven", False)
+        if policy1_retention == "settled" and classification != "completed":
+            return VMTeardownResult("retention_preflight_unproven", False)
         if classification == "completed":
+            if policy1_retention == "open":
+                from orchestrator.services.vm_pre_ssh_stop_store import (
+                    VMPreSSHStopStore,
+                )
+
+                try:
+                    proof = await VMPreSSHStopStore(self._db).committed_proof(
+                        job_id, generation, parent_cleanup
+                    )
+                except Exception:
+                    proof = None
+                if proof is None:
+                    return VMTeardownResult("process_zero_unproven", False)
             contained = bool(
                 self._db
                 and await self._db.managed_repository_workspace_process_zero_is_current(
@@ -2480,7 +2516,7 @@ class VMProvisioner:
                     runtime_incarnation=generation,
                 )
             )
-            if not contained:
+            if not contained and policy1_retention != "settled":
                 contained = await self._retire_unallocated_preparation(
                     job_id, entity_type, identity, probe
                 )
@@ -2503,7 +2539,12 @@ class VMProvisioner:
                 runtime_incarnation=generation,
             )
         ):
-            if entity_type == "job":
+            if policy1_retention == "open":
+                if not await self._release_pre_ssh_stop_finalizer(
+                    job_id, generation, parent_cleanup
+                ):
+                    return VMTeardownResult("process_zero_unproven", False)
+            elif entity_type == "job":
                 from orchestrator.services.vm_pre_ssh_stop_store import (
                     VMPreSSHStopStore,
                 )
@@ -2608,6 +2649,25 @@ class VMProvisioner:
             )
         ):
             return VMTeardownResult("process_zero_unproven", False)
+        if policy1_retention == "open":
+            if (
+                probe.identity is None
+                or probe.identity.credential_runtime_started is not True
+                or not await self._attempt_pre_ssh_positive_stop(
+                    job_id, identity, parent_cleanup
+                )
+                or not await self._release_pre_ssh_stop_finalizer(
+                    job_id, generation, parent_cleanup
+                )
+            ):
+                return VMTeardownResult("process_zero_unproven", False)
+            return await self.delete_vm_captured(
+                job_id,
+                identity,
+                purge_disk=False,
+                entity_type="job",
+                parent_cleanup=parent_cleanup,
+            )
         current_identity = probe.identity
         never_started = bool(
             current_identity is not None
