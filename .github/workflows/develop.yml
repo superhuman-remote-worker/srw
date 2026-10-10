@@ -741,6 +741,7 @@ jobs:
 
           if git diff --name-only "$BASE" HEAD -- \
             'src/' 'tests/' 'config/' 'init.py' 'scripts/' 'policy/' '.github/workflows/' \
+            '.github/actions/' \
             'docker/prepare-tokenizer-cache.py' \
             'cockpit/angular.json' 'docker/cockpit-nginx.conf' \
             'docker/Dockerfile.cockpit' \
@@ -1094,6 +1095,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
+      - uses: ./.github/actions/docker-hub-mirror
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
