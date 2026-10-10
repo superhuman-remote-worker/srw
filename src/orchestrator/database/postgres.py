@@ -11560,6 +11560,62 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def release_stale_cloud_baseline_seeds(
+        self, *, stale_after_seconds: float, reason: str, limit: int = 100
+    ) -> list[str]:
+        """Fail each project-folder copy still ``seeding`` past
+        ``stale_after_seconds``, at most ``limit`` jobs per call; returns
+        their ids.
+
+        The dispatcher holds a ``created``/``paused`` job whose
+        ``context.cloud_baseline.state`` is ``seeding``; a seed lost with its
+        pod, or a request cut off before it fired one, would hold it
+        forever. Each copy counts from the seed's own ``since`` stamp, else
+        from the job's last write. A loop's copy is its spawn's to settle (a
+        loop job with a failed copy stays held), so loops are left alone. The
+        row lock and the ``seeding`` recheck keep a seed that finishes
+        meanwhile from being overwritten.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                r"""
+                WITH stale AS (
+                    SELECT j.id
+                    FROM jobs j
+                    WHERE j.status IN ('created', 'paused')
+                      AND j.context->'cloud_baseline'->>'state' = 'seeding'
+                      AND COALESCE(j.context->>'loop_id', '') = ''
+                      AND COALESCE(
+                          CASE
+                              WHEN j.context->'cloud_baseline'->>'since'
+                                   ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2}|Z)$'
+                              THEN (j.context->'cloud_baseline'->>'since')::timestamptz
+                          END,
+                          j.updated_at,
+                          j.created_at
+                      ) < CURRENT_TIMESTAMP - make_interval(secs => $1::double precision)
+                    ORDER BY j.created_at
+                    LIMIT $3
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE jobs j
+                SET context = j.context || jsonb_build_object(
+                        'cloud_baseline',
+                        (j.context->'cloud_baseline')
+                        || jsonb_build_object('state', 'failed', 'error', $2::text)
+                    ),
+                    updated_at = CURRENT_TIMESTAMP
+                FROM stale
+                WHERE j.id = stale.id
+                  AND j.context->'cloud_baseline'->>'state' = 'seeding'
+                RETURNING j.id
+                """,
+                float(stale_after_seconds),
+                reason,
+                int(limit),
+            )
+        return [str(row["id"]) for row in rows]
+
     async def merge_job_context(self, job_id: str, updates: Dict[str, Any]) -> bool:
         """Atomically merge updates into the job's context JSONB column.
 

@@ -32,6 +32,7 @@ import base64
 import json
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from typing import Any
 
 from orchestrator.services.cloud import (
@@ -104,6 +105,21 @@ _BASELINE_COMMIT_MESSAGE = (
 #: legacy copy), and files that could not be read or written.
 SEED_COUNT_KEYS: tuple[str, ...] = ("seeded", "skipped_binary", "failed")
 
+#: How long a copy may stay ``seeding`` before the stale-seed sweep (the
+#: leader's stale detector) fails it, so the job dispatches without it. A
+#: seed records when it started (``cloud_baseline.since``); a copy no seed
+#: started yet (admission's stamp, a request cut off before the seed was
+#: fired) counts from the job's last write. Far above a real walk: a seed
+#: the sweep overtakes still finishes, and would then push onto a branch the
+#: agent already works on.
+SEED_STALE_AFTER_SECONDS = 30 * 60
+
+#: What the sweep records as the failed copy's ``error``.
+SEED_STALE_REASON = (
+    "the project folder copy did not finish within 30 minutes (its seed was "
+    "lost, e.g. with a restarted orchestrator); the job runs without it"
+)
+
 
 async def seed_project_folder_baseline(
     *,
@@ -158,6 +174,9 @@ async def seed_project_folder_baseline(
             "state": state,
             "project_slug": project_slug or slug,
         }
+        if state == "seeding":
+            # The stale-seed sweep counts from here (SEED_STALE_AFTER_SECONDS).
+            payload["since"] = datetime.now(timezone.utc).isoformat()
         if error:
             payload["error"] = error
         if entries is not None:

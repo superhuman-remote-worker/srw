@@ -64,6 +64,7 @@ def _mock_db(shutdown_event: asyncio.Event, stall_return: int = 0):
     db.recover_orphaned_jobs = AsyncMock(return_value=OrphanRecoveryBatch())
     db.recover_expired_lease_jobs = AsyncMock(return_value=LeaseRecoveryBatch())
     db.gc_offline_agents = AsyncMock(return_value=0)
+    db.release_stale_cloud_baseline_seeds = AsyncMock(return_value=[])
     return db
 
 
@@ -613,6 +614,31 @@ async def test_stale_detector_triggers_dispatch_on_graph_progress_stall():
         dependencies=_detector_dependencies(db, trigger_dispatch=trigger_dispatch),
     )
 
+    trigger_dispatch.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_a_lost_copy_seed_is_released_and_its_job_dispatched():
+    """A project-folder copy stuck in seeding (its seed lost with a pod)
+    is failed past the bound, so its job dispatches without it."""
+    from orchestrator.services.job_cloud_baseline import (
+        SEED_STALE_AFTER_SECONDS,
+        SEED_STALE_REASON,
+    )
+
+    shutdown_event = asyncio.Event()
+    db = _mock_db(shutdown_event)
+    db.release_stale_cloud_baseline_seeds = AsyncMock(return_value=["job-a"])
+    trigger_dispatch = MagicMock()
+
+    await detector.stale_agent_detector(
+        shutdown_event,
+        dependencies=_detector_dependencies(db, trigger_dispatch=trigger_dispatch),
+    )
+
+    db.release_stale_cloud_baseline_seeds.assert_awaited_once_with(
+        stale_after_seconds=SEED_STALE_AFTER_SECONDS, reason=SEED_STALE_REASON
+    )
     trigger_dispatch.assert_called_once()
 
 

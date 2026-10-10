@@ -1004,6 +1004,31 @@ async def stale_agent_detector(
             )
             if gc_count:
                 logger.info(f"GC'd {gc_count} offline agent record(s) > 24h old")
+
+            # 6. A project-folder copy whose seed was lost (a restart, a pod
+            # killed mid-seed) would hold its job in created forever: fail
+            # it past the bound, and the job dispatches without it.
+            from orchestrator.services.job_cloud_baseline import (
+                SEED_STALE_AFTER_SECONDS,
+                SEED_STALE_REASON,
+            )
+
+            released_seeds = await _step(
+                "stale_cloud_baseline_seeds",
+                dependencies.store.release_stale_cloud_baseline_seeds(
+                    stale_after_seconds=SEED_STALE_AFTER_SECONDS,
+                    reason=SEED_STALE_REASON,
+                ),
+            )
+            if released_seeds:
+                logger.warning(
+                    "Released %d project folder copy seed(s) stuck in seeding "
+                    "past %ds; those jobs dispatch without the copy: %s",
+                    len(released_seeds),
+                    SEED_STALE_AFTER_SECONDS,
+                    ", ".join(released_seeds),
+                )
+                dependencies.trigger_dispatch()
         except Exception as e:
             # Last resort — individual steps are isolated above, so anything
             # landing here is a bug in the loop scaffolding itself.

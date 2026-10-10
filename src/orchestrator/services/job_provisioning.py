@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 from orchestrator.services.managed_repository_authority import (
@@ -192,6 +193,17 @@ async def _release_unseeded_copy(
         )
 
 
+@dataclass
+class _CopySeed:
+    """Whether provisioning fired the copy's seed, and why not if it did not."""
+
+    started: bool = False
+    unseeded_reason: str = (
+        "the project folder could not be copied: the job has no repository "
+        "or the project no cloud folder"
+    )
+
+
 async def provision_job_repo(
     *,
     job_row: dict[str, Any],
@@ -216,7 +228,51 @@ async def provision_job_repo(
     passes ``username`` / ``full_name`` / ``sub`` so Gitea can pre-provision
     the user when they have never logged into Gitea directly (the old
     email-only call silently no-ops for such users).
+
+    A copy admission stamped ``seeding`` that no seed was fired for is
+    released (:func:`_release_unseeded_copy`) on every way out, a raise
+    included, or the dispatcher would hold the job in ``created`` forever. A
+    loop's raise is its spawn's to settle: it fails the loop job, and its
+    handoff authority may already be gone. What a raise cannot reach (a
+    restart mid-request, a seed task killed with its pod) the stale-seed
+    sweep releases (``release_stale_cloud_baseline_seeds``).
     """
+    seed = _CopySeed()
+    try:
+        result = await _provision_job_repo(
+            job_row=job_row,
+            gitea_client=gitea_client,
+            postgres_db=postgres_db,
+            main_cloud_router=main_cloud_router,
+            loop_floor=loop_floor,
+            require_repository=require_repository,
+            authority_check=authority_check,
+            seed=seed,
+        )
+    except Exception:
+        if not seed.started and not loop_floor:
+            await _release_unseeded_copy(
+                postgres_db,
+                job_row,
+                "the job's provisioning failed before its project folder was copied",
+            )
+        raise
+    if not seed.started:
+        await _release_unseeded_copy(postgres_db, job_row, seed.unseeded_reason)
+    return result
+
+
+async def _provision_job_repo(
+    *,
+    job_row: dict[str, Any],
+    gitea_client: Any,
+    postgres_db: Any,
+    main_cloud_router: Any,
+    loop_floor: bool,
+    require_repository: bool,
+    authority_check: Callable[[], Awaitable[None]] | None,
+    seed: _CopySeed,
+) -> dict[str, Any]:
     await _permit(authority_check)
     if not gitea_client.is_initialized:
         if loop_floor or require_repository:
@@ -224,9 +280,7 @@ async def provision_job_repo(
                 "Gitea is unavailable; cannot provision isolated job repository",
                 phase="repository",
             )
-        await _release_unseeded_copy(
-            postgres_db, job_row, "Gitea is unavailable; the job has no repository"
-        )
+        seed.unseeded_reason = "Gitea is unavailable; the job has no repository"
         return job_row
 
     # asyncpg returns native UUIDs; str()-coerce before any postgres_db
@@ -433,7 +487,6 @@ async def provision_job_repo(
     # 'seeding' keeps the dispatcher off it. A subjob gets none: its branch
     # already holds its parent's copy, edits included. Only fires when the
     # project actually has a cloud folder provisioned.
-    seed_started = False
     if project_id and job_row.get("repo_name"):
         try:
             await _permit(authority_check)
@@ -488,7 +541,7 @@ async def provision_job_repo(
                 baseline_kwargs: dict[str, Any] = {}
                 if authority_check is not None:
                     baseline_kwargs["authority_check"] = authority_check
-                seed_started = True
+                seed.started = True
                 try:
                     await seed_project_folder_baseline(
                         job_id=job_id_str,
@@ -534,18 +587,11 @@ async def provision_job_repo(
                     main_cloud_router=main_cloud_router,
                     include_binary=True,
                 )
-                seed_started = True
+                seed.started = True
         elif loop_floor:
             raise JobProvisioningError(
                 "project loop requires a provisioned cloud folder",
                 phase="cloud",
             )
 
-    if not seed_started:
-        await _release_unseeded_copy(
-            postgres_db,
-            job_row,
-            "the project folder could not be copied: the job has no repository "
-            "or the project no cloud folder",
-        )
     return job_row

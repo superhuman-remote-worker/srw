@@ -634,6 +634,62 @@ class TestProvisionJobRepo:
         assert "Gitea" in released["error"]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("loop_floor", [False, True], ids=["job", "loop"])
+    async def test_a_raise_before_the_seed_releases_the_admitted_copy(
+        self, patched_seed, patched_loop_seed, loop_floor
+    ) -> None:
+        # The repository authority cannot be bound: provisioning raises after
+        # create_job, before any seed. The admitted ``seeding`` would hold the
+        # job in created forever; a loop's spawn settles its own failure.
+        g = _make_gitea()
+        db = _make_db(
+            user=_creator(),
+            project={
+                "main_cloud_folder_handle": "cloud/project",
+                "main_cloud_backend": "opencloud",
+            },
+        )
+        db.bind_job_managed_repository = AsyncMock(return_value=False)
+        row = {
+            "id": uuid.uuid4(),
+            "parent_job_id": None,
+            "project_id": uuid.uuid4(),
+            "user_id": uuid.uuid4(),
+            "config_name": "default",
+            "context": {
+                "cloud_checkout": {"access": "reviewed_write_back"},
+                "cloud_baseline": {"state": "seeding"},
+            },
+        }
+
+        with pytest.raises(JobProvisioningError):
+            await provision_job_repo(
+                job_row=row,
+                gitea_client=g,
+                postgres_db=db,
+                main_cloud_router=MagicMock(),
+                loop_floor=loop_floor,
+            )
+
+        patched_seed.assert_not_called()
+        patched_loop_seed.assert_not_awaited()
+        releases = [
+            call.args[1]["cloud_baseline"]
+            for call in db.merge_job_context.await_args_list
+            if "cloud_baseline" in call.args[1]
+        ]
+        if loop_floor:
+            assert releases == []
+        else:
+            assert releases == [
+                {
+                    "state": "failed",
+                    "error": "the job's provisioning failed before its project "
+                    "folder was copied",
+                }
+            ]
+
+    @pytest.mark.asyncio
     async def test_cloud_seed_skipped_without_folder(self, patched_seed) -> None:
         g = _make_gitea()
         db = _make_db(
