@@ -231,6 +231,21 @@ describe('DatasourcesGroupComponent access levels', () => {
     expect(fixture.componentInstance.getSelectedDatasourceAccess()).toEqual({});
   });
 
+  it('drops a choice the list stops offering when the tier moves', () => {
+    const rows = [ds('folder', 'cloud_folder', {access: access()})];
+    const fixture = mount(rows);
+    const c = fixture.componentInstance;
+    c.chooseAccess('folder', 'protected');
+    expect(c.getSelectedDatasourceAccess()).toEqual({folder: 'protected'});
+    // Re-read for a VM: protected is the container tier's.
+    rows[0] = ds('folder', 'cloud_folder', {
+      access: access({levels: [LEVELS[0], {...LEVELS[1], offered: false, reason: 'level_not_offered'}, LEVELS[2]]}),
+    });
+    Object.defineProperty(c, 'datasources', {value: () => [...rows]});
+    expect(c.accessLevel(rows[0])).toBe('read_write');
+    expect(c.getSelectedDatasourceAccess()).toEqual({});
+  });
+
   it('shows an unselected row its default level, not a select', () => {
     const fixture = mount([ds('folder', 'cloud_folder', {default_selected: false, access: access()})]);
     expect(select(fixture, 'folder')).toBeNull();

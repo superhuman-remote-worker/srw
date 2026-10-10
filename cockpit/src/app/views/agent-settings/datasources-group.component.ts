@@ -1001,8 +1001,11 @@ export class DatasourcesGroupComponent {
     if (!access) return null;
     const known = (level: string | undefined | null) =>
       level && access.levels.some((l) => l.id === level) ? level : null;
-    return known(this.accessChoice()[ds.id]) ?? known(this.initialAccess()?.[ds.id]) ??
-      known(access.default);
+    // A choice the list no longer offers (the tier moved) is dropped, never
+    // shown as if it would be sent.
+    const chosen = this.accessChoice()[ds.id];
+    const offered = chosen && access.levels.some((l) => l.id === chosen && l.offered) ? chosen : null;
+    return offered ?? known(this.initialAccess()?.[ds.id]) ?? known(access.default);
   }
 
   accessLevelKey(level: string): string | null {
