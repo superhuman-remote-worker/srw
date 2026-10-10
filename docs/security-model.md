@@ -104,14 +104,21 @@ rclone inside the workspace container:
   rclone config file from a Secret, never an environment variable. Its remote
   controls listen on Unix sockets only.
 
-The workspace container then runs without FUSE: no `/dev/fuse`, no
-`SYS_ADMIN` and no privilege. Its folders are created when the Session's
-workspace Pod is created. A folder that does not mount never holds the
-workspace back; the Session shows it as unavailable, with the reason.
+The workspace container then runs unprivileged: no `/dev/fuse`, no
+`SYS_ADMIN`, no privilege, and seccomp `RuntimeDefault` instead of
+`Unconfined`, the profile SRW's own images had for FUSE. Its folders are
+created when the Session's workspace Pod is created. A folder that does not
+mount never holds the workspace back; the Session shows it as unavailable,
+with the reason. A folder still coming up, or unavailable, is an empty
+read-only directory, so nothing is written where nobody syncs it.
 
-**What users notice:** a shell in such a Session can't mount FUSE filesystems
-itself. `sshfs`, `rclone mount` and `fuse-overlayfs` fail there. Use a VM
-workspace for that, or turn the plane off.
+**What users notice:** a shell in such a Session runs like an unprivileged
+container. It can't mount FUSE filesystems itself (`sshfs`, `rclone mount`
+and `fuse-overlayfs` fail there), and the system calls the default seccomp
+profile blocks fail too. Use a VM workspace for that, or turn the plane off.
+
+A Pod with nothing to mount (for instance with the main cloud off) gets no
+sidecars and keeps today's profile.
 
 These keep the old in-workspace path and `workspace.fuse`:
 
@@ -126,12 +133,24 @@ These keep the old in-workspace path and `workspace.fuse`:
   not guaranteed: it rests on that credential and rclone's `--read-only`. The
   overlay mounts beside the lower, so such a workspace sees the sidecars'
   volume writable; being privileged, it was never held back by a read-only
-  view.
+  view. When that cloud layer does not come up, the Session starts with no
+  cloud folder at all and says "protected cloud unavailable" with the reason;
+  nothing it writes reaches the cloud unreviewed.
 
 The orchestrator needs `create` on Secrets in the workspace namespace. The
 chart grants nothing more: not `get`, `list` or `delete`. Each credential
 Secret is immutable and owned by its Pod, so it is garbage-collected with
 the Pod. The namespace must admit the privileged opener.
+
+The workspace drops its drain and refresh requests into a directory the
+supervisor reads. The supervisor never follows a link there, never blocks on
+a FIFO, and reads at most a small regular file. The caches of a Pod's
+folders share one emptyDir with no size limit: past a limit the kubelet
+would evict the whole workspace Pod, and rclone's cap is soft. They stay
+under `connectors.inPodPlane.cacheSize` together, on node disk. The
+supervisor's memory limit scales with the folders
+(`connectors.inPodPlane.supervisorMemory`). An out-of-memory kill restarts
+only the supervisor, and its folders come back.
 
 ## Defense in depth
 

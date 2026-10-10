@@ -60,8 +60,10 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               the overlay and a write through it lands in the upper layer; the
               reader credential in the Secret is refused a WebDAV PUT; with
               the reader account disabled and the supervisor restarted, the
-              lower reads unavailable with credential_rejected and the
-              workspace never restarts (the account is enabled again at once)
+              lower reads unavailable with credential_rejected, the workspace
+              never restarts, and the next claim starts without cloud with
+              the thread's state saying credential_rejected (decision 42;
+              the account is enabled again at once)
   teardown    50 MB written into the rw folder, then End at once: End returns
               within the grace period, the Pod is gone with nothing of it in
               the node's mount table, its plan ConfigMap and credential Secret
@@ -655,7 +657,8 @@ PLAN = [
     "is a read-only sidecar mount (EROFS for agent-host); the overlay at "
     "/cloud/merged captures a write in its upper layer; the reader credential "
     "is refused a WebDAV PUT; reader disabled + supervisor restarted -> "
-    "credential_rejected, no workspace restart",
+    "credential_rejected, no workspace restart, the next claim starts without "
+    "cloud and says so (decision 42)",
     "teardown: 50 MB written, End at once: End within the grace period, the "
     "Pod gone with nothing in the node's mount table, its ConfigMap and "
     "Secret collected, the file complete in Nextcloud",
@@ -1341,6 +1344,12 @@ class CloudMountSidecarGate:
         try:
             self.stop_supervisor_from_node(before)
             entry = self.wait_status_file(session.pod, 0, "unavailable", timeout=240)
+            # Decision 42: the next claim starts without cloud and reports
+            # why, instead of failing.
+            self.turn(session)
+            started, detail = self.wait_thread_state(
+                session, "unavailable", "credential_rejected"
+            )
         finally:
             if self.occ(["user:enable", reader]) == 0:
                 self.disabled_reader = None
@@ -1351,6 +1360,12 @@ class CloudMountSidecarGate:
             entry.get("reason") == "credential_rejected"
             and restarts(after, WORKSPACE_CONTAINER) == workspace_restarts,
             f"{entry.get('state')} {entry.get('reason')}",
+        )
+        self.report.check(
+            "protected: a claim then starts without cloud and the thread's state "
+            "says credential_rejected (decision 42)",
+            started,
+            detail,
         )
 
     def teardown(self) -> None:
