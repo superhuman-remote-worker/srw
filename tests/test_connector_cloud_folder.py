@@ -305,6 +305,35 @@ class TestConfig:
             _config(folder_kind="user_root", project_id=None)
         )
 
+    def test_a_user_root_names_its_folder_once_connected(self):
+        # Not connected: no folder yet. Connected: its account and grant,
+        # never a credential.
+        assert normalize_cloud_folder_config(
+            _config(folder_kind="user_root", folder_handle=None)
+        ) == {
+            "folder_kind": "user_root",
+            "project_id": PROJECT_ID,
+            "backend_id": "nextcloud",
+            "backend_instance_id": INSTANCE_ID,
+        }
+        connected = _config(
+            folder_kind="user_root",
+            folder_handle="home:abc",
+            account_id="abc",
+            grant={"state": "connected", "source": "login_flow"},
+            connect_failure={"reason": "wrong_account", "at": "2026-10-10"},
+        )
+        assert normalize_cloud_folder_config(connected) == connected
+        with pytest.raises(ValueError, match="grant must be an object"):
+            normalize_cloud_folder_config({**connected, "grant": "connected"})
+        with pytest.raises(ValueError, match="Unknown cloud folder config"):
+            normalize_cloud_folder_config({**connected, "password": SECRET})
+
+    def test_only_a_user_root_holds_a_connection(self):
+        with pytest.raises(ValueError) as caught:
+            normalize_cloud_folder_config(_config(account_id="abc", grant={}))
+        assert "Only a personal root has account_id, grant" in str(caught.value)
+
     @pytest.mark.parametrize(
         ("config", "message"),
         [
@@ -518,6 +547,36 @@ class TestMountBinding:
         assert driver.mount_binding(
             row, ctx=_on("sandbox"), requested="protected"
         ).access == ("protected")
+
+    def test_a_user_root_binds_only_under_its_users_key(self, provider):
+        provider(("user_root", "read_write", frozenset({"sandbox"})))
+        driver = CloudFolderDriver()
+        owner = "00000000-0000-0000-0000-0000000000a1"
+        config = _config(
+            backend_id="acme-cloud", folder_kind="user_root", folder_handle=None
+        )
+        root = _row(
+            config=config, name="My cloud", managed_key=f"user-cloud-root:{owner}"
+        )
+        mount = driver.mount_binding(root, ctx=_on("sandbox"))
+        # Not connected yet: the binding carries no folder, which the
+        # user-root binder turns into its own exclusion.
+        assert isinstance(mount, CloudFolderMount)
+        assert (mount.folder_kind, mount.access, mount.folder_handle) == (
+            "user_root",
+            "read_write",
+            "",
+        )
+        assert driver.mount_binding(root, ctx=_on("vm")).reason == "access_unavailable"
+        for key in (f"project-cloud:{PROJECT_ID}", f"cloud-outbox:{owner}"):
+            refused = driver.mount_binding(
+                {**root, "managed_key": key}, ctx=_on("sandbox")
+            )
+            assert refused == CloudFolderUnavailable(
+                CONNECTOR_ID,
+                "config_invalid",
+                "This cloud folder connector is not a user's own root",
+            )
 
     def test_a_read_only_binding_takes_the_reader_level_or_nothing(self, provider):
         provider(

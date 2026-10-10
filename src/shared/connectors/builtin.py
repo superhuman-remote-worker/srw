@@ -1472,11 +1472,12 @@ CLOUD_FOLDER_SPEC = DriverSpec(
     config_schema={
         "type": "object",
         "additionalProperties": False,
+        # A project's folder also needs its project_id and folder_handle; a
+        # personal root names its folder only once its user connected it.
         "required": [
             "folder_kind",
             "backend_id",
             "backend_instance_id",
-            "folder_handle",
         ],
         "properties": {
             "folder_kind": {"enum": list(CLOUD_FOLDER_KINDS), "readOnly": True},
@@ -1492,8 +1493,16 @@ CLOUD_FOLDER_SPEC = DriverSpec(
                 "readOnly": True,
             },
             # The provider's opaque folder handle, verbatim as the project row
-            # stores it (main_cloud_folder_handle).
+            # stores it (main_cloud_folder_handle); a personal root's, its
+            # account's root.
             "folder_handle": {"type": "string", "minLength": 1, "readOnly": True},
+            # A personal root's only (main cloud slice 4): the account its
+            # user connected it to, the grant's lifecycle (state, source,
+            # when, why revoked) and the last connect attempt's failure. Never
+            # the credential, which is the row's own.
+            "account_id": {"type": "string", "minLength": 1, "readOnly": True},
+            "grant": {"type": "object", "readOnly": True},
+            "connect_failure": {"type": "object", "readOnly": True},
         },
     },
     access_levels=(

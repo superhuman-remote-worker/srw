@@ -6,7 +6,10 @@ names the folder and never a credential: the folder's kind and project, the
 provider and its installation, and the provider's opaque folder handle. The
 credential is the main cloud's, resolved when the folder is mounted. A
 project's folder carries the managed key ``project-cloud:<project>``; no
-other marker counts.
+other marker counts. A user's own root (folder kind ``user_root``) carries
+``user-cloud-root:<user>`` and is mounted with its user's own credential,
+which SRW stores on the row when the user connects it
+(``orchestrator.services.cloud_user_root``); the API never sets one.
 
 The connector never reaches the agent as a connector: no payload entry, no
 tools, no credentials (:meth:`CloudFolderDriver.runtime_allowed` keeps it
@@ -46,7 +49,7 @@ from orchestrator.services.connector_drivers.base import (
     bound_access,
 )
 from shared.connectors.builtin import CLOUD_FOLDER_KINDS, CLOUD_FOLDER_SPEC
-from shared.connectors.platform import platform_owned
+from shared.connectors.platform import USER_CLOUD_ROOT, native_user, platform_owned
 
 #: The managed key kind of a project's own cloud folder connector.
 PROJECT_CLOUD = "project-cloud"
@@ -56,6 +59,9 @@ _REVIEWED = "protected"
 _KEYS_IN_ORDER = tuple(CLOUD_FOLDER_SPEC.config_schema["properties"])
 _KEYS = frozenset(_KEYS_IN_ORDER)
 _REQUIRED = tuple(CLOUD_FOLDER_SPEC.config_schema["required"])
+#: A personal root's connection, in its config once its user connects it
+#: (main cloud slice 4): never the credential, which is the row's own.
+USER_ROOT_KEYS = frozenset({"account_id", "grant", "connect_failure"})
 #: Why a connector mounts nothing, as closed codes: its access level is
 #: refused here (the strict rule; ``detail`` says why), or its row is not a
 #: folder SRW created (a config that does not name one, or no managed key).
@@ -65,8 +71,11 @@ UNAVAILABLE_REASONS: tuple[str, ...] = ("access_unavailable", "config_invalid")
 def normalize_cloud_folder_config(config: Any) -> dict[str, Any]:
     """The config a cloud folder connector stores, or ``ValueError``.
 
-    The keys the spec declares and no others; ``project_id`` is required for
-    a project folder; ids are UUIDs, kept in their canonical spelling.
+    The keys the spec declares and no others; ``project_id`` and
+    ``folder_handle`` are required for a project folder (a personal root
+    names its folder once its user connected it, and only a personal root
+    has the connection's keys, :data:`USER_ROOT_KEYS`); ids are UUIDs, kept
+    in their canonical spelling.
     """
     if not isinstance(config, Mapping):
         raise ValueError("A cloud folder connector's config must be an object")
@@ -74,8 +83,10 @@ def normalize_cloud_folder_config(config: Any) -> dict[str, Any]:
     if unknown:
         raise ValueError(f"Unknown cloud folder config field(s): {', '.join(unknown)}")
     missing = [key for key in _REQUIRED if config.get(key) in (None, "")]
-    if config.get("folder_kind") == "project" and not config.get("project_id"):
-        missing.append("project_id")
+    if config.get("folder_kind") == "project":
+        missing += [
+            key for key in ("project_id", "folder_handle") if not config.get(key)
+        ]
     if missing:
         raise ValueError(
             f"A cloud folder connector needs {', '.join(sorted(set(missing)))}"
@@ -83,6 +94,11 @@ def normalize_cloud_folder_config(config: Any) -> dict[str, Any]:
     if config["folder_kind"] not in CLOUD_FOLDER_KINDS:
         raise ValueError(
             f"Cloud folder folder_kind must be one of {', '.join(CLOUD_FOLDER_KINDS)}"
+        )
+    root_only = sorted(key for key in USER_ROOT_KEYS if key in config)
+    if root_only and config["folder_kind"] != "user_root":
+        raise ValueError(
+            f"Only a personal root has {', '.join(root_only)} in its config"
         )
     out: dict[str, Any] = {"folder_kind": config["folder_kind"]}
     for key in ("project_id", "backend_instance_id"):
@@ -93,11 +109,19 @@ def normalize_cloud_folder_config(config: Any) -> dict[str, Any]:
             out[key] = str(UUID(str(value)))
         except ValueError:
             raise ValueError(f"Cloud folder {key} must be a UUID") from None
-    for key in ("backend_id", "folder_handle"):
+    for key in ("backend_id", "folder_handle", "account_id"):
+        if key not in config or (key != "backend_id" and config[key] in (None, "")):
+            continue
         value = config[key]
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"Cloud folder {key} must be a non-empty string")
         out[key] = value
+    for key in ("grant", "connect_failure"):
+        if config.get(key) is None:
+            continue
+        if not isinstance(config[key], Mapping):
+            raise ValueError(f"Cloud folder {key} must be an object")
+        out[key] = dict(config[key])
     # In the spec's key order, so a stored config reads the same each time.
     return {key: out[key] for key in _KEYS_IN_ORDER if key in out}
 
@@ -300,6 +324,14 @@ class CloudFolderDriver(DatasourceDriver):
                 "config_invalid",
                 "This cloud folder connector is not its project's own folder",
             )
+        if config["folder_kind"] == "user_root" and (
+            key.partition(":")[0] != USER_CLOUD_ROOT or native_user(row) is None
+        ):
+            return CloudFolderUnavailable(
+                connector_id,
+                "config_invalid",
+                "This cloud folder connector is not a user's own root",
+            )
         access = bound_access(
             self,
             row,
@@ -322,5 +354,7 @@ class CloudFolderDriver(DatasourceDriver):
             project_id=config.get("project_id"),
             backend_id=config["backend_id"],
             backend_instance_id=config["backend_instance_id"],
-            folder_handle=config["folder_handle"],
+            # A personal root names its folder once its user connected it;
+            # its binder decides what an unconnected one mounts.
+            folder_handle=config.get("folder_handle") or "",
         )

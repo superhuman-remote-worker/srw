@@ -2183,8 +2183,7 @@
         "required": [
           "folder_kind",
           "backend_id",
-          "backend_instance_id",
-          "folder_handle"
+          "backend_instance_id"
         ],
         "properties": {
           "folder_kind": {
@@ -2212,6 +2211,19 @@
           "folder_handle": {
             "type": "string",
             "minLength": 1,
+            "readOnly": true
+          },
+          "account_id": {
+            "type": "string",
+            "minLength": 1,
+            "readOnly": true
+          },
+          "grant": {
+            "type": "object",
+            "readOnly": true
+          },
+          "connect_failure": {
+            "type": "object",
             "readOnly": true
           }
         }
