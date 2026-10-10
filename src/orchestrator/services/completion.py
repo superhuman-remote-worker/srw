@@ -384,6 +384,28 @@ def is_teardown_infra_error(message: str | None) -> bool:
     return any(pattern in low for pattern in _TEARDOWN_ERROR_PATTERNS)
 
 
+#: ``error.type`` of the terminal report a refused job start is admitted as
+#: (connector drivers decision 34, ``job_completion.refuse_job_start``).
+START_REFUSED_ERROR_TYPE = "start_refused"
+
+
+def refused_resume_keeps_workspace(result: dict[str, Any]) -> bool:
+    """True for a start refusal its claim owner reported for a resume.
+
+    The owner's decision (2026-10-10): a refused resume fails the job but
+    keeps the paused job's workspace, as the provisioner keeps a failed job's
+    pod with completion commands off. A refused fresh start still tears down
+    what was provisioned for it. The claim owner states which claim it was in
+    ``error.resume``; nothing here infers it.
+    """
+    error = result.get("error")
+    return (
+        isinstance(error, dict)
+        and error.get("type") == START_REFUSED_ERROR_TYPE
+        and error.get("resume") is True
+    )
+
+
 async def probe_workspace_ssh(host: str, port: int, timeout: float = 3.0) -> bool:
     """TCP-probe the workspace sshd; True means something accepted the connect.
 

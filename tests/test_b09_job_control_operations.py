@@ -407,6 +407,8 @@ async def test_a_refused_start_fails_the_job_through_the_completion_ledger():
         JOB_ID,
         reason="unrouted_model",
         message="Pinned model(s) have no endpoint",
+        # A fresh start: the finalizer tears down what was provisioned.
+        resume=False,
         agent_id="agent-1",
     )
     # Nothing reaches the agent, and the status is the ledger's to write.
@@ -535,11 +537,85 @@ def _resume_refusal(case: str, *, commands_on: bool, monkeypatch):
             side_effect=_unavailable_model()
         )
         message = _unavailable_model().message(where=WHERE_JOB)
+    elif case == "grant_denied/frozen":
+        # Current jobs resume from their frozen execution snapshot.
+        from orchestrator.services import manifest_execution_snapshot
+
+        monkeypatch.setattr(
+            manifest_execution_snapshot,
+            "read_execution",
+            AsyncMock(return_value={"frozen": True}),
+        )
+        monkeypatch.setattr(
+            manifest_execution_snapshot,
+            "srw_snapshot_config",
+            lambda _snapshot: ({"agent": {"llm": {}}}, {}),
+        )
+        monkeypatch.setattr(
+            manifest_execution_snapshot,
+            "apply_srw_delivery_bindings",
+            lambda blob, policy, _override: (blob, policy),
+        )
+        ready = SimpleNamespace(
+            status_code=200,
+            json=lambda: {"capabilities": {"resolved_config_resume": True}},
+        )
+        values.update(
+            http_client_factory=MagicMock(
+                return_value=_AsyncContext(
+                    SimpleNamespace(get=AsyncMock(return_value=ready))
+                )
+            ),
+            user_experts_enabled=AsyncMock(return_value=True),
+            enforce_dispatch_grants=AsyncMock(
+                side_effect=GrantDenied(["tools.shell not granted"])
+            ),
+        )
+        message = "denied: tools.shell not granted"
+    elif case in {"workspace_contract", "workspace_waiting"}:
+        definitive = case == "workspace_contract"
+        values["inject_matching_workspace_config"] = MagicMock(
+            side_effect=lambda job, co, **kw: (
+                co or {},
+                SimpleNamespace(
+                    ready=False,
+                    state="failed" if definitive else "pending",
+                    effective_backend="sandbox",
+                    reason="sandbox_provisioning_failed" if definitive else None,
+                    safe_projection=lambda: {},
+                ),
+            )
+        )
+        message = "Workspace contract refused dispatch: sandbox_provisioning_failed"
+    elif case in {"connector_bind_refused", "connector_bind_pending"}:
+        from orchestrator.services import (
+            connector_bind_time,
+            connector_credential_leases,
+        )
+
+        error = (
+            connector_bind_time.BindTimeRefused("connector 'gitea' failed to bind")
+            if case == "connector_bind_refused"
+            else connector_bind_time.BindTimePending("still binding")
+        )
+        monkeypatch.setattr(
+            connector_credential_leases, "prepare_lease_delivery", AsyncMock()
+        )
+        monkeypatch.setattr(
+            connector_credential_leases,
+            "deliver_connector_leases_with",
+            AsyncMock(side_effect=error),
+        )
+        values["mint_worker_runtime_actor"] = AsyncMock(
+            return_value=SimpleNamespace(to_payload=lambda: {})
+        )
+        message = "connector 'gitea' failed to bind"
     else:  # pragma: no cover - parametrization guard
         raise AssertionError(case)
     return _delivery(**values), message
 
 
+#: Refusals the resume path writes with completion commands off.
 RESUME_REFUSALS = [
     "connector_unavailable",
     "lite_shell_connector",
@@ -547,10 +623,17 @@ RESUME_REFUSALS = [
     "grant_denied",
     "model_unavailable",
 ]
+#: Definitive refusals the resume path routes only with completion commands
+#: on; with them off it returns without a write, as before.
+ROUTED_ONLY_RESUME_REFUSALS = [
+    "grant_denied/frozen",
+    "workspace_contract",
+    "connector_bind_refused",
+]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", RESUME_REFUSALS)
+@pytest.mark.parametrize("case", RESUME_REFUSALS + ROUTED_ONLY_RESUME_REFUSALS)
 async def test_a_refused_resume_fails_the_job_through_the_completion_ledger(
     case, monkeypatch
 ):
@@ -560,15 +643,17 @@ async def test_a_refused_resume_fails_the_job_through_the_completion_ledger(
 
     assert not await resume_job_on_agent(
         {"id": JOB_ID, "execution_lane": "pinned", "status": "paused"},
-        {"id": "agent-1", "pod_ip": "10.0.0.1"},
+        {"id": "agent-1", "pod_ip": "10.0.0.1", "pod_port": 8001},
         dependencies=dependencies,
     )
 
     dependencies.refuse_job_start.assert_awaited_once()
     call = dependencies.refuse_job_start.await_args
     assert call.args == (JOB_ID,)
-    assert call.kwargs["reason"] == case
+    assert call.kwargs["reason"] == case.split("/")[0]
     assert call.kwargs["agent_id"] == "agent-1"
+    # A refused resume keeps the paused job's workspace.
+    assert call.kwargs["resume"] is True
     if message is None:
         assert "lite tier" in call.kwargs["message"]
         assert "app" in call.kwargs["message"]
@@ -588,7 +673,7 @@ async def test_with_completion_commands_off_a_refused_resume_is_written(
 
     assert not await resume_job_on_agent(
         {"id": JOB_ID, "execution_lane": "pinned", "status": "paused"},
-        {"id": "agent-1", "pod_ip": "10.0.0.1"},
+        {"id": "agent-1", "pod_ip": "10.0.0.1", "pod_port": 8001},
         dependencies=dependencies,
     )
 
@@ -600,6 +685,42 @@ async def test_with_completion_commands_off_a_refused_resume_is_written(
         assert "lite tier" in written["error_message"]
     else:
         assert written["error_message"] == message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ROUTED_ONLY_RESUME_REFUSALS)
+async def test_with_completion_commands_off_these_resume_refusals_stay_unwritten(
+    case, monkeypatch
+):
+    dependencies, _message = _resume_refusal(
+        case, commands_on=False, monkeypatch=monkeypatch
+    )
+
+    assert not await resume_job_on_agent(
+        {"id": JOB_ID, "execution_lane": "pinned", "status": "paused"},
+        {"id": "agent-1", "pod_ip": "10.0.0.1", "pod_port": 8001},
+        dependencies=dependencies,
+    )
+
+    dependencies.refuse_job_start.assert_not_awaited()
+    dependencies.store.update_job_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["workspace_waiting", "connector_bind_pending"])
+async def test_a_resume_that_must_wait_is_not_refused(case, monkeypatch):
+    dependencies, _message = _resume_refusal(
+        case, commands_on=True, monkeypatch=monkeypatch
+    )
+
+    assert not await resume_job_on_agent(
+        {"id": JOB_ID, "execution_lane": "pinned", "status": "paused"},
+        {"id": "agent-1", "pod_ip": "10.0.0.1", "pod_port": 8001},
+        dependencies=dependencies,
+    )
+
+    dependencies.refuse_job_start.assert_not_awaited()
+    dependencies.store.update_job_status.assert_not_awaited()
 
 
 @pytest.mark.asyncio

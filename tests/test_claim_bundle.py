@@ -1039,7 +1039,7 @@ async def test_worker_bundle_reuses_job_start_builder_and_rechecks_lease(monkeyp
     }
 
 
-def _refusing_worker_claim(monkeypatch, orch_main, built):
+def _refusing_worker_claim(monkeypatch, orch_main, built, *, checkpoint=False):
     """A leased worker claim whose start bundle returns ``built``."""
 
     row = dict(LEASED_ROW, unit_kind="worker_batch")
@@ -1052,6 +1052,9 @@ def _refusing_worker_claim(monkeypatch, orch_main, built):
         ),
     }
     db = FakeDB(run_queue_row=row, thread=None, job=job)
+    # Whether the job ran before: the claim resumed it, and a refusal keeps
+    # its workspace.
+    db.job_has_checkpoint = AsyncMock(return_value=checkpoint)
     monkeypatch.setattr(access_module, "require_internal", AsyncMock())
     monkeypatch.setattr(orch_main.app.state.resources, "postgres_db", db)
     monkeypatch.setattr(
@@ -1074,8 +1077,9 @@ def _refusing_worker_claim(monkeypatch, orch_main, built):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("checkpoint", [False, True], ids=["start", "resume"])
 async def test_a_refused_worker_start_fails_the_job_under_the_claim_lease(
-    monkeypatch,
+    monkeypatch, checkpoint
 ):
     """Connector drivers decision 34: the build stays read-only, and the
     refusal is admitted as this lease's terminal report."""
@@ -1085,7 +1089,7 @@ async def test_a_refused_worker_start_fails_the_job_under_the_claim_lease(
         "connector_unavailable", "connector_unavailable"
     )
     db, attest, refuse, dependencies = _refusing_worker_claim(
-        monkeypatch, orch_main, refusal
+        monkeypatch, orch_main, refusal, checkpoint=checkpoint
     )
 
     with pytest.raises(HTTPException) as exc:
@@ -1103,8 +1107,10 @@ async def test_a_refused_worker_start_fails_the_job_under_the_claim_lease(
         UNIT_ID,
         reason="connector_unavailable",
         message="connector_unavailable",
+        resume=checkpoint,
         lease_token=7,
     )
+    db.job_has_checkpoint.assert_awaited_once_with(UNIT_ID)
     # No credential crosses the boundary: the confirming attestation and the
     # final lease recheck never run.
     assert attest.await_count == 1
@@ -1133,6 +1139,60 @@ async def test_a_worker_bundle_that_is_not_ready_is_not_a_refusal(monkeypatch):
 
     assert exc.value.status_code == 409
     refuse.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("checkpoint", [False, True], ids=["start", "resume"])
+@pytest.mark.parametrize("definitive", [True, False], ids=["refused", "pending"])
+async def test_a_bind_refused_in_the_claim_transaction_fails_the_job(
+    monkeypatch, definitive, checkpoint
+):
+    """A bind or provider mint that failed for good refuses the claim in its
+    transaction; the job then fails under the same lease. A pending one only
+    refuses this claim, as before."""
+    from orchestrator import main as orch_main
+    from orchestrator.services import connector_bind_time, connector_credential_leases
+
+    built = job_runtime_module.JobStartRequest(job_id=UNIT_ID, description="work")
+    _db, _attest, refuse, dependencies = _refusing_worker_claim(
+        monkeypatch, orch_main, built, checkpoint=checkpoint
+    )
+    error = (
+        connector_bind_time.BindTimeRefused("connector 'gitea' failed to bind")
+        if definitive
+        else connector_bind_time.BindTimePending("still binding")
+    )
+    monkeypatch.setattr(
+        connector_credential_leases, "prepare_lease_delivery", AsyncMock()
+    )
+    monkeypatch.setattr(connector_credential_leases, "needs_leases", lambda _e: True)
+    monkeypatch.setattr(
+        connector_credential_leases,
+        "deliver_connector_leases",
+        AsyncMock(side_effect=error),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=dependencies,
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Job bundle assembly refused"
+    if definitive:
+        refuse.assert_awaited_once_with(
+            UNIT_ID,
+            reason="connector_bind_refused",
+            message="connector 'gitea' failed to bind",
+            resume=checkpoint,
+            lease_token=7,
+        )
+    else:
+        refuse.assert_not_awaited()
 
 
 def test_the_claim_bundle_routes_refusals_to_the_completion_ledger():
@@ -1798,11 +1858,12 @@ async def test_stateless_bundle_refusal_never_mutates_job_status(monkeypatch):
 
     db = MagicMock()
     db.update_job_status = AsyncMock()
+    # No execution snapshot, so the build reaches the connector check.
+    db.fetchrow = AsyncMock(return_value=None)
+    resolve = AsyncMock(side_effect=HTTPException(status_code=409, detail="revoked"))
     monkeypatch.setattr(orch_main.app.state.resources, "postgres_db", db)
     monkeypatch.setattr(
-        job_datasource_selection_module,
-        "resolve_authorized_job_datasources",
-        AsyncMock(side_effect=HTTPException(status_code=409, detail="revoked")),
+        job_datasource_selection_module, "resolve_authorized_job_datasources", resolve
     )
 
     built = await job_start_bundle.build_job_start_request(
@@ -1818,7 +1879,11 @@ async def test_stateless_bundle_refusal_never_mutates_job_status(monkeypatch):
         ),
     )
 
-    assert built is None
+    resolve.assert_awaited_once()
+    # Handed back for the claimant's lease-fenced report, never written here.
+    assert built == job_start_bundle.JobStartRefusal(
+        "connector_unavailable", "connector_unavailable"
+    )
     db.update_job_status.assert_not_awaited()
 
 

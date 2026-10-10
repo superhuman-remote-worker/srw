@@ -322,14 +322,20 @@ async def accept_completion_command(
     code_version: str | None = None,
     status_reorder_enabled: bool = False,
     expected_job_status: str | None = None,
+    origin: str = "agent",
 ) -> CompletionAcceptResult:
     """Accept one immutable completion report in a short fenced transaction.
 
     ``expected_job_status`` additionally requires the job's status under the
     jobs-row lock: a server-side report for a claim (a refused job start)
     loses to any control that moved the row first, before anything is written.
+    ``origin`` records who reported: the agent, or ``dispatch`` for such a
+    server-side report. Both carry exactly one lane fence; the fenceless
+    ``operator`` origin is not admitted here.
     """
 
+    if origin == "operator":
+        raise ValueError("operator-origin commands carry no fence to admit")
     job_uuid = UUID(str(job_id))
     canonical_payload = canonical_completion_payload(payload)
     digest = completion_payload_digest(str(job_uuid), canonical_payload)
@@ -578,7 +584,7 @@ async def accept_completion_command(
                 ) VALUES (
                     $1::uuid, $2::bigint, $3::uuid, $4::jsonb,
                     $5::text, $6::bigint, $7::uuid,
-                    $8::text, 'agent', $9::text,
+                    $8::text, $14::text, $9::text,
                     now() + make_interval(secs => $10::float8), $11::text,
                     now() + make_interval(secs => $12::float8), $13::boolean
                 )
@@ -600,6 +606,7 @@ async def accept_completion_command(
                 selected_code_version,
                 COMPLETION_INLINE_GRACE_SECONDS,
                 bool(status_reorder_enabled),
+                str(origin),
             )
             if idle_source is not None and pinned_delivery is not None:
                 from orchestrator.services.pinned_job_delivery import (

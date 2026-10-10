@@ -17,7 +17,7 @@ from orchestrator.security.access import (
     externalize_gitea_url,
     vm_workspaces_on_pod_network,
 )
-from orchestrator.services import connector_credential_leases
+from orchestrator.services import connector_bind_time, connector_credential_leases
 from orchestrator.services.config_resolver import (
     inject_blob_credentials,
     resolve_config,
@@ -223,6 +223,7 @@ async def dispatch_job_to_agent(
                 job_id,
                 reason=job_start.reason,
                 message=job_start.message,
+                resume=False,
                 agent_id=agent_id,
             )
             return False
@@ -404,6 +405,7 @@ async def _refuse_unavailable_model_resume(
             str(job["id"]),
             reason="model_unavailable",
             message=unavailable.message(where=WHERE_JOB),
+            resume=True,
             agent_id=agent_id,
         )
 
@@ -524,6 +526,7 @@ async def resume_job_on_agent(
                     job_id,
                     reason="connector_unavailable",
                     message="connector_unavailable",
+                    resume=True,
                     agent_id=agent_id,
                 )
             return False
@@ -580,6 +583,20 @@ async def resume_job_on_agent(
                 job_id,
                 workspace_decision.reason or workspace_decision.state,
             )
+            if dependencies.completion_commands_enabled() and (
+                workspace_decision.state in {"invalid", "failed", "mismatch"}
+            ):
+                # Definitive, as on the fresh path; any other state waits.
+                await dependencies.refuse_job_start(
+                    job_id,
+                    reason="workspace_contract",
+                    message=(
+                        "Workspace contract refused dispatch: "
+                        f"{workspace_decision.reason or workspace_decision.state}"
+                    ),
+                    resume=True,
+                    agent_id=agent_id,
+                )
             return False
         if workspace_decision.effective_backend == "vm":
             dependencies.logger.info(
@@ -664,6 +681,7 @@ async def resume_job_on_agent(
                         job_id,
                         reason="lite_shell_connector",
                         message=msg,
+                        resume=True,
                         agent_id=agent_id,
                     )
                 return False
@@ -684,6 +702,7 @@ async def resume_job_on_agent(
                         job_id,
                         reason="lite_config",
                         message=str(exc),
+                        resume=True,
                         agent_id=agent_id,
                     )
                 return False
@@ -749,6 +768,14 @@ async def resume_job_on_agent(
                 )
             except GrantDenied as gd:
                 dependencies.logger.warning("Resume denied for job %s: %s", job_id, gd)
+                if dependencies.completion_commands_enabled():
+                    await dependencies.refuse_job_start(
+                        job_id,
+                        reason="grant_denied",
+                        message=dependencies.grant_violations_detail(gd.violations),
+                        resume=True,
+                        agent_id=agent_id,
+                    )
                 return False
             except ModelUnavailable as unavailable:
                 await _refuse_unavailable_model_resume(
@@ -836,6 +863,7 @@ async def resume_job_on_agent(
                         job_id,
                         reason="grant_denied",
                         message=dependencies.grant_violations_detail(gd.violations),
+                        resume=True,
                         agent_id=agent_id,
                     )
                 return False
@@ -993,6 +1021,18 @@ async def resume_job_on_agent(
                 job_id,
                 exc,
             )
+            if dependencies.completion_commands_enabled() and isinstance(
+                exc, connector_bind_time.BindTimeRefused
+            ):
+                # A bind or provider mint that failed for good, as on the
+                # fresh path; a pending one and any other delivery error wait.
+                await dependencies.refuse_job_start(
+                    job_id,
+                    reason="connector_bind_refused",
+                    message=str(exc)[:1000],
+                    resume=True,
+                    agent_id=agent_id,
+                )
             return False
 
         if not await dependencies.pinned_k8s_job_workspace_authority_is_current(

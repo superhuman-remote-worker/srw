@@ -12,11 +12,10 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from orchestrator.schemas.job_runtime import JobCompleteRequest
+from orchestrator.services.completion import START_REFUSED_ERROR_TYPE
 
 
 DURABLE_COMPLETION_HTTP_ERROR = "_completion_http_error"
-#: ``error.type`` of the terminal report a refused job start is admitted as.
-START_REFUSED_ERROR_TYPE = "start_refused"
 #: Lane fences and transport fields: never part of the admitted payload.
 _COMPLETION_TRANSPORT_FIELDS = frozenset(
     {
@@ -324,6 +323,7 @@ async def refuse_job_start(
     *,
     reason: str,
     message: str,
+    resume: bool,
     agent_id: str | None = None,
     lease_token: int | None = None,
     dependencies: JobCompletionDependencies,
@@ -339,7 +339,13 @@ async def refuse_job_start(
     CAS. A cancel or another control that won the row first, before admission
     or before the finalizer, keeps it; a stale claim is fenced out. A
     stateless admission also closes the queue unit, so nothing claims the job
-    again.
+    again. The row's origin is ``dispatch``.
+
+    ``resume`` says whether the refused claim resumed a job that had already
+    run (the pinned resume lane, or a stateless job with a checkpoint). The
+    finalizer then keeps the job's workspace instead of tearing it down
+    (``completion.refused_resume_keeps_workspace``); a refused fresh start
+    still tears down what was provisioned for it.
 
     Only the admission runs here: it is bounded database work, and the
     background finalizer drain picks the command up. Returns whether the
@@ -361,6 +367,7 @@ async def refuse_job_start(
             "reason": reason,
             "message": message,
             "recoverable": False,
+            "resume": bool(resume),
         },
         lease_token=lease_token,
         agent_id=agent_id,
@@ -379,6 +386,7 @@ async def refuse_job_start(
             # The claim set ``processing``; a control that moved the row
             # since keeps it, and nothing is admitted.
             expected_job_status="processing",
+            origin="dispatch",
             requested_by=(
                 f"start-refusal:agent:{agent_id}"
                 if agent_id is not None

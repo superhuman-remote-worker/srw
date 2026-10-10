@@ -221,6 +221,7 @@ async def complete_job_legacy(
         is_container_worker_workspace_exhaustion,
         is_late_completion_report,
         is_verification_enabled,
+        refused_resume_keeps_workspace,
         should_persist_completion_freeze,
         should_reset_recovery_counter,
         unmerged_pr_seal_status,
@@ -2864,11 +2865,16 @@ async def complete_job_legacy(
             _kick_dispatch,
         )
 
-        # 7. Archive workspace (snapshot to S3) and clean up VM/container
-        if job.get("status") in ("completed", "failed") or (
-            job.get("status") == "cancelled"
-            and completion_outcome_kind == "blocked_undelivered"
-        ):
+        # 7. Archive workspace (snapshot to S3) and clean up VM/container.
+        # A refused resume keeps the paused job's workspace (connector
+        # drivers decision 34): its claim owner says so in the report.
+        if (
+            job.get("status") in ("completed", "failed")
+            or (
+                job.get("status") == "cancelled"
+                and completion_outcome_kind == "blocked_undelivered"
+            )
+        ) and not refused_resume_keeps_workspace(completion_result):
             workspace_cleanup = await _run_completion_workspace_teardown(
                 job_id,
                 _effect_runner,

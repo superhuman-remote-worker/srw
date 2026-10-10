@@ -65,33 +65,55 @@ def _dependencies(pool) -> job_completion.JobCompletionDependencies:
     )
 
 
-async def _refuse(pool, job_id, **fence) -> bool:
+async def _refuse(pool, job_id, *, resume: bool = False, **fence) -> bool:
     return await job_completion.refuse_job_start(
         str(job_id),
         reason="unrouted_model",
         message=MESSAGE,
+        resume=resume,
         **fence,
         dependencies=_dependencies(pool),
     )
 
 
-async def _claimed_pinned_job(pool) -> tuple[UUID, UUID]:
-    """A pinned job as the dispatcher's claim leaves it."""
-
+async def _ready_agent(pool) -> UUID:
     async with pool.acquire() as conn:
-        agent_id = await conn.fetchval(
+        return await conn.fetchval(
             "INSERT INTO agents (config_name, hostname, status) "
             "VALUES ('worker_base', $1, 'ready') RETURNING id",
             f"refusal-{uuid4().hex[:10]}",
         )
-        job_id = await conn.fetchval(
+
+
+async def _pinned_job(pool, *, status: str, agent_id: UUID | None) -> UUID:
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
             "INSERT INTO jobs (description, status, execution_lane, "
             "assigned_agent_id, lease_expires_at) "
-            "VALUES ('refused start', 'processing', 'pinned', $1, "
-            "now() + interval '4 minutes') RETURNING id",
+            "VALUES ('refused start', $1, 'pinned', $2, "
+            "CASE WHEN $2::uuid IS NULL THEN NULL "
+            "ELSE now() + interval '4 minutes' END) RETURNING id",
+            status,
             agent_id,
         )
-    return job_id, agent_id
+
+
+async def _claimed_pinned_job(pool) -> tuple[UUID, UUID]:
+    """A pinned job as the dispatcher's claim leaves it."""
+
+    agent_id = await _ready_agent(pool)
+    return await _pinned_job(pool, status="processing", agent_id=agent_id), agent_id
+
+
+async def _assert_claimable_shape(database, pool) -> UUID:
+    """A ready agent, and proof that a job of this shape is claimable by it
+    when pending: a refused job it cannot claim is held by its status."""
+
+    twin = await _pinned_job(pool, status="created", agent_id=None)
+    assert await database.claim_job_for_agent(
+        str(twin), str(await _ready_agent(pool)), completion_commands_enabled=True
+    )
+    return await _ready_agent(pool)
 
 
 async def _leased_stateless_job(pool, *, lease_token: int = 7) -> UUID:
@@ -123,7 +145,7 @@ async def _commands(pool, job_id) -> list[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT id, state, payload, accepted_agent_id, accepted_lease_token, "
-            "accepted_job_status, requested_by FROM job_completion_commands "
+            "accepted_job_status, origin, requested_by FROM job_completion_commands "
             "WHERE job_id=$1 ORDER BY report_seq",
             job_id,
         )
@@ -186,11 +208,15 @@ async def test_a_refused_pinned_start_fails_once_and_is_never_claimed_again(pg):
     assert command["accepted_agent_id"] == agent_id
     assert command["accepted_lease_token"] is None
     assert command["accepted_job_status"] == "processing"
+    assert command["origin"] == "dispatch"
     assert command["requested_by"] == f"start-refusal:agent:{agent_id}"
-    assert json.loads(command["payload"])["error"]["message"] == MESSAGE
+    error = json.loads(command["payload"])["error"]
+    assert error["message"] == MESSAGE
+    assert error["resume"] is False
 
-    # Not dispatchable while the command is pending: no other agent claims it.
-    other_agent = uuid4()
+    # Not dispatchable while the command is pending: a ready agent that could
+    # claim a pending job of this shape cannot claim it.
+    other_agent = await _assert_claimable_shape(database, pg)
     assert not await database.claim_job_for_agent(
         str(job_id), str(other_agent), completion_commands_enabled=True
     )
@@ -278,12 +304,15 @@ async def test_a_cancel_after_the_refusal_still_wins(pg):  # noqa: F811
 async def test_a_refused_worker_start_fails_and_closes_its_unit(pg):  # noqa: F811
     job_id = await _leased_stateless_job(pg, lease_token=7)
 
-    assert await _refuse(pg, job_id, lease_token=7) is True
+    # A rotation of a job that already ran: its refusal keeps the workspace.
+    assert await _refuse(pg, job_id, lease_token=7, resume=True) is True
 
     [command] = await _commands(pg, job_id)
     assert command["accepted_lease_token"] == 7
     assert command["accepted_agent_id"] is None
+    assert command["origin"] == "dispatch"
     assert command["requested_by"] == "start-refusal:worker-lease:7"
+    assert json.loads(command["payload"])["error"]["resume"] is True
     async with pg.acquire() as conn:
         queue = await conn.fetchrow(
             "SELECT state, leased_by, consumed_seq FROM run_queue WHERE unit_id=$1",

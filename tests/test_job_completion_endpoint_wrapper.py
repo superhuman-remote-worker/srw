@@ -4063,9 +4063,10 @@ def _refusal_fence(lane: str) -> dict[str, object]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True], ids=["start", "resume"])
 @pytest.mark.parametrize("lane", ["pinned", "stateless"])
 async def test_a_start_refusal_is_admitted_as_a_terminal_report_under_its_fence(
-    lane: str,
+    lane: str, resume: bool
 ) -> None:
     accept = AsyncMock(return_value=_accepted("fresh"))
     dependencies = _refusal_dependencies(accept=accept)
@@ -4074,6 +4075,7 @@ async def test_a_start_refusal_is_admitted_as_a_terminal_report_under_its_fence(
         JOB_ID,
         reason="unrouted_model",
         message=REFUSAL_MESSAGE,
+        resume=resume,
         **_refusal_fence(lane),
         dependencies=dependencies,
     )
@@ -4090,6 +4092,7 @@ async def test_a_start_refusal_is_admitted_as_a_terminal_report_under_its_fence(
                 "reason": "unrouted_model",
                 "message": REFUSAL_MESSAGE,
                 "recoverable": False,
+                "resume": resume,
             },
             "freeze_data": None,
         },
@@ -4100,6 +4103,7 @@ async def test_a_start_refusal_is_admitted_as_a_terminal_report_under_its_fence(
         # replay an earlier claim's command.
         client_report_id=None,
         expected_job_status="processing",
+        origin="dispatch",
         requested_by=(
             f"start-refusal:agent:{AGENT_ID}"
             if lane == "pinned"
@@ -4117,6 +4121,7 @@ async def test_with_completion_commands_off_a_start_refusal_is_not_admitted() ->
             JOB_ID,
             reason="connector_unavailable",
             message="connector_unavailable",
+            resume=False,
             agent_id=str(AGENT_ID),
             dependencies=_refusal_dependencies(accept=accept, commands_enabled=False),
         )
@@ -4144,6 +4149,7 @@ async def test_a_start_refusal_that_lost_the_row_is_not_admitted(error) -> None:
             JOB_ID,
             reason="connector_unavailable",
             message="connector_unavailable",
+            resume=False,
             lease_token=17,
             dependencies=_refusal_dependencies(accept=accept),
         )
@@ -4152,7 +4158,22 @@ async def test_a_start_refusal_that_lost_the_row_is_not_admitted(error) -> None:
     accept.assert_awaited_once()
 
 
-async def _admitted_refusal_command(lane: str) -> dict[str, object]:
+@pytest.mark.asyncio
+async def test_admission_never_takes_a_fenceless_operator_origin() -> None:
+    with pytest.raises(ValueError):
+        await commands.accept_completion_command(
+            SimpleNamespace(),
+            job_id=JOB_ID,
+            payload={"should_stop": True},
+            lease_token=17,
+            agent_id=None,
+            client_report_id=None,
+            requested_by="test",
+            origin="operator",
+        )
+
+
+async def _admitted_refusal_command(lane: str, *, resume: bool) -> dict[str, object]:
     """The command row a refusal is admitted as, as the finalizer reads it."""
 
     accept = AsyncMock(return_value=_accepted("fresh"))
@@ -4160,6 +4181,7 @@ async def _admitted_refusal_command(lane: str) -> dict[str, object]:
         JOB_ID,
         reason="unrouted_model",
         message=REFUSAL_MESSAGE,
+        resume=resume,
         **_refusal_fence(lane),
         dependencies=_refusal_dependencies(accept=accept),
     )
@@ -4172,19 +4194,14 @@ async def _admitted_refusal_command(lane: str) -> dict[str, object]:
     }
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("lane", ["pinned", "stateless"])
-async def test_the_finalizer_fails_a_refused_job_with_the_refusal_message(
-    monkeypatch: pytest.MonkeyPatch,
-    lane: str,
-) -> None:
-    """The background drain's workflow over the real completion body."""
+async def _finalize_refusal(monkeypatch, *, lane: str, resume: bool, status: str):
+    """Run the background drain's workflow over the real completion body."""
 
-    job = _route_job()
+    job = _route_job(status=status)
     job["execution_lane"] = lane
     database = _RouteDB(job)
     runner = _RecordingRunner()
-    runner.command = await _admitted_refusal_command(lane)
+    runner.command = await _admitted_refusal_command(lane, resume=resume)
     workspace_cleanup = AsyncMock(return_value=["workspace archived"])
     _patch_normal_route_dependencies(
         monkeypatch,
@@ -4192,12 +4209,25 @@ async def test_the_finalizer_fails_a_refused_job_with_the_refusal_message(
         terminal_effects=AsyncMock(return_value={"actions": []}),
         workspace_cleanup=workspace_cleanup,
     )
-
     result = await job_completion_module.run_persisted_completion_workflow(
         runner,
         dependencies=job_completion_module.PersistedCompletionDependencies(
             legacy_complete=b08_helpers.complete_job_legacy
         ),
+    )
+    return result, database, runner, workspace_cleanup
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True], ids=["start", "resume"])
+@pytest.mark.parametrize("lane", ["pinned", "stateless"])
+async def test_the_finalizer_fails_a_refused_job_with_the_refusal_message(
+    monkeypatch: pytest.MonkeyPatch,
+    lane: str,
+    resume: bool,
+) -> None:
+    result, database, _runner, _cleanup = await _finalize_refusal(
+        monkeypatch, lane=lane, resume=resume, status="processing"
     )
 
     assert result["new_status"] == "failed"
@@ -4209,8 +4239,41 @@ async def test_the_finalizer_fails_a_refused_job_with_the_refusal_message(
     # The status write is the finalizer's CAS on the claimed row.
     assert written["expected_status"] == "processing"
     assert written["completion_command_id"] == COMMAND_ID
-    # A refused job's workspace is retired like any failed job's.
+    # A waiting parent is released either way.
+    subjob_completion_module.handle_scholar_completion.assert_awaited_once()
+    subjob_completion_module.handle_delegation_child_completion.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["pinned", "stateless"])
+async def test_a_refused_fresh_start_tears_down_what_was_provisioned(
+    monkeypatch: pytest.MonkeyPatch,
+    lane: str,
+) -> None:
+    _result, _database, runner, workspace_cleanup = await _finalize_refusal(
+        monkeypatch, lane=lane, resume=False, status="processing"
+    )
+
     workspace_cleanup.assert_awaited_once_with(JOB_ID)
+    assert "workspace_archive_teardown" in runner.details
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["pinned", "stateless"])
+async def test_a_refused_resume_keeps_the_paused_jobs_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    lane: str,
+) -> None:
+    """The owner's decision (2026-10-10): the job fails, its workspace stays,
+    as the provisioner keeps a failed job's pod with completion commands off."""
+
+    result, _database, runner, workspace_cleanup = await _finalize_refusal(
+        monkeypatch, lane=lane, resume=True, status="processing"
+    )
+
+    assert result["new_status"] == "failed"
+    workspace_cleanup.assert_not_awaited()
+    assert "workspace_archive_teardown" not in runner.started
 
 
 @pytest.mark.asyncio
@@ -4219,23 +4282,8 @@ async def test_a_cancel_that_won_the_row_keeps_it_over_a_start_refusal(
     monkeypatch: pytest.MonkeyPatch,
     lane: str,
 ) -> None:
-    job = _route_job(status="cancelled")
-    job["execution_lane"] = lane
-    database = _RouteDB(job)
-    runner = _RecordingRunner()
-    runner.command = await _admitted_refusal_command(lane)
-    _patch_normal_route_dependencies(
-        monkeypatch,
-        database=database,
-        terminal_effects=AsyncMock(return_value={"actions": []}),
-        workspace_cleanup=AsyncMock(return_value=[]),
-    )
-
-    await job_completion_module.run_persisted_completion_workflow(
-        runner,
-        dependencies=job_completion_module.PersistedCompletionDependencies(
-            legacy_complete=b08_helpers.complete_job_legacy
-        ),
+    _result, database, _runner, _cleanup = await _finalize_refusal(
+        monkeypatch, lane=lane, resume=False, status="cancelled"
     )
 
     assert database.status_write_count == 0

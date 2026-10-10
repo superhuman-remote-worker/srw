@@ -46,6 +46,7 @@ from shared.workspace_recovery import (
 
 from orchestrator.security.access import vm_workspaces_on_pod_network
 from orchestrator.services import (
+    connector_bind_time,
     connector_credential_leases,
     dispatch_credentials,
     job_start_bundle,
@@ -86,10 +87,6 @@ from shared.workspace_contract import (
 logger = logging.getLogger(__name__)
 
 
-async def _start_refusal_not_routed(_job_id: str, **_refusal: Any) -> bool:
-    return False
-
-
 @dataclass(frozen=True)
 class UnitClaimBundleDependencies:
     """Everything the bundle needs from the application, per invocation.
@@ -116,6 +113,11 @@ class UnitClaimBundleDependencies:
     job_workspace_authority_dependencies: Callable[[], Any]
     job_start_bundle_dependencies: Callable[[], Any]
     dispatch_credential_dependencies: Callable[[], Any]
+    #: Fails a worker job whose start was refused for good through the
+    #: completion-command path, fenced by the claimant's lease
+    #: (``job_completion.refuse_job_start``, connector drivers decision 34).
+    #: It admits nothing while completion commands are off.
+    refuse_job_start: Callable[..., Awaitable[bool]]
     recovery_store: Any = None
     #: Read-only pooled-executor attestation (K8s Pod UID + pool membership).
     #: Injected so routes/services stay testable without a cluster. ``None``
@@ -125,11 +127,6 @@ class UnitClaimBundleDependencies:
     #: (``DeploymentSettings.session_subagent_fanout``), read at every claim.
     #: The default keeps fan-out off for a composition that does not wire it.
     session_subagent_fanout: Callable[[str], bool] = lambda _lane: False
-    #: Fails a worker job whose start bundle was refused through the
-    #: completion-command path, fenced by the claimant's lease
-    #: (``job_completion.refuse_job_start``, connector drivers decision 34).
-    #: The default admits nothing, so the claimant keeps retrying as before.
-    refuse_job_start: Callable[..., Awaitable[bool]] = _start_refusal_not_routed
 
 
 class _WorkspaceRecoveryRefusal(HTTPException):
@@ -140,6 +137,15 @@ class _WorkspaceRecoveryRefusal(HTTPException):
     ):
         super().__init__(409, detail)
         self.code = code
+
+
+class _ClaimLeasesRefused(HTTPException):
+    """A claim refused because a lease could not be delivered; ``cause`` is
+    the delivery error, for a caller that tells for-good from transient."""
+
+    def __init__(self, detail: str, cause: BaseException):
+        super().__init__(409, detail)
+        self.cause = cause
 
 
 async def _deliver_claim_leases(
@@ -168,7 +174,30 @@ async def _deliver_claim_leases(
             owner.id,
             exc,
         )
-        raise HTTPException(status_code=409, detail=refusal) from exc
+        raise _ClaimLeasesRefused(refusal, exc) from exc
+
+
+async def _refuse_worker_start(
+    unit_id: str,
+    *,
+    reason: str,
+    message: str,
+    lease_token: int,
+    dependencies: UnitClaimBundleDependencies,
+) -> None:
+    """Fail a worker job whose start was refused for good, under this lease.
+
+    A job with a checkpoint has run before, so this claim resumed it and its
+    workspace is kept; a first start's workspace is torn down (the pinned
+    lane's resume test, ``resume_lane_applies``, asks the same question).
+    """
+    await dependencies.refuse_job_start(
+        unit_id,
+        reason=reason,
+        message=message,
+        resume=await dependencies.db.job_has_checkpoint(unit_id),
+        lease_token=lease_token,
+    )
 
 
 def _digest(value: Any) -> str:
@@ -714,11 +743,12 @@ async def _assemble_claim_bundle(
             # admitted as this lease's terminal report instead. The lease
             # fence decides, and an admitted report closes the unit, so the
             # job ends failed with its message and is not claimed again.
-            await dependencies.refuse_job_start(
+            await _refuse_worker_start(
                 unit_id,
                 reason=job_start.reason,
                 message=job_start.message,
                 lease_token=lease_token,
+                dependencies=dependencies,
             )
             raise HTTPException(status_code=409, detail="Job bundle assembly refused")
         if job_start is None:
@@ -904,36 +934,53 @@ async def _assemble_claim_bundle(
             owner=connector_credential_leases.job_lease_owner(job),
             bind_wait=0,
         )
-        async with dependencies.db.acquire() as conn:
-            async with conn.transaction():
-                await _validate_worker_lease(
-                    conn,
-                    unit_id=unit_id,
+        try:
+            async with dependencies.db.acquire() as conn:
+                async with conn.transaction():
+                    await _validate_worker_lease(
+                        conn,
+                        unit_id=unit_id,
+                        lease_token=lease_token,
+                        pod_name=pod_name,
+                        pod_uid=pod_uid,
+                    )
+                    authorized = (
+                        await dependencies.recovery_store.record_bundle_authorized(
+                            conn,
+                            job_id=UUID(unit_id),
+                            lease_token=lease_token,
+                            authority_digest=initial_runtime_digest,
+                            vm_mode=vm_provisioner.mode,
+                            vm_binding_required=(
+                                assigned_backend == "vm"
+                                and job.get("parent_job_id") is None
+                            ),
+                        )
+                    )
+                    if not authorized:
+                        raise HTTPException(403, "Lease validation failed")
+                    # Credential leases (connector drivers C2), in the claim
+                    # transaction: only the claimant whose run_queue lease was
+                    # just re-checked receives a lease token.
+                    await _deliver_claim_leases(
+                        conn,
+                        job_start.datasources,
+                        owner=connector_credential_leases.job_lease_owner(job),
+                        refusal="Job bundle assembly refused",
+                    )
+        except _ClaimLeasesRefused as refused:
+            # The claim transaction rolled back. A bind or provider mint that
+            # failed for good fails the job, as on the pinned lane; a pending
+            # one and any other delivery error leave the claimant to retry.
+            if isinstance(refused.cause, connector_bind_time.BindTimeRefused):
+                await _refuse_worker_start(
+                    unit_id,
+                    reason="connector_bind_refused",
+                    message=str(refused.cause)[:1000],
                     lease_token=lease_token,
-                    pod_name=pod_name,
-                    pod_uid=pod_uid,
+                    dependencies=dependencies,
                 )
-                authorized = await dependencies.recovery_store.record_bundle_authorized(
-                    conn,
-                    job_id=UUID(unit_id),
-                    lease_token=lease_token,
-                    authority_digest=initial_runtime_digest,
-                    vm_mode=vm_provisioner.mode,
-                    vm_binding_required=(
-                        assigned_backend == "vm" and job.get("parent_job_id") is None
-                    ),
-                )
-                if not authorized:
-                    raise HTTPException(403, "Lease validation failed")
-                # Credential leases (connector drivers C2), in the claim
-                # transaction: only the claimant whose run_queue lease was
-                # just re-checked receives a lease token.
-                await _deliver_claim_leases(
-                    conn,
-                    job_start.datasources,
-                    owner=connector_credential_leases.job_lease_owner(job),
-                    refusal="Job bundle assembly refused",
-                )
+            raise
         return {
             "unit_id": unit_id,
             "job_id": unit_id,
