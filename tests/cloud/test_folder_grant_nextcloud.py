@@ -135,6 +135,15 @@ class FakeNc:
         if m and method == "POST":
             self.folder_groups[m.group(1)][m.group(2)] = int(form["permissions"])
             return self._ocs(100)
+        m = re.fullmatch(r"/remote\.php/dav/groupfolders/([^/]+)/", path)
+        if m and method == "PROPFIND":
+            user = self.users.get(m.group(1))
+            expected = httpx.BasicAuth(m.group(1), (user or {}).get("password", ""))
+            if user is None or request.headers.get("authorization") != (
+                expected._auth_header
+            ):
+                return httpx.Response(401)
+            return httpx.Response(207, text="<d:multistatus/>")
         m = re.fullmatch(r"/remote\.php/dav/groupfolders/([^/]+)/([^/]+)/", path)
         if m and method == "PROPFIND":
             uid = m.group(1)
@@ -363,3 +372,42 @@ def test_principal_client_authenticates_as_the_principal() -> None:
     assert client.auth is not None
     with pytest.raises(CloudBackendError):
         backend.folder_principal_client("agent-service", "pw")
+
+
+@pytest.mark.asyncio
+async def test_a_folder_not_at_its_path_keeps_a_live_principals_grant() -> None:
+    """Moved away (its mountpoint renamed): the principal's own root reads,
+    so the grant stands and the mount says not_found, as for any folder
+    that went missing."""
+    backend, fake = _backend()
+    moved = ProjectFolderHandle(
+        backend="nextcloud", native_id=FOLDER_ID, vendor_meta={"mountpoint": "Gone"}
+    )
+    await backend.ensure_folder_principal(
+        moved,
+        principal_id=WRITER,
+        group_id=WRITER_GROUP,
+        password="pw-1",
+        kind="writer",
+    )
+    assert fake.users[WRITER]["groups"] == [WRITER_GROUP]
+    assert fake.log[-1] == ("PROPFIND", f"/remote.php/dav/groupfolders/{WRITER}/")
+
+
+@pytest.mark.asyncio
+async def test_a_principal_that_reads_nothing_fails_its_grant() -> None:
+    backend, fake = _backend()
+    fake.fail[("PROPFIND", f"/remote.php/dav/groupfolders/{WRITER}/{MOUNTPOINT}/")] = (
+        httpx.Response(404)
+    )
+    fake.fail[("PROPFIND", f"/remote.php/dav/groupfolders/{WRITER}/")] = httpx.Response(
+        404
+    )
+    with pytest.raises(CloudBackendError, match="cannot read its folder: HTTP 404"):
+        await backend.ensure_folder_principal(
+            _handle(),
+            principal_id=WRITER,
+            group_id=WRITER_GROUP,
+            password="pw-1",
+            kind="writer",
+        )

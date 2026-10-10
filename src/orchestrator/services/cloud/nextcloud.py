@@ -2103,7 +2103,9 @@ class NextcloudBackend(NextcloudUserRootGrant):
         accepts "already done", so a retry completes a crashed attempt.
         Then the principal must read the folder; a refused password is reset
         to the stored one once (a principal a lost attempt created with
-        another).
+        another). A folder not at its path (404 while the principal's own
+        groupfolders root reads) does not fail the grant: its mount reports
+        not_found, as any folder that went missing does.
         """
         self._ensure_ready()
         grant_kind = self._folder_principal_ids(principal_id, group_id, kind)
@@ -2173,6 +2175,23 @@ class NextcloudBackend(NextcloudUserRootGrant):
                     resp, ok={100, 200}, op="reset folder grant password"
                 )
                 status = await self._principal_reads(webdav_url, principal_id, password)
+            if status == 404 and (
+                await self._principal_reads(
+                    webdav_url.rstrip("/").rsplit("/", 1)[0] + "/",
+                    principal_id,
+                    password,
+                )
+                == 207
+            ):
+                # The principal is live, but its folder is not at the
+                # handle's path (moved, or gone): the grant stands, and the
+                # mount says not_found, as for any folder that went missing.
+                logger.warning(
+                    "Per-folder principal %s: its Group Folder %s is not at its path",
+                    principal_id,
+                    folder_id,
+                )
+                status = 207
         except httpx.HTTPError as e:
             raise self._map_http_error(e) from e
         if status != 207:
