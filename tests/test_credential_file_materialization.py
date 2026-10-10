@@ -213,6 +213,60 @@ class TestPlan:
             }
         ]
 
+    @pytest.mark.parametrize("kube_first", [False, True])
+    def test_another_connectors_kube_config_is_never_linked_over(
+        self, kube_first, caplog
+    ):
+        """A file connector (or a driver) delivering ~/.kube/config keeps it:
+        the merged kubeconfig is listed after it, as after the user's own."""
+        admin = _file_row(
+            "Admin",
+            {"contents": "admin", "target_path": "/home/srw/.kube/config"},
+        )
+        kube = _kube_row("Kube", "a", "t")
+        rows = [kube, admin] if kube_first else [admin, kube]
+        with caplog.at_level(logging.WARNING):
+            plan = plan_credential_files(deliveries_from_payload(rows))
+        by_link = {f["link"]: f for f in plan.files}
+        assert by_link[".kube/config"]["content"] == "admin"
+        merged = next(f for f in plan.files if f["name"] == MERGED_KUBECONFIG)
+        assert merged["link"] is None
+        assert [c["name"] for c in yaml.safe_load(merged["content"])["contexts"]] == [
+            "kube-default"
+        ]
+        assert _env(plan) == {
+            "KUBECONFIG": [by_link[".kube/config"]["name"], MERGED_KUBECONFIG]
+        }
+        assert plan.kubeconfig_after == "Admin"
+        assert "'Admin' delivers ~/.kube/config" in caplog.text
+
+    def test_a_file_claiming_a_kubeconfigs_target_keeps_it_in_the_merge(self, caplog):
+        """The other file keeps the path; the kubeconfig is merged all the
+        same, stored without a link of its own."""
+        squatter = _file_row(
+            "Squatter",
+            {"contents": "x", "target_path": "/home/srw/.kube/configs/kube.yaml"},
+        )
+        rows = [squatter, _kube_row("Kube", "a", "t"), _kube_row("Other", "b", "u")]
+        with caplog.at_level(logging.WARNING):
+            plan = plan_credential_files(deliveries_from_payload(rows))
+        links = [f["link"] for f in plan.files]
+        assert links == [
+            ".kube/configs/kube.yaml",
+            None,
+            ".kube/configs/other.yaml",
+            ".kube/config",
+        ]
+        assert plan.files[0]["content"] == "x"
+        assert len({f["name"] for f in plan.files}) == 4
+        merged = plan.files[-1]
+        assert [c["name"] for c in yaml.safe_load(merged["content"])["contexts"]] == [
+            "kube-default",
+            "other-default",
+        ]
+        assert plan.kubeconfig_after is None
+        assert "merged without a link of its own" in caplog.text
+
     def test_kubeconfigs_that_cannot_merge_are_each_listed(self, caplog):
         broken = _kube_row("Broken", "x", "t")
         broken["credentials"]["files"][0]["contents"] = "- not a mapping"
@@ -456,7 +510,7 @@ class TestFacts:
             "- **Mixed** (file) — `~/.netrc` (`$NETRC`), "
             "`/tmp/outside` (not delivered: outside the home), "
             "`/home/srw/.ssh/config` (not delivered: not a credential-file "
-            "location), `~/.srw-files/x` (variable not set: Environment name "
+            "location), `~/.srw-files/x` (variable not delivered by SRW: Environment name "
             "PATH is reserved by the workspace)"
         ]
 
@@ -509,6 +563,19 @@ class TestFacts:
         assert self._facts([_kube_row("Kube", "a", "t")], backend) == [
             f"- **Kube** (kubeconfig) — {where}; contexts prefixed `kube-*`. "
             "Where kubectl is installed, try `kubectl config get-contexts`."
+        ]
+
+    def test_the_readme_names_the_connector_whose_kube_config_comes_first(self):
+        admin = _file_row(
+            "Admin",
+            {"contents": "admin", "target_path": "/home/srw/.kube/config"},
+        )
+        assert self._facts([admin, _kube_row("Kube", "a", "t")]) == [
+            "- **Admin** (file) — `~/.kube/config`",
+            "- **Kube** (kubeconfig) — merged into `$KUBECONFIG` after **Admin**'s "
+            "`~/.kube/config`, whose current context stays the default; contexts "
+            "prefixed `kube-*`. Where kubectl is installed, try `kubectl config "
+            "get-contexts`.",
         ]
 
     def test_a_kubeconfig_saved_off_the_allowlist_is_not_delivered(self):
@@ -602,6 +669,25 @@ def test_the_users_own_kubeconfig_stays_in_kubeconfig(workspace):
     assert own == str(workspace.home / ".kube/config")
     assert merged.endswith("/kubeconfig")
     assert (workspace.home / ".kube/config").read_text() == "the user's own\n"
+
+
+def test_another_connectors_kube_config_comes_first_in_the_workspace(workspace):
+    """The real workspace program: ~/.kube/config stays the other connector's
+    file, and KUBECONFIG lists it before the merged one."""
+    admin = _file_row(
+        "Admin",
+        {"contents": "admin's own\n", "target_path": "/home/srw/.kube/config"},
+    )
+    CredentialFileMaterializer().materialize(
+        deliveries_from_payload([admin, _kube_row("Kube", "a", "t")]),
+        _rt(workspace.backend),
+    )
+    assert (workspace.home / ".kube/config").read_text() == "admin's own\n"
+    first, merged = _shell(workspace, 'printf %s "$KUBECONFIG"').split(":")
+    assert Path(first).read_text() == "admin's own\n"
+    assert merged.endswith("/kubeconfig")
+    contexts = yaml.safe_load(Path(merged).read_text())["contexts"]
+    assert [c["name"] for c in contexts] == ["kube-default"]
 
 
 def test_a_detach_between_attaches_removes_the_files_and_the_variable(workspace):

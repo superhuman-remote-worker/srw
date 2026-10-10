@@ -40,7 +40,10 @@ kubeconfig type check: kubeconfig names are prefixed with the connector's
 slug, and every kubeconfig is merged into one config that ``KUBECONFIG``
 names (after the user's own ``~/.kube/config``, if there is one, so the
 user's current context stays the default) and ``~/.kube/config`` links to
-otherwise. An entry's ``env_var`` names the file
+otherwise. Another connector's file at ``~/.kube/config`` is treated as the
+user's: never linked over, listed first in ``KUBECONFIG``, and the README
+says so. A kubeconfig whose own target another connector's file claims still
+joins the merge, stored without a link. An entry's ``env_var`` names the file
 in the shell's environment, unless another connector already set it.
 """
 
@@ -52,7 +55,7 @@ import posixpath
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 from agent.connectors.base import (
     Delivery,
@@ -199,10 +202,22 @@ class CredentialFilePlan:
 
     files: list[dict[str, Any]] = field(default_factory=list)
     env: list[dict[str, Any]] = field(default_factory=list)
+    #: The connector whose own file holds ``~/.kube/config``: the merged
+    #: kubeconfig is listed after it in ``KUBECONFIG``, never linked over it.
+    kubeconfig_after: str | None = None
 
     @property
     def env_names(self) -> list[str]:
         return [item["name"] for item in self.env]
+
+
+class _Owner(NamedTuple):
+    """Who delivers a home path: its stored file, its connector, and whether
+    it is one of the kubeconfigs the merge holds."""
+
+    stored: str
+    connector: str
+    merged: bool
 
 
 def plan_credential_files(
@@ -215,7 +230,7 @@ def plan_credential_files(
             logger.warning(message, *args)
 
     plan = CredentialFilePlan()
-    targets: set[str] = set()
+    owners: dict[str, _Owner] = {}
     named: set[str] = set()
     groups: dict[str, list[tuple[str, str]]] = {}
     for delivery in deliveries:
@@ -230,15 +245,31 @@ def plan_credential_files(
                     refused,
                 )
                 continue
-            if relative in targets:
+            group = value.get("merge_group")
+            link: str | None = relative
+            stored = _store_name(relative)
+            if relative in owners:
+                if not group:
+                    warn(
+                        "Skipping a credential file for '%s': another connector "
+                        "already delivers ~/%s",
+                        name,
+                        relative,
+                    )
+                    continue
+                # Another connector's file claims this kubeconfig's own
+                # target: the kubeconfig still joins the merge, stored
+                # without a link of its own.
                 warn(
-                    "Skipping a credential file for '%s': another connector "
-                    "already delivers ~/%s",
-                    name,
+                    "~/%s is another connector's file; '%s''s kubeconfig is "
+                    "merged without a link of its own",
                     relative,
+                    name,
                 )
-                continue
-            targets.add(relative)
+                link = None
+                stored = _store_name(f"{relative}#{delivery.index}.{index}")
+            else:
+                owners[relative] = _Owner(stored, name, bool(group))
             contents = str(value.get("content") or "")
             if value.get("transform") == "kubeconfig_prefix":
                 contents = _prefix_kubeconfig_yaml(contents, _ds_slug_hyphen(name))
@@ -253,13 +284,12 @@ def plan_credential_files(
                     name,
                     safe_mode(mode),
                 )
-            stored = _store_name(relative)
             plan.files.append(
                 {
                     "name": stored,
                     "content": contents,
                     "mode": safe_mode(mode),
-                    "link": relative,
+                    "link": link,
                 }
             )
             env_var = value.get("env_var")
@@ -272,12 +302,15 @@ def plan_credential_files(
                 else:
                     named.add(env_var)
                     plan.env.append({"name": env_var, "files": [stored]})
-            group = value.get("merge_group")
             if group:
                 groups.setdefault(group, []).append((stored, contents))
 
     kubeconfigs = groups.get("kubeconfig")
     if kubeconfigs:
+        # Another connector's own file at ~/.kube/config (not one of the
+        # merged kubeconfigs) keeps its place.
+        claimed = owners.get(MERGED_KUBECONFIG_LINK)
+        other = claimed if claimed is not None and not claimed.merged else None
         merged = merge_kubeconfigs([contents for _stored, contents in kubeconfigs])
         if merged is None:
             warn("Kubeconfigs could not be merged; KUBECONFIG lists each file")
@@ -288,13 +321,23 @@ def plan_credential_files(
                     "name": MERGED_KUBECONFIG,
                     "content": merged,
                     "mode": 0o600,
-                    "link": MERGED_KUBECONFIG_LINK,
+                    "link": None if other is not None else MERGED_KUBECONFIG_LINK,
                 }
             )
             files = [MERGED_KUBECONFIG]
+        if other is not None:
+            warn(
+                "'%s' delivers ~/%s; the merged kubeconfig is listed after it "
+                "in KUBECONFIG",
+                other.connector,
+                MERGED_KUBECONFIG_LINK,
+            )
+            files = [other.stored, *files]
+            plan.kubeconfig_after = other.connector
         # The user's own ~/.kube/config, if the merged one could not take its
         # place, comes first: its current-context stays the default and a
-        # shared connector's never replaces it.
+        # shared connector's never replaces it. Another connector's file
+        # there is listed first the same way (above).
         plan.env.append(
             {"name": KUBECONFIG_VAR, "files": files, "prepend": MERGED_KUBECONFIG_LINK}
         )
@@ -368,12 +411,13 @@ class CredentialFileMaterializer:
         self, deliveries: Sequence[Delivery], rt: RuntimeContext
     ) -> list[FactsLines]:
         report = _report(rt)
+        after = plan_credential_files(deliveries, quiet=True).kubeconfig_after
         out: list[FactsLines] = []
         for delivery in deliveries:
             name = delivery.name
             values = delivery.values("credential_file")
             if _files_slot_kind(delivery) == "kubeconfig":
-                line = _kubeconfig_line(name, values, report)
+                line = _kubeconfig_line(name, values, report, after=after)
             else:
                 paths = (
                     ", ".join(_fact_path(value, report) for value in values) or "<none>"
@@ -401,7 +445,11 @@ def _files_slot_kind(delivery: Delivery) -> str | None:
 
 
 def _kubeconfig_line(
-    name: str, values: Sequence[Mapping[str, Any]], report: Mapping[str, Any]
+    name: str,
+    values: Sequence[Mapping[str, Any]],
+    report: Mapping[str, Any],
+    *,
+    after: str | None = None,
 ) -> str:
     refused = [
         (str(value.get("path") or ""), problem)
@@ -419,6 +467,11 @@ def _kubeconfig_line(
             "merged into `~/.kube/config` (`$KUBECONFIG` is another connector's)"
             if MERGED_KUBECONFIG_LINK not in skipped
             else "merged, but `~/.kube/config` and `$KUBECONFIG` are taken"
+        )
+    elif after is not None:
+        where = (
+            f"merged into `$KUBECONFIG` after **{after}**'s `~/.kube/config`, "
+            "whose current context stays the default"
         )
     elif MERGED_KUBECONFIG_LINK in skipped:
         where = (
@@ -448,7 +501,7 @@ def _fact_path(value: Mapping[str, Any], report: Mapping[str, Any]) -> str:
     if skipped:
         notes.append(f"not linked: {skipped}")
     if unnamed is not None:
-        notes.append(f"variable not set: {unnamed}")
+        notes.append(f"variable not delivered by SRW: {unnamed}")
     elif named and not taken:
         notes.append(f"`${env_var}`")
     elif taken:
