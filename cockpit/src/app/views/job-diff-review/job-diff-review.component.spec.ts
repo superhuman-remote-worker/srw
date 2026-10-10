@@ -24,7 +24,11 @@ import {
   receiptAppliesTo,
   writeReceipt,
 } from './cloud-review-receipt';
-import { folderLinkMatches, selectProtectedProjectMount } from './protected-folder-link';
+import {
+  folderLinkMatches,
+  protectedFolderSource,
+  selectProtectedProjectMount,
+} from './protected-folder-link';
 
 // ============================================================================
 // Pure helpers
@@ -180,6 +184,38 @@ describe('selectProtectedProjectMount', () => {
   it('returns null for an empty or absent mount list', () => {
     expect(selectProtectedProjectMount([])).toBeNull();
     expect(selectProtectedProjectMount(null)).toBeNull();
+  });
+});
+
+describe('protectedFolderSource', () => {
+  const mounts = [
+    {
+      id: 'm1',
+      mount_kind: 'project',
+      target_path: 'cloud/old',
+      source_kind: 'project',
+      source_ref: 'proj-old',
+      backend_id: 'nextcloud',
+    },
+  ];
+
+  it('takes the folder the session bound at protected, frozen at admission', () => {
+    // A member may protect another project's folder: the thread's own mount
+    // rows would name the wrong one.
+    expect(
+      protectedFolderSource(
+        { datasource_id: 'ds-1', source_ref: 'proj-b', target_path: 'cloud/acme' },
+        mounts,
+      ),
+    ).toEqual({ projectId: 'proj-b', targetPath: 'cloud/acme' });
+  });
+
+  it('falls back to the mount rows for a session protected before connectors', () => {
+    expect(protectedFolderSource(null, mounts)).toEqual({
+      projectId: 'proj-old',
+      targetPath: 'cloud/old',
+    });
+    expect(protectedFolderSource(undefined, [])).toBeNull();
   });
 });
 

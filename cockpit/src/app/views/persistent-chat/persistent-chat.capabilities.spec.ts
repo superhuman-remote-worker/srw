@@ -43,7 +43,8 @@ function sessionState() {
     'draftDefaultsLoading', 'reconnectGaveUp', 'endRetryAvailable', 'cloudFoldersAgentOutdated',
     'cloudFoldersProtected']) state[key] = signal(false);
   for (const key of ['turns', 'visibleTurns', 'pendingAttachments', 'pendingPermissions', 'tasks',
-    'outbox', 'outboxIds', 'draftDatasourceIds', 'runningTools', 'cloudFolderProblems']) state[key] = signal([]);
+    'outbox', 'outboxIds', 'draftDatasourceIds', 'runningTools', 'cloudFolderProblems',
+    'cloudFolders']) state[key] = signal([]);
   for (const key of ['compaction', 'rewindPrefill', 'rewindPreview', 'pendingWorkspaceOffer',
     'currentUsage', 'queueState', 'verifiedProjectFolder', 'cloudSessionUrl', 'ncSessionFolder',
     'cloudDiffProbe', 'cloudStagedAt', 'attachmentError', 'error', 'endedAt', 'draftDefaultsError',

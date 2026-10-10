@@ -1927,10 +1927,26 @@
       "regionLabel": "Cloud-Ordner",
       "title": "Einige Cloud-Ordner dieser Sitzung sind nicht verfügbar",
       "notAttached": "Ein Cloud-Ordner wurde nicht verbunden",
+      "kind": {
+        "session_folder": "Sitzungsordner",
+        "project": "Projektordner",
+        "project_default": "Cloud-Home",
+        "user_root": "Meine Cloud",
+        "cloud_outbox": "Session-Outbox",
+        "protected_lower": "Geschützter Projektordner"
+      },
+      "state": {
+        "mounted": "eingebunden",
+        "pending": "wird verbunden…"
+      },
+      "review": "Zur Prüfung",
       "notAttachedKind": {
         "session_folder": "Der Sitzungsordner wurde nicht verbunden",
         "project": "Ein Projektordner wurde nicht verbunden",
-        "project_default": "Dein Projektordner wurde nicht verbunden"
+        "project_default": "Dein Projektordner wurde nicht verbunden",
+        "user_root": "Meine Cloud wurde nicht verbunden",
+        "cloud_outbox": "Die Session-Outbox wurde nicht verbunden",
+        "protected_lower": "Der geschützte Ordner wurde nicht verbunden"
       },
       "protectedTitle": "Geschützte Cloud nicht verfügbar",
       "protectedMeta": "Diese geschützte Sitzung läuft ohne Cloud-Ordner, nichts, was sie schreibt, erreicht die Cloud. Starte eine neue Sitzung, sobald die Ursache behoben ist.",
@@ -1946,7 +1962,17 @@
         "unbuildable": "er konnte für diese Sitzung nicht vorbereitet werden",
         "set_fallback": "ein anderer Ordner dieser Sitzung konnte nicht vorbereitet werden, deshalb ist stattdessen der Sitzungsordner eingebunden",
         "too_many_mounts": "die Sitzung hat mehr Cloud-Ordner, als ein Arbeitsbereich einbindet",
-        "protected_unavailable": "die geschützte Cloud konnte nicht eingerichtet werden"
+        "protected_unavailable": "die geschützte Cloud konnte nicht eingerichtet werden",
+        "access_unavailable": "in dieser Art Arbeitsbereich wird dafür keine Zugriffsstufe angeboten",
+        "config_invalid": "es ist kein Cloud-Ordner, den SRW eingerichtet hat",
+        "not_eligible": "diese Sitzung darf ihn nicht mehr nutzen",
+        "no_session_folder": "SRW hat den Outbox-Ordner dieser Sitzung nicht angelegt",
+        "backend_unavailable": "die Haupt-Cloud war beim Start der Sitzung nicht erreichbar",
+        "beside_protected": "neben einem geschützten Ordner nicht eingebunden: eine geschützte Sitzung bindet nur diesen ein",
+        "grant_unavailable": "sein Konto für diesen Ordner ist noch nicht bereit",
+        "reader_unavailable": "sein Nur-Lese-Konto für diesen Ordner ist noch nicht bereit",
+        "cloud_not_connected": "noch kein Cloud-Konto: verbinde deine Cloud unter Einstellungen → Konnektoren",
+        "cloud_grant_revoked": "die Cloud akzeptiert deine Verbindung nicht mehr: verbinde sie neu unter Einstellungen → Konnektoren"
       }
     },
     "cloudReview": {

@@ -2567,6 +2567,11 @@ describe('PersistentChatService — SSE event dispatch', () => {
     expect(service.cloudFolderProblems()).toEqual([
       { name: 'project', path: 'workspace/cloud/project', kind: '', reason: 'credential_rejected' },
     ]);
+    // Every folder keeps its row in the header, mounted or not.
+    expect(service.cloudFolders().map((f) => [f.name, f.state, f.reason])).toEqual([
+      ['project', 'unavailable', 'credential_rejected'],
+      ['home', 'mounted', ''],
+    ]);
     expect(service.cloudFoldersAgentOutdated()).toBe(false);
     expect(service.cloudFoldersProtected()).toBe(false);
     fireSseMessage(

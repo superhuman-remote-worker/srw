@@ -1195,12 +1195,15 @@ export function clearDraft(threadId: string | null): void {
         (recheck)="chat.refreshCloudDiffCount()"
       />
 
-      <!-- Cloud folders that did not mount (connector drivers D7): the
-           workspace starts anyway, and this says which folder and why. -->
+      <!-- Every attached cloud folder and its binding state (main cloud
+           slices 3 to 6); one that did not mount says why, and the
+           workspace starts anyway (connector drivers D7). -->
       <app-cloud-folders-notice
         [problems]="chat.cloudFolderProblems()"
+        [folders]="chat.cloudFolders()"
         [protectedCloud]="chat.cloudFoldersProtected()"
         [agentOutdated]="chat.cloudFoldersAgentOutdated()"
+        (showReview)="showCloudReview()"
       />
 
       <!-- View menu: device-local display prefs (chatPrefs/localStorage).
@@ -2728,6 +2731,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private readonly headerActionsEl = viewChild.required<ElementRef<HTMLDivElement>>('headerActionsEl');
     @ViewChild('inputEl') inputEl!: ElementRef<HTMLTextAreaElement>;
     @ViewChild('fileInput') fileInput?: ElementRef<HTMLInputElement>;
+    @ViewChild(CloudReviewBannerComponent, {read: ElementRef}) cloudReviewBanner?: ElementRef<HTMLElement>;
     @ViewChild('cameraInput') cameraInput?: ElementRef<HTMLInputElement>;
     @ViewChild('waveformCanvas') waveformCanvas?: ElementRef<HTMLCanvasElement>;
 
@@ -4299,6 +4303,14 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             ? 'chat.header.sessionFilesButton'
             : 'chat.header.filesButton',
     );
+
+    /** The protected folder's row in the cloud folders strip points at the
+     *  review banner, the one place the review opens from. */
+    showCloudReview(): void {
+        const banner = this.cloudReviewBanner?.nativeElement;
+        banner?.scrollIntoView({block: 'nearest'});
+        banner?.querySelector<HTMLElement>('button')?.focus();
+    }
 
     /** PC-19: the protected project folder, never a guessed URL. Only ever
      *  reachable when `verifiedProjectFolder` resolved one. */

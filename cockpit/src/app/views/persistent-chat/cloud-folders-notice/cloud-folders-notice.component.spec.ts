@@ -58,7 +58,7 @@ describe('cloud folder state', () => {
   });
 
   it('is empty for a session without the record', () => {
-    const empty = { problems: [], protected: false, agentOutdated: false };
+    const empty = { problems: [], folders: [], protected: false, agentOutdated: false };
     expect(cloudFolderStateFromStatus(undefined)).toEqual(empty);
     expect(cloudFolderStateFromStatus('nonsense')).toEqual(empty);
   });
@@ -85,9 +85,69 @@ describe('cloud folder state', () => {
       const folders = (lang as any).chat.cloudFolders;
       for (const reason of CLOUD_FOLDER_REASONS) expect(folders.reason[reason]).toBeTruthy();
       for (const kind of CLOUD_FOLDER_KINDS) expect(folders.notAttachedKind[kind]).toBeTruthy();
+      for (const kind of CLOUD_FOLDER_KINDS) expect(folders.kind[kind]).toBeTruthy();
+      expect(folders.state.mounted).toBeTruthy();
+      expect(folders.state.pending).toBeTruthy();
+      expect(folders.review).toBeTruthy();
       expect(folders.protectedTitle).toBeTruthy();
       expect(folders.protectedMeta).toBeTruthy();
     }
+  });
+
+  it("lists every attached connector's folder with its level and state", () => {
+    const state = cloudFolderStateFromStatus({
+      mounts: {
+        acme: { mount_kind: 'project', access: 'read_only', state: 'mounted', reason: null },
+        outbox: { mount_kind: 'cloud_outbox', access: 'read_write', state: 'pending', reason: null },
+      },
+      excluded: [
+        { source_ref: 'ds-root', mount_kind: 'user_root', reason: 'cloud_not_connected' },
+        { source_ref: 'ds-b', mount_kind: 'project', reason: 'grant_unavailable', detail: 'not_ready' },
+      ],
+    });
+    expect(state.folders).toEqual([
+      { name: 'acme', path: 'workspace/cloud/acme', kind: 'project', level: 'read_only', state: 'mounted', reason: '', connectorId: '', title: '' },
+      { name: 'outbox', path: 'workspace/cloud/outbox', kind: 'cloud_outbox', level: 'read_write', state: 'pending', reason: '', connectorId: '', title: '' },
+      // Left out: nothing takes its place, and it says why.
+      { name: '', path: '', kind: 'user_root', level: '', state: 'excluded', reason: 'cloud_not_connected', connectorId: 'ds-root', title: '' },
+      { name: '', path: '', kind: 'project', level: '', state: 'excluded', reason: 'grant_unavailable', connectorId: 'ds-b', title: '' },
+    ]);
+    expect(state.problems.map((p) => p.reason)).toEqual(['cloud_not_connected', 'grant_unavailable']);
+  });
+
+  it('keeps a protected session with folders left out beside it protected, not broken', () => {
+    const state = cloudFolderStateFromStatus({
+      mounts: { cloud: { mount_kind: 'protected_lower', access: 'read_only', state: 'mounted' } },
+      excluded: [{ source_ref: 'ds-2', mount_kind: 'project', reason: 'beside_protected' }],
+    });
+    // Its folder is up: the others staying out is no protected outage.
+    expect(state.protected).toBe(false);
+    expect(state.folders[0].level).toBe('protected');
+    expect(state.folders[1].reason).toBe('beside_protected');
+  });
+
+  it("keeps what each folder is from the thread's record when the agent reports", () => {
+    const before = cloudFolderStateFromStatus({
+      mounts: {
+        acme: { mount_kind: 'project', access: 'read_write', state: 'pending' },
+        outbox: { mount_kind: 'cloud_outbox', access: 'read_write', state: 'pending' },
+      },
+    });
+    const after = cloudFolderStateFromEvent(
+      {
+        mounts: [
+          { name: 'acme', state: 'mounted' },
+          { name: 'outbox', state: 'unavailable', reason: 'timeout' },
+        ],
+        excluded: [{ source_ref: 'ds-3', mount_kind: 'project', reason: 'beside_protected', title: 'Other folder', name: '' }],
+      },
+      before,
+    );
+    expect(after.folders.map((f) => [f.name, f.kind, f.level, f.state, f.reason, f.title])).toEqual([
+      ['acme', 'project', 'read_write', 'mounted', '', ''],
+      ['outbox', 'cloud_outbox', 'read_write', 'unavailable', 'timeout', ''],
+      ['', 'project', '', 'excluded', 'beside_protected', 'Other folder'],
+    ]);
   });
 });
 
@@ -160,8 +220,54 @@ describe('CloudFoldersNoticeComponent', () => {
     expect(text(root)).toContain('older than its workspace');
   });
 
-  it('shows nothing when every folder came up', async () => {
+  it('shows nothing for a session without cloud folders', async () => {
     const root = await render({ problems: [], agentOutdated: false });
     expect(root.querySelector('[data-testid="cloud-folders-notice"]')).toBeNull();
+  });
+
+  it("shows each folder's binding state, and a failed one names why", async () => {
+    const state = cloudFolderStateFromStatus({
+      mounts: {
+        acme: { mount_kind: 'project', access: 'read_only', state: 'mounted' },
+        outbox: { mount_kind: 'cloud_outbox', access: 'read_write', state: 'pending' },
+      },
+      excluded: [{ source_ref: 'ds-root', mount_kind: 'user_root', reason: 'cloud_not_connected' }],
+    });
+    const root = await render({ problems: state.problems, folders: state.folders, agentOutdated: false });
+    const rows = [...root.querySelectorAll<HTMLElement>('[data-cloud-folder]')];
+    expect(rows.map((r) => r.dataset['state'])).toEqual(['mounted', 'pending', 'excluded']);
+    expect(text(rows[0])).toBe('workspace/cloud/acme · Project folder Read-only · mounted');
+    expect(text(rows[1])).toBe('workspace/cloud/outbox · Session outbox Read-write · connecting…');
+    expect(text(rows[2])).toBe(
+      'My cloud was not attached · no cloud account yet: connect your cloud under Settings → Connectors',
+    );
+    expect(rows[2].classList).toContain('cfn__folder--down');
+    expect(text(root)).toContain('Some cloud folders of this session are not available');
+  });
+
+  it('reads as information when every folder is bound', async () => {
+    const state = cloudFolderStateFromStatus({
+      mounts: { acme: { mount_kind: 'project', access: 'read_write', state: 'mounted' } },
+    });
+    const root = await render({ problems: state.problems, folders: state.folders, agentOutdated: false });
+    expect(root.querySelector('.cfn')?.classList).toContain('cfn--ok');
+    expect(text(root.querySelector('.cfn__title') as HTMLElement)).toBe('Cloud folders');
+  });
+
+  it("links a protected session's folder to its review", async () => {
+    const state = cloudFolderStateFromStatus({
+      mounts: { cloud: { mount_kind: 'protected_lower', access: 'read_only', state: 'mounted' } },
+      excluded: [{ source_ref: 'ds-2', mount_kind: 'project', reason: 'beside_protected' }],
+    });
+    const root = await render({ problems: state.problems, folders: state.folders, protectedCloud: state.protected, agentOutdated: false });
+    let reviewed = 0;
+    fixture.componentInstance.showReview.subscribe(() => reviewed++);
+    const rows = [...root.querySelectorAll<HTMLElement>('[data-cloud-folder]')];
+    expect(text(rows[0])).toContain('Protected project folder');
+    expect(rows[0].querySelector('[data-level]')?.textContent?.trim()).toBe('Protected');
+    (rows[0].querySelector('[data-review]') as HTMLButtonElement).click();
+    expect(reviewed).toBe(1);
+    expect(text(rows[1])).toContain('not mounted beside a protected folder');
+    expect(rows[1].querySelector('[data-review]')).toBeNull();
   });
 });

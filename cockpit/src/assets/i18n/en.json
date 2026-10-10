@@ -1927,10 +1927,26 @@
       "regionLabel": "Cloud folders",
       "title": "Some cloud folders of this session are not available",
       "notAttached": "A cloud folder was not attached",
+      "kind": {
+        "session_folder": "Session folder",
+        "project": "Project folder",
+        "project_default": "Cloud home",
+        "user_root": "My cloud",
+        "cloud_outbox": "Session outbox",
+        "protected_lower": "Protected project folder"
+      },
+      "state": {
+        "mounted": "mounted",
+        "pending": "connecting…"
+      },
+      "review": "Go to the review",
       "notAttachedKind": {
         "session_folder": "The session folder was not attached",
         "project": "A project folder was not attached",
-        "project_default": "Your project folder was not attached"
+        "project_default": "Your project folder was not attached",
+        "user_root": "My cloud was not attached",
+        "cloud_outbox": "The session outbox was not attached",
+        "protected_lower": "The protected folder was not attached"
       },
       "protectedTitle": "Protected cloud unavailable",
       "protectedMeta": "This protected session runs without a cloud folder, so nothing it writes reaches the cloud. Start a new session once the cause is fixed.",
@@ -1946,7 +1962,17 @@
         "unbuildable": "it could not be prepared for this session",
         "set_fallback": "another folder of this session could not be prepared, so the session folder is mounted instead",
         "too_many_mounts": "the session has more cloud folders than a workspace mounts",
-        "protected_unavailable": "the protected cloud could not be set up"
+        "protected_unavailable": "the protected cloud could not be set up",
+        "access_unavailable": "no access level is offered for it in this kind of workspace",
+        "config_invalid": "it is not a cloud folder SRW set up",
+        "not_eligible": "this session may no longer use it",
+        "no_session_folder": "SRW has not created this session's outbox folder",
+        "backend_unavailable": "the main cloud was not reachable when the session started",
+        "beside_protected": "not mounted beside a protected folder: a protected session mounts only that one",
+        "grant_unavailable": "its account for this folder is not ready yet",
+        "reader_unavailable": "its read-only account for this folder is not ready yet",
+        "cloud_not_connected": "no cloud account yet: connect your cloud under Settings → Connectors",
+        "cloud_grant_revoked": "the cloud no longer accepts your connection: reconnect it under Settings → Connectors"
       }
     },
     "cloudReview": {

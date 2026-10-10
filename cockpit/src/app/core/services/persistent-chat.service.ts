@@ -12,14 +12,14 @@ import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { HttpClient } from '@angular/common/http';
 import { filter, firstValueFrom, map, Observable, Subscription, tap, timeout } from 'rxjs';
 import { environment } from '../environment';
-import { Project, ThreadCloudDiffSummary, ThreadMount, ThreadStatus, WorkspaceCreationView, WorkspaceLifecycleView } from '../models/api.model';
+import { Project, ThreadCloudDiffSummary, ThreadMount, ThreadProtectedSource, ThreadStatus, WorkspaceCreationView, WorkspaceLifecycleView } from '../models/api.model';
 // Type + pure derivation only — importing them from the review component
 // would pull it (and Monaco's loader) back into the eager bundle graph and
 // defeat the @defer that keeps the review surface lazy.
 import {
   folderLinkMatches,
   ProtectedFolderLink,
-  selectProtectedProjectMount,
+  protectedFolderSource,
 } from '../../views/job-diff-review/protected-folder-link';
 import { FilePreview, ThreadUploadEvent } from '../models/file.model';
 import {
@@ -66,6 +66,7 @@ import {
 import { CanvasService } from './canvas.service';
 import { CapabilitiesService } from './capabilities.service';
 import {
+  CloudFolderBinding,
   CloudFolderProblem,
   cloudFolderStateFromEvent,
   cloudFolderStateFromStatus,
@@ -1227,6 +1228,9 @@ export class PersistentChatService {
   readonly protectedCloud = computed(() => this._protectedCloud());
   /** Cloud folders of this session that are not available, and why (D7). */
   readonly cloudFolderProblems = signal<CloudFolderProblem[]>([]);
+  /** Every attached cloud folder with its level and binding state (main
+   *  cloud slices 3 to 6), for the session header. */
+  readonly cloudFolders = signal<CloudFolderBinding[]>([]);
   /** The session's agent predates the in-pod plane: folders unmanaged. */
   readonly cloudFoldersAgentOutdated = signal(false);
   /** A protected session runs without its cloud (decision 42). */
@@ -1243,6 +1247,9 @@ export class PersistentChatService {
    *  Phase 1; nothing read them until PC-19 needed to name the folder the
    *  staged diff applies to. */
   readonly threadMounts = signal<ThreadMount[]>([]);
+  /** A protected session's folder as the thread GET names it
+   *  (`protected_source`): the connector it bound at protected. */
+  readonly protectedSource = signal<ThreadProtectedSource | null>(null);
   /** A browser link to the protected project folder, or null when it cannot
    *  be derived with certainty. Consumers must still cross-check it against
    *  the diff summary's `protected_mount` (`folderLinkMatches`) before
@@ -2450,6 +2457,7 @@ export class PersistentChatService {
       if (!preserveReviewPlane) {
         this._protectedCloud.set(false);
         this.cloudFolderProblems.set([]);
+        this.cloudFolders.set([]);
         this.cloudFoldersAgentOutdated.set(false);
         this.cloudFoldersProtected.set(false);
         this.cloudChangesCount.set(0);
@@ -2457,6 +2465,7 @@ export class PersistentChatService {
         this.cloudStagedAt.set(null);
         this.cloudDiffPanelOpen.set(false);
         this.threadMounts.set([]);
+        this.protectedSource.set(null);
         this.protectedFolderLink.set(null);
         this.cloudDiffProbe.set('idle');
       }
@@ -3064,9 +3073,11 @@ export class PersistentChatService {
       this.workspaceCreation.set(thread.workspace_creation ?? null);
       if (!lifecycleOnly) {
         this.threadMounts.set(Array.isArray(thread.mounts) ? thread.mounts : []);
+        this.protectedSource.set(thread.protected_source ?? null);
         this._protectedCloud.set(!!thread.metadata?.protected_cloud);
         const folders = cloudFolderStateFromStatus(thread.metadata?.cloud_mount_status);
         this.cloudFolderProblems.set(folders.problems);
+        this.cloudFolders.set(folders.folders);
         this.cloudFoldersAgentOutdated.set(folders.agentOutdated);
         this.cloudFoldersProtected.set(folders.protected);
         if (this._protectedCloud()) {
@@ -3291,12 +3302,12 @@ export class PersistentChatService {
    */
   async resolveProtectedFolderLink(): Promise<void> {
     const threadId = this.threadId();
-    const mount = selectProtectedProjectMount(this.threadMounts());
-    if (!threadId || !mount?.source_ref) {
+    const folder = protectedFolderSource(this.protectedSource(), this.threadMounts());
+    if (!threadId || !folder) {
       this.protectedFolderLink.set(null);
       return;
     }
-    const project = await firstValueFrom(this.api.getProject(mount.source_ref));
+    const project = await firstValueFrom(this.api.getProject(folder.projectId));
     if (this.threadId() !== threadId) return; // stale response after a switch
     const url = project?.cloud_storage_url;
     if (!project || !url) {
@@ -3306,7 +3317,7 @@ export class PersistentChatService {
     this.protectedFolderLink.set({
       url,
       name: project.name,
-      targetPath: mount.target_path,
+      targetPath: folder.targetPath,
     });
   }
 
@@ -5260,6 +5271,7 @@ export class PersistentChatService {
     if (!preserveReviewPlane) {
       this._protectedCloud.set(false);
       this.cloudFolderProblems.set([]);
+      this.cloudFolders.set([]);
       this.cloudFoldersAgentOutdated.set(false);
       this.cloudFoldersProtected.set(false);
       this.cloudChangesCount.set(0);
@@ -5267,6 +5279,7 @@ export class PersistentChatService {
       this.cloudStagedAt.set(null);
       this.cloudDiffPanelOpen.set(false);
       this.threadMounts.set([]);
+      this.protectedSource.set(null);
       this.protectedFolderLink.set(null);
       this.cloudDiffProbe.set('idle');
     }
@@ -8325,8 +8338,16 @@ export class PersistentChatService {
       case 'cloud_mount.status': {
         // The agent's live view of the sidecar cloud folders (D7). An agent
         // that reports is up to date: an earlier outdated notice clears.
-        const folders = cloudFolderStateFromEvent(params);
+        // The event names each mount's state; what it is and its level stay
+        // the thread record's.
+        const folders = cloudFolderStateFromEvent(params, {
+          problems: this.cloudFolderProblems(),
+          folders: this.cloudFolders(),
+          protected: this.cloudFoldersProtected(),
+          agentOutdated: this.cloudFoldersAgentOutdated(),
+        });
         this.cloudFolderProblems.set(folders.problems);
+        this.cloudFolders.set(folders.folders);
         this.cloudFoldersProtected.set(folders.protected);
         this.cloudFoldersAgentOutdated.set(folders.agentOutdated);
         break;

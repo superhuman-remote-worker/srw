@@ -1,4 +1,4 @@
-import { ThreadMount } from '../../core/models/api.model';
+import { ThreadMount, ThreadProtectedSource } from '../../core/models/api.model';
 
 /**
  * A protected project folder resolved for a thread, safe to link to.
@@ -59,6 +59,27 @@ export function selectProtectedProjectMount(
     }
   }
   return null;
+}
+
+/**
+ * The protected folder of a thread to resolve a link for: its project and
+ * where it is mounted.
+ *
+ * A session protected from its connector (main cloud slice 5) names its
+ * folder in `protected_source`, frozen at admission, and that is the folder
+ * the review applies to. A session protected before connectors has none, and
+ * falls back to {@link selectProtectedProjectMount}. Either answer is still
+ * checked against the summary's `protected_mount` (`folderLinkMatches`).
+ */
+export function protectedFolderSource(
+  source: ThreadProtectedSource | null | undefined,
+  mounts: readonly ThreadMount[] | null | undefined,
+): { projectId: string; targetPath: string } | null {
+  if (source?.source_ref && source.target_path) {
+    return { projectId: source.source_ref, targetPath: source.target_path };
+  }
+  const mount = selectProtectedProjectMount(mounts);
+  return mount?.source_ref ? { projectId: mount.source_ref, targetPath: mount.target_path } : null;
 }
 
 /**
