@@ -405,6 +405,12 @@ async def bind_services(resources: ApplicationResources) -> None:
             await cloud_user_root.backfill_user_root_connectors(
                 resources.postgres_db, resources.main_cloud_router
             )
+            # "Connect your cloud" flows a restart interrupted are polled again.
+            await cloud_user_root.resume_pending_connects(
+                resources.postgres_db,
+                resources.main_cloud_router,
+                resources.cloud_root_connect_flows,
+            )
         except Exception:
             logger.error(
                 "User cloud root connectors backfill failed; it retries at the "

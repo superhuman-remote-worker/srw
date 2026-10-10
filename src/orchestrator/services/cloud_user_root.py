@@ -60,9 +60,8 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
-import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -693,7 +692,7 @@ async def revoke_root_credential(
         )
     config = _config(full)
     grant = dict(config.get("grant") or {})
-    if grant or credentials:
+    if grant or credentials.get("password"):
         grant.update({"state": "revoked", "revoked_at": _iso(_now()), "reason": reason})
         config["grant"] = grant
     await store.update_datasource(str(row["id"]), credentials={}, config=config)
@@ -774,28 +773,98 @@ async def retirement_revoke(
     return revoke
 
 
+#: The keys of a flow in flight in the row's encrypted credentials, beside a
+#: connected root's ``username`` and ``password``: its poll token, the page
+#: its user opens and when it ends. Any replica, and the next start, picks
+#: the flow up from them.
+_PENDING_KEYS = ("pending_poll_token", "pending_login_url", "pending_expires_at")
+
+
+@dataclass(frozen=True)
+class PendingConnect:
+    """A connect flow in flight, as the row records it; never printed."""
+
+    poll_token: str
+    login_url: str
+    expires_at: datetime
+
+    def __repr__(self) -> str:
+        return f"PendingConnect(expires_at={self.expires_at.isoformat()})"
+
+
+def _pending_of(
+    credentials: Mapping[str, Any] | None, *, expired: bool = False
+) -> PendingConnect | None:
+    """The flow in flight the credentials record; one past its end only
+    with ``expired`` (its own poller's last look)."""
+    credentials = credentials or {}
+    token = credentials.get("pending_poll_token")
+    url = credentials.get("pending_login_url")
+    try:
+        expires = datetime.fromisoformat(str(credentials.get("pending_expires_at")))
+    except (TypeError, ValueError):
+        return None
+    if not token or not url or (expires <= _now() and not expired):
+        return None
+    return PendingConnect(str(token), str(url), expires)
+
+
+async def _write_pending(
+    store: Any, row_id: str, pending: PendingConnect | None
+) -> None:
+    """Record (or clear) the row's flow in flight; its credential stays."""
+    full = await store.get_datasource(row_id)
+    if full is None:
+        return
+    credentials = {
+        key: value
+        for key, value in (full.get("credentials") or {}).items()
+        if key not in _PENDING_KEYS
+    }
+    if pending is None and len(credentials) == len(full.get("credentials") or {}):
+        return
+    if pending is not None:
+        credentials.update(
+            {
+                "pending_poll_token": pending.poll_token,
+                "pending_login_url": pending.login_url,
+                "pending_expires_at": pending.expires_at.isoformat(),
+            }
+        )
+    await store.update_datasource(row_id, credentials=credentials)
+
+
+async def _pending_for(
+    store: Any, row_id: str, *, expired: bool = False
+) -> PendingConnect | None:
+    full = await store.get_datasource(row_id)
+    return _pending_of((full or {}).get("credentials"), expired=expired)
+
+
 @dataclass
 class ConnectFlow:
-    """One user's consent flow in flight on this replica. The poll token
-    lives only in the poller's closure."""
+    """One user's consent flow, polled by this replica."""
 
     user_id: str
     connector_id: str
-    login_url: str
+    login_url: str = field(repr=False)
     started_at: datetime
     expires_at: datetime
     task: "asyncio.Task[None] | None" = None
 
 
 class CloudRootConnectFlows:
-    """The connect flows one application has in flight, at most one per
-    user. Owned by the application (``ApplicationResources``) and drained
-    at shutdown; an interrupted flow is simply gone, and the user starts
-    another.
+    """The connect flows this application polls, at most one per user.
+    Owned by the application (``ApplicationResources``) and drained at
+    shutdown.
 
-    A flow's outcome is written to the connector's row, so any replica's
-    status read sees it; ``connecting`` itself is known only to the replica
-    that runs the poller.
+    A flow in flight is recorded in the root's encrypted credentials
+    (:data:`_PENDING_KEYS`), so it outlives the replica that started it: a
+    status read on any replica, and :func:`resume_pending_connects` at
+    startup, resume polling it. Its outcome is written to the row; a poller
+    whose flow another one finished (the record cleared or replaced) stops
+    without a word. A flow nobody polls to its end would leave its user a
+    granted app password SRW never holds.
     """
 
     def __init__(
@@ -815,7 +884,8 @@ class CloudRootConnectFlows:
         return flow
 
     async def cancel(self, user_id: Any) -> bool:
-        """Stop ``user_id``'s flow; True when one was running."""
+        """Stop polling ``user_id``'s flow here; True when one was running.
+        Its record stays (:func:`cancel_connect` clears it)."""
         flow = self._flows.pop(str(user_id), None)
         if flow is None or flow.task is None or flow.task.done():
             return False
@@ -826,10 +896,34 @@ class CloudRootConnectFlows:
             pass
         return True
 
+    def _spawn(
+        self,
+        *,
+        user: Mapping[str, Any],
+        row_id: str,
+        pending: PendingConnect,
+        store: Any,
+        backend: SupportsUserRootGrant,
+    ) -> ConnectFlow:
+        user_id = str(user["id"])
+        flow = ConnectFlow(
+            user_id=user_id,
+            connector_id=row_id,
+            login_url=pending.login_url,
+            started_at=_now(),
+            expires_at=pending.expires_at,
+        )
+        self._flows[user_id] = flow
+        flow.task = asyncio.create_task(
+            self._poll(flow, pending.poll_token, store, backend, dict(user)),
+            name=f"cloud-root-connect-{user_id}",
+        )
+        return flow
+
     async def start(
         self, store: Any, cloud_router: Any, user: Mapping[str, Any]
     ) -> ConnectFlow:
-        """A new flow for ``user`` (an earlier one is cancelled).
+        """A new flow for ``user`` (an earlier one is replaced).
         ``LookupError`` with the reason when there is no root to connect;
         ``CloudBackendError`` when the cloud cannot start one."""
         user_id = str(user["id"])
@@ -841,20 +935,51 @@ class CloudRootConnectFlows:
             raise LookupError("no_main_cloud")
         await self.cancel(user_id)
         started = await backend.start_login_flow()
-        now = _now()
-        flow = ConnectFlow(
-            user_id=user_id,
-            connector_id=str(row["id"]),
-            login_url=started.login_url,
-            started_at=now,
-            expires_at=now + timedelta(seconds=self._flow_seconds),
+        pending = PendingConnect(
+            started.poll_token,
+            started.login_url,
+            _now() + timedelta(seconds=self._flow_seconds),
         )
-        self._flows[user_id] = flow
-        flow.task = asyncio.create_task(
-            self._poll(flow, started.poll_token, store, backend, dict(user)),
-            name=f"cloud-root-connect-{user_id}",
+        await _write_pending(store, str(row["id"]), pending)
+        return self._spawn(
+            user=user,
+            row_id=str(row["id"]),
+            pending=pending,
+            store=store,
+            backend=backend,
         )
-        return flow
+
+    async def resume(
+        self, store: Any, cloud_router: Any, user: Mapping[str, Any]
+    ) -> ConnectFlow | None:
+        """``user``'s flow: the one polled here, else the one the row
+        records (started elsewhere, or before a restart), polled from now
+        on; ``None`` without one. Never raises."""
+        active = self.active(user["id"])
+        if active is not None:
+            return active
+        try:
+            row = await store.get_datasource_by_managed_key(user_root_key(user["id"]))
+            if row is None:
+                return None
+            pending = await _pending_for(store, str(row["id"]))
+            backend = _row_provider(cloud_router, row) if pending else None
+            if pending is None or backend is None:
+                return None
+            return self._spawn(
+                user=user,
+                row_id=str(row["id"]),
+                pending=pending,
+                store=store,
+                backend=backend,
+            )
+        except Exception:
+            logger.warning(
+                "User %s: a connect flow in flight was not resumed",
+                user.get("id"),
+                exc_info=True,
+            )
+            return None
 
     async def _poll(
         self,
@@ -864,10 +989,15 @@ class CloudRootConnectFlows:
         backend: SupportsUserRootGrant,
         user: dict[str, Any],
     ) -> None:
-        deadline = time.monotonic() + self._flow_seconds
+        async def still_ours() -> bool:
+            pending = await _pending_for(store, flow.connector_id, expired=True)
+            return pending is not None and pending.poll_token == poll_token
+
         try:
-            while time.monotonic() < deadline:
+            while _now() < flow.expires_at:
                 await asyncio.sleep(self._poll_seconds)
+                if not await still_ours():
+                    return  # finished, cancelled or replaced elsewhere
                 try:
                     grant = await backend.poll_login_flow(poll_token)
                 except CloudBackendError as exc:
@@ -879,8 +1009,12 @@ class CloudRootConnectFlows:
                     continue
                 if grant is not None:
                     await complete_connect(store, backend, user, grant)
+                    if await still_ours():
+                        await _write_pending(store, flow.connector_id, None)
                     return
-            await _record_failure(store, flow.connector_id, "expired")
+            if await still_ours():
+                await _write_pending(store, flow.connector_id, None)
+                await _record_failure(store, flow.connector_id, "expired")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -888,6 +1022,7 @@ class CloudRootConnectFlows:
                 "Cloud root %s: connect flow failed", flow.connector_id, exc_info=True
             )
             try:
+                await _write_pending(store, flow.connector_id, None)
                 await _record_failure(store, flow.connector_id, "error")
             except Exception:
                 pass
@@ -896,7 +1031,8 @@ class CloudRootConnectFlows:
                 self._flows.pop(flow.user_id, None)
 
     async def drain(self) -> None:
-        """Cancel and await every flow (shutdown)."""
+        """Cancel and await every poller (shutdown). The flows' records
+        stay: the next start resumes them."""
         flows = list(self._flows.values())
         self._flows.clear()
         tasks = [flow.task for flow in flows if flow.task is not None]
@@ -904,6 +1040,46 @@ class CloudRootConnectFlows:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def cancel_connect(
+    store: Any,
+    cloud_router: Any,
+    flows: CloudRootConnectFlows,
+    user: Mapping[str, Any],
+) -> bool:
+    """The user's own cancel: the poller stopped and the flow's record
+    cleared, so no replica resumes it. True when a flow was in flight."""
+    cancelled = await flows.cancel(str(user["id"]))
+    row = await store.get_datasource_by_managed_key(user_root_key(user["id"]))
+    if row is not None:
+        cancelled = (await _pending_for(store, str(row["id"]))) is not None or cancelled
+        await _write_pending(store, str(row["id"]), None)
+    return cancelled
+
+
+async def resume_pending_connects(
+    store: Any, cloud_router: Any, flows: CloudRootConnectFlows
+) -> int:
+    """At startup: every flow in flight a row records, polled again (its
+    user granted it while no replica polled, or will). Returns how many.
+    Never raises."""
+    resumed = 0
+    try:
+        rows = await store.fetch(
+            "SELECT created_by FROM datasources WHERE managed_key LIKE $1 "
+            "AND created_by IS NOT NULL",
+            f"{USER_CLOUD_ROOT}:%",
+        )
+        for row in rows:
+            user = await store.get_user(str(row["created_by"]))
+            if user and await flows.resume(store, cloud_router, user):
+                resumed += 1
+    except Exception:
+        logger.warning("Connect flows in flight were not resumed", exc_info=True)
+    if resumed:
+        logger.info("User cloud roots: %d connect flow(s) in flight resumed", resumed)
+    return resumed
 
 
 async def status(
@@ -914,7 +1090,8 @@ async def status(
 ) -> dict[str, Any]:
     """``GET /api/me/cloud-root``: the caller's root, ensured lazily."""
     row, reason = await own_root(store, cloud_router, user)
-    return public_status(row, reason=reason, flow=flows.active(user["id"]))
+    flow = await flows.resume(store, cloud_router, user) if reason is None else None
+    return public_status(row, reason=reason, flow=flow)
 
 
 # --------------------------------------------------------------------------- #
@@ -1120,10 +1297,12 @@ __all__ = [
     "USER_ROOT_FOLDER",
     "CloudRootConnectFlows",
     "ConnectFlow",
+    "PendingConnect",
     "UserRootCredential",
     "active_root_provider",
     "backfill_user_root_connectors",
     "base_config",
+    "cancel_connect",
     "complete_connect",
     "disconnect",
     "ensure_user_root_connector",
@@ -1132,6 +1311,7 @@ __all__ = [
     "own_root",
     "prepare_session_root",
     "public_status",
+    "resume_pending_connects",
     "retirement_revoke",
     "revoke_root_credential",
     "root_state",

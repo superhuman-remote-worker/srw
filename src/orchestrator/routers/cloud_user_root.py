@@ -103,7 +103,9 @@ async def cancel_cloud_root_connect(
 ) -> dict[str, Any]:
     """Cancel the caller's connect flow (nothing is stored)."""
     user = await _caller(request, dependencies)
-    cancelled = await dependencies.flows.cancel(str(user["id"]))
+    cancelled = await cloud_user_root.cancel_connect(
+        dependencies.store, dependencies.cloud_router, dependencies.flows, user
+    )
     body = await cloud_user_root.status(
         dependencies.store, dependencies.cloud_router, dependencies.flows, user
     )

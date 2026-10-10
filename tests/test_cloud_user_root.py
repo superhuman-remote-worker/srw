@@ -250,6 +250,15 @@ class FakeStore:
     async def record_security_event(self, **event):
         self.events.append(event)
 
+    async def fetch(self, query, *args):
+        assert "managed_key LIKE" in query
+        prefix = args[0].rstrip("%")
+        return [
+            {"created_by": row["created_by"]}
+            for row in self.rows.values()
+            if row["managed_key"].startswith(prefix) and row["created_by"]
+        ]
+
     async def merge_user_cloud_identity(self, user_id, backend_id, entry):
         self.identities.append((user_id, backend_id, entry))
         return True
@@ -626,6 +635,7 @@ class TestConnectFlows:
         assert flows.active(ANN) is None
         assert await flows.cancel(ANN) is False
         assert "connect_failure" not in store.root()["config"]
+        await cloud_user_root.cancel_connect(store, router, flows, store.users[ANN])
 
     @pytest.mark.asyncio
     async def test_an_unfinished_flow_expires(self, store, cloud):
@@ -645,6 +655,77 @@ class TestConnectFlows:
         with pytest.raises(LookupError, match="no_personal_project"):
             await flows.start(store, FakeRouter(cloud), store.users[ANN])
         assert cloud.started == 0
+
+    @pytest.mark.asyncio
+    async def test_a_flow_outlives_its_replica(self, store, cloud):
+        """Recorded on the row (encrypted, never in the config): a restart's
+        resume, or another replica's status read, polls it to its end."""
+        router = FakeRouter(cloud)
+        first = cloud_user_root.CloudRootConnectFlows(poll_seconds=10, flow_seconds=60)
+        flow = await first.start(store, router, store.users[ANN])
+        assert store.root()["credentials"]["pending_poll_token"] == POLL_TOKEN
+        _secrets_absent(store.root()["config"], flow)
+        await first.drain()  # the replica stops
+        assert flow.task.cancelled()
+        assert store.root()["credentials"]["pending_poll_token"] == POLL_TOKEN
+
+        cloud.polls = [cloud.issue(TOKEN, "uid-ann")]
+        second = cloud_user_root.CloudRootConnectFlows(poll_seconds=0, flow_seconds=60)
+        assert await cloud_user_root.resume_pending_connects(store, router, second) == 1
+        resumed = second.active(ANN)
+        assert resumed is not None and resumed.login_url == flow.login_url
+        await asyncio.wait_for(resumed.task, 5)
+        row = store.root()
+        assert row["credentials"] == {"username": "uid-ann", "password": TOKEN}
+        assert cloud_user_root.root_state(row) == "connected"
+        # Nothing left to resume.
+        third = cloud_user_root.CloudRootConnectFlows(poll_seconds=0)
+        assert await cloud_user_root.resume_pending_connects(store, router, third) == 0
+
+    @pytest.mark.asyncio
+    async def test_a_second_poller_of_a_finished_flow_stops_without_a_failure(
+        self, store, cloud
+    ):
+        router = FakeRouter(cloud)
+        here = cloud_user_root.CloudRootConnectFlows(poll_seconds=0, flow_seconds=60)
+        there = cloud_user_root.CloudRootConnectFlows(
+            poll_seconds=0.05, flow_seconds=60
+        )
+        await here.start(store, router, store.users[ANN])
+        other = await there.resume(store, router, store.users[ANN])
+        cloud.polls = [cloud.issue(TOKEN, "uid-ann")]  # one answer, one taker
+        await asyncio.wait_for(here.active(ANN).task, 5)
+        await asyncio.wait_for(other.task, 5)
+        row = store.root()
+        assert cloud_user_root.root_state(row) == "connected"
+        assert "connect_failure" not in row["config"]
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_clears_the_record_for_every_replica(self, store, cloud):
+        router = FakeRouter(cloud)
+        flows = cloud_user_root.CloudRootConnectFlows(poll_seconds=10, flow_seconds=60)
+        await flows.start(store, router, store.users[ANN])
+        assert await cloud_user_root.cancel_connect(
+            store, router, flows, store.users[ANN]
+        )
+        assert store.root()["credentials"] == {}
+        other = cloud_user_root.CloudRootConnectFlows()
+        assert await other.resume(store, router, store.users[ANN]) is None
+
+    @pytest.mark.asyncio
+    async def test_a_reconnect_keeps_the_working_credential_beside_its_flow(
+        self, store, cloud
+    ):
+        await _connected(store, cloud)
+        flows = cloud_user_root.CloudRootConnectFlows(poll_seconds=10, flow_seconds=60)
+        await flows.start(store, FakeRouter(cloud), store.users[ANN])
+        credentials = store.root()["credentials"]
+        assert credentials["password"] == TOKEN and credentials["pending_poll_token"]
+        built = await cloud_user_root.user_root_mount(
+            store.root(), owner_id=ANN, store=store, cloud_router=FakeRouter(cloud)
+        )
+        assert built[1].credential == TOKEN
+        await flows.drain()
 
     @pytest.mark.asyncio
     async def test_drain_cancels_every_flow(self, store, cloud):
