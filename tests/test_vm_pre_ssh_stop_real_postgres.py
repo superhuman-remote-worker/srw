@@ -79,9 +79,14 @@ async def db(pre_ssh_schema, _db_fixture):  # noqa: F811
 
 
 async def seeded_stop(
-    db, *, cleanup_source="dispatcher_vm_recycle", purge_disk=False, retiring=True,
+    db,
+    *,
+    cleanup_source="dispatcher_vm_recycle",
+    purge_disk=False,
+    retiring=True,
+    bound=True,
 ):
-    policy, inventory, _, _ = await environment(db, installation_count=2)
+    policy, inventory, snapshot, demand = await environment(db, installation_count=2)
     retry = await waiter(db, policy, inventory, lane="stateless", user_id=uuid4())
     admitted = await policy.admit(request_id=str(retry["request_id"]))
     assert admitted["action"] == "admitted"
@@ -114,14 +119,15 @@ async def seeded_stop(
         "FROM vm_creation_retries WHERE request_id=$1)",
         retry["request_id"],
     )
-    await db.execute(
-        "UPDATE vm_resource_reservations SET state='active',vm_uid=$2,"
-        "vmi_uid=$3,launcher_uid=$4 WHERE id=$1",
-        UUID(admitted["reservation_id"]),
-        UUID(vm_uid),
-        UUID(vmi_uid),
-        UUID(launcher_uid),
-    )
+    if bound:
+        await db.execute(
+            "UPDATE vm_resource_reservations SET state='active',vm_uid=$2,"
+            "vmi_uid=$3,launcher_uid=$4 WHERE id=$1",
+            UUID(admitted["reservation_id"]),
+            UUID(vm_uid),
+            UUID(vmi_uid),
+            UUID(launcher_uid),
+        )
     context = json.loads(
         await db.fetchval("SELECT context FROM jobs WHERE id=$1", UUID(job_id))
     )
@@ -137,6 +143,10 @@ async def seeded_stop(
         creation_request_id=str(retry["request_id"]),
     )
     context.pop("_vm_creation_pending", None)
+    if not bound:
+        context["vm"].pop("vmi_uid", None)
+        context["vm"].pop("active_pod_uid", None)
+        context["_vm_creation_pending"] = str(retry["request_id"])
     await db.execute(
         "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
         UUID(job_id),
@@ -196,6 +206,9 @@ async def seeded_stop(
         "frozen": frozen,
         "reservation_id": admitted["reservation_id"],
         "store": VMPreSSHStopStore(db),
+        "inventory": inventory,
+        "snapshot": snapshot,
+        "demand": demand,
     }
 
 

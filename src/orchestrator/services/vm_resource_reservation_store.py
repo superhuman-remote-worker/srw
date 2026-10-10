@@ -562,15 +562,25 @@ class VMResourceReservationStore:
             or retry["provision_generation"] != UUID(generation)
             or retry["reason"] != "creation_adopted"
             or retry["ready_at"] is not None
-            or vm.get("status") not in {
-                "created", "provisioning", "starting", "ssh_pending", "running",
+            or vm.get("status")
+            not in {
+                "created",
+                "provisioning",
+                "starting",
+                "ssh_pending",
+                "running",
+                "ssh_unreachable",
             }
             or vm.get("ssh_verified_at") is not None
             or vm.get("active_pod_uid") is not None
         ):
             return False
         return await self.bind_ready_on_conn(
-            conn, retry=retry, vm=vm, job_id=job_id, generation=generation,
+            conn,
+            retry=retry,
+            vm=vm,
+            job_id=job_id,
+            generation=generation,
             observed_before_ready=True,
         )
 
