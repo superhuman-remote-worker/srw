@@ -201,12 +201,17 @@ class TestSpec:
             {"config": {"access": "no-such-level"}},
             {"config": "not a mapping"},
         ]
+        from shared.connectors.contract import access_resolution
+
         for spec in BUILTIN_SPECS + DEVELOPMENT_SPECS:
             for shape in shapes:
                 entry = {"type": spec.legacy_type, "name": "x", **shape}
                 expected = effective_access(entry, spec)
                 levels = spec.ranked_access_ids()
-                assert expected is None if not levels else expected in levels
+                # A level of the spec, or none: a driver without levels, or a
+                # strict driver's refusal (an outbox has no read-only level).
+                refused = access_resolution(entry, spec).refused
+                assert expected is None if not levels or refused else expected in levels
                 if spec.legacy_type:
                     binding = binding_from_legacy_entry(entry)
                     assert binding is not None and binding.access == expected

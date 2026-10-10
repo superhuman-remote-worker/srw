@@ -259,9 +259,16 @@ class TestBoundAccess:
         driver = CloudFolderDriver()
         ctx = AccessContext(workspace_backend="sandbox", protected_mode_enabled=False)
         resolved = bound_access(driver, self._row(project_access="protected"), ctx=ctx)
-        # read_only is not offered on Nextcloud yet (5.6): nothing below.
-        assert resolved.level is None
-        assert resolved.code == "level_not_offered"
+        from orchestrator.services.cloud.nextcloud import NEXTCLOUD_CAPABILITIES
+
+        if NEXTCLOUD_CAPABILITIES.offers(
+            "cloud_folder", "project", "read_only", workspace_backend="sandbox"
+        ):
+            # Lowered to the reader account's level, never left protected.
+            assert (resolved.level, resolved.origin) == ("read_only", "clamped")
+        else:
+            assert resolved.level is None
+            assert resolved.code == "level_not_offered"
 
     def test_a_stored_level_binds_or_is_refused(self):
         driver = CloudFolderDriver()
