@@ -38,21 +38,30 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
              the Connectors page links to it
   picker     Playwright: Connectors -> New connector -> Public, then for every
              publishable type, a managed MCP server's included: the access
-             choices shown are exactly the levels the driver's spec offers,
-             literally MCP read-write only, KB read-only only, Postgres both.
-             A managed MCP server takes the generic form, whose access choice
-             lists exactly the driver's levels too. A public connector's
-             read-only is only declared, so no "enforced by" line shows there:
-             the hint is the scope-your-credentials advice, except the KB's
-             always read-only one. The form is closed without saving. An
-             account without the public_datasources grant gets the public
-             choice shown in the gate's own browser only (a NOTE says so).
+             choices (the creator's read-only tag, decisions 31 and 32) shown
+             are exactly the levels the driver's spec offers, literally MCP
+             read-write only, KB read-only only, Postgres both. A managed MCP
+             server takes the generic form, whose access choice lists exactly
+             the driver's levels too. The hint under the tag says what it
+             does for everyone who uses the connector (no write tools; only a
+             note where there are none; no read-only mode; the KB's always
+             read-only one), never an "enforced by" claim. Then, private: the
+             same choices for the literal types, Postgres read-only checked
+             while public and read-write while private (a mode never chosen).
+             The form is closed without saving. An account without the
+             public_datasources grant gets the public choice shown in the
+             gate's own browser only (a NOTE says so).
   links      Playwright: a project's Connectors tab shows, per linked type,
              the access the driver offers (MCP a fixed read-write badge, KB a
              fixed read-only badge, Postgres the switch) and the bound level's
-             "Enforced by" line, the one place it is true. The link rows are
-             synthetic, served to the gate's own browser over the test
-             account's first active project; nothing is linked.
+             "Enforced by" line, the one place it is true. The bound level is
+             the stricter of the link and the creator's tag: a Postgres
+             connector its creator tagged read-only, or public with no mode
+             set, shows a read-only badge with the creator note under a
+             read-write or unset link, while one published read-write keeps
+             the switch. The link rows are synthetic, served to the gate's own
+             browser over the test account's first active project; nothing is
+             linked.
 
 Run with the repository venv (Playwright and its Chromium installed):
 
@@ -87,7 +96,7 @@ SERVED = (
     "src/shared/connectors/builtin.py",
     "src/shared/connectors/contract.py",
 )
-#: Types the connector form never publishes, so it shows them no access choice.
+#: Types the connector form never publishes, which the public pass skips.
 UNPUBLISHED_IN_FORM = frozenset({"email", "credentials"})
 #: The gate's literal promise, besides the spec-derived expectation.
 LITERAL_CHOICES = {
@@ -95,12 +104,19 @@ LITERAL_CHOICES = {
     "kb": ["read_only"],
     "postgresql": ["read_only", "read_write"],
 }
-#: Synthetic project links: (type, project_read_only, the switch or a badge).
+#: Synthetic project links: (type, project_read_only, the connector's own
+#: read_only, is_global, the switch or a badge).
 LINK_ROWS = (
-    ("mcp", None, "badge"),
-    ("kb", True, "badge"),
-    ("postgresql", True, "switch"),
-    ("postgresql", None, "switch"),
+    ("mcp", None, None, False, "badge"),
+    ("kb", True, None, False, "badge"),
+    ("postgresql", True, None, False, "switch"),
+    ("postgresql", None, None, False, "switch"),
+    # A read-write link cannot lift the creator's read-only tag (decision 31),
+    ("postgresql", False, True, False, "badge"),
+    # nor a public connector's with no mode set (decision 32);
+    ("postgresql", None, None, True, "badge"),
+    # one published read-write leaves the link to decide.
+    ("postgresql", False, False, True, "switch"),
 )
 EN = ROOT / "cockpit/src/assets/i18n/en.json"
 _SECRETS: list[str] = []
@@ -117,12 +133,14 @@ PLAN = [
     "picker: Playwright opens New connector, makes it public and, per "
     "publishable type (managed MCP servers included), sees exactly the access "
     "levels the driver offers (MCP read-write only, KB read-only only, "
-    "Postgres both) and the declared-only hint, no 'enforced by' line; a "
-    "managed server's generic form offers exactly its levels; closes without "
-    "saving",
+    "Postgres both) and the hint that says what the creator's read-only tag "
+    "does for everyone, no 'enforced by' line; a managed server's generic "
+    "form offers exactly its levels; private, the same choices, Postgres "
+    "read-write until chosen; closes without saving",
     "links: Playwright opens a project's Connectors tab over synthetic link "
     "rows and sees each driver's access with the bound level's 'Enforced by' "
-    "line; links nothing",
+    "line, the creator's read-only tag standing over a read-write link; links "
+    "nothing",
 ]
 
 
@@ -245,11 +263,14 @@ def access_choice(driver: dict[str, Any]) -> list[str] | None:
 
 
 def picker_expectation(driver: dict[str, Any]) -> tuple[list[str], str]:
-    """The public access choices the form shows, and the hint key under them.
+    """The access choices the form shows, and the hint key under them.
 
-    A public connector's read-only is only declared (tool selection reads a
-    project link's read-only), so the hint is the advice to scope the
-    credentials, except for a driver that is read-only for everyone.
+    Mirrors ``accessHintKey`` in datasource-list.component.ts. The choice is
+    the creator's read-only tag, which removes the write tools for everyone
+    who uses the connector (decision 31), so the hint says so: the KB's
+    always read-only one, no read-only mode for a driver without that level,
+    only a note to the agent where the read-write level binds no tools, else
+    no write tools while the credential still decides.
     """
     read_only, read_write = offered(driver)
     choices = [
@@ -257,23 +278,45 @@ def picker_expectation(driver: dict[str, Any]) -> tuple[list[str], str]:
         for name, level in (("read_only", read_only), ("read_write", read_write))
         if level
     ]
-    hint = "visibilityCredentialHint" if read_write else "visibilityKbHint"
+    if not read_write:
+        hint = "accessKbHint"
+    elif not read_only:
+        hint = "accessReadWriteOnlyHint"
+    elif read_write.get("tools") == []:
+        hint = "accessAdvisoryHint"
+    else:
+        hint = "accessReadOnlyHint"
     return choices, hint
 
 
-def link_expectation(
-    driver: dict[str, Any], project_read_only: bool | None
-) -> tuple[str, dict[str, Any] | None]:
-    """A project link's access ('badge' or 'switch') and the level it binds.
+def creator_read_only(read_only: bool | None, is_global: bool) -> bool:
+    """The connector creator's read-only tag: its own flag, or public with
+    none set (decision 32); ``connector_read_only`` in shared.connectors."""
+    return read_only is True or (read_only is None and is_global)
 
-    Mirrors ``linkAccessLevel`` in project-detail.component.ts for drivers
-    with at most two levels: a read-only link floors at the lowest level.
+
+def link_expectation(
+    driver: dict[str, Any],
+    project_read_only: bool | None,
+    read_only: bool | None = None,
+    is_global: bool = False,
+) -> tuple[str, dict[str, Any] | None, bool]:
+    """A project link's access ('badge' or 'switch'), the level it binds, and
+    whether the creator note shows.
+
+    Mirrors ``linkAccessShown`` and ``linkAccessLevel`` in
+    project-detail.component.ts for drivers with at most two levels: a
+    read-only link or the creator's read-only tag floors at the lowest
+    level, and a tag over a link that could choose replaces the switch.
     """
-    read_only, read_write = offered(driver)
-    shape = "switch" if read_only and read_write else "badge"
-    if read_only and (not read_write or project_read_only is True):
-        return shape, read_only
-    return shape, read_write
+    ro_level, rw_level = offered(driver)
+    choice = bool(ro_level and rw_level)
+    tagged = creator_read_only(read_only, is_global)
+    creator_note = choice and tagged
+    shape = "switch" if choice and not creator_note else "badge"
+    if ro_level and (not rw_level or project_read_only is True or tagged):
+        return shape, ro_level, creator_note
+    return shape, rw_level, creator_note
 
 
 def is_development(driver: dict[str, Any]) -> bool:
@@ -682,6 +725,7 @@ class MatrixGate:
         )
         problems: list[str] = []
         seen_literal: dict[str, list[str]] = {}
+        checked_public: dict[str, str | None] = {}
         managed_seen: list[str] = []
         for driver in self.matrix["drivers"]:
             kind = driver.get("legacy_type")
@@ -703,14 +747,15 @@ class MatrixGate:
                 continue
             type_select.select_option(kind)
             choices, hint_key = picker_expectation(driver)
-            seen, hint, claims = self.read_choices(page, choices)
+            seen, hint, claims, checked = self.read_choices(page, choices)
             seen_literal[kind] = seen
+            checked_public[kind] = checked
             if seen != choices:
                 problems.append(f"{kind}: shows {seen}, the spec offers {choices}")
             if hints[hint_key] not in hint:
                 problems.append(f"{kind}: hint {hint[:80]!r} is not {hint_key}")
             if claims:
-                problems.append(f"{kind}: a public access claims {claims[:80]!r}")
+                problems.append(f"{kind}: the access choice claims {claims[:80]!r}")
             if is_managed(driver):
                 # No bespoke section: the generic form renders its spec, and
                 # its access choice is the connector's level.
@@ -727,12 +772,41 @@ class MatrixGate:
             for kind, expected in LITERAL_CHOICES.items()
             if seen_literal.get(kind) != expected
         ]
+        # The tag is the creator's on a private connector too (decision 31):
+        # the same choices, and a mode never chosen reads read-write there
+        # while a public one reads read-only (decision 32).
+        public.uncheck(timeout=30000)
+        drivers = {
+            d["legacy_type"]: d
+            for d in self.matrix["drivers"]
+            if d.get("legacy_type") and owns_type(d)
+        }
+        for kind, expected in LITERAL_CHOICES.items():
+            type_select.select_option(kind)
+            seen, hint, claims, checked = self.read_choices(page, expected)
+            if seen != expected:
+                problems.append(f"{kind} (private): shows {seen}, expects {expected}")
+            hint_key = picker_expectation(drivers[kind])[1]
+            if hints[hint_key] not in hint:
+                problems.append(
+                    f"{kind} (private): hint {hint[:80]!r} is not {hint_key}"
+                )
+            if claims:
+                problems.append(f"{kind} (private): claims {claims[:80]!r}")
+            if kind == "postgresql" and (
+                checked_public.get(kind) != "read_only" or checked != "read_write"
+            ):
+                problems.append(
+                    f"postgresql: checked {checked_public.get(kind)!r} public and "
+                    f"{checked!r} private, expects 'read_only' then 'read_write'"
+                )
         page.locator(".form-header app-icon-button button").first.click()
         self.report.check(
             "picker (Playwright): access choices are exactly the driver's levels "
             "(MCP read-write only, KB read-only only, Postgres both; a managed "
-            "MCP server its own, in its generic form too); no 'enforced by' "
-            "claim on a public connector",
+            "MCP server its own, in its generic form too), public and private, "
+            "under a hint that says what the creator's read-only tag does for "
+            "everyone; no 'enforced by' claim",
             not problems,
             "; ".join(problems[:5]),
         )
@@ -770,10 +844,12 @@ class MatrixGate:
             time.sleep(0.2)
 
     @staticmethod
-    def read_choices(page: Any, expected: list[str]) -> tuple[list[str], str, str]:
-        """The rendered access choices, the hint under them and any
-        enforcement claim in the visibility block, once they settle."""
-        block = page.locator("app-form-field:has(.visibility-controls)")
+    def read_choices(
+        page: Any, expected: list[str]
+    ) -> tuple[list[str], str, str, str | None]:
+        """The rendered access choices, the hint under them, any enforcement
+        claim in the access block and the checked choice, once they settle."""
+        block = page.locator("app-form-field:has(.access-radio)")
         deadline = time.monotonic() + 5
         while True:
             choices = block.locator(".access-radio label[data-access]").evaluate_all(
@@ -785,11 +861,14 @@ class MatrixGate:
                 ).split()
             )
             if choices == expected or time.monotonic() >= deadline:
-                text = " ".join(block.inner_text().split())
+                text = " ".join(block.inner_text().split()) if choices else ""
                 claims = (
                     text[text.find("Enforced by") :] if "Enforced by" in text else ""
                 )
-                return choices, hint, claims
+                checked = block.locator(
+                    ".access-radio label[data-access]:has(input:checked)"
+                ).evaluate_all("els => els.map(e => e.dataset.access)")
+                return choices, hint, claims, (checked[0] if checked else None)
             time.sleep(0.2)
 
     def check_links(self, page: Any) -> None:
@@ -827,10 +906,15 @@ class MatrixGate:
                 "created_at": "",
                 "updated_at": "",
                 "linked_at": "",
-                "project_read_only": read_only,
+                "read_only": own,
+                "is_global": is_global,
+                "project_read_only": link,
                 "project_description": None,
             }
-            for index, (kind, read_only, _shape) in enumerate(LINK_ROWS)
+            for index, (kind, link, own, is_global, _shape) in enumerate(LINK_ROWS)
+        ]
+        creator_note = json.loads(EN.read_text())["projectDetail"]["datasources"][
+            "accessCreatorReadOnly"
         ]
 
         def serve_links(route: Any) -> None:
@@ -848,22 +932,33 @@ class MatrixGate:
         tab = json.loads(EN.read_text())["projectDetail"]["tabs"]["datasources"]
         page.locator(".tab-btn", has_text=tab).first.click(timeout=60000)
         problems: list[str] = []
-        for row, (kind, read_only, shape) in zip(rows, LINK_ROWS):
-            cell = page.locator("tr", has_text=row["name"]).locator("td").nth(3)
+        for row, (kind, link, own, is_global, shape) in zip(rows, LINK_ROWS):
+            name = row["name"]
+            cell = page.locator("tr", has_text=name).locator("td").nth(3)
             cell.wait_for(timeout=30000)
-            expected_shape, level = link_expectation(drivers[kind], read_only)
+            expected_shape, level, noted = link_expectation(
+                drivers[kind], link, own, is_global
+            )
             switch = cell.locator("app-select").count() > 0
             if expected_shape != shape or switch != (shape == "switch"):
                 problems.append(
-                    f"{kind}: {'switch' if switch else 'badge'}, not {shape}"
+                    f"{name}: {'switch' if switch else 'badge'}, not {shape}"
                 )
             line = " ".join(cell.locator(".link-enforced").inner_text().split())
             if not level or level["enforced_by"] not in line:
-                problems.append(f"{kind}: line {line[:80]!r}")
+                problems.append(f"{name}: line {line[:80]!r}")
+            note = cell.locator("[data-creator-read-only]")
+            shown = " ".join(note.first.inner_text().split()) if note.count() else ""
+            if (creator_note in shown) != noted:
+                problems.append(
+                    f"{name}: creator note {'missing' if noted else 'shown'}"
+                )
         self.report.check(
             "links (Playwright): each link shows the access its driver offers "
             "(MCP read-write, KB read-only, Postgres the switch) and the bound "
-            "level's 'Enforced by' line",
+            "level's 'Enforced by' line; the creator's read-only tag stands "
+            "over a read-write or unset link and says so, a connector "
+            "published read-write keeps the switch",
             not problems,
             "; ".join(problems[:5]),
         )

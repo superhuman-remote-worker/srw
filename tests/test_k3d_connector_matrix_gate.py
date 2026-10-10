@@ -124,32 +124,84 @@ class TestExpectations:
         }
         assert gate.picker_expectation(_driver("srw.env/v1"))[0] == []
 
-    def test_a_public_connector_gets_the_declared_only_hint(self):
-        # Public read-only binds nothing, so no enforced_by line is expected:
-        # only an always read-only driver (the KB) gets the other hint.
-        for driver in MATRIX["drivers"]:
-            if not driver["legacy_type"]:
-                continue
-            hint = gate.picker_expectation(driver)[1]
-            expected = (
-                "visibilityKbHint"
-                if driver["forced_read_only"]
-                else "visibilityCredentialHint"
-            )
-            assert hint == expected, driver["name"]
+    def test_the_access_hint_says_what_the_creators_tag_does(self):
+        # The tag removes the write tools for everyone (decision 31): no
+        # enforced_by line, a hint per kind of driver, and each hint the
+        # cockpit names exists in its catalogue.
+        hints = json.loads(gate.EN.read_text())["datasources"]["form"]
+        expected = {
+            "srw.kb/v1": "accessKbHint",
+            "srw.mcp/v1": "accessReadWriteOnlyHint",
+            "srw.generic/v1": "accessAdvisoryHint",
+            "srw.credentials/v1": "accessAdvisoryHint",
+            "srw.kubeconfig/v1": "accessAdvisoryHint",
+            "srw.ssh-key/v1": "accessAdvisoryHint",
+            "srw.generic-file/v1": "accessAdvisoryHint",
+            "srw.repository/v1": "accessReadOnlyHint",
+            "srw.postgresql/v1": "accessReadOnlyHint",
+            "srw.neo4j/v1": "accessReadOnlyHint",
+            "srw.mongodb/v1": "accessReadOnlyHint",
+            "srw.webdav/v1": "accessReadOnlyHint",
+        }
+        for name, hint in expected.items():
+            assert gate.picker_expectation(_driver(name))[1] == hint, name
+            assert "everyone who uses" in hints[hint], hint
+            assert "enforced" not in hints[hint].lower(), hint
 
     def test_a_link_binds_the_level_its_read_only_says(self):
-        shape, level = gate.link_expectation(_driver("srw.postgresql/v1"), True)
+        shape, level, noted = gate.link_expectation(_driver("srw.postgresql/v1"), True)
         assert shape == "switch" and "READ ONLY transaction" in level["enforced_by"]
+        assert not noted
         assert gate.link_expectation(_driver("srw.postgresql/v1"), None)[1]["id"] == (
             "ReadWrite"
         )
         assert gate.link_expectation(_driver("srw.mcp/v1"), True)[0] == "badge"
         assert gate.link_expectation(_driver("srw.mcp/v1"), True)[1]["tools"] == "*"
         assert gate.link_expectation(_driver("srw.kb/v1"), None)[1]["id"] == "ReadOnly"
-        for kind, read_only, shape in gate.LINK_ROWS:
+        for kind, link, own, is_global, shape in gate.LINK_ROWS:
             driver = next(d for d in MATRIX["drivers"] if d["legacy_type"] == kind)
-            assert gate.link_expectation(driver, read_only)[0] == shape
+            assert gate.link_expectation(driver, link, own, is_global)[0] == shape
+
+    @pytest.mark.parametrize(
+        ("link", "own", "is_global", "level", "noted"),
+        [
+            # A read-write or unset link cannot lift the creator's tag ...
+            (False, True, False, "ReadOnly", True),
+            (None, True, False, "ReadOnly", True),
+            # ... nor a public connector's with no mode set (decision 32).
+            (None, None, True, "ReadOnly", True),
+            (False, None, True, "ReadOnly", True),
+            # Published read-write: the link decides.
+            (False, False, True, "ReadWrite", False),
+            (True, False, True, "ReadOnly", False),
+            # Untagged: the link decides, as before.
+            (None, None, False, "ReadWrite", False),
+            (True, None, False, "ReadOnly", False),
+        ],
+    )
+    def test_a_link_binds_the_stricter_of_itself_and_the_creators_tag(
+        self, link, own, is_global, level, noted
+    ):
+        shape, bound, shown = gate.link_expectation(
+            _driver("srw.postgresql/v1"), link, own, is_global
+        )
+        assert bound["id"] == level
+        assert shown is noted
+        # A tag the link cannot lift replaces the switch.
+        assert shape == ("badge" if noted else "switch")
+
+    def test_the_link_rows_cover_the_creators_tag(self):
+        rows = {
+            (kind, link, own, is_global)
+            for kind, link, own, is_global, _ in gate.LINK_ROWS
+        }
+        assert ("postgresql", False, True, False) in rows
+        assert ("postgresql", None, None, True) in rows
+        assert ("postgresql", False, False, True) in rows
+        note = json.loads(gate.EN.read_text())["projectDetail"]["datasources"][
+            "accessCreatorReadOnly"
+        ]
+        assert "everyone who uses it" in note
 
     def test_a_drifted_matrix_is_reported(self):
         drifted = copy.deepcopy(MATRIX)
@@ -357,7 +409,7 @@ class TestOfficialAndManagedDrivers:
         assert gate.is_managed(gitea) and gate.owns_type(gitea)
         assert gate.picker_expectation(gitea) == (
             ["read_only", "read_write"],
-            "visibilityCredentialHint",
+            "accessReadOnlyHint",
         )
         assert gate.level_ids(gitea) == ["ReadOnly", "ReadWrite"]
         assert gate.access_choice(gitea) == gate.level_ids(gitea)
