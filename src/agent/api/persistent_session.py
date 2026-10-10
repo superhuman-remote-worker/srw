@@ -182,6 +182,68 @@ def _canvas_enabled(config: Any) -> bool:
     return extra.get(_CANVAS_DISABLED_KEY) is not True
 
 
+def _in_workspace_cloud_folders(
+    cloud_mount_cfg: Dict[str, Any], manager: Any
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """``(mounted, unavailable)`` prompt rows of an in-workspace mount set:
+    each folder ``manager`` mounted under workspace/cloud, and each attached
+    folder the orchestrator left out (main cloud slice 3)."""
+    from shared.runtime.services.cloud_mount.sidecar import (
+        describe_mounted,
+        excluded_row,
+    )
+
+    access = {
+        str(mount.get("mount_id")): str(mount.get("access") or "read_write")
+        for mount in cloud_mount_cfg.get("mounts") or []
+        if isinstance(mount, dict)
+    }
+    shared = cloud_mount_cfg.get("outbox_shared")
+    mounted = [
+        {
+            "name": state.workspace_name,
+            "path": f"workspace/cloud/{state.workspace_name}",
+            "kind": state.mount_kind,
+            "state": "mounted",
+            "text": describe_mounted(
+                state.mount_kind,
+                access.get(state.mount_id, "read_write"),
+                shared=shared if isinstance(shared, bool) else None,
+            ),
+        }
+        for state in getattr(manager, "mounts", None) or []
+    ]
+    unavailable = [
+        excluded_row(entry)
+        for entry in cloud_mount_cfg.get("excluded") or []
+        if isinstance(entry, dict)
+    ]
+    return mounted, unavailable
+
+
+def _config_with_cloud_folders(
+    config: Any,
+    mounted: list[dict[str, Any]],
+    unavailable: list[dict[str, Any]],
+) -> Any:
+    """``config`` keeping a session's cloud folders for its system prompt:
+    what is mounted, what is not (``cloud_mount_system_floor``). A copy,
+    never an in-place write: the config may be the pod-wide singleton a
+    later session reuses."""
+    if (not mounted and not unavailable) or not (
+        _dc_is_dataclass(config) and hasattr(config, "extra")
+    ):
+        return config
+    return _dc_replace(
+        config,
+        extra={
+            **config.extra,
+            "_cloud_mounts_mounted": mounted,
+            "_cloud_mounts_unavailable": unavailable,
+        },
+    )
+
+
 @dataclass
 class PersistentSession:
     """State for an interactive persistent agent session.
@@ -1152,6 +1214,11 @@ class PersistentSession:
                 raise
             return
 
+        if not cloud_mount_cfg.get("protected"):
+            self.config = _config_with_cloud_folders(
+                self.config,
+                *_in_workspace_cloud_folders(cloud_mount_cfg, self.cloud_mount_manager),
+            )
         await self._finish_protected_cloud(cloud_mount_cfg)
 
     async def _finish_protected_cloud(self, cloud_mount_cfg: Dict[str, Any]) -> None:
@@ -1344,18 +1411,12 @@ class PersistentSession:
                 self.cloud_mount_error = watcher.status()
             else:
                 self.cloud_mount_error = "; ".join(
-                    f"{row['path'] or 'a folder'}: {row['text']}" for row in unavailable
+                    f"{row['path'] or row.get('title') or 'a folder'}: {row['text']}"
+                    for row in unavailable
                 )
-            if _dc_is_dataclass(self.config) and hasattr(self.config, "extra"):
-                # A copy, never an in-place write: the config may be the
-                # pod-wide singleton a later session reuses.
-                self.config = _dc_replace(
-                    self.config,
-                    extra={
-                        **self.config.extra,
-                        "_cloud_mounts_unavailable": unavailable,
-                    },
-                )
+        self.config = _config_with_cloud_folders(
+            self.config, watcher.mounted(), unavailable
+        )
         logger.info(
             "Sidecar cloud folders: %d mounted, %d unavailable",
             len(watcher.mounts),

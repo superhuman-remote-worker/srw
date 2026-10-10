@@ -5601,24 +5601,33 @@ def append_expert_workflow_addendum(body: str, addendum: str) -> str:
     return f"{body.rstrip()}\n\n{addendum}\n"
 
 
-def cloud_mount_system_floor(unavailable: Any) -> str:
-    """Return what the agent must know about cloud folders that did not
-    mount, or "".
+def cloud_mount_system_floor(unavailable: Any, mounted: Any = None) -> str:
+    """Return what the agent must know about this session's cloud folders,
+    or "" when it has none.
 
-    A mount that does not come up never blocks the workspace (connector
-    drivers D7, decision 23): the session starts, and the agent is told here,
-    at trusted system altitude, which folder is missing and why, so it never
-    says work is saved where nothing is mounted. ``unavailable`` comes from
-    the session's sidecar mount watcher: rows of ``name`` (empty for a folder
-    that was not attached at all) and plain ``text`` derived from a closed
-    reason code, never a remote's own words.
+    Every folder in the workspace is named (main cloud slice 3): where it
+    is, whose it is and its access, so the agent never mistakes the
+    session's outbox for the project's folder. ``mounted`` rows carry
+    ``path`` (or ``name``) and plain ``text``. A mount that does not come up
+    never blocks the workspace (connector drivers D7, decision 23): the
+    session starts, and the agent is told here, at trusted system altitude,
+    which folder is missing and why, so it never says work is saved where
+    nothing is mounted. ``unavailable`` comes from the session's sidecar
+    mount watcher: rows of ``name`` (empty for a folder that was not
+    attached at all, then ``title`` names its connector) and plain ``text``
+    derived from a closed reason code, never a remote's own words.
     """
     rows = [
         row
         for row in (unavailable or [])
         if isinstance(row, dict) and isinstance(row.get("text"), str)
     ]
-    if not rows:
+    present = [
+        row
+        for row in (mounted or [])
+        if isinstance(row, dict) and isinstance(row.get("text"), str)
+    ]
+    if not rows and not present:
         return ""
     if any(row.get("protected") for row in rows):
         # Decision 42: a protected session runs without its cloud.
@@ -5635,19 +5644,40 @@ def cloud_mount_system_floor(unavailable: Any) -> str:
                 "</cloud_folders>",
             ]
         )
-    lines = ["<cloud_folders>", "Some cloud folders of this session are not available:"]
-    for row in rows:
-        name = str(row.get("name") or "")
-        path = str(row.get("path") or "") or (f"workspace/cloud/{name}" if name else "")
-        if path:
-            lines.append(f"- {path}: {row['text']}.")
-        else:
-            lines.append(f"- a cloud folder was not attached: {row['text']}.")
+    lines = ["<cloud_folders>"]
+    if present:
+        lines.append("Cloud folders in this session's workspace:")
+        for row in present:
+            name = str(row.get("name") or "")
+            path = str(row.get("path") or "") or (
+                f"workspace/cloud/{name}" if name else ""
+            )
+            pending = " (still coming up)" if row.get("state") == "pending" else ""
+            lines.append(f"- {path or 'workspace/cloud'}: {row['text']}{pending}.")
+    if rows:
+        lines.append(
+            "Some cloud folders of this session are not available:"
+            if present or any(row.get("path") or row.get("name") for row in rows)
+            else "No cloud folder of this session is available:"
+        )
+        for row in rows:
+            name = str(row.get("name") or "")
+            path = str(row.get("path") or "") or (
+                f"workspace/cloud/{name}" if name else ""
+            )
+            title = str(row.get("title") or "")
+            if path:
+                lines.append(f"- {path}: {row['text']}.")
+            elif title:
+                lines.append(f'- "{title}" was not attached: {row["text"]}.')
+            else:
+                lines.append(f"- a cloud folder was not attached: {row['text']}.")
     lines.append(
-        "Never say a file is saved to the cloud in a folder that is not "
-        "available. Tell the user plainly what is missing if their request "
-        "needs it; srw_cloud_status shows the current state, and the user can "
-        "start a new session once the folder is fixed."
+        "Save work for the user only into a folder listed here as in the "
+        "workspace, and say which one; never say a file is saved to the cloud "
+        "in a folder that is not available. Tell the user plainly what is "
+        "missing if their request needs it; srw_cloud_status shows the current "
+        "state, and the user can start a new session once a folder is fixed."
     )
     lines.append("</cloud_folders>")
     return "\n".join(lines)
@@ -5957,10 +5987,11 @@ def get_phase_system_prompt(
         if delegation_floor:
             rendered = f"{rendered}\n\n{delegation_floor}"
 
-        # Cloud folders this session's workspace could not mount (D7). Empty
-        # for every session whose folders all came up.
+        # This session's cloud folders: what is mounted and what is not (D7,
+        # main cloud slice 3). Empty for a session without cloud folders.
         cloud_floor = cloud_mount_system_floor(
-            config.extra.get("_cloud_mounts_unavailable")
+            config.extra.get("_cloud_mounts_unavailable"),
+            config.extra.get("_cloud_mounts_mounted"),
         )
         if cloud_floor:
             rendered = f"{rendered}\n\n{cloud_floor}"

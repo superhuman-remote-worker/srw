@@ -62,7 +62,63 @@ REASON_TEXT = {
     "set_fallback": "another folder of this session could not be prepared",
     "too_many_mounts": "the session has more cloud folders than a workspace mounts",
     "protected_unavailable": "the protected cloud could not be set up",
+    # Why an attached cloud connector was not mounted (main cloud slice 3).
+    "access_unavailable": "the cloud offers no access to it in this kind of workspace",
+    "not_eligible": "this session may no longer use it",
+    "config_invalid": "it is not a cloud folder SRW set up",
+    "no_session_folder": "SRW has not created this session's outbox folder",
+    "backend_unavailable": "the main cloud was not reachable when the session started",
+    "beside_protected": "a protected session mounts only its protected folder",
 }
+
+#: What each kind of mounted folder is, for the agent's prompt.
+FOLDER_KIND_TEXT = {
+    "project": "the project's folder in the main cloud, shared with the project's members",
+    "cloud_outbox": (
+        "a folder SRW created for this session and shared with the user; it is "
+        "not the project folder"
+    ),
+    "user_root": "the user's own files in the main cloud",
+    "protected_lower": (
+        "the project's folder, protected: what you change there reaches the "
+        "cloud only after the owner approves it"
+    ),
+    "session_folder": "this session's folder in the main cloud",
+    "project_default": "the user's home in the main cloud",
+}
+#: Said of an outbox SRW could not share with the user yet.
+UNSHARED_OUTBOX_TEXT = (
+    "the user can't see it yet: they need to sign in to the cloud once"
+)
+
+
+def describe_mounted(
+    mount_kind: str, access: str, *, shared: bool | None = None
+) -> str:
+    """One mounted folder in plain words: what it is, its access, and for an
+    outbox SRW has not shared yet, that the user cannot see it."""
+    text = FOLDER_KIND_TEXT.get(mount_kind, "a folder in the main cloud")
+    if mount_kind == "cloud_outbox" and shared is False:
+        text = f"{text}; {UNSHARED_OUTBOX_TEXT}"
+    return f"{text} ({'read-only' if access == 'read_only' else 'read-write'})"
+
+
+def excluded_row(entry: dict[str, Any]) -> dict[str, str]:
+    """A cloud folder the plan left out, for the prompt and the status:
+    ``name`` and ``path`` where it would have been mounted (empty when it
+    never got a name), ``title`` (its connector's name), ``kind``, the
+    closed ``reason`` and its ``text``."""
+    reason = str(entry.get("reason") or "")
+    name = str(entry.get("name") or "")
+    return {
+        "name": name,
+        "path": f"workspace/cloud/{name}" if name else "",
+        "title": str(entry.get("title") or ""),
+        "kind": str(entry.get("mount_kind") or ""),
+        "reason": reason,
+        "text": REASON_TEXT.get(reason, REASON_TEXT["unbuildable"]),
+    }
+
 
 _MOUNTINFO = "==srw-mountinfo"
 
@@ -336,15 +392,33 @@ class SidecarMountWatcher:
             if self.cloud_cfg.get("protected"):
                 entry["protected"] = True
             rows.append(entry)
-        for excluded in self.excluded:
-            reason = str(excluded.get("reason") or "")
+        rows.extend(excluded_row(entry) for entry in self.excluded)
+        return rows
+
+    def mounted(self) -> list[dict[str, str]]:
+        """What is in the workspace, in plain words (for the agent's prompt):
+        each planned folder that mounted or is still coming up, with its
+        ``name``, ``path``, ``kind``, ``access``, ``state`` and ``text``.
+        None for a protected session that runs without its cloud."""
+        if self._unavailable_reason is not None:
+            return []
+        rows: list[dict[str, str]] = []
+        shared = self.cloud_cfg.get("outbox_shared")
+        for row, mount in zip(self.report(), self.planned):
+            if row["state"] not in {"mounted", "pending"}:
+                continue
             rows.append(
                 {
-                    "name": "",
-                    "path": "",
-                    "kind": str(excluded.get("mount_kind") or ""),
-                    "reason": reason,
-                    "text": REASON_TEXT.get(reason, REASON_TEXT["unbuildable"]),
+                    "name": mount.workspace_name,
+                    "path": self.path_of(mount),
+                    "kind": mount.mount_kind,
+                    "access": mount.access,
+                    "state": row["state"],
+                    "text": describe_mounted(
+                        mount.mount_kind,
+                        mount.access,
+                        shared=shared if isinstance(shared, bool) else None,
+                    ),
                 }
             )
         return rows
@@ -366,21 +440,33 @@ class SidecarMountWatcher:
                 "folder; nothing it writes reaches the cloud."
             )
         lines = ["Cloud folders (mounted by the workspace's cloud mount service):"]
+        shared = self.cloud_cfg.get("outbox_shared")
         for row, mount in zip(self.report(), self.planned):
             where = self.path_of(mount)
             access = "read-only" if mount.access == "read_only" else "read-write"
+            what = FOLDER_KIND_TEXT.get(mount.mount_kind, "a folder in the main cloud")
             if row["state"] == "mounted":
-                lines.append(f"- {where} ({mount.target_path}, {access}): mounted")
+                note = (
+                    f"; {UNSHARED_OUTBOX_TEXT}"
+                    if mount.mount_kind == "cloud_outbox" and shared is False
+                    else ""
+                )
+                lines.append(
+                    f"- {where} ({mount.target_path}, {access}): mounted, {what}{note}"
+                )
             elif row["state"] == "unavailable":
                 text = REASON_TEXT.get(row["reason"], REASON_TEXT["mount_failed"])
                 lines.append(f"- {where}: unavailable, {text} (read-only, empty)")
             else:
                 lines.append(f"- {where}: still coming up (read-only until then)")
         for entry in self.excluded:
-            text = REASON_TEXT.get(str(entry.get("reason")), REASON_TEXT["unbuildable"])
-            lines.append(
-                f"- a {entry.get('mount_kind') or 'cloud'} folder was not attached: {text}"
+            row = excluded_row(entry)
+            subject = (
+                row["path"]
+                or (f'"{row["title"]}"' if row["title"] else "")
+                or f"a {row['kind'] or 'cloud'} folder"
             )
+            lines.append(f"- {subject}: not mounted, {row['text']}")
         return "\n".join(lines)
 
     # --------------------------------------------------------------- attach

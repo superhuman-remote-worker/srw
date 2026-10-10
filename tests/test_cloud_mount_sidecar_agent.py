@@ -899,3 +899,153 @@ def test_a_control_request_is_readable_by_the_supervisor(tmp_path):
     assert request.read_text() == nonce
     assert stat.S_IMODE(os.stat(request).st_mode) == 0o644
     assert not (control / "drain.tmp").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Main cloud slice 3: every folder named, whose it is, and what was left out
+# --------------------------------------------------------------------------- #
+
+
+def _connector_cfg(*, shared=True):
+    cfg = _cfg(
+        "acme_launch",
+        "outbox",
+        excluded=[
+            {
+                "source_ref": "c-1",
+                "mount_kind": "project",
+                "reason": "access_unavailable",
+                "name": "",
+                "title": "Beta cloud folder (abcd1234)",
+                "detail": "Folder offers this connector no access level here",
+            },
+            {
+                "source_ref": "c-2",
+                "mount_kind": "project",
+                "reason": "unbuildable",
+                "name": "gamma",
+                "title": "Gamma cloud folder",
+                "detail": "backend_unavailable",
+            },
+        ],
+    )
+    cfg["mounts"][1]["mount_kind"] = "cloud_outbox"
+    cfg["outbox_shared"] = shared
+    return cfg
+
+
+def test_the_prompt_names_every_mounted_folder_and_whose_it_is():
+    workspace = _Workspace(["acme_launch", "outbox"])
+    for index in (0, 1):
+        workspace.status[index] = {"state": "mounted"}
+    workspace.live = {"acme_launch", "outbox"}
+    watcher = _watcher(workspace, _connector_cfg())
+    watcher._start_sync()
+    mounted = watcher.mounted()
+    assert [(row["path"], row["kind"]) for row in mounted] == [
+        ("workspace/cloud/acme_launch", "project"),
+        ("workspace/cloud/outbox", "cloud_outbox"),
+    ]
+    floor = cloud_mount_system_floor(watcher.unavailable(), mounted)
+    assert "- workspace/cloud/acme_launch: the project's folder" in floor
+    assert (
+        "- workspace/cloud/outbox: a folder SRW created for this session and shared "
+        "with the user; it is not the project folder (read-write)." in floor
+    )
+    assert "can't see it yet" not in floor
+    # What was left out, by its connector's name or where it would have been.
+    assert (
+        '- "Beta cloud folder (abcd1234)" was not attached: the cloud offers no '
+        "access to it in this kind of workspace." in floor
+    )
+    assert "- workspace/cloud/gamma: it could not be prepared" in floor
+    status = watcher.status()
+    assert (
+        "workspace/cloud/outbox (/cloud/outbox, read-write): mounted, a folder SRW"
+        in status
+    )
+    assert '"Beta cloud folder (abcd1234)": not mounted' in status
+
+
+def test_an_outbox_the_user_cannot_see_yet_says_so():
+    workspace = _Workspace(["acme_launch", "outbox"])
+    for index in (0, 1):
+        workspace.status[index] = {"state": "mounted"}
+    workspace.live = {"acme_launch", "outbox"}
+    watcher = _watcher(workspace, _connector_cfg(shared=False))
+    watcher._start_sync()
+    floor = cloud_mount_system_floor([], watcher.mounted())
+    assert "the user can't see it yet: they need to sign in to the cloud once" in floor
+    assert "the user can't see it yet" in watcher.status()
+
+
+def test_the_block_is_there_whenever_the_session_has_a_cloud_folder():
+    assert cloud_mount_system_floor(None, None) == ""
+    one = [
+        {"name": "outbox", "path": "workspace/cloud", "text": "a folder (read-write)"}
+    ]
+    floor = cloud_mount_system_floor([], one)
+    assert (
+        floor.startswith("<cloud_folders>") and "- workspace/cloud: a folder" in floor
+    )
+    assert "are not available:" not in floor
+    # A protected session whose cloud is down keeps its own wording.
+    down = [
+        {"name": "lower", "text": "the cloud refused its credential", "protected": True}
+    ]
+    assert "Protected cloud unavailable" in cloud_mount_system_floor(down, one)
+
+
+def test_a_protected_session_without_its_cloud_names_no_folder():
+    workspace = _Workspace(["lower"])
+    workspace.status[0] = {"state": "mounted"}
+    workspace.live = {"lower"}
+    watcher = _watcher(workspace, _cfg("lower"))
+    watcher._start_sync()
+    watcher.mark_unavailable("protected_unavailable")
+    assert watcher.mounted() == []
+
+
+def test_an_in_workspace_mount_set_is_named_for_the_prompt_too():
+    from agent.api.persistent_session import (
+        _config_with_cloud_folders,
+        _in_workspace_cloud_folders,
+    )
+    from shared.runtime.core.loader import AgentConfig
+
+    cfg = {
+        "mounts": [
+            {"mount_id": "c-1", "access": "read_write"},
+            {"mount_id": "ob", "access": "read_write"},
+        ],
+        "excluded": [
+            {
+                "source_ref": "x",
+                "mount_kind": "cloud_outbox",
+                "reason": "beside_protected",
+            }
+        ],
+        "outbox_shared": False,
+    }
+    manager = SimpleNamespace(
+        mounts=[
+            SimpleNamespace(
+                mount_id="c-1", mount_kind="project", workspace_name="acme"
+            ),
+            SimpleNamespace(
+                mount_id="ob", mount_kind="cloud_outbox", workspace_name="outbox"
+            ),
+        ]
+    )
+    mounted, unavailable = _in_workspace_cloud_folders(cfg, manager)
+    assert [row["path"] for row in mounted] == [
+        "workspace/cloud/acme",
+        "workspace/cloud/outbox",
+    ]
+    assert "can't see it yet" in mounted[1]["text"]
+    assert unavailable[0]["reason"] == "beside_protected"
+    config = AgentConfig(agent_id="a", display_name="A", extra={"k": 1})
+    updated = _config_with_cloud_folders(config, mounted, unavailable)
+    assert updated is not config and config.extra == {"k": 1}
+    assert updated.extra["_cloud_mounts_mounted"] == mounted
+    assert _config_with_cloud_folders(config, [], []) is config
