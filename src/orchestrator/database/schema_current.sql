@@ -10876,8 +10876,12 @@ BEGIN
     IF TG_OP <> 'INSERT' THEN
         RAISE EXCEPTION 'VM pre-SSH stop intent is append-only' USING ERRCODE='23514';
     END IF;
+    IF NEW.frozen->>'kind' IN ('vm_initial_ready_positive_stop_candidate_v1','vm_job_never_app_ready_retained_stop_candidate_v1') THEN
     IF NEW.frozen->>'kind'='vm_initial_ready_positive_stop_candidate_v1' THEN
-    NEW.initial_ready_xact_id := pg_current_xact_id();
+        NEW.initial_ready_xact_id := pg_current_xact_id();
+    ELSE
+        NEW.held_stop_xact_id := pg_current_xact_id();
+    END IF;
     PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery:job:'||NEW.job_id,0));
     PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery-pvc:'||(SELECT pvc_uid::text FROM public.vm_workspace_cleanup_admissions WHERE id=NEW.cleanup_admission_id),0));
     PERFORM 1 FROM public.run_queue WHERE unit_id=NEW.job_id FOR UPDATE;
@@ -10902,6 +10906,8 @@ BEGIN
        OR retry.observed_pvc_uid IS DISTINCT FROM NEW.pvc_uid
        OR (CASE WHEN NEW.frozen->>'kind'='vm_initial_ready_positive_stop_candidate_v1'
            THEN retry.ready_at IS NULL OR NOT public.vm_initial_ready_stop_authorized(NEW)
+           WHEN NEW.frozen->>'kind'='vm_job_never_app_ready_retained_stop_candidate_v1'
+           THEN retry.ready_at IS NOT NULL OR NOT public.vm_never_app_ready_stop_authorized(NEW)
            ELSE retry.ready_at IS NOT NULL OR NEW.frozen->>'kind' IS DISTINCT FROM 'vm_pre_ssh_stop_candidate_v1' END)
        OR reservation.id IS NULL OR reservation.request_id IS DISTINCT FROM retry.request_id
        OR reservation.revision IS DISTINCT FROM NEW.reservation_revision
@@ -10914,11 +10920,13 @@ BEGIN
        OR owner_vm->>'vm_uid' IS DISTINCT FROM NEW.vm_uid::text
        OR owner_vm->>'rootdisk_pvc_uid' IS DISTINCT FROM NEW.pvc_uid::text
        OR owner_vm->>'status' IS DISTINCT FROM 'retiring_process_zero'
-       OR EXISTS (
+       OR (NEW.frozen->>'kind'<>'vm_job_never_app_ready_retained_stop_candidate_v1'
+           AND NEW.prior_zero_receipt_id IS NOT NULL)
+       OR (NEW.frozen->>'kind'<>'vm_job_never_app_ready_retained_stop_candidate_v1' AND EXISTS (
            SELECT 1 FROM public.managed_repository_process_zero_receipts z
            WHERE z.owner_kind='job' AND z.owner_id=NEW.job_id
              AND z.scope='vm' AND z.provisioner='vm'
-             AND z.runtime_incarnation=NEW.provision_generation::text)
+             AND z.runtime_incarnation=NEW.provision_generation::text))
        OR EXISTS (SELECT 1 FROM public.vm_resource_recovery_successors s
                    WHERE s.reservation_id=reservation.id)
        OR NEW.frozen->>'job_id' IS DISTINCT FROM NEW.job_id::text
@@ -10957,7 +10965,7 @@ BEGIN
     IF TG_OP <> 'INSERT' THEN
         RAISE EXCEPTION 'VM pre-SSH stop proof is append-only' USING ERRCODE='23514';
     END IF;
-    IF EXISTS(SELECT 1 FROM public.vm_pre_ssh_stop_intents i WHERE i.cleanup_admission_id=NEW.cleanup_admission_id AND i.frozen->>'kind'='vm_initial_ready_positive_stop_candidate_v1') THEN
+    IF EXISTS(SELECT 1 FROM public.vm_pre_ssh_stop_intents i WHERE i.cleanup_admission_id=NEW.cleanup_admission_id AND i.frozen->>'kind' IN ('vm_initial_ready_positive_stop_candidate_v1','vm_job_never_app_ready_retained_stop_candidate_v1')) THEN
     PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery:job:'||NEW.job_id,0));
     PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery-pvc:'||(SELECT pvc_uid::text FROM public.vm_workspace_cleanup_admissions WHERE id=NEW.cleanup_admission_id),0));
     PERFORM 1 FROM public.run_queue WHERE unit_id=NEW.job_id FOR UPDATE;
@@ -10979,6 +10987,11 @@ BEGIN
             RAISE EXCEPTION 'Initial Ready proof requires committed stop intent' USING ERRCODE='23514';
         END IF;
         NEW.initial_ready_xact_id := pg_current_xact_id();
+    ELSIF intent.frozen->>'kind'='vm_job_never_app_ready_retained_stop_candidate_v1' THEN
+        IF intent.held_stop_xact_id IS NULL OR intent.held_stop_xact_id=pg_current_xact_id() THEN
+            RAISE EXCEPTION 'Held stop proof requires committed stop intent' USING ERRCODE='23514';
+        END IF;
+        NEW.held_stop_xact_id := pg_current_xact_id();
     END IF;
     IF intent.cleanup_admission_id IS NULL
        OR intent.job_id IS DISTINCT FROM NEW.job_id
@@ -10996,6 +11009,10 @@ BEGIN
        OR (CASE WHEN intent.frozen->>'kind'='vm_initial_ready_positive_stop_candidate_v1'
            THEN retry.ready_at IS NULL OR NOT public.vm_initial_ready_stop_authorized(intent)
                OR NOT public.valid_vm_initial_ready_positive_stop(intent.frozen,NEW.terminal_evidence,NEW.frozen_digest)
+           WHEN intent.frozen->>'kind'='vm_job_never_app_ready_retained_stop_candidate_v1'
+           THEN retry.ready_at IS NOT NULL OR NOT public.vm_never_app_ready_stop_authorized(intent)
+               OR NOT public.valid_vm_initial_ready_positive_stop(intent.frozen,
+                   jsonb_set(NEW.terminal_evidence,'{kind}','"vm_initial_ready_positive_stop_v1"'::jsonb),NEW.frozen_digest)
            ELSE retry.ready_at IS NOT NULL OR intent.frozen->>'kind' IS DISTINCT FROM 'vm_pre_ssh_stop_candidate_v1' END)
        OR retry.observed_vm_uid IS DISTINCT FROM intent.vm_uid
        OR retry.observed_pvc_uid IS DISTINCT FROM intent.pvc_uid
@@ -11009,7 +11026,10 @@ BEGIN
        OR owner_vm->>'status' IS DISTINCT FROM 'retiring_process_zero'
        OR owner_vm->>'provision_generation' IS DISTINCT FROM NEW.provision_generation::text
        OR NEW.terminal_evidence->>'kind' IS DISTINCT FROM (CASE WHEN intent.frozen->>'kind'='vm_initial_ready_positive_stop_candidate_v1'
-           THEN 'vm_initial_ready_positive_stop_v1' ELSE 'vm_pre_ssh_positive_stop_v1' END)
+           THEN 'vm_initial_ready_positive_stop_v1'
+           WHEN intent.frozen->>'kind'='vm_job_never_app_ready_retained_stop_candidate_v1'
+           THEN 'vm_job_never_app_ready_retained_positive_stop_v1'
+           ELSE 'vm_pre_ssh_positive_stop_v1' END)
        OR NEW.terminal_evidence->>'frozen_digest' IS DISTINCT FROM NEW.frozen_digest
        OR NEW.terminal_evidence->>'vm_run_strategy' IS DISTINCT FROM 'Halted'
        OR NEW.terminal_evidence->>'vm_generation' IS DISTINCT FROM
@@ -23421,6 +23441,8 @@ CREATE TABLE public.vm_pre_ssh_stop_intents (
     admitted_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
     retention_preflight jsonb,
     initial_ready_xact_id xid8,
+    prior_zero_receipt_id uuid,
+    held_stop_xact_id xid8,
     CONSTRAINT vm_pre_ssh_stop_intents_cleanup_intent_digest_check CHECK ((cleanup_intent_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
     CONSTRAINT vm_pre_ssh_stop_intents_frozen_check CHECK ((jsonb_typeof(frozen) = 'object'::text)),
     CONSTRAINT vm_pre_ssh_stop_intents_frozen_digest_check CHECK ((frozen_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
@@ -23693,7 +23715,6 @@ DECLARE a public.vm_job_cancel_retention_authorities%ROWTYPE;
         retained jsonb;
         expected jsonb;
         digest text;
-        preflight jsonb;
 BEGIN
     SELECT * INTO a FROM public.vm_job_cancel_retention_authorities WHERE cleanup_admission_id=parent_id;
     IF a.cleanup_admission_id IS NULL THEN RETURN false; END IF;
@@ -23702,11 +23723,10 @@ BEGIN
     SELECT * INTO i FROM public.vm_pre_ssh_stop_intents WHERE cleanup_admission_id=parent_id;
     SELECT * INTO s FROM public.vm_resource_cleanup_stop_receipts WHERE cleanup_admission_id=parent_id;
     SELECT * INTO v FROM public.vm_resource_reservations WHERE id=a.reservation_id;
-    preflight := COALESCE(a.ready_retention_preflight,i.retention_preflight);
     retained := jsonb_build_object('version',1,'kind','vm_retained_rootdisk_v1',
         'namespace',a.namespace,'owner_kind','job','owner_id',a.job_id,
-        'pvc_name',preflight->>'pvc_name','pvc_uid',a.pvc_uid,
-        'dv_uid',preflight->>'dv_uid','ownership','standalone_dv',
+        'pvc_name',i.retention_preflight->>'pvc_name','pvc_uid',a.pvc_uid,
+        'dv_uid',i.retention_preflight->>'dv_uid','ownership','standalone_dv',
         'deleting',false,'no_consumers',true);
     expected := jsonb_build_object('version',1,'kind','vm_cleanup_physical_stop',
         'job_id',a.job_id,'provision_generation',a.provision_generation,'vm_uid',a.vm_uid,
@@ -23715,7 +23735,7 @@ BEGIN
         'pvc_disposition','retained','controller_authenticated',true,'retained_rootdisk',retained);
     digest := 'sha256:'||encode(sha256(convert_to(expected::text,'UTF8')),'hex');
     RETURN c.completed_at IS NOT NULL AND c.outcome='completed'
-       AND preflight IS NOT NULL AND (a.ready_retention_preflight IS NOT NULL OR i.cleanup_admission_id IS NOT NULL)
+       AND i.cleanup_admission_id IS NOT NULL AND i.retention_preflight IS NOT NULL
        AND s.cleanup_admission_id IS NOT NULL AND s.stop_evidence=expected
        AND s.reservation_id=a.reservation_id AND s.request_id=a.creation_request_id
        AND s.intent_digest=a.intent_digest AND s.job_id=a.job_id
@@ -23726,11 +23746,23 @@ BEGIN
            'cleanup_admission_id',parent_id,'job_id',a.job_id,'provision_generation',a.provision_generation,
            'vm_uid',a.vm_uid,'vmi_uid',a.vmi_uid,'launcher_uid',a.launcher_uid,
            'pvc_uid',a.pvc_uid,'stop_evidence_digest',digest)
-       AND (a.ready_retention_preflight IS NOT NULL OR EXISTS (SELECT 1 FROM public.vm_pre_ssh_stop_proofs p WHERE p.cleanup_admission_id=parent_id
-           AND p.job_id=a.job_id AND p.provision_generation=a.provision_generation AND p.frozen_digest=i.frozen_digest))
+       AND EXISTS (SELECT 1 FROM public.vm_pre_ssh_stop_proofs p WHERE p.cleanup_admission_id=parent_id
+           AND p.job_id=a.job_id AND p.provision_generation=a.provision_generation AND p.frozen_digest=i.frozen_digest)
        AND EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts z
            WHERE z.owner_kind='job' AND z.owner_id=a.job_id AND z.scope='vm' AND z.provisioner='vm'
-           AND z.runtime_incarnation=a.provision_generation::text);
+           AND z.runtime_incarnation=a.provision_generation::text)
+       AND (i.frozen->>'kind' IS DISTINCT FROM 'vm_job_never_app_ready_retained_stop_candidate_v1'
+           OR (i.held_stop_xact_id IS NOT NULL
+               AND EXISTS (SELECT 1 FROM public.vm_pre_ssh_stop_proofs p
+                   WHERE p.cleanup_admission_id=parent_id
+                     AND p.held_stop_xact_id IS NOT NULL
+                     AND p.held_stop_xact_id<>i.held_stop_xact_id
+                     AND p.frozen_digest=i.frozen_digest
+                     AND p.terminal_evidence->>'kind'='vm_job_never_app_ready_retained_positive_stop_v1')
+               AND EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts z
+                   WHERE z.owner_kind='job' AND z.owner_id=a.job_id AND z.scope='vm'
+                     AND z.provisioner='vm' AND z.runtime_incarnation=a.provision_generation::text
+                     AND (i.prior_zero_receipt_id IS NULL OR z.id=i.prior_zero_receipt_id))));
 END;
 $$;
 
@@ -24941,6 +24973,60 @@ BEGIN
         'retry_reason',r.reason,'resolved_at',r.resolved_at);
 END;
 $$;
+
+
+--
+-- Name: vm_never_app_ready_stop_authorized(public.vm_pre_ssh_stop_intents); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_never_app_ready_stop_authorized(i public.vm_pre_ssh_stop_intents) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE a public.vm_job_cancel_retention_authorities%ROWTYPE;
+        f jsonb := i.frozen;
+        receipt_id uuid;
+        item jsonb;
+BEGIN
+    SELECT * INTO a FROM public.vm_job_cancel_retention_authorities
+     WHERE cleanup_admission_id=i.cleanup_admission_id;
+    IF a.cleanup_admission_id IS NULL OR a.policy_version IS DISTINCT FROM 1
+       OR a.admitted_xact_id=pg_current_xact_id() OR a.job_retained_resume_id IS NOT NULL
+       OR i.job_id IS DISTINCT FROM a.job_id OR i.provision_generation IS DISTINCT FROM a.provision_generation
+       OR i.creation_request_id IS DISTINCT FROM a.creation_request_id
+       OR i.reservation_id IS DISTINCT FROM a.reservation_id OR i.reservation_revision IS DISTINCT FROM a.reservation_revision
+       OR i.vm_uid IS DISTINCT FROM a.vm_uid OR i.vmi_uid IS DISTINCT FROM a.vmi_uid
+       OR i.launcher_uid IS DISTINCT FROM a.launcher_uid OR i.pvc_uid IS DISTINCT FROM a.pvc_uid
+       OR i.node_uid IS DISTINCT FROM a.node_uid OR i.cleanup_intent_digest IS DISTINCT FROM a.intent_digest
+       OR f->>'kind' IS DISTINCT FROM 'vm_job_never_app_ready_retained_stop_candidate_v1'
+       OR (SELECT array_agg(k ORDER BY k COLLATE "C") FROM jsonb_object_keys(f) k) IS DISTINCT FROM ARRAY['cleanup_admission_id','cleanup_intent_digest','cleanup_request_id','containers','job_id','kind','kube_vm_ready_at_inspection','launcher_name','launcher_resource_version','launcher_uid','namespace','node_name','node_uid','provision_generation','pvc_uid','vm_generation','vm_name','vm_resource_version','vm_uid','vmi_uid']
+       OR jsonb_typeof(f->'kube_vm_ready_at_inspection') IS DISTINCT FROM 'boolean'
+       OR f->>'cleanup_admission_id' IS DISTINCT FROM a.cleanup_admission_id::text
+       OR f->>'cleanup_request_id' IS DISTINCT FROM a.cleanup_request_id::text
+       OR f->>'cleanup_intent_digest' IS DISTINCT FROM a.intent_digest
+       OR f->>'namespace' IS DISTINCT FROM a.namespace
+       OR f->>'vm_name' IS DISTINCT FROM 'agent-vm-'||a.job_id
+       OR jsonb_typeof(f->'containers') IS DISTINCT FROM 'array'
+       OR jsonb_array_length(f->'containers')=0
+       OR NOT EXISTS(SELECT 1 FROM jsonb_array_elements(f->'containers') c WHERE c->>'kind'='regular' AND c->>'name'='compute')
+       OR (SELECT count(*)<>count(DISTINCT c->>'name') FROM jsonb_array_elements(f->'containers') c) THEN
+        RETURN false;
+    END IF;
+    SELECT z.id INTO receipt_id FROM public.managed_repository_process_zero_receipts z
+     WHERE z.owner_kind='job' AND z.owner_id=i.job_id AND z.scope='vm' AND z.provisioner='vm'
+       AND z.runtime_incarnation=i.provision_generation::text;
+    IF i.prior_zero_receipt_id IS DISTINCT FROM receipt_id THEN RETURN false; END IF;
+    FOREACH item IN ARRAY ARRAY[f->'launcher_name',f->'node_name',f->'vm_resource_version',f->'launcher_resource_version'] LOOP
+        IF jsonb_typeof(item) IS DISTINCT FROM 'string' OR item#>>'{}' !~ '^[^[:space:]]+$' THEN RETURN false; END IF;
+    END LOOP;
+    FOR item IN SELECT value FROM jsonb_array_elements(f->'containers') LOOP
+        IF (SELECT array_agg(k ORDER BY k COLLATE "C") FROM jsonb_object_keys(item) k) IS DISTINCT FROM ARRAY['container_id','kind','name']
+           OR item->>'kind' NOT IN ('regular','init')
+           OR jsonb_typeof(item->'name') IS DISTINCT FROM 'string' OR item->>'name' !~ '^[^[:space:]]+$'
+           OR jsonb_typeof(item->'container_id') IS DISTINCT FROM 'string' OR item->>'container_id' !~ '^[^[:space:]]+$' THEN RETURN false; END IF;
+    END LOOP;
+    RETURN public.validate_vm_job_cancel_retention(i.cleanup_admission_id,false);
+END;
+$_$;
 
 
 --
@@ -33096,6 +33182,7 @@ CREATE TABLE public.vm_pre_ssh_stop_proofs (
     evidence_digest text NOT NULL,
     observed_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
     initial_ready_xact_id xid8,
+    held_stop_xact_id xid8,
     CONSTRAINT vm_pre_ssh_stop_proofs_evidence_digest_check CHECK ((evidence_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
     CONSTRAINT vm_pre_ssh_stop_proofs_frozen_digest_check CHECK ((frozen_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
     CONSTRAINT vm_pre_ssh_stop_proofs_terminal_evidence_check CHECK ((jsonb_typeof(terminal_evidence) = 'object'::text))
@@ -43937,6 +44024,14 @@ ALTER TABLE ONLY public.vm_pre_ssh_stop_intents
 
 ALTER TABLE ONLY public.vm_pre_ssh_stop_intents
     ADD CONSTRAINT vm_pre_ssh_stop_intents_reservation_id_fkey FOREIGN KEY (reservation_id) REFERENCES public.vm_resource_reservations(id);
+
+
+--
+-- Name: vm_pre_ssh_stop_intents vm_pre_ssh_stop_prior_zero_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_pre_ssh_stop_intents
+    ADD CONSTRAINT vm_pre_ssh_stop_prior_zero_fk FOREIGN KEY (prior_zero_receipt_id) REFERENCES public.managed_repository_process_zero_receipts(id);
 
 
 --
