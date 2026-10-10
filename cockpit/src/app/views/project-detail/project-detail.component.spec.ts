@@ -26,6 +26,9 @@ import {
 } from '../../core/models/connector-driver.model';
 // The API's own capability matrix for the built-in drivers.
 import driversFixture from '../../core/models/fixtures/connector-drivers.json';
+// The real catalogue, so these specs also prove the keys they name exist.
+import en from '../../../assets/i18n/en.json';
+import de from '../../../assets/i18n/de-DE.json';
 
 const BUILTIN_DRIVERS = (driversFixture as unknown as ConnectorDriverMatrix).drivers;
 
@@ -824,6 +827,58 @@ describe('ProjectDetailPageComponent link access from the capability matrix', ()
         ?.advisory,
     ).toBe(true);
     expect(component.githubAppReadOnly({type: 'repository', config: {forge: 'github'}, read_only: true})).toBe(false);
+  });
+
+  it("binds the stricter of the link and the creator's read-only tag", () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const row = (over: object) => ({type: 'postgresql' as const, config: {}, ...over});
+    // A read-write link cannot lift the creator's tag (decision 31) ...
+    expect(component.linkAccessLevel(row({read_only: true, project_read_only: false}))?.id)
+      .toBe('ReadOnly');
+    // ... nor a public connector's with no mode set (decision 32).
+    expect(component.linkAccessLevel(row({is_global: true, read_only: null}))?.id).toBe('ReadOnly');
+    // Published read-write, the link decides.
+    expect(component.linkAccessLevel(row({is_global: true, read_only: false}))?.id).toBe('ReadWrite');
+    expect(
+      component.linkAccessLevel(row({is_global: true, read_only: false, project_read_only: true}))?.id,
+    ).toBe('ReadOnly');
+    expect(component.linkAccessLevel(row({read_only: false}))?.id).toBe('ReadWrite');
+  });
+
+  it("shows a creator's read-only tag instead of the switch, and says why", () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const tagged = {type: 'postgresql' as const, read_only: true};
+    expect(component.creatorReadOnly(tagged)).toBe(true);
+    expect(component.linkAccessShown(tagged)).toBe('read_only');
+    expect(component.creatorReadOnly({type: 'postgresql', is_global: true, read_only: null})).toBe(true);
+    expect(component.creatorReadOnly({type: 'postgresql', read_only: false})).toBe(false);
+    expect(component.linkAccessShown({type: 'postgresql'})).toBe('choice');
+    // A driver that is read-only anyway needs no note.
+    expect(component.creatorReadOnly({type: 'kb', read_only: true})).toBe(false);
+    const enText = (en as {projectDetail: {datasources: Record<string, string>}})
+      .projectDetail.datasources['accessCreatorReadOnly'];
+    const deText = (de as {projectDetail: {datasources: Record<string, string>}})
+      .projectDetail.datasources['accessCreatorReadOnly'];
+    expect(enText).toMatch(/everyone who uses it/);
+    expect(deText).toMatch(/alle, die ihn nutzen/);
+  });
+
+  it("ignores a link change the creator's tag would override", () => {
+    const {api, component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const updateProjectDatasource = vi.fn().mockReturnValue(of({status: 'updated'}));
+    (api as unknown as {updateProjectDatasource: unknown}).updateProjectDatasource =
+      updateProjectDatasource;
+    component.projectDatasources.set([
+      {
+        ...datasource('pg-1'),
+        read_only: true,
+        linked_at: '',
+        project_read_only: null,
+        project_description: null,
+      },
+    ]);
+    component.updateDatasourceReadOnly('pg-1', 'false');
+    expect(updateProjectDatasource).not.toHaveBeenCalled();
   });
 
   it('keeps the KB rule until the matrix loads', () => {

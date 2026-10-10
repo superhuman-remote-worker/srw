@@ -657,9 +657,11 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                         <td>
                           <!-- Only the levels the connector's driver offers
                                (capability matrix): one level is shown, not
-                               chosen. A link's read-only is what drivers
-                               enforce, so the bound level's line shows here. -->
-                          @switch (linkAccess(ds)) {
+                               chosen. The bound level is the stricter of the
+                               link and the creator's read-only tag, so the
+                               bound level's line shows here; a tag the link
+                               cannot lift replaces the switch and says why. -->
+                          @switch (linkAccessShown(ds)) {
                             @case ('read_only') {
                               <app-badge
                                 tone="info"
@@ -668,6 +670,11 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                               >
                                 {{ 'projectDetail.datasources.accessReadOnly' | transloco }}
                               </app-badge>
+                              @if (creatorReadOnly(ds)) {
+                                <div class="link-creator" data-creator-read-only>
+                                  {{ 'projectDetail.datasources.accessCreatorReadOnly' | transloco }}
+                                </div>
+                              }
                             }
                             @case ('read_write') {
                               <app-badge tone="neutral" size="sm">
@@ -1531,8 +1538,10 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .role-source { background: var(--success-tint); color: var(--success); }
     .role-reference { background: var(--warning-tint); color: var(--warning); }
 
-    /* What a connector link's access level is enforced by (capability matrix). */
-    .link-enforced {
+    /* What a connector link's access level is enforced by (capability matrix),
+       and why a creator's read-only tag stands over the link. */
+    .link-enforced,
+    .link-creator {
       max-width: 36ch;
       margin-top: 4px;
       font-size: 11px;
@@ -2551,11 +2560,33 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     return access.readOnly ? 'read_only' : 'choice';
   }
 
+  /** Whether the connector's creator tagged it read-only: its own flag, or
+   *  public with none set (decisions 31 and 32). Every user's executions
+   *  then bind it read-only, whatever a project link says. */
+  connectorReadOnly(ds: Partial<Pick<Datasource, 'read_only' | 'is_global'>>): boolean {
+    return ds.read_only === true || (ds.read_only == null && ds.is_global === true);
+  }
+
+  /** Whether the creator's tag stands over a link that could otherwise
+   *  choose: the switch cannot lift it, so the row shows read-only. */
+  creatorReadOnly(ds: Pick<Datasource, 'type'> & Partial<Pick<Datasource, 'read_only' | 'is_global'>>): boolean {
+    return this.linkAccess(ds) === 'choice' && this.connectorReadOnly(ds);
+  }
+
+  /** The access a link row shows: its driver's choice, unless the creator's
+   *  tag fixes it at read-only. */
+  linkAccessShown(
+    ds: Pick<Datasource, 'type'> & Partial<Pick<Datasource, 'read_only' | 'is_global'>>,
+  ): 'read_only' | 'read_write' | 'choice' {
+    return this.creatorReadOnly(ds) ? 'read_only' : this.linkAccess(ds);
+  }
+
   /** The level a link binds the connector at, with what enforces it; null
-   *  until the matrix loads. A read-only link floors the connector at its
-   *  lowest level. Otherwise it keeps its own: the top one for a
-   *  read/read-write driver, or, for a tiered one (email), the tier its
-   *  config stores, else the driver's default. */
+   *  until the matrix loads. A read-only link or the creator's read-only
+   *  tag, either, floors the connector at its lowest level. Otherwise it
+   *  keeps its own: the top one for a read/read-write driver, or, for a
+   *  tiered one (email), the tier its config stores, else the driver's
+   *  default. */
   linkAccessLevel(
     ds: Pick<Datasource, 'type' | 'config'> &
       Partial<Pick<Datasource, 'read_only' | 'is_global'>> & {project_read_only?: boolean | null},
@@ -2567,7 +2598,10 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
       // Enforced, not advisory: the token SRW mints has contents: read.
       return {...access.readOnly, advisory: false};
     }
-    if (access.readOnly && (!access.readWrite || ds.project_read_only === true)) {
+    if (
+      access.readOnly &&
+      (!access.readWrite || ds.project_read_only === true || this.connectorReadOnly(ds))
+    ) {
       return access.readOnly;
     }
     if (driver.access_levels.length > 2) {
@@ -2587,14 +2621,13 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   ): boolean {
     const config = ds.config as {github_app?: unknown} | undefined;
     if (ds.type !== 'repository' || !config?.github_app) return false;
-    const own = ds.read_only === true || (ds.read_only == null && ds.is_global === true);
-    return ds.project_read_only === true || own;
+    return ds.project_read_only === true || this.connectorReadOnly(ds);
   }
 
   updateDatasourceReadOnly(datasourceId: string, value: string): void {
     if (
       this.projectDatasources().some(
-        (ds) => ds.id === datasourceId && this.linkAccess(ds) !== 'choice',
+        (ds) => ds.id === datasourceId && this.linkAccessShown(ds) !== 'choice',
       )
     ) {
       return;

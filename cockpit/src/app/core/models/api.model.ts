@@ -490,8 +490,10 @@ export interface Datasource {
   created_by?: string | null;
   /** Whether the datasource is visible to all users (vs owner/project only). */
   is_global?: boolean;
-  /** Declared read-only flag for public datasources (null = not applicable).
-   *  Declarative — credentials are the enforcement boundary. */
+  /** The creator's read-only tag: when set, agents get no write tools for
+   *  the connector, for everyone who uses it. Null = never chosen, which a
+   *  public connector reads as read-only. The credential still decides what
+   *  is really allowed. */
   read_only?: boolean | null;
   /** Execution-context restriction. `all` includes projectless work. */
   scope_mode?: DatasourceScopeMode;
@@ -549,7 +551,8 @@ export interface DatasourceCreateRequest {
   config?: DatasourceConfig;
   /** Publish org-wide; requires the public_datasources capability. */
   is_global?: boolean;
-  /** Declared read-only flag; defaults to true server-side on publish. */
+  /** The creator's read-only tag (no write tools for anyone who uses the
+   *  connector); defaults to true server-side on publish. */
   read_only?: boolean;
   scope_mode?: DatasourceScopeMode;
   project_ids?: string[];
@@ -569,7 +572,7 @@ export interface DatasourceUpdateRequest {
   config?: DatasourceConfig;
   /** Publish (true) / unpublish (false); publishing requires the capability. */
   is_global?: boolean;
-  /** Declared read-only flag (kb: always true). */
+  /** The creator's read-only tag (kb: always true). */
   read_only?: boolean;
   scope_mode?: DatasourceScopeMode;
   project_ids?: string[];

@@ -188,13 +188,13 @@ export interface ConnectorDriverMatrix {
  * The choices of the read-only switch that a driver offers, each with the
  * level it stands for.
  *
- * On a project link the switch is real: a read-only link floors the
- * connector at its lowest level (the level's `enforced_by` says how), so
- * read-only is offered only when a lower level exists to floor to, and
- * read-write leaves the connector at its own level, so a driver forced
- * read-only has none. A public connector's read-only flag is only declared:
- * nothing binds by it, so its levels' `enforced_by` lines never describe it.
- * A driver with no access levels (env and file delivery) offers neither.
+ * The same switch serves a project link and the connector's creator: a
+ * read-only link or creator's tag floors the connector at its lowest level
+ * for everyone who uses it (the stricter of the two binds; the level's
+ * `enforced_by` says how), so read-only is offered only when a lower level
+ * exists to floor to, and read-write leaves the connector at its own level,
+ * so a driver forced read-only has none. A driver with no access levels
+ * (env and file delivery) offers neither.
  */
 export interface OfferedAccess {
   readOnly: ConnectorAccessLevel | null;

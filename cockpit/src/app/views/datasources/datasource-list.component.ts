@@ -1295,11 +1295,9 @@ type KeyValueRow = {key: string; value: string};
             }
             @if (capabilities.canPublishDatasources() && formData.type !== 'email' && formData.type !== 'credentials') {
               <div class="form-row">
-                <!-- Full width: the hint below the choice is a sentence. -->
                 <app-form-field
                   class="flex-1"
                   [label]="'datasources.form.visibilityLabel' | transloco"
-                  [hint]="formData.is_global ? (publicHintKey() | transloco) : ''"
                 >
                   <div class="visibility-controls">
                     <label class="visibility-toggle">
@@ -1311,34 +1309,43 @@ type KeyValueRow = {key: string; value: string};
                       >
                       {{ 'datasources.form.visibilityPublic' | transloco }}
                     </label>
-                    <!-- Only the levels the driver offers (its spec's access
-                         levels and forced_read_only). A public connector's
-                         read-only is declared, never enforced, so no
-                         "enforced by" line here: a project link's read-only
-                         is what the drivers enforce (project-detail). A
-                         GitHub App connector is the exception: its token is
-                         minted with contents: read, and its hint says so. -->
-                    @if (formData.is_global) {
-                      <div class="access-radio">
-                        @if (offersReadOnly()) {
-                          <label data-access="read_only">
-                            <input type="radio" name="ds-access"
-                              [checked]="publicReadOnly()"
-                              (change)="formData.read_only = true"
-                              [disabled]="isSaving() || !offersReadWrite()">
-                            {{ 'datasources.form.accessReadOnly' | transloco }}
-                          </label>
-                        }
-                        @if (offersReadWrite()) {
-                          <label data-access="read_write">
-                            <input type="radio" name="ds-access"
-                              [checked]="!publicReadOnly()"
-                              (change)="formData.read_only = false"
-                              [disabled]="isSaving() || !offersReadOnly()">
-                            {{ 'datasources.form.accessReadWrite' | transloco }}
-                          </label>
-                        }
-                      </div>
+                  </div>
+                </app-form-field>
+              </div>
+            }
+
+            <!-- The creator's read-only tag (connector drivers decisions 31
+                 and 32), for every connector and not only a public one: it
+                 decides the tools of everyone who uses the connector, so its
+                 hint says that, and never that writes are impossible. Only
+                 the levels the driver offers (its spec's access levels and
+                 forced_read_only). Email's own tier choice stands in for it. -->
+            @if (showsAccessChoice()) {
+              <div class="form-row">
+                <!-- Full width: the hint below the choice is a sentence. -->
+                <app-form-field
+                  class="flex-1"
+                  [label]="'datasources.form.accessLabel' | transloco"
+                  [hint]="accessHintKey() | transloco"
+                >
+                  <div class="access-radio">
+                    @if (offersReadOnly()) {
+                      <label data-access="read_only">
+                        <input type="radio" name="ds-access"
+                          [checked]="formReadOnly()"
+                          (change)="formData.read_only = true"
+                          [disabled]="isSaving() || !offersReadWrite()">
+                        {{ 'datasources.form.accessReadOnly' | transloco }}
+                      </label>
+                    }
+                    @if (offersReadWrite()) {
+                      <label data-access="read_write">
+                        <input type="radio" name="ds-access"
+                          [checked]="!formReadOnly()"
+                          (change)="formData.read_only = false"
+                          [disabled]="isSaving() || !offersReadOnly()">
+                        {{ 'datasources.form.accessReadWrite' | transloco }}
+                      </label>
                     }
                   </div>
                 </app-form-field>
@@ -2642,23 +2649,46 @@ export class DatasourceListComponent implements OnInit {
     return access ? access.readWrite !== null : this.formData.type !== 'kb';
   }
 
-  /** The `read_only` a public connector saves: the user's choice when the
-   *  driver offers both, else the only one it offers. The flag is declared:
-   *  only a project link's read-only changes what an execution binds. */
-  publicReadOnly(): boolean {
-    if (!this.offersReadWrite()) return true;
-    if (!this.offersReadOnly()) return false;
-    return this.formData.read_only;
+  /** Whether the form shows the creator's read-only tag: for every type
+   *  whose driver offers a level, but email, whose tier choice is its own. */
+  showsAccessChoice(): boolean {
+    if (this.formData.type === 'email') return false;
+    return this.offersReadOnly() || this.offersReadWrite();
   }
 
-  /** The hint under a public connector's access: always-read-only drivers
-   *  (the KB) are read-only for everyone; for the rest the flag is only
-   *  declared, so the credentials must be scoped. */
-  publicHintKey(): string {
-    if (this.isGithubAppForm()) return 'datasources.form.visibilityGithubAppHint';
-    return this.offersReadWrite()
-      ? 'datasources.form.visibilityCredentialHint'
-      : 'datasources.form.visibilityKbHint';
+  /** The creator's read-only tag as the form shows it: the user's choice
+   *  when the driver offers both levels, else the only one it offers. Never
+   *  chosen, a public connector is read-only and a private one is not, as
+   *  the server reads it (decision 32). It decides the tools of everyone
+   *  who uses the connector, together with a project link's read-only. */
+  formReadOnly(): boolean {
+    if (!this.offersReadWrite()) return true;
+    if (!this.offersReadOnly()) return false;
+    return this.formData.read_only ?? this.formData.is_global;
+  }
+
+  /** The `read_only` a save sends: a public connector's always (the
+   *  publish confirmation weighs it), a private one's only once chosen, so
+   *  a connector never touched keeps the server's default. */
+  savedReadOnly(): boolean | undefined {
+    if (this.formData.is_global) return this.formReadOnly();
+    if (!this.showsAccessChoice() || this.formData.read_only === null) return undefined;
+    return this.formReadOnly();
+  }
+
+  /** The hint under the tag. It says what SRW does, that it applies to
+   *  everyone who uses the connector, and that the credential decides what
+   *  is really allowed; it never promises that writes are impossible. */
+  accessHintKey(): string {
+    if (!this.offersReadWrite()) return 'datasources.form.accessKbHint';
+    if (!this.offersReadOnly()) return 'datasources.form.accessReadWriteOnlyHint';
+    if (this.isGithubAppForm()) return 'datasources.form.accessGithubAppHint';
+    // No write tools to remove (env, file, key and kubeconfig delivery): the
+    // tag only tells the agent.
+    const writeTools = this.formAccess()?.readWrite?.tools;
+    return Array.isArray(writeTools) && writeTools.length === 0
+      ? 'datasources.form.accessAdvisoryHint'
+      : 'datasources.form.accessReadOnlyHint';
   }
 
   /** Whether the form edits a GitHub App repository connector that keeps
@@ -2958,7 +2988,8 @@ export class DatasourceListComponent implements OnInit {
     mcpToken: string;
     mcpHeaders: KeyValueRow[];
     is_global: boolean;
-    read_only: boolean;
+    /** The creator's read-only tag; null until chosen (see formReadOnly). */
+    read_only: boolean | null;
     scope_mode: DatasourceScopeMode | null;
     auto_attach: boolean;
     policy_revision: number | null;
@@ -2975,7 +3006,7 @@ export class DatasourceListComponent implements OnInit {
     mcpToken: '',
     mcpHeaders: [],
     is_global: false,
-    read_only: true,
+    read_only: null,
     scope_mode: null,
     auto_attach: false,
     policy_revision: null,
@@ -3428,7 +3459,7 @@ export class DatasourceListComponent implements OnInit {
       mcpToken: '',
       mcpHeaders: [],
       is_global: ds.is_global ?? false,
-      read_only: ds.read_only ?? true,
+      read_only: ds.read_only ?? null,
       scope_mode: ds.scope_mode ?? 'all',
       auto_attach: ds.auto_attach ?? false,
       policy_revision: ds.policy_revision ?? 1,
@@ -3771,7 +3802,7 @@ export class DatasourceListComponent implements OnInit {
   onTypeSelect(value: DatasourceType | null): void {
     if (value) {
       this.formData.type = value;
-      // A driver forced read-only (the KB) saves read-only: publicReadOnly().
+      // A driver forced read-only (the KB) saves read-only: formReadOnly().
       this.genericFormValue.set(null);
       this.genericFormError.set(null);
       // Mailboxes are private-only; the server rejects is_global for email.
@@ -3927,7 +3958,7 @@ export class DatasourceListComponent implements OnInit {
     // A driver with no read-only level (an MCP server) was read-write
     // whatever its stored flag says; saving the flag to match needs no gate.
     const wasRw = wasPublic && (prev?.read_only === false || !this.offersReadOnly());
-    const isRw = !this.publicReadOnly();
+    const isRw = !this.formReadOnly();
     if (isRw && !wasRw) return 'name';
     if (!wasPublic) return 'warn';
     return null;
@@ -4005,9 +4036,7 @@ export class DatasourceListComponent implements OnInit {
         default_branch: this.formData.default_branch || undefined,
         config: this.buildTypeConfig(),
         is_global: this.formData.is_global,
-        read_only: this.formData.is_global
-          ? this.publicReadOnly()
-          : undefined,
+        read_only: this.savedReadOnly(),
       };
       const connectionUrl = this.connectionUrlForPayload();
       if (connectionUrl !== undefined) update.connection_url = connectionUrl;
@@ -4058,9 +4087,7 @@ export class DatasourceListComponent implements OnInit {
         default_branch: this.formData.default_branch || undefined,
         config: this.buildTypeConfig(),
         is_global: this.formData.is_global,
-        read_only: this.formData.is_global
-          ? this.publicReadOnly()
-          : undefined,
+        read_only: this.savedReadOnly(),
         ...this.createAvailabilityPolicy(),
       };
 
@@ -4619,7 +4646,7 @@ export class DatasourceListComponent implements OnInit {
       mcpToken: '',
       mcpHeaders: [],
       is_global: false,
-      read_only: true,
+      read_only: null,
       scope_mode: null,
       auto_attach: false,
       policy_revision: null,

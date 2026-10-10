@@ -768,11 +768,11 @@ describe('DatasourceListComponent repository forge selection', () => {
       config: {forge: 'github', github_app: githubApp},
     });
     expect(component.isGithubAppForm()).toBe(true);
-    expect(component.publicHintKey()).toBe('datasources.form.visibilityGithubAppHint');
+    expect(component.accessHintKey()).toBe('datasources.form.accessGithubAppHint');
     component.gitAuthMethod = 'token';
     component.formCredentials.password = 'ghp_replacement';
     expect(component.isGithubAppForm()).toBe(false);
-    expect(component.publicHintKey()).toBe('datasources.form.visibilityCredentialHint');
+    expect(component.accessHintKey()).toBe('datasources.form.accessReadOnlyHint');
   });
 
   it('drops the GitHub App config when a token replaces the App', () => {
@@ -1386,23 +1386,30 @@ describe('DatasourceListComponent access levels from the capability matrix', () 
     return created;
   }
 
-  it('offers both levels for a driver that has both, and says the flag is only declared', () => {
+  it('offers both levels for a driver that has both, and says what read-only does', () => {
     const {component} = create('postgresql');
     expect(component.offersReadOnly()).toBe(true);
     expect(component.offersReadWrite()).toBe(true);
-    // A public connector's read-only binds nothing: no "enforced by" claim,
-    // the old advice to scope the credentials instead.
-    expect(component.publicHintKey()).toBe('datasources.form.visibilityCredentialHint');
+    // The creator's tag removes the write tools for everyone (decision 31):
+    // the hint says so, and no "enforced by" claim sits under it.
+    expect(component.accessHintKey()).toBe('datasources.form.accessReadOnlyHint');
     expect('publicAccessLevel' in component).toBe(false);
+    // Published with no mode chosen: read-only (decision 32).
+    expect(component.formReadOnly()).toBe(true);
     component.formData.read_only = false;
-    expect(component.publicReadOnly()).toBe(false);
+    expect(component.formReadOnly()).toBe(false);
   });
 
-  it('keeps the credential hint for every driver that is not forced read-only', () => {
-    for (const type of ['generic', 'repository', 'neo4j', 'mongodb', 'webdav', 'mcp', 'kubeconfig', 'ssh_key'] as const) {
-      expect(create(type).component.publicHintKey()).toBe('datasources.form.visibilityCredentialHint');
+  it('names what the tag does for each kind of driver', () => {
+    for (const type of ['repository', 'postgresql', 'neo4j', 'mongodb', 'webdav'] as const) {
+      expect(create(type).component.accessHintKey(), type).toBe('datasources.form.accessReadOnlyHint');
     }
-    expect(create('kb').component.publicHintKey()).toBe('datasources.form.visibilityKbHint');
+    // Their read-only only tells the agent: the same credential is delivered.
+    for (const type of ['generic', 'credentials', 'kubeconfig', 'ssh_key', 'generic_file'] as const) {
+      expect(create(type).component.accessHintKey(), type).toBe('datasources.form.accessAdvisoryHint');
+    }
+    expect(create('mcp').component.accessHintKey()).toBe('datasources.form.accessReadWriteOnlyHint');
+    expect(create('kb').component.accessHintKey()).toBe('datasources.form.accessKbHint');
   });
 
   it('hides read-write for a driver forced read-only and saves it read-only', () => {
@@ -1410,7 +1417,7 @@ describe('DatasourceListComponent access levels from the capability matrix', () 
     expect(component.offersReadOnly()).toBe(true);
     expect(component.offersReadWrite()).toBe(false);
     component.formData.read_only = false;
-    expect(component.publicReadOnly()).toBe(true);
+    expect(component.formReadOnly()).toBe(true);
     expect(component.publishConfirmTier()).toBe('warn');
     component.doSave();
     expect(api.createDatasource.mock.calls[0][0].read_only).toBe(true);
@@ -1420,9 +1427,10 @@ describe('DatasourceListComponent access levels from the capability matrix', () 
     const {api, component} = create('mcp');
     expect(component.offersReadOnly()).toBe(false);
     expect(component.offersReadWrite()).toBe(true);
-    // The form's default is read-only; an MCP server is bound read-write.
-    expect(component.formData.read_only).toBe(true);
-    expect(component.publicReadOnly()).toBe(false);
+    // Nothing chosen, which a public connector reads as read-only; an MCP
+    // server is bound read-write all the same.
+    expect(component.formData.read_only).toBeNull();
+    expect(component.formReadOnly()).toBe(false);
     expect(component.publishConfirmTier()).toBe('name');
     component.formData.mcpTransport = 'http';
     component.formData.connection_url = 'https://mcp.example.com';
@@ -1462,11 +1470,111 @@ describe('DatasourceListComponent access levels from the capability matrix', () 
   it('keeps the pre-matrix rule until the matrix loads', () => {
     const kb = create('kb', null).component;
     expect(kb.offersReadWrite()).toBe(false);
-    expect(kb.publicHintKey()).toBe('datasources.form.visibilityKbHint');
+    expect(kb.accessHintKey()).toBe('datasources.form.accessKbHint');
     const mcp = create('mcp', null).component;
     expect(mcp.offersReadOnly()).toBe(true);
     expect(mcp.offersReadWrite()).toBe(true);
     expect(mcp.isPublicReadWrite({...kbDatasource(), type: 'mcp', read_only: true})).toBe(false);
+  });
+});
+
+describe("DatasourceListComponent the creator's read-only tag", () => {
+  function createPrivate(type: Datasource['type'] = 'postgresql') {
+    const created = createComponent(false, null, BUILTIN_DRIVERS);
+    created.component.openCreateForm();
+    created.component.formData.name = 'Orders DB';
+    created.component.onTypeSelect(type);
+    created.component.formData.connection_url = 'postgresql://reader@db/orders';
+    return created;
+  }
+
+  it('is offered on a private connector too, read-write until chosen', () => {
+    const {api, component} = createPrivate();
+    expect(component.formData.is_global).toBe(false);
+    expect(component.showsAccessChoice()).toBe(true);
+    expect(component.formReadOnly()).toBe(false);
+    expect(component.publishConfirmTier()).toBeNull();
+    component.doSave();
+    // Never chosen: nothing is sent, so the server's default stands.
+    expect(api.createDatasource.mock.calls[0][0].read_only).toBeUndefined();
+  });
+
+  it("saves a private connector's read-only tag once its creator chooses it", () => {
+    const {api, component} = createPrivate();
+    component.formData.read_only = true;
+    expect(component.formReadOnly()).toBe(true);
+    // Read-only is exposure-reducing: no confirmation for a private save.
+    expect(component.publishConfirmTier()).toBeNull();
+    component.doSave();
+    expect(api.createDatasource.mock.calls[0][0].read_only).toBe(true);
+  });
+
+  it('shows a stored tag on an edit and lets its creator lift it', () => {
+    const {api, component, ds} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm({
+      ...ds,
+      type: 'postgresql',
+      connection_url: 'postgresql://reader@db/orders',
+      config: {},
+      is_global: false,
+      read_only: true,
+    });
+    expect(component.formReadOnly()).toBe(true);
+    component.formData.read_only = false;
+    component.saveForm();
+    expect(api.updateDatasource.mock.calls[0][1].read_only).toBe(false);
+  });
+
+  it('leaves an untagged stored connector untouched on an edit', () => {
+    const {api, component, ds} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm({
+      ...ds,
+      type: 'postgresql',
+      connection_url: 'postgresql://reader@db/orders',
+      config: {},
+      is_global: false,
+      read_only: null,
+    });
+    expect(component.formReadOnly()).toBe(false);
+    component.saveForm();
+    expect(api.updateDatasource.mock.calls[0][1].read_only).toBeUndefined();
+  });
+
+  it('is not offered for email, whose tier choice is its own', () => {
+    const {component} = createPrivate('email');
+    expect(component.showsAccessChoice()).toBe(false);
+    component.formData.read_only = true;
+    expect(component.savedReadOnly()).toBeUndefined();
+  });
+
+  it('says in both languages what the tag does, for everyone, and promises nothing', () => {
+    const keys = [
+      'accessReadOnlyHint',
+      'accessAdvisoryHint',
+      'accessReadWriteOnlyHint',
+      'accessKbHint',
+      'accessGithubAppHint',
+    ];
+    const enForm = (en as {datasources: {form: Record<string, string>}}).datasources.form;
+    const deForm = (de as {datasources: {form: Record<string, string>}}).datasources.form;
+    expect(enForm['accessLabel']).toBeTruthy();
+    expect(deForm['accessLabel']).toBeTruthy();
+    for (const key of keys) {
+      expect(enForm[key], key).toMatch(/everyone who uses/);
+      expect(deForm[key], key).toMatch(/alle, die/);
+      // SRW assists and never guarantees (decision 18).
+      expect(enForm[key], key).not.toMatch(/enforced|guarantee|impossible|cannot write/i);
+      expect(deForm[key], key).not.toMatch(/erzwungen|garantiert|unmöglich/i);
+    }
+    // What a read-only tag does, in plain words, and who still decides.
+    expect(enForm['accessReadOnlyHint']).toMatch(/no write tools/);
+    expect(enForm['accessReadOnlyHint']).toMatch(/credential still decides/);
+    expect(deForm['accessReadOnlyHint']).toMatch(/keine Schreibwerkzeuge/);
+    // The hints that said a public flag was only declared are gone.
+    for (const old of ['visibilityCredentialHint', 'visibilityKbHint', 'visibilityGithubAppHint']) {
+      expect(enForm[old], old).toBeUndefined();
+      expect(deForm[old], old).toBeUndefined();
+    }
   });
 });
 
@@ -1617,11 +1725,11 @@ describe('DatasourceListComponent managed MCP servers', () => {
     expect(component.formDriver()).toBe(gitea);
     expect(component.hasBespokeForm()).toBe(false);
     expect(component.useGenericForm()).toBe(true);
-    // Public: both of its levels, with the declared-only credential hint.
+    // Both of its levels, with what the read-only tag does.
     component.formData.is_global = true;
     expect(component.offersReadOnly()).toBe(true);
     expect(component.offersReadWrite()).toBe(true);
-    expect(component.publicHintKey()).toBe('datasources.form.visibilityCredentialHint');
+    expect(component.accessHintKey()).toBe('datasources.form.accessReadOnlyHint');
   });
 
   it('creates it from what the generic form holds: config and token, no connection URL', () => {

@@ -1715,6 +1715,7 @@
       "accessEnforcedBy": "Durchgesetzt durch:",
       "accessAdvisory": "Nur ein Hinweis:",
       "githubAppReadOnly": "das GitHub-App-Token, das SRW für jede Ausführung erzeugt, hat contents: read, kein Push gelingt (auch nicht aus der Workspace-Shell).",
+      "accessCreatorReadOnly": "Nur Lesen für alle, die ihn nutzen: Sein Ersteller hat ihn so markiert, und ein Projekt-Link kann das nicht aufheben.",
       "unlink": "Trennen"
     },
     "repos": {
@@ -2836,9 +2837,12 @@
       "visibilityPublic": "Öffentlich — für alle Benutzer sichtbar",
       "accessReadOnly": "Nur Lesen",
       "accessReadWrite": "Lesen & Schreiben",
-      "visibilityCredentialHint": "Nur-Lesen ist deklariert, nicht erzwungen — verwenden Sie Nur-Lese-Zugangsdaten (Deploy-Token / eingeschränktes DB-Konto).",
-      "visibilityGithubAppHint": "Bei einem GitHub-App-Konnektor wird Nur-Lesen durchgesetzt: das Token jeder Ausführung wird mit contents: read erzeugt, kein Push gelingt.",
-      "visibilityKbHint": "Wissensdatenbank-Konnektoren sind immer schreibgeschützt; Zugangsdaten erreichen die Agenten nie.",
+      "accessLabel": "Agentenzugriff",
+      "accessReadOnlyHint": "Nur Lesen heißt: SRW gibt Agenten für diesen Konnektor keine Schreibwerkzeuge, für alle, die ihn nutzen. Was sich wirklich ändern lässt, entscheiden weiterhin die Zugangsdaten: Verwenden Sie Nur-Lese-Zugangsdaten, wenn nichts geändert werden darf.",
+      "accessAdvisoryHint": "Nur Lesen wird dem Agenten nur als Hinweis mitgegeben: Es werden in beiden Fällen dieselben Zugangsdaten ausgeliefert, und sie entscheiden, was sich ändern lässt. Das gilt für alle, die den Konnektor nutzen.",
+      "accessReadWriteOnlyHint": "Für diesen Konnektortyp hat SRW keinen Nur-Lese-Modus: Agenten erhalten alle Werkzeuge, die er anbietet. Was erlaubt ist, entscheiden seine Zugangsdaten, für alle, die den Konnektor nutzen.",
+      "accessKbHint": "Wissensdatenbanken sind für alle, die sie nutzen, immer nur lesbar: SRW indexiert das Repository, und Agenten erhalten Suchwerkzeuge, aber nie seine Zugangsdaten.",
+      "accessGithubAppHint": "Nur Lesen heißt: SRW gibt Agenten für diesen Konnektor keine Schreibwerkzeuge, für alle, die ihn nutzen. Bei einem GitHub-App-Konnektor erzeugt SRW das Token jeder Ausführung zusätzlich mit contents: read, sodass GitHub Pushes ablehnt.",
       "availabilityTitle": "Verfügbarkeit",
       "scopeEverywhere": "Überall in meiner Arbeit",
       "scopeEverywhereHint": "In allen Projekten und eigenständiger Arbeit verfügbar, vorbehaltlich Freigabe- und öffentlicher Zugriffsregeln.",
