@@ -53,6 +53,7 @@ on:
       - 'tests/test_canvas_viewer_postgres_integration.py'
       - 'scripts/schema-snapshot.sh'
       - '.github/workflows/db-migrations.yml'
+      - '.github/actions/docker-hub-mirror/**'
       - '.squawk.toml'
   pull_request:
     paths:
@@ -74,6 +75,7 @@ on:
       - 'tests/test_canvas_viewer_postgres_integration.py'
       - 'scripts/schema-snapshot.sh'
       - '.github/workflows/db-migrations.yml'
+      - '.github/actions/docker-hub-mirror/**'
       - '.squawk.toml'
   workflow_dispatch:
 
@@ -214,8 +216,13 @@ jobs:
       # so the stock postgres:15 image fails on CREATE EXTENSION vector; this
       # image bundles the extension. (The audit DB is postgres:16 in prod and
       # is covered by the `artifact` job below, which pins each family's major.)
+      #
+      # Pulled through mirror.gcr.io, Google's Docker Hub cache, by name: the
+      # runner starts service containers before any step, so the engine-level
+      # mirror in .github/actions/docker-hub-mirror cannot reach this pull, and
+      # Docker Hub's per-IP anonymous limit failed it on 2026-10-09.
       postgres:
-        image: pgvector/pgvector:pg15
+        image: mirror.gcr.io/pgvector/pgvector:pg15
         env:
           POSTGRES_PASSWORD: ci
           POSTGRES_USER: ci
@@ -291,6 +298,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
+      - uses: ./.github/actions/docker-hub-mirror
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'

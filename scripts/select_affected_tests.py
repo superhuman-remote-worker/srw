@@ -85,6 +85,7 @@ FULL_SUITE_TRIGGERS = (
     "src/mcp_server/requirements.txt",
     "src/vm_controller/requirements.txt",
     ".github/workflows/",
+    ".github/actions/",
     ".squawk.toml",
     "scripts/select_affected_tests.py",
     "tests/select_affected_tests_data",
