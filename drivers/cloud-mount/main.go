@@ -95,7 +95,13 @@ func run(args []string, stderr io.Writer) int {
 	<-signals
 	s.logf("stopping: draining for up to %ds", plan.DrainSeconds)
 	stopControl()
-	<-controlDone
+	// A request being answered ends with its context; never let a stuck one
+	// eat the grace period the shutdown drain needs.
+	select {
+	case <-controlDone:
+	case <-time.After(controlStopWait):
+		s.logf("the control loop did not stop in %s; going on", controlStopWait)
+	}
 	pending, complete := s.shutdown(cancel, &workers)
 	if complete {
 		s.logf("stopped: every upload flushed")
@@ -110,9 +116,13 @@ func run(args []string, stderr io.Writer) int {
 	return 0
 }
 
-// waitForPlan reads the plan, waiting for its (optional) ConfigMap volume
-// to fill. A missing or broken plan is logged and waited out, never a crash
-// loop; nil means a stop signal came first.
+// controlStopWait bounds the wait for the control loop at shutdown.
+const controlStopWait = 5 * time.Second
+
+// waitForPlan reads the plan. The ConfigMap volume is not optional, so a
+// missing or broken plan is one the kubelet has not finished writing, or a
+// bad one: it is logged and waited out, never a crash loop; nil means a stop
+// signal came first.
 func waitForPlan(path string, signals <-chan os.Signal, stderr io.Writer) *Plan {
 	logged := ""
 	for {

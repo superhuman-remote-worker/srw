@@ -83,6 +83,16 @@ func (b *statusBoard) set(index int, state, reason string) {
 	b.write(status)
 }
 
+// retry counts another attempt of a mount that failed, keeping its state
+// and last reason.
+func (b *statusBoard) retry(index int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	status := b.all[index]
+	status.Attempts++
+	b.write(status)
+}
+
 func (b *statusBoard) ack(index int, refresh bool, ack Ack) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

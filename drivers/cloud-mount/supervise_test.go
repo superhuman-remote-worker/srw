@@ -189,6 +189,11 @@ func TestABadCredentialIsReportedAndNeverMounted(t *testing.T) {
 	if h.runner.startCount() != 0 {
 		t.Fatal("rclone mounted with a refused credential")
 	}
+	// Retried, it keeps its last reason rather than flipping back to pending.
+	eventually(t, "attempts counted", func() bool { return h.statusFile(t, 0).Attempts >= 2 })
+	if status := h.statusFile(t, 0); status.State != stateUnavailable || status.Reason != reasonCredentialRejected {
+		t.Fatalf("a retried mount lost its reason: %+v", status)
+	}
 	// The credential is fixed (say the remote recovered): the next try mounts.
 	h.runner.mu.Lock()
 	h.runner.results["lsjson"] = result{}
@@ -397,4 +402,61 @@ func TestWaitForPlanGivesWayToAStop(t *testing.T) {
 	if !strings.Contains(stderr.String(), "no usable plan yet") {
 		t.Fatalf("stderr %q", stderr.String())
 	}
+}
+
+func TestAControlRequestIsOnlyEverASmallRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "plain")
+	os.WriteFile(plain, []byte("n-1\n"), 0o644)
+	if got, err := readControl(plain); err != nil || got != "n-1\n" {
+		t.Fatalf("a plain request: %q %v", got, err)
+	}
+	secret := filepath.Join(dir, "secret")
+	os.WriteFile(secret, []byte("n-secret"), 0o600)
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(secret, link); err != nil {
+		t.Fatal(err)
+	}
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	big := filepath.Join(dir, "big")
+	os.WriteFile(big, []byte(strings.Repeat("a", maxControlBytes+1)), 0o644)
+	sub := filepath.Join(dir, "sub")
+	os.Mkdir(sub, 0o755)
+	for _, path := range []string{link, fifo, big, sub} {
+		done := make(chan error, 1)
+		go func(path string) {
+			_, err := readControl(path)
+			done <- err
+		}(path)
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("%s was read as a request", filepath.Base(path))
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s blocked the read", filepath.Base(path))
+		}
+	}
+}
+
+func TestAFifoInTheControlDirectoryNeverStallsTheLoop(t *testing.T) {
+	h := newHarness(t, testPlan())
+	h.mounts.set("/srw/cloud/project", true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.s.worker(ctx, h.s.plan.Mounts[0])
+	eventually(t, "mounted", func() bool { return h.statusFile(t, 0).State == stateMounted })
+	if err := syscall.Mkfifo(filepath.Join(h.dir, "control", "drain"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	go h.s.control(ctx)
+	time.Sleep(50 * time.Millisecond)
+	os.WriteFile(filepath.Join(h.dir, "control", "refresh"), []byte("r-9"), 0o644)
+	eventually(t, "the refresh is still answered", func() bool {
+		ack := h.statusFile(t, 0).Refresh
+		return ack != nil && ack.Nonce == "r-9"
+	})
 }

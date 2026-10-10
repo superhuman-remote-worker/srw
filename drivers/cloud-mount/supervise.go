@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -69,12 +70,21 @@ func (s *supervisor) socket(m Mount) string {
 	return filepath.Join(s.runDir, "rc-"+strconv.Itoa(m.Index)+".sock")
 }
 
-// worker keeps one mount up until ctx ends.
+// worker keeps one mount up until ctx ends. A mount that failed stays
+// unavailable with its last reason while it is retried, so a reader never
+// sees it flip back to pending between attempts; it is pending only before
+// its first attempt and after a mount that came up was lost.
 func (s *supervisor) worker(ctx context.Context, m Mount) {
 	backoff := s.backoffMin
+	lastReason := ""
 	for ctx.Err() == nil {
-		s.board.set(m.Index, statePending, "")
+		if lastReason == "" {
+			s.board.set(m.Index, statePending, "")
+		} else {
+			s.board.retry(m.Index)
+		}
 		reason := s.attempt(ctx, m)
+		lastReason = reason
 		if ctx.Err() != nil {
 			return
 		}
@@ -133,8 +143,9 @@ func (s *supervisor) attempt(ctx context.Context, m Mount) string {
 	return ""
 }
 
-// configReady waits for the credential file, which the Pod mounts from an
-// optional Secret.
+// configReady waits for the credential file. The Pod's Secret volume is
+// not optional (the kubelet starts the container only once it exists), so
+// this covers a file the kubelet has not finished writing.
 func (s *supervisor) configReady(ctx context.Context) bool {
 	deadline := time.Now().Add(s.configWait)
 	for {
@@ -261,6 +272,40 @@ func (s *supervisor) stopChild(c child) {
 
 var nonceRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
+// maxControlBytes bounds what is read of a control request: a nonce.
+const maxControlBytes = 128
+
+var errNotARequest = errors.New("not a regular request file")
+
+// readControl reads one request the workspace dropped. The workspace owns
+// the directory, so the file may be anything: a link is never followed
+// (O_NOFOLLOW), a FIFO never blocks the loop (O_NONBLOCK), and only a small
+// regular file is read.
+func readControl(path string) (string, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return "", err
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxControlBytes {
+		return "", errNotARequest
+	}
+	buf := make([]byte, maxControlBytes+1)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	if n > maxControlBytes {
+		return "", errNotARequest
+	}
+	return string(buf[:n]), nil
+}
+
 // control answers requests the workspace drops into the control directory:
 // a file "drain" or "refresh" holding a nonce. The workspace can only ask
 // for a flush or a directory refresh, both of which rclone does by itself
@@ -279,11 +324,11 @@ func (s *supervisor) control(ctx context.Context) {
 		case <-ticker.C:
 		}
 		for _, command := range []string{"drain", "refresh"} {
-			raw, err := os.ReadFile(filepath.Join(s.controlDir, command))
+			raw, err := readControl(filepath.Join(s.controlDir, command))
 			if err != nil {
 				continue
 			}
-			nonce := strings.TrimSpace(string(raw))
+			nonce := strings.TrimSpace(raw)
 			if !nonceRE.MatchString(nonce) || answered[command] == nonce {
 				continue
 			}
