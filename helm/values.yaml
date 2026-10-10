@@ -289,8 +289,10 @@ connectors:
   #
   # Such a Pod's workspace runs WITHOUT FUSE: no /dev/fuse, SYS_ADMIN or
   # privilege, so a user can no longer run sshfs or rclone mount in its
-  # shell. VM, lite and job workspaces, OpenCloud mounts, officers and
-  # protected sessions keep the in-workspace path and workspace.fuse.
+  # shell. VM, lite and job workspaces, OpenCloud mounts and officers keep
+  # the in-workspace path and workspace.fuse. A protected session keeps
+  # workspace.fuse for its capture overlay; its read-only lower comes from
+  # the sidecars when its reader grant is active as the Pod is created.
   #
   # Needs: the release namespace admits privileged Pods (the opener), and
   # the orchestrator may create Secrets there (the chart grants create only).
@@ -324,7 +326,8 @@ connectors:
   # Needs servicePods.enabled for its pods.
   customDrivers:
     # -- Let images outside drivers.trustedRepositories have privilege too
-    # (the in-pod plane, when it arrives). Off: only trusted repositories.
+    # (for an in-pod driver; the in-pod plane above serves only SRW's own
+    # cloud mounts). Off: only trusted repositories.
     privileged: false
     # -- A bind-time pod's activeDeadlineSeconds: the longest one driver
     # operation (bind, revoke, check, spec) may run, canary wait included.
