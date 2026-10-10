@@ -7,7 +7,8 @@ Every name follows the one rule all connectors do
 checked whenever the variables are written; ``generic`` keeps any other
 credential field it is given. ``credentials`` requires its variables, merges
 an edit into the stored set, and is never published. A row saved before the
-rule is delivered without a refused name, and its Test says which.
+rule is delivered without a refused name and its Test says which; an edit of
+a ``credentials`` connector's variables drops it, with a notice.
 """
 
 from __future__ import annotations
@@ -33,9 +34,9 @@ from shared.connectors.env_names import connector_env_problem
 from shared.connectors.envelope import DriverError, DriverOutcome, api_check_result
 from shared.credential_connectors import normalize_credential_env, split_credential_env
 
-#: How a ``credentials`` connector drops a stored variable: an edit keeps
-#: every one it does not name.
-RECREATE = "Create the connector again without it: an edit keeps every stored variable"
+#: How a ``credentials`` connector drops a stored name it may no longer set:
+#: any edit of its variables drops it.
+EDIT_TO_DROP = "Save any of its variables again to drop it"
 
 
 def _refused_result(variables: Any, fix: str) -> dict[str, Any] | None:
@@ -141,6 +142,7 @@ class CredentialsDriver(EnvironmentDriver):
 
         credentials = self.stored_credentials(draft, existing)
         self._refuse_publish(draft.is_global is True)
+        notices: tuple[str, ...] = ()
         if credentials is not None:
             # An edit names only the variables it changes; the rest stay.
             try:
@@ -148,22 +150,25 @@ class CredentialsDriver(EnvironmentDriver):
                     credentials.get("env_vars", {}), required=True
                 )
                 previous = (existing.get("credentials") or {}).get("env_vars", {})
-                _kept, refused = split_credential_env(previous)
-                if refused:
-                    # Saved before the rule: the edit would store it again.
-                    raise ValueError(
-                        "; ".join(refused.values())
-                        + f". It was saved before this rule. {RECREATE}."
-                    )
+                # A stored name saved before the rule is never delivered: the
+                # edit drops it, and the response says so.
+                kept, refused = split_credential_env(previous)
                 credentials = {
                     "env_vars": normalize_credential_env(
-                        {**previous, **values}, required=True
+                        {**kept, **values}, required=True
                     )
                 }
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            notices = tuple(
+                f"{name} was dropped from the stored variables: {why}"
+                for name, why in refused.items()
+            )
         return NormalizedConnector(
-            draft.connection_url, self.no_config(draft, existing), credentials
+            draft.connection_url,
+            self.no_config(draft, existing),
+            credentials,
+            notices=notices,
         )
 
     async def check(
@@ -173,7 +178,7 @@ class CredentialsDriver(EnvironmentDriver):
         # always was: it cannot come from the API. A name refused since it
         # was saved is the connector's to fix.
         split_credential_env(credentials.get("env_vars", {}), required=True)
-        return _refused_result(credentials.get("env_vars"), RECREATE) or {
+        return _refused_result(credentials.get("env_vars"), EDIT_TO_DROP) or {
             "status": "ok",
             "message": "Credential variables are valid; provider access is tested in the workspace",
         }

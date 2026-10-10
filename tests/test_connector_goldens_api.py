@@ -872,15 +872,22 @@ CASES.update(
         "update/credentials/reserved_name": _update(
             _stored("credentials"), {"credentials": {"env_vars": {"HOME": "x"}}}
         ),
-        # A row saved before the one rule: an edit of its variables would
-        # store the refused name again, so it is refused with the reason;
-        # an edit that leaves the variables alone is not.
-        "update/credentials/stored_code_hook_refused": _update(
+        # A row saved before the one rule: an edit of its variables drops
+        # the refused name (never delivered) and the response says so; an
+        # edit that leaves the variables alone keeps the row as it is.
+        "update/credentials/stored_code_hook_dropped_with_notice": _update(
             _stored(
                 "credentials",
                 credentials={"env_vars": {"VENDOR_USER": "a", "NODE_OPTIONS": "x"}},
             ),
             {"credentials": {"env_vars": {"VENDOR_PASSWORD": "rotated"}}},
+        ),
+        "update/credentials/submitted_code_hook_refused": _update(
+            _stored(
+                "credentials",
+                credentials={"env_vars": {"VENDOR_USER": "a", "NODE_OPTIONS": "x"}},
+            ),
+            {"credentials": {"env_vars": {"NODE_OPTIONS": "y"}}},
         ),
         "update/credentials/stored_code_hook_kept_without_variables": _update(
             _stored(

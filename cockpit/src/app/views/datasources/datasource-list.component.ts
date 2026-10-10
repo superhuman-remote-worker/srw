@@ -4074,7 +4074,11 @@ export class DatasourceListComponent implements OnInit {
         next: (result) => {
           this.isSaving.set(false);
           if (result) {
-            this.successMessage.set(this.transloco.translate('datasources.messages.updated'));
+            // What the update changed beyond what was asked (a stored
+            // variable no connector may set, dropped) is the server's text.
+            const notices = (result.notices ?? []).join(' ');
+            const updated = this.transloco.translate('datasources.messages.updated');
+            this.successMessage.set(notices ? `${updated} ${notices}` : updated);
             this.closeForm();
             this.refresh();
           } else {

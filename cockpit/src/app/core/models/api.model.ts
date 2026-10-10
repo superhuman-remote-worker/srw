@@ -482,6 +482,9 @@ export interface Datasource {
   /** A registered image driver's connector (D6): the variables its driver
    *  declares its bind sets in the workspace, shown before it is attached. */
   driver_env_names?: string[];
+  /** What an update changed beyond what was asked (an update response only):
+   *  e.g. a stored variable no connector may set, dropped. */
+  notices?: string[];
   cli_hint: string | null;
   default_branch: string | null;
   config?: DatasourceConfig;

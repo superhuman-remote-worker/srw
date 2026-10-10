@@ -267,6 +267,16 @@ describe('Credentials connector', () => {
     }));
   });
 
+  it('shows what an update dropped from the stored variables', () => {
+    const {component, api} = createComponent(false);
+    const dropped = 'NODE_OPTIONS was dropped from the stored variables: why';
+    api.updateDatasource.mockReturnValue(of({id: 'email-1', notices: [dropped]}));
+    component.openEditForm(emailDatasource({type: 'credentials', env_var_names: ['API_KEY']}));
+    component.envVars = [{key: 'API_KEY', value: 'rotated'}];
+    component.saveForm();
+    expect(component.successMessage()).toContain(dropped);
+  });
+
   it('keeps stored credentials on an edit without replacement values', () => {
     const {component, api} = createComponent(false);
     component.openEditForm(emailDatasource({type: 'credentials', env_var_names: ['API_KEY']}));

@@ -6242,7 +6242,7 @@
     },
     "calls": []
   },
-  "update/credentials/stored_code_hook_refused": {
+  "update/credentials/stored_code_hook_dropped_with_notice": {
     "request": {
       "method": "PUT",
       "path": "/api/datasources/d5000002-0000-0000-0000-000000000002",
@@ -6254,9 +6254,73 @@
         }
       }
     },
+    "status": 200,
+    "body": {
+      "id": "d5000002-0000-0000-0000-000000000002",
+      "name": "Vendor login",
+      "description": "Vendor portal account",
+      "type": "credentials",
+      "connection_url": null,
+      "config": {},
+      "cli_hint": null,
+      "default_branch": null,
+      "read_only": null,
+      "created_by": "00000000-0000-0000-0000-0000000000c1",
+      "is_global": false,
+      "scope_mode": "all",
+      "auto_attach": false,
+      "policy_revision": 1,
+      "created_at": "2026-01-02T03:04:05Z",
+      "updated_at": "2026-01-02T03:04:05Z",
+      "project_ids": [],
+      "env_var_names": [
+        "VENDOR_PASSWORD",
+        "VENDOR_USER"
+      ],
+      "notices": [
+        "NODE_OPTIONS was dropped from the stored variables: NODE_OPTIONS is not a variable a connector may set: tools read it to run code or load their config"
+      ]
+    },
+    "calls": [
+      {
+        "call": "update_datasource",
+        "args": [
+          "d5000002-0000-0000-0000-000000000002"
+        ],
+        "kwargs": {
+          "name": null,
+          "description": null,
+          "connection_url": null,
+          "credentials": {
+            "env_vars": {
+              "VENDOR_USER": "a",
+              "VENDOR_PASSWORD": "rotated"
+            }
+          },
+          "cli_hint": null,
+          "default_branch": null,
+          "config": null,
+          "is_global": null,
+          "read_only": null
+        }
+      }
+    ]
+  },
+  "update/credentials/submitted_code_hook_refused": {
+    "request": {
+      "method": "PUT",
+      "path": "/api/datasources/d5000002-0000-0000-0000-000000000002",
+      "body": {
+        "credentials": {
+          "env_vars": {
+            "NODE_OPTIONS": "y"
+          }
+        }
+      }
+    },
     "status": 400,
     "body": {
-      "detail": "NODE_OPTIONS is not a variable a connector may set: tools read it to run code or load their config. It was saved before this rule. Create the connector again without it: an edit keeps every stored variable."
+      "detail": "NODE_OPTIONS is not a variable a connector may set: tools read it to run code or load their config"
     },
     "calls": []
   },

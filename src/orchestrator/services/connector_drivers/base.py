@@ -135,13 +135,16 @@ class NormalizedConnector:
     """What a create or update stores.  ``None`` leaves a stored value alone.
 
     ``reindex_required`` asks the KB driver's write effect for a full
-    rebuild.
+    rebuild. ``notices`` are what the write changed beyond what was asked
+    (a stored variable no connector may set, dropped); the response carries
+    them.
     """
 
     connection_url: str | None
     config: dict[str, Any] | None
     credentials: dict[str, Any] | None
     reindex_required: bool = False
+    notices: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -804,7 +804,10 @@ async def update_datasource(
                 ),
                 request=request,
             )
-        return redact_datasource(updated_ds)
+        response = redact_datasource(updated_ds)
+        if normalized.notices:
+            response["notices"] = list(normalized.notices)
+        return response
     except DatasourceScopeAuthorizationError as exc:
         raise HTTPException(
             status_code=403,
