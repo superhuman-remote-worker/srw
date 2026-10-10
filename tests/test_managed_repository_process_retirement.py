@@ -94,3 +94,125 @@ async def test_whole_workspace_retirement_composes_valid_shell(monkeypatch):
     assert "; ;" not in commands[0]
     assert " all " in commands[0]
     assert " zero " in commands[0]
+
+
+# The credential scrub of a workspace a refused resume keeps (connector
+# drivers decision 34).
+
+
+def test_the_credential_scrub_is_valid_shell():
+    command = subject.workspace_credential_scrub_command()
+
+    syntax = subprocess.run(
+        ["bash", "-n"], input=command, text=True, capture_output=True, check=False
+    )
+    assert syntax.returncode == 0, syntax.stderr
+    assert "; ;" not in command
+    # The managed ssh-agents are retired as a terminal teardown retires them.
+    assert " all " in command
+
+
+@pytest.mark.skipif(
+    not __import__("os").path.exists("/usr/bin/python3"),
+    reason="the workspace programs run as /usr/bin/python3",
+)
+def test_the_credential_scrub_removes_srw_material_and_keeps_the_users(
+    monkeypatch, tmp_path
+):
+    import json
+    import os
+
+    from shared.runtime.core.credential_env import INSTALL_CREDENTIAL_FILES
+
+    # The process classifier is the terminal teardown's own, covered above;
+    # this exercises what the scrub removes from the home.
+    monkeypatch.setattr(subject, "_whole_workspace_retirement", lambda _home: "true")
+    home = tmp_path / "home"
+    home.mkdir()
+    synced = subprocess.run(
+        [
+            "/usr/bin/python3",
+            "-I",
+            "-c",
+            INSTALL_CREDENTIAL_FILES,
+            str(home),
+            "files-0123",
+            "sync",
+        ],
+        input=json.dumps(
+            {
+                "files": [
+                    {
+                        "name": "kubeconfig",
+                        "content": "secret",
+                        "mode": 0o600,
+                        "link": ".kube/config",
+                    },
+                    {
+                        "name": "token",
+                        "content": "secret",
+                        "mode": 0o600,
+                        "link": ".config/tool/token",
+                    },
+                ],
+                "env": [{"name": "KUBECONFIG", "files": ["kubeconfig"]}],
+            }
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert synced.returncode == 0, synced.stderr
+    srw = [
+        ".srw-credentials/leases/0f0f",
+        ".srw-credentials/git/config",
+        ".ssh/srw-managed/config.d/a.conf",
+        ".ssh/repo_legacy",
+    ]
+    user = [
+        ".ssh/id_ed25519",
+        ".ssh/config",
+        ".gitconfig",
+        ".config/tool/settings",
+        "workspace/notes.md",
+    ]
+    for relative in srw + user:
+        (home / relative).parent.mkdir(parents=True, exist_ok=True)
+        (home / relative).write_text("x")
+
+    scrubbed = subprocess.run(
+        ["bash", "-c", subject.workspace_credential_scrub_command(str(home))],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert scrubbed.returncode == 0, scrubbed.stderr
+    remaining = {
+        os.path.relpath(os.path.join(root, name), home)
+        for root, _dirs, files in os.walk(home)
+        for name in files
+    }
+    assert remaining == set(user)
+    # The links it placed are gone with the store; nothing dangles.
+    assert not os.path.lexists(home / ".kube" / "config")
+    assert not os.path.lexists(home / ".config" / "tool" / "token")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fingerprint", ["", "MD5:aa", None])
+async def test_the_credential_scrub_needs_an_exact_pin(monkeypatch, fingerprint):
+    class AsyncSSH:
+        @staticmethod
+        async def connect(*_args, **_kwargs):  # pragma: no cover - must not run
+            raise AssertionError("connected without a pinned host key")
+
+    monkeypatch.setattr(subject, "asyncssh", AsyncSSH())
+    monkeypatch.setattr(subject, "resolve_ssh_key_path", lambda: "/test/key")
+
+    assert (
+        await subject.scrub_workspace_credentials(
+            host="192.0.2.1", port=30022, host_key_fingerprint=fingerprint
+        )
+        is False
+    )

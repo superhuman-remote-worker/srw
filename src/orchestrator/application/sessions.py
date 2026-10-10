@@ -741,6 +741,7 @@ def unit_claim_bundle_dependencies(
             completion_composition.job_completion_dependencies,
             resources,
         ),
+        completion_commands_enabled=lambda: resources.settings.completion_commands_enabled,
     )
 
 

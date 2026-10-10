@@ -1039,7 +1039,9 @@ async def test_worker_bundle_reuses_job_start_builder_and_rechecks_lease(monkeyp
     }
 
 
-def _refusing_worker_claim(monkeypatch, orch_main, built, *, checkpoint=False):
+def _refusing_worker_claim(
+    monkeypatch, orch_main, built, *, checkpoint=False, commands_on=True
+):
     """A leased worker claim whose start bundle returns ``built``."""
 
     row = dict(LEASED_ROW, unit_kind="worker_batch")
@@ -1055,6 +1057,7 @@ def _refusing_worker_claim(monkeypatch, orch_main, built, *, checkpoint=False):
     # Whether the job ran before: the claim resumed it, and a refusal keeps
     # its workspace.
     db.job_has_checkpoint = AsyncMock(return_value=checkpoint)
+    db.merge_job_context = AsyncMock()
     monkeypatch.setattr(access_module, "require_internal", AsyncMock())
     monkeypatch.setattr(orch_main.app.state.resources, "postgres_db", db)
     monkeypatch.setattr(
@@ -1072,14 +1075,26 @@ def _refusing_worker_claim(monkeypatch, orch_main, built, *, checkpoint=False):
             orch_main.app.state.resources
         ),
         refuse_job_start=refuse,
+        completion_commands_enabled=lambda: commands_on,
     )
     return db, attest, refuse, dependencies
+
+
+@pytest.fixture
+def scrub(monkeypatch):
+    from orchestrator.services import managed_repository_process_retirement
+
+    run = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        managed_repository_process_retirement, "scrub_workspace_credentials", run
+    )
+    return run
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("checkpoint", [False, True], ids=["start", "resume"])
 async def test_a_refused_worker_start_fails_the_job_under_the_claim_lease(
-    monkeypatch, checkpoint
+    monkeypatch, checkpoint, scrub
 ):
     """Connector drivers decision 34: the build stays read-only, and the
     refusal is admitted as this lease's terminal report."""
@@ -1111,6 +1126,17 @@ async def test_a_refused_worker_start_fails_the_job_under_the_claim_lease(
         lease_token=7,
     )
     db.job_has_checkpoint.assert_awaited_once_with(UNIT_ID)
+    if checkpoint:
+        # A revoked resume keeps the workspace and scrubs SRW's credentials
+        # from it, through the endpoint this claim attested.
+        scrub.assert_awaited_once_with(
+            host="10.0.0.9", port=30022, host_key_fingerprint=WORKSPACE_FINGERPRINT
+        )
+        db.merge_job_context.assert_awaited_once()
+    else:
+        # A fresh start is torn down whole.
+        scrub.assert_not_awaited()
+        db.merge_job_context.assert_not_awaited()
     # No credential crosses the boundary: the confirming attestation and the
     # final lease recheck never run.
     assert attest.await_count == 1
@@ -1118,6 +1144,58 @@ async def test_a_refused_worker_start_fails_the_job_under_the_claim_lease(
         "SELECT EXISTS (SELECT 1 FROM run_queue" in call.args[0]
         for call in db.conn.fetchval.await_args_list
     )
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_that_revokes_nothing_keeps_the_resumed_workspace_whole(
+    monkeypatch, scrub
+):
+    from orchestrator import main as orch_main
+
+    refusal = job_start_bundle.JobStartRefusal("unrouted_model", "no endpoint")
+    _db, _attest, refuse, dependencies = _refusing_worker_claim(
+        monkeypatch, orch_main, refusal, checkpoint=True
+    )
+
+    with pytest.raises(HTTPException):
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=dependencies,
+        )
+
+    assert refuse.await_args.kwargs["resume"] is True
+    scrub.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_with_completion_commands_off_a_worker_refusal_only_refuses_the_claim(
+    monkeypatch, scrub
+):
+    from orchestrator import main as orch_main
+
+    refusal = job_start_bundle.JobStartRefusal(
+        "connector_unavailable", "connector_unavailable"
+    )
+    db, _attest, refuse, dependencies = _refusing_worker_claim(
+        monkeypatch, orch_main, refusal, checkpoint=True, commands_on=False
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=dependencies,
+        )
+
+    assert exc.value.status_code == 409
+    db.job_has_checkpoint.assert_not_awaited()
+    refuse.assert_not_awaited()
+    scrub.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1145,7 +1223,7 @@ async def test_a_worker_bundle_that_is_not_ready_is_not_a_refusal(monkeypatch):
 @pytest.mark.parametrize("checkpoint", [False, True], ids=["start", "resume"])
 @pytest.mark.parametrize("definitive", [True, False], ids=["refused", "pending"])
 async def test_a_bind_refused_in_the_claim_transaction_fails_the_job(
-    monkeypatch, definitive, checkpoint
+    monkeypatch, definitive, checkpoint, scrub
 ):
     """A bind or provider mint that failed for good refuses the claim in its
     transaction; the job then fails under the same lease. A pending one only
@@ -1191,8 +1269,10 @@ async def test_a_bind_refused_in_the_claim_transaction_fails_the_job(
             resume=checkpoint,
             lease_token=7,
         )
+        assert scrub.await_count == (1 if checkpoint else 0)
     else:
         refuse.assert_not_awaited()
+        scrub.assert_not_awaited()
 
 
 def test_the_claim_bundle_routes_refusals_to_the_completion_ledger():

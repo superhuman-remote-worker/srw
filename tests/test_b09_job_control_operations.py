@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -10,6 +11,10 @@ import pytest
 from fastapi import HTTPException
 
 from orchestrator.services import job_control_delivery as job_control_delivery_module
+from orchestrator.services import (
+    managed_repository_process_retirement,
+    refused_workspace_credentials,
+)
 from orchestrator.services.grant_enforcement import GrantDenied
 from orchestrator.services.job_control_delivery import (
     JobDeliveryDependencies,
@@ -578,15 +583,17 @@ def _resume_refusal(case: str, *, commands_on: bool, monkeypatch):
             side_effect=lambda job, co, **kw: (
                 co or {},
                 SimpleNamespace(
+                    # Only ``invalid`` reaches this check on a resume: a
+                    # failed or missing workspace went back to the dispatcher.
                     ready=False,
-                    state="failed" if definitive else "pending",
+                    state="invalid" if definitive else "pending",
                     effective_backend="sandbox",
-                    reason="sandbox_provisioning_failed" if definitive else None,
+                    reason="workspace_contract_invalid" if definitive else None,
                     safe_projection=lambda: {},
                 ),
             )
         )
-        message = "Workspace contract refused dispatch: sandbox_provisioning_failed"
+        message = "Workspace contract refused dispatch: workspace_contract_invalid"
     elif case in {"connector_bind_refused", "connector_bind_pending"}:
         from orchestrator.services import (
             connector_bind_time,
@@ -652,8 +659,10 @@ async def test_a_refused_resume_fails_the_job_through_the_completion_ledger(
     assert call.args == (JOB_ID,)
     assert call.kwargs["reason"] == case.split("/")[0]
     assert call.kwargs["agent_id"] == "agent-1"
-    # A refused resume keeps the paused job's workspace.
-    assert call.kwargs["resume"] is True
+    # A refused resume keeps the paused job's workspace, but a revocation
+    # that no attested endpoint can scrub (none here) tears it down.
+    revocation = case.split("/")[0] in refused_workspace_credentials.REVOCATION_REASONS
+    assert call.kwargs["resume"] is not revocation
     if message is None:
         assert "lite tier" in call.kwargs["message"]
         assert "app" in call.kwargs["message"]
@@ -721,6 +730,168 @@ async def test_a_resume_that_must_wait_is_not_refused(case, monkeypatch):
 
     dependencies.refuse_job_start.assert_not_awaited()
     dependencies.store.update_job_status.assert_not_awaited()
+
+
+# A revoked resume keeps the workspace but scrubs SRW's credentials from it,
+# through the endpoint the claim attested (owner decision, 2026-10-10).
+
+FINGERPRINT = "SHA256:" + "f" * 43
+REVOKING_RESUME_REFUSALS = [
+    "connector_unavailable",
+    "grant_denied",
+    "grant_denied/frozen",
+    "connector_bind_refused",
+]
+
+
+def _attested(dependencies):
+    attestation = SimpleNamespace(
+        host="10.0.0.9",
+        pod_ip="10.0.0.9",
+        port=30022,
+        ssh_host_key_fingerprint=FINGERPRINT,
+        workspace_generation="gen-1",
+        runtime_incarnation="pod-1",
+    )
+    authority = SimpleNamespace(
+        attestation=attestation, owner=SimpleNamespace(kind="job", id=JOB_ID)
+    )
+    return dataclasses.replace(
+        dependencies,
+        attest_pinned_k8s_job_workspace=AsyncMock(
+            side_effect=lambda job: (job, authority)
+        ),
+        store=SimpleNamespace(
+            update_job_status=AsyncMock(),
+            fetchrow=AsyncMock(return_value=None),
+            merge_job_context=AsyncMock(),
+        ),
+    )
+
+
+@pytest.fixture
+def scrub(monkeypatch):
+    run = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        managed_repository_process_retirement, "scrub_workspace_credentials", run
+    )
+    return run
+
+
+async def _resume(dependencies):
+    return await resume_job_on_agent(
+        {"id": JOB_ID, "execution_lane": "pinned", "status": "paused"},
+        {"id": "agent-1", "pod_ip": "10.0.0.1", "pod_port": 8001},
+        dependencies=dependencies,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", REVOKING_RESUME_REFUSALS)
+async def test_a_revoked_resume_keeps_and_scrubs_the_attested_workspace(
+    case, monkeypatch, scrub
+):
+    dependencies, _message = _resume_refusal(
+        case, commands_on=True, monkeypatch=monkeypatch
+    )
+    dependencies = _attested(dependencies)
+
+    assert not await _resume(dependencies)
+
+    assert dependencies.refuse_job_start.await_args.kwargs["resume"] is True
+    scrub.assert_awaited_once_with(
+        host="10.0.0.9", port=30022, host_key_fingerprint=FINGERPRINT
+    )
+    dependencies.store.merge_job_context.assert_awaited_once_with(
+        JOB_ID,
+        {
+            refused_workspace_credentials.SCRUB_CONTEXT_KEY: {
+                "reason": case.split("/")[0],
+                "outcome": "scrubbed",
+            }
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_scrub_never_blocks_the_refusal(monkeypatch, scrub):
+    scrub.return_value = False
+    dependencies, _message = _resume_refusal(
+        "connector_unavailable", commands_on=True, monkeypatch=monkeypatch
+    )
+    dependencies = _attested(dependencies)
+
+    assert not await _resume(dependencies)
+
+    dependencies.refuse_job_start.assert_awaited_once()
+    record = dependencies.store.merge_job_context.await_args.args[1]
+    assert record[refused_workspace_credentials.SCRUB_CONTEXT_KEY]["outcome"] == (
+        "failed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_that_was_not_admitted_scrubs_nothing(monkeypatch, scrub):
+    dependencies, _message = _resume_refusal(
+        "connector_unavailable", commands_on=True, monkeypatch=monkeypatch
+    )
+    dependencies = dataclasses.replace(
+        _attested(dependencies), refuse_job_start=AsyncMock(return_value=False)
+    )
+
+    assert not await _resume(dependencies)
+
+    scrub.assert_not_awaited()
+    dependencies.store.merge_job_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case", ["model_unavailable", "lite_config", "workspace_contract"]
+)
+async def test_other_resume_refusals_keep_everything(case, monkeypatch, scrub):
+    dependencies, _message = _resume_refusal(
+        case, commands_on=True, monkeypatch=monkeypatch
+    )
+    dependencies = _attested(dependencies)
+
+    assert not await _resume(dependencies)
+
+    assert dependencies.refuse_job_start.await_args.kwargs["resume"] is True
+    scrub.assert_not_awaited()
+    dependencies.store.merge_job_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_with_completion_commands_off_a_revoked_resume_scrubs_nothing(
+    monkeypatch, scrub
+):
+    dependencies, _message = _resume_refusal(
+        "connector_unavailable", commands_on=False, monkeypatch=monkeypatch
+    )
+    dependencies = _attested(dependencies)
+
+    assert not await _resume(dependencies)
+
+    dependencies.store.update_job_status.assert_awaited_once()
+    scrub.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_revoked_fresh_start_is_torn_down_not_scrubbed(scrub):
+    refusal = JobStartRefusal("connector_unavailable", "connector_unavailable")
+    dependencies = _refusing_delivery(
+        commands_on=True, build=AsyncMock(return_value=refusal)
+    )
+
+    assert not await dispatch_job_to_agent(
+        {"id": JOB_ID, "execution_lane": "pinned"},
+        {"id": "agent-1", "pod_ip": "10.0.0.1"},
+        dependencies=dependencies,
+    )
+
+    assert dependencies.refuse_job_start.await_args.kwargs["resume"] is False
+    scrub.assert_not_awaited()
 
 
 @pytest.mark.asyncio

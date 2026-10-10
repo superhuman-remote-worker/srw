@@ -51,6 +51,7 @@ from orchestrator.services import (
     dispatch_credentials,
     job_start_bundle,
     job_workspace_authority,
+    refused_workspace_credentials,
     session_attach_payload,
 )
 from orchestrator.services.job_workspace_runtime import (
@@ -118,6 +119,9 @@ class UnitClaimBundleDependencies:
     #: (``job_completion.refuse_job_start``, connector drivers decision 34).
     #: It admits nothing while completion commands are off.
     refuse_job_start: Callable[..., Awaitable[bool]]
+    #: Whether completion commands own job status, read at each refusal: only
+    #: then is a refused worker start failed through the ledger.
+    completion_commands_enabled: Callable[[], bool]
     recovery_store: Any = None
     #: Read-only pooled-executor attestation (K8s Pod UID + pool membership).
     #: Injected so routes/services stay testable without a cluster. ``None``
@@ -183,21 +187,38 @@ async def _refuse_worker_start(
     reason: str,
     message: str,
     lease_token: int,
+    job: dict[str, Any],
+    attestation: Any,
     dependencies: UnitClaimBundleDependencies,
 ) -> None:
     """Fail a worker job whose start was refused for good, under this lease.
 
-    A job with a checkpoint has run before, so this claim resumed it and its
-    workspace is kept; a first start's workspace is torn down (the pinned
-    lane's resume test, ``resume_lane_applies``, asks the same question).
+    Only while completion commands own job status; otherwise the claimant
+    keeps its retries. A job with a checkpoint has run before, so this claim
+    resumed it and its workspace is kept (scrubbed of SRW's credentials when
+    the refusal revokes access, through the endpoint this claim attested); a
+    first start's workspace is torn down. The pinned lane's resume test,
+    ``resume_lane_applies``, asks the same question.
     """
-    await dependencies.refuse_job_start(
+    if not dependencies.completion_commands_enabled():
+        return
+    plan = refused_workspace_credentials.RefusedResume(keep_workspace=False)
+    if await dependencies.db.job_has_checkpoint(unit_id):
+        plan = refused_workspace_credentials.plan_refused_resume(
+            reason,
+            job=job,
+            target=refused_workspace_credentials.attested_scrub_target(attestation),
+        )
+    if await dependencies.refuse_job_start(
         unit_id,
         reason=reason,
         message=message,
-        resume=await dependencies.db.job_has_checkpoint(unit_id),
+        resume=plan.keep_workspace,
         lease_token=lease_token,
-    )
+    ):
+        await refused_workspace_credentials.scrub_refused_workspace(
+            dependencies.db, unit_id, reason=reason, plan=plan
+        )
 
 
 def _digest(value: Any) -> str:
@@ -748,6 +769,8 @@ async def _assemble_claim_bundle(
                 reason=job_start.reason,
                 message=job_start.message,
                 lease_token=lease_token,
+                job=job,
+                attestation=initial_attestation,
                 dependencies=dependencies,
             )
             raise HTTPException(status_code=409, detail="Job bundle assembly refused")
@@ -978,6 +1001,8 @@ async def _assemble_claim_bundle(
                     reason="connector_bind_refused",
                     message=str(refused.cause)[:1000],
                     lease_token=lease_token,
+                    job=job,
+                    attestation=initial_attestation,
                     dependencies=dependencies,
                 )
             raise
