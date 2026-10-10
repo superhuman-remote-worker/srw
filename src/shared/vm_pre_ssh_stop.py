@@ -35,6 +35,9 @@ _INITIAL_READY_CANDIDATE_KEYS = _CANDIDATE_KEYS | {
     "cleanup_request_id",
     "cleanup_intent_digest",
 }
+_NEVER_APP_READY_CANDIDATE_KEYS = _INITIAL_READY_CANDIDATE_KEYS | {
+    "kube_vm_ready_at_inspection",
+}
 _PROOF_KEYS = {
     "kind",
     "frozen_digest",
@@ -113,13 +116,26 @@ def valid_frozen_stop_candidate(value: object) -> bool:
     if kind == "vm_pre_ssh_stop_candidate_v1":
         if set(value) != _CANDIDATE_KEYS:
             return False
-    elif kind == "vm_initial_ready_positive_stop_candidate_v1":
+    elif kind in {
+        "vm_initial_ready_positive_stop_candidate_v1",
+        "vm_job_never_app_ready_retained_stop_candidate_v1",
+    }:
         if (
-            set(value) != _INITIAL_READY_CANDIDATE_KEYS
+            set(value)
+            != (
+                _NEVER_APP_READY_CANDIDATE_KEYS
+                if kind == "vm_job_never_app_ready_retained_stop_candidate_v1"
+                else _INITIAL_READY_CANDIDATE_KEYS
+            )
             or not _canonical_uuid(value.get("cleanup_admission_id"))
             or not _canonical_uuid(value.get("cleanup_request_id"))
             or not isinstance(value.get("cleanup_intent_digest"), str)
             or not _DIGEST.fullmatch(value["cleanup_intent_digest"])
+        ):
+            return False
+        if (
+            kind == "vm_job_never_app_ready_retained_stop_candidate_v1"
+            and type(value.get("kube_vm_ready_at_inspection")) is not bool
         ):
             return False
     else:
@@ -168,11 +184,11 @@ def valid_positive_stop_proof(
         or not isinstance(frozen_digest, str)
         or not _DIGEST.fullmatch(frozen_digest)
         or observed.get("kind")
-        != (
-            "vm_initial_ready_positive_stop_v1"
-            if frozen["kind"] == "vm_initial_ready_positive_stop_candidate_v1"
-            else "vm_pre_ssh_positive_stop_v1"
-        )
+        != {
+            "vm_initial_ready_positive_stop_candidate_v1": "vm_initial_ready_positive_stop_v1",
+            "vm_job_never_app_ready_retained_stop_candidate_v1": "vm_job_never_app_ready_retained_positive_stop_v1",
+            "vm_pre_ssh_stop_candidate_v1": "vm_pre_ssh_positive_stop_v1",
+        }[frozen["kind"]]
         or observed.get("frozen_digest") != frozen_digest
         or observed.get("pod_intent_digest") != frozen_digest
         or observed.get("pod_finalizer") != PRE_SSH_STOP_FINALIZER

@@ -582,6 +582,20 @@ def _initial_ready_parent_preflight(
     return preflight
 
 
+def _held_stop_cluster_matches(controller, authority: object) -> bool:
+    """Never accept a signed authority for a different Controller inventory."""
+    from shared.vm_cancel_retention import valid_never_app_ready_retention_authority
+
+    collector = getattr(controller, "resource_inventory_collector", None)
+    return (
+        valid_never_app_ready_retention_authority(authority)
+        and authority["namespace"] == VM_NAMESPACE
+        and collector is not None
+        and getattr(collector, "namespace", None) == VM_NAMESPACE
+        and getattr(collector, "cluster_id", None) == authority["cluster_id"]
+    )
+
+
 def _object_value(value: object, key: str, default=None):
     if isinstance(value, Mapping):
         return value.get(key, default)
@@ -4056,12 +4070,16 @@ class VMController:
         expected_vm_uid: str,
         expected_pvc_uid: str,
         parent_cleanup: Mapping | None = None,
+        held_stop_authority: Mapping | None = None,
     ) -> dict | None:
         """Read one pre-SSH launcher vector without authorizing or stopping it."""
 
         from kubernetes.client.exceptions import ApiException
         from shared.vm_pre_ssh_stop import valid_frozen_stop_candidate
-        from shared.vm_cancel_retention import valid_retention_preflight
+        from shared.vm_cancel_retention import (
+            never_app_ready_retention_authority_matches,
+            valid_retention_preflight,
+        )
 
         generation = _provision_generation(provision_generation)
         vm_name = f"agent-vm-{job_id}"
@@ -4072,7 +4090,18 @@ class VMController:
         ):
             return None
         ready_preflight = None
-        if parent_cleanup is not None:
+        held_stop = held_stop_authority is not None
+        if held_stop:
+            if (
+                not _held_stop_cluster_matches(self, held_stop_authority)
+                or not isinstance(parent_cleanup, Mapping)
+                or held_stop_authority["job_id"] != job_id
+                or held_stop_authority["provision_generation"] != generation
+                or held_stop_authority["vm_uid"] != expected_vm_uid
+                or held_stop_authority["pvc_uid"] != expected_pvc_uid
+            ):
+                return None
+        elif parent_cleanup is not None:
             ready_preflight = _initial_ready_parent_preflight(
                 parent_cleanup,
                 job_id=job_id,
@@ -4114,6 +4143,11 @@ class VMController:
             vm_spec = _object_value(vm, "spec", {})
             vm_status = _object_value(vm, "status", {})
             vm_conditions = _object_value(vm_status, "conditions", []) or []
+            ready_statuses = [
+                _object_value(condition, "status")
+                for condition in vm_conditions
+                if _object_value(condition, "type") == "Ready"
+            ]
             if (
                 _admitted_vm_uid(vm, expected_name=vm_name) != expected_vm_uid
                 or _object_value(vm_meta, "deletionTimestamp") is not None
@@ -4123,11 +4157,24 @@ class VMController:
                 or labels.get("srw.io/owner-id") != job_id
                 or not isinstance(annotations, Mapping)
                 or annotations.get("srw.io/provision-generation") != generation
+                or (
+                    held_stop
+                    and annotations.get("srw.io/vm-create-request-id")
+                    != held_stop_authority["creation_request_id"]
+                )
                 or type(vm_generation) is not int
                 or vm_generation < 1
                 or _object_value(vm_spec, "runStrategy") != "RerunOnFailure"
                 or (
+                    held_stop
+                    and (
+                        len(ready_statuses) != 1
+                        or ready_statuses[0] not in {"True", "False"}
+                    )
+                )
+                or (
                     ready_preflight is None
+                    and not held_stop
                     and any(
                         _object_value(condition, "type") == "Ready"
                         and _object_value(condition, "status") == "True"
@@ -4289,7 +4336,11 @@ class VMController:
                 "kind": (
                     "vm_initial_ready_positive_stop_candidate_v1"
                     if ready_preflight is not None
-                    else "vm_pre_ssh_stop_candidate_v1"
+                    else (
+                        "vm_job_never_app_ready_retained_stop_candidate_v1"
+                        if held_stop
+                        else "vm_pre_ssh_stop_candidate_v1"
+                    )
                 ),
                 "job_id": job_id,
                 "provision_generation": generation,
@@ -4307,12 +4358,19 @@ class VMController:
                 "launcher_resource_version": pod_rv,
                 "containers": containers,
             }
-            if ready_preflight is not None:
+            if ready_preflight is not None or held_stop:
                 result.update(
-                    cleanup_admission_id=parent_cleanup["admission_id"],
-                    cleanup_request_id=parent_cleanup["request_id"],
-                    cleanup_intent_digest=parent_cleanup["intent_digest"],
+                    cleanup_admission_id=parent_cleanup.get("admission_id"),
+                    cleanup_request_id=parent_cleanup.get("request_id"),
+                    cleanup_intent_digest=parent_cleanup.get("intent_digest"),
                 )
+            if held_stop:
+                result["kube_vm_ready_at_inspection"] = ready_statuses[0] == "True"
+                if not never_app_ready_retention_authority_matches(
+                    held_stop_authority, parent_cleanup, result
+                ):
+                    return None
+            if ready_preflight is not None:
                 if (
                     not valid_frozen_stop_candidate(result)
                     or not valid_retention_preflight(ready_preflight, result)
@@ -4325,7 +4383,13 @@ class VMController:
             return result if valid_frozen_stop_candidate(result) else None
 
     async def _do_pre_ssh_stop(
-        self, frozen: Mapping[str, object], digest: str, *, retention_preflight=None
+        self,
+        frozen: Mapping[str, object],
+        digest: str,
+        *,
+        retention_preflight=None,
+        held_stop_authority=None,
+        parent_cleanup=None,
     ) -> dict:
         """Stop only the exact retained launcher; ACK alone never proves zero."""
 
@@ -4346,7 +4410,24 @@ class VMController:
             return {"status": "identity_refused"}
         job_id = str(frozen["job_id"])
         initial_ready = frozen["kind"] == "vm_initial_ready_positive_stop_candidate_v1"
-        if initial_ready and retention_preflight is None:
+        held_stop = (
+            frozen["kind"] == "vm_job_never_app_ready_retained_stop_candidate_v1"
+        )
+        if (initial_ready or held_stop) and retention_preflight is None:
+            return {"status": "identity_refused"}
+        if held_stop:
+            from shared.vm_cancel_retention import (
+                never_app_ready_retention_authority_matches,
+            )
+
+            if not (
+                _held_stop_cluster_matches(self, held_stop_authority)
+                and never_app_ready_retention_authority_matches(
+                    held_stop_authority, parent_cleanup, frozen
+                )
+            ):
+                return {"status": "identity_refused"}
+        elif held_stop_authority is not None or parent_cleanup is not None:
             return {"status": "identity_refused"}
         if retention_preflight is not None:
             from shared.vm_cancel_retention import valid_retention_preflight
@@ -4407,6 +4488,11 @@ class VMController:
                     and vm_annotations.get("srw.io/vm-create-request-id")
                     != retention_preflight["frozen"]["request_id"]
                 )
+                or (
+                    held_stop
+                    and vm_annotations.get("srw.io/vm-create-request-id")
+                    != held_stop_authority["creation_request_id"]
+                )
                 or type(vm_generation) is not int
                 or vm_generation != frozen["vm_generation"] + (vm_strategy == "Halted")
                 or _object_value(vm_meta, "deletionTimestamp") is not None
@@ -4420,7 +4506,7 @@ class VMController:
                     pod, kind="VirtualMachineInstance", uid=frozen["vmi_uid"]
                 )
                 or (
-                    not initial_ready
+                    not (initial_ready or held_stop)
                     and any(
                         _object_value(condition, "type") == "Ready"
                         and _object_value(condition, "status") == "True"
@@ -4795,7 +4881,11 @@ class VMController:
                 "kind": (
                     "vm_initial_ready_positive_stop_v1"
                     if initial_ready
-                    else "vm_pre_ssh_positive_stop_v1"
+                    else (
+                        "vm_job_never_app_ready_retained_positive_stop_v1"
+                        if held_stop
+                        else "vm_pre_ssh_positive_stop_v1"
+                    )
                 ),
                 "frozen_digest": digest,
                 "vm_uid": frozen["vm_uid"],
@@ -4825,6 +4915,8 @@ class VMController:
         *,
         process_zero_receipt_id: str,
         retention_preflight: Mapping | None = None,
+        held_stop_authority: Mapping | None = None,
+        parent_cleanup: Mapping | None = None,
     ) -> dict:
         """Drop only our retained-Pod finalizer after signed durable-zero authority."""
 
@@ -4848,11 +4940,26 @@ class VMController:
         ):
             return {"status": "identity_refused"}
         initial_ready = frozen["kind"] == "vm_initial_ready_positive_stop_candidate_v1"
-        if initial_ready:
-            from shared.vm_cancel_retention import valid_retention_preflight
+        held_stop = (
+            frozen["kind"] == "vm_job_never_app_ready_retained_stop_candidate_v1"
+        )
+        if initial_ready or held_stop:
+            from shared.vm_cancel_retention import (
+                never_app_ready_retention_authority_matches,
+                valid_retention_preflight,
+            )
 
             if not valid_retention_preflight(retention_preflight, frozen):
                 return {"status": "identity_refused"}
+            if held_stop and not (
+                _held_stop_cluster_matches(self, held_stop_authority)
+                and never_app_ready_retention_authority_matches(
+                    held_stop_authority, parent_cleanup, frozen
+                )
+            ):
+                return {"status": "identity_refused"}
+        elif held_stop_authority is not None or parent_cleanup is not None:
+            return {"status": "identity_refused"}
         async with self._workspace_lifecycle(str(frozen["job_id"])):
             vm = await asyncio.to_thread(
                 self.k8s_client.get_namespaced_custom_object,
@@ -4862,6 +4969,8 @@ class VMController:
                 plural=KUBEVIRT_PLURAL,
                 name=frozen["vm_name"],
             )
+            vm_labels = _metadata_value(vm, "labels")
+            vm_annotations = _metadata_value(vm, "annotations")
             if (
                 _admitted_vm_uid(vm, expected_name=frozen["vm_name"])
                 != frozen["vm_uid"]
@@ -4870,9 +4979,20 @@ class VMController:
                 != "Halted"
                 or _object_value(_metadata(vm), "generation")
                 != frozen["vm_generation"] + 1
+                or (
+                    held_stop
+                    and (
+                        not isinstance(vm_labels, Mapping)
+                        or vm_labels.get("srw.io/owner-kind") != "job"
+                        or vm_labels.get("srw.io/owner-id") != frozen["job_id"]
+                        or not isinstance(vm_annotations, Mapping)
+                        or vm_annotations.get("srw.io/vm-create-request-id")
+                        != held_stop_authority["creation_request_id"]
+                    )
+                )
             ):
                 return {"status": "identity_refused"}
-            if initial_ready:
+            if initial_ready or held_stop:
                 try:
                     storage = await self._qualify_cancel_retained_rootdisk(
                         frozen["job_id"],
@@ -6857,7 +6977,53 @@ class VMController:
         generation = _provision_generation(data.get("provision_generation"))
         if not isinstance(job_id, str) or generation is None:
             return {"status": "identity_refused"}
-        if action == "inspect_initial_ready":
+        if action == "inspect_never_app_ready_retained":
+            from shared.vm_cancel_retention import (
+                never_app_ready_retention_authority_matches,
+                valid_retention_preflight,
+            )
+
+            authority = data.get("held_stop_authority")
+            parent = data.get("parent_cleanup")
+            if not _held_stop_cluster_matches(self, authority):
+                return {"status": "identity_refused"}
+            candidate = await self._do_inspect_pre_ssh_stop(
+                job_id,
+                provision_generation=generation,
+                expected_vm_uid=data.get("expected_vm_uid"),
+                expected_pvc_uid=data.get("expected_pvc_uid"),
+                parent_cleanup=parent,
+                held_stop_authority=authority,
+            )
+            if not never_app_ready_retention_authority_matches(
+                authority, parent, candidate
+            ):
+                result = {"status": "identity_refused"}
+            else:
+                try:
+                    storage = await self._qualify_cancel_retained_rootdisk(
+                        job_id, candidate["pvc_uid"], allowed_runtime=candidate
+                    )
+                    preflight = {
+                        "version": 1,
+                        "kind": "vm_cancel_retention_preflight_v1",
+                        "stop_policy": "cancel_retention_v1",
+                        "frozen": candidate,
+                        **storage,
+                        "consumer_scope": "exact_frozen_runtime_only",
+                    }
+                    result = (
+                        {
+                            "status": "candidate",
+                            "frozen": candidate,
+                            "retention_preflight": preflight,
+                        }
+                        if valid_retention_preflight(preflight, candidate)
+                        else {"status": "identity_refused"}
+                    )
+                except Exception:
+                    result = {"status": "identity_refused"}
+        elif action == "inspect_initial_ready":
             from shared.vm_cancel_retention import valid_retention_preflight
             from shared.vm_pre_ssh_stop import valid_frozen_stop_candidate
 
@@ -6936,6 +7102,17 @@ class VMController:
                     if "retention_preflight" in data
                     else {}
                 ),
+                **(
+                    {
+                        "held_stop_authority": data.get("held_stop_authority"),
+                        "parent_cleanup": data.get("parent_cleanup"),
+                    }
+                    if frozen.get("kind")
+                    == "vm_job_never_app_ready_retained_stop_candidate_v1"
+                    or "held_stop_authority" in data
+                    or "parent_cleanup" in data
+                    else {}
+                ),
             )
         elif action == "release":
             frozen = data.get("frozen")
@@ -6957,6 +7134,17 @@ class VMController:
                     if "retention_preflight" in data
                     else {}
                 ),
+                **(
+                    {
+                        "held_stop_authority": data.get("held_stop_authority"),
+                        "parent_cleanup": data.get("parent_cleanup"),
+                    }
+                    if frozen.get("kind")
+                    == "vm_job_never_app_ready_retained_stop_candidate_v1"
+                    or "held_stop_authority" in data
+                    or "parent_cleanup" in data
+                    else {}
+                ),
             )
         else:
             result = {"status": "identity_refused"}
@@ -6975,12 +7163,18 @@ class VMController:
             if action not in {
                 "inspect",
                 "inspect_initial_ready",
+                "inspect_never_app_ready_retained",
                 "stop",
                 "release",
             } or not await self._verify_lifecycle_request(
                 signed,
                 "pre-ssh-stop",
-                mutating=action not in {"inspect", "inspect_initial_ready"},
+                mutating=action
+                not in {
+                    "inspect",
+                    "inspect_initial_ready",
+                    "inspect_never_app_ready_retained",
+                },
             ):
                 return
             request_id = _lifecycle_request_id(signed)
@@ -7074,12 +7268,18 @@ class VMController:
             if action not in {
                 "inspect",
                 "inspect_initial_ready",
+                "inspect_never_app_ready_retained",
                 "stop",
                 "release",
             } or not await self._verify_lifecycle_request(
                 signed,
                 "pre-ssh-stop",
-                mutating=action not in {"inspect", "inspect_initial_ready"},
+                mutating=action
+                not in {
+                    "inspect",
+                    "inspect_initial_ready",
+                    "inspect_never_app_ready_retained",
+                },
             ):
                 return web.json_response({"error": "authentication failed"}, status=401)
             request_id = _lifecycle_request_id(signed)

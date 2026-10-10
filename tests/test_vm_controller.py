@@ -7612,6 +7612,521 @@ async def test_retention_stop_rechecks_disk_before_halted(controller, after_fina
     controller.k8s_client.patch_namespaced_custom_object.assert_not_called()
 
 
+async def _held_stop_controller_fixture(controller, *, ready):
+    """Complete physical fixture with the signed policy 1 envelope."""
+    from tests.test_vm_never_app_ready_stop_protocol import held_pair
+
+    fixture = TestWorkspaceRecoveryControllerEvidence()
+    vm, pod = fixture.wire_pre_ssh_stop(controller)
+    base = await controller._do_inspect_pre_ssh_stop(
+        SAMPLE_JOB_CONFIG["job_id"],
+        provision_generation=PROVISION_GENERATION,
+        expected_vm_uid=fixture.VM_UID,
+        expected_pvc_uid=fixture.PVC_UID,
+    )
+    authority, parent, frozen, preflight = held_pair()
+    frozen.update(base)
+    frozen.update(
+        kind="vm_job_never_app_ready_retained_stop_candidate_v1",
+        kube_vm_ready_at_inspection=ready,
+    )
+    for key in (
+        "job_id",
+        "provision_generation",
+        "namespace",
+        "vm_uid",
+        "vmi_uid",
+        "launcher_uid",
+        "pvc_uid",
+        "node_uid",
+    ):
+        authority[key] = frozen[key]
+    parent["intent"].update(
+        owner_id=frozen["job_id"],
+        provision_generation=frozen["provision_generation"],
+        vm_uid=frozen["vm_uid"],
+        pvc_uid=frozen["pvc_uid"],
+    )
+    preflight.update(
+        frozen=frozen,
+        namespace=frozen["namespace"],
+        owner_id=frozen["job_id"],
+        pvc_name=f"agent-vm-{frozen['job_id']}-rootdisk",
+        pvc_uid=frozen["pvc_uid"],
+    )
+    vm["metadata"]["annotations"]["srw.io/vm-create-request-id"] = authority[
+        "creation_request_id"
+    ]
+    vm["status"]["conditions"] = [
+        {"type": "Ready", "status": "True" if ready else "False"}
+    ]
+    controller.resource_inventory_collector = types.SimpleNamespace(
+        namespace=VM_NAMESPACE, cluster_id=authority["cluster_id"]
+    )
+    controller.core_api.read_namespaced_pod.return_value = pod
+    storage = {
+        key: preflight[key]
+        for key in (
+            "namespace",
+            "owner_id",
+            "pvc_name",
+            "pvc_uid",
+            "dv_uid",
+            "ownership",
+            "deleting",
+        )
+    }
+    controller._qualify_cancel_retained_rootdisk = AsyncMock(return_value=storage)
+    return vm, pod, authority, parent, frozen, preflight
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ready", [True, False])
+async def test_held_stop_inspects_both_kube_ready_values_and_preserves_disk(
+    controller, ready
+):
+    vm, _, authority, parent, frozen, preflight = await _held_stop_controller_fixture(
+        controller, ready=ready
+    )
+    result = await controller._dispatch_pre_ssh_stop(
+        {
+            "action": "inspect_never_app_ready_retained",
+            "job_id": frozen["job_id"],
+            "provision_generation": frozen["provision_generation"],
+            "expected_vm_uid": frozen["vm_uid"],
+            "expected_pvc_uid": frozen["pvc_uid"],
+            "held_stop_authority": authority,
+            "parent_cleanup": parent,
+        }
+    )
+    assert result["status"] == "candidate"
+    assert result["frozen"] == frozen
+    assert result["retention_preflight"] == preflight
+    assert vm["spec"]["runStrategy"] == "RerunOnFailure"
+    controller.core_api.patch_namespaced_pod.assert_not_called()
+    controller.k8s_client.patch_namespaced_custom_object.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("condition", [[], [{"type": "Ready", "status": "Unknown"}]])
+async def test_held_stop_inspect_refuses_unobserved_ready_condition(
+    controller, condition
+):
+    vm, _, authority, parent, frozen, _ = await _held_stop_controller_fixture(
+        controller, ready=False
+    )
+    vm["status"]["conditions"] = condition
+    result = await controller._dispatch_pre_ssh_stop(
+        {
+            "action": "inspect_never_app_ready_retained",
+            "job_id": frozen["job_id"],
+            "provision_generation": frozen["provision_generation"],
+            "expected_vm_uid": frozen["vm_uid"],
+            "expected_pvc_uid": frozen["pvc_uid"],
+            "held_stop_authority": authority,
+            "parent_cleanup": parent,
+        }
+    )
+    assert result["status"] == "identity_refused"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "foreign",
+    ["vm_owner", "vmi_uid", "launcher_uid", "node_uid", "cluster", "consumer"],
+)
+async def test_held_stop_inspect_refuses_foreign_physical_identity(controller, foreign):
+    vm, pod, authority, parent, frozen, _ = await _held_stop_controller_fixture(
+        controller, ready=True
+    )
+    if foreign == "vm_owner":
+        vm["metadata"]["labels"]["srw.io/owner-id"] = "foreign"
+    elif foreign == "vmi_uid":
+        vmi = controller.k8s_client.get_namespaced_custom_object(
+            plural="virtualmachineinstances"
+        )
+        vmi["metadata"]["uid"] = "00000000-0000-4000-8000-000000000798"
+    elif foreign == "launcher_uid":
+        pod["metadata"]["uid"] = "00000000-0000-4000-8000-000000000798"
+    elif foreign == "node_uid":
+        controller.core_api.read_node.return_value.metadata.uid = (
+            "00000000-0000-4000-8000-000000000798"
+        )
+    elif foreign == "cluster":
+        controller.resource_inventory_collector.cluster_id = "other-cluster"
+    else:
+        controller._qualify_cancel_retained_rootdisk.side_effect = RuntimeError(
+            "foreign consumer"
+        )
+    result = await controller._dispatch_pre_ssh_stop(
+        {
+            "action": "inspect_never_app_ready_retained",
+            "job_id": frozen["job_id"],
+            "provision_generation": frozen["provision_generation"],
+            "expected_vm_uid": frozen["vm_uid"],
+            "expected_pvc_uid": frozen["pvc_uid"],
+            "held_stop_authority": authority,
+            "parent_cleanup": parent,
+        }
+    )
+    assert result["status"] == "identity_refused"
+    controller.core_api.patch_namespaced_pod.assert_not_called()
+    controller.k8s_client.patch_namespaced_custom_object.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["held_stop_authority", "parent_cleanup"])
+async def test_held_stop_inspect_requires_both_signed_authorities(controller, missing):
+    _, _, authority, parent, frozen, _ = await _held_stop_controller_fixture(
+        controller, ready=True
+    )
+    data = {
+        "action": "inspect_never_app_ready_retained",
+        "job_id": frozen["job_id"],
+        "provision_generation": frozen["provision_generation"],
+        "expected_vm_uid": frozen["vm_uid"],
+        "expected_pvc_uid": frozen["pvc_uid"],
+        "held_stop_authority": authority,
+        "parent_cleanup": parent,
+    }
+    data.pop(missing)
+    assert (await controller._dispatch_pre_ssh_stop(data))[
+        "status"
+    ] == "identity_refused"
+    controller.k8s_client.patch_namespaced_custom_object.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flip", [False, True])
+async def test_held_stop_ready_flip_still_halts_exact_vm_after_finalizer(
+    controller, flip
+):
+    from shared.vm_pre_ssh_stop import PRE_SSH_STOP_ANNOTATION, PRE_SSH_STOP_FINALIZER
+
+    vm, pod, authority, parent, frozen, preflight = await _held_stop_controller_fixture(
+        controller, ready=flip
+    )
+    vm["status"]["conditions"] = [
+        {"type": "Ready", "status": "False" if flip else "True"}
+    ]
+    digest = "sha256:" + "b" * 64
+    patches = []
+
+    def patch_pod(**kwargs):
+        patches.append("finalizer")
+        assert {p["path"]: p["value"] for p in kwargs["body"] if p["op"] == "test"} == {
+            "/metadata/uid": frozen["launcher_uid"],
+            "/metadata/resourceVersion": "43",
+        }
+        pod["metadata"].update(
+            annotations={PRE_SSH_STOP_ANNOTATION: digest},
+            finalizers=[PRE_SSH_STOP_FINALIZER],
+            resourceVersion="44",
+        )
+
+    def patch_vm(**kwargs):
+        patches.append("Halted")
+        assert {p["path"]: p["value"] for p in kwargs["body"] if p["op"] == "test"} == {
+            "/metadata/uid": frozen["vm_uid"],
+            "/metadata/resourceVersion": "42",
+            "/spec/runStrategy": "RerunOnFailure",
+        }
+        vm["spec"]["runStrategy"] = "Halted"
+        vm["metadata"]["generation"] = frozen["vm_generation"] + 1
+
+    controller.core_api.patch_namespaced_pod.side_effect = patch_pod
+    controller.k8s_client.patch_namespaced_custom_object.side_effect = patch_vm
+    result = await controller._do_pre_ssh_stop(
+        frozen,
+        digest,
+        retention_preflight=preflight,
+        held_stop_authority=authority,
+        parent_cleanup=parent,
+    )
+    assert result["status"] == "pending_terminal_proof"
+    assert patches == ["finalizer", "Halted"]
+    assert vm["spec"]["runStrategy"] == "Halted"
+    assert preflight["pvc_uid"] == frozen["pvc_uid"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changed", ["vm_uid", "generation", "creation_request", "container", "pvc"]
+)
+async def test_held_stop_rejects_replaced_runtime_or_disk_before_patch(
+    controller, changed
+):
+    vm, pod, authority, parent, frozen, preflight = await _held_stop_controller_fixture(
+        controller, ready=True
+    )
+    if changed == "vm_uid":
+        vm["metadata"]["uid"] = "00000000-0000-4000-8000-000000000799"
+    elif changed == "generation":
+        vm["metadata"]["generation"] += 1
+    elif changed == "creation_request":
+        vm["metadata"]["annotations"]["srw.io/vm-create-request-id"] = "foreign"
+    elif changed == "container":
+        pod["status"]["containerStatuses"][0]["containerID"] = "containerd://other"
+    else:
+        controller._qualify_cancel_retained_rootdisk.side_effect = RuntimeError(
+            "consumer"
+        )
+    result = await controller._do_pre_ssh_stop(
+        frozen,
+        "sha256:" + "b" * 64,
+        retention_preflight=preflight,
+        held_stop_authority=authority,
+        parent_cleanup=parent,
+    )
+    assert result["status"] == "identity_refused"
+    controller.core_api.patch_namespaced_pod.assert_not_called()
+    controller.k8s_client.patch_namespaced_custom_object.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["http", "nats"])
+async def test_held_stop_inspect_accepts_signed_http_and_nats_request(
+    controller, transport
+):
+    from vm_controller.lifecycle_auth import verify_payload
+
+    _, _, authority, parent, frozen, _ = await _held_stop_controller_fixture(
+        controller, ready=True
+    )
+    signed = sign_payload(
+        {
+            "action": "inspect_never_app_ready_retained",
+            "job_id": frozen["job_id"],
+            "provision_generation": frozen["provision_generation"],
+            "expected_vm_uid": frozen["vm_uid"],
+            "expected_pvc_uid": frozen["pvc_uid"],
+            "held_stop_authority": authority,
+            "parent_cleanup": parent,
+        },
+        direction="request",
+        operation="pre-ssh-stop",
+        secret=LIFECYCLE_SECRET,
+    )
+    with patch("vm_controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+        if transport == "http":
+            response = await controller.http_pre_ssh_stop(
+                types.SimpleNamespace(json=AsyncMock(return_value=signed))
+            )
+            assert response.status == 200
+            result = json.loads(response.body)
+        else:
+            controller.nc = AsyncMock()
+            await controller.handle_pre_ssh_stop(
+                MagicMock(reply="test.reply", data=json.dumps(signed).encode())
+            )
+            result = json.loads(controller.nc.publish.await_args.args[1])
+    assert verify_payload(
+        result,
+        direction="response",
+        operation="pre-ssh-stop",
+        secret=LIFECYCLE_SECRET,
+        expected_correlation_id=signed["_lifecycle_auth"]["request_id"],
+    )
+    assert result["status"] == "candidate"
+    assert result["frozen"] == frozen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("race", ["pod", "vm"])
+async def test_held_stop_cas_race_keeps_vm_running_without_proof(controller, race):
+    from shared.vm_pre_ssh_stop import PRE_SSH_STOP_ANNOTATION, PRE_SSH_STOP_FINALIZER
+
+    vm, pod, authority, parent, frozen, preflight = await _held_stop_controller_fixture(
+        controller, ready=True
+    )
+    digest = "sha256:" + "b" * 64
+
+    def patch_pod(**_kwargs):
+        if race == "pod":
+            raise _FakeApiException(status=409)
+        pod["metadata"].update(
+            annotations={PRE_SSH_STOP_ANNOTATION: digest},
+            finalizers=[PRE_SSH_STOP_FINALIZER],
+        )
+
+    controller.core_api.patch_namespaced_pod.side_effect = patch_pod
+    if race == "vm":
+        controller.k8s_client.patch_namespaced_custom_object.side_effect = (
+            _FakeApiException(status=409)
+        )
+    result = await controller._do_pre_ssh_stop(
+        frozen,
+        digest,
+        retention_preflight=preflight,
+        held_stop_authority=authority,
+        parent_cleanup=parent,
+    )
+    assert result["status"] == (
+        "finalizer_pending" if race == "pod" else "halt_pending"
+    )
+    assert "terminal_evidence" not in result
+    assert vm["spec"]["runStrategy"] == "RerunOnFailure"
+    assert controller.k8s_client.patch_namespaced_custom_object.call_count == int(
+        race == "vm"
+    )
+
+
+@pytest.mark.asyncio
+async def test_held_stop_release_requires_exact_proof_and_replays_once(controller):
+    from shared.vm_pre_ssh_stop import PRE_SSH_STOP_ANNOTATION, PRE_SSH_STOP_FINALIZER
+    from tests.test_vm_pre_ssh_stop_protocol import proof
+
+    vm, pod, authority, parent, frozen, preflight = await _held_stop_controller_fixture(
+        controller, ready=True
+    )
+    digest = "sha256:" + "b" * 64
+    vm["spec"]["runStrategy"] = "Halted"
+    vm["metadata"]["generation"] = frozen["vm_generation"] + 1
+    pod["metadata"].update(
+        annotations={PRE_SSH_STOP_ANNOTATION: digest},
+        finalizers=["other.io/keep", PRE_SSH_STOP_FINALIZER],
+        deletionGracePeriodSeconds=30,
+    )
+    pod["status"]["phase"] = "Failed"
+    for status in pod["status"]["containerStatuses"]:
+        status["state"] = {
+            "terminated": {
+                "containerID": status["containerID"],
+                "finishedAt": "2026-10-07T12:00:00Z",
+                "reason": "Completed",
+            }
+        }
+    observed = proof(frozen)
+    observed.update(
+        kind="vm_job_never_app_ready_retained_positive_stop_v1",
+        frozen_digest=digest,
+        pod_intent_digest=digest,
+    )
+    kwargs = dict(
+        process_zero_receipt_id="00000000-0000-4000-8000-000000000799",
+        retention_preflight=preflight,
+        held_stop_authority=authority,
+        parent_cleanup=parent,
+    )
+    assert (
+        await controller._do_release_pre_ssh_stop_finalizer(
+            frozen, digest, {**observed, "vm_uid": "foreign"}, **kwargs
+        )
+    )["status"] == "identity_refused"
+    assert (
+        await controller._do_release_pre_ssh_stop_finalizer(
+            frozen, digest, observed, **{**kwargs, "process_zero_receipt_id": None}
+        )
+    )["status"] == "identity_refused"
+
+    def release_pod(**call):
+        tests = {p["path"]: p["value"] for p in call["body"] if p["op"] == "test"}
+        assert tests["/metadata/uid"] == frozen["launcher_uid"]
+        assert tests["/metadata/resourceVersion"] == "43"
+        assert tests["/metadata/finalizers"] == [
+            "other.io/keep",
+            PRE_SSH_STOP_FINALIZER,
+        ]
+        assert (
+            tests["/metadata/annotations/srw.io~1vm-pre-ssh-stop-intent-digest"]
+            == digest
+        )
+        pod["metadata"]["finalizers"] = ["other.io/keep"]
+
+    controller.core_api.patch_namespaced_pod.side_effect = release_pod
+    for _ in range(2):
+        assert await controller._do_release_pre_ssh_stop_finalizer(
+            frozen, digest, observed, **kwargs
+        ) == {"status": "finalizer_released"}
+    controller.core_api.patch_namespaced_pod.assert_called_once()
+    assert pod["metadata"]["finalizers"] == ["other.io/keep"]
+    assert preflight["pvc_uid"] == frozen["pvc_uid"]
+
+
+@pytest.mark.asyncio
+async def test_held_stop_halted_replay_proves_terminal_without_ready_condition(
+    controller,
+):
+    from shared.vm_pre_ssh_stop import PRE_SSH_STOP_ANNOTATION, PRE_SSH_STOP_FINALIZER
+
+    vm, pod, authority, parent, frozen, preflight = await _held_stop_controller_fixture(
+        controller, ready=True
+    )
+    digest = "sha256:" + "b" * 64
+    vm["spec"]["runStrategy"] = "Halted"
+    vm["metadata"]["generation"] = frozen["vm_generation"] + 1
+    vm["status"]["conditions"] = []
+    vmi = controller.k8s_client.get_namespaced_custom_object(
+        plural="virtualmachineinstances"
+    )
+    vmi["status"]["phase"] = "Failed"
+    pod["metadata"].update(
+        annotations={PRE_SSH_STOP_ANNOTATION: digest},
+        finalizers=[PRE_SSH_STOP_FINALIZER],
+        deletionGracePeriodSeconds=30,
+    )
+    pod["status"]["phase"] = "Failed"
+    for status in pod["status"]["containerStatuses"]:
+        status["state"] = {
+            "terminated": {
+                "containerID": status["containerID"],
+                "finishedAt": "2026-10-07T12:00:00Z",
+                "reason": "Completed",
+            }
+        }
+    results = [
+        await controller._do_pre_ssh_stop(
+            frozen,
+            digest,
+            retention_preflight=preflight,
+            held_stop_authority=authority,
+            parent_cleanup=parent,
+        )
+        for _ in range(2)
+    ]
+    assert [result["status"] for result in results] == [
+        "positive_terminal_proof",
+        "positive_terminal_proof",
+    ]
+    assert results[0]["terminal_evidence"] == results[1]["terminal_evidence"]
+    assert results[0]["terminal_evidence"]["kind"] == (
+        "vm_job_never_app_ready_retained_positive_stop_v1"
+    )
+    controller.core_api.patch_namespaced_pod.assert_not_called()
+    controller.k8s_client.patch_namespaced_custom_object.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("labels", ["missing", "null"])
+async def test_held_stop_release_refuses_missing_vm_ownership_labels(
+    controller, labels
+):
+    from tests.test_vm_pre_ssh_stop_protocol import proof
+
+    vm, _, authority, parent, frozen, preflight = await _held_stop_controller_fixture(
+        controller, ready=True
+    )
+    vm["spec"]["runStrategy"] = "Halted"
+    vm["metadata"]["generation"] = frozen["vm_generation"] + 1
+    if labels == "missing":
+        vm["metadata"].pop("labels")
+    else:
+        vm["metadata"]["labels"] = None
+    observed = proof(frozen)
+    observed["kind"] = "vm_job_never_app_ready_retained_positive_stop_v1"
+    result = await controller._do_release_pre_ssh_stop_finalizer(
+        frozen,
+        "sha256:" + "a" * 64,
+        observed,
+        process_zero_receipt_id="00000000-0000-4000-8000-000000000799",
+        retention_preflight=preflight,
+        held_stop_authority=authority,
+        parent_cleanup=parent,
+    )
+    assert result == {"status": "identity_refused"}
+    controller.core_api.patch_namespaced_pod.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_retaining_compute_delete_checks_disk_before_vm_delete(controller):
     from uuid import uuid4

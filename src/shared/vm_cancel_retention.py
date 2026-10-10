@@ -36,6 +36,109 @@ def _same(value, expected):
         return False
 
 
+_HELD_STOP_UUID_FIELDS = frozenset(
+    {
+        "job_id",
+        "provision_generation",
+        "cleanup_admission_id",
+        "cleanup_request_id",
+        "creation_request_id",
+        "reservation_id",
+        "vm_uid",
+        "vmi_uid",
+        "launcher_uid",
+        "pvc_uid",
+        "node_uid",
+    }
+)
+_HELD_STOP_FIELDS = _HELD_STOP_UUID_FIELDS | {
+    "version",
+    "kind",
+    "policy_version",
+    "owner_kind",
+    "namespace",
+    "cluster_id",
+    "cleanup_intent_digest",
+    "reservation_revision",
+}
+
+
+def valid_never_app_ready_retention_authority(value: object) -> bool:
+    """Validate only the closed, signed policy 1 held-stop authority."""
+    return (
+        isinstance(value, Mapping)
+        and set(value) == _HELD_STOP_FIELDS
+        and type(value["version"]) is int
+        and value["version"] == 1
+        and value["kind"] == "vm_job_cancel_retention_held_stop_authority_v1"
+        and type(value["policy_version"]) is int
+        and value["policy_version"] == 1
+        and value["owner_kind"] == "job"
+        and all(_uuid(value[field]) for field in _HELD_STOP_UUID_FIELDS)
+        and _name(value["namespace"], 63)
+        and "." not in value["namespace"]
+        and isinstance(value["cluster_id"], str)
+        and 0 < len(value["cluster_id"]) <= 253
+        and value["cluster_id"] == value["cluster_id"].strip()
+        and not any(ch.isspace() for ch in value["cluster_id"])
+        and type(value["reservation_revision"]) is int
+        and value["reservation_revision"] > 0
+        and isinstance(value["cleanup_intent_digest"], str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", value["cleanup_intent_digest"])
+        is not None
+    )
+
+
+def never_app_ready_retention_authority_matches(
+    authority: object, parent_cleanup: object, frozen: object
+) -> bool:
+    """Bind the new physical observation to its exact ordinary cleanup parent."""
+    if (
+        not valid_never_app_ready_retention_authority(authority)
+        or not isinstance(parent_cleanup, Mapping)
+        or set(parent_cleanup)
+        != {"admission_id", "request_id", "intent_digest", "intent"}
+        or not valid_frozen_stop_candidate(frozen)
+        or frozen["kind"] != "vm_job_never_app_ready_retained_stop_candidate_v1"
+    ):
+        return False
+    if any(
+        frozen[field] != authority[field]
+        for field in (
+            "job_id",
+            "provision_generation",
+            "namespace",
+            "vm_uid",
+            "vmi_uid",
+            "launcher_uid",
+            "pvc_uid",
+            "node_uid",
+            "cleanup_admission_id",
+            "cleanup_request_id",
+            "cleanup_intent_digest",
+        )
+    ):
+        return False
+    return (
+        parent_cleanup.get("admission_id") == authority["cleanup_admission_id"]
+        and parent_cleanup.get("request_id") == authority["cleanup_request_id"]
+        and parent_cleanup.get("intent_digest") == authority["cleanup_intent_digest"]
+        and _same(
+            parent_cleanup.get("intent"),
+            {
+                "owner_id": authority["job_id"],
+                "owner_kind": "job",
+                "provision_generation": authority["provision_generation"],
+                "purge_disk": False,
+                "pvc_uid": authority["pvc_uid"],
+                "resource": "vm_workspace",
+                "source": "job_terminal_vm_release",
+                "vm_uid": authority["vm_uid"],
+            },
+        )
+    )
+
+
 def valid_retention_preflight(value, frozen):
     if not isinstance(value, Mapping) or not valid_frozen_stop_candidate(frozen):
         return False
@@ -63,6 +166,11 @@ def valid_retention_preflight(value, frozen):
     if not _uuid(value.get("dv_uid")) or not _name(value.get("pvc_name"), 253):
         return False
     if not _name(frozen["namespace"], 63) or "." in frozen["namespace"]:
+        return False
+    if (
+        frozen["kind"] == "vm_job_never_app_ready_retained_stop_candidate_v1"
+        and value["pvc_name"] != f"agent-vm-{frozen['job_id']}-rootdisk"
+    ):
         return False
     return _same(
         value,
