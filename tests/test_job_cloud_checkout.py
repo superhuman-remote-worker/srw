@@ -526,6 +526,60 @@ class TestCapture:
         assert await run() == {"state": "captured", "files": 1}
         db.update_job_cloud_diff.assert_awaited_once_with(JOB_ID, diff_status="pending")
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("head", ["base", "head"], ids=["no-commit", "reverted"])
+    async def test_a_rerun_without_changes_clears_the_earlier_pending_diff(self, head):
+        """A critic returned the job after its diff was captured; the re-run
+        reverted the edits. The stale pending diff goes, or it would block
+        approval and hide the outbox with nothing left to accept."""
+        db = SimpleNamespace(update_job_cloud_diff=AsyncMock())
+        gitea = SimpleNamespace(
+            get_branch_head_sha=AsyncMock(return_value=head),
+            list_tree=AsyncMock(
+                side_effect=[
+                    _tree("projects/hand_book/a.md"),
+                    _tree("projects/hand_book/a.md", "output/r.md"),
+                ]
+            ),
+        )
+        job = {
+            "id": JOB_ID,
+            "repo_name": "job-x",
+            "cloud_diff_baseline_commit": "base",
+            "diff_status": "pending",
+            "context": {"cloud_baseline": {"project_slug": "hand_book"}},
+        }
+
+        result = await capture_checkout_diff(
+            job=job, postgres_db=db, gitea_client=gitea
+        )
+
+        assert result == {"state": "no_changes", "files": 0}
+        db.update_job_cloud_diff.assert_awaited_once_with(
+            JOB_ID, clear_diff_status=True
+        )
+        assert job["diff_status"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("decided", [None, "accepted", "rejected"])
+    async def test_no_changes_leaves_a_decided_or_absent_diff_alone(self, decided):
+        db = SimpleNamespace(update_job_cloud_diff=AsyncMock())
+        gitea = SimpleNamespace(get_branch_head_sha=AsyncMock(return_value="base"))
+        job = {
+            "id": JOB_ID,
+            "repo_name": "job-x",
+            "cloud_diff_baseline_commit": "base",
+            "diff_status": decided,
+            "context": {},
+        }
+
+        result = await capture_checkout_diff(
+            job=job, postgres_db=db, gitea_client=gitea
+        )
+
+        assert result["state"] == "no_changes"
+        db.update_job_cloud_diff.assert_not_awaited()
+
 
 class TestCriticApproval:
     def _transition(self, *, autonomy, diff_status):

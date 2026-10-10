@@ -568,9 +568,24 @@ async def capture_checkout_diff(
 
     Returns ``{"state": <one of CAPTURE_STATES>, "files": <count>}``. The
     caller is responsible for the status transition itself — this helper
-    only flips the ``diff_status`` flag.
+    only flips the ``diff_status`` flag. ``no_changes`` also clears a
+    ``pending`` flag an earlier capture left (a critic returned the job and
+    the re-run reverted its edits): a stale pending diff would block the
+    approval and hide the outbox, with nothing left to accept.
     """
     job_id = str(job["id"])
+
+    async def _no_changes() -> dict[str, Any]:
+        if job.get("diff_status") == "pending":
+            await postgres_db.update_job_cloud_diff(job_id, clear_diff_status=True)
+            job["diff_status"] = None
+            logger.info(
+                "Mode A: job %s — no project-folder changes any more; cleared "
+                "the earlier capture's pending diff",
+                job_id,
+            )
+        return {"state": "no_changes", "files": 0}
+
     baseline = job.get("cloud_diff_baseline_commit")
     repo_name = job.get("repo_name")
     branch = job.get("branch_name")
@@ -585,7 +600,7 @@ async def capture_checkout_diff(
         logger.warning("Mode A: job %s — couldn't read HEAD for diff capture", job_id)
         return {"state": "head_unreadable", "files": 0}
     if head == baseline:
-        return {"state": "no_changes", "files": 0}
+        return await _no_changes()
     files = await _diff_files_by_tree(
         gitea_client=gitea_client,
         repo_name=repo_name,
@@ -616,7 +631,7 @@ async def capture_checkout_diff(
             str(baseline)[:8],
             head[:8],
         )
-        return {"state": "no_changes", "files": 0}
+        return await _no_changes()
     await postgres_db.update_job_cloud_diff(job_id, diff_status="pending")
     logger.info(
         "Mode A: job %s — captured %d-file diff baseline=%s head=%s; "
