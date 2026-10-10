@@ -144,7 +144,8 @@ class ProjectWorkspaceDefaultsUpdate(BaseModel):
 class ProjectConnectorDefaultsUpdate(BaseModel):
     """Body for PUT /api/projects/{id}/connector-defaults: the linked
     connectors new work in the Project attaches when it takes its defaults.
-    The project knowledge base is always the first default and is not listed."""
+    The project's own connectors (knowledge base, cloud folder) are always
+    defaults and are not listed."""
 
     model_config = ConfigDict(extra="forbid")
     connector_ids: list[UUID] = Field(

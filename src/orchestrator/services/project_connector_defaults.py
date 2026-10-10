@@ -7,13 +7,14 @@ server-side apply.
 
 The row holds connector ids (a datasource's id is its Connector's uid) that
 must be linked to the Project; an id whose link is gone is ignored when read
-and pruned on the next refresh.  The project's own knowledge base is never
-stored: it is the layer's first, platform-owned entry, implied for every
-Project (``effective_project_connector_defaults``).
+and pruned on the next refresh.  The project's own connectors (its knowledge
+base, its cloud folder) are never stored: they are the layer's first,
+platform-owned entries, implied for every Project
+(``effective_project_connector_defaults``).
 
 Creation reads the layer through ``default_datasource_selection``, which adds
-these connectors to the owner's ``auto_attach`` connectors and the native
-knowledge base when a job or session takes its defaults.  ``auto_attach``
+these connectors to the owner's ``auto_attach`` connectors and the project's
+own connectors when a job or session takes its defaults.  ``auto_attach``
 stays the creator's own preference and is not part of this layer.
 """
 
@@ -34,7 +35,8 @@ NOT_LINKED = (
     "connector first."
 )
 PLATFORM_ENTRY = (
-    "The project knowledge base is always the first default; it is not set here."
+    "The project's own connectors (knowledge base, cloud folder) are always "
+    "defaults; they are not set here."
 )
 
 _UPSERT = """
@@ -136,8 +138,8 @@ async def linked_connectors(db, project_id) -> list[dict[str, Any]]:
 
 async def effective_project_connector_defaults(db, project_id) -> list[dict[str, Any]]:
     """The layer as creation applies it: the platform-owned connectors linked
-    to the Project (its knowledge base) first, then the stored ids still
-    linked, each once."""
+    to the Project (its knowledge base, its cloud folder) first, then the
+    stored ids still linked, each once."""
     linked = await linked_connectors(db, project_id)
     stored = await read_current_project_connector_defaults(db, project_id)
     by_id = {row["id"]: row for row in linked if not row["platform_owned"]}
@@ -155,7 +157,7 @@ async def save_settings_connector_defaults(
     """Write a Settings row; a manifest row is never overwritten from the API.
 
     Every id must be linked to the Project and not platform-owned (the
-    knowledge base is implied): 422 otherwise.
+    project's own connectors are implied): 422 otherwise.
     """
     try:
         wanted = _uuids(connector_ids)

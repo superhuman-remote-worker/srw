@@ -51,7 +51,7 @@ from orchestrator.services.manifest_execution_retirement import (
 )
 from orchestrator.services.manifest_store import ManifestStore, resource_key
 from shared.connectors.builtin import spec_for_row
-from shared.connectors.platform import platform_owned
+from shared.connectors.platform import managed_refusal, platform_owned
 from shared.manifests import API_VERSION, validate_documents
 from shared.manifests.resolution import content_revision
 
@@ -743,10 +743,7 @@ async def sync_project_connector_links(db, project_row, user, *, previous=None) 
                     403, "Not authorized to add one or more project links"
                 )
             if platform_owned(datasource):
-                raise HTTPException(
-                    409,
-                    "The native knowledge connector cannot be linked to another project",
-                )
+                raise HTTPException(409, managed_refusal(datasource, "link"))
             spec = spec_for_row(datasource)
             try:
                 await db.link_datasource_to_project(

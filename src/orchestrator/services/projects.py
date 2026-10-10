@@ -73,7 +73,12 @@ from orchestrator.services.officer_metadata import (
     thread_officer_meta as _thread_officer_meta,
 )
 from shared.connectors.builtin import spec_for_row
-from shared.connectors.platform import platform_owned
+from shared.connectors.platform import (
+    PROJECT_KB,
+    managed_kind,
+    managed_refusal,
+    platform_owned,
+)
 
 
 def _link_forced_read_only(datasource: dict[str, Any]) -> bool:
@@ -1183,10 +1188,7 @@ async def link_datasource_to_project(
         )
 
     if platform_owned(ds):
-        raise HTTPException(
-            status_code=409,
-            detail="The native knowledge connector cannot be linked to another project",
-        )
+        raise HTTPException(status_code=409, detail=managed_refusal(ds, "link"))
     is_connector_owner = str(ds.get("created_by") or "") == str(user["id"])
     if (ds.get("scope_mode") == "projects" or not ds.get("is_global")) and not (
         user.get("is_admin") or is_connector_owner
@@ -1237,6 +1239,12 @@ async def update_project_datasource(
         raise HTTPException(
             status_code=404, detail=f"Connector '{datasource_id}' not found"
         )
+    kind = managed_kind(ds)
+    if kind is not None and kind != PROJECT_KB and body.read_only:
+        # A read-only link on a connector SRW keeps (a cloud folder) is no
+        # access level its driver offers yet: the per-link access comes
+        # with the connector access levels.
+        raise HTTPException(status_code=409, detail=managed_refusal(ds, "link_access"))
     effective_read_only = True if _link_forced_read_only(ds) else body.read_only
     try:
         success = await store.update_project_datasource(
@@ -1286,10 +1294,7 @@ async def resolve_datasource_unlink(
     if not ds:
         raise HTTPException(status_code=404, detail="Connector not found")
     if platform_owned(ds):
-        raise HTTPException(
-            status_code=409,
-            detail="The native knowledge connector link is managed by its project",
-        )
+        raise HTTPException(status_code=409, detail=managed_refusal(ds, "unlink"))
     is_connector_owner = str(ds.get("created_by") or "") == str(user["id"])
     return ds, not (user.get("is_admin") or is_connector_owner)
 

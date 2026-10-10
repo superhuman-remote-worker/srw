@@ -75,7 +75,12 @@ from orchestrator.services.connector_drivers.registered import (
     SupportsDriverRegistration,
 )
 from shared.credential_connectors import CredentialConnectorAttachedError
-from shared.connectors.platform import platform_owned
+from shared.connectors.platform import (
+    PROJECT_KB,
+    managed_kind,
+    managed_refusal,
+    platform_owned,
+)
 from shared.runtime.utils.ssh_key import (
     generate_ed25519_keypair as _generate_ed25519_keypair,
 )
@@ -605,8 +610,11 @@ async def update_datasource(
     """Update a connector. F3: creator/admin only; credentials are preserved.
 
     Authority comes first (MCP token scope, the driver's deployment gate, the
-    publish gate, the native-KB lock, owner authority over new project
+    platform-owned locks, the publish gate, owner authority over new project
     links); the connector's driver then validates the content it changes.
+    A project's knowledge base refuses only policy edits; every other
+    connector SRW keeps (a cloud folder) refuses any edit, since SRW writes
+    its name, its folder and its links.
     """
     scope_project_id = mcp_scope_project_id(user)
     scoped_current_project_ids = await require_scoped_datasource_mutation(
@@ -616,6 +624,11 @@ async def update_datasource(
     driver = await dependencies.driver_for(existing_ds)
     if driver is not None:
         driver.require_enabled(environment.gates)
+    kind = managed_kind(existing_ds)
+    if kind is not None and kind != PROJECT_KB:
+        raise HTTPException(
+            status_code=409, detail=managed_refusal(existing_ds, "edit")
+        )
     # Publish gate (spec: knowledge-base/knowledge/features/public_datasources.md). Only the
     # false→true transition needs the capability; unpublishing must always
     # work for creator/admin (a revoked grant must not trap a public row).
@@ -641,8 +654,7 @@ async def update_datasource(
     policy_changed = bool(policy_fields.intersection(body.model_fields_set))
     if platform_owned(existing_ds) and policy_changed:
         raise HTTPException(
-            status_code=409,
-            detail="The native project knowledge connector policy is managed by its project",
+            status_code=409, detail=managed_refusal(existing_ds, "policy")
         )
 
     # A connector-owner may always revoke an existing link, but every newly
@@ -853,8 +865,7 @@ async def delete_datasource(
     """
     if platform_owned(datasource):
         raise HTTPException(
-            status_code=409,
-            detail="The project knowledge connector is managed by its project",
+            status_code=409, detail=managed_refusal(datasource, "delete")
         )
     await require_scoped_datasource_mutation(
         user, datasource, datasource_id, dependencies=dependencies

@@ -821,6 +821,137 @@ class TestPlatformOwnedGuards:
         assert "reindex it from the project instead" in refused.value.detail
 
 
+CLOUD_FOLDER = _row(
+    "cloud_folder",
+    config={
+        "folder_kind": "project",
+        "project_id": PROJECT,
+        "backend_id": "nextcloud",
+        "backend_instance_id": OTHER_PROJECT,
+        "folder_handle": "nextcloud:41",
+    },
+    managed_key=project_cloud_key(PROJECT),
+)
+
+
+class TestCloudFolderGuards:
+    """A project's cloud folder is SRW's: every API change is refused, in its
+    own words (a knowledge base keeps its policy-only lock:
+    ``tests/test_kb_native_datasource.py``)."""
+
+    USER = {"id": OWNER, "is_admin": True}
+
+    @pytest.mark.asyncio
+    async def test_delete_is_refused(self):
+        from orchestrator.services.datasources import delete_datasource
+
+        store = SimpleNamespace(delete_datasource=AsyncMock())
+        with pytest.raises(HTTPException) as refused:
+            await delete_datasource(
+                user=self.USER,
+                datasource=dict(CLOUD_FOLDER),
+                datasource_id=str(CLOUD_FOLDER["id"]),
+                dependencies=_datasource_dependencies(store),
+            )
+        assert refused.value.status_code == 409
+        assert refused.value.detail == (
+            "The project cloud folder connector is managed by its project"
+        )
+        store.delete_datasource.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            {"name": "Renamed"},
+            {"description": "Another folder"},
+            {"auto_attach": False, "policy_revision": 1},
+            {"is_global": False},
+        ],
+    )
+    async def test_every_edit_is_refused(self, fields):
+        from orchestrator.schemas.datasources import DatasourceUpdate
+        from orchestrator.services.datasources import update_datasource
+
+        store = SimpleNamespace(
+            update_datasource=AsyncMock(),
+            update_datasource_with_policy=AsyncMock(),
+        )
+        with pytest.raises(HTTPException) as refused:
+            await update_datasource(
+                request=MagicMock(),
+                datasource_id=str(CLOUD_FOLDER["id"]),
+                body=DatasourceUpdate(**fields),
+                user=self.USER,
+                existing_ds=dict(CLOUD_FOLDER),
+                require_project_owner=AsyncMock(),
+                dependencies=_datasource_dependencies(store),
+            )
+        assert refused.value.status_code == 409
+        assert refused.value.detail == (
+            "The project cloud folder connector is managed by its project "
+            "and cannot be edited"
+        )
+        store.update_datasource.assert_not_awaited()
+        store.update_datasource_with_policy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_link_unlink_and_a_read_only_link_are_refused(self):
+        from orchestrator.schemas.datasources import ProjectDatasourceSettings
+        from orchestrator.services.projects import (
+            link_datasource_to_project,
+            resolve_datasource_unlink,
+            update_project_datasource,
+        )
+
+        store = SimpleNamespace(
+            get_datasource=AsyncMock(return_value=dict(CLOUD_FOLDER)),
+            list_datasource_projects=AsyncMock(return_value=[PROJECT]),
+            link_datasource_to_project=AsyncMock(),
+            update_project_datasource=AsyncMock(return_value=True),
+        )
+        dependencies = SimpleNamespace(store=store)
+        row_id = str(CLOUD_FOLDER["id"])
+        with pytest.raises(HTTPException) as linked:
+            await link_datasource_to_project(
+                OTHER_PROJECT, row_id, None, user=self.USER, dependencies=dependencies
+            )
+        assert (linked.value.status_code, linked.value.detail) == (
+            409,
+            "The project cloud folder connector cannot be linked to another project",
+        )
+        with pytest.raises(HTTPException) as unlinked:
+            await resolve_datasource_unlink(
+                PROJECT, row_id, user=self.USER, dependencies=dependencies
+            )
+        assert (unlinked.value.status_code, unlinked.value.detail) == (
+            409,
+            "The project cloud folder connector's link is managed by its project",
+        )
+        with pytest.raises(HTTPException) as narrowed:
+            await update_project_datasource(
+                PROJECT,
+                row_id,
+                ProjectDatasourceSettings(read_only=True),
+                user=self.USER,
+                dependencies=dependencies,
+            )
+        assert (narrowed.value.status_code, narrowed.value.detail) == (
+            409,
+            "The project cloud folder connector's access is managed by its project",
+        )
+        store.link_datasource_to_project.assert_not_awaited()
+        store.update_project_datasource.assert_not_awaited()
+        # A project-level description stays the project's to set.
+        assert await update_project_datasource(
+            PROJECT,
+            row_id,
+            ProjectDatasourceSettings(description="Shared drafts"),
+            user=self.USER,
+            dependencies=dependencies,
+        ) == {"status": "updated"}
+
+
 def test_the_policy_reads_the_native_project_from_the_managed_key():
     from orchestrator.services.datasource_policy import _native_project_id
 
