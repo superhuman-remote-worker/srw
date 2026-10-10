@@ -340,6 +340,18 @@ async def test_engage_called_for_protected_thread_with_project_mount():
         ),
         patch.object(
             orchestrator.main.app.state.resources.postgres_db,
+            "list_protected_selection_rows",
+            AsyncMock(return_value=mount_rows),
+        ),
+        patch.object(
+            orchestrator.main.app.state.resources.postgres_db,
+            "get_user_project_roles",
+            AsyncMock(
+                side_effect=lambda _user, projects: dict.fromkeys(projects, "owner")
+            ),
+        ),
+        patch.object(
+            orchestrator.main.app.state.resources.postgres_db,
             "get_ro_mount_by_thread",
             AsyncMock(return_value=None),
         ),
@@ -400,6 +412,18 @@ async def test_engage_success_clears_stale_protected_cloud_error():
         ),
         patch.object(
             orchestrator.main.app.state.resources.postgres_db,
+            "list_protected_selection_rows",
+            AsyncMock(return_value=mount_rows),
+        ),
+        patch.object(
+            orchestrator.main.app.state.resources.postgres_db,
+            "get_user_project_roles",
+            AsyncMock(
+                side_effect=lambda _user, projects: dict.fromkeys(projects, "owner")
+            ),
+        ),
+        patch.object(
+            orchestrator.main.app.state.resources.postgres_db,
             "get_ro_mount_by_thread",
             AsyncMock(return_value=None),
         ),
@@ -454,6 +478,18 @@ async def test_engage_refusal_records_error_and_does_not_raise():
             orchestrator.main.app.state.resources.postgres_db,
             "list_thread_mounts",
             AsyncMock(return_value=mount_rows),
+        ),
+        patch.object(
+            orchestrator.main.app.state.resources.postgres_db,
+            "list_protected_selection_rows",
+            AsyncMock(return_value=mount_rows),
+        ),
+        patch.object(
+            orchestrator.main.app.state.resources.postgres_db,
+            "get_user_project_roles",
+            AsyncMock(
+                side_effect=lambda _user, projects: dict.fromkeys(projects, "owner")
+            ),
         ),
         patch.object(
             orchestrator.main.app.state.resources.postgres_db,
@@ -588,6 +624,18 @@ async def test_cross_replica_same_generation_engage_mints_only_once():
             orchestrator.main.app.state.resources.postgres_db,
             "list_thread_mounts",
             AsyncMock(return_value=_PROTECTED_MOUNT_ROWS),
+        ),
+        patch.object(
+            orchestrator.main.app.state.resources.postgres_db,
+            "list_protected_selection_rows",
+            AsyncMock(return_value=_PROTECTED_MOUNT_ROWS),
+        ),
+        patch.object(
+            orchestrator.main.app.state.resources.postgres_db,
+            "get_user_project_roles",
+            AsyncMock(
+                side_effect=lambda _user, projects: dict.fromkeys(projects, "owner")
+            ),
         ),
         patch.object(
             orchestrator.main.app.state.resources.postgres_db,
@@ -961,6 +1009,7 @@ async def test_stateless_sandbox_resume_skips_registered_agent_and_ensures_works
         }
     )
     db.list_thread_mounts = AsyncMock(return_value=[])
+    db.list_protected_selection_rows = db.list_thread_mounts
     agent_provisioner = MagicMock(is_available=True)
     agent_provisioner.provision_agent = AsyncMock()
     persistent_provisioner = MagicMock(is_available=True)
@@ -1090,6 +1139,7 @@ async def test_resume_cas_loss_to_retirement_fails_closed():
     db.get_user = AsyncMock(return_value={"id": "user-1"})
     db.resume_thread = AsyncMock(return_value=False)
     db.list_thread_mounts = AsyncMock(return_value=[])
+    db.list_protected_selection_rows = db.list_thread_mounts
 
     with (
         patch(
@@ -1131,6 +1181,7 @@ async def test_resume_refetch_refuses_lane_changed_while_task_was_scheduled():
     db.get_user = AsyncMock(return_value=user)
     db.resume_thread = AsyncMock()
     db.list_thread_mounts = AsyncMock(return_value=[])
+    db.list_protected_selection_rows = db.list_thread_mounts
     db.get_thread = AsyncMock(
         return_value={
             **thread,
@@ -1226,6 +1277,7 @@ async def test_resume_refetches_lane_after_failed_pool_reservation():
     db.get_user = AsyncMock(return_value=user)
     db.resume_thread = AsyncMock()
     db.list_thread_mounts = AsyncMock(return_value=[])
+    db.list_protected_selection_rows = db.list_thread_mounts
     db.get_thread = AsyncMock(side_effect=lambda _tid: dict(state["thread"]))
     lock_cm = AsyncMock()
     lock_cm.__aenter__.return_value = None
@@ -1329,6 +1381,7 @@ async def test_resume_schedules_reengage_when_no_active_row():
     db.resume_thread = AsyncMock(return_value=True)
     db.get_thread = AsyncMock(return_value=resumed)
     db.list_thread_mounts = AsyncMock(return_value=[])
+    db.list_protected_selection_rows = db.list_thread_mounts
     db.get_ro_mount_by_thread = AsyncMock(return_value=None)
     spawned, create_task = _capture_background_tasks()
 
@@ -1405,6 +1458,7 @@ async def test_resume_skips_reengage_when_active_row_present():
     db.resume_thread = AsyncMock(return_value=True)
     db.get_thread = AsyncMock(return_value=resumed)
     db.list_thread_mounts = AsyncMock(return_value=[])
+    db.list_protected_selection_rows = db.list_thread_mounts
     db.get_ro_mount_by_thread = AsyncMock(return_value=_ACTIVE_NC_ROW)
     spawned, create_task = _capture_background_tasks()
 
@@ -1475,6 +1529,7 @@ async def test_resume_skips_reengage_for_non_protected_thread():
     db.resume_thread = AsyncMock(return_value=True)
     db.get_thread = AsyncMock(return_value=resumed)
     db.list_thread_mounts = AsyncMock(return_value=[])
+    db.list_protected_selection_rows = db.list_thread_mounts
     db.get_ro_mount_by_thread = AsyncMock(return_value=None)
     spawned, create_task = _capture_background_tasks()
 

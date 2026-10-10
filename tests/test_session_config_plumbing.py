@@ -2286,6 +2286,11 @@ class TestColdSessionDatasourceDelivery:
                 AsyncMock(return_value=mount_rows),
             ),
             patch.object(
+                orch_main.app.state.resources.postgres_db,
+                "list_protected_selection_rows",
+                AsyncMock(return_value=mount_rows),
+            ),
+            patch.object(
                 thread_mount_rows_module,
                 "thread_project_ids",
                 AsyncMock(return_value=[]),

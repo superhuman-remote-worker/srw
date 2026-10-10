@@ -629,11 +629,14 @@ async def _protected_plan(
     if authority is None:
         return None
     tid = str(thread.get("id"))
+    # The session's protected folder (thread_protected_sources; for one
+    # release an older session's thread_mounts row), not its mounts.
+    protected_rows = await dependencies.store.list_protected_selection_rows(tid)
 
     def current(row: Mapping[str, Any] | None) -> bool:
         return _ro_mount_matches_protected_selection(
             row,
-            mount_rows,
+            protected_rows,
             thread_id=tid,
             user_id=str(thread.get("user_id") or ""),
             runtime_generation=authority.generation,

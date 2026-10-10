@@ -174,6 +174,10 @@ class ThreadAdmissionStore(Protocol):
 
     async def list_thread_mounts(self, thread_id: str) -> list[dict[str, Any]]: ...
 
+    async def list_protected_selection_rows(
+        self, thread_id: str
+    ) -> list[dict[str, Any]]: ...
+
     async def list_thread_mounts_bulk(
         self, thread_ids: list[str]
     ) -> dict[str, list[dict[str, Any]]]: ...
@@ -566,10 +570,11 @@ async def resolve_session_access(
     effective_backend: str | None,
     officer: bool,
     dependencies: ThreadAdmissionDependencies,
-) -> SelectionAccess:
+) -> tuple[SelectionAccess, list[dict[str, Any]]]:
     """The level of every attached connector with access levels (main cloud
     slice 5), from ``datasource_access``, ``execution.connectors.*.access``
-    and the deprecated ``protected_cloud`` alias, or the request's 422.
+    and the deprecated ``protected_cloud`` alias, or the request's 422; and
+    those connectors' rows (``strict_selection_rows``).
 
     The alias asks for the session project's own cloud folder at
     ``protected``; it is refused when that folder is not selected
@@ -663,20 +668,76 @@ async def resolve_session_access(
         execution="session",
     )
     try:
-        return await resolve_selection_access(
+        resolved = await resolve_selection_access(
             dependencies.store,
             owner_id=str(user["id"]),
             datasource_ids=selected_ids,
             project_ids=effective_project_ids,
             requested=requested,
             ctx=ctx,
-            protected_folders=(
-                frozenset({own_folder}) if own_folder is not None else frozenset()
-            ),
             rows=rows,
         )
     except ConnectorAccessError as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
+    return resolved, rows
+
+
+async def frozen_protected_source(
+    connector_id: str,
+    rows: list[dict[str, Any]],
+    *,
+    dependencies: ThreadAdmissionDependencies,
+) -> dict[str, Any]:
+    """The protected folder a new session records (``thread_protected_sources``),
+    from the cloud_folder connector bound at protected, or a 422.
+
+    Built from the connector's config, never looked up again: the project,
+    its installation and the folder handle verbatim, and
+    ``projects/<slug>`` from the project's name now, so a later rename or
+    re-point never changes what a staged review applies to. A folder the
+    protected reader cannot be made for (no project, a handle that is not a
+    Nextcloud Group Folder's) is refused here, not at engage.
+    """
+    from orchestrator.services.cloud_staging.source_identity import (
+        ProtectedMountSourceIdentity,
+    )
+    from orchestrator.services.thread_mount_rows import slugify_mount_name
+
+    row = next((row for row in rows if str(row.get("id")) == connector_id), None)
+    config = (row or {}).get("config") or {}
+    project = (
+        await dependencies.store.get_project(str(config["project_id"]))
+        if config.get("project_id")
+        else None
+    )
+    source = {
+        "id": str(uuid4()),
+        "datasource_id": connector_id,
+        "mount_kind": "project",
+        "source_kind": "project_folder",
+        "source_ref": str(config.get("project_id") or ""),
+        "target_path": f"projects/{slugify_mount_name(str((project or {}).get('name') or ''))}",
+        "backend_id": config.get("backend_id"),
+        "backend_instance_id": config.get("backend_instance_id"),
+        "cloud_handle": config.get("folder_handle"),
+    }
+    if (
+        config.get("folder_kind") != "project"
+        or not project
+        or ProtectedMountSourceIdentity.from_mount_row(source) is None
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "protected_cloud_source_invalid",
+                "message": (
+                    "This cloud folder cannot be protected: it is not a "
+                    "project's Nextcloud Group Folder"
+                ),
+                "datasource_id": connector_id,
+            },
+        )
+    return source
 
 
 async def resolve_thread_creation_plan(
@@ -1027,7 +1088,7 @@ async def resolve_thread_creation_plan(
     # (main cloud slice 5); the session is protected exactly when one cloud
     # folder is bound at ``protected``. The protected refusals come here,
     # after the selection that says whether a folder is protected.
-    selection_access = await resolve_session_access(
+    selection_access, strict_rows = await resolve_session_access(
         request_body,
         user,
         selected_ids=selected_thread_datasource_ids,
@@ -1039,6 +1100,13 @@ async def resolve_thread_creation_plan(
         dependencies=dependencies,
     )
     protected = selection_access.protected is not None
+    protected_source = (
+        await frozen_protected_source(
+            selection_access.protected, strict_rows, dependencies=dependencies
+        )
+        if selection_access.protected is not None
+        else None
+    )
     if selection_access.origins:
         thread_selection_provenance["access"] = selection_access.origins
     # VM tier is operator-gated on top of the ``vm_workspace`` PDP grant that
@@ -1174,6 +1242,10 @@ async def resolve_thread_creation_plan(
         create_kwargs["workspace_selection"] = workspace_selection
     if inline_expert is not None:
         create_kwargs["expert_row"] = selected_expert_row
+    if protected_source is not None:
+        # Inserted with the thread: a protected session never exists
+        # without its folder.
+        create_kwargs["protected_source"] = protected_source
     if trusted_seed is not None:
         create_kwargs["initial_event"] = trusted_seed.opening_event
     # A review branch is attach authority, not decorative metadata. Commit
@@ -1318,7 +1390,7 @@ async def commit_thread_creation(
     # lands before this task finishes can await it instead of racing it.
     if plan.protected:
         if dependencies.is_protected_cloud_mode_enabled():
-            seeded_rows = await store.list_thread_mounts(thread_id)
+            seeded_rows = await store.list_protected_selection_rows(thread_id)
             engage_thread = await store.get_thread(thread_id)
             engage_authority = thread_runtime_authority(engage_thread)
             if engage_authority is None:

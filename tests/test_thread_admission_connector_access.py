@@ -446,3 +446,110 @@ class TestLiveEdits:
         with pytest.raises(HTTPException) as exc:
             await self._live({"protected_cloud": True}, [FOLDER], {FOLDER: "read_only"})
         assert exc.value.detail["code"] == "protected_cloud_fixed"
+
+
+class TestTheProtectedSource:
+    """A protected session records its folder from the connector, frozen,
+    in the thread's INSERT (``create_thread(protected_source=...)``)."""
+
+    @pytest.mark.asyncio
+    async def test_the_folder_is_frozen_from_its_connector(self):
+        plan = await _plan(_body(datasource_access={FOLDER: "protected"}), _deps_with())
+        source = plan.create_kwargs["protected_source"]
+        row = _folder_row()
+        assert {key: source[key] for key in source if key != "id"} == {
+            "datasource_id": FOLDER,
+            "mount_kind": "project",
+            "source_kind": "project_folder",
+            "source_ref": PROJECT,
+            "target_path": "projects/atlas",
+            "backend_id": "nextcloud",
+            "backend_instance_id": row["config"]["backend_instance_id"],
+            "cloud_handle": row["config"]["folder_handle"],
+        }
+        plan = await _plan(
+            _body(datasource_access={FOLDER: "read_write"}), _deps_with()
+        )
+        assert "protected_source" not in plan.create_kwargs
+
+    @pytest.mark.asyncio
+    async def test_a_member_may_protect_another_projects_folder(self):
+        deps = _deps_with(
+            [_folder_row(), _foreign_row()], roles={OTHER_PROJECT: "editor"}
+        )
+        plan = await _plan(
+            _body(
+                datasource_ids=[FOLDER, OTHER_FOLDER],
+                datasource_access={OTHER_FOLDER: "protected"},
+            ),
+            deps,
+        )
+        assert plan.protected is True
+        assert plan.create_kwargs["protected_source"]["source_ref"] == OTHER_PROJECT
+        assert plan.datasource_access == {
+            FOLDER: "read_write",
+            OTHER_FOLDER: "protected",
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_viewer_may_not_protect_it(self):
+        detail = await _refused(
+            _body(
+                datasource_ids=[FOLDER, OTHER_FOLDER],
+                datasource_access={OTHER_FOLDER: "protected"},
+            ),
+            _deps_with(
+                [_folder_row(), _foreign_row()], roles={OTHER_PROJECT: "viewer"}
+            ),
+        )
+        assert detail["code"] == "connector_access_unavailable"
+        assert detail["reason"] == "above_ceiling"
+
+    @pytest.mark.asyncio
+    async def test_two_protected_folders_are_refused(self):
+        detail = await _refused(
+            _body(
+                datasource_ids=[FOLDER, OTHER_FOLDER],
+                datasource_access={FOLDER: "protected", OTHER_FOLDER: "protected"},
+            ),
+            _deps_with([_folder_row(), _foreign_row()], roles={OTHER_PROJECT: "owner"}),
+        )
+        assert detail["code"] == "protected_cloud_single_folder"
+
+    @pytest.mark.asyncio
+    async def test_a_folder_no_reader_can_be_made_for_is_refused(self):
+        row = _folder_row()
+        row["config"] = {**row["config"], "folder_handle": "nextcloud:7"}
+        detail = await _refused(
+            _body(datasource_access={FOLDER: "protected"}), _deps_with([row])
+        )
+        assert detail["code"] == "protected_cloud_source_invalid"
+
+
+class TestTheEngageRecheck:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("role", "admitted"),
+        [("owner", True), ("editor", True), ("viewer", False), (None, False)],
+    )
+    async def test_only_an_owner_or_editor_of_the_folders_project(self, role, admitted):
+        from orchestrator.services.protected_cloud_engage import (
+            protected_source_admissible,
+        )
+
+        store = SimpleNamespace(
+            get_user_project_roles=AsyncMock(
+                return_value={OTHER_PROJECT: role} if role else {}
+            )
+        )
+        assert (
+            await protected_source_admissible(
+                USER["id"],
+                {"source_ref": OTHER_PROJECT},
+                dependencies=SimpleNamespace(store=store),
+            )
+            is admitted
+        )
+        assert not await protected_source_admissible(
+            USER["id"], {}, dependencies=SimpleNamespace(store=store)
+        )

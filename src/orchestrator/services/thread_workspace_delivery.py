@@ -1372,7 +1372,7 @@ async def agent_get_thread_workspace_locked(
             return _protected_workspace_wait_payload(state="engaging")
         prepared_ro_row, prepared_mount_rows = await asyncio.gather(
             postgres_db.get_ro_mount_by_thread(thread_id),
-            postgres_db.list_thread_mounts(thread_id),
+            postgres_db.list_protected_selection_rows(thread_id),
         )
         if not _ro_mount_matches_protected_selection(
             prepared_ro_row,

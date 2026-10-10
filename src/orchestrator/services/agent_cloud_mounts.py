@@ -1160,16 +1160,24 @@ async def beside_protected_exclusions(
 ) -> list[dict[str, str]]:
     """Every attached cloud connector a protected session leaves out.
 
-    A protected session mounts its protected folder alone (its project's
-    folder, chosen from ``thread_mounts`` until slice 5); every other cloud
-    connector it has attached, its outbox included, is named
-    ``beside_protected`` rather than dropped silently.
+    A protected session mounts its protected folder alone (its
+    ``thread_protected_sources`` row: the folder its connector binds at
+    protected; for one release an older session's ``thread_mounts`` row);
+    every other cloud connector it has attached, its outbox included, is
+    named ``beside_protected`` rather than dropped silently. ``mount_rows``
+    give a legacy multi-project session its project scope.
     """
     from orchestrator.services.cloud_staging import select_protected_mount
 
-    protected = select_protected_mount(mount_rows or []) or {}
-    protected_project = str(protected.get("source_ref") or "")
     try:
+        protected = (
+            select_protected_mount(
+                await dependencies.store.list_protected_selection_rows(
+                    str(thread.get("id"))
+                )
+            )
+            or {}
+        )
         selected = await selected_cloud_connectors(
             thread,
             datasource_ids=selected_ids(thread_metadata_object(thread)),
@@ -1184,13 +1192,25 @@ async def beside_protected_exclusions(
             exc_info=True,
         )
         return []
+    protected_connector = str(protected.get("datasource_id") or "")
+    protected_project = str(protected.get("source_ref") or "")
+
+    def is_protected(connector: SelectedCloudConnector) -> bool:
+        # A connector-sourced folder names its connector; one copied from
+        # thread_mounts names only its project.
+        if protected_connector:
+            return connector.connector_id == protected_connector
+        return bool(protected_project) and (
+            native_project(connector.row) == protected_project
+        )
+
     return [
         {
             **excluded_entry(connector, "beside_protected"),
             "title": str(connector.row.get("name") or ""),
         }
         for connector in selected
-        if not protected_project or native_project(connector.row) != protected_project
+        if not is_protected(connector)
     ]
 
 

@@ -105,12 +105,16 @@ async def get_thread(
         from orchestrator.services.vm_creation_owner_view import thread_creation_views
 
         creations = await thread_creation_views(
-            store, [thread_id], viewer_user_id=str(user["id"]),
+            store,
+            [thread_id],
+            viewer_user_id=str(user["id"]),
             admin=user.get("is_admin") is True,
         )
         result["vm_creation"] = creations.get(thread_id)
     states = await read_vm_idle_states(
-        store, owner_kind="thread", owner_ids=[thread_id],
+        store,
+        owner_kind="thread",
+        owner_ids=[thread_id],
         current_thread_creations=creations,
     )
     result["workspace_lifecycle"] = states.get(thread_id)
@@ -146,6 +150,25 @@ async def get_thread(
     # legacy multi-project session's list), so the cockpit's picker asks for
     # the same projects the attach path re-authorizes against.
     result["project_ids"] = durable_project_ids(thread, legacy_mounts=mounts)
+    # A protected session's folder (main cloud slice 5): the connector bound
+    # at protected (None for a session protected before connectors), its
+    # project and where it is mounted. The review banner links it.
+    source = (
+        await store.get_thread_protected_source(thread_id)
+        if protected_cloud_marker_state(thread_metadata_object(thread)) == "on"
+        else None
+    )
+    result["protected_source"] = (
+        {
+            "datasource_id": (
+                str(source["datasource_id"]) if source.get("datasource_id") else None
+            ),
+            "source_ref": str(source["source_ref"]),
+            "target_path": source["target_path"],
+        }
+        if source is not None
+        else None
+    )
     return result
 
 

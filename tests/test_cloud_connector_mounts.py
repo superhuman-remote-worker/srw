@@ -791,6 +791,12 @@ async def test_a_protected_session_names_its_other_folders_beside_it(
             "cloud_handle": "h",
         }
     ]
+    # The session's protected folder (main cloud slice 5).
+
+    async def protected_selection(_thread_id):
+        return protected_rows
+
+    store.list_protected_selection_rows = protected_selection
     payload = await mounts._build_agent_cloud_mount(
         thread,
         mount_rows=protected_rows,

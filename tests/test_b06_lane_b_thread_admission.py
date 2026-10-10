@@ -103,6 +103,10 @@ def _deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         # none, unless a test attaches the project's cloud folder.
         resolve_datasources_for_thread=AsyncMock(return_value=[]),
         get_user_project_roles=AsyncMock(return_value={}),
+        # A protected folder's project (its frozen source's target), and
+        # the protected session's folder the engage reads back.
+        get_project=AsyncMock(return_value={"id": PROJECT, "name": "Atlas"}),
+        list_protected_selection_rows=AsyncMock(return_value=[]),
     )
     for key, value in store_over.items():
         setattr(store, key, value)
@@ -183,7 +187,10 @@ def _folder_row() -> dict[str, Any]:
             "project_id": PROJECT,
             "backend_id": "nextcloud",
             "backend_instance_id": GENERATION,
-            "folder_handle": "nextcloud:7",
+            "folder_handle": (
+                '{"backend": "nextcloud", "native_id": "7", '
+                '"vendor_meta": {"mountpoint": "Atlas"}}'
+            ),
         },
     }
 

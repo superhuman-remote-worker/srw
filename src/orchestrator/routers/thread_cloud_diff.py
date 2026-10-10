@@ -173,6 +173,7 @@ async def apply_thread_cloud_diff(
         thread=thread,
         body=body,
         dependencies=dependencies.operations,
+        user=user,
     )
 
 

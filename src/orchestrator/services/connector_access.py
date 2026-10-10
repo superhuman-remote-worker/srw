@@ -21,7 +21,7 @@ Design: knowledge-base/knowledge/features/main_cloud_as_connectors.md,
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any
 
 from orchestrator.services.connector_drivers.base import (
@@ -114,7 +114,6 @@ async def resolve_selection_access(
     requested: Mapping[str, str],
     ctx: AccessContext,
     keep: Mapping[str, str | None] | None = None,
-    protected_folders: frozenset[str] | None = None,
     rows: list[dict[str, Any]] | None = None,
 ) -> SelectionAccess:
     """Resolve the level of every strict connector of an authorized
@@ -129,9 +128,7 @@ async def resolve_selection_access(
     (``resolve_access``): the project link's, lowered within what ``ctx``
     offers and the owner's ceiling (a viewer of a cloud folder's project),
     or no level at all. More than one connector at ``protected`` is refused
-    (``protected_cloud_single_folder``). ``protected_folders``, when set, are
-    the only connectors the reviewed level is offered for (``None``: any).
-    ``rows`` are :func:`strict_selection_rows` when the caller read them.
+    (``protected_cloud_single_folder``). ``rows`` are :func:`strict_selection_rows` when the caller read them.
     """
     from orchestrator.services.datasource_policy import access_ceiling_for
 
@@ -175,14 +172,7 @@ async def resolve_selection_access(
             continue
         ceiling = access_ceiling_for(row, roles.get(native_cloud_project(row) or ""))
         level = requested.get(datasource_id)
-        row_ctx = (
-            ctx
-            if protected_folders is None or datasource_id in protected_folders
-            else replace(ctx, protected_mode_enabled=False)
-        )
-        resolved = bound_access(
-            driver, row, ctx=row_ctx, requested=level, ceiling=ceiling
-        )
+        resolved = bound_access(driver, row, ctx=ctx, requested=level, ceiling=ceiling)
         if level is not None and resolved.refused:
             raise ConnectorAccessError(
                 {

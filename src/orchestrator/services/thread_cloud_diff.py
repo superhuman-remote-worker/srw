@@ -450,18 +450,25 @@ async def apply_thread_cloud_diff(
     thread: dict[str, Any],
     body: dict,
     dependencies: ThreadCloudDiffDependencies,
+    user: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Owner-triggered apply of the staged protected-cloud diff (Task 10).
 
     Whole-diff, epoch-pinned write-back to the real cloud folder — see
     ``services.cloud_staging.apply`` module docstring for the full flow and
     its invariants (conflict gate, deletes-first, fail-soft partial writes,
-    baseline re-capture on full success).
+    baseline re-capture on full success). The caller (``user``) must be an
+    owner or editor of the protected folder's project now, whichever project
+    the session belongs to (main cloud slice 5): ``403
+    protected_cloud_apply_not_member`` otherwise.
     """
     _require_protected(thread, dependencies=dependencies)
     from orchestrator.services.cloud_staging.apply import (
         StagedApplyError,
         apply_staged_diff,
+    )
+    from orchestrator.services.protected_cloud_engage import (
+        protected_source_admissible,
     )
 
     postgres_db = dependencies.store
@@ -471,6 +478,23 @@ async def apply_thread_cloud_diff(
     except (ValueError, TypeError):
         raise HTTPException(status_code=422, detail={"code": "invalid_epoch"})
     reset_row = await postgres_db.get_ro_mount_by_thread(thread_id)
+    if user is not None and reset_row is not None:
+        binding = reset_row.get("source_binding")
+        if not await protected_source_admissible(
+            str(user.get("id") or ""),
+            binding if isinstance(binding, dict) else None,
+            dependencies=postgres_db,
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "protected_cloud_apply_not_member",
+                    "message": (
+                        "Only an owner or editor of the protected folder's "
+                        "project can apply its changes"
+                    ),
+                },
+            )
     reset_summary = (
         reset_row.get("staged_summary")
         if reset_row and int(reset_row.get("staged_epoch") or -1) == epoch

@@ -467,8 +467,12 @@ def _protected_thread() -> dict:
 
 
 def _protected_deps(store=None, tasks=None):
+    store = store or SimpleNamespace()
+    if not hasattr(store, "list_protected_selection_rows"):
+        # The session's protected folder (main cloud slice 5).
+        store.list_protected_selection_rows = AsyncMock(return_value=[{"id": "row-1"}])
     return agent_cloud_mounts.AgentCloudMountDependencies(
-        store=store or SimpleNamespace(),
+        store=store,
         cloud_router=SimpleNamespace(),
         cloud_tasks=tasks or SimpleNamespace(protected_engage_get=lambda key: None),
         is_protected_cloud_mode_enabled=lambda: True,

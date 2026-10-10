@@ -98,7 +98,12 @@ async def _active_attempt_is_current(
         and protected_cloud_marker_state(_metadata_object(thread)) == "on"
     ):
         return False
-    selected = select_protected_mount(await postgres_db.list_thread_mounts(thread_id))
+    # The session's protected folder (thread_protected_sources; for one
+    # release an older session's thread_mounts row): a grant whose source
+    # it no longer is, is stale.
+    selected = select_protected_mount(
+        await postgres_db.list_protected_selection_rows(thread_id)
+    )
     return bool(
         isinstance(selected, Mapping)
         and str(selected.get("id") or "") == str(row.get("selected_mount_id") or "")

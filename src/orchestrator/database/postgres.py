@@ -1857,6 +1857,89 @@ def _datasource_row_to_dict(
     return d
 
 
+#: A protected session's folder (``thread_protected_sources``) in the
+#: shape of a ``thread_mounts`` row, which ``select_protected_mount`` and
+#: ``ProtectedMountSourceIdentity.from_mount_row`` read.
+_PROTECTED_SOURCE_COLUMNS = (
+    "id, thread_id, datasource_id, mount_kind, target_path, source_kind, "
+    "source_ref, backend_id, backend_instance_id, cloud_handle, created_at"
+)
+
+
+def _protected_source_row(row: Any) -> Dict[str, Any]:
+    return {**dict(row), "webdav_url": None, "target_user_sub": None}
+
+
+async def _locked_protected_source(
+    conn: Any, mount_id: Any, thread_id: Any
+) -> Dict[str, Any] | None:
+    """The protected folder ``cloud_ro_mounts.selected_mount_id`` names,
+    locked ``FOR SHARE``: the thread's ``thread_protected_sources`` row,
+    else (for one release) the ``thread_mounts`` row an older orchestrator
+    selected, as the 0524 trigger reads them."""
+    row = await conn.fetchrow(
+        f"""
+        SELECT {_PROTECTED_SOURCE_COLUMNS}
+          FROM thread_protected_sources
+         WHERE id=$1::uuid AND thread_id=$2::uuid
+         FOR SHARE
+        """,
+        mount_id,
+        thread_id,
+    )
+    if row is not None:
+        return _protected_source_row(row)
+    row = await conn.fetchrow(
+        """
+        SELECT id, thread_id, mount_kind, target_path, source_kind,
+               source_ref, backend_id, backend_instance_id,
+               cloud_handle, webdav_url, target_user_sub, created_at
+          FROM thread_mounts
+         WHERE id=$1::uuid AND thread_id=$2::uuid
+         FOR SHARE
+        """,
+        mount_id,
+        thread_id,
+    )
+    return dict(row) if row is not None else None
+
+
+#: Copies every protected thread's selected ``thread_mounts`` row that has
+#: no ``thread_protected_sources`` row yet, under the same id (0524's
+#: carry-over, for sessions an older orchestrator created).
+_BACKFILL_PROTECTED_SOURCES_SQL = """
+WITH selected AS (
+    SELECT DISTINCT ON (mount.thread_id) mount.*
+      FROM thread_mounts AS mount
+      JOIN threads AS thread ON thread.id = mount.thread_id
+     WHERE thread.metadata->'protected_cloud' = 'true'::jsonb
+       AND mount.mount_kind <> 'project_default'
+       AND mount.backend_id = 'nextcloud'
+       AND NULLIF(mount.cloud_handle, '') IS NOT NULL
+       AND NOT EXISTS (
+            SELECT 1 FROM thread_protected_sources AS source
+             WHERE source.thread_id = mount.thread_id
+       )
+     ORDER BY mount.thread_id, mount.target_path
+)
+INSERT INTO thread_protected_sources (
+    id, thread_id, datasource_id, mount_kind, source_kind, source_ref,
+    target_path, backend_id, backend_instance_id, cloud_handle, created_at
+)
+SELECT selected.id, selected.thread_id, NULL, selected.mount_kind,
+       selected.source_kind, selected.source_ref, selected.target_path,
+       selected.backend_id, selected.backend_instance_id,
+       selected.cloud_handle, COALESCE(selected.created_at, now())
+  FROM selected
+ WHERE selected.mount_kind = 'project'
+   AND selected.source_kind = 'project_folder'
+   AND selected.source_ref IS NOT NULL
+   AND selected.backend_instance_id IS NOT NULL
+   AND selected.target_path <> ''
+ON CONFLICT DO NOTHING
+"""
+
+
 QUERIES_DIR = Path(__file__).parent / "queries" / "postgres"
 
 # Frozen schema reference (no longer applied at runtime — see migrate.py).
@@ -9257,21 +9340,10 @@ class PostgresDB:
                 )
                 if thread is None:
                     return None
-                mount_row = await conn.fetchrow(
-                    """
-                    SELECT id, thread_id, mount_kind, target_path, source_kind,
-                           source_ref, backend_id, backend_instance_id,
-                           cloud_handle, webdav_url, target_user_sub, created_at
-                      FROM thread_mounts
-                     WHERE id=$1::uuid AND thread_id=$2::uuid
-                     FOR SHARE
-                    """,
-                    parsed_mount,
-                    parsed_thread,
+                mount_row = await _locked_protected_source(
+                    conn, parsed_mount, parsed_thread
                 )
-                selected_source = ProtectedMountSourceIdentity.from_mount_row(
-                    dict(mount_row) if mount_row is not None else None
-                )
+                selected_source = ProtectedMountSourceIdentity.from_mount_row(mount_row)
                 if selected_source != plan.source:
                     return None
                 backend_exists = await conn.fetchval(
@@ -9736,21 +9808,10 @@ class PostgresDB:
                 )
                 if thread is None:
                     return False
-                mount_row = await conn.fetchrow(
-                    """
-                    SELECT id, thread_id, mount_kind, target_path, source_kind,
-                           source_ref, backend_id, backend_instance_id,
-                           cloud_handle, webdav_url, target_user_sub, created_at
-                      FROM thread_mounts
-                     WHERE id=$1::uuid AND thread_id=$2::uuid
-                     FOR SHARE
-                    """,
-                    parsed_mount,
-                    parsed_thread,
+                mount_row = await _locked_protected_source(
+                    conn, parsed_mount, parsed_thread
                 )
-                selected_source = ProtectedMountSourceIdentity.from_mount_row(
-                    dict(mount_row) if mount_row is not None else None
-                )
+                selected_source = ProtectedMountSourceIdentity.from_mount_row(mount_row)
                 if selected_source != plan.source:
                     return False
                 raw = await conn.fetchrow(
@@ -36499,6 +36560,7 @@ class PostgresDB:
         execution_manifest: Mapping[str, Any] | None = None,
         workspace_selection: Mapping[str, Any] | None = None,
         expert_row: Mapping[str, Any] | None = None,
+        protected_source: Mapping[str, Any] | None = None,
     ) -> str:
         """Create a thread with its complete connector selection in one row.
 
@@ -36517,6 +36579,12 @@ class PostgresDB:
         ``expert_row`` is an admission-validated inline Expert definition. The
         session snapshot freezes it in place of ``metadata.expert_id``, which an
         inline session never carries.
+
+        ``protected_source`` is a protected session's folder
+        (``thread_protected_sources``: ``id``, ``datasource_id``,
+        ``source_ref``, ``target_path``, ``backend_id``,
+        ``backend_instance_id``, ``cloud_handle``), inserted in the same
+        transaction, so a protected thread never exists without it.
         """
         if execution_lane not in ("pinned", "stateless"):
             raise ValueError(f"Unsupported thread execution lane: {execution_lane!r}")
@@ -36698,6 +36766,30 @@ class PostgresDB:
                         """,
                         row["id"],
                         initial_event,
+                    )
+                if protected_source is not None:
+                    await conn.execute(
+                        """
+                        INSERT INTO thread_protected_sources (
+                            id, thread_id, datasource_id, mount_kind,
+                            source_kind, source_ref, target_path, backend_id,
+                            backend_instance_id, cloud_handle
+                        )
+                        VALUES ($1::uuid, $2, $3::uuid, 'project',
+                                'project_folder', $4::uuid, $5, $6, $7::uuid, $8)
+                        """,
+                        str(protected_source["id"]),
+                        row["id"],
+                        (
+                            str(protected_source["datasource_id"])
+                            if protected_source.get("datasource_id")
+                            else None
+                        ),
+                        str(protected_source["source_ref"]),
+                        str(protected_source["target_path"]),
+                        str(protected_source["backend_id"]),
+                        str(protected_source["backend_instance_id"]),
+                        str(protected_source["cloud_handle"]),
                     )
                 from orchestrator.services.manifest_execution_snapshot import (
                     capture_execution,
@@ -48512,6 +48604,52 @@ class PostgresDB:
                 target_user_sub,
             )
         return str(row["id"])
+
+    async def list_protected_selection_rows(
+        self, thread_id: str
+    ) -> list[Dict[str, Any]]:
+        """The rows a protected session's folder is selected from
+        (``cloud_staging.select_protected_mount``).
+
+        Its ``thread_protected_sources`` row (main cloud slice 5: the folder
+        its connector binds at protected, frozen at admission), in the shape
+        of a ``thread_mounts`` row; for one release a session without one
+        (created by an older orchestrator) still selects from its
+        ``thread_mounts`` rows.
+        """
+        source = await self.get_thread_protected_source(thread_id)
+        if source is not None:
+            return [source]
+        return await self.list_thread_mounts(thread_id)
+
+    async def get_thread_protected_source(
+        self, thread_id: str
+    ) -> Dict[str, Any] | None:
+        """A protected session's ``thread_protected_sources`` row (mount-row
+        shape), or ``None``."""
+        try:
+            thread_uuid = UUID(str(thread_id))
+        except (TypeError, ValueError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT {_PROTECTED_SOURCE_COLUMNS} "
+                "FROM thread_protected_sources WHERE thread_id = $1",
+                thread_uuid,
+            )
+        return _protected_source_row(row) if row is not None else None
+
+    async def backfill_thread_protected_sources(self) -> int:
+        """Copy each protected thread's selected ``thread_mounts`` row that
+        has no ``thread_protected_sources`` row yet, under the same id, and
+        return how many. Idempotent: run at startup, for sessions an older
+        orchestrator created while this one rolled out."""
+        async with self.acquire() as conn:
+            result = await conn.execute(_BACKFILL_PROTECTED_SOURCES_SQL)
+        try:
+            return int(str(result).rsplit(" ", 1)[-1])
+        except ValueError:
+            return 0
 
     async def list_thread_mounts(self, thread_id: str) -> list[Dict[str, Any]]:
         """Return all mounts attached to a thread, ordered by ``target_path``."""

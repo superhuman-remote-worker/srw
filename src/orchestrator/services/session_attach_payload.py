@@ -334,7 +334,7 @@ async def assemble_session_attach_payload(
             return None
         ro_row, mount_rows = await asyncio.gather(
             postgres_db.get_ro_mount_by_thread(thread_id),
-            postgres_db.list_thread_mounts(thread_id),
+            postgres_db.list_protected_selection_rows(thread_id),
         )
         from orchestrator.services.cloud_staging import select_protected_mount
 

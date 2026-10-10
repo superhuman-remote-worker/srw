@@ -2549,13 +2549,30 @@ BEGIN
         );
     END IF;
     IF NEW.status = 'engaging' AND validate_selected THEN
-        SELECT mount.mount_kind, mount.target_path, mount.source_kind,
-               mount.source_ref, mount.backend_id,
-               mount.backend_instance_id, mount.cloud_handle
+        -- 0524: the protected folder a session selected is its
+        -- thread_protected_sources row.
+        -- 0525: both lookups yield one row type (text, not thread_mounts'
+        -- varchar), so a backend that runs both keeps one cached plan.
+        SELECT source.mount_kind::text, source.target_path::text,
+               source.source_kind::text, source.source_ref::uuid,
+               source.backend_id::text, source.backend_instance_id::uuid,
+               source.cloud_handle::text
           INTO selected
-          FROM public.thread_mounts AS mount
-         WHERE mount.id = NEW.selected_mount_id
-           AND mount.thread_id = NEW.thread_id;
+          FROM public.thread_protected_sources AS source
+         WHERE source.id = NEW.selected_mount_id
+           AND source.thread_id = NEW.thread_id;
+        IF NOT FOUND THEN
+            -- For one release: a session an older orchestrator selected from
+            -- its thread_mounts row, before the startup pass copied it.
+            SELECT mount.mount_kind::text, mount.target_path::text,
+                   mount.source_kind::text, mount.source_ref::uuid,
+                   mount.backend_id::text, mount.backend_instance_id::uuid,
+                   mount.cloud_handle::text
+              INTO selected
+              FROM public.thread_mounts AS mount
+             WHERE mount.id = NEW.selected_mount_id
+               AND mount.thread_id = NEW.thread_id;
+        END IF;
         IF NOT FOUND THEN
             RAISE EXCEPTION 'protected reader selected mount no longer exists'
                 USING ERRCODE = '23514',
@@ -8116,6 +8133,21 @@ $_$;
 --
 
 COMMENT ON FUNCTION public.enforce_thread_ended_transition() IS 'Mixed-version lifecycle fence: ended resumes rotate generation; pending retirement blocks Resume/runtime status mutation.';
+
+
+--
+-- Name: enforce_thread_protected_source_immutable(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_thread_protected_source_immutable() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    RAISE EXCEPTION 'a protected session''s source is immutable'
+        USING ERRCODE = '23514',
+              CONSTRAINT = 'thread_protected_sources_immutable';
+END;
+$$;
 
 
 --
@@ -26794,6 +26826,13 @@ COMMENT ON COLUMN public.cloud_ro_mounts.source_binding IS 'Canonical immutable 
 
 
 --
+-- Name: COLUMN cloud_ro_mounts.selected_mount_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.cloud_ro_mounts.selected_mount_id IS 'thread_protected_sources.id of the protected folder (for one release, a thread_mounts.id selected by an older orchestrator).';
+
+
+--
 -- Name: completion_effects; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -32432,6 +32471,33 @@ COMMENT ON COLUMN public.thread_permission_requests.accepted_lease_token IS 'Imm
 
 
 --
+-- Name: thread_protected_sources; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_protected_sources (
+    id uuid NOT NULL,
+    thread_id uuid NOT NULL,
+    datasource_id uuid,
+    mount_kind text NOT NULL,
+    source_kind text NOT NULL,
+    source_ref uuid NOT NULL,
+    target_path text NOT NULL,
+    backend_id text NOT NULL,
+    backend_instance_id uuid NOT NULL,
+    cloud_handle text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT thread_protected_sources_shape_check CHECK (((mount_kind = 'project'::text) AND (source_kind = 'project_folder'::text) AND (target_path <> ''::text) AND (cloud_handle <> ''::text)))
+);
+
+
+--
+-- Name: TABLE thread_protected_sources; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.thread_protected_sources IS 'A protected session''s folder: the project folder its cloud_folder connector binds at protected, frozen at admission. cloud_ro_mounts.selected_mount_id names its id. Immutable; rows copied from thread_mounts keep that row''s id and have no datasource_id.';
+
+
+--
 -- Name: thread_rewinds; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -36067,6 +36133,22 @@ ALTER TABLE ONLY public.thread_notifications
 
 ALTER TABLE ONLY public.thread_permission_requests
     ADD CONSTRAINT thread_permission_requests_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: thread_protected_sources thread_protected_sources_one_per_thread; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_protected_sources
+    ADD CONSTRAINT thread_protected_sources_one_per_thread UNIQUE (thread_id);
+
+
+--
+-- Name: thread_protected_sources thread_protected_sources_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_protected_sources
+    ADD CONSTRAINT thread_protected_sources_pkey PRIMARY KEY (id);
 
 
 --
@@ -40839,6 +40921,13 @@ CREATE TRIGGER thread_permission_notify_trigger AFTER UPDATE ON public.thread_pe
 
 
 --
+-- Name: thread_protected_sources thread_protected_sources_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER thread_protected_sources_immutable BEFORE UPDATE ON public.thread_protected_sources FOR EACH ROW EXECUTE FUNCTION public.enforce_thread_protected_source_immutable();
+
+
+--
 -- Name: thread_runtime_attach_abort_outcomes thread_runtime_attach_abort_outcomes_append_only; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -43803,6 +43892,22 @@ ALTER TABLE ONLY public.thread_notifications
 
 ALTER TABLE ONLY public.thread_permission_requests
     ADD CONSTRAINT thread_permission_requests_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: thread_protected_sources thread_protected_sources_backend_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_protected_sources
+    ADD CONSTRAINT thread_protected_sources_backend_fk FOREIGN KEY (backend_instance_id, backend_id) REFERENCES public.main_cloud_backend_instances(id, backend_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: thread_protected_sources thread_protected_sources_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_protected_sources
+    ADD CONSTRAINT thread_protected_sources_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
 
 
 --

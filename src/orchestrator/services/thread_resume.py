@@ -625,7 +625,9 @@ async def resume_thread(
     ):
         ro_row = await postgres_db.get_ro_mount_by_thread(thread_id)
         if not ro_row or ro_row.get("status") != "active":
-            resume_mount_rows = await postgres_db.list_thread_mounts(thread_id)
+            resume_mount_rows = await postgres_db.list_protected_selection_rows(
+                thread_id
+            )
             _schedule_protected_engage(
                 thread_id,
                 user_id=str(user["id"]),

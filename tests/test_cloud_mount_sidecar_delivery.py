@@ -602,6 +602,9 @@ async def _protected_poll(*, recorded_attempt: str, header: str | None = "sideca
         patch.object(store, "get_ro_mount_by_thread", AsyncMock(return_value=ro_row)),
         patch.object(store, "list_thread_mounts", AsyncMock(return_value=mount_rows)),
         patch.object(
+            store, "list_protected_selection_rows", AsyncMock(return_value=mount_rows)
+        ),
+        patch.object(
             thread_mount_rows, "thread_project_ids", AsyncMock(return_value=[])
         ),
         patch.object(

@@ -127,9 +127,16 @@ def _store(conn: _Conn | None = None, **over: Any) -> SimpleNamespace:
         list_thread_mounts=AsyncMock(return_value=list(MOUNT_ROWS)),
         get_ro_mount_by_thread=AsyncMock(return_value=None),
         get_main_cloud_backend_instance=AsyncMock(return_value=None),
+        # The owner may protect the folder's project (main cloud slice 5).
+        get_user_project_roles=AsyncMock(
+            side_effect=lambda _user, projects: dict.fromkeys(projects, "owner")
+        ),
     )
     for key, value in over.items():
         setattr(store, key, value)
+    if "list_protected_selection_rows" not in over:
+        # The protected session's folder: here, its project's mount row.
+        store.list_protected_selection_rows = store.list_thread_mounts
     return store
 
 

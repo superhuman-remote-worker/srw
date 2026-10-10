@@ -337,6 +337,22 @@ async def bind_services(resources: ApplicationResources) -> None:
     # row (one-time input before 0186) is no configuration: it is removed once
     # an instance is active, and until then it only stops a first boot from
     # adopting a Helm description of another cloud (instance_registry).
+    # Every protected session has its protected folder recorded (main cloud
+    # slice 5): one an older orchestrator created while this one rolled out
+    # is copied from its thread_mounts row under the same id. Idempotent on
+    # every replica; when the count stays 0 for a release, the thread_mounts
+    # fallback can go.
+    try:
+        copied = await resources.postgres_db.backfill_thread_protected_sources()
+        logger.info(
+            "Protected session folders backfill: %d copied from thread_mounts",
+            copied,
+        )
+    except Exception:
+        logger.error(
+            "Protected session folders backfill failed; it retries at the next start",
+            exc_info=True,
+        )
     try:
         _legacy_overlay = await resources.postgres_db.get_system_setting("main_cloud")
     except Exception as _e:
