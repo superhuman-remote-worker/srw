@@ -72,6 +72,7 @@ def test_dry_run_prints_the_plan_and_touches_nothing(no_cluster, capsys):
         "killed",
         "missing",
         "protected",
+        "without",
         "teardown",
         "regression",
         "cleanup",
@@ -317,3 +318,32 @@ def test_a_registered_password_is_never_printed(capsys):
     gate.Report("d7-0000000000").check("x", True, f"detail {password}")
     gate.Report("d7-0000000000").note(f"note {password}")
     assert password not in capsys.readouterr().out
+
+
+def test_the_gate_follows_the_lane_thread_admission_picks():
+    """Protected sessions always run pinned (thread admission keeps their
+    overlay staging off the stateless lane); the gate's sandbox sessions run
+    stateless, whose End drains the folders."""
+    assert gate.expected_lane(protected=True) == "pinned"
+    assert gate.expected_lane(protected=False) == "stateless"
+    source = (ROOT / "src/orchestrator/services/thread_admission.py").read_text()
+    assert "if request_body.protected_cloud:\n" in source
+    assert 'execution_lane = "pinned"' in source
+
+
+def test_a_pinned_session_gets_the_reader_disabled_before_its_attach(monkeypatch):
+    """prot42 disables its reader as soon as the grant is active, and a
+    reader that never becomes active is infrastructure trouble."""
+    g = gate.CloudMountSidecarGate(_args("--gate-id", "d7-0123456789"))
+    session = gate.Session("prot42", "p", "1", thread="t")
+    answers = iter(["", "", "srw-reader-a-17aefa77"])
+    monkeypatch.setattr(g, "active_reader", lambda _s: next(answers) or None)
+    monkeypatch.setattr(gate.time, "sleep", lambda _s: None)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(g, "occ", lambda argv: calls.append(argv) or 0)
+    g.disable_reader_once_granted(session)
+    assert calls == [["user:disable", "srw-reader-a-17aefa77"]]
+    assert g.disabled_reader == "srw-reader-a-17aefa77"
+    g.enable_reader()
+    assert calls[-1] == ["user:enable", "srw-reader-a-17aefa77"]
+    assert g.disabled_reader is None

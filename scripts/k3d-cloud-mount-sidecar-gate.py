@@ -19,9 +19,13 @@ protected checks, ``agent.protectedCloudModeEnabled: "true"``.
 
 Fixtures (all disposable, all named after the gate id): projects ``rw``,
 ``missing`` (its Nextcloud group folder renamed before its session starts,
-and renamed back before cleanup) and ``prot``; one stateless sandbox session in each (``prot`` protected); one
-stateless job in ``rw``. Each session gets one cheap turn ("Reply with the
-single word ready.") so its agent attaches.
+and renamed back before cleanup), ``prot`` and ``prot42``; one sandbox
+session in each, and one stateless job in ``rw``. The gate follows the lane
+thread admission picks: ``rw`` and ``missing`` run on the stateless lane
+(whose End drains the folders), while ``prot`` and ``prot42`` are protected
+and protected sessions always run pinned, with a dedicated agent pod. Each
+session gets one cheap turn ("Reply with the single word ready.") so a
+stateless claim attaches; a pinned agent attaches as it starts.
 
 Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
 
@@ -56,15 +60,21 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               workspace's FUSE profile for the capture overlay; the opener
               serves /srw/cloud/lower read-only and creates /srw/cloud/merged
               for agent-host; /cloud/lower is a read-only fuse.rclone mount and
-              a write to it fails with EROFS; after the turn /cloud/merged is
+              a write to it fails with EROFS; its dedicated agent pod serves
+              this checkout's agent files; after the turn /cloud/merged is
               the overlay and a write through it lands in the upper layer; the
               reader credential in the Secret is refused a WebDAV PUT; with
               the reader account disabled and the supervisor restarted, the
-              lower reads unavailable with credential_rejected, the workspace
-              never restarts, and the next claim starts without cloud with
-              the thread's state saying credential_rejected, no overlay left
-              on /cloud/merged and no workspace/cloud link to it (decision 42;
-              the account is enabled again at once)
+              lower reads unavailable with credential_rejected and the
+              workspace never restarts (the account is enabled again at once)
+  without     (protected mode on) decision 42 at a pinned session's attach,
+              the only attach it has: the prot42 session's reader account is
+              disabled as soon as its grant is active, before its agent
+              attaches (a supervisor that mounted first is restarted); its
+              lower reads unavailable with credential_rejected, the session
+              starts without cloud with the thread's state saying
+              credential_rejected, no overlay on /cloud/merged and no
+              workspace/cloud link to it (the account is enabled again)
   teardown    50 MB written into the rw folder, then End at once: End returns
               within the grace period, the Pod is gone with nothing of it in
               the node's mount table, its plan ConfigMap and credential Secret
@@ -657,9 +667,13 @@ PLAN = [
     "protected: the prot session keeps the workspace FUSE profile; the lower "
     "is a read-only sidecar mount (EROFS for agent-host); the overlay at "
     "/cloud/merged captures a write in its upper layer; the reader credential "
-    "is refused a WebDAV PUT; reader disabled + supervisor restarted -> "
-    "credential_rejected, no workspace restart, the next claim starts without "
-    "cloud, keeps no overlay or workspace/cloud link, and says so (decision 42)",
+    "is refused a WebDAV PUT; its pinned agent pod serves this checkout; "
+    "reader disabled + supervisor restarted -> credential_rejected, no "
+    "workspace restart",
+    "without: the prot42 session's reader disabled once its grant is active, "
+    "before its pinned agent attaches -> the session starts without cloud, "
+    "keeps no overlay or workspace/cloud link, and says credential_rejected "
+    "(decision 42)",
     "teardown: 50 MB written, End at once: End within the grace period, the "
     "Pod gone with nothing in the node's mount table, its ConfigMap and "
     "Secret collected, the file complete in Nextcloud",
@@ -668,6 +682,14 @@ PLAN = [
     "credential Secrets; a moved group folder moved back and a disabled reader "
     "enabled again; residue check by gate id",
 ]
+
+
+def expected_lane(*, protected: bool) -> str:
+    """The execution lane thread admission gives a gate session: a
+    protected session always runs pinned (its overlay staging is not fenced
+    to a stateless claim, thread_admission.resolve_thread_creation_plan), a
+    sandbox one stateless on this profile."""
+    return "pinned" if protected else "stateless"
 
 
 @dataclass
@@ -680,6 +702,7 @@ class Session:
     pod_uid: str = ""
     objects: str = ""
     mount: str = ""
+    lane: str = ""
 
 
 class CloudMountSidecarGate:
@@ -747,18 +770,52 @@ class CloudMountSidecarGate:
         if not pods:
             problems.append(f"no {component} pod")
         for pod in pods:
-            name = pod["metadata"]["name"]
-            found = json.loads(
+            problems += self.pod_served_problems(
+                pod["metadata"]["name"], container_name, paths
+            )
+        return problems
+
+    def pod_served_problems(self, name: str, container_name: str, paths) -> list[str]:
+        found = json.loads(
+            command(
+                K
+                + ["exec", "-i", name, "-c", container_name, "--"]
+                + ["python", "-c", _HASH_PROGRAM, POD_ROOT],
+                data=json.dumps(expected_bytes(paths)),
+            ).splitlines()[-1]
+        )
+        if found.get("stale"):
+            return [f"{name} stale: {found['stale'][:6]}"]
+        return []
+
+    def pinned_agent_problems(self, session: Session) -> list[str]:
+        """A pinned session's dedicated agent pod (not covered by the
+        preflight, which reads the stateless pool) must serve this checkout's
+        agent files."""
+
+        def running() -> str | None:
+            listing = json.loads(
                 command(
                     K
-                    + ["exec", "-i", name, "-c", container_name, "--"]
-                    + ["python", "-c", _HASH_PROGRAM, POD_ROOT],
-                    data=json.dumps(expected_bytes(paths)),
-                ).splitlines()[-1]
-            )
-            if found.get("stale"):
-                problems.append(f"{name} stale: {found['stale'][:6]}")
-        return problems
+                    + ["get", "pods", "-l"]
+                    + [f"srw.io/thread-id={session.thread},srw/component=agent"]
+                    + ["-o", "json"]
+                )
+            )["items"]
+            for pod in listing:
+                if (pod.get("status") or {}).get("phase") == "Running" and not pod[
+                    "metadata"
+                ].get("deletionTimestamp"):
+                    return pod["metadata"]["name"]
+            return None
+
+        name = wait_for(
+            f"the {session.label} session's agent pod",
+            running,
+            timeout=self.args.pod_timeout,
+            interval=5,
+        )
+        return self.pod_served_problems(name, AGENT_CONTAINER, AGENT_SERVED)
 
     def orchestrator_env(self, name: str) -> str:
         rc, out, _err = run(
@@ -917,7 +974,12 @@ class CloudMountSidecarGate:
         return project, folder_id, mountpoint
 
     def start_session(
-        self, label: str, *, protected: bool = False, folder_moved: bool = False
+        self,
+        label: str,
+        *,
+        protected: bool = False,
+        folder_moved: bool = False,
+        on_created: Callable[[Session], None] | None = None,
     ) -> Session:
         project, folder_id, mountpoint = self.create_project(label)
         session = self.sessions[label] = Session(label, project, folder_id)
@@ -939,11 +1001,17 @@ class CloudMountSidecarGate:
         created = self.api.ok("POST", "/api/persistent/threads", body)
         session.thread = str(created.get("thread_id") or created["id"])
         print(f"session {label} {session.thread}", flush=True)
-        lane = sql(
+        session.lane = sql(
             f"SELECT execution_lane FROM threads WHERE id = {lit(session.thread)}"
         )
-        if lane != "stateless":
-            raise GateError(f"session lane is {lane!r}, not stateless")
+        expected = expected_lane(protected=protected)
+        if session.lane != expected:
+            raise GateError(
+                f"session lane is {session.lane!r}; thread admission gives a "
+                f"{'protected' if protected else 'sandbox'} session {expected!r}"
+            )
+        if on_created is not None:
+            on_created(session)
         pod = self.workspace_pod(
             f"srw/thread-id={session.thread}",
             "ws-thread-",
@@ -1277,6 +1345,13 @@ class CloudMountSidecarGate:
         tops = top_mounts(self.inspect(session.pod).get("mountinfo", ""))
         fstype, options = tops.get("/cloud/lower", ("", ""))
         rc, _out, err = self.as_agent(session.pod, "touch /cloud/lower/gate-probe")
+        agent_problems = self.pinned_agent_problems(session)
+        self.report.check(
+            "protected: the pinned session's agent pod serves this checkout's "
+            "agent files",
+            not agent_problems,
+            "; ".join(agent_problems)[:600],
+        )
         self.report.check(
             "protected: /cloud/lower is a read-only sidecar mount and a write "
             "to it fails with EROFS",
@@ -1331,29 +1406,17 @@ class CloudMountSidecarGate:
             rc != 0 and ("403" in err or "Forbidden" in err),
             f"rc={rc} {err.strip()[-160:]}",
         )
-        reader = sql(
-            "SELECT reader_id FROM cloud_ro_mounts WHERE thread_id = "
-            f"{lit(session.thread)} AND status = 'active'"
-        )
-        if not _READER_RE.fullmatch(reader or ""):
+        reader = self.active_reader(session)
+        if reader is None:
             raise GateError("the protected session has no active reader")
         before = self.pod_json(session.pod) or {}
         workspace_restarts = restarts(before, WORKSPACE_CONTAINER)
-        self.disabled_reader = reader
-        if self.occ(["user:disable", reader]):
-            raise GateError("could not disable the reader account")
+        self.disable_reader(reader)
         try:
             self.stop_supervisor_from_node(before)
             entry = self.wait_status_file(session.pod, 0, "unavailable", timeout=240)
-            # Decision 42: the next claim starts without cloud and reports
-            # why, instead of failing.
-            self.turn(session)
-            started, detail = self.wait_thread_state(
-                session, "unavailable", "credential_rejected"
-            )
         finally:
-            if self.occ(["user:enable", reader]) == 0:
-                self.disabled_reader = None
+            self.enable_reader()
         after = self.pod_json(session.pod) or {}
         self.report.check(
             "protected: with the reader disabled the restarted supervisor reads "
@@ -1362,23 +1425,82 @@ class CloudMountSidecarGate:
             and restarts(after, WORKSPACE_CONTAINER) == workspace_restarts,
             f"{entry.get('state')} {entry.get('reason')}",
         )
-        self.report.check(
-            "protected: a claim then starts without cloud and the thread's state "
-            "says credential_rejected (decision 42)",
-            started,
-            detail,
+
+    def active_reader(self, session: Session) -> str | None:
+        reader = sql(
+            "SELECT reader_id FROM cloud_ro_mounts WHERE thread_id = "
+            f"{lit(session.thread)} AND status = 'active'"
         )
-        # Without its cloud means no folder at all: no overlay on the dead
-        # lower, and no workspace/cloud link into the sidecars' volume.
-        merged = top_mounts(self.inspect(session.pod).get("mountinfo", "")).get(
-            "/cloud/merged", ("", "")
-        )[0]
-        _rc, link, _err = self.as_agent(
-            session.pod, f"readlink {HOME}/workspace/cloud || true"
+        return reader if _READER_RE.fullmatch(reader or "") else None
+
+    def disable_reader(self, reader: str) -> None:
+        self.disabled_reader = reader
+        if self.occ(["user:disable", reader]):
+            raise GateError("could not disable the reader account")
+
+    def enable_reader(self) -> None:
+        if (
+            self.disabled_reader
+            and self.occ(["user:enable", self.disabled_reader]) == 0
+        ):
+            self.disabled_reader = None
+
+    def disable_reader_once_granted(self, session: Session) -> None:
+        """Disable the session's reader the moment its grant is active: the
+        planner waits for that grant before it creates the Pod, and the
+        pinned agent attaches only once the Pod is ready."""
+        reader = wait_for(
+            f"the {session.label} session's active reader grant",
+            lambda: self.active_reader(session),
+            timeout=self.args.pod_timeout,
+            interval=1,
+        )
+        self.disable_reader(reader)
+
+    def protected_without_cloud(self) -> None:
+        """Decision 42 on the pinned lane, where a session attaches once:
+        its lower does not come up, so it starts with no cloud folder at
+        all and says why."""
+        if not self.protected_mode:
+            return
+        try:
+            session = self.start_session(
+                "prot42", protected=True, on_created=self.disable_reader_once_granted
+            )
+            if self.status_entry(session.pod, 0).get("state") == "mounted":
+                # The supervisor mounted before the reader was disabled: make
+                # it read the credential again.
+                raced = evaluate_status(
+                    self.thread_status(session.thread), session.mount, state="mounted"
+                )[0]
+                if raced:
+                    raise GateError(
+                        "inconclusive: the agent attached before the reader "
+                        "was disabled"
+                    )
+                self.stop_supervisor_from_node(self.pod_json(session.pod) or {})
+            entry = self.wait_status_file(session.pod, 0, "unavailable", timeout=240)
+            self.turn(session)
+            started, detail = self.wait_thread_state(
+                session, "unavailable", "credential_rejected"
+            )
+            merged = top_mounts(self.inspect(session.pod).get("mountinfo", "")).get(
+                "/cloud/merged", ("", "")
+            )[0]
+            _rc, link, _err = self.as_agent(
+                session.pod, f"readlink {HOME}/workspace/cloud || true"
+            )
+        finally:
+            self.enable_reader()
+        self.report.check(
+            "without: a pinned protected session whose lower reads "
+            "credential_rejected starts without cloud and its thread state "
+            "says so (decision 42)",
+            entry.get("reason") == "credential_rejected" and started,
+            f"status file {entry.get('reason')}; thread {detail}",
         )
         self.report.check(
-            "protected: without its cloud no overlay stays on /cloud/merged and "
-            "workspace/cloud is no link to it",
+            "without: no overlay on /cloud/merged and workspace/cloud is no link to it",
             merged != "fuse.fuse-overlayfs" and link.strip() != "/cloud/merged",
             f"/cloud/merged {merged or 'unmounted'}; link {link.strip() or 'none'}",
         )
@@ -1512,8 +1634,10 @@ class CloudMountSidecarGate:
                 return True
             return sql(f"SELECT count(*) FROM threads WHERE id = {lit(thread)}") == "0"
 
+        # A pinned session retires its dedicated agent first, and one still
+        # being created (an engage, a Pod) finishes that before it ends.
         try:
-            wait_for("session deleted", gone, timeout=300, interval=5)
+            wait_for("session deleted", gone, timeout=600, interval=10)
         except GateError:
             return False
         return True
@@ -1570,7 +1694,7 @@ class CloudMountSidecarGate:
             step(
                 f"delete project {label}",
                 lambda p=project_deleted: bool(
-                    wait_for("project deleted", p, timeout=180, interval=10)
+                    wait_for("project deleted", p, timeout=300, interval=10)
                 ),
             )
         for problem in problems:
@@ -1629,6 +1753,7 @@ class CloudMountSidecarGate:
                 (self.teardown,),
                 (self.missing,),
                 (self.protected,),
+                (self.protected_without_cloud,),
                 (self.regression,),
             ):
                 for phase in group:
