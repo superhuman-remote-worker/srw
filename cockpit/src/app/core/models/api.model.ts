@@ -1414,7 +1414,6 @@ export interface Project {
   default_config_name?: string | null;
   default_config_override?: Record<string, unknown> | null;
   nextcloud_folder_id?: number | null;
-  cloud_storage_read_only?: boolean;
   cloud_storage_url?: string | null;
   main_cloud_backend?: string | null;
   network_tier?: ProjectNetworkTier;
@@ -1891,7 +1890,6 @@ export interface ProjectUpdateRequest {
   status?: ProjectStatus;
   default_config_name?: string;
   default_config_override?: Record<string, unknown>;
-  cloud_storage_read_only?: boolean;
   network_tier?: ProjectNetworkTier;
 }
 

@@ -1270,15 +1270,11 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                       <app-icon size="xs">open_in_new</app-icon>
                     </a>
                   </div>
-                  <app-checkbox
-                    [checked]="settingsCloudReadOnly()"
-                    [disabled]="isArchived()"
-                    (changed)="toggleCloudReadOnly($event)"
-                  >
-                    {{ 'projectDetail.settings.readOnlyAgent' | transloco }}
-                  </app-checkbox>
-                  <p class="text-muted setting-desc">
-                    {{ 'projectDetail.settings.readOnlyAgentDesc' | transloco }}
+                  <!-- What an agent may do in the folder is its connector's
+                       level now (main cloud slices 5 and 8), not a project
+                       switch. -->
+                  <p class="text-muted setting-desc" data-cloud-access-hint>
+                    {{ 'projectDetail.settings.cloudAccessHint' | transloco }}
                   </p>
                 } @else {
                   <p class="text-muted setting-desc">
@@ -2326,7 +2322,6 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   // Settings tab
   readonly settingsName = signal('');
   readonly settingsConfigName = signal('');
-  readonly settingsCloudReadOnly = signal(false);
   readonly settingsNetworkTier = signal<'internet-only' | 'home-allowed'>('internet-only');
   readonly isSavingSettings = signal(false);
   /** Admin-only fields (e.g. workspace network tier) are hidden unless this is true. */
@@ -2463,7 +2458,6 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
       if (p) {
         this.settingsName.set(p.name);
         this.settingsConfigName.set(p.default_config_name ?? '');
-        this.settingsCloudReadOnly.set(p.cloud_storage_read_only ?? false);
         this.settingsNetworkTier.set(p.network_tier ?? 'internet-only');
       }
       this.loadWorkspaceDefaults();
@@ -3085,20 +3079,6 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     this.api.updateProjectFields(this.projectId, { default_config_override: override }).subscribe({
       next: () => this.api.getProject(this.projectId).subscribe((proj) => this.project.set(proj)),
       error: (err: unknown) => this.reportEditFailure(err),
-    });
-  }
-
-  toggleCloudReadOnly(checked: boolean): void {
-    if (this.isArchived()) return;
-    const previous = this.settingsCloudReadOnly();
-    this.settingsCloudReadOnly.set(checked);
-    this.editError.set(null);
-    this.api.updateProjectFields(this.projectId, { cloud_storage_read_only: checked }).subscribe({
-      next: () => this.api.getProject(this.projectId).subscribe((proj) => this.project.set(proj)),
-      error: (err: unknown) => {
-        this.settingsCloudReadOnly.set(previous);
-        this.reportEditFailure(err);
-      },
     });
   }
 

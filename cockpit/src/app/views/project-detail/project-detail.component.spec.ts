@@ -519,7 +519,6 @@ describe('ProjectDetailPageComponent archived read-only settings', () => {
     status: 'archived' as const,
     is_default: false,
     default_config_name: 'developer',
-    cloud_storage_read_only: false,
     network_tier: 'internet-only' as const,
   };
 
@@ -562,7 +561,6 @@ describe('ProjectDetailPageComponent archived read-only settings', () => {
     component.saveSettings();
     component.onRenameProject('Renamed');
     component.toggleProjectMemory(true);
-    component.toggleCloudReadOnly(true);
     component.onNetworkTierChange('home-allowed');
 
     expect(api.updateProjectFields).not.toHaveBeenCalled();
@@ -640,10 +638,8 @@ describe('ProjectDetailPageComponent archived read-only settings', () => {
       throwError(() => new HttpErrorResponse({status: 409, error: {detail: 'refused'}})),
     );
 
-    component.toggleCloudReadOnly(true);
     component.onNetworkTierChange('home-allowed');
 
-    expect(component.settingsCloudReadOnly()).toBe(false);
     expect(component.settingsNetworkTier()).toBe('internet-only');
     expect(component.editError()).toBe('refused');
   });
@@ -952,6 +948,18 @@ describe('ProjectDetailPageComponent link access from the capability matrix', ()
     const {component, connectorDrivers} = createComponent({drivers: BUILTIN_DRIVERS});
     component.loadProjectDatasources();
     expect(connectorDrivers.load).toHaveBeenCalled();
+  });
+});
+
+describe('ProjectDetailPageComponent cloud storage settings', () => {
+  it('has no project read-only switch: the folder has its connector level', () => {
+    // The server dropped projects.cloud_storage_read_only (main cloud slice 8).
+    const {component} = createComponent();
+    expect('toggleCloudReadOnly' in component).toBe(false);
+    expect('settingsCloudReadOnly' in component).toBe(false);
+    expect(en.projectDetail.settings.cloudAccessHint).toContain('Cloud folders');
+    expect(de.projectDetail.settings.cloudAccessHint).toBeTruthy();
+    expect('readOnlyAgent' in en.projectDetail.settings).toBe(false);
   });
 });
 
