@@ -99,6 +99,10 @@ def _deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         get_user=AsyncMock(return_value={"id": USER["id"], "is_approved": True}),
         user_is_member_of_projects=AsyncMock(return_value=True),
         list_default_datasource_candidates=AsyncMock(return_value=[]),
+        # The selection's connectors with access levels (main cloud slice 5):
+        # none, unless a test attaches the project's cloud folder.
+        resolve_datasources_for_thread=AsyncMock(return_value=[]),
+        get_user_project_roles=AsyncMock(return_value={}),
     )
     for key, value in store_over.items():
         setattr(store, key, value)
@@ -157,6 +161,46 @@ def _deps(**over: Any) -> ta.ThreadAdmissionDependencies:
 
 async def _plan(body: ThreadCreateRequest, deps: ta.ThreadAdmissionDependencies):
     return await ta.resolve_thread_creation_plan(body, USER, dependencies=deps)
+
+
+#: The project's own cloud folder connector (main cloud slice 3).
+FOLDER = "66666666-6666-4666-8666-666666666666"
+
+
+def _folder_row() -> dict[str, Any]:
+    return {
+        "id": FOLDER,
+        "name": "Atlas cloud folder",
+        "type": "cloud_folder",
+        "managed_key": f"project-cloud:{PROJECT}",
+        "created_by": USER["id"],
+        "is_global": False,
+        "read_only": None,
+        "project_read_only": None,
+        "project_access": None,
+        "config": {
+            "folder_kind": "project",
+            "project_id": PROJECT,
+            "backend_id": "nextcloud",
+            "backend_instance_id": GENERATION,
+            "folder_handle": "nextcloud:7",
+        },
+    }
+
+
+def _protected_body(**fields: Any) -> ThreadCreateRequest:
+    """The legacy alias, on a session of the project with its folder."""
+    return ThreadCreateRequest(
+        project_id=PROJECT, datasource_ids=[FOLDER], protected_cloud=True, **fields
+    )
+
+
+def _folder_deps(**over: Any) -> ta.ThreadAdmissionDependencies:
+    store = over.pop("store", {})
+    store.setdefault(
+        "resolve_datasources_for_thread", AsyncMock(return_value=[_folder_row()])
+    )
+    return _deps(store=store, **over)
 
 
 # =============================================================================
@@ -587,30 +631,34 @@ class TestCreationPlan:
 
     @pytest.mark.asyncio
     async def test_protected_cloud_requires_the_container_tier(self):
-        body = ThreadCreateRequest(
-            protected_cloud=True, config_override={"workspace": {"backend": "virtual"}}
-        )
+        body = _protected_body(config_override={"workspace": {"backend": "virtual"}})
         with pytest.raises(HTTPException) as exc:
-            await _plan(body, _deps())
+            await _plan(body, _folder_deps())
         assert exc.value.status_code == 422
         assert exc.value.detail["code"] == "protected_cloud_unsupported_workspace"
 
     @pytest.mark.asyncio
     async def test_protected_cloud_is_refused_for_the_officer_runtime(self):
-        body = ThreadCreateRequest(
-            protected_cloud=True, config_override={"officer": {"enabled": True}}
-        )
+        body = _protected_body(config_override={"officer": {"enabled": True}})
+        # A commission reaches the connector selection, where a protected
+        # folder is known (main cloud slice 5).
+        body._officer_post_config_snapshot = {}
         with pytest.raises(HTTPException) as exc:
-            await _plan(body, _deps())
+            await _plan(body, _folder_deps())
         assert exc.value.status_code == 422
         assert exc.value.detail["code"] == "protected_cloud_unsupported_session_class"
 
     @pytest.mark.asyncio
     async def test_protected_cloud_stays_pinned_even_when_stateless_is_admitted(self):
-        deps = _deps(resolve_thread_execution_lane=MagicMock(return_value="stateless"))
-        plan = await _plan(ThreadCreateRequest(protected_cloud=True), deps)
+        deps = _folder_deps(
+            resolve_thread_execution_lane=MagicMock(return_value="stateless")
+        )
+        plan = await _plan(_protected_body(), deps)
         assert plan.execution_lane == "pinned"
         assert plan.create_kwargs["initial_metadata"]["protected_cloud"] is True
+        assert plan.create_kwargs["initial_metadata"]["datasource_access"] == {
+            FOLDER: "protected"
+        }
 
     @pytest.mark.asyncio
     async def test_a_hand_rolled_post_owned_key_is_refused_at_the_request_boundary(
@@ -1051,17 +1099,19 @@ class TestCommit:
         deps.hold_officer_for_conference.assert_awaited_once_with(PROJECT, THREAD)
 
     @pytest.mark.asyncio
-    async def test_a_disabled_deployment_records_why_protected_cloud_is_absent(self):
-        deps = _deps(is_protected_cloud_mode_enabled=MagicMock(return_value=False))
-        plan = await _plan(ThreadCreateRequest(protected_cloud=True), deps)
-        await ta.commit_thread_creation(
-            plan, ThreadCreateRequest(protected_cloud=True), USER, dependencies=deps
+    async def test_a_disabled_deployment_refuses_a_protected_folder(self):
+        """Main cloud slice 5: protected is the folder's level, which a
+        deployment with the switch off does not offer; asking for it is
+        refused, never accepted without its lane."""
+        deps = _folder_deps(
+            is_protected_cloud_mode_enabled=MagicMock(return_value=False)
         )
+        with pytest.raises(HTTPException) as exc:
+            await _plan(_protected_body(), deps)
+        assert exc.value.status_code == 422
+        assert exc.value.detail["code"] == "connector_access_unavailable"
+        assert exc.value.detail["access"] == "protected"
         deps.schedule_protected_engage.assert_not_called()
-        deps.record_protected_error.assert_awaited_once()
-        assert (
-            deps.record_protected_error.await_args.kwargs["code"] == "feature_disabled"
-        )
 
     @pytest.mark.asyncio
     async def test_a_mount_seeding_failure_never_fails_the_create(self):

@@ -108,6 +108,92 @@ def _live_detach_refused(row: Mapping[str, Any]) -> bool:
     return spec is not None and spec.live_detach == "refused"
 
 
+def _protected_fixed(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={"code": "protected_cloud_fixed", "message": message},
+    )
+
+
+async def _live_selection_access(
+    thread_row: Mapping[str, Any],
+    selected_ds_ids: list[str],
+    target_project_ids: list[str],
+    *,
+    requested: Mapping[str, str] | None,
+    dependencies: ThreadConfigUpdateDependencies,
+) -> tuple[dict[str, str | None] | None, dict[str, Any]]:
+    """The session's connector levels after a live edit (main cloud slice
+    5), or ``(None, {})`` for a session that never recorded them and is not
+    asked to.
+
+    A level it recorded stays unless ``requested`` changes it; a connector
+    attached now gets its default, within what the session's tier offers;
+    one detached loses its level. Protected is fixed for the session's life:
+    no live edit sets it, changes it, or detaches the protected folder
+    (``409 protected_cloud_fixed``). A level change applies at the next
+    attach.
+    """
+    from orchestrator.services.connector_access import (
+        PROTECTED,
+        ConnectorAccessError,
+        resolve_selection_access,
+    )
+    from shared.connectors.contract import AccessContext
+
+    metadata = thread_metadata_object(thread_row)
+    stored = metadata.get("datasource_access")
+    current = (
+        {str(cid): level for cid, level in stored.items()}
+        if isinstance(stored, Mapping)
+        else None
+    )
+    if current is None and not requested:
+        return None, {}
+    asked = {
+        str(UUID(str(cid))): str(level) for cid, level in (requested or {}).items()
+    }
+    protected_marker = protected_cloud_mutation_marker(dict(thread_row))
+    if current is None and protected_marker == "on":
+        raise _protected_fixed(
+            "A protected session created before connector access levels keeps "
+            "its folders' levels"
+        )
+    current = current or {}
+    for cid, level in current.items():
+        if level == PROTECTED and cid not in selected_ds_ids:
+            raise _protected_fixed(
+                "A protected session keeps its protected folder attached"
+            )
+    for cid, level in asked.items():
+        if (level == PROTECTED) != (current.get(cid) == PROTECTED):
+            raise _protected_fixed(
+                "Protected is chosen when the session is created and kept for its life"
+            )
+    owner_id = str(thread_row["user_id"]) if thread_row.get("user_id") else None
+    ctx = AccessContext(
+        workspace_backend=thread_workspace_backend(dict(thread_row)),
+        protected_mode_enabled=False,
+        execution="session",
+    )
+    keep = {cid: level for cid, level in current.items() if cid in selected_ds_ids}
+    try:
+        resolved = await resolve_selection_access(
+            dependencies.store,
+            owner_id=owner_id,
+            datasource_ids=selected_ds_ids,
+            project_ids=target_project_ids,
+            requested={
+                cid: level for cid, level in asked.items() if level != PROTECTED
+            },
+            ctx=ctx,
+            keep=keep,
+        )
+    except ConnectorAccessError as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
+    return resolved.levels, resolved.origins
+
+
 class ThreadConfigStore(Protocol):
     async def get_thread(self, thread_id: str) -> dict[str, Any] | None: ...
 
@@ -150,6 +236,7 @@ class ThreadConfigStore(Protocol):
         *,
         datasource_policy_revisions: dict[str, int] | None = None,
         datasource_selection_provenance: dict[str, Any] | None = None,
+        datasource_access: dict[str, str | None] | None = None,
     ) -> bool: ...
 
 
@@ -227,6 +314,7 @@ async def apply_thread_config_update(
     managed_runtime: bool = False,
     snapshot_patch_protocol: int | None = None,
     snapshot_generation: int | None = None,
+    datasource_access: dict[str, str] | None = None,
     dependencies: ThreadConfigUpdateDependencies,
 ) -> tuple[dict[str, Any], list[str] | None]:
     """Commit accepted settings, connector selection and one spec generation."""
@@ -273,6 +361,7 @@ async def apply_thread_config_update(
             datasource_ids,
             request=request,
             actor=actor,
+            datasource_access=datasource_access,
             dependencies=dependencies,
         )
         try:
@@ -292,6 +381,7 @@ async def apply_thread_config_update_locked(
     *,
     request: Request,
     actor: dict[str, Any] | None,
+    datasource_access: dict[str, str] | None = None,
     dependencies: ThreadConfigUpdateDependencies,
 ) -> tuple[dict[str, Any], list[str] | None]:
     """Validate → authorize → enrich → persist a thread config change.
@@ -450,6 +540,15 @@ async def apply_thread_config_update_locked(
     detached_bound_ids: list[str] = []
     previous_ds_ids: set[str] = set()
     grant_fragment = config_override
+    live_access: dict[str, str | None] | None = None
+    if datasource_access is not None and datasource_ids is None:
+        # A level change alone keeps the selection it applies to.
+        if thread_row is None:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        datasource_ids = [
+            str(value)
+            for value in thread_metadata_object(thread_row).get("datasource_ids") or []
+        ]
     if datasource_ids is not None:
         if thread_row is None:
             raise HTTPException(status_code=404, detail="Thread not found")
@@ -545,6 +644,13 @@ async def apply_thread_config_update_locked(
             datasource_ids=selected_ds_ids,
             project_ids=target_project_ids,
         )
+        live_access, access_origins = await _live_selection_access(
+            thread_row,
+            selected_ds_ids,
+            target_project_ids,
+            requested=datasource_access,
+            dependencies=dependencies,
+        )
         flip = dependencies.build_datasource_tool_override(resolved_ds, None)
         # THE FLIP WINS, and the order is load-bearing. It used to be the other
         # way round, safe only because the request's tools were filtered down
@@ -577,6 +683,8 @@ async def apply_thread_config_update_locked(
                 ),
             )
         )
+        if access_origins:
+            datasource_selection_provenance["access"] = access_origins
 
     # Layer 2 (fail loud): a runtime config change must also fit the owner's
     # grants — reject a denied permission_mode/model with 422 instead of
@@ -663,6 +771,11 @@ async def apply_thread_config_update_locked(
                 selected_ds_ids,
                 datasource_policy_revisions=selected_ds_revisions,
                 datasource_selection_provenance=datasource_selection_provenance,
+                **(
+                    {"datasource_access": live_access}
+                    if live_access is not None
+                    else {}
+                ),
             )
         except CredentialConnectorAttachedError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -867,6 +980,7 @@ async def agent_update_thread_config(
             managed_runtime=True,
             snapshot_patch_protocol=body.snapshot_patch_protocol,
             snapshot_generation=body.snapshot_generation,
+            datasource_access=body.datasource_access,
             dependencies=dependencies,
         )
         return {
@@ -1303,7 +1417,11 @@ async def update_thread_config(
                 "the running session until its next attach."
             ),
         )
-    if not body.config_override and body.datasource_ids is None:
+    if (
+        not body.config_override
+        and body.datasource_ids is None
+        and body.datasource_access is None
+    ):
         raise HTTPException(status_code=400, detail="No changes provided")
     config_override, selected_ds_ids = await apply_thread_config_update(
         thread_id,
@@ -1312,6 +1430,7 @@ async def update_thread_config(
         body.datasource_ids,
         request=request,
         actor=user,
+        datasource_access=body.datasource_access,
         dependencies=dependencies,
     )
     return {

@@ -25,6 +25,10 @@ class AgentThreadConfigUpdateRequest(BaseModel):
     # FULL selection, matching create semantics. None = no datasource change;
     # [] = detach all.
     datasource_ids: list[str] | None = None
+    # The level of connectors with access levels, by id (main cloud slice
+    # 5), applied at the next attach; None = no change. Never to or from
+    # protected.
+    datasource_access: dict[str, str] | None = None
 
 
 class ThreadWorkspaceUpgradeRequest(BaseModel):
@@ -43,6 +47,8 @@ class ThreadConfigPatchRequest(BaseModel):
     # Desired FULL datasource selection (create semantics): None = no change,
     # [] = detach all. Same key as the internal agent PATCH.
     datasource_ids: list[str] | None = None
+    # As the internal agent PATCH: levels by connector id, None = no change.
+    datasource_access: dict[str, str] | None = None
 
 
 __all__ = [

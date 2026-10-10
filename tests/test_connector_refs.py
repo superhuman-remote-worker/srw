@@ -515,7 +515,11 @@ async def test_session_refs_are_an_explicit_selection(monkeypatch):
     )
     assert (ids, revisions) == ([CONNECTOR, KB], {CONNECTOR: 3, KB: 3})
     assert provenance["origin"] == "explicit"
-    assert resolver.await_args.kwargs == {"owner_id": OWNER, "project_id": PROJECT}
+    assert resolver.await_args.kwargs == {
+        "owner_id": OWNER,
+        "project_id": PROJECT,
+        "accepts_access": True,
+    }
     assert dependencies.authorize_thread_datasource_selection.await_args.args[1] == [
         CONNECTOR,
         KB,

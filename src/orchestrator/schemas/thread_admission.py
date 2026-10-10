@@ -23,8 +23,10 @@ Two properties are load-bearing and are preserved exactly:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
+from uuid import UUID
 
 from pydantic import (
     field_validator,
@@ -40,6 +42,10 @@ from orchestrator.schemas.inline_expert import (
     EXPERT_BASED_ON_DESCRIPTION,
     InlineExpertSelection,
 )
+
+
+#: An access level id (``shared.connectors.contract.AccessLevel.id``).
+_ACCESS_LEVEL = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,62}$")
 
 
 @dataclass(frozen=True)
@@ -173,13 +179,28 @@ class ThreadCreateRequest(BaseModel):
             "honored as session tool group toggles."
         ),
     )
+    datasource_access: dict[str, str] | None = Field(
+        None,
+        description=(
+            "The access level per attached connector whose driver has levels "
+            "(a cloud folder: read_only, protected, read_write), by connector "
+            "id. Each id must be in the session's resolved selection; a level "
+            "the connector cannot have here is refused with 422 "
+            "connector_access_unavailable, never changed. Connectors it does "
+            "not name get their project link's default, lowered to what is "
+            "allowed. A folder at protected makes the session protected (at "
+            "most one; Container tier only, never an Officer)."
+        ),
+    )
     protected_cloud: StrictBool = Field(
         False,
         description=(
-            "Protected cloud mode: mount the project cloud folder read-only with "
-            "a capture overlay so agent writes are staged for review, not live. "
-            "Nextcloud-only, container-runtime-only (design §3, §9.2). The New "
-            "Session checkbox that sets this lands in Slice C."
+            "DEPRECATED alias, for one release, of datasource_access "
+            "{<the session project's own cloud folder>: protected}: mount that "
+            "folder read-only with a capture overlay so agent writes are "
+            "staged for review, not live. Refused with 422 when that folder is "
+            "not selected or datasource_access gives it another level. "
+            "Container tier only (design §3, §9.2)."
         ),
     )
 
@@ -208,6 +229,26 @@ class ThreadCreateRequest(BaseModel):
                 "execution_lane is orchestrator-managed and cannot be selected"
             )
         return value
+
+    @field_validator("datasource_access")
+    @classmethod
+    def _validate_datasource_access(
+        cls, value: dict[str, str] | None
+    ) -> dict[str, str] | None:
+        if value is None:
+            return None
+        normalized: dict[str, str] = {}
+        for key, level in value.items():
+            try:
+                datasource_id = str(UUID(str(key)))
+            except ValueError:
+                raise ValueError("datasource_access is keyed by connector id") from None
+            if not isinstance(level, str) or not _ACCESS_LEVEL.match(level):
+                raise ValueError(f"datasource_access[{key}] is not an access level id")
+            if normalized.get(datasource_id, level) != level:
+                raise ValueError(f"datasource_access names {key} twice")
+            normalized[datasource_id] = level
+        return normalized
 
     @model_validator(mode="after")
     def reject_null_datasource_selection(self) -> "ThreadCreateRequest":

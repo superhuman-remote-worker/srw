@@ -162,6 +162,17 @@ class _Bundle:
                 kind, deepcopy(selection["inline"]), scope, number, (*path, "inline")
             )
             return {"inline": spec}
+        if "access" in selection:
+            # A Session's create request chooses a connector's level; a
+            # manifest execution binds at the link's level, and says so
+            # rather than drop the field.
+            fail(
+                "UnsupportedField",
+                "A connector's access level is chosen by a Session's create "
+                "request; this execution binds it at its project link's level.",
+                document=number,
+                path=pointer((*path, "access")),
+            )
         ref = selection["ref"]
         target_scope = ref.get("scope", scope)
         key = _key(kind, target_scope, ref["name"])

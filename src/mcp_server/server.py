@@ -2458,6 +2458,7 @@ async def create_persistent_thread(
     model: str | None = None,
     temperature: float | None = None,
     workspace: str | dict[str, Any] | None = None,
+    datasource_access: dict[str, str] | None = None,
 ) -> str:
     """Create a new persistent thread (interactive agent session).
 
@@ -2487,6 +2488,11 @@ async def create_persistent_thread(
             a second project is refused.
         datasource_ids: Connector selection. Omit to use automatic defaults;
             pass [] for none, or IDs for exactly that authorized selection.
+        datasource_access: The access level of attached connectors that have
+            levels, by connector id: a cloud folder's "read_only",
+            "protected" (writes wait for the owner's review; one folder at
+            most) or "read_write". Each id must be attached; a level it cannot
+            have is refused. Omit for each link's default.
         model: LLM model override (e.g. "RedHatAI/gemma-4-31B-it-FP8-Dynamic")
         temperature: Temperature override
         workspace: The session's workspace. Omit it to use the project's default
@@ -2531,6 +2537,7 @@ async def create_persistent_thread(
             model=model,
             temperature=temperature,
             **extra,
+            **({"datasource_access": datasource_access} if datasource_access else {}),
         )
         return fmt.format_created_thread(result, config_name, title)
     except Exception as e:

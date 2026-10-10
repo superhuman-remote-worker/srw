@@ -26552,6 +26552,7 @@ class PostgresDB:
         *,
         datasource_policy_revisions: Dict[str, int] | None = None,
         datasource_selection_provenance: Dict[str, Any] | None = None,
+        datasource_access: Dict[str, str | None] | None = None,
     ) -> bool:
         """Atomically replace a thread's complete connector selection.
 
@@ -26567,6 +26568,9 @@ class PostgresDB:
         Args:
             thread_id: Thread UUID as string
             datasource_ids: Complete new selection (may be empty to detach all)
+            datasource_access: The level of each connector with access levels
+                (``metadata.datasource_access``), replaced with the selection
+                when given; omitted, it is left as it is.
 
         Returns:
             True if updated, False if thread not found
@@ -26593,6 +26597,10 @@ class PostgresDB:
             "datasource_ids": selected_ids,
             "datasource_selection": safe_provenance,
         }
+        if datasource_access is not None:
+            metadata_patch["datasource_access"] = {
+                str(key): value for key, value in datasource_access.items()
+            }
 
         # Own the shared datasource key *before* taking an application-pool
         # slot. Delivery holds the same dedicated-session lock while it builds

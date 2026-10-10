@@ -3281,6 +3281,7 @@ class AsyncCockpitClient:
         temperature: float | None = None,
         workspace: dict[str, Any] | None = None,
         workspace_supplied: bool = False,
+        datasource_access: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Create a new persistent thread.
 
@@ -3294,6 +3295,9 @@ class AsyncCockpitClient:
 
         workspace / workspace_supplied: the REST WorkspaceBinding (None = no
         workspace), sent only when supplied.
+
+        ``datasource_access``: the level per attached connector with access
+        levels (``{connector id: level}``), sent only when given.
 
         Returns:
             Dict with ``thread_id`` and ``status``.
@@ -3317,6 +3321,8 @@ class AsyncCockpitClient:
             body["temperature"] = temperature
         if workspace_supplied:
             body["workspace"] = workspace
+        if datasource_access:
+            body["datasource_access"] = datasource_access
         resp = await self._mutation_request(
             "POST", "/api/persistent/threads", json=body
         )

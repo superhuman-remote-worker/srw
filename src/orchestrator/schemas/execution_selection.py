@@ -79,11 +79,23 @@ class ConnectorRef(BaseModel):
 
 
 class ConnectorSelection(BaseModel):
-    """One ``ConnectorMap`` entry: ``{"ref": …}``."""
+    """One ``ConnectorMap`` entry: ``{"ref": …, "access"?: …}``."""
 
     model_config = ConfigDict(extra="forbid")
 
     ref: ConnectorRef | None = None
+    access: (
+        Annotated[str, StringConstraints(pattern=r"^[A-Za-z][A-Za-z0-9_]{0,62}$")]
+        | None
+    ) = Field(
+        None,
+        description=(
+            "The level a session binds this connector at, for a driver with "
+            "access levels (a cloud folder: read_only, protected, "
+            "read_write); as datasource_access. Omit for its project link's "
+            "default. A job binds at the link's level and refuses it."
+        ),
+    )
     inline: dict[str, Any] | None = Field(
         None, description="Refused: create the connector and reference it."
     )

@@ -80,7 +80,15 @@ from orchestrator.services.cloud_connector_mounts import (
 )
 from orchestrator.services.config_overrides import validated_config_name
 from orchestrator.services.connector_drivers.cloud_outbox import CloudOutboxDriver
+from orchestrator.services.connector_access import (
+    PROTECTED,
+    ConnectorAccessError,
+    SelectionAccess,
+    resolve_selection_access,
+    strict_selection_rows,
+)
 from orchestrator.services.connector_refs import (
+    connector_access_requests,
     refuse_connector_selector_conflict,
     resolve_execution_connectors,
 )
@@ -309,6 +317,11 @@ class ThreadCreationPlan:
     model_notices: list[str] = field(default_factory=list)
     officer_requested: bool = False
     explicit_officer_commission: bool = False
+    # Whether one attached cloud folder is bound at ``protected`` (the
+    # session's protected marker is derived from it), and every strict
+    # connector's resolved level (``metadata.datasource_access``).
+    protected: bool = False
+    datasource_access: dict[str, str | None] = field(default_factory=dict)
 
 
 def build_session_config_override(
@@ -443,7 +456,28 @@ async def select_thread_datasources(
     deployment attaches defaults on omission. Returns
     ``(ids, policy_revisions, provenance)``.
     """
+    ids, revisions, provenance, _access = await _select_thread_datasources(
+        request_body,
+        user,
+        thread_backend=thread_backend,
+        effective_project_ids=effective_project_ids,
+        dependencies=dependencies,
+    )
+    return ids, revisions, provenance
+
+
+async def _select_thread_datasources(
+    request_body: ThreadCreateRequest,
+    user: dict[str, Any],
+    *,
+    thread_backend: str | None,
+    effective_project_ids: list[str],
+    dependencies: ThreadAdmissionDependencies,
+) -> tuple[list[str], dict[str, int], dict[str, Any], dict[str, str]]:
+    """:func:`select_thread_datasources`, and the level each
+    ``execution.connectors`` entry asks for, by connector id."""
     requested_ids = request_body.datasource_ids or []
+    execution_access: dict[str, str] = {}
     if request_body.execution is not None:
         # Connector refs are an explicit selection of the ids they name: the
         # same branch, the same authorization, the same snapshot.
@@ -454,6 +488,10 @@ async def select_thread_datasources(
             project_id=(
                 effective_project_ids[0] if len(effective_project_ids) == 1 else None
             ),
+            accepts_access=True,
+        )
+        execution_access = connector_access_requests(
+            request_body.execution, requested_ids
         )
     if (
         "datasource_ids" in request_body.model_fields_set
@@ -513,7 +551,132 @@ async def select_thread_datasources(
         selected_thread_datasource_ids,
         selected_thread_datasource_revisions,
         thread_selection_provenance,
+        execution_access,
     )
+
+
+async def resolve_session_access(
+    request_body: ThreadCreateRequest,
+    user: dict[str, Any],
+    *,
+    selected_ids: list[str],
+    execution_access: dict[str, str],
+    effective_project_ids: list[str],
+    primary_project_id: str | None,
+    effective_backend: str | None,
+    officer: bool,
+    dependencies: ThreadAdmissionDependencies,
+) -> SelectionAccess:
+    """The level of every attached connector with access levels (main cloud
+    slice 5), from ``datasource_access``, ``execution.connectors.*.access``
+    and the deprecated ``protected_cloud`` alias, or the request's 422.
+
+    The alias asks for the session project's own cloud folder at
+    ``protected``; it is refused when that folder is not selected
+    (``protected_cloud_requires_folder``) or ``datasource_access`` gives it
+    another level (``protected_cloud_conflict``), never ignored. A
+    protected level needs the Container tier
+    (``protected_cloud_unsupported_workspace``) and an ordinary session
+    (``protected_cloud_unsupported_session_class``); then every level is
+    resolved by the one rule (``connector_access.resolve_selection_access``).
+    """
+    from shared.connectors.platform import project_cloud_key
+
+    requested: dict[str, str] = dict(request_body.datasource_access or {})
+    for datasource_id, level in execution_access.items():
+        if requested.get(datasource_id, level) != level:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "connector_access_conflict",
+                    "message": (
+                        "datasource_access and execution.connectors ask for "
+                        "different levels of one connector"
+                    ),
+                    "datasource_id": datasource_id,
+                },
+            )
+        requested[datasource_id] = level
+    rows = await strict_selection_rows(
+        dependencies.store, selected_ids, effective_project_ids
+    )
+    own_key = project_cloud_key(primary_project_id) if primary_project_id else None
+    own_folder = next(
+        (
+            str(row["id"])
+            for row in rows
+            if own_key is not None and row.get("managed_key") == own_key
+        ),
+        None,
+    )
+    if request_body.protected_cloud:
+        if own_folder is None or own_folder not in selected_ids:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "protected_cloud_requires_folder",
+                    "message": (
+                        "protected_cloud protects the session project's own "
+                        "cloud folder, which this session does not attach"
+                    ),
+                },
+            )
+        if requested.get(own_folder, PROTECTED) != PROTECTED:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "protected_cloud_conflict",
+                    "message": (
+                        "protected_cloud asks for the project's cloud folder at "
+                        f"protected, datasource_access for {requested[own_folder]!r}"
+                    ),
+                    "datasource_id": own_folder,
+                },
+            )
+        requested[own_folder] = PROTECTED
+    if PROTECTED in requested.values():
+        if effective_backend != "sandbox":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "protected_cloud_unsupported_workspace",
+                    "message": (
+                        "Protected cloud sessions require the Container workspace tier."
+                    ),
+                },
+            )
+        if officer:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "protected_cloud_unsupported_session_class",
+                    "message": (
+                        "Protected cloud sessions are not supported for the "
+                        "background Officer runtime."
+                    ),
+                },
+            )
+    ctx = AccessContext(
+        workspace_backend=effective_backend,
+        officer=officer,
+        protected_mode_enabled=dependencies.is_protected_cloud_mode_enabled(),
+        execution="session",
+    )
+    try:
+        return await resolve_selection_access(
+            dependencies.store,
+            owner_id=str(user["id"]),
+            datasource_ids=selected_ids,
+            project_ids=effective_project_ids,
+            requested=requested,
+            ctx=ctx,
+            protected_folders=(
+                frozenset({own_folder}) if own_folder is not None else frozenset()
+            ),
+            rows=rows,
+        )
+    except ConnectorAccessError as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
 
 
 async def resolve_thread_creation_plan(
@@ -526,8 +689,10 @@ async def resolve_thread_creation_plan(
 
     Raises the create path's refusals in their original order: project scope,
     expert selection, override validity, Officer release/post authority,
-    conference single-writer, protected-cloud compatibility, connector policy,
-    VM availability and capability grants.
+    conference single-writer, connector policy, the connectors' access
+    levels with protected-cloud compatibility (protected is a connector's
+    level, so it is known only once the selection is), VM availability and
+    capability grants.
     """
     # Project scope is needed for both selection precedence and grant
     # resolution, so authorize it before choosing the expert. A new Session
@@ -737,16 +902,6 @@ async def resolve_thread_creation_plan(
     effective_backend = backend_from_override(effective_create_config)
     if effective_backend:
         config_override.setdefault("workspace", {})["backend"] = effective_backend
-    if request_body.protected_cloud and effective_backend != "sandbox":
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "protected_cloud_unsupported_workspace",
-                "message": (
-                    "Protected cloud sessions require the Container workspace tier."
-                ),
-            },
-        )
 
     # Officer/conference selects pinned-only lifecycle machinery. Freeze
     # the fully resolved booleans into the highest-priority request layer
@@ -757,17 +912,6 @@ async def resolve_thread_creation_plan(
         effective_create_config
     )
     config_override.setdefault("officer", {}).update(materialized_session_class)
-    if request_body.protected_cloud and materialized_session_class["enabled"]:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "protected_cloud_unsupported_session_class",
-                "message": (
-                    "Protected cloud sessions are not supported for the "
-                    "background Officer runtime."
-                ),
-            },
-        )
     # Agent attach requires one project for every enabled background Officer,
     # including an Officer selected by an account or Expert default. Check the
     # canonical authorized set; with a second project already refused above,
@@ -871,13 +1015,32 @@ async def resolve_thread_creation_plan(
         selected_thread_datasource_ids,
         selected_thread_datasource_revisions,
         thread_selection_provenance,
-    ) = await select_thread_datasources(
+        execution_access,
+    ) = await _select_thread_datasources(
         request_body,
         user,
         thread_backend=thread_backend,
         effective_project_ids=effective_project_ids,
         dependencies=dependencies,
     )
+    # Each attached connector with access levels gets its level now, once
+    # (main cloud slice 5); the session is protected exactly when one cloud
+    # folder is bound at ``protected``. The protected refusals come here,
+    # after the selection that says whether a folder is protected.
+    selection_access = await resolve_session_access(
+        request_body,
+        user,
+        selected_ids=selected_thread_datasource_ids,
+        execution_access=execution_access,
+        effective_project_ids=effective_project_ids,
+        primary_project_id=primary_project_id,
+        effective_backend=effective_backend,
+        officer=bool(materialized_session_class["enabled"]),
+        dependencies=dependencies,
+    )
+    protected = selection_access.protected is not None
+    if selection_access.origins:
+        thread_selection_provenance["access"] = selection_access.origins
     # VM tier is operator-gated on top of the ``vm_workspace`` PDP grant that
     # enforce_session_create_grants runs below: the global ``vm_workspaces``
     # kill-switch + per-user ``can_use_vm`` (admins bypass). Fail fast with a
@@ -918,7 +1081,7 @@ async def resolve_thread_creation_plan(
         workspace_backend=thread_backend,
         effective_config=effective_create_config,
     )
-    if request_body.protected_cloud:
+    if protected:
         # Protected-cloud overlay staging is not yet lease/runtime fenced;
         # keep it on the dedicated plane even when ordinary sandbox
         # sessions are admitted to the stateless pool.
@@ -947,8 +1110,11 @@ async def resolve_thread_creation_plan(
         metadata_patch["expert_selection_source"] = "inline"
         if request_body.expert_based_on:
             metadata_patch["expert_based_on"] = request_body.expert_based_on
-    if request_body.protected_cloud:
+    if protected:
+        # Written by the server alone, from the connector's level.
         metadata_patch["protected_cloud"] = True
+    if selection_access.levels:
+        metadata_patch["datasource_access"] = dict(selection_access.levels)
     # Its cloud folders are its attached cloud connectors from birth (main
     # cloud slice 3): it never converts, and End rebuilds that rule.
     metadata_patch[CLOUD_MOUNT_RULE_KEY] = CONNECTOR_RULE
@@ -1033,6 +1199,8 @@ async def resolve_thread_creation_plan(
         model_notices=model_notices,
         officer_requested=_officer_requested,
         explicit_officer_commission=_explicit_officer_commission,
+        protected=protected,
+        datasource_access=dict(selection_access.levels),
     )
 
 
@@ -1148,7 +1316,7 @@ async def commit_thread_creation(
     # the session simply boots with no cloud mount. Registered via
     # ``schedule_protected_engage`` (F-I1) so a concurrent attach that
     # lands before this task finishes can await it instead of racing it.
-    if request_body.protected_cloud:
+    if plan.protected:
         if dependencies.is_protected_cloud_mode_enabled():
             seeded_rows = await store.list_thread_mounts(thread_id)
             engage_thread = await store.get_thread(thread_id)
@@ -1619,7 +1787,7 @@ async def create_thread(
                 user,
                 datasource_ids=plan.selected_datasource_ids,
                 workspace_backend=plan.thread_backend,
-                protected=bool(request_body.protected_cloud),
+                protected=plan.protected,
                 dependencies=dependencies,
             )
 
@@ -1650,7 +1818,7 @@ async def create_thread(
                         user,
                         datasource_ids=plan.selected_datasource_ids,
                         workspace_backend=plan.thread_backend,
-                        protected=bool(request_body.protected_cloud),
+                        protected=plan.protected,
                         dependencies=dependencies,
                     ),
                 )

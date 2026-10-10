@@ -21,11 +21,17 @@ Design: knowledge-base/knowledge/features/main_cloud_as_connectors.md,
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from orchestrator.services.connector_drivers.base import (
     DatasourceDriver,
     SupportsOfferedAccess,
+    bound_access,
+)
+from orchestrator.services.connector_drivers.registry import (
+    ConnectorDriverRegistry,
+    builtin_connector_drivers,
 )
 from shared.connectors.builtin import spec_for_row
 from shared.connectors.contract import (
@@ -34,6 +40,197 @@ from shared.connectors.contract import (
     resolve_access,
     strict_access,
 )
+from shared.connectors.platform import native_cloud_project
+
+#: The reviewed level of a cloud folder, which makes a session protected.
+PROTECTED = "protected"
+
+
+class ConnectorAccessError(ValueError):
+    """A level an execution asked for cannot be bound; ``detail`` is the
+    API's 422 body (``code``, ``message``, and the connector and level)."""
+
+    def __init__(self, detail: dict[str, Any]) -> None:
+        super().__init__(detail.get("message") or detail.get("code"))
+        self.detail = detail
+
+
+@dataclass(frozen=True)
+class SelectionAccess:
+    """The level of every strict connector of one selection.
+
+    ``levels`` maps each such connector to the level it binds at (``None``:
+    a default no level was allowed for; it mounts nothing and says why).
+    ``origins`` is the audit record per connector (``access``, ``origin``
+    and, when lowered or refused, ``reason``). ``protected`` is the one
+    connector bound at ``protected``, or ``None``.
+    """
+
+    levels: dict[str, str | None] = field(default_factory=dict)
+    origins: dict[str, dict[str, Any]] = field(default_factory=dict)
+    protected: str | None = None
+
+
+def _registry(store: Any) -> ConnectorDriverRegistry:
+    registry = getattr(store, "connector_drivers", None)
+    if isinstance(registry, ConnectorDriverRegistry):
+        return registry
+    return builtin_connector_drivers()
+
+
+async def strict_selection_rows(
+    store: Any, datasource_ids: list[str], project_ids: list[str]
+) -> list[dict[str, Any]]:
+    """The selection's strict connectors as the thread resolver reads them
+    (``project_read_only``, ``project_access``), with their managed key."""
+    if not datasource_ids:
+        return []
+    rows = await store.resolve_datasources_for_thread(
+        datasource_ids=datasource_ids, project_ids=project_ids
+    )
+    strict: list[dict[str, Any]] = []
+    for row in rows:
+        if not strict_spec_row(row):
+            continue
+        if "managed_key" not in row:
+            full = await store.get_datasource(str(row["id"]))
+            if full is None:
+                continue
+            row = {
+                **full,
+                "project_read_only": row.get("project_read_only"),
+                "project_access": row.get("project_access"),
+            }
+        strict.append(dict(row))
+    return strict
+
+
+async def resolve_selection_access(
+    store: Any,
+    *,
+    owner_id: str | None,
+    datasource_ids: list[str],
+    project_ids: list[str],
+    requested: Mapping[str, str],
+    ctx: AccessContext,
+    keep: Mapping[str, str | None] | None = None,
+    protected_folders: frozenset[str] | None = None,
+    rows: list[dict[str, Any]] | None = None,
+) -> SelectionAccess:
+    """Resolve the level of every strict connector of an authorized
+    selection, or raise :class:`ConnectorAccessError`.
+
+    ``requested`` maps connector ids to the level the execution asks for;
+    each must be a strict connector of the selection
+    (``connector_access_not_selected``) and is bound as asked or refused
+    (``connector_access_unavailable``, with the rule's closed reason).
+    ``keep`` maps connectors to a level resolved before (a live edit): kept
+    as it is, not resolved again. Any other connector gets its default
+    (``resolve_access``): the project link's, lowered within what ``ctx``
+    offers and the owner's ceiling (a viewer of a cloud folder's project),
+    or no level at all. More than one connector at ``protected`` is refused
+    (``protected_cloud_single_folder``). ``protected_folders``, when set, are
+    the only connectors the reviewed level is offered for (``None``: any).
+    ``rows`` are :func:`strict_selection_rows` when the caller read them.
+    """
+    from orchestrator.services.datasource_policy import access_ceiling_for
+
+    if not datasource_ids:
+        if requested:
+            raise _not_selected(next(iter(requested)))
+        return SelectionAccess()
+    if rows is None:
+        rows = await strict_selection_rows(store, datasource_ids, project_ids)
+    by_id = {str(row["id"]): row for row in rows}
+    for datasource_id in requested:
+        if datasource_id not in by_id:
+            raise _not_selected(datasource_id)
+    cloud_projects = sorted(
+        {project for row in rows if (project := native_cloud_project(row)) is not None}
+    )
+    roles: dict[str, str] = (
+        await store.get_user_project_roles(owner_id, cloud_projects)
+        if owner_id is not None and cloud_projects
+        else {}
+    )
+    registry = _registry(store)
+    result = SelectionAccess()
+    for datasource_id in datasource_ids:
+        row = by_id.get(datasource_id)
+        if row is None or datasource_id in result.levels:
+            continue
+        if (
+            keep is not None
+            and datasource_id in keep
+            and datasource_id not in requested
+        ):
+            result.levels[datasource_id] = keep[datasource_id]
+            result.origins[datasource_id] = {
+                "access": keep[datasource_id],
+                "origin": "materialized",
+            }
+            continue
+        driver = registry.for_type(row.get("type"))
+        if driver is None:
+            continue
+        ceiling = access_ceiling_for(row, roles.get(native_cloud_project(row) or ""))
+        level = requested.get(datasource_id)
+        row_ctx = (
+            ctx
+            if protected_folders is None or datasource_id in protected_folders
+            else replace(ctx, protected_mode_enabled=False)
+        )
+        resolved = bound_access(
+            driver, row, ctx=row_ctx, requested=level, ceiling=ceiling
+        )
+        if level is not None and resolved.refused:
+            raise ConnectorAccessError(
+                {
+                    "code": "connector_access_unavailable",
+                    "message": resolved.reason
+                    or f"The access level {level!r} is not available here",
+                    "datasource_id": datasource_id,
+                    "access": level,
+                    "reason": resolved.code,
+                }
+            )
+        result.levels[datasource_id] = resolved.level
+        record: dict[str, Any] = {"access": resolved.level, "origin": resolved.origin}
+        if resolved.reason:
+            record["reason"] = resolved.reason
+        if resolved.code:
+            record["code"] = resolved.code
+        result.origins[datasource_id] = record
+    protected = [cid for cid, level in result.levels.items() if level == PROTECTED]
+    if len(protected) > 1:
+        raise ConnectorAccessError(
+            {
+                "code": "protected_cloud_single_folder",
+                "message": (
+                    "A session can have one protected cloud folder; "
+                    f"{len(protected)} are set to protected"
+                ),
+                "datasource_ids": protected,
+            }
+        )
+    return SelectionAccess(
+        levels=result.levels,
+        origins=result.origins,
+        protected=protected[0] if protected else None,
+    )
+
+
+def _not_selected(datasource_id: str) -> ConnectorAccessError:
+    return ConnectorAccessError(
+        {
+            "code": "connector_access_not_selected",
+            "message": (
+                "datasource_access names a connector that is not in the "
+                "session's selection or has no access levels"
+            ),
+            "datasource_id": datasource_id,
+        }
+    )
 
 
 def strict_spec_row(row: Mapping[str, Any]) -> bool:
@@ -108,4 +305,12 @@ def access_choice(
     }
 
 
-__all__ = ["access_choice", "strict_spec_row"]
+__all__ = [
+    "PROTECTED",
+    "ConnectorAccessError",
+    "SelectionAccess",
+    "access_choice",
+    "resolve_selection_access",
+    "strict_selection_rows",
+    "strict_spec_row",
+]

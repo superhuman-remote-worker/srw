@@ -778,6 +778,8 @@ def session_create_env(monkeypatch):
         get_user=AsyncMock(return_value={"id": SESSION_USER_ID, "is_approved": True}),
         user_is_member_of_projects=AsyncMock(return_value=True),
         list_default_datasource_candidates=AsyncMock(return_value=[]),
+        # The selection's connectors with access levels (main cloud slice 5).
+        resolve_datasources_for_thread=AsyncMock(return_value=[]),
     )
     user = {"id": SESSION_USER_ID, "is_admin": False}
 

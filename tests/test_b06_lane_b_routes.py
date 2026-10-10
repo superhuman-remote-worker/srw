@@ -87,6 +87,9 @@ def _admission_deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         get_user=AsyncMock(return_value={"id": "u", "is_approved": True}),
         user_is_member_of_projects=AsyncMock(return_value=True),
         list_default_datasource_candidates=AsyncMock(return_value=[]),
+        # The selection's connectors with access levels (main cloud slice 5).
+        resolve_datasources_for_thread=AsyncMock(return_value=[]),
+        get_user_project_roles=AsyncMock(return_value={}),
     )
     for key, value in store_over.items():
         setattr(store, key, value)
@@ -508,9 +511,29 @@ class TestCreate:
         assert response.json()["detail"]["missing_chat_model"] is True
 
     def test_a_protected_cloud_tier_mismatch_keeps_its_error_code(self):
-        response = _client().post(
+        project = "33333333-3333-4333-8333-333333333333"
+        folder = "66666666-6666-4666-8666-666666666666"
+        row = {
+            "id": folder,
+            "type": "cloud_folder",
+            "managed_key": f"project-cloud:{project}",
+            "config": {
+                "folder_kind": "project",
+                "project_id": project,
+                "backend_id": "nextcloud",
+                "backend_instance_id": GENERATION,
+                "folder_handle": "nextcloud:7",
+            },
+        }
+        deps = _admission_deps(
+            store={"resolve_datasources_for_thread": AsyncMock(return_value=[row])},
+            authorize_thread_project_ids=AsyncMock(side_effect=lambda _u, ids: ids),
+        )
+        response = _client(admission=deps).post(
             "/api/persistent/threads",
             json={
+                "project_id": project,
+                "datasource_ids": [folder],
                 "protected_cloud": True,
                 "config_override": {"workspace": {"backend": "virtual"}},
             },

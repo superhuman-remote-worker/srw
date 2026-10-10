@@ -643,6 +643,11 @@
           "properties": {
             "ref": {
               "$ref": "#/$defs/Ref"
+            },
+            "access": {
+              "description": "The level a Session binds this Connector at, for a driver with access levels (a cloud folder: read_only, protected, read_write). Omitted: its project link's default. Only a Session's create request chooses one.",
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_]{0,62}$"
             }
           }
         },

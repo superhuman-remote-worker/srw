@@ -141,15 +141,71 @@ async def resolve_execution_connectors(
     *,
     owner_id: str | None,
     project_id: str | None,
+    accepts_access: bool = False,
 ) -> list[str]:
-    """``resolve_connector_refs`` for a request's ``execution`` block."""
+    """``resolve_connector_refs`` for a request's ``execution`` block.
+
+    An entry's ``access`` (the level a session binds it at,
+    :func:`connector_access_requests`) is a session's choice: work that does
+    not take one (``accepts_access`` off: a job, which binds at the link's
+    level) refuses it with 422 rather than ignore it.
+    """
+    if not accepts_access:
+        asked = sorted(
+            alias
+            for alias, selection in execution.connectors.items()
+            if getattr(selection, "access", None) is not None
+        )
+        if asked:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "connector_access_unsupported",
+                    "message": (
+                        "This execution binds its connectors at their project "
+                        "link's level; execution.connectors.<alias>.access is "
+                        f"a session's choice ({', '.join(asked)})"
+                    ),
+                },
+            )
     return await resolve_connector_refs(
         db, connector_refs(execution), owner_id=owner_id, project_id=project_id
     )
 
 
+def connector_access_requests(
+    execution: Any, datasource_ids: list[str]
+) -> dict[str, str]:
+    """The level each ``execution.connectors`` entry asks for, by the
+    connector id its ref resolved to (``datasource_ids``, in alias order as
+    :func:`resolve_execution_connectors` returns them). Two aliases of one
+    connector asking for different levels is a 422."""
+    requested: dict[str, str] = {}
+    for (alias, selection), datasource_id in zip(
+        execution.connectors.items(), datasource_ids
+    ):
+        level = getattr(selection, "access", None)
+        if level is None:
+            continue
+        if requested.get(datasource_id, level) != level:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "connector_access_conflict",
+                    "message": (
+                        f"execution.connectors.{alias} asks for another access "
+                        "level of a connector another alias names"
+                    ),
+                    "datasource_id": datasource_id,
+                },
+            )
+        requested[datasource_id] = level
+    return requested
+
+
 __all__ = [
     "SELECTOR_CONFLICT_DETAIL",
+    "connector_access_requests",
     "connector_refs",
     "refuse_connector_selector_conflict",
     "resolve_connector_refs",
