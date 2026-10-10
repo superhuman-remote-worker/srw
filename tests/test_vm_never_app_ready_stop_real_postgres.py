@@ -519,3 +519,85 @@ async def test_ready_application_retry_revokes_held_authority(db):
             retention_preflight=state["preflight"],
             prior_zero_receipt_id=str(state["zero"]["id"]),
         )
+
+
+@pytest.mark.asyncio
+async def test_stale_generation_revision_and_successor_refuse_authority(db):
+    state = await held_state(db)
+    args = dict(
+        job_id=state["job_id"],
+        generation=state["generation"],
+        vm_uid=state["frozen"]["vm_uid"],
+        pvc_uid=state["frozen"]["pvc_uid"],
+    )
+    assert (
+        await current_policy1_stop_authority(
+            db, state["parent"], **{**args, "generation": str(uuid4())}
+        )
+        is None
+    )
+
+    async with db.acquire() as conn:
+        old_revision = await conn.fetchval(
+            "SELECT revision FROM vm_resource_reservations WHERE id=$1",
+            UUID(state["reservation_id"]),
+        )
+        # Model stale persisted data without making production mutators accept
+        # an impossible revision or a successor with no recovery fixture.
+        await conn.execute("SET session_replication_role=replica")
+        try:
+            await conn.execute(
+                "UPDATE vm_resource_reservations SET revision=revision+1 WHERE id=$1",
+                UUID(state["reservation_id"]),
+            )
+        finally:
+            await conn.execute("SET session_replication_role=origin")
+    assert await current_policy1_stop_authority(db, state["parent"], **args) is None
+    async with db.acquire() as conn:
+        await conn.execute("SET session_replication_role=replica")
+        try:
+            await conn.execute(
+                "UPDATE vm_resource_reservations SET revision=$2 WHERE id=$1",
+                UUID(state["reservation_id"]),
+                old_revision,
+            )
+        finally:
+            await conn.execute("SET session_replication_role=origin")
+
+    successor_id = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute("SET session_replication_role=replica")
+        try:
+            await conn.execute(
+                "INSERT INTO vm_resource_recovery_successors "
+                "(recovery_id,reservation_id,ordinal,owner_id,provision_generation,"
+                "vm_uid,root_pvc_uid,prior_vmi_uid,prior_launcher_uid,"
+                "successor_vmi_uid,successor_launcher_uid,stop_receipt_digest,"
+                "final_attestation_digest) "
+                "VALUES($1,$2,1,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11)",
+                successor_id,
+                UUID(state["reservation_id"]),
+                UUID(state["job_id"]),
+                UUID(state["generation"]),
+                UUID(state["frozen"]["vm_uid"]),
+                UUID(state["frozen"]["pvc_uid"]),
+                UUID(state["frozen"]["vmi_uid"]),
+                UUID(state["frozen"]["launcher_uid"]),
+                uuid4(),
+                uuid4(),
+                "sha256:" + "f" * 64,
+            )
+        finally:
+            await conn.execute("SET session_replication_role=origin")
+    try:
+        assert await current_policy1_stop_authority(db, state["parent"], **args) is None
+    finally:
+        async with db.acquire() as conn:
+            await conn.execute("SET session_replication_role=replica")
+            try:
+                await conn.execute(
+                    "DELETE FROM vm_resource_recovery_successors WHERE recovery_id=$1",
+                    successor_id,
+                )
+            finally:
+                await conn.execute("SET session_replication_role=origin")
