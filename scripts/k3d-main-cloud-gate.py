@@ -408,7 +408,7 @@ async def main():
     try:
         thread = await db.get_thread(request["thread"])
         mount_deps = thread_mount_rows.ThreadMountDependencies(
-            store=db, cloud_router=None, resolve_user_identity_cached=None,
+            store=db, cloud_router=None,
             externalize_gitea_url=str, resolve_authorized_thread_datasources=None,
             build_datasources_payload=None, build_workspace_ssh_identities=None,
             cloud_workspace_driver=lambda: "sync",
