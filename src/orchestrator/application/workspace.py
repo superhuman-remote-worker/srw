@@ -325,7 +325,16 @@ async def _prepare_session_cloud(
     await session_cloud_preparation.prepare_session_outbox(
         thread, store=store, cloud_router=resources.main_cloud_router
     )
-    return await store.get_thread(str(thread["id"])) or thread
+    thread = await store.get_thread(str(thread["id"])) or thread
+    # The per-folder grants its project folders mount with (main cloud slices
+    # 5 and 7): minted here, outside the lock; the planner only looks them up.
+    await agent_cloud_mounts.prepare_folder_grants(
+        thread,
+        mount_rows=mount_rows,
+        runtime_is_vm=False,
+        dependencies=agent_cloud_mount_dependencies(resources),
+    )
+    return thread
 
 
 def cloud_mount_planner(

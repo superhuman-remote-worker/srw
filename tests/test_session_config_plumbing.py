@@ -2488,7 +2488,9 @@ class TestColdSessionDatasourceDelivery:
 
         assert response["datasources"] is None
         assert datasource_a not in str(response)
-        assert get_thread.await_count == 2
+        # Two reads under the lock, and the per-folder grant preparation's
+        # before it (it mints only; nothing it reads is delivered).
+        assert get_thread.await_count == 3
         assert all(call.args == (thread_id,) for call in get_thread.await_args_list)
 
     @pytest.mark.asyncio

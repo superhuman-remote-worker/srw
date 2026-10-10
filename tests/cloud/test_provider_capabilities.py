@@ -54,13 +54,14 @@ class TestTheDeclarations:
 
     def test_nextcloud_is_the_design_table(self):
         assert [_cell(NEXTCLOUD, row) for row in MATRIX_ROWS] == [
-            ("planned", ["sandbox", "vm"], 5),  # project · read_only
-            ("offered", ["sandbox"], None),  # project · read_write
+            ("offered", ["sandbox", "vm"], None),  # project · read_only (reader)
+            ("offered", ["sandbox"], None),  # project · read_write (writer)
             ("offered", ["sandbox"], None),  # project · protected (container only)
             ("planned", ["sandbox"], 4),  # user root · read_write (app token)
             ("unsupported", [], None),  # user root · read_only
             ("unsupported", [], None),  # user root · protected
             ("offered", ["sandbox", "vm"], None),  # checkout
+            ("planned", ["sandbox", "vm"], 6),  # checkout · reviewed write-back
             ("offered", ["sandbox"], None),  # outbox
         ]
 
@@ -73,6 +74,7 @@ class TestTheDeclarations:
             ("unsupported", [], None),
             ("unsupported", [], None),
             ("offered", ["sandbox", "vm"], None),
+            ("planned", ["sandbox", "vm"], 6),
             ("offered", ["sandbox"], None),
         ]
 
@@ -88,7 +90,7 @@ class TestTheDeclarations:
 class TestTheDriverVocabulary:
     def test_offered_levels_are_a_driver_specs_access_levels(self):
         levels = NEXTCLOUD.access_levels("cloud_folder", "project")
-        assert [level.id for level in levels] == ["protected", "read_write"]
+        assert [level.id for level in levels] == ["read_only", "protected", "read_write"]
         assert all(level.enforced_by for level in levels)
         spec = DriverSpec(
             name="srw.cloud-folder/v1",
@@ -115,7 +117,14 @@ class TestQueries:
         assert NEXTCLOUD.offers(*PROTECTED_PROJECT_FOLDER)
         assert NEXTCLOUD.offers(*PROTECTED_PROJECT_FOLDER, workspace_backend="sandbox")
         assert not NEXTCLOUD.offers(*PROTECTED_PROJECT_FOLDER, workspace_backend="vm")
-        assert not NEXTCLOUD.offers("cloud_folder", "project", "read_only")
+        assert NEXTCLOUD.offers("cloud_folder", "project", "read_only")
+        assert NEXTCLOUD.offers(
+            "cloud_folder", "project", "read_only", workspace_backend="vm"
+        )
+        assert not NEXTCLOUD.offers(
+            "cloud_folder", "project", "read_write", workspace_backend="vm"
+        )
+        assert not OPENCLOUD.offers("cloud_folder", "project", "read_only")
         assert not OPENCLOUD.offers(*PROTECTED_PROJECT_FOLDER)
 
     @pytest.mark.parametrize("backend_id", [None, "", "ms365", "NEXTCLOUD", 7])
@@ -143,7 +152,9 @@ class TestValidation:
     @pytest.mark.parametrize(
         ("change", "problem"),
         [
-            ({"slice": None}, "names a slice"),
+            # An offered cell named after a slice; a planned one without.
+            ({"slice": 5}, "names a slice"),
+            ({"status": "planned"}, "names a slice"),
             ({"note": ""}, "enforced_by line or a reason"),
             ({"supported_backends": frozenset({"cluster"})}, "unknown workspace"),
             ({"supported_backends": frozenset()}, "names its tiers"),

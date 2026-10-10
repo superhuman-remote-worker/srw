@@ -116,9 +116,10 @@ _UNRESTRICTABLE_APP_TOKEN = (
 )
 
 #: What Nextcloud delivers (main_cloud_as_connectors.md, "Provider support
-#: matrix"). The workspace tier narrows it: rclone mounts the VM tier only
-#: with a read-only flag on a write-capable credential, which enforces
-#: nothing, so no VM row is offered until the reader grant reaches it.
+#: matrix"). A project folder is mounted as its per-folder grant's principal
+#: (``folder_grants``), never as agent-service: a reader for ``read_only``, a
+#: writer for ``read_write``. The workspace tier narrows it: a VM's rclone
+#: config holds the credential itself, so only the reader is offered there.
 NEXTCLOUD_CAPABILITIES = ProviderCapabilities(
     backend_id=BACKEND_ID,
     title="Nextcloud",
@@ -127,19 +128,18 @@ NEXTCLOUD_CAPABILITIES = ProviderCapabilities(
             "cloud_folder",
             "project",
             "read_only",
-            "planned",
-            "a reader account granted read-only access to this one folder "
-            "(the reader grant protected mode mints)",
+            "offered",
+            "a reader account allowed to read only this folder; on a VM its "
+            "credential sits in the workspace's rclone config",
             frozenset({"sandbox", "vm"}),
-            slice=5,
         ),
         CloudCapability(
             "cloud_folder",
             "project",
             "read_write",
             "offered",
-            "the agent-service account, a member of the project's Group "
-            "Folder (it can write every project folder until slice 7)",
+            "a writer account per project member that can read and write only "
+            "this project's folder",
             frozenset({"sandbox"}),
         ),
         CloudCapability(
@@ -199,8 +199,8 @@ NEXTCLOUD_CAPABILITIES = ProviderCapabilities(
             "offered",
             "a folder SRW creates in the agent-service account's home and "
             "shares with the execution's owner; a session mounts it with "
-            "agent-service's credential (which can write every project folder "
-            "until slice 7), so not on a root VM",
+            "agent-service's credential (which can still write every project "
+            "folder, until slice 7b), so not on a root VM",
             frozenset({"sandbox"}),
         ),
     ),
@@ -560,6 +560,45 @@ class NextcloudBackend:
                 return {"username": username, "password": user_password}
         return None
 
+    def _project_folder_transport(
+        self,
+        handle: ProjectFolderHandle,
+        subject: CloudMountSubject | None,
+        access: str,
+    ) -> tuple[Optional[str], dict[str, str]]:
+        """A project's Group Folder as its per-folder grant's principal.
+
+        ``subject`` carries the grant's principal and password; a reader is
+        mounted read-only only. A project mount is never made as the
+        service account, which can write every project folder: without a
+        grant there is no mount (``NOT_SUPPORTED``). The one exception is
+        End's reconstruction of a mount the old rule made that way
+        (``legacy_service_account``), byte for byte as it was.
+        """
+        if subject is not None and subject.credential:
+            principal = _FOLDER_PRINCIPAL_RE.fullmatch(str(subject.username or ""))
+            if principal is None or (
+                principal.group(1) == "reader" and access != "read_only"
+            ):
+                raise CloudBackendError(
+                    CloudBackendErrorKind.INVALID_REQUEST,
+                    "a project mount's principal is not its per-folder grant's",
+                    backend=self.backend_id,
+                    retryable=False,
+                )
+            return (
+                self.folder_grant_webdav_url(handle, str(subject.username)),
+                {"username": str(subject.username), "password": subject.credential},
+            )
+        if subject is not None and subject.legacy_service_account:
+            return self.get_project_folder_webdav_url(handle), self.webdav_credentials
+        raise CloudBackendError(
+            CloudBackendErrorKind.NOT_SUPPORTED,
+            "no per-folder grant for this project folder",
+            backend=self.backend_id,
+            retryable=False,
+        )
+
     async def build_rclone_mount_spec(
         self,
         *,
@@ -585,8 +624,9 @@ class NextcloudBackend:
                 )
                 creds = self._explicit_user_home_credentials(handle, subject) or {}
             else:
-                webdav_url = self.get_project_folder_webdav_url(handle)
-                creds = self.webdav_credentials
+                webdav_url, creds = self._project_folder_transport(
+                    handle, subject, access
+                )
                 group_folder = True
 
         # Cross-cluster VM runtimes can't reach the internal service URL; swap

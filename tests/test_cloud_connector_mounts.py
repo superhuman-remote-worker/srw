@@ -353,16 +353,169 @@ async def test_a_project_that_names_no_folder_now_mounts_nothing(denied):
     )
 
 
-@pytest.mark.asyncio
-async def test_a_root_vm_gets_neither_folder(denied):
-    store = Store([_folder_row(), _outbox_row()])
-    live, _ = await _live(_thread([FOLDER, OUTBOX]), store, vm=True)
-    assert live.mounts == []
-    assert {(e["source_ref"], e["reason"]) for e in live.excluded} == {
-        (FOLDER, "access_unavailable"),
-        (OUTBOX, "access_unavailable"),
+class GrantBackend(Backend):
+    """A provider with per-folder grants (``SupportsFolderGrant``)."""
+
+    def folder_grant_webdav_url(self, handle, principal_id):
+        return f"http://srw-nextcloud/dav/groupfolders/{principal_id}/x/"
+
+    async def ensure_folder_principal(self, handle, **kwargs):
+        raise AssertionError("a mount never mints a grant")
+
+    async def revoke_folder_principal(self, **kwargs):
+        raise AssertionError("a mount never revokes a grant")
+
+    def folder_principal_client(self, principal_id, password):
+        raise AssertionError("a mount never probes")
+
+    async def seed_canary_fixture(self, handle):
+        raise AssertionError("a mount never probes")
+
+    async def remove_canary_fixture(self, handle, fixture):
+        raise AssertionError("a mount never probes")
+
+    async def build_rclone_mount_spec(self, *, subject=None, **kwargs):
+        spec = await super().build_rclone_mount_spec(subject=subject, **kwargs)
+        self.specs[-1]["subject"] = subject
+        return spec
+
+
+READER = "srw-reader-f-" + "1" * 32
+WRITER = "srw-writer-f-" + "2" * 32
+
+
+def _grant(kind, principal, *, status="active", handle="project-handle"):
+    import hashlib
+
+    return {
+        "id": "33333333-3333-4333-8333-333333333333",
+        "kind": kind,
+        "status": status,
+        "datasource_id": FOLDER,
+        "project_id": PROJECT,
+        "user_id": USER,
+        "backend_id": "nextcloud",
+        "backend_instance_id": INSTANCE,
+        "folder_handle_sha256": hashlib.sha256(handle.encode()).hexdigest(),
+        "principal_id": principal,
+        "webdav_url": "http://srw-nextcloud/dav/x/",
+        "credentials": f"{kind}-password",
     }
+
+
+class GrantStore(Store):
+    def __init__(self, *args, grants=(), failure=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.grants = {(g["datasource_id"], g["user_id"], g["kind"]): g for g in grants}
+        self.failure = failure
+
+    async def get_live_cloud_folder_grant(self, datasource_id, user_id, kind):
+        return self.grants.get((datasource_id, user_id, kind))
+
+    async def latest_cloud_folder_grant_failure(self, datasource_id, user_id, kind):
+        return self.failure
+
+
+@pytest.mark.asyncio
+async def test_a_root_vm_gets_its_folder_through_its_reader_and_no_outbox(denied):
+    store = GrantStore(
+        [_folder_row(), _outbox_row()], grants=[_grant("reader", READER)]
+    )
+    backend = GrantBackend()
+    live, _ = await _live(_thread([FOLDER, OUTBOX]), store, vm=True, backend=backend)
+    assert [(m["mount_id"], m["access"]) for m in live.mounts] == [
+        (FOLDER, "read_only")
+    ]
+    [spec] = backend.specs
+    # The reader's own credential, over the public URL: never agent-service.
+    assert (spec["subject"].username, spec["subject"].credential) == (
+        READER,
+        "reader-password",
+    )
+    assert spec["prefer_public_url"] is True
+    assert [(e["source_ref"], e["reason"]) for e in live.excluded] == [
+        (OUTBOX, "access_unavailable")
+    ]
     assert all(e.get("detail") for e in live.excluded)
+
+
+@pytest.mark.asyncio
+async def test_a_writer_folder_mounts_as_the_owners_writer(denied):
+    store = GrantStore([_folder_row()], grants=[_grant("writer", WRITER)])
+    backend = GrantBackend()
+    live, _ = await _live(_thread([FOLDER]), store, backend=backend)
+    assert [(m["mount_id"], m["access"]) for m in live.mounts] == [
+        (FOLDER, "read_write")
+    ]
+    assert backend.specs[0]["subject"].username == WRITER
+
+
+@pytest.mark.parametrize(
+    ("vm", "grants", "failure", "reason", "detail"),
+    [
+        (False, [], None, "grant_unavailable", "not_ready"),
+        (True, [], "probe_failed", "reader_unavailable", "probe_failed"),
+        # A grant made on the folder before it moved serves nothing.
+        (
+            False,
+            [_grant("writer", WRITER, handle="old-handle")],
+            None,
+            "grant_unavailable",
+            "not_ready",
+        ),
+        # A writer never stands in for a missing reader.
+        (True, [_grant("writer", WRITER)], None, "reader_unavailable", "not_ready"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_without_its_grant_a_folder_is_left_out_never_the_service_account(
+    denied, vm, grants, failure, reason, detail
+):
+    store = GrantStore([_folder_row()], grants=grants, failure=failure)
+    backend = GrantBackend()
+    live, _ = await _live(_thread([FOLDER]), store, vm=vm, backend=backend)
+    assert live.mounts == [] and backend.specs == []
+    assert [(e["reason"], e["detail"], e["name"]) for e in live.excluded] == [
+        (reason, detail, "acme_launch")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_preparing_mints_the_bound_levels_grant_outside_the_mount(
+    denied, monkeypatch
+):
+    from orchestrator.services.cloud import folder_grants
+
+    calls = []
+
+    async def ensure(store, router, target, *, user_id, kind):
+        calls.append((target.datasource_id, target.folder_handle, user_id, kind))
+
+    monkeypatch.setattr(folder_grants, "ensure_folder_grant", ensure)
+    store = GrantStore([_folder_row(), _outbox_row()])
+    deps = _deps(store, backend=GrantBackend())
+    thread = _thread([FOLDER, OUTBOX])
+    await mounts.prepare_folder_grants(
+        thread, mount_rows=[], runtime_is_vm=False, dependencies=deps
+    )
+    await mounts.prepare_folder_grants(
+        thread, mount_rows=[], runtime_is_vm=True, dependencies=deps
+    )
+    # The project's current folder, the session owner, the level's kind.
+    assert calls == [
+        (FOLDER, "project-handle", USER, "writer"),
+        (FOLDER, "project-handle", USER, "reader"),
+    ]
+    # A provider without grants, a protected session: nothing to mint.
+    calls.clear()
+    await mounts.prepare_folder_grants(
+        thread, mount_rows=[], runtime_is_vm=False, dependencies=_deps(store)
+    )
+    protected = _thread([FOLDER], metadata={"protected_cloud": True})
+    await mounts.prepare_folder_grants(
+        protected, mount_rows=[], runtime_is_vm=False, dependencies=deps
+    )
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -500,9 +653,10 @@ async def test_a_protected_link_default_is_lowered_never_mounted_live(
     denied, monkeypatch
 ):
     store = Store([_folder_row(project_access="protected")])
-    # Nextcloud offers no reader grant yet: nothing to lower it to.
-    live, _ = await _live(_thread([FOLDER]), store)
-    assert [e["reason"] for e in live.excluded] == ["access_unavailable"]
+    # Nextcloud's reader grant: lowered to read-only, never mounted live.
+    backend = Backend()
+    live, _ = await _live(_thread([FOLDER]), store, backend=backend)
+    assert [m["access"] for m in live.mounts] == ["read_only"]
 
     from orchestrator.services.connector_drivers.cloud_folder import CloudFolderDriver
 
@@ -529,9 +683,9 @@ async def test_a_viewers_ceiling_takes_write_away_at_the_next_attach(monkeypatch
     monkeypatch.setattr(rule, "_classified", viewer)
     store = Store([_folder_row()])
     live, _ = await _live(_thread([FOLDER]), store)
-    # Read-only is not offered on Nextcloud yet: refused, never written.
-    assert live.mounts == []
-    assert [e["reason"] for e in live.excluded] == ["access_unavailable"]
+    # Lowered to the reader's level, never written.
+    assert [m["access"] for m in live.mounts] == ["read_only"]
+    assert live.excluded == []
 
 
 # --------------------------------------------------------------------------- #

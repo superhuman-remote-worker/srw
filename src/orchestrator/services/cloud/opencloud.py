@@ -122,8 +122,9 @@ OPENCLOUD_CAPABILITIES = ProviderCapabilities(
             "project",
             "read_write",
             "offered",
-            "the orchestrator's Keycloak service account, a member of the "
-            "project Space; the workspace only holds short-lived tokens",
+            "the orchestrator's Keycloak service account, a member of every "
+            "project Space; the workspace holds only its short-lived tokens, "
+            "which reach every project Space while they last",
             frozenset({"sandbox"}),
         ),
         CloudCapability(

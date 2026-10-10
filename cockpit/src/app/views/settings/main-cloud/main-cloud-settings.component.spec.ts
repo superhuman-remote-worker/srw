@@ -106,8 +106,13 @@ describe('MainCloudSettingsComponent', () => {
     const rootRo = cell(host, 'cloud_folder/user_root/read_only', 'nextcloud');
     expect(text(rootRo)).toContain('app token');
 
-    const plannedRo = cell(host, 'cloud_folder/project/read_only', 'nextcloud');
-    expect(text(plannedRo)).toContain('planned (slice 5)');
+    // A project folder's reader: its own account, offered on a VM too.
+    const readerNc = cell(host, 'cloud_folder/project/read_only', 'nextcloud');
+    expect(readerNc.getAttribute('data-status')).toBe('offered');
+    expect(text(readerNc)).toContain('reader account');
+    expect(text(readerNc)).toContain('vm');
+    expect(text(cell(host, 'cloud_folder_checkout/project/reviewed_write_back', 'nextcloud')))
+      .toContain('planned (slice 6)');
 
     // A checkout's write-back waits for its gate on both providers.
     for (const provider of ['nextcloud', 'opencloud']) {

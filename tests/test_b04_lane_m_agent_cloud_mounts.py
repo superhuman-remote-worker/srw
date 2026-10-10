@@ -487,8 +487,10 @@ def test_cloud_sync_is_none_when_nothing_resolves():
     )
 
 
-def test_cloud_sync_emits_v2_with_basic_auth_for_nextcloud():
-    """The adapter builds the entry (``cloud_sync_config``), not this module."""
+def test_cloud_sync_never_syncs_a_nextcloud_project_folder_as_the_service_account():
+    """A project folder of a provider with per-folder grants is reached only
+    as its grant's principal, which the sync path does not carry (main cloud
+    slice 7): it is skipped, never synced as agent-service."""
     from orchestrator.services.cloud import NextcloudBackend, NextcloudSettings
 
     backend = NextcloudBackend(
@@ -523,10 +525,7 @@ def test_cloud_sync_emits_v2_with_basic_auth_for_nextcloud():
         dependencies=dependencies,
     )
 
-    assert payload["version"] == 2
-    assert payload["session_folder"] is None
-    (mount,) = payload["mounts"]
-    assert mount["auth"] == {"type": "basic", "username": "agent", "password": "pw"}
+    assert payload is None
 
 
 def test_cloud_sync_skips_a_row_without_transport_details():

@@ -633,4 +633,9 @@ def thread_workspace_delivery_dependencies(
         session_subagent_fanout=lambda lane: (
             resources.settings.session_subagent_fanout(lane)
         ),
+        prepare_cloud_folder_grants=bound(
+            agent_cloud_mounts.prepare_thread_folder_grants,
+            workspace_composition.agent_cloud_mount_dependencies,
+            resources,
+        ),
     )

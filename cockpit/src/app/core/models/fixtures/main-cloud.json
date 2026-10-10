@@ -42,13 +42,13 @@
         "access": "read_only",
         "cells": {
           "nextcloud": {
-            "status": "planned",
-            "note": "a reader account granted read-only access to this one folder (the reader grant protected mode mints)",
+            "status": "offered",
+            "note": "a reader account allowed to read only this folder; on a VM its credential sits in the workspace's rclone config",
             "workspace_backends": [
               "sandbox",
               "vm"
             ],
-            "slice": 5
+            "slice": null
           },
           "opencloud": {
             "status": "unsupported",
@@ -65,7 +65,7 @@
         "cells": {
           "nextcloud": {
             "status": "offered",
-            "note": "the agent-service account, a member of the project's Group Folder (it can write every project folder until slice 7)",
+            "note": "a writer account per project member that can read and write only this project's folder",
             "workspace_backends": [
               "sandbox"
             ],
@@ -73,7 +73,7 @@
           },
           "opencloud": {
             "status": "offered",
-            "note": "the orchestrator's Keycloak service account, a member of the project Space; the workspace only holds short-lived tokens",
+            "note": "the orchestrator's Keycloak service account, a member of every project Space; the workspace holds only its short-lived tokens, which reach every project Space while they last",
             "workspace_backends": [
               "sandbox"
             ],
@@ -218,7 +218,7 @@
         "cells": {
           "nextcloud": {
             "status": "offered",
-            "note": "a folder SRW creates in the agent-service account's home and shares with the execution's owner; a session mounts it with agent-service's credential (which can write every project folder until slice 7), so not on a root VM",
+            "note": "a folder SRW creates in the agent-service account's home and shares with the execution's owner; a session mounts it with agent-service's credential (which can still write every project folder, until slice 7b), so not on a root VM",
             "workspace_backends": [
               "sandbox"
             ],

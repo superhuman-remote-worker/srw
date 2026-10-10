@@ -67,6 +67,10 @@ class CloudMountSubject:
     user_sub: Optional[str] = None
     username: Optional[str] = None
     credential: Optional[str] = field(default=None, repr=False)
+    #: End's reconstruction of a mount the old rule made in the workspace
+    #: with the service account, byte for byte, so its resident process can
+    #: be adopted and removed. Never set for a delivery.
+    legacy_service_account: bool = False
 
 
 @dataclass(frozen=True, slots=True)

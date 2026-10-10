@@ -158,7 +158,7 @@ AGENT_SERVED = (
 #: provider. ``planned`` is "with slice N".
 EXPECTED_MATRIX: dict[tuple[str, str | None, str], dict[str, str]] = {
     ("cloud_folder", "project", "read_only"): {
-        "nextcloud": "planned",
+        "nextcloud": "offered",
         "opencloud": "unsupported",
     },
     ("cloud_folder", "project", "read_write"): {

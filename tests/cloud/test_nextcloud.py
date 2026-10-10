@@ -24,13 +24,17 @@ import pytest
 from orchestrator.services.cloud import (
     CloudBackendError,
     CloudBackendErrorKind,
+    CloudMountSubject,
     NextcloudBackend,
     ProjectFolderHandle,
 )
 from orchestrator.services.cloud.config import NextcloudSettings
+from orchestrator.services.cloud.folder_grants import principal_ids
 
 NEXTCLOUD_BASE = "https://nc.example.com"
 AGENT_USER = "agent-service"
+_WRITER = principal_ids("writer", "11111111-1111-4111-8111-111111111111")[0]
+_READER = principal_ids("reader", "11111111-1111-4111-8111-111111111111")[0]
 # Mountpoint with a space → exercises URL-encoding end-to-end (the real
 # "NC Validation Project" group folder has one too).
 MOUNTPOINT = "Test Project"
@@ -568,12 +572,92 @@ class TestRcloneMountSpec:
             mount_kind="project",
             target_path="/cloud/test",
             access="read_write",
+            subject=CloudMountSubject(username=_WRITER, credential="writer-pw"),
         )
+        assert spec.source_config["url"].startswith(
+            f"{NEXTCLOUD_BASE}/remote.php/dav/groupfolders/{_WRITER}/"
+        )
+        assert spec.source_config["user"] == _WRITER
+        assert spec.auth == {"type": "basic", "password": "writer-pw"}
+        assert spec.source_config["nextcloud_chunk_size"] == "0"
+        assert spec.source_config["vendor"] == "nextcloud"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "subject",
+        [
+            None,
+            CloudMountSubject(),
+            CloudMountSubject(username=AGENT_USER),
+            CloudMountSubject(username=_WRITER),
+        ],
+    )
+    async def test_a_project_folder_is_never_mounted_as_the_service_account(
+        self, subject
+    ):
+        """Main cloud slice 7: no per-folder grant, no project mount."""
+        be = NextcloudBackend(_nc_test_settings())
+        with pytest.raises(CloudBackendError) as caught:
+            await be.build_rclone_mount_spec(
+                handle=_handle(),
+                mount_kind="project",
+                target_path="/cloud/test",
+                access="read_write",
+                subject=subject,
+            )
+        assert caught.value.kind == CloudBackendErrorKind.NOT_SUPPORTED
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("username", "access"),
+        [(AGENT_USER, "read_write"), ("admin", "read_only"), (_READER, "read_write")],
+    )
+    async def test_only_a_grant_principal_at_its_level_is_mounted(
+        self, username, access
+    ):
+        be = NextcloudBackend(_nc_test_settings())
+        with pytest.raises(CloudBackendError) as caught:
+            await be.build_rclone_mount_spec(
+                handle=_handle(),
+                mount_kind="project",
+                target_path="/cloud/test",
+                access=access,
+                subject=CloudMountSubject(username=username, credential="pw"),
+            )
+        assert caught.value.kind == CloudBackendErrorKind.INVALID_REQUEST
+
+    @pytest.mark.asyncio
+    async def test_a_reader_mounts_read_only_over_the_public_url_on_a_vm(self):
+        be = NextcloudBackend(_nc_test_settings())
+        spec = await be.build_rclone_mount_spec(
+            handle=_handle(),
+            mount_kind="project",
+            target_path="/cloud/test",
+            access="read_only",
+            subject=CloudMountSubject(username=_READER, credential="reader-pw"),
+            prefer_public_url=True,
+        )
+        assert spec.source_config["user"] == _READER
+        assert spec.source_config["url"].startswith(
+            f"{be._public_url}/remote.php/dav/groupfolders/{_READER}/"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ends_reconstruction_of_an_old_mount_keeps_its_bytes(self):
+        """The old rule's in-workspace mount, rebuilt for End to adopt and
+        remove its resident process: the service account, as it was."""
+        be = NextcloudBackend(_nc_test_settings())
+        spec = await be.build_rclone_mount_spec(
+            handle=_handle(),
+            mount_kind="project",
+            target_path="/cloud/test",
+            access="read_write",
+            subject=CloudMountSubject(legacy_service_account=True),
+        )
+        assert spec.source_config["user"] == AGENT_USER
         assert spec.source_config["url"].startswith(
             f"{NEXTCLOUD_BASE}/remote.php/dav/groupfolders/{AGENT_USER}/"
         )
-        assert spec.source_config["nextcloud_chunk_size"] == "0"
-        assert spec.source_config["vendor"] == "nextcloud"
 
     @pytest.mark.asyncio
     async def test_a_session_folder_keeps_chunked_uploads(self):

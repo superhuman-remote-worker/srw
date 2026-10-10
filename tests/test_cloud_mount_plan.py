@@ -752,7 +752,11 @@ async def test_ends_legacy_set_rule_names_every_row_it_left_out(monkeypatch):
         for x in "abc"
     ]
 
-    async def build(row, *, workspace_name, runtime_is_vm, dependencies, failures=None):
+    async def build(
+        row, *, workspace_name, runtime_is_vm, dependencies, failures=None, **kwargs
+    ):
+        # The old rule's level, as the service account (End's adoption).
+        assert kwargs == {"access": "read_write", "legacy": True}
         if row["id"] == "row-b":
             failures.append("not_supported")
             return None

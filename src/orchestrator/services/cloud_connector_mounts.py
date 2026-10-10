@@ -70,8 +70,11 @@ OUTBOX_FAILURE_REASONS: tuple[str, ...] = (
 #: drivers' own (``access_unavailable``, ``config_invalid``, ``not_eligible``,
 #: ``no_session_folder``, ``backend_unavailable``), ``unbuildable`` for a
 #: mount the provider could not build (``detail`` says why, a closed code),
-#: ``beside_protected`` beside a protected session's folder, and
-#: ``too_many_mounts`` past the workspace's limit.
+#: ``beside_protected`` beside a protected session's folder,
+#: ``too_many_mounts`` past the workspace's limit, and ``grant_unavailable``
+#: / ``reader_unavailable`` for a project folder whose per-folder grant (a
+#: writer, a reader) is not active (``detail``: the failed mint's code, or
+#: ``not_ready``).
 EXCLUSION_REASONS: tuple[str, ...] = (
     "access_unavailable",
     "config_invalid",
@@ -81,6 +84,8 @@ EXCLUSION_REASONS: tuple[str, ...] = (
     "unbuildable",
     "beside_protected",
     "too_many_mounts",
+    "grant_unavailable",
+    "reader_unavailable",
 )
 
 _DRIVERS: dict[str, CloudFolderDriver | CloudOutboxDriver] = {

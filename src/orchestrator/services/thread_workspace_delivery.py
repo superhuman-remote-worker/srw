@@ -159,6 +159,12 @@ class ThreadWorkspaceDeliveryDependencies:
     # composition without it delivers ``resolve_thread_datasources`` alone,
     # and no connector key.
     resolve_thread_datasource_delivery: Any = None
+    # ``(thread_id) -> None``: the per-folder grants a workspace-side cloud
+    # mount (a VM, an officer, a Pod without the in-pod plane) is made with,
+    # minted before the locked response only looks them up
+    # (``agent_cloud_mounts.prepare_thread_folder_grants``). A composition
+    # without it mints none, and such a folder is left out until one exists.
+    prepare_cloud_folder_grants: Any = None
 
 
 def agent_canvas_workspace_capabilities(
@@ -508,6 +514,16 @@ async def prepare_agent_thread_workspace(
         dependencies.store, thread_id
     )
     await _settle_cloud_mount_record(thread_id, dependencies=dependencies)
+    prepare_grants = getattr(dependencies, "prepare_cloud_folder_grants", None)
+    if prepare_grants is not None:
+        try:
+            await prepare_grants(thread_id)
+        except Exception:
+            logger.warning(
+                "Thread %s: its cloud folders' grants were not prepared",
+                thread_id,
+                exc_info=True,
+            )
 
 
 #: Pod UIDs known to record no cloud mount plan (from before the plane), so

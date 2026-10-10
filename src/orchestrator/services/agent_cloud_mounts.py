@@ -37,10 +37,17 @@ from orchestrator.services.cloud import (
     CloudMountSubject,
     ProjectFolderHandle,
     SessionFolderHandle,
+    SupportsFolderGrant,
     SupportsProtectedLower,
     SupportsRcloneMount,
     provider_adapter,
     provider_offers,
+)
+from orchestrator.services.cloud import folder_grants
+from orchestrator.services.cloud.folder_grants import (
+    KIND_FOR_ACCESS,
+    FolderGrantTarget,
+    FolderGrantUnavailable,
 )
 from orchestrator.services.cloud_connector_mounts import (
     FOLDER_KIND_BINDERS,
@@ -58,6 +65,7 @@ from orchestrator.services.cloud_mount_sidecar import (
     recorded_sidecar_plan,
 )
 from orchestrator.services.connector_drivers.cloud_folder import (
+    CloudFolderMount,
     CloudFolderUnavailable,
 )
 from orchestrator.services.connector_drivers.cloud_outbox import (
@@ -219,6 +227,18 @@ def _build_agent_cloud_sync(
             continue
         if not backend.is_initialized:
             continue
+        if row.get("mount_kind") == "project" and isinstance(
+            backend, SupportsFolderGrant
+        ):
+            # A project folder of a provider with per-folder grants is reached
+            # only as its grant's principal, which this sync path does not
+            # carry: never as the service account (main cloud slice 7).
+            logger.info(
+                "Thread mount %s: a project folder is not synced as the service "
+                "account; skipped",
+                row.get("id") or row.get("source_ref"),
+            )
+            continue
         cfg = _backend_cloud_cfg(
             backend,
             webdav_url,
@@ -352,6 +372,8 @@ async def _build_rclone_mount_from_row(
     workspace_name: str,
     runtime_is_vm: bool = False,
     access: str | None = None,
+    subject: CloudMountSubject | None = None,
+    legacy: bool = False,
     dependencies: AgentCloudMountDependencies,
     failures: list[str] | None = None,
 ) -> Optional[dict[str, Any]]:
@@ -359,8 +381,11 @@ async def _build_rclone_mount_from_row(
     closed code (``no_transport``, ``backend_unavailable``, a
     ``CloudBackendErrorKind`` value, or ``error``), never the error text.
 
-    ``access`` is the level a connector's driver resolved; without one (a
-    ``thread_mounts`` row of the old rule) the tier decides, as it did."""
+    ``access`` is the level a connector's driver resolved, and ``subject``
+    the principal a project folder is mounted as (its per-folder grant's).
+    ``legacy`` is End's reconstruction of a mount the old rule made in the
+    workspace as the service account, at the level the old rule gave it.
+    No level, no mount: a tier never picks one."""
 
     def refused(reason: str) -> None:
         if failures is not None:
@@ -384,16 +409,16 @@ async def _build_rclone_mount_from_row(
         return None
     try:
         handle = ProjectFolderHandle.from_db(handle_str, backend=backend.backend_id)
-        subject = CloudMountSubject(
-            user_sub=row.get("target_user_sub"),
-            username=handle.vendor_meta.get("username"),
-        )
+        if subject is None:
+            subject = CloudMountSubject(
+                user_sub=row.get("target_user_sub"),
+                username=handle.vendor_meta.get("username"),
+                legacy_service_account=legacy,
+            )
         target_path = f"/cloud/{workspace_name}"
-        # vm tier = root → read-only by default (root + FUSE over the whole
-        # Space is a real blast radius); see
-        # knowledge-base/knowledge/issues/workspace_upgrade_drops_cloud_mount.md § Security.
-        if access is None:
-            access = "read_only" if runtime_is_vm else "read_write"
+        if access not in ("read_only", "read_write"):
+            refused("no_access")
+            return None
         spec = await backend.build_rclone_mount_spec(
             handle=handle,
             mount_kind=str(row.get("mount_kind") or "project"),
@@ -678,6 +703,20 @@ async def _bind_cloud_connectors(
     return LiveMountSet(mounts=mounts, excluded=excluded)
 
 
+def _folder_binding(
+    connector: SelectedCloudConnector, *, ctx: AccessContext
+) -> CloudFolderMount | CloudFolderUnavailable:
+    """A ``cloud_folder`` connector's binding: at the level the session
+    resolved for it, else its project link's default, within what its owner
+    may have now (``ceiling``). Its mount and its grant follow the same."""
+    return connector.driver.mount_binding(
+        connector.row,
+        ctx=ctx,
+        requested=connector.requested,
+        ceiling=connector.ceiling,
+    )
+
+
 async def _bind_folder(
     thread: dict[str, Any],
     connector: SelectedCloudConnector,
@@ -690,12 +729,7 @@ async def _bind_folder(
     """A ``cloud_folder`` connector's mount, or its exclusion: at the level
     the session resolved for it, else its project link's default, within
     what its owner may have now (``ceiling``)."""
-    binding = connector.driver.mount_binding(
-        connector.row,
-        ctx=ctx,
-        requested=connector.requested,
-        ceiling=connector.ceiling,
-    )
+    binding = _folder_binding(connector, ctx=ctx)
     if isinstance(binding, CloudFolderUnavailable):
         return excluded_entry(connector, binding.reason, detail=binding.detail)
     binder = FOLDER_KIND_BINDERS.get(binding.folder_kind)
@@ -714,6 +748,13 @@ async def _bind_folder(
     )
     if isinstance(bound, CloudFolderUnavailable):
         return excluded_entry(connector, bound.reason, detail=bound.detail)
+    granted = await _folder_grant_subject(
+        thread, bound.row, binding, dependencies=dependencies
+    )
+    if isinstance(granted, CloudFolderUnavailable):
+        return excluded_entry(
+            connector, granted.reason, name=bound.name, detail=granted.detail
+        )
     name = _unique_name(bound.name, used)
     failures: list[str] = []
     built = await _build_rclone_mount_from_row(
@@ -721,6 +762,7 @@ async def _bind_folder(
         workspace_name=name,
         runtime_is_vm=runtime_is_vm,
         access=binding.access,
+        subject=granted,
         dependencies=dependencies,
         failures=failures,
     )
@@ -732,6 +774,228 @@ async def _bind_folder(
             detail=failures[-1] if failures else "error",
         )
     return built
+
+
+def _grant_backend(
+    row: dict[str, Any], *, dependencies: AgentCloudMountDependencies
+) -> Any:
+    """The folder's installation when its provider has per-folder grants,
+    else ``None`` (its mount, or why not, is the rclone builder's)."""
+    try:
+        backend = dependencies.cloud_router.for_backend_instance(
+            str(row.get("backend_instance_id") or ""),
+            expected_backend_id=str(row.get("backend_id") or ""),
+        )
+    except Exception:
+        return None
+    return backend if isinstance(backend, SupportsFolderGrant) else None
+
+
+def _grant_slot(
+    thread: dict[str, Any],
+    row: dict[str, Any],
+    binding: CloudFolderMount,
+    *,
+    dependencies: AgentCloudMountDependencies,
+) -> tuple[FolderGrantTarget, str] | CloudFolderUnavailable | None:
+    """Which grant a bound project folder is mounted with: its target and
+    kind (the level's), ``None`` for a provider without grants, or why it
+    cannot be mounted with one."""
+    if (
+        binding.folder_kind != "project"
+        or _grant_backend(row, dependencies=dependencies) is None
+    ):
+        return None
+    kind = KIND_FOR_ACCESS.get(binding.access)
+    target = FolderGrantTarget.from_mount_row(row, project_id=binding.project_id)
+    if kind is None or target is None or not thread.get("user_id"):
+        return CloudFolderUnavailable(
+            binding.connector_id,
+            "grant_unavailable",
+            "no_grant_for_level" if kind is None else "folder_invalid",
+        )
+    return target, kind
+
+
+async def _folder_grant_subject(
+    thread: dict[str, Any],
+    row: dict[str, Any],
+    binding: CloudFolderMount,
+    *,
+    dependencies: AgentCloudMountDependencies,
+) -> CloudMountSubject | CloudFolderUnavailable | None:
+    """The principal a bound project folder is mounted as: its active
+    per-folder grant for the session's owner at the bound level (a reader
+    for ``read_only``, a writer for ``read_write``), found, never minted
+    here (the planner may hold the thread's lock; the grants were prepared
+    before, :func:`prepare_folder_grants`). Without one the folder is left
+    out (``grant_unavailable``, ``reader_unavailable`` for a reader, its
+    ``detail`` the closed code of a failed mint or ``not_ready``): never
+    the service account in its place. ``None`` for a provider without
+    grants, whose own credential the adapter uses."""
+    slot = _grant_slot(thread, row, binding, dependencies=dependencies)
+    if slot is None or isinstance(slot, CloudFolderUnavailable):
+        return slot
+    target, kind = slot
+    store = dependencies.store
+    user_id = str(thread["user_id"])
+    try:
+        grant = await folder_grants.lookup_active_folder_grant(
+            store, target, user_id=user_id, kind=kind
+        )
+        failure = (
+            None
+            if grant is not None
+            else await store.latest_cloud_folder_grant_failure(
+                target.datasource_id, user_id, kind
+            )
+        )
+    except Exception:
+        logger.warning(
+            "Thread %s: could not read the grant of cloud folder %s",
+            thread.get("id"),
+            binding.connector_id,
+            exc_info=True,
+        )
+        grant, failure = None, "error"
+    if grant is None:
+        return CloudFolderUnavailable(
+            binding.connector_id,
+            "reader_unavailable" if kind == "reader" else "grant_unavailable",
+            failure if failure in folder_grants.FAILURE_CODES else "not_ready",
+        )
+    return grant.subject()
+
+
+#: How long one session's grant preparation may take in all (a reader's
+#: read-only probe takes seconds; a writer's mint about one).
+GRANT_PREPARE_SECONDS = 60.0
+
+
+async def prepare_folder_grants(
+    thread: dict[str, Any],
+    *,
+    mount_rows: list[dict[str, Any]] | None,
+    runtime_is_vm: bool,
+    dependencies: AgentCloudMountDependencies,
+    timeout_s: float = GRANT_PREPARE_SECONDS,
+) -> None:
+    """Mint the per-folder grants a session's project folders are mounted
+    with, before the mount is built (never under the thread's advisory
+    lock: the provider is called and a reader is probed). Each attached
+    project folder at the level it binds at on this tier, for the
+    session's owner; one already active is only looked up. Bounded and
+    best effort: a grant that is not ready leaves its folder out, with the
+    reason, and the next preparation tries again. Never raises."""
+    metadata = thread_metadata_object(thread)
+    if protected_cloud_marker_state(metadata) != "off" or not thread.get("user_id"):
+        return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    try:
+        selected = await selected_cloud_connectors(
+            thread,
+            datasource_ids=selected_ids(metadata),
+            project_ids=_project_scope(thread, mount_rows),
+            store=dependencies.store,
+        )
+        ctx = _access_context(thread, runtime_is_vm=runtime_is_vm)
+        for connector in selected:
+            if not connector.eligible or isinstance(
+                connector.driver, CloudOutboxDriver
+            ):
+                continue
+            binding = _folder_binding(connector, ctx=ctx)
+            if not isinstance(binding, CloudFolderMount):
+                continue
+            binder = FOLDER_KIND_BINDERS.get(binding.folder_kind)
+            if binding.folder_kind != "project" or binder is None:
+                continue
+            bound = await binder(
+                FolderBindRequest(
+                    thread=thread,
+                    row=connector.row,
+                    binding=binding,
+                    store=dependencies.store,
+                    slugify=dependencies.slugify_mount_name,
+                )
+            )
+            if isinstance(bound, CloudFolderUnavailable):
+                continue
+            slot = _grant_slot(thread, bound.row, binding, dependencies=dependencies)
+            if slot is None or isinstance(slot, CloudFolderUnavailable):
+                continue
+            target, kind = slot
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.info(
+                    "Thread %s: out of time preparing its cloud folders' grants",
+                    thread.get("id"),
+                )
+                return
+            try:
+                await asyncio.wait_for(
+                    folder_grants.ensure_folder_grant(
+                        dependencies.store,
+                        dependencies.cloud_router,
+                        target,
+                        user_id=str(thread["user_id"]),
+                        kind=kind,
+                    ),
+                    timeout=remaining,
+                )
+            except FolderGrantUnavailable as exc:
+                logger.info(
+                    "Thread %s: no %s grant for cloud folder %s (%s)",
+                    thread.get("id"),
+                    kind,
+                    binding.connector_id,
+                    exc.code,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.info(
+                    "Thread %s: the %s grant for cloud folder %s is not ready yet",
+                    thread.get("id"),
+                    kind,
+                    binding.connector_id,
+                )
+                return
+    except Exception:
+        logger.warning(
+            "Thread %s: its cloud folders' grants were not prepared",
+            thread.get("id"),
+            exc_info=True,
+        )
+
+
+async def prepare_thread_folder_grants(
+    thread_id: str, *, dependencies: AgentCloudMountDependencies
+) -> None:
+    """:func:`prepare_folder_grants` for a session whose folders its
+    workspace mounts itself (a VM, an officer, a Pod without the in-pod
+    plane): the attach path's preparation, before its locked response. A
+    Pod whose sidecars mount its folders needs none here (its planner
+    prepared them). Never raises."""
+    try:
+        thread = await dependencies.store.get_thread(thread_id)
+        if not thread:
+            return
+        metadata = thread_metadata_object(thread)
+        runtime_is_vm = _vm_runtime_ready(metadata)
+        if recorded_sidecar_plan(metadata) is not None and not runtime_is_vm:
+            return
+        await prepare_folder_grants(
+            thread,
+            mount_rows=await dependencies.store.list_thread_mounts(thread_id),
+            runtime_is_vm=runtime_is_vm,
+            dependencies=dependencies,
+        )
+    except Exception:
+        logger.warning(
+            "Thread %s: its cloud folders' grants were not prepared",
+            thread_id,
+            exc_info=True,
+        )
 
 
 async def _bind_outbox(
@@ -950,6 +1214,10 @@ async def _legacy_live_mount_set(
             row,
             workspace_name=workspace_name,
             runtime_is_vm=runtime_is_vm,
+            # The old rule's level (a root VM got its folders read-only, an
+            # rclone flag only): what the resident process was mounted with.
+            access="read_only" if runtime_is_vm else "read_write",
+            legacy=True,
             dependencies=dependencies,
             failures=failures,
         )

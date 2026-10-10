@@ -63766,6 +63766,25 @@ class PostgresDB:
             )
         return result == "UPDATE 1"
 
+    async def latest_cloud_folder_grant_failure(
+        self, datasource_id: str, user_id: str, kind: str
+    ) -> str | None:
+        """The closed code of the slot's latest grant when its mint failed
+        (``failure_code``), else ``None``."""
+        async with self.acquire() as conn:
+            return await conn.fetchval(
+                """
+                SELECT failure_code FROM cloud_folder_grants
+                 WHERE datasource_id = $1::uuid AND user_id = $2::uuid
+                   AND kind = $3
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1
+                """,
+                str(datasource_id),
+                str(user_id),
+                kind,
+            )
+
     async def cloud_folder_grants_pending(self) -> bool:
         """Whether any grant may still need a provider call."""
         async with self.acquire() as conn:
