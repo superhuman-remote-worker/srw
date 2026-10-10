@@ -307,6 +307,125 @@ async def current_policy1_retention_parent(
         return None
 
 
+async def current_policy1_stop_authority(
+    db, parent_cleanup, *, job_id, generation, vm_uid, pvc_uid
+) -> dict | None:
+    """Read a committed, current policy-1 authority under its writer locks."""
+    from shared.vm_cancel_retention import (
+        valid_never_app_ready_retention_authority,
+    )
+
+    try:
+        owner, incarnation = _uuid(job_id), _uuid(generation)
+        expected_vm, expected_pvc = _uuid(vm_uid), _uuid(pvc_uid)
+        if not isinstance(parent_cleanup, Mapping):
+            return None
+        async with db.acquire() as conn:
+            # A released savepoint still belongs to its outer transaction.
+            if conn.is_in_transaction() or not await _installed(conn):
+                return None
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                    f"workspace-recovery:job:{owner}",
+                )
+                locator = await conn.fetchrow(
+                    "SELECT pvc_uid FROM vm_job_cancel_retention_authorities "
+                    "WHERE job_id=$1 AND provision_generation=$2 AND policy_version=1",
+                    owner,
+                    incarnation,
+                )
+                if locator is None or locator["pvc_uid"] != expected_pvc:
+                    return None
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                    f"workspace-recovery-pvc:{expected_pvc}",
+                )
+                await conn.fetchrow(
+                    "SELECT unit_id FROM run_queue WHERE unit_id=$1 FOR UPDATE", owner
+                )
+                job = await conn.fetchrow(
+                    "SELECT id,status,execution_lane,assigned_agent_id,context "
+                    "FROM jobs WHERE id=$1 FOR UPDATE",
+                    owner,
+                )
+                row = await conn.fetchrow(
+                    "SELECT a.*,c.completed_at FROM vm_job_cancel_retention_authorities a "
+                    "JOIN vm_workspace_cleanup_admissions c ON c.id=a.cleanup_admission_id "
+                    "WHERE a.job_id=$1 AND a.provision_generation=$2 "
+                    "AND a.policy_version=1 FOR UPDATE OF c",
+                    owner,
+                    incarnation,
+                )
+                if row is None or job is None or row["completed_at"] is not None:
+                    return None
+                context = _json(job["context"])
+                vm = context.get("vm") if isinstance(context, dict) else None
+                if (
+                    not isinstance(vm, dict)
+                    or vm.get("status") != "retiring_process_zero"
+                    or vm.get("provision_generation") != str(incarnation)
+                    or vm.get("vm_uid") != str(expected_vm)
+                    or vm.get("rootdisk_pvc_uid") != str(expected_pvc)
+                ):
+                    return None
+                await conn.fetchrow(
+                    "SELECT request_id FROM vm_creation_retries WHERE request_id=$1 FOR UPDATE",
+                    row["creation_request_id"],
+                )
+                await conn.fetchrow(
+                    "SELECT id FROM vm_resource_reservations WHERE id=$1 FOR UPDATE",
+                    row["reservation_id"],
+                )
+                if (
+                    row["vm_uid"] != expected_vm
+                    or row["pvc_uid"] != expected_pvc
+                    or row["admitted_xact_id"]
+                    == await conn.fetchval("SELECT pg_current_xact_id()")
+                ):
+                    return None
+                expected = bind_vm_cleanup_permit(
+                    CleanupPermit(
+                        allowed=True, admission_id=row["cleanup_admission_id"]
+                    ),
+                    request_id=row["cleanup_request_id"],
+                    intent=_json(row["retaining_intent"]),
+                ).parent_cleanup
+                if dict(parent_cleanup) != expected or not await conn.fetchval(
+                    "SELECT public.validate_vm_job_cancel_retention($1,false)",
+                    row["cleanup_admission_id"],
+                ):
+                    return None
+                result = {
+                    "version": 1,
+                    "kind": "vm_job_cancel_retention_held_stop_authority_v1",
+                    "policy_version": 1,
+                    "owner_kind": "job",
+                    "job_id": str(row["job_id"]),
+                    "provision_generation": str(row["provision_generation"]),
+                    "namespace": row["namespace"],
+                    "cluster_id": row["cluster_id"],
+                    "cleanup_admission_id": str(row["cleanup_admission_id"]),
+                    "cleanup_request_id": str(row["cleanup_request_id"]),
+                    "cleanup_intent_digest": row["intent_digest"],
+                    "creation_request_id": str(row["creation_request_id"]),
+                    "reservation_id": str(row["reservation_id"]),
+                    "reservation_revision": row["reservation_revision"],
+                    "vm_uid": str(row["vm_uid"]),
+                    "vmi_uid": str(row["vmi_uid"]),
+                    "launcher_uid": str(row["launcher_uid"]),
+                    "pvc_uid": str(row["pvc_uid"]),
+                    "node_uid": str(row["node_uid"]),
+                }
+                return (
+                    result
+                    if valid_never_app_ready_retention_authority(result)
+                    else None
+                )
+    except Exception:
+        return None
+
+
 @dataclass(frozen=True)
 class JobRetainedPurgeBootstrap:
     """Private transaction-only proposal; never physical effect authority."""

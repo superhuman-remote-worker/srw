@@ -152,7 +152,23 @@ class VMPreSSHStopStore:
 
         authority = await retention_for_admission_on_conn(conn, cleanup_id)
         ready_stop = authority is not None and authority.get("policy_version") == 3
-        if ready_stop:
+        held_stop = (
+            authority is not None
+            and authority.get("policy_version") == 1
+            and (
+                frozen is not None
+                and frozen.get("kind")
+                == "vm_job_never_app_ready_retained_stop_candidate_v1"
+                or frozen is None
+                and await conn.fetchval(
+                    "SELECT frozen->>'kind'='vm_job_never_app_ready_retained_stop_candidate_v1' "
+                    "FROM vm_pre_ssh_stop_intents WHERE cleanup_admission_id=$1",
+                    cleanup_id,
+                )
+                is True
+            )
+        )
+        if ready_stop or held_stop:
             for key in (
                 f"workspace-recovery:job:{job_id}",
                 f"workspace-recovery-pvc:{authority['pvc_uid']}",
@@ -224,6 +240,15 @@ class VMPreSSHStopStore:
             )
         ):
             raise VMPreSSHStopConflict("initial_ready_authority_changed")
+        if held_stop and (
+            authority["cleanup_admission_id"] != cleanup_id
+            or authority["admitted_xact_id"]
+            == await conn.fetchval("SELECT pg_current_xact_id()")
+            or not await conn.fetchval(
+                "SELECT public.validate_vm_job_cancel_retention($1,false)", cleanup_id
+            )
+        ):
+            raise VMPreSSHStopConflict("held_stop_authority_changed")
         charge = await conn.fetchrow(
             "SELECT * FROM vm_resource_reservations WHERE request_id=$1 "
             "AND state<>'released' FOR UPDATE",
@@ -259,13 +284,21 @@ class VMPreSSHStopStore:
             or (frozen.get("kind") == "vm_initial_ready_positive_stop_candidate_v1")
             != ready_stop
             or (
-                ready_stop
+                frozen.get("kind")
+                == "vm_job_never_app_ready_retained_stop_candidate_v1"
+            )
+            != held_stop
+            or (
+                (ready_stop or held_stop)
                 and (
                     frozen.get("cleanup_admission_id") != str(cleanup_id)
                     or frozen.get("cleanup_request_id") != str(cleanup_request)
                     or frozen.get("cleanup_intent_digest") != cleanup_digest
-                    or not valid_retention_preflight(
-                        parent_cleanup.get("retention_preflight"), frozen
+                    or (
+                        ready_stop
+                        and not valid_retention_preflight(
+                            parent_cleanup.get("retention_preflight"), frozen
+                        )
                     )
                 )
             )
@@ -309,12 +342,20 @@ class VMPreSSHStopStore:
                     return None
                 _require_intent_current(row, cleanup, retry, charge)
                 frozen = _json_object(row["frozen"])
-                if (
-                    frozen["kind"] == "vm_initial_ready_positive_stop_candidate_v1"
-                    and not await conn.fetchval(
-                        "SELECT initial_ready_xact_id<>pg_current_xact_id() FROM vm_pre_ssh_stop_intents WHERE cleanup_admission_id=$1",
-                        cleanup["id"],
+                if frozen["kind"] in {
+                    "vm_initial_ready_positive_stop_candidate_v1",
+                    "vm_job_never_app_ready_retained_stop_candidate_v1",
+                } and not await conn.fetchval(
+                    "SELECT "
+                    + (
+                        "initial_ready_xact_id"
+                        if frozen["kind"]
+                        == "vm_initial_ready_positive_stop_candidate_v1"
+                        else "held_stop_xact_id"
                     )
+                    + "<>pg_current_xact_id() FROM vm_pre_ssh_stop_intents "
+                    "WHERE cleanup_admission_id=$1",
+                    cleanup["id"],
                 ):
                     raise VMPreSSHStopConflict("initial_ready_intent_uncommitted")
                 await self._locked_current(
@@ -338,6 +379,7 @@ class VMPreSSHStopStore:
         frozen: Mapping[str, Any],
         *,
         retention_preflight: Mapping[str, Any] | None = None,
+        prior_zero_receipt_id: str | None = None,
     ) -> dict:
         owner, incarnation = _uuid(job_id), _uuid(generation)
         if not valid_frozen_stop_candidate(frozen):
@@ -366,13 +408,25 @@ class VMPreSSHStopStore:
                     wire = _intent_wire(prior)
                     if wire.get("retention_preflight") != retention_preflight:
                         raise VMPreSSHStopConflict("retention_preflight_rebound")
+                    if prior.get("prior_zero_receipt_id") != (
+                        _uuid(prior_zero_receipt_id) if prior_zero_receipt_id else None
+                    ):
+                        raise VMPreSSHStopConflict("prior_zero_rebound")
                     return wire
-                if await conn.fetchval(
-                    "SELECT EXISTS(SELECT 1 FROM managed_repository_process_zero_receipts "
+                zero = await conn.fetchrow(
+                    "SELECT id FROM managed_repository_process_zero_receipts "
                     "WHERE owner_kind='job' AND owner_id=$1 AND scope='vm' "
-                    "AND provisioner='vm' AND runtime_incarnation=$2)",
+                    "AND provisioner='vm' AND runtime_incarnation=$2",
                     owner,
                     str(incarnation),
+                )
+                held_stop = (
+                    frozen["kind"]
+                    == "vm_job_never_app_ready_retained_stop_candidate_v1"
+                )
+                if (zero is not None and not held_stop) or (
+                    (zero["id"] if zero else None)
+                    != (_uuid(prior_zero_receipt_id) if prior_zero_receipt_id else None)
                 ):
                     raise VMPreSSHStopConflict("preexisting_zero_receipt")
                 preflight_column = (
@@ -381,15 +435,21 @@ class VMPreSSHStopStore:
                 preflight_value = (
                     ",$14::jsonb" if retention_preflight is not None else ""
                 )
+                prior_column = ",prior_zero_receipt_id" if held_stop else ""
+                prior_value = (
+                    f",${15 if retention_preflight is not None else 14}"
+                    if held_stop
+                    else ""
+                )
                 row = await conn.fetchrow(
                     "INSERT INTO vm_pre_ssh_stop_intents ("
                     "cleanup_admission_id,job_id,provision_generation,"
                     "creation_request_id,reservation_id,reservation_revision,"
                     "vm_uid,vmi_uid,launcher_uid,pvc_uid,node_uid,"
-                    f"cleanup_intent_digest,frozen,frozen_digest{preflight_column}) VALUES ("
+                    f"cleanup_intent_digest,frozen,frozen_digest{preflight_column}{prior_column}) VALUES ("
                     "$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,"
                     "'sha256:'||encode(sha256(convert_to($13::jsonb::text,'UTF8')),'hex')"
-                    f"{preflight_value}) RETURNING *",
+                    f"{preflight_value}{prior_value}) RETURNING *",
                     cleanup["id"],
                     owner,
                     incarnation,
@@ -406,6 +466,15 @@ class VMPreSSHStopStore:
                     *(
                         [json.dumps(dict(retention_preflight))]
                         if retention_preflight is not None
+                        else []
+                    ),
+                    *(
+                        [
+                            _uuid(prior_zero_receipt_id)
+                            if prior_zero_receipt_id
+                            else None
+                        ]
+                        if held_stop
                         else []
                     ),
                 )
@@ -438,6 +507,14 @@ class VMPreSSHStopStore:
                     raise VMPreSSHStopConflict("stop_intent_absent")
                 _require_intent_current(intent, cleanup, retry, charge)
                 frozen = _json_object(intent["frozen"])
+                if frozen[
+                    "kind"
+                ] == "vm_job_never_app_ready_retained_stop_candidate_v1" and (
+                    intent["held_stop_xact_id"] is None
+                    or intent["held_stop_xact_id"]
+                    == await conn.fetchval("SELECT pg_current_xact_id()")
+                ):
+                    raise VMPreSSHStopConflict("held_stop_intent_uncommitted")
                 _, cleanup, retry, charge = await self._locked_current(
                     conn,
                     job_id=owner,
@@ -532,13 +609,32 @@ class VMPreSSHStopStore:
                 )
                 if row is None:
                     return None
+                frozen_kind = _json_object(row["frozen"])["kind"]
                 if (
-                    _json_object(row["frozen"])["kind"]
-                    == "vm_initial_ready_positive_stop_candidate_v1"
-                    and not await conn.fetchval(
-                        "SELECT initial_ready_xact_id<>pg_current_xact_id() FROM vm_pre_ssh_stop_proofs WHERE cleanup_admission_id=$1",
-                        cleanup["id"],
+                    frozen_kind == "vm_job_never_app_ready_retained_stop_candidate_v1"
+                    and (
+                        (
+                            row["prior_zero_receipt_id"] is not None
+                            and row["prior_zero_receipt_id"] != row["zero_id"]
+                        )
+                        or _json_object(row["terminal_evidence"]).get("kind")
+                        != "vm_job_never_app_ready_retained_positive_stop_v1"
                     )
+                ):
+                    raise VMPreSSHStopConflict("held_stop_proof_zero_changed")
+                if frozen_kind in {
+                    "vm_initial_ready_positive_stop_candidate_v1",
+                    "vm_job_never_app_ready_retained_stop_candidate_v1",
+                } and not await conn.fetchval(
+                    "SELECT "
+                    + (
+                        "initial_ready_xact_id"
+                        if frozen_kind == "vm_initial_ready_positive_stop_candidate_v1"
+                        else "held_stop_xact_id"
+                    )
+                    + "<>pg_current_xact_id() FROM vm_pre_ssh_stop_proofs "
+                    "WHERE cleanup_admission_id=$1",
+                    cleanup["id"],
                 ):
                     raise VMPreSSHStopConflict("initial_ready_proof_uncommitted")
                 _require_intent_current(row, cleanup, retry, charge)
@@ -568,7 +664,10 @@ class VMPreSSHStopStore:
                             )
                         }
                         if frozen["kind"]
-                        == "vm_initial_ready_positive_stop_candidate_v1"
+                        in {
+                            "vm_initial_ready_positive_stop_candidate_v1",
+                            "vm_job_never_app_ready_retained_stop_candidate_v1",
+                        }
                         else {}
                     ),
                 }
