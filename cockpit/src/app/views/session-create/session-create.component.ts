@@ -4,7 +4,7 @@ import {WorkspaceChoice} from '../../core/models/workspace-template.model';
 import {choiceBackend, choiceRequestFields} from '../workspaces/workspace-template-utils';
 import {Component, computed, effect, inject, OnInit, signal, ViewChild} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
-import {HttpClient} from '@angular/common/http';
+import {HttpClient, HttpParams} from '@angular/common/http';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../../core/environment';
 import {UserService} from '../../core/services/user.service';
@@ -838,12 +838,13 @@ export class SessionCreateComponent implements OnInit {
     this.loadingDatasources.set(true);
     this.datasourceLoadError.set(false);
     // The server applies all-project scope matching and computes owner-specific
-    // defaults for this exact session context.
-    const qs = Array.from(this.selectedProjectIds())
-      .map(id => `project_id=${encodeURIComponent(id)}`)
-      .join('&');
-    const url = `${environment.apiUrl}/datasources/eligible${qs ? '?' + qs : ''}`;
-    this.http.get<EligibleDatasource[]>(url).subscribe({
+    // defaults for this exact session context, keeping only what a session
+    // can attach (a project's folder checkout is for jobs).
+    let params = new HttpParams();
+    for (const id of this.selectedProjectIds()) params = params.append('project_id', id);
+    params = params.set('execution', 'session');
+    const url = `${environment.apiUrl}/datasources/eligible`;
+    this.http.get<EligibleDatasource[]>(url, {params}).subscribe({
       next: (ds) => {
         if (serial !== this.datasourceRequestSerial) return;
         this.datasources.set(ds);

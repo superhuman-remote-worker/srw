@@ -1456,8 +1456,10 @@ export class JobCreateComponent implements OnInit {
     this.datasourceLoadError.set(false);
     // The server applies execution authorization and scope for this exact
     // project, then marks owner-specific defaults. Re-fetch on context change.
+    // Only what a job can attach: a project's cloud folder mounts in
+    // sessions, never in a job.
     const pid = this.selectedProjectId();
-    this.api.getEligibleDatasources(pid ? [pid] : []).subscribe({
+    this.api.getEligibleDatasources(pid ? [pid] : [], 'job').subscribe({
       next: (datasources) => {
         if (serial !== this.datasourceRequestSerial) return;
         this.availableDatasources.set(datasources);

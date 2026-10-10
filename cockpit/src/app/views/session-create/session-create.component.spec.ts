@@ -213,7 +213,13 @@ describe('SessionCreateComponent framework defaults', () => {
         session: {application: null, personal: null, effective: null, source: 'application'},
       },
     });
-    http.expectOne((request) => request.url.endsWith('/datasources/eligible')).flush([]);
+    // A session's eligible list: only what a session can attach.
+    http.expectOne(
+      (request) =>
+        request.url.endsWith('/datasources/eligible') &&
+        request.params.get('execution') === 'session' &&
+        !request.params.has('project_id'),
+    ).flush([]);
     const persistentConfig = {
       agent_id: 'session_base',
       tools: {communication: [], delegation: []},
@@ -491,7 +497,10 @@ describe('SessionCreateComponent — reasoning pick lost to an involuntary prefi
     // never runs; expertSelectionTouched stays false throughout.
     fixture.componentInstance.selectProject('project-x');
 
-    http.expectOne((r) => r.url.includes('/datasources/eligible')).flush([]);
+    const eligible = http.expectOne((r) => r.url.includes('/datasources/eligible'));
+    expect(eligible.request.params.getAll('project_id')).toEqual(['project-x']);
+    expect(eligible.request.params.get('execution')).toBe('session');
+    eligible.flush([]);
     // The project's own effective default expert differs from expert-1 —
     // exactly what the `:502` guard checks for, and exactly what a per-project
     // override (`source: 'project'`) ordinarily produces.

@@ -278,8 +278,26 @@ describe('ApiService datasource policy endpoints', () => {
     const pending = firstValueFrom(api.getEligibleDatasources(['p1', 'p2']));
     const req = httpMock.expectOne(r => r.url.endsWith('/datasources/eligible'));
     expect(req.request.params.getAll('project_id')).toEqual(['p1', 'p2']);
+    // No execution kind named: the server lists every kind.
+    expect(req.request.params.has('execution')).toBe(false);
     req.flush({detail: 'unavailable'}, {status: 503, statusText: 'Unavailable'});
     await expect(pending).rejects.toBeTruthy();
+  });
+
+  it('names the execution kind the eligible list is for', async () => {
+    const pending = firstValueFrom(api.getEligibleDatasources(['p1'], 'job'));
+    const req = httpMock.expectOne(r => r.url.endsWith('/datasources/eligible'));
+    expect(req.request.params.getAll('project_id')).toEqual(['p1']);
+    expect(req.request.params.get('execution')).toBe('job');
+    req.flush([]);
+    await expect(pending).resolves.toEqual([]);
+
+    const session = firstValueFrom(api.getEligibleDatasources(undefined, 'session'));
+    const sessionReq = httpMock.expectOne(r => r.url.endsWith('/datasources/eligible'));
+    expect(sessionReq.request.params.has('project_id')).toBe(false);
+    expect(sessionReq.request.params.get('execution')).toBe('session');
+    sessionReq.flush([]);
+    await session;
   });
 
   it('loads retained project targets and propagates policy-write conflicts', async () => {

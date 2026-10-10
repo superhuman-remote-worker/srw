@@ -1015,14 +1015,21 @@ export class ApiService {
 
   /** Get execution-authorized, scope-matching connectors for an exact project
    * context. The server computes owner-specific `default_selected`; callers
-   * must not infer defaults from visibility or `auto_attach` alone. */
-  getEligibleDatasources(projectIds?: string[]): Observable<EligibleDatasource[]> {
+   * must not infer defaults from visibility or `auto_attach` alone.
+   * `execution` keeps only the connectors that kind of execution can attach
+   * (a project's cloud folder mounts in sessions, its checkout copies into
+   * jobs); omitted, the server lists every kind. */
+  getEligibleDatasources(
+    projectIds?: string[],
+    execution?: 'session' | 'job',
+  ): Observable<EligibleDatasource[]> {
     let params = new HttpParams();
     for (const pid of projectIds ?? []) {
       if (pid) {
         params = params.append('project_id', pid);
       }
     }
+    if (execution) params = params.set('execution', execution);
     return this.http
       .get<EligibleDatasource[]>(`${this.baseUrl}/datasources/eligible`, { params });
   }

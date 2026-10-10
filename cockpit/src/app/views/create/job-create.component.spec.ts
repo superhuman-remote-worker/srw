@@ -318,6 +318,13 @@ describe('JobCreateComponent project picker', () => {
     expect(component.buildRequest().context?.['cloud_storage_read_only']).toBe(true);
   });
 
+  it("asks for a job's eligible connectors, for the selected project", () => {
+    // A project's cloud folder mounts in sessions only: the job list must
+    // never offer it.
+    const {api} = setup(null);
+    expect(api.getEligibleDatasources).toHaveBeenLastCalledWith(['proj-1'], 'job');
+  });
+
   it('offers active projects only', () => {
     const {component, api} = setup(null);
 
