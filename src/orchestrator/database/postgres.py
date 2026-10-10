@@ -52168,10 +52168,15 @@ class PostgresDB:
         read_only: bool | None = None,
         description: str | None = None,
         *,
+        access: str | None = None,
         authority_user_id: str | None = None,
         authority_is_admin: bool = False,
     ) -> bool:
         """Link a datasource to a project with optional overrides.
+
+        ``access`` is the link's default level, for a connector whose
+        driver's levels say what they let through (its ``read_only`` is then
+        NULL: ``project_datasources_access_or_read_only_check``).
 
         Returns True if newly linked, False if already linked.
         """
@@ -52243,17 +52248,19 @@ class PostgresDB:
                 result = await conn.execute(
                     """
                     INSERT INTO project_datasources (
-                        project_id, datasource_id, read_only, description
+                        project_id, datasource_id, read_only, description, access
                     )
-                    VALUES ($1, $2, $3, $4)
+                    VALUES ($1, $2, $3, $4, $5)
                     ON CONFLICT (project_id, datasource_id) DO UPDATE SET
                         read_only = EXCLUDED.read_only,
-                        description = EXCLUDED.description
+                        description = EXCLUDED.description,
+                        access = EXCLUDED.access
                     """,
                     p_uuid,
                     d_uuid,
                     read_only,
                     description,
+                    access,
                 )
 
         return "INSERT" in result or "UPDATE" in result
@@ -52315,7 +52322,7 @@ class PostgresDB:
         """List all datasources linked to a project.
 
         Returns datasource details with project-level settings (read_only,
-        description override).
+        the default level ``project_access``, description override).
         """
         try:
             p_uuid = UUID(project_id)
@@ -52334,6 +52341,7 @@ class PostgresDB:
                        d.managed_key, d.created_at, d.updated_at,
                        pd.linked_at,
                        pd.read_only AS project_read_only,
+                       pd.access AS project_access,
                        pd.description AS project_description
                 FROM datasources d
                 JOIN project_datasources pd ON pd.datasource_id = d.id
@@ -52352,6 +52360,7 @@ class PostgresDB:
         read_only: bool | None = ...,
         description: str | None = ...,
         *,
+        access: str | None = ...,
         authority_user_id: str | None = None,
         authority_is_admin: bool = False,
     ) -> bool:
@@ -52359,6 +52368,10 @@ class PostgresDB:
 
         Pass None to clear an override (fall back to datasource default).
         Uses sentinel default (...) so None is a valid value to set.
+        ``access`` is the link's default level (a strict driver's; its
+        ``read_only`` is then NULL). Any change bumps the connector's policy
+        revision (``datasource_project_policy_change``), so a creation that
+        resolved against the old default is refused as stale.
         """
         try:
             p_uuid = UUID(project_id)
@@ -52378,6 +52391,11 @@ class PostgresDB:
         if description is not ...:
             set_parts.append(f"description = ${idx}")
             values.append(description)
+            idx += 1
+
+        if access is not ...:
+            set_parts.append(f"access = ${idx}")
+            values.append(access)
             idx += 1
 
         if not set_parts:

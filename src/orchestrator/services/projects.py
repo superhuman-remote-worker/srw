@@ -73,6 +73,7 @@ from orchestrator.services.officer_metadata import (
     thread_officer_meta as _thread_officer_meta,
 )
 from shared.connectors.builtin import spec_for_row
+from shared.connectors.contract import AccessContext, strict_access
 from shared.connectors.platform import (
     PROJECT_KB,
     managed_kind,
@@ -85,6 +86,85 @@ def _link_forced_read_only(datasource: dict[str, Any]) -> bool:
     """Whether the connector's driver keeps every project link read-only (KB)."""
     spec = spec_for_row(datasource)
     return spec is not None and spec.forced_read_only
+
+
+def _link_access_offered(datasource: dict[str, Any]) -> tuple[str, ...]:
+    """The levels a project link of a strict connector may default to: what
+    its driver offers the connector on some workspace tier."""
+    from orchestrator.services.connector_drivers.base import SupportsOfferedAccess
+    from orchestrator.services.connector_drivers.registry import (
+        builtin_connector_drivers,
+    )
+
+    spec = spec_for_row(datasource)
+    if spec is None:
+        return ()
+    driver = builtin_connector_drivers().for_type(datasource.get("type"))
+    if isinstance(driver, SupportsOfferedAccess):
+        return tuple(driver.offered_access(datasource, AccessContext()))
+    return spec.ranked_access_ids()
+
+
+def _link_access_settings(
+    datasource: dict[str, Any], body: ProjectDatasourceSettings | None
+) -> tuple[bool | None, Any]:
+    """The ``read_only`` and ``access`` a project link of ``datasource``
+    stores from ``body`` (``...``: ``access`` unchanged), or a 422.
+
+    A connector whose driver's levels say what they let through (strict,
+    ``strict_access``: a cloud folder) takes a default level per link,
+    ``access``, and never the ``read_only`` boolean, which the link keeps
+    NULL: a read-only default is the level that writes nothing. The level
+    must be one the driver offers the connector on some workspace tier; an
+    execution on a tier that does not offer it gets it lowered. Any other
+    driver keeps ``read_only`` and takes no level.
+    """
+    spec = spec_for_row(datasource)
+    sent = body.model_fields_set if body is not None else set()
+    read_only = body.read_only if body is not None else None
+    access = body.access if body is not None else None
+    if spec is None or not strict_access(spec):
+        if access is not None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "link_access_not_a_level",
+                    "message": (
+                        f"{spec.title if spec else 'This'} connectors take no "
+                        "access level per project link; set read_only instead"
+                    ),
+                },
+            )
+        return read_only, ...
+    if read_only:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "link_access_is_a_level",
+                "message": (
+                    f"{spec.title} connectors take an access level per project "
+                    "link (access), not read_only"
+                ),
+                "offered": list(_link_access_offered(datasource)),
+            },
+        )
+    if access is not None:
+        offered = _link_access_offered(datasource)
+        if access not in offered:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "link_access_not_offered",
+                    "message": (
+                        f"{spec.title} does not offer the access level "
+                        f"{access!r} for this connector"
+                        + (f" (offered: {', '.join(offered)})" if offered else "")
+                    ),
+                    "access": access,
+                    "offered": list(offered),
+                },
+            )
+    return None, (access if "access" in sent else ...)
 
 
 @dataclass(frozen=True)
@@ -1217,15 +1297,15 @@ async def link_datasource_to_project(
             detail="Only the connector owner or an admin may add this project link",
         )
 
+    read_only, access = _link_access_settings(ds, body)
     try:
-        effective_read_only = (
-            True if _link_forced_read_only(ds) else (body.read_only if body else None)
-        )
+        effective_read_only = True if _link_forced_read_only(ds) else read_only
         await store.link_datasource_to_project(
             project_id,
             datasource_id,
             read_only=effective_read_only,
             description=body.description if body else None,
+            access=None if access is ... else access,
             authority_user_id=str(user["id"]),
             authority_is_admin=bool(user.get("is_admin")),
         )
@@ -1259,18 +1339,25 @@ async def update_project_datasource(
             status_code=404, detail=f"Connector '{datasource_id}' not found"
         )
     kind = managed_kind(ds)
-    if kind is not None and kind != PROJECT_KB and body.read_only:
-        # A read-only link on a connector SRW keeps (a cloud folder) is no
-        # access level its driver offers yet: the per-link access comes
-        # with the connector access levels.
+    spec = spec_for_row(ds)
+    if (
+        kind is not None
+        and kind != PROJECT_KB
+        and body.read_only
+        and not (spec is not None and strict_access(spec))
+    ):
+        # A read-only link on a connector SRW keeps whose driver has no
+        # level that says it writes nothing.
         raise HTTPException(status_code=409, detail=managed_refusal(ds, "link_access"))
-    effective_read_only = True if _link_forced_read_only(ds) else body.read_only
+    read_only, access = _link_access_settings(ds, body)
+    effective_read_only = True if _link_forced_read_only(ds) else read_only
     try:
         success = await store.update_project_datasource(
             project_id,
             datasource_id,
             read_only=effective_read_only,
             description=body.description,
+            access=access,
             authority_user_id=str(user["id"]),
             authority_is_admin=bool(user.get("is_admin")),
         )

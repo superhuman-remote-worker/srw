@@ -186,4 +186,15 @@ class ProjectDatasourceSettings(BaseModel):
         None,
         description="Managed connectors: true = read-only tools, false/null = read-write tools",
     )
+    access: str | None = Field(
+        None,
+        pattern=r"^[A-Za-z][A-Za-z0-9_]{0,62}$",
+        description=(
+            "Connectors whose driver has access levels that say what they let "
+            "through (a cloud folder: read_only, protected, read_write): the "
+            "level the project's work binds it at when it names none. Such a "
+            "link takes a level instead of read_only; null on update clears it "
+            "(the driver's default). Omitted on update: unchanged."
+        ),
+    )
     description: str | None = Field(None, description="Project-specific usage context")

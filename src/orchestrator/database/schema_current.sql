@@ -29584,8 +29584,18 @@ CREATE TABLE public.project_datasources (
     datasource_id uuid NOT NULL,
     linked_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     read_only boolean,
-    description text
+    description text,
+    access text,
+    CONSTRAINT project_datasources_access_check CHECK (((access IS NULL) OR (access ~ '^[A-Za-z][A-Za-z0-9_]{0,62}$'::text))),
+    CONSTRAINT project_datasources_access_or_read_only_check CHECK (((access IS NULL) OR (read_only IS NULL)))
 );
+
+
+--
+-- Name: COLUMN project_datasources.access; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.project_datasources.access IS 'The project''s default level for this connector: a level id of its driver (cloud_folder: read_only, protected, read_write). NULL: the driver''s default. Only for drivers whose levels declare writes; their links keep read_only NULL. A default only, never a ceiling.';
 
 
 --

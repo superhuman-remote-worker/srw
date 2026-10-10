@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0520_cloud_folder_grants.sql"
+    / "src/orchestrator/database/migrations/app/0523_validate_project_link_access.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

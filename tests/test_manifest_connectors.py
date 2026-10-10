@@ -936,10 +936,9 @@ class TestCloudFolderGuards:
                 user=self.USER,
                 dependencies=dependencies,
             )
-        assert (narrowed.value.status_code, narrowed.value.detail) == (
-            409,
-            "The project cloud folder connector's access is managed by its project",
-        )
+        # Its link takes a level (access), never the read-only boolean.
+        assert narrowed.value.status_code == 422
+        assert narrowed.value.detail["code"] == "link_access_is_a_level"
         store.link_datasource_to_project.assert_not_awaited()
         store.update_project_datasource.assert_not_awaited()
         # A project-level description stays the project's to set.

@@ -118,6 +118,8 @@ RESERVED_READ_FIELDS: frozenset[str] = frozenset(
         "project_ids",
         "project_count",
         "project_read_only",
+        "project_access",
+        "access",
         "default_selected",
         "unavailable",
     }

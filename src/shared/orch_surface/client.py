@@ -2911,13 +2911,20 @@ class AsyncCockpitClient:
         datasource_id: str,
         read_only: bool | None = None,
         description: str | None = None,
+        access: str | None = None,
     ) -> dict[str, str]:
-        """Update project-level settings for a linked datasource."""
+        """Update project-level settings for a linked datasource.
+
+        ``access`` sets the link's default level, for a connector whose
+        driver has strict levels (a cloud folder: ``read_only``,
+        ``protected``, ``read_write``); such a link takes no ``read_only``."""
         body: dict[str, Any] = {}
         if read_only is not None:
             body["read_only"] = read_only
         if description is not None:
             body["description"] = description
+        if access is not None:
+            body["access"] = access
         resp = await self._mutation_request(
             "PATCH",
             f"/api/projects/{project_id}/datasources/{datasource_id}",
