@@ -52,6 +52,7 @@ def _row(
     config: dict | None = None,
     revision: int = 1,
     job_id: str | None = None,
+    managed_key: str | None = None,
 ) -> dict:
     return {
         "id": datasource_id,
@@ -64,6 +65,7 @@ def _row(
         "job_id": job_id,
         "project_ids": list(projects),
         "config": config or {},
+        "managed_key": managed_key,
     }
 
 
@@ -267,6 +269,97 @@ async def test_native_project_kb_is_project_managed_default():
     assert await default_datasource_ids(
         db, OWNER, [PROJECT_A, PROJECT_B], "sandbox"
     ) == [DS_NATIVE]
+
+
+@pytest.mark.asyncio
+async def test_native_project_cloud_folder_is_project_managed_default():
+    # A key-only row (no config marker): the project's own cloud folder.
+    native = _row(
+        DS_NATIVE,
+        owner=OTHER,
+        scope="projects",
+        projects=(PROJECT_A,),
+        automatic=True,
+        ds_type="cloud_folder",
+        managed_key=f"project-cloud:{PROJECT_A}",
+    )
+    db = _db([native])
+
+    assert await default_datasource_ids(db, OWNER, [PROJECT_A], "sandbox") == [
+        DS_NATIVE
+    ]
+    # Another project's work neither defaults to it nor may name it.
+    assert await default_datasource_ids(db, OWNER, [PROJECT_B], "sandbox") == []
+    with pytest.raises(DatasourceUnavailableError):
+        await authorize_datasource_ids(
+            db, {"id": OWNER}, OWNER, [DS_NATIVE], [PROJECT_B], "sandbox"
+        )
+    # A member of its project may name it, though another user created it.
+    assert await authorize_datasource_ids(
+        db, {"id": OWNER}, OWNER, [DS_NATIVE], [PROJECT_A], "sandbox"
+    ) == [DS_NATIVE]
+
+
+def _user_root(owner: str = OWNER, **over) -> dict:
+    return _row(
+        DS_NATIVE,
+        owner=owner,
+        automatic=True,
+        ds_type="cloud_folder",
+        managed_key=f"user-cloud-root:{owner}",
+        **over,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_users_own_connector_is_its_users_alone():
+    db = _db([_user_root(public=True, scope="projects", projects=(PROJECT_A,))])
+
+    assert await authorize_datasource_ids(
+        db, {"id": OWNER}, OWNER, [DS_NATIVE], [PROJECT_A], "sandbox"
+    ) == [DS_NATIVE]
+    # Not for an administrator's own work, not through a project link or
+    # trusted inheritance, and not for ownerless work.
+    for kwargs in (
+        {"allow_admin_explicit_override": True},
+        {"trusted_system_inheritance": True},
+    ):
+        verdicts, _ = await classify_datasource_selection(
+            db,
+            {"id": OTHER, "is_admin": True},
+            OTHER,
+            [DS_NATIVE],
+            [PROJECT_A],
+            "sandbox",
+            **kwargs,
+        )
+        assert verdicts == [ItemVerdict(DS_NATIVE, True, "revoked")]
+    verdicts, _ = await classify_datasource_selection(
+        db,
+        None,
+        None,
+        [DS_NATIVE],
+        [PROJECT_A],
+        "sandbox",
+        trusted_system_inheritance=True,
+    )
+    assert verdicts == [ItemVerdict(DS_NATIVE, True, "revoked")]
+
+
+@pytest.mark.asyncio
+async def test_a_users_own_connector_defaults_only_for_its_user():
+    # Even a project's chosen default (were it linked) never reaches another
+    # user's work, and a key naming one user on another's row reaches nobody.
+    root = _user_root(scope="projects", projects=(PROJECT_A,))
+    root["project_default"] = True
+    db = _db([root])
+    assert await default_datasource_ids(db, OWNER, [PROJECT_A], "sandbox") == [
+        DS_NATIVE
+    ]
+    assert await default_datasource_ids(db, OTHER, [PROJECT_A], "sandbox") == []
+    mismatched = _user_root()
+    mismatched["created_by"] = OTHER
+    assert await default_datasource_ids(_db([mismatched]), OTHER, [], "sandbox") == []
 
 
 @pytest.mark.asyncio

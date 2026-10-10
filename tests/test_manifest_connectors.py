@@ -36,11 +36,27 @@ from shared.connectors.builtin import (
     MCP_SPEC,
 )
 from shared.connectors.platform import (
+    PROJECT_CLOUD,
+    PROJECT_KB,
+    PROJECT_KINDS,
+    REFUSAL_ACTIONS,
+    USER_CLOUD_ROOT,
+    USER_KINDS,
+    managed_key,
     managed_key_for,
+    managed_kind,
+    managed_refusal,
     native_kb_project,
+    native_project,
+    native_project_sql,
+    native_user,
+    native_user_sql,
     platform_owned,
     platform_owned_sql,
+    project_cloud_key,
     project_kb_key,
+    project_managed_keys,
+    user_managed_keys,
 )
 from shared.manifests import preview_documents, validate_documents
 
@@ -542,6 +558,148 @@ class TestPlatformOwned:
             r"[0-9a-f]{4}-[0-9a-f]{12}$"
         )
         assert shape.fullmatch(project_kb_key(PROJECT.upper()))
+
+
+class TestPlatformKinds:
+    """Every platform-owned kind: whose own connector a key names."""
+
+    @pytest.mark.parametrize(
+        ("key", "kind", "project", "user"),
+        [
+            ("project-kb:" + PROJECT, PROJECT_KB, PROJECT, None),
+            ("project-cloud:" + PROJECT, PROJECT_CLOUD, PROJECT, None),
+            (
+                "project-cloud-checkout:" + PROJECT,
+                "project-cloud-checkout",
+                PROJECT,
+                None,
+            ),
+            ("user-cloud-root:" + OWNER, USER_CLOUD_ROOT, None, OWNER),
+            ("cloud-outbox:" + OWNER, "cloud-outbox", None, OWNER),
+            # A kind SRW does not know yet names neither.
+            ("future-thing:" + PROJECT, "future-thing", None, None),
+        ],
+    )
+    def test_a_key_names_its_kind_and_its_owner(self, key, kind, project, user):
+        row = _row("cloud_folder", created_by=None, managed_key=key)
+        assert managed_kind(row) == kind
+        assert native_project(row) == project
+        assert native_user(row) == user
+        # Only the knowledge base is a knowledge base.
+        assert native_kb_project(row) == (project if kind == PROJECT_KB else None)
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "project-cloud:not-a-uuid",
+            "project-cloud:",
+            "project-cloud",
+            "user-cloud-root:x",
+        ],
+    )
+    def test_a_malformed_key_names_nobody_but_stays_owned(self, key):
+        row = _row("cloud_folder", managed_key=key)
+        assert platform_owned(row) == key
+        assert native_project(row) is None
+        assert native_user(row) is None
+
+    def test_the_older_marker_is_a_project_knowledge_base(self):
+        row = _row("kb", config={"native_project_id": PROJECT.upper()})
+        assert managed_kind(row) == PROJECT_KB
+        assert native_project(row) == PROJECT
+        assert native_user(row) is None
+        # The marker only means something on a knowledge base.
+        other = _row("cloud_folder", config={"native_project_id": PROJECT})
+        assert managed_kind(other) is None
+        assert native_project(other) is None
+
+    @pytest.mark.parametrize("row", [None, {}, _row("postgresql")])
+    def test_ordinary_rows_have_no_kind(self, row):
+        assert managed_kind(row) is None
+        assert native_project(row) is None
+        assert native_user(row) is None
+
+    def test_keys_are_canonical_and_kinds_are_closed(self):
+        assert project_cloud_key(PROJECT.upper()) == "project-cloud:" + PROJECT
+        assert managed_key(USER_CLOUD_ROOT, OWNER) == "user-cloud-root:" + OWNER
+        with pytest.raises(ValueError):
+            managed_key("user-cloud", OWNER)
+        with pytest.raises(ValueError):
+            managed_key(PROJECT_CLOUD, "not-a-uuid")
+        assert set(project_managed_keys(PROJECT)) == {
+            f"{kind}:{PROJECT}" for kind in PROJECT_KINDS
+        }
+        assert set(user_managed_keys(OWNER)) == {
+            f"{kind}:{OWNER}" for kind in USER_KINDS
+        }
+        assert not PROJECT_KINDS & USER_KINDS
+        shape = re.compile(
+            r"^[a-z][a-z0-9-]{0,62}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}$"
+        )
+        for key in project_managed_keys(PROJECT) + user_managed_keys(OWNER):
+            assert shape.fullmatch(key)
+
+    def test_the_sql_twins_name_every_kind(self):
+        project_sql = native_project_sql("d")
+        assert project_sql.startswith("(CASE WHEN d.managed_key IS NOT NULL")
+        for kind in PROJECT_KINDS:
+            assert f"'{kind}'" in project_sql
+        assert "WHEN d.type = 'kb' THEN lower(NULLIF(" in project_sql
+        user_sql = native_user_sql("d")
+        for kind in USER_KINDS:
+            assert f"'{kind}'" in user_sql
+        assert "d.type" not in user_sql
+        assert native_project_sql().startswith("(CASE WHEN managed_key IS NOT NULL")
+
+
+class TestManagedRefusal:
+    KB_KEY = _row("kb", managed_key=project_kb_key(PROJECT))
+    KB_MARKER = _row("kb", config={"native_project_id": PROJECT})
+
+    @pytest.mark.parametrize("row", [KB_KEY, KB_MARKER], ids=["key", "marker"])
+    def test_a_knowledge_base_keeps_its_wording(self, row):
+        # Pinned by the API goldens (tests/fixtures/connector_goldens/api.json).
+        assert managed_refusal(row, "policy") == (
+            "The native project knowledge connector policy is managed by its project"
+        )
+        assert managed_refusal(row, "delete") == (
+            "The project knowledge connector is managed by its project"
+        )
+        assert managed_refusal(row, "link") == (
+            "The native knowledge connector cannot be linked to another project"
+        )
+        assert managed_refusal(row, "unlink") == (
+            "The native knowledge connector link is managed by its project"
+        )
+
+    def test_a_project_cloud_folder_says_what_it_is(self):
+        row = _row("cloud_folder", managed_key=project_cloud_key(PROJECT))
+        assert managed_refusal(row, "delete") == (
+            "The project cloud folder connector is managed by its project"
+        )
+        assert managed_refusal(row, "edit") == (
+            "The project cloud folder connector is managed by its project "
+            "and cannot be edited"
+        )
+        assert managed_refusal(row, "link") == (
+            "The project cloud folder connector cannot be linked to another project"
+        )
+        for action in REFUSAL_ACTIONS:
+            assert "knowledge" not in managed_refusal(row, action)
+
+    def test_a_users_folder_is_srws_for_its_user(self):
+        row = _row("cloud_folder", managed_key="user-cloud-root:" + OWNER)
+        assert managed_refusal(row, "delete") == (
+            "The personal cloud folder connector is managed by SRW for its user"
+        )
+        assert managed_refusal(row, "link") == (
+            "The personal cloud folder connector cannot be linked to a project"
+        )
+
+    def test_an_unknown_action_is_a_bug(self):
+        with pytest.raises(ValueError):
+            managed_refusal(self.KB_KEY, "rename")
 
 
 # =============================================================================

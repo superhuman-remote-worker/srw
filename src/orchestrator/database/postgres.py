@@ -52,7 +52,11 @@ from shared.connectors.builtin import (
     legacy_types_where,
     legacy_types_with_config_key,
 )
-from shared.connectors.platform import platform_owned_sql
+from shared.connectors.platform import (
+    native_project_sql,
+    native_user_sql,
+    platform_owned_sql,
+)
 
 try:
     import asyncpg
@@ -50108,7 +50112,7 @@ class PostgresDB:
                 SELECT id, name, description, type, connection_url, credentials,
                        config, cli_hint, default_branch, job_id, created_by, is_global,
                        read_only, scope_mode, auto_attach, policy_revision,
-                       created_at, updated_at
+                       managed_key, created_at, updated_at
                 FROM datasources
                 {where_clause}
                 ORDER BY created_at DESC
@@ -50264,8 +50268,8 @@ class PostgresDB:
                 SELECT d.id, d.name, d.description, d.type, d.connection_url,
                        d.config, d.cli_hint, d.default_branch, d.job_id,
                        d.created_by, d.is_global, d.read_only, d.scope_mode,
-                       d.auto_attach, d.policy_revision, d.created_at,
-                       d.updated_at,
+                       d.auto_attach, d.policy_revision, d.managed_key,
+                       d.created_at, d.updated_at,
                        CASE
                            WHEN $3::boolean OR (
                                NOT $4::boolean AND d.created_by = $1
@@ -50523,11 +50527,11 @@ class PostgresDB:
     async def get_datasource(self, datasource_id: str) -> Dict[str, Any] | None:
         """Get a single datasource by ID.
 
-        The one read that carries ``managed_key``: the platform-owned guards
-        (update, delete, link, unlink, reindex) read the row through it, so a
-        single GET shows the key too. The list, catalog and eligible reads do
-        not carry it yet; until D3c adds a managed reason to them, a client
-        that lists connectors tells a platform-owned one by its
+        Carries ``managed_key``, which the platform-owned guards (update,
+        delete, link, unlink, reindex) read the row through. The list,
+        catalog, project and eligible reads carry it too, so a client tells a
+        platform-owned connector (``shared.connectors.platform``) by its key;
+        a knowledge base written before the key still carries the
         ``config.native_project_id`` mirror.
 
         Args:
@@ -51729,12 +51733,13 @@ class PostgresDB:
         Project-link authorization is target-bound: a private connector shared
         through Project A is not portable into Project B or projectless work.
         Restricted connectors use all-match semantics for multi-project work.
-        ``default_selected`` is owner-only except for the server-owned native
-        project KB marker and the target projects' connector defaults (a
-        default of every target project, linked to each), as in
-        ``default_datasource_selection``. Credentials are decrypted here; REST
-        callers must
-        redact them before returning the rows.
+        ``default_selected`` is owner-only except for the target projects' own
+        connectors (``native_project_sql``: a knowledge base, a cloud folder)
+        and the target projects' connector defaults (a default of every target
+        project, linked to each), as in ``default_datasource_selection``. A
+        user's own connector (``native_user_sql``) is eligible for that user
+        only, an administrator included. Credentials are decrypted here; REST
+        callers must redact them before returning the rows.
         """
         try:
             u_uuid = UUID(user_id) if user_id else None
@@ -51750,29 +51755,28 @@ class PostgresDB:
 
         project_id_strings = [str(value) for value in proj_uuids]
 
+        native_project = native_project_sql("d")
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT d.id, d.name, d.description, d.type,
                        d.connection_url, d.credentials, d.config, d.cli_hint,
                        d.default_branch, d.created_by, d.is_global, d.read_only,
                        d.scope_mode, d.auto_attach, d.policy_revision,
-                       d.created_at, d.updated_at,
+                       d.managed_key, d.created_at, d.updated_at,
                        (
                            d.auto_attach
                            AND (
                                d.created_by = $1
                                OR (
-                                   d.type = 'kb'
-                                   AND d.config->>'native_project_id'
-                                       = ANY($4::text[])
+                                   {native_project} = ANY($4::text[])
                                    AND (
                                        $3::boolean
                                        OR EXISTS (
                                            SELECT 1
                                            FROM project_members native_pm
                                            WHERE native_pm.project_id::text =
-                                                 d.config->>'native_project_id'
+                                                 {native_project}
                                              AND native_pm.user_id = $1
                                        )
                                    )
@@ -51817,11 +51821,7 @@ class PostgresDB:
                                       )
                                   )
                               )
-                              OR (
-                                  d.type = 'kb'
-                                  AND d.config->>'native_project_id'
-                                      = ANY($4::text[])
-                              )
+                              OR {native_project} = ANY($4::text[])
                           )
                       )
                   )
@@ -51853,17 +51853,17 @@ class PostgresDB:
                           )
                       )
                       OR (
-                          d.type = 'kb'
-                          AND d.config->>'native_project_id' = ANY($4::text[])
+                          {native_project} = ANY($4::text[])
                           AND EXISTS (
                               SELECT 1
                               FROM project_members native_pm
-                              WHERE native_pm.project_id::text =
-                                    d.config->>'native_project_id'
+                              WHERE native_pm.project_id::text = {native_project}
                                 AND native_pm.user_id = $1
                           )
                       )
                   )
+                  -- A user's own connector is that user's alone.
+                  AND ({native_user_sql("d")} IS NULL OR d.created_by = $1)
                 ORDER BY d.type, d.name, d.id
                 """,
                 u_uuid,
@@ -51904,6 +51904,7 @@ class PostgresDB:
                 """
                 SELECT d.id, d.type, d.created_by, d.is_global, d.config, d.job_id,
                        d.scope_mode, d.auto_attach, d.policy_revision,
+                       d.managed_key,
                        COALESCE(
                            array_agg(pd.project_id ORDER BY pd.project_id)
                                FILTER (WHERE pd.project_id IS NOT NULL),
@@ -51932,9 +51933,12 @@ class PostgresDB:
         ownerless/project-managed exception, and the target projects'
         connector defaults (``project_connector_defaults``, slice D3c) add the
         connectors a project admin chose, while they stay linked; those rows
-        carry ``project_default``. The central policy service still applies
-        scope, membership, tier, and native-marker checks before it returns
-        IDs.
+        carry ``project_default``. A project's own connectors are its native
+        rows (``native_project_sql``: its knowledge base, its cloud folder). A
+        user's own connector (``native_user_sql``) is a candidate for that
+        user's work only, never through a project's defaults. The central
+        policy service still applies scope, membership, tier, and
+        native-marker checks before it returns IDs.
         """
         try:
             owner_uuid = (
@@ -51951,7 +51955,7 @@ class PostgresDB:
 
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 WITH project_defaults AS (
                     -- A default of every target project, linked to each:
                     -- one project's defaults never reach another's work.
@@ -51970,6 +51974,7 @@ class PostgresDB:
                 )
                 SELECT d.id, d.type, d.created_by, d.is_global, d.config,
                        d.scope_mode, d.auto_attach, d.policy_revision,
+                       d.managed_key,
                        COALESCE(
                            array_agg(pd.project_id ORDER BY pd.project_id)
                                FILTER (WHERE pd.project_id IS NOT NULL),
@@ -51985,15 +51990,12 @@ class PostgresDB:
                           d.auto_attach = TRUE
                           AND (
                               d.created_by = $1
-                              OR (
-                                  d.type = 'kb'
-                                  AND d.config->>'native_project_id'
-                                      = ANY($2::text[])
-                              )
+                              OR {native_project_sql("d")} = ANY($2::text[])
                           )
                       )
                       OR d.id IN (SELECT connector_id FROM project_defaults)
                   )
+                  AND ({native_user_sql("d")} IS NULL OR d.created_by = $1)
                 GROUP BY d.id
                 ORDER BY d.type, d.id
                 """,
@@ -52202,7 +52204,7 @@ class PostgresDB:
                        d.cli_hint, d.default_branch,
                        d.job_id, d.created_by, d.is_global, d.read_only,
                        d.scope_mode, d.auto_attach, d.policy_revision,
-                       d.created_at, d.updated_at,
+                       d.managed_key, d.created_at, d.updated_at,
                        pd.linked_at,
                        pd.read_only AS project_read_only,
                        pd.description AS project_description

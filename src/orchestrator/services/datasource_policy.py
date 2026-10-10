@@ -15,7 +15,7 @@ from typing import Any, Iterable, Mapping
 from uuid import UUID
 
 from shared.connectors.builtin import spec_for_row
-from shared.connectors.platform import native_kb_project
+from shared.connectors.platform import native_project, native_user
 
 LITE_WORKSPACE_BACKENDS = frozenset({"virtual", "none"})
 GENERIC_UNAVAILABLE_DETAIL = "One or more selected connectors are unavailable"
@@ -57,16 +57,35 @@ def _row_project_ids(row: dict[str, Any]) -> set[str]:
 
 
 def _native_project_id(row: dict[str, Any]) -> str | None:
-    # A malformed server-owned marker names no project, so the row is never
-    # treated as a portable ordinary connector either: migration 0082 leaves
-    # it restricted and unavailable.
-    return native_kb_project(row)
+    # The project whose own connector this is: its knowledge base, its cloud
+    # folder. A malformed server-owned marker names no project, so the row is
+    # never treated as a portable ordinary connector either: migration 0082
+    # leaves it restricted and unavailable.
+    return native_project(row)
+
+
+def _user_kind_refuses(row: Mapping[str, Any], owner_id: str | None) -> bool:
+    """Whether a user's own connector (a ``USER_KINDS`` managed key) is
+    another's to attach.
+
+    Only its user's work may: no administrator override, project link,
+    membership or trusted inheritance reaches it, and ownerless work never
+    does.
+    """
+    user = native_user(row)
+    if user is None:
+        return False
+    return not (
+        owner_id is not None
+        and user == owner_id
+        and str(row.get("created_by") or "") == owner_id
+    )
 
 
 def _scope_matches(row: dict[str, Any], target_project_ids: set[str]) -> bool:
     native_project_id = _native_project_id(row)
     if native_project_id is not None:
-        # Native KB management rows represent one binding per project. In a
+        # A project's own connectors represent one binding per project. In a
         # multi-project session each selected project's native binding is
         # independently valid, rather than requiring one synthetic row to be
         # linked to every project.
@@ -227,7 +246,7 @@ async def classify_datasource_selection(
             or native_access
             or admin_override
         )
-        if not execution_authorized:
+        if not execution_authorized or _user_kind_refuses(row, owner_id):
             verdicts.append(ItemVerdict(datasource_id, True, "revoked"))
             continue
         if workspace_tier_refuses(row, workspace_backend):
@@ -351,10 +370,10 @@ async def default_datasource_selection(
     selected: list[str] = []
     revisions: dict[str, int] = {}
     for row in rows:
-        if not _scope_matches(row, target_set):
+        if not _scope_matches(row, target_set) or _user_kind_refuses(row, owner_id):
             continue
         native_project_id = _native_project_id(row)
-        owned = str(row.get("created_by") or "") == owner_id
+        owned =str(row.get("created_by") or "") == owner_id
         native_default = (
             native_project_id is not None and native_project_id in target_set
         )
