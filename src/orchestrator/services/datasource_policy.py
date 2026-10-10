@@ -131,15 +131,28 @@ def _scope_matches(
     return target_project_ids.issubset(_row_project_ids(row))
 
 
+def _cloud_folder_refuses(
+    row: Mapping[str, Any], owner_id: str | None, owner_roles: Mapping[str, str]
+) -> bool:
+    """Whether a project's cloud folder is out of the owner's reach: only a
+    member of its project reaches it, an administrator included (no admin
+    bypass, as the protected lane's ``protected_source_admissible`` and the
+    grant sweep, which revokes a non-member's grant). Work with no owner is
+    not asked here."""
+    project = native_cloud_project(row)
+    return project is not None and owner_id is not None and project not in owner_roles
+
+
 def access_ceiling_for(row: Mapping[str, Any], role: str | None) -> str | None:
     """The highest level the owner may bind ``row`` at, from the owner's
     role in the row's project, or ``None`` for no ceiling.
 
     Only a project's cloud folder has one: a viewer of its project gets at
     most its read-only level (``read_only_ceiling``), in its own project's
-    work and another's alike; an editor or owner, or a non-member admin of
-    its own project, gets every level. Every other connector keeps its
-    policy (``None``).
+    work and another's alike; an editor or owner gets every level. A
+    non-member, an administrator too, gets none: the folder is refused
+    outright (:func:`_cloud_folder_refuses`). Every other connector keeps
+    its policy (``None``).
     """
     if native_cloud_project(row) is None or role != "viewer":
         return None
@@ -346,7 +359,11 @@ async def classify_datasource_selection(
             or native_access
             or admin_override
         )
-        if not execution_authorized or _user_kind_refuses(row, owner_id):
+        if (
+            not execution_authorized
+            or _user_kind_refuses(row, owner_id)
+            or _cloud_folder_refuses(row, owner_id, owner_roles)
+        ):
             verdicts.append(ItemVerdict(datasource_id, True, "revoked"))
             continue
         if workspace_tier_refuses(row, workspace_backend):
@@ -503,11 +520,23 @@ async def default_datasource_selection(
     owner_id = str(UUID(str(effective_work_owner_id)))
     target_set = set(normalized_projects)
     rows = await db.list_default_datasource_candidates(owner_id, normalized_projects)
+    cloud_projects = sorted(
+        {project for row in rows if (project := native_cloud_project(row)) is not None}
+    )
+    owner_roles: dict[str, str] = (
+        await db.get_user_project_roles(owner_id, cloud_projects)
+        if cloud_projects
+        else {}
+    )
 
     selected: list[str] = []
     revisions: dict[str, int] = {}
     for row in rows:
-        if not _scope_matches(row, target_set) or _user_kind_refuses(row, owner_id):
+        if (
+            not _scope_matches(row, target_set)
+            or _user_kind_refuses(row, owner_id)
+            or _cloud_folder_refuses(row, owner_id, owner_roles)
+        ):
             continue
         owned = str(row.get("created_by") or "") == owner_id
         native_default = _native_default(row, owner_id, target_set)

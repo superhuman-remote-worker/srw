@@ -280,6 +280,26 @@ async def test_a_writer_is_minted_once_and_then_reused(database, probe):
 
 
 @pytest.mark.asyncio
+async def test_a_non_member_gets_no_grant_an_administrator_neither(database, probe):
+    """Only a member of the folder's project gets a grant of it; the sweep
+    revokes a non-member's (member_removed), so none is minted for one, an
+    administrator included."""
+    world = await _world(database)
+    admin = await _user(database, "Grant admin")
+    await database.execute(
+        "UPDATE users SET is_admin = TRUE WHERE id = $1", UUID(str(admin["id"]))
+    )
+    for kind in ("writer", "reader"):
+        with pytest.raises(FolderGrantUnavailable) as refused:
+            await ensure_folder_grant(
+                database, world.router, world.target, user_id=admin["id"], kind=kind
+            )
+        assert refused.value.code == "not_member"
+    assert "not_member" in folder_grants.FAILURE_CODES
+    assert await _grants(database) == [] and world.backend.calls == []
+
+
+@pytest.mark.asyncio
 async def test_a_reader_is_active_only_after_its_probe(database, probe):
     world = await _world(database)
     grant = await ensure_folder_grant(

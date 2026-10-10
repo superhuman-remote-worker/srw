@@ -214,6 +214,45 @@ async def test_a_non_member_never_sees_it_and_naming_it_is_refused(database):
 
 
 @pytest.mark.asyncio
+async def test_an_admin_outside_b_never_reaches_bs_folder_in_bs_own_work(database):
+    """No admin bypass in the folder's own project either: an administrator
+    who is no member of B neither sees it listed nor gets it by default nor
+    may name it in B's session (the grant sweep would revoke their grant),
+    while B's own knowledge base stays theirs as before."""
+    world = await _world(database)
+    listed = await _eligible(database, world.admin, [world.b], execution="session")
+    assert world.folder not in listed
+    selected, _ = await default_datasource_selection(
+        database, world.admin["id"], [world.b], "sandbox", execution_kind="session"
+    )
+    assert world.folder not in selected
+    with pytest.raises(DatasourceUnavailableError):
+        await authorize_datasource_selection(
+            database,
+            world.admin,
+            world.admin["id"],
+            [world.folder],
+            [world.b],
+            "sandbox",
+            allow_admin_explicit_override=True,
+            execution_kind="session",
+        )
+    verdicts, _ = await classify_datasource_selection(
+        database,
+        world.admin,
+        world.admin["id"],
+        [world.folder, world.kb],
+        [world.b],
+        "sandbox",
+        execution_kind="session",
+    )
+    assert [(v.datasource_id, v.denied) for v in verdicts] == [
+        (world.folder, True),
+        (world.kb, False),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_b_kb_and_bs_connectors_stay_refused_in_a(database):
     world = await _world(database)
     for connector in (world.kb, world.linked):

@@ -76,8 +76,9 @@ KIND_FOR_ACCESS: dict[str, str] = {"read_only": "reader", "read_write": "writer"
 #: ``provision_failed``: the provider refused a step; ``probe_failed``: a
 #: reader's read-only probe did not pass; ``busy``: another mint of the slot
 #: did not finish in time; ``revoked``: its revoke was requested while it was
-#: minted; ``mint_abandoned``: a lost process left it half made; ``error``:
-#: anything else.
+#: minted; ``mint_abandoned``: a lost process left it half made;
+#: ``not_member``: the user is no member of the folder's project (an
+#: administrator neither); ``error``: anything else.
 FAILURE_CODES: tuple[str, ...] = (
     "backend_unavailable",
     "not_supported",
@@ -87,6 +88,7 @@ FAILURE_CODES: tuple[str, ...] = (
     "busy",
     "revoked",
     "mint_abandoned",
+    "not_member",
     "error",
 )
 #: Why a grant's revoke was requested (``revoke_reason``).
@@ -473,6 +475,13 @@ async def ensure_folder_grant(
     if kind not in KINDS:
         raise ValueError(f"unknown per-folder grant kind {kind!r}")
     user_id = str(user_id)
+    roles = await store.get_user_project_roles(user_id, [target.project_id])
+    if str(target.project_id) not in roles:
+        # Only a member of the folder's project, an administrator included:
+        # the sweep revokes a non-member's grant (member_removed).
+        raise FolderGrantUnavailable(
+            "not_member", "the user is not a member of the folder's project"
+        )
     found = await lookup_active_folder_grant(store, target, user_id=user_id, kind=kind)
     if found is not None:
         return found

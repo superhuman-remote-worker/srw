@@ -297,12 +297,13 @@ async def test_native_project_cloud_folder_is_project_managed_default():
         ds_type="cloud_folder",
         managed_key=f"project-cloud:{PROJECT_A}",
     )
-    db = _db([native])
+    db = _db([native], roles={PROJECT_A: "editor"})
 
     assert await default_datasource_ids(
         db, OWNER, [PROJECT_A], "sandbox", execution_kind="session"
     ) == [DS_NATIVE]
-    # Another project's work neither defaults to it nor may name it.
+    # Another project's work never defaults to it; a non-member of its
+    # project may not name it there.
     assert (
         await default_datasource_ids(
             db, OWNER, [PROJECT_B], "sandbox", execution_kind="session"
@@ -311,12 +312,75 @@ async def test_native_project_cloud_folder_is_project_managed_default():
     )
     with pytest.raises(DatasourceUnavailableError):
         await authorize_datasource_ids(
-            db, {"id": OWNER}, OWNER, [DS_NATIVE], [PROJECT_B], "sandbox"
+            _db([native]), {"id": OWNER}, OWNER, [DS_NATIVE], [PROJECT_B], "sandbox"
         )
     # A member of its project may name it, though another user created it.
     assert await authorize_datasource_ids(
         db, {"id": OWNER}, OWNER, [DS_NATIVE], [PROJECT_A], "sandbox"
     ) == [DS_NATIVE]
+
+
+@pytest.mark.asyncio
+async def test_a_project_cloud_folder_is_its_members_alone_an_admin_included():
+    """No admin bypass: an administrator who is no member of the folder's
+    project neither defaults to it nor may name it, in that project's own
+    work too, with or without the admin override (as the grant sweep, which
+    revokes a non-member's grant, and the protected lane decide)."""
+    native = _row(
+        DS_NATIVE,
+        owner=OTHER,
+        scope="projects",
+        projects=(PROJECT_A,),
+        automatic=True,
+        ds_type="cloud_folder",
+        managed_key=f"project-cloud:{PROJECT_A}",
+    )
+    kb = _row(
+        DS_SHARED,
+        owner=None,
+        scope="projects",
+        projects=(PROJECT_A,),
+        automatic=True,
+        ds_type="kb",
+        managed_key=f"project-kb:{PROJECT_A}",
+    )
+    db = _db([native, kb], member=False)
+    db.get_user = AsyncMock(
+        side_effect=lambda user_id: {
+            "id": user_id,
+            "is_approved": True,
+            "is_admin": True,
+        }
+    )
+    admin = {"id": OWNER, "is_admin": True}
+    assert await default_datasource_ids(
+        db, OWNER, [PROJECT_A], "sandbox", execution_kind="session"
+    ) == [DS_SHARED]
+    for override in (False, True):
+        with pytest.raises(DatasourceUnavailableError):
+            await authorize_datasource_ids(
+                db,
+                admin,
+                OWNER,
+                [DS_NATIVE],
+                [PROJECT_A],
+                "sandbox",
+                allow_admin_explicit_override=override,
+            )
+    verdicts, _ = await classify_datasource_selection(
+        db, admin, OWNER, [DS_NATIVE, DS_SHARED], [PROJECT_A], "sandbox"
+    )
+    assert [(v.datasource_id, v.denied) for v in verdicts] == [
+        (DS_NATIVE, True),
+        (DS_SHARED, False),
+    ]
+    # As a member, even a viewer, it is theirs (read-only for a viewer).
+    member = _db([native], member=False, roles={PROJECT_A: "viewer"})
+    member.get_user = db.get_user
+    verdicts, _ = await classify_datasource_selection(
+        member, admin, OWNER, [DS_NATIVE], [PROJECT_A], "sandbox"
+    )
+    assert [(v.denied, v.access_ceiling) for v in verdicts] == [(False, "read_only")]
 
 
 def _user_root(owner: str = OWNER, **over) -> dict:
@@ -421,7 +485,7 @@ async def test_native_only_keeps_the_works_own_and_jobs_never_get_a_folder():
         managed_key=f"project-cloud:{PROJECT_B}",
     )
     owned = _row(DS_OWNED, automatic=True)
-    db = _db([kb, folder, other_folder, owned])
+    db = _db([kb, folder, other_folder, owned], roles={PROJECT_A: "editor"})
 
     async def defaults(kind, *, native_only):
         return set(
@@ -456,7 +520,7 @@ async def test_an_explicit_job_naming_a_cloud_folder_is_told_why():
         ds_type="cloud_folder",
         managed_key=f"project-cloud:{PROJECT_A}",
     )
-    db = _db([folder, _row(DS_OWNED)])
+    db = _db([folder, _row(DS_OWNED)], roles={PROJECT_A: "editor"})
 
     for kind in (None, "session"):
         selected, _ = await authorize_datasource_selection(
@@ -496,7 +560,7 @@ async def test_an_explicit_job_naming_a_cloud_folder_is_told_why():
     # so the reason never tells a caller what it may not see.
     with pytest.raises(DatasourceUnavailableError):
         await authorize_datasource_selection(
-            db,
+            _db([folder, _row(DS_OWNED)]),
             {"id": OWNER},
             OWNER,
             [DS_NATIVE],
@@ -516,7 +580,8 @@ async def test_the_thread_funnel_answers_400_with_the_reason():
         managed_key=f"project-cloud:{PROJECT_A}",
     )
     dependencies = thread_datasource_authorization_module.ThreadDatasourceAuthorizationDependencies(
-        store=_db([folder]), thread_project_ids=AsyncMock(return_value=[])
+        store=_db([folder], roles={PROJECT_A: "editor"}),
+        thread_project_ids=AsyncMock(return_value=[]),
     )
     with pytest.raises(HTTPException) as refused:
         await thread_datasource_authorization_module.authorize_thread_datasource_selection(

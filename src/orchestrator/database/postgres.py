@@ -51887,8 +51887,9 @@ class PostgresDB:
 
         One native kind crosses projects: a project's cloud folder
         (``native_cloud_project_sql``) is eligible in any work of a member of
-        its project, an administrator only as a member, and never
-        ``default_selected`` outside its project. Each row carries
+        its project, and only of a member (an administrator included, in its
+        own project's work too), and never ``default_selected`` outside its
+        project. Each row carries
         ``native_member_role`` (the user's role in a native row's project,
         for the viewer ceiling) and ``project_access`` (the link's default
         level: a native row's own project link, else the one level every
@@ -52058,6 +52059,17 @@ class PostgresDB:
                   )
                   -- A user's own connector is that user's alone.
                   AND ({native_user_sql("d")} IS NULL OR d.created_by = $1)
+                  -- A project's cloud folder is its project's members'
+                  -- alone, an administrator included.
+                  AND (
+                      {native_cloud} IS NULL
+                      OR EXISTS (
+                          SELECT 1
+                          FROM project_members cloud_member_pm
+                          WHERE cloud_member_pm.project_id::text = {native_cloud}
+                            AND cloud_member_pm.user_id = $1
+                      )
+                  )
                 ORDER BY d.type, d.name, d.id
                 """,
                 u_uuid,
