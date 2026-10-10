@@ -1460,7 +1460,7 @@
         "inPodPlane": {
           "type": "object",
           "additionalProperties": false,
-          "description": "The in-pod plane's mount sidecars (connector drivers D7, spike prototype).",
+          "description": "The in-pod plane's cloud mount sidecars (connector drivers D7).",
           "properties": {
             "enabled": {"type": "boolean"},
             "opener": {
@@ -1473,7 +1473,7 @@
                   "properties": {
                     "repository": {"type": "string"},
                     "tag": {"type": "string"},
-                    "digest": {"type": "string"}
+                    "digest": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"}
                   }
                 }
               }
@@ -1488,11 +1488,14 @@
                   "properties": {
                     "repository": {"type": "string"},
                     "tag": {"type": "string"},
-                    "digest": {"type": "string"}
+                    "digest": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"}
                   }
                 }
               }
-            }
+            },
+            "cacheSize": {"type": "string", "pattern": "^[0-9]+(Ki|Mi|Gi|Ti|K|M|G|T)?$"},
+            "drainSeconds": {"type": "integer", "minimum": 0, "maximum": 600},
+            "maxMounts": {"type": "integer", "minimum": 1, "maximum": 16}
           }
         },
         "providerMinting": {

@@ -277,30 +277,44 @@ connectors:
       # maxInstallation, whatever this says.
       secrets: 64
       services: 48
-  # -- The in-pod plane (connector drivers D7), a SPIKE PROTOTYPE: a FUSE
-  # mount in a workspace Pod from two native sidecars, so the FUSE daemon and
-  # the cloud credential live outside the workspace container. The opener
-  # (docker/Dockerfile.in-pod-mount, target opener) is privileged and only
-  # opens /dev/fuse, mounts and passes the descriptor on; rclone (target
-  # rclone) runs unprivileged and holds the credential. That keeps the mount
-  # out of the workspace's reach only if the workspace itself has no
-  # privilege or SYS_ADMIN, which the default FUSE profile (workspace.fuse)
-  # gives it; SRW refuses to add the sidecars to such a workspace. The
-  # workspace namespace must admit privileged Pods. Both images need a
-  # digest. Nothing asks for a mount yet; scripts/k3d-in-pod-plane-spike.py
-  # runs the sidecars directly. Off by default.
+  # -- The in-pod plane (connector drivers D7): a session workspace Pod's
+  # cloud folders are mounted by two native sidecars, so the FUSE daemons and
+  # the cloud credentials live outside the workspace container. The opener
+  # (srw-fuse-opener, docker/Dockerfile.in-pod-mount target opener) is
+  # privileged and only opens /dev/fuse, mounts and passes the descriptor on;
+  # the supervisor (srw-cloud-mount, target rclone) runs rclone unprivileged
+  # and holds the credentials, as a file from a Secret the Pod owns. Mounts
+  # are set up when a session's workspace Pod is created; one that does not
+  # come up never blocks the workspace, it is shown as unavailable.
+  #
+  # Such a Pod's workspace runs WITHOUT FUSE: no /dev/fuse, SYS_ADMIN or
+  # privilege, so a user can no longer run sshfs or rclone mount in its
+  # shell. VM, lite and job workspaces, OpenCloud mounts, officers and
+  # protected sessions keep the in-workspace path and workspace.fuse.
+  #
+  # Needs: the release namespace admits privileged Pods (the opener), and
+  # the orchestrator may create Secrets there (the chart grants create only).
+  # CI stamps tag and digest; a render from the repository uses the tag.
   inPodPlane:
-    enabled: false
+    enabled: true
     opener:
       image:
-        repository: ""
-        tag: ""
+        repository: ghcr.io/superhuman-remote-worker/srw-fuse-opener
+        tag: latest
         digest: ""
     rclone:
       image:
-        repository: ""
-        tag: ""
+        repository: ghcr.io/superhuman-remote-worker/srw-cloud-mount
+        tag: latest
         digest: ""
+    # -- The disk emptyDir every mount's rclone cache shares in a Pod; its
+    # sizeLimit evicts the Pod, so rclone's own cap stays at half of it.
+    cacheSize: 10Gi
+    # -- How long the supervisor waits for pending uploads at a drain
+    # request (End of a stateless session) and when it stops.
+    drainSeconds: 60
+    # -- At most this many mounts per Pod; the rest are shown as left out.
+    maxMounts: 8
   # -- Driver images users register themselves (connector drivers D6): in
   # their Account, as Project editors in a Project, as administrators in the
   # shared Catalog. Any image may be registered; the control is privilege,

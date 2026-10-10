@@ -620,8 +620,9 @@ jobs:
       driver-shim: ${{ steps.check.outputs.driver-shim }}
       driver-mcp-front: ${{ steps.check.outputs.driver-mcp-front }}
       driver-git-swap: ${{ steps.check.outputs.driver-git-swap }}
-      # The in-pod plane's FUSE opener (D7): tested only, no image yet.
-      in-pod-mount: ${{ steps.check.outputs.in-pod-mount }}
+      # The in-pod plane (D7): the FUSE opener and the co-built cloud mount
+      # supervisor, one identity.
+      fuse-opener: ${{ steps.check.outputs.fuse-opener }}
       workspace: ${{ steps.check.outputs.workspace }}
       # Per-component image identity: full sha of the newest commit that
       # touched the component's build inputs. Consumed by the build jobs
@@ -637,7 +638,7 @@ jobs:
       driver-shim-sha: ${{ steps.check.outputs.driver-shim-sha }}
       driver-mcp-front-sha: ${{ steps.check.outputs.driver-mcp-front-sha }}
       driver-git-swap-sha: ${{ steps.check.outputs.driver-git-swap-sha }}
-      in-pod-mount-sha: ${{ steps.check.outputs.in-pod-mount-sha }}
+      fuse-opener-sha: ${{ steps.check.outputs.fuse-opener-sha }}
       vm-base-sha: ${{ steps.check.outputs.vm-base-sha }}
       vm-base-stage1-sha: ${{ steps.check.outputs.vm-base-stage1-sha }}
       chart: ${{ steps.check.outputs.chart }}
@@ -933,16 +934,14 @@ jobs:
           DRIVER_GIT_SWAP_SHA=$(last_input_sha "${DRIVER_GIT_SWAP_PATHS[@]}")
           DRIVER_GIT_SWAP=$(image_missing driver-git-swap "$DRIVER_GIT_SWAP_SHA")
 
-          # The in-pod plane's FUSE opener (D7, spike prototype): one static Go
-          # binary, stdlib only. Its images wait for D7 proper, so no image
-          # answers "changed": the push range does (as for the chart below),
-          # and a range that cannot be resolved tests it.
-          IN_POD_MOUNT_PATHS=(drivers/fuse-opener/ .dockerignore docker/Dockerfile.in-pod-mount)
-          IN_POD_MOUNT_SHA=$(last_input_sha "${IN_POD_MOUNT_PATHS[@]}")
-          if [ -z "${RANGE_BASE:-}" ] || [ -n "$(git diff --name-only "$RANGE_BASE" HEAD -- "${IN_POD_MOUNT_PATHS[@]}" .github/workflows/develop.yml)" ]; then
-            IN_POD_MOUNT="true"
-          else
-            IN_POD_MOUNT="false"
+          # The in-pod plane (D7): the FUSE opener and the cloud mount
+          # supervisor, two static Go binaries (stdlib only) in two targets of
+          # one Dockerfile. Rebuilt when either image is missing.
+          FUSE_OPENER_PATHS=(drivers/fuse-opener/ drivers/cloud-mount/ .dockerignore docker/Dockerfile.in-pod-mount)
+          FUSE_OPENER_SHA=$(last_input_sha "${FUSE_OPENER_PATHS[@]}")
+          FUSE_OPENER=$(image_missing fuse-opener "$FUSE_OPENER_SHA")
+          if [ "$(image_missing cloud-mount "$FUSE_OPENER_SHA")" = "true" ]; then
+            FUSE_OPENER="true"
           fi
 
           AGENT_SHA=$(last_input_sha "${AGENT_PATHS[@]}")
@@ -1048,7 +1047,7 @@ jobs:
           echo "  vm-preparer=$VM_PREPARER  driver-shim=$DRIVER_SHIM (${DRIVER_SHIM_SHA::7})"
           echo "  driver-mcp-front=$DRIVER_MCP_FRONT (${DRIVER_MCP_FRONT_SHA::7})"
           echo "  driver-git-swap=$DRIVER_GIT_SWAP (${DRIVER_GIT_SWAP_SHA::7})"
-          echo "  in-pod-mount=$IN_POD_MOUNT (${IN_POD_MOUNT_SHA::7})"
+          echo "  fuse-opener=$FUSE_OPENER (${FUSE_OPENER_SHA::7})"
           echo "  vm input shas: vm-controller=${VM_CONTROLLER_SHA::7} vm-base=${VM_BASE_SHA::7} vm-base-stage1=${VM_BASE_STAGE1_SHA::7}"
           echo "  chart=$CHART"
           echo "  input shas: agent=${AGENT_SHA::7} orchestrator=${ORCHESTRATOR_SHA::7} cockpit=${COCKPIT_SHA::7} mcp=${MCP_SHA::7} workspace=${WORKSPACE_SHA::7}"
@@ -1074,8 +1073,8 @@ jobs:
             echo "driver-mcp-front-sha=$DRIVER_MCP_FRONT_SHA"
             echo "driver-git-swap=$DRIVER_GIT_SWAP"
             echo "driver-git-swap-sha=$DRIVER_GIT_SWAP_SHA"
-            echo "in-pod-mount=$IN_POD_MOUNT"
-            echo "in-pod-mount-sha=$IN_POD_MOUNT_SHA"
+            echo "fuse-opener=$FUSE_OPENER"
+            echo "fuse-opener-sha=$FUSE_OPENER_SHA"
             echo "vm-base=$VM_BASE"
             echo "vm-base-sha=$VM_BASE_SHA"
             echo "vm-base-stage1=$VM_BASE_STAGE1"
@@ -2298,30 +2297,6 @@ jobs:
           go vet ./...
           go test -count=1 -race ./...
 
-  # The in-pod plane's FUSE opener (connector drivers D7, spike prototype):
-  # vetted and tested with the toolchain docker/Dockerfile.in-pod-mount
-  # builds with. Its images and the chart's digests wait for D7 proper.
-  test-in-pod-mount:
-    needs: [changes]
-    if: needs.changes.outputs.in-pod-mount == 'true' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.26.8'
-          cache: false
-      - name: Vet and test the FUSE opener
-        working-directory: drivers/fuse-opener
-        run: |
-          go vet ./...
-          go test -count=1 -race ./...
-
   # The managed MCP front (D5a): the only exposed port of every managed MCP
   # driver pod. Vetted and tested with the toolchain the image builds with,
   # then published; the chart is stamped with its digest (a managed MCP
@@ -2505,6 +2480,125 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-driver-git-swap:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
 
+  # The in-pod plane (connector drivers D7): the privileged FUSE opener and
+  # the unprivileged cloud mount supervisor, two targets of one Dockerfile.
+  # Both Go modules are vetted and tested under the race detector with the
+  # toolchain the images build with, then both images are published; the
+  # chart pins both digests (the opener runs privileged in every session Pod
+  # that mounts). The supervisor image is co-built (scripts/verify_chart_images.py).
+  build-fuse-opener:
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
+    if: >-
+      needs.architecture.result == 'success' &&
+      always() && !cancelled() &&
+      (needs.changes.outputs.fuse-opener == 'true' || github.event_name == 'workflow_dispatch') &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result != 'failure' && needs.test-python.result != 'cancelled' &&
+      needs.test-cockpit.result != 'failure' && needs.test-cockpit.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      # The same release as docker/Dockerfile.in-pod-mount's pinned base.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - name: Vet and test the FUSE opener
+        working-directory: drivers/fuse-opener
+        run: |
+          go vet ./...
+          go test -count=1 -race ./...
+      - name: Vet and test the cloud mount supervisor
+        working-directory: drivers/cloud-mount
+        run: |
+          go vet ./...
+          go test -count=1 -race ./...
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Image identity = newest input commit, not push HEAD (see build-agent).
+      - name: Resolve component identity
+        id: ident
+        run: |
+          FULL="${{ needs.changes.outputs.fuse-opener-sha }}"
+          : "${FULL:?component identity is required}"
+          {
+            echo "full=$FULL"
+            echo "short=${FULL::7}"
+            echo "version=0.0.0-dev.sha-${FULL}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Extract metadata (opener)
+        id: meta-opener
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-fuse-opener
+          tags: |
+            type=raw,value=sha-${{ steps.ident.outputs.short }}
+            type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
+      - name: Extract metadata (cloud mount)
+        id: meta-cloud-mount
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cloud-mount
+          tags: |
+            type=raw,value=sha-${{ steps.ident.outputs.short }}
+            type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
+      - name: Build the opener${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.in-pod-mount
+          target: opener
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta-opener.outputs.tags }}
+          labels: |
+            ${{ steps.meta-opener.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ steps.ident.outputs.full }}
+            org.opencontainers.image.version=${{ steps.ident.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=fuse-opener
+          provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ steps.ident.outputs.full }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-fuse-opener:buildcache-develop
+      - name: Build the cloud mount supervisor${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.in-pod-mount
+          target: rclone
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta-cloud-mount.outputs.tags }}
+          labels: |
+            ${{ steps.meta-cloud-mount.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ steps.ident.outputs.full }}
+            org.opencontainers.image.version=${{ steps.ident.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=cloud-mount
+          provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ steps.ident.outputs.full }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-fuse-opener:buildcache-develop
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-fuse-opener:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
+
   # ---------------------------------------------------------------------------
   # Publish the dev Helm chart. The chart version (monotonic 0.0.<run_number>)
   # plus the baked image tags fully determine what the dev cluster runs — the
@@ -2528,6 +2622,7 @@ jobs:
       - build-driver-shim
       - build-driver-mcp-front
       - build-driver-git-swap
+      - build-fuse-opener
       - chart-test
       - chart-schema-negative
     if: >-
@@ -2614,7 +2709,8 @@ jobs:
           needs.build-vm-preparer.result == 'success' ||
           needs.build-driver-shim.result == 'success' ||
           needs.build-driver-mcp-front.result == 'success' ||
-          needs.build-driver-git-swap.result == 'success'
+          needs.build-driver-git-swap.result == 'success' ||
+          needs.build-fuse-opener.result == 'success'
         env:
           SHA_ORCHESTRATOR: ${{ needs.changes.outputs.orchestrator-sha }}
           SHA_AGENT: ${{ needs.changes.outputs.agent-sha }}
@@ -2626,6 +2722,7 @@ jobs:
           SHA_DRIVERSHIM: ${{ needs.changes.outputs.driver-shim-sha }}
           SHA_DRIVERMCPFRONT: ${{ needs.changes.outputs.driver-mcp-front-sha }}
           SHA_DRIVERGITSWAP: ${{ needs.changes.outputs.driver-git-swap-sha }}
+          SHA_FUSEOPENER: ${{ needs.changes.outputs.fuse-opener-sha }}
         run: |
           helm repo add collabora https://collaboraonline.github.io/online --force-update
           helm dependency build helm/
@@ -2665,6 +2762,8 @@ jobs:
           export TAG_DRIVERMCPFRONT="sha-${SHA_DRIVERMCPFRONT::7}"
           : "${SHA_DRIVERGITSWAP:?verified component identity is required}"
           export TAG_DRIVERGITSWAP="sha-${SHA_DRIVERGITSWAP::7}"
+          : "${SHA_FUSEOPENER:?verified component identity is required}"
+          export TAG_FUSEOPENER="sha-${SHA_FUSEOPENER::7}"
           export REV_ORCHESTRATOR="$SHA_ORCHESTRATOR"
           export REV_AGENT="$SHA_AGENT"
           export REV_COCKPIT="$SHA_COCKPIT"
@@ -2678,6 +2777,8 @@ jobs:
           : "${DRIVER_SHIM_DIGEST:?verified driver shim image digest is required}"
           : "${DRIVER_MCP_FRONT_DIGEST:?verified managed MCP front image digest is required}"
           : "${DRIVER_GIT_SWAP_DIGEST:?verified git swap driver image digest is required}"
+          : "${FUSE_OPENER_DIGEST:?verified FUSE opener image digest is required}"
+          : "${CLOUD_MOUNT_DIGEST:?verified cloud mount image digest is required}"
 
           yq -i '
             .image.orchestrator.tag = strenv(TAG_ORCHESTRATOR) |
@@ -2696,6 +2797,10 @@ jobs:
             .connectors.drivers.mcpFront.image.digest = strenv(DRIVER_MCP_FRONT_DIGEST) |
             .connectors.drivers.gitSwap.image.tag = strenv(TAG_DRIVERGITSWAP) |
             .connectors.drivers.gitSwap.image.digest = strenv(DRIVER_GIT_SWAP_DIGEST) |
+            .connectors.inPodPlane.opener.image.tag = strenv(TAG_FUSEOPENER) |
+            .connectors.inPodPlane.opener.image.digest = strenv(FUSE_OPENER_DIGEST) |
+            .connectors.inPodPlane.rclone.image.tag = strenv(TAG_FUSEOPENER) |
+            .connectors.inPodPlane.rclone.image.digest = strenv(CLOUD_MOUNT_DIGEST) |
             .provenance.releaseVersion = strenv(CHART_VERSION) |
             .provenance.components.orchestrator.sourceRevision = strenv(REV_ORCHESTRATOR) |
             .provenance.components.agent.sourceRevision        = strenv(REV_AGENT) |

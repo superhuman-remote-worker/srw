@@ -53,6 +53,15 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create", "delete", "get", "list", "patch", "update"]
+  {{- if .Values.connectors.inPodPlane.enabled }}
+  # The in-pod plane (connector drivers D7): each sidecar workspace Pod's
+  # credential Secret (an rclone config), created with an ownerReference to
+  # the Pod. Create only: the orchestrator never reads, lists, patches or
+  # deletes a Secret here; garbage collection removes it with its Pod.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  {{- end }}
   # Session router: per-session Service + Ingress lifecycle managed by
   # SessionRouterService when a thread binds to an agent. See
   # knowledge-base/knowledge/features/direct_session_websockets.md §RBAC changes.

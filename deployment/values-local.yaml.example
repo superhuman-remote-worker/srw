@@ -387,6 +387,21 @@ connectors:
     # mcpTest image): the stdio gate's isolation probes.
     mcpStdioProbe:
       enabled: true
+  # The in-pod plane (connector drivers D7): session workspace Pods get their
+  # cloud folders from two sidecars and run without FUSE. On by default; Tilt
+  # builds srw-fuse-opener and srw-cloud-mount and overrides repository, tag
+  # and digest; these placeholders only keep a plain `helm install`
+  # rendering. scripts/k3d-cloud-mount-sidecar-gate.py drives it.
+  inPodPlane:
+    enabled: true
+    opener:
+      image:
+        repository: srw-registry:5000/srw-fuse-opener
+        tag: dev
+    rclone:
+      image:
+        repository: srw-registry:5000/srw-cloud-mount
+        tag: dev
 
 databases:
   # Non-HA local default. All five PostgreSQL engines continue to inherit

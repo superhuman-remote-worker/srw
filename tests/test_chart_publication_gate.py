@@ -195,7 +195,7 @@ def test_a_missing_minimal_image_refuses_publication():
 
 
 def test_a_cobuilt_image_never_needs_its_own_job():
-    assert set(gate.COBUILT) == {"workspace-minimal"}
+    assert set(gate.COBUILT) == {"workspace-minimal", "cloud-mount"}
     assert set(gate.COBUILT.values()) <= set(gate.COMPONENTS)
     assert not set(gate.COBUILT) & set(gate.COMPONENTS)
 
@@ -414,3 +414,59 @@ def test_develop_rebuilds_the_swap_driver_when_its_inputs_change():
     assert 'image_missing driver-git-swap "$DRIVER_GIT_SWAP_SHA"' in text
     outputs = jobs["changes"]["outputs"]
     assert "driver-git-swap" in outputs and "driver-git-swap-sha" in outputs
+
+
+@pytest.mark.parametrize(
+    ("name", "publication"),
+    [("develop", "deploy-experimental"), ("main", "release-chart")],
+)
+def test_the_in_pod_plane_images_are_raced_built_and_pinned_by_digest(
+    name, publication
+):
+    """The in-pod plane (D7) is on in every installation: CI tests both Go
+    modules under the race detector with the toolchain the images build with,
+    builds both targets of one Dockerfile in one job, and the chart pins both
+    digests; publication waits for them."""
+    import re
+
+    _, jobs = workflow(name)
+    steps = jobs["build-fuse-opener"]["steps"]
+    tested = {
+        s["working-directory"]: s["run"]
+        for s in steps
+        if s.get("working-directory", "").startswith("drivers/")
+    }
+    assert set(tested) == {"drivers/fuse-opener", "drivers/cloud-mount"}
+    assert all("go vet ./..." in run and "-race" in run for run in tested.values())
+    go = next(s for s in steps if s.get("uses", "").startswith("actions/setup-go@"))
+    dockerfile = (SCRIPT.parents[1] / "docker/Dockerfile.in-pod-mount").read_text()
+    base = re.search(
+        r"FROM --platform=\$BUILDPLATFORM golang:([0-9.]+)-alpine[0-9.]*"
+        r"@sha256:[0-9a-f]{64} AS build",
+        dockerfile,
+    )
+    assert base is not None and base.group(1) == go["with"]["go-version"]
+    builds = [
+        s["with"] for s in steps if s.get("uses", "").startswith("docker/build-push")
+    ]
+    assert [b["target"] for b in builds] == ["opener", "rclone"]
+    assert all(b["file"] == "./docker/Dockerfile.in-pod-mount" for b in builds)
+    assert "cache-to" not in builds[0] and "mode=max" in builds[1]["cache-to"]
+    scripts = "\n".join(step.get("run", "") for step in jobs[publication]["steps"])
+    for stamp in (
+        ".connectors.inPodPlane.opener.image.digest = strenv(FUSE_OPENER_DIGEST)",
+        ".connectors.inPodPlane.rclone.image.digest = strenv(CLOUD_MOUNT_DIGEST)",
+    ):
+        assert stamp in scripts
+    assert "build-fuse-opener" in jobs[publication]["needs"]
+    assert "fuse-opener" in gate.COMPONENTS
+    assert gate.COBUILT["cloud-mount"] == "fuse-opener"
+
+
+def test_develop_rebuilds_the_in_pod_plane_when_either_image_is_missing():
+    text, jobs = workflow("develop")
+    assert "FUSE_OPENER_PATHS=(drivers/fuse-opener/ drivers/cloud-mount/" in text
+    assert 'image_missing fuse-opener "$FUSE_OPENER_SHA"' in text
+    assert 'image_missing cloud-mount "$FUSE_OPENER_SHA"' in text
+    outputs = jobs["changes"]["outputs"]
+    assert "fuse-opener" in outputs and "fuse-opener-sha" in outputs

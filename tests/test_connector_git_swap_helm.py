@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import re
 import subprocess
 
 import pytest
@@ -179,7 +180,14 @@ def test_tilt_builds_the_driver_and_pins_it_by_digest():
         "('srw-driver-git-swap', 'connectors.drivers.gitSwap.image.repository', "
         "'connectors.drivers.gitSwap.image.tag')" in tiltfile
     )
-    assert "'srw-driver-git-swap']" in tiltfile
+    assert "srw-driver-git-swap" in _tilt_digest_pinned(tiltfile)
+
+
+def _tilt_digest_pinned(tiltfile: str) -> list[str]:
+    """The images Tilt hands the chart with a digest."""
+    pinned = re.search(r"if _srw_images\[i\]\[0\] in (\[[^\]]*\]):", tiltfile)
+    assert pinned is not None
+    return ast.literal_eval(pinned.group(1))
 
 
 def test_the_image_runs_the_driver_as_an_unprivileged_user_with_ca_roots():

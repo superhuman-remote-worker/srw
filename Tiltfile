@@ -470,6 +470,26 @@ docker_build(
     only=['drivers/git-swap/', 'docker/Dockerfile.driver-git-swap'],
 )
 
+# The in-pod plane (connector drivers D7): the privileged FUSE opener and the
+# unprivileged cloud mount supervisor every session workspace Pod with cloud
+# folders runs as native sidecars. Product images (CI publishes them); the
+# chart receives them as tag@digest. One Dockerfile, two targets; its build
+# stage compiles both Go modules.
+docker_build(
+    'srw-fuse-opener',
+    context='.',
+    dockerfile='docker/Dockerfile.in-pod-mount',
+    target='opener',
+    only=['drivers/fuse-opener/', 'drivers/cloud-mount/', 'docker/Dockerfile.in-pod-mount'],
+)
+docker_build(
+    'srw-cloud-mount',
+    context='.',
+    dockerfile='docker/Dockerfile.in-pod-mount',
+    target='rclone',
+    only=['drivers/fuse-opener/', 'drivers/cloud-mount/', 'docker/Dockerfile.in-pod-mount'],
+)
+
 _srw_images = [
     ('srw-orchestrator', 'image.orchestrator.repository', 'image.orchestrator.tag'),
     ('srw-cockpit', 'image.cockpit.repository', 'image.cockpit.tag'),
@@ -484,6 +504,8 @@ _srw_images = [
     ('srw-driver-mcp-front', 'connectors.drivers.mcpFront.image.repository', 'connectors.drivers.mcpFront.image.tag'),
     ('srw-driver-mcp-test', 'connectors.drivers.mcpTest.image.repository', 'connectors.drivers.mcpTest.image.tag'),
     ('srw-driver-git-swap', 'connectors.drivers.gitSwap.image.repository', 'connectors.drivers.gitSwap.image.tag'),
+    ('srw-fuse-opener', 'connectors.inPodPlane.opener.image.repository', 'connectors.inPodPlane.opener.image.tag'),
+    ('srw-cloud-mount', 'connectors.inPodPlane.rclone.image.repository', 'connectors.inPodPlane.rclone.image.tag'),
 ]
 
 # Tilt fills in TILT_IMAGE_<i> (the freshly built+pushed ref) per image_deps
@@ -499,7 +521,7 @@ for i in range(len(_srw_images)):
     _srw_helm_env['TILT_IMAGE_KEY_TAG_%s' % i] = _srw_images[i][2]
     # These chart images also accept a digest, which outranks the tag. Tilt
     # owns the local image selection, including a pin saved by an earlier gate.
-    if _srw_images[i][0] in ['srw-mcp', 'srw-vm-preparer', 'srw-driver-shim', 'srw-driver-echo', 'srw-driver-mcp-front', 'srw-driver-mcp-test', 'srw-driver-git-swap']:
+    if _srw_images[i][0] in ['srw-mcp', 'srw-vm-preparer', 'srw-driver-shim', 'srw-driver-echo', 'srw-driver-mcp-front', 'srw-driver-mcp-test', 'srw-driver-git-swap', 'srw-fuse-opener', 'srw-cloud-mount']:
         _srw_helm_env['TILT_IMAGE_KEY_DIGEST_%s' % i] = _srw_images[i][2][:-4] + '.digest'
 
 _srw_exposure_mode = os.getenv('SRW_EXPOSURE_MODE') or 'multi-host'
