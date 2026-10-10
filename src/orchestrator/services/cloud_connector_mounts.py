@@ -137,13 +137,19 @@ class SelectedCloudConnector:
     """One cloud connector of a session's selection.
 
     ``row`` is the connector as stored, with its managed key and its project
-    link's ``project_read_only``. ``eligible`` is False when the owner may
-    no longer attach it (a revoked link or membership, a deleted project).
+    link's ``project_read_only`` and ``project_access``. ``eligible`` is
+    False when the owner may no longer attach it (a revoked link or
+    membership, a deleted project). ``requested`` is the level the session
+    resolved for it when it was created (``metadata.datasource_access``),
+    ``ceiling`` the highest level its owner may have now (the policy's
+    verdict: a viewer of the folder's project, ``read_only``).
     """
 
     row: dict[str, Any]
     driver: CloudFolderDriver | CloudOutboxDriver
     eligible: bool
+    requested: str | None = None
+    ceiling: str | None = None
 
     @property
     def connector_id(self) -> str:
@@ -191,26 +197,80 @@ async def selected_cloud_connectors(
             full = await store.get_datasource(connector_id)
             if full is None:
                 continue
-            row = {**full, "project_read_only": row.get("project_read_only")}
+            row = {
+                **full,
+                **{
+                    key: row[key]
+                    for key in ("project_read_only", "project_access")
+                    if key in row
+                },
+            }
         found[connector_id] = (dict(row), driver)
     if not found:
         return []
-    denied = await _denied(thread, list(found), project_ids, store)
-    return [
-        SelectedCloudConnector(row=row, driver=driver, eligible=cid not in denied)
-        for cid in datasource_ids
-        if cid in found
-        for row, driver in (found[cid],)
-    ]
+    verdicts = await _verdicts(thread, list(found), project_ids, store)
+    access = _requested_access(thread)
+    selected: list[SelectedCloudConnector] = []
+    for cid in datasource_ids:
+        if cid not in found:
+            continue
+        row, driver = found[cid]
+        denied, ceiling = verdicts.get(cid, (False, None))
+        selected.append(
+            SelectedCloudConnector(
+                row=row,
+                driver=driver,
+                eligible=not denied,
+                requested=access.get(cid),
+                ceiling=ceiling,
+            )
+        )
+    return selected
 
 
-async def _denied(
+def _requested_access(thread: Mapping[str, Any]) -> dict[str, str]:
+    """The level the session resolved per connector at creation, if any."""
+    from orchestrator.services.stateless_workspace_gate import (
+        thread_metadata_object,
+    )
+
+    stored = thread_metadata_object(thread).get("datasource_access")
+    if not isinstance(stored, Mapping):
+        return {}
+    return {str(cid): str(level) for cid, level in stored.items() if level}
+
+
+async def _verdicts(
     thread: Mapping[str, Any],
     connector_ids: list[str],
     project_ids: list[str],
     store: Any,
-) -> set[str]:
-    """The connectors the session's owner may no longer attach."""
+) -> dict[str, tuple[bool, str | None]]:
+    """Per connector: whether the session's owner may no longer attach it,
+    and the highest level they may have (``access_ceiling``, where the
+    policy gives one)."""
+    verdicts = await _classified(thread, connector_ids, project_ids, store)
+    if verdicts is None:
+        return {cid: (True, None) for cid in connector_ids}
+    found = {str(verdict.datasource_id): verdict for verdict in verdicts}
+    return {
+        cid: (
+            bool(getattr(found.get(cid), "denied", False)),
+            getattr(found.get(cid), "access_ceiling", None) or None,
+        )
+        for cid in connector_ids
+    }
+
+
+async def _classified(
+    thread: Mapping[str, Any],
+    connector_ids: list[str],
+    project_ids: list[str],
+    store: Any,
+) -> list[Any] | None:
+    """The policy's verdicts for the session's owner, as attach classifies;
+    ``None`` when the owner is gone or the selection is malformed (every
+    connector refused)."""
     from orchestrator.services.datasource_policy import (
         DatasourceUnavailableError,
         classify_datasource_selection,
@@ -231,7 +291,7 @@ async def _denied(
         else:
             owner = await store.get_user(str(owner_id))
             if owner is None:
-                return set(connector_ids)
+                return None
             verdicts, _ = await classify_datasource_selection(
                 store,
                 owner,
@@ -242,8 +302,8 @@ async def _denied(
                 allow_admin_explicit_override=True,
             )
     except DatasourceUnavailableError:
-        return set(connector_ids)
-    return {str(verdict.datasource_id) for verdict in verdicts if verdict.denied}
+        return None
+    return list(verdicts)
 
 
 def excluded_entry(

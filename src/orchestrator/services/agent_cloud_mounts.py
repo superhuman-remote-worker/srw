@@ -621,15 +621,14 @@ async def _resolve_live_mount_set(
     )
 
 
-def _access_context(
-    thread: dict[str, Any],
-    *,
-    runtime_is_vm: bool,
-    dependencies: AgentCloudMountDependencies,
-) -> AccessContext:
+def _access_context(thread: dict[str, Any], *, runtime_is_vm: bool) -> AccessContext:
+    # An ordinary session's folders never bind at the reviewed level: only a
+    # protected session has the review lane, and it takes its own path. A
+    # link default of ``protected`` is lowered (read-only where offered),
+    # never mounted live at it.
     return AccessContext(
         workspace_backend="vm" if runtime_is_vm else "sandbox",
-        protected_mode_enabled=dependencies.is_protected_cloud_mode_enabled(),
+        protected_mode_enabled=False,
         execution="session",
         main_cloud_backend=str(thread.get("main_cloud_backend") or "") or None,
     )
@@ -644,9 +643,7 @@ async def _bind_cloud_connectors(
 ) -> LiveMountSet:
     """``selected`` mounted one by one; the outbox first, so it keeps
     ``cloud/outbox`` whatever a project is called."""
-    ctx = _access_context(
-        thread, runtime_is_vm=runtime_is_vm, dependencies=dependencies
-    )
+    ctx = _access_context(thread, runtime_is_vm=runtime_is_vm)
     used: set[str] = set()
     mounts: list[dict[str, Any]] = []
     excluded: list[dict[str, Any]] = []
@@ -690,8 +687,15 @@ async def _bind_folder(
     runtime_is_vm: bool,
     dependencies: AgentCloudMountDependencies,
 ) -> dict[str, Any]:
-    """A ``cloud_folder`` connector's mount, or its exclusion."""
-    binding = connector.driver.mount_binding(connector.row, ctx=ctx)
+    """A ``cloud_folder`` connector's mount, or its exclusion: at the level
+    the session resolved for it, else its project link's default, within
+    what its owner may have now (``ceiling``)."""
+    binding = connector.driver.mount_binding(
+        connector.row,
+        ctx=ctx,
+        requested=connector.requested,
+        ceiling=connector.ceiling,
+    )
     if isinstance(binding, CloudFolderUnavailable):
         return excluded_entry(connector, binding.reason, detail=binding.detail)
     binder = FOLDER_KIND_BINDERS.get(binding.folder_kind)

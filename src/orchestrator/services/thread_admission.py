@@ -1380,6 +1380,7 @@ async def setup_thread_main_cloud(
     *,
     datasource_ids: list[str] | None = None,
     workspace_backend: str | None = None,
+    protected: bool = False,
     dependencies: ThreadAdmissionDependencies,
 ) -> None:
     """Create a new session's outbox folder, when its outbox is attached.
@@ -1387,8 +1388,9 @@ async def setup_thread_main_cloud(
     The session folder is the outbox connector's (main cloud slice 6.1): a
     session without the owner's outbox in ``datasource_ids`` (an explicit
     ``[]`` included) gets no folder at all, and nothing else stands in. Nor
-    does a tier the outbox is not offered on (a root VM): its folder would
-    never be mounted. A failure is recorded on the session
+    does a tier the outbox is not offered on (a root VM), or a protected
+    session, which mounts its protected folder alone: the folder would never
+    be mounted. A failure is recorded on the session
     (``cloud_outbox.state: "unavailable"`` with a closed reason) and the
     session starts anyway; the share is retried before its next Pod.
     """
@@ -1404,7 +1406,7 @@ async def setup_thread_main_cloud(
     # session folder.
     store = dependencies.store
     main_cloud_router = dependencies.main_cloud_router
-    if main_cloud_router.active_instance_id is None:
+    if main_cloud_router.active_instance_id is None or protected:
         return
     try:
         connector_id = await outbox_selected(store, user.get("id"), datasource_ids)
@@ -1617,6 +1619,7 @@ async def create_thread(
                 user,
                 datasource_ids=plan.selected_datasource_ids,
                 workspace_backend=plan.thread_backend,
+                protected=bool(request_body.protected_cloud),
                 dependencies=dependencies,
             )
 
@@ -1647,6 +1650,7 @@ async def create_thread(
                         user,
                         datasource_ids=plan.selected_datasource_ids,
                         workspace_backend=plan.thread_backend,
+                        protected=bool(request_body.protected_cloud),
                         dependencies=dependencies,
                     ),
                 )

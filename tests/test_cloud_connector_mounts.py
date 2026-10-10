@@ -249,9 +249,12 @@ def denied(monkeypatch):
     refused: set[str] = set()
 
     async def fake(thread, connector_ids, project_ids, store):
-        return {cid for cid in connector_ids if cid in refused}
+        return [
+            SimpleNamespace(datasource_id=cid, denied=cid in refused)
+            for cid in connector_ids
+        ]
 
-    monkeypatch.setattr(rule, "_denied", fake)
+    monkeypatch.setattr(rule, "_classified", fake)
     return refused
 
 
@@ -476,6 +479,59 @@ async def test_a_user_root_waits_for_its_package_through_its_own_hook(
     assert [(m["workspace_name"], m["mount_kind"]) for m in live.mounts] == [
         ("my_cloud", "user_root")
     ]
+
+
+@pytest.mark.asyncio
+async def test_the_level_the_session_resolved_binds_as_stored(denied):
+    store = Store([_folder_row()])
+    thread = _thread([FOLDER], metadata={"datasource_access": {FOLDER: "read_write"}})
+    backend = Backend()
+    live, _ = await _live(thread, store, backend=backend)
+    assert [m["access"] for m in live.mounts] == ["read_write"]
+    # An ordinary session never binds at the reviewed level.
+    thread = _thread([FOLDER], metadata={"datasource_access": {FOLDER: "protected"}})
+    live, _ = await _live(thread, store)
+    assert live.mounts == []
+    assert [e["reason"] for e in live.excluded] == ["access_unavailable"]
+
+
+@pytest.mark.asyncio
+async def test_a_protected_link_default_is_lowered_never_mounted_live(
+    denied, monkeypatch
+):
+    store = Store([_folder_row(project_access="protected")])
+    # Nextcloud offers no reader grant yet: nothing to lower it to.
+    live, _ = await _live(_thread([FOLDER]), store)
+    assert [e["reason"] for e in live.excluded] == ["access_unavailable"]
+
+    from orchestrator.services.connector_drivers.cloud_folder import CloudFolderDriver
+
+    monkeypatch.setattr(
+        CloudFolderDriver,
+        "offered_access",
+        lambda self, row, ctx: ("read_only", "read_write")
+        + (("protected",) if ctx.protected_mode_enabled else ()),
+    )
+    backend = Backend()
+    live, _ = await _live(_thread([FOLDER]), store, backend=backend)
+    assert [m["access"] for m in live.mounts] == ["read_only"]
+    assert backend.specs[0]["access"] == "read_only"
+
+
+@pytest.mark.asyncio
+async def test_a_viewers_ceiling_takes_write_away_at_the_next_attach(monkeypatch):
+    async def viewer(thread, connector_ids, project_ids, store):
+        return [
+            SimpleNamespace(datasource_id=cid, denied=False, access_ceiling="read_only")
+            for cid in connector_ids
+        ]
+
+    monkeypatch.setattr(rule, "_classified", viewer)
+    store = Store([_folder_row()])
+    live, _ = await _live(_thread([FOLDER]), store)
+    # Read-only is not offered on Nextcloud yet: refused, never written.
+    assert live.mounts == []
+    assert [e["reason"] for e in live.excluded] == ["access_unavailable"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1027,6 +1083,17 @@ async def test_admission_creates_a_session_folder_only_for_the_outbox(
     assert bool(store.main_cloud) is created
     if created:
         assert store.metadata[-1][1]["cloud_outbox"]["connector_id"] == OUTBOX
+        # A protected session mounts its protected folder alone: no folder.
+        protected = CloudBackend()
+        await ta.setup_thread_main_cloud(
+            THREAD,
+            {"id": USER},
+            datasource_ids=ids,
+            workspace_backend=tier,
+            protected=True,
+            dependencies=_admission(IdentityStore([_outbox_row()]), protected),
+        )
+        assert protected.folders == []
 
 
 @pytest.mark.asyncio
