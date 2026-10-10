@@ -308,8 +308,8 @@ def _cache_flags(cache: Mapping[str, Any], max_size_bytes: int) -> list[str] | N
         if value is None:
             return None
         flags += [flag, value]
-    # Every mount's cache shares one emptyDir; its sizeLimit evicts the whole
-    # Pod, so rclone's (soft) cap stays at half of it.
+    # Every mount's cache shares one emptyDir (no sizeLimit, which would
+    # evict the whole Pod); together they stay under cacheSize, softly.
     flags += ["--vfs-cache-max-size", f"{max(1, max_size_bytes // 1024**2)}M"]
     return flags
 
@@ -462,7 +462,7 @@ async def resolve_cloud_mount_plan(
                 "reason": "too_many_mounts",
             }
         )
-    cache_bytes = _quantity_bytes(settings.cache_size) // 2 // max(1, len(kept))
+    cache_bytes = _quantity_bytes(settings.cache_size) // max(1, len(kept))
     mounts: list[SidecarMount] = []
     passwords: dict[int, str] = {}
     for index, entry in enumerate(kept):
@@ -539,7 +539,7 @@ async def _protected_plan(
     overlay = payload.get("overlay")
     if not isinstance(overlay, Mapping):
         return None
-    cache_bytes = _quantity_bytes(settings.cache_size) // 2
+    cache_bytes = _quantity_bytes(settings.cache_size)
     built = _sidecar_mount(0, payload["mounts"][0], cache_bytes=cache_bytes)
     if built is None or built[0].access != "read_only":
         return None

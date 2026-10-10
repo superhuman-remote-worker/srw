@@ -2105,6 +2105,8 @@ spec:
               value: {{ .drainSeconds | default 60 | quote }}
             - name: CONNECTOR_IN_POD_MAX_MOUNTS
               value: {{ .maxMounts | default 8 | quote }}
+            - name: CONNECTOR_IN_POD_SUPERVISOR_MEMORY
+              value: {{ .supervisorMemory | default "" | quote }}
             {{- end }}
             {{- end }}
             - name: KB_EXTERNAL_REINDEX_CONCURRENCY

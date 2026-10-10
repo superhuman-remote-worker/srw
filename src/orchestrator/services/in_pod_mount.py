@@ -99,8 +99,21 @@ CACHE_DIR = "/srw/cloud-cache"
 RCLONE_UID = 65534
 #: agent-host in the workspace image owns what the mounts show.
 WORKSPACE_UID = 1000
+#: The workspace Pod's terminationGracePeriodSeconds. The workspace stops
+#: first, then the supervisor drains and stops its rclones, then the opener
+#: detaches: the drain must leave room for the rest.
+WORKSPACE_GRACE_SECONDS = 120
+MAX_DRAIN_SECONDS = 90
+#: The shortest grace a sidecar Pod is deleted with: the opener needs a
+#: moment to detach every mount, or the kubelet cannot tear down the
+#: emptyDir they sit in and the Pod hangs Terminating.
+SIDECAR_DELETE_GRACE_SECONDS = 5
+#: The supervisor's memory limit when the chart leaves it automatic: a base
+#: and a share per rclone, capped.
+SUPERVISOR_MEMORY_BASE_MI = 256
+SUPERVISOR_MEMORY_PER_MOUNT_MI = 192
+SUPERVISOR_MEMORY_CAP_MI = 2048
 
-_IMAGE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}")
 _QUANTITY = re.compile(r"[0-9]+(Ki|Mi|Gi|Ti|K|M|G|T)?")
 
 
@@ -113,6 +126,8 @@ class InPodPlaneSettings:
     cache_size: str = "10Gi"
     drain_seconds: int = 60
     max_mounts: int = 8
+    #: The supervisor's memory limit; ``None`` scales it with the mounts.
+    supervisor_memory: str | None = None
 
     @classmethod
     def from_env(cls) -> "InPodPlaneSettings | None":
@@ -123,20 +138,26 @@ class InPodPlaneSettings:
         cache_size = os.environ.get("CONNECTOR_IN_POD_CACHE_SIZE", "").strip() or "10Gi"
         if not _QUANTITY.fullmatch(cache_size):
             cache_size = "10Gi"
+        memory = os.environ.get("CONNECTOR_IN_POD_SUPERVISOR_MEMORY", "").strip()
         return cls(
             opener_image=opener,
             rclone_image=rclone,
             cache_size=cache_size,
-            drain_seconds=_bounded_int("CONNECTOR_IN_POD_DRAIN_SECONDS", 60, 0, 600),
+            drain_seconds=_bounded_int(
+                "CONNECTOR_IN_POD_DRAIN_SECONDS", 60, 0, MAX_DRAIN_SECONDS
+            ),
             max_mounts=_bounded_int("CONNECTOR_IN_POD_MAX_MOUNTS", 8, 1, 16),
+            supervisor_memory=memory if _QUANTITY.fullmatch(memory) else None,
         )
 
-    @property
-    def images_pinned(self) -> bool:
-        """Both images by digest, as the chart requires."""
-        return bool(
-            _IMAGE.fullmatch(self.opener_image) and _IMAGE.fullmatch(self.rclone_image)
+    def supervisor_memory_for(self, mounts: int) -> str:
+        """The supervisor's memory limit for a Pod with ``mounts`` rclones."""
+        if self.supervisor_memory:
+            return self.supervisor_memory
+        mebibytes = SUPERVISOR_MEMORY_BASE_MI + SUPERVISOR_MEMORY_PER_MOUNT_MI * max(
+            1, mounts
         )
+        return f"{min(SUPERVISOR_MEMORY_CAP_MI, mebibytes)}Mi"
 
 
 def _bounded_int(name: str, default: int, low: int, high: int) -> int:
@@ -183,6 +204,12 @@ def _field(obj: Any, snake: str, camel: str | None = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(camel or snake)
     return getattr(obj, snake, None)
+
+
+def pod_has_cloud_mount_sidecars(pod: Any) -> bool:
+    """Whether a Pod (client object or dict) runs the cloud mount opener."""
+    containers = _field(_field(pod, "spec"), "init_containers", "initContainers")
+    return any(_field(c, "name") == OPENER_CONTAINER for c in containers or ())
 
 
 def objects_name_from_pod(pod: Any) -> str | None:
@@ -233,7 +260,7 @@ def _opener(spec: SidecarSpec, image: str) -> dict[str, Any]:
     }
 
 
-def _supervisor(image: str) -> dict[str, Any]:
+def _supervisor(image: str, memory: str) -> dict[str, Any]:
     return {
         "name": RCLONE_CONTAINER,
         "image": image,
@@ -254,9 +281,13 @@ def _supervisor(image: str) -> dict[str, Any]:
             "/tmp/srw-cloud-mount",
         ],
         "env": [{"name": "HOME", "value": "/tmp"}],
+        # One rclone per mount, each with its VFS cache's directory tree in
+        # memory: the limit scales with the mounts (connectors.inPodPlane.
+        # supervisorMemory overrides it). An OOM kill restarts only the
+        # supervisor, never the workspace.
         "resources": {
             "requests": {"cpu": "20m", "memory": "64Mi"},
-            "limits": {"cpu": "1000m", "memory": "512Mi"},
+            "limits": {"cpu": "1000m", "memory": memory},
         },
         "securityContext": {
             "runAsUser": RCLONE_UID,
@@ -341,7 +372,13 @@ def add_cloud_mount_sidecars(
     if names & (SIDECAR_VOLUMES | {OPENER_CONTAINER, RCLONE_CONTAINER}):
         raise ValueError("the Pod already has cloud mount sidecars")
     pod_spec.setdefault("initContainers", []).extend(
-        [_opener(spec, settings.opener_image), _supervisor(settings.rclone_image)]
+        [
+            _opener(spec, settings.opener_image),
+            _supervisor(
+                settings.rclone_image,
+                settings.supervisor_memory_for(len(spec.targets)),
+            ),
+        ]
     )
     volumes = [
         {"name": CLOUD_VOLUME, **_memory_dir()},
@@ -366,7 +403,11 @@ def add_cloud_mount_sidecars(
                 "defaultMode": 0o444,
             },
         },
-        {"name": CACHE_VOLUME, "emptyDir": {"sizeLimit": settings.cache_size}},
+        # No sizeLimit: the kubelet evicts the whole Pod when an emptyDir
+        # passes its limit, and rclone's cache cap is soft (a file being
+        # written or read past it stays). A cloud folder must never take the
+        # workspace down; rclone keeps the caches under cacheSize together.
+        {"name": CACHE_VOLUME, "emptyDir": {}},
         {
             "name": RCLONE_TMP_VOLUME,
             "emptyDir": {"medium": "Memory", "sizeLimit": "64Mi"},

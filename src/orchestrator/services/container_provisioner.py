@@ -79,10 +79,12 @@ from orchestrator.services.cloud_mount_sidecar import (
 from orchestrator.services.in_pod_mount import (
     CREDENTIAL_KEY,
     PLAN_KEY,
+    SIDECAR_DELETE_GRACE_SECONDS,
     InPodPlaneSettings,
     add_cloud_mount_sidecars,
     objects_name_for,
     objects_name_from_pod,
+    pod_has_cloud_mount_sidecars,
 )
 from orchestrator.services.workspace_lifecycle import (
     SessionWorkspaceObservationYielded,
@@ -11325,6 +11327,18 @@ class ContainerProvisioner:
             return {"state": "exact_deleting", "uid": uid}
         return {"state": "exact_fence" if fence else "exact_original", "uid": uid}
 
+    async def _fence_delete_grace(self, name: str, namespace: str) -> int:
+        """Grace for an exact fence delete of a workspace Pod: none, unless the
+        Pod runs the cloud mount sidecars, whose opener must detach its mounts
+        first (connector drivers D7)."""
+        try:
+            pod = await self._bounded_kubernetes_call(
+                self._core_api.read_namespaced_pod, name=name, namespace=namespace
+            )
+        except Exception:
+            return 0
+        return SIDECAR_DELETE_GRACE_SECONDS if pod_has_cloud_mount_sidecars(pod) else 0
+
     async def _delete_workspace_provision_resource_exact(
         self, *, resource: str, name: str, namespace: str, uid: str
     ) -> bool:
@@ -11343,7 +11357,9 @@ class ContainerProvisioner:
             "body": {"preconditions": {"uid": uid}},
         }
         if resource == "pod":
-            kwargs["grace_period_seconds"] = 0
+            kwargs["grace_period_seconds"] = await self._fence_delete_grace(
+                name, namespace
+            )
         try:
             await self._bounded_kubernetes_call(deleter, **kwargs)
             return True

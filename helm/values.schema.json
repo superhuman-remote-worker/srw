@@ -1494,8 +1494,9 @@
               }
             },
             "cacheSize": {"type": "string", "pattern": "^[0-9]+(Ki|Mi|Gi|Ti|K|M|G|T)?$"},
-            "drainSeconds": {"type": "integer", "minimum": 0, "maximum": 600},
-            "maxMounts": {"type": "integer", "minimum": 1, "maximum": 16}
+            "drainSeconds": {"type": "integer", "minimum": 0, "maximum": 90},
+            "maxMounts": {"type": "integer", "minimum": 1, "maximum": 16},
+            "supervisorMemory": {"type": "string", "pattern": "^$|^[0-9]+(Ki|Mi|Gi|K|M|G)?$"}
           }
         },
         "providerMinting": {

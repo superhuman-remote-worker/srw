@@ -1115,14 +1115,17 @@ class TestPinnedWorkspaceProvisionIntentFlow:
             "grace_period_seconds": 0,
             "_request_timeout": (5, 30),
         }
-        if replacement:
-            provisioner._core_api.read_namespaced_pod.assert_not_called()
-        else:
-            provisioner._core_api.read_namespaced_pod.assert_called_once_with(
-                name=intent["pod_name"],
-                namespace="captured-old-namespace",
-                _request_timeout=(5, 30),
-            )
+        # One read decides the delete's grace (a Pod running the cloud mount
+        # opener gets time to detach, connector drivers D7); the absent case
+        # reads once more to observe the deletion.
+        reads = provisioner._core_api.read_namespaced_pod.call_args_list
+        assert len(reads) == (1 if replacement else 2)
+        for read in reads:
+            assert read.kwargs == {
+                "name": intent["pod_name"],
+                "namespace": "captured-old-namespace",
+                "_request_timeout": (5, 30),
+            }
 
 
 class TestWorkspacePodLive:

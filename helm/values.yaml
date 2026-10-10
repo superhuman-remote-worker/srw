@@ -309,14 +309,20 @@ connectors:
         repository: ghcr.io/superhuman-remote-worker/srw-cloud-mount
         tag: latest
         digest: ""
-    # -- The disk emptyDir every mount's rclone cache shares in a Pod; its
-    # sizeLimit evicts the Pod, so rclone's own cap stays at half of it.
+    # -- What every mount's rclone cache in a Pod stays under together. The
+    # cache emptyDir has no sizeLimit (the kubelet would evict the whole Pod
+    # past it, and rclone's cap is soft), so it uses node disk.
     cacheSize: 10Gi
     # -- How long the supervisor waits for pending uploads at a drain
-    # request (End of a stateless session) and when it stops.
+    # request (End of a stateless session) and when it stops. At most 90:
+    # the workspace Pod's grace period is 120 s and the workspace and the
+    # opener stop within it too.
     drainSeconds: 60
     # -- At most this many mounts per Pod; the rest are shown as left out.
     maxMounts: 8
+    # -- The supervisor's memory limit. Empty: 256Mi plus 192Mi per mount,
+    # at most 2Gi (each mount runs its own rclone).
+    supervisorMemory: ""
   # -- Driver images users register themselves (connector drivers D6): in
   # their Account, as Project editors in a Project, as administrators in the
   # shared Catalog. Any image may be registered; the control is privilege,

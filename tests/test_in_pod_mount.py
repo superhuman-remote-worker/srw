@@ -163,16 +163,34 @@ def test_the_plane_reads_its_bounded_settings(monkeypatch):
     monkeypatch.setenv("CONNECTOR_IN_POD_DRAIN_SECONDS", "9999")
     monkeypatch.setenv("CONNECTOR_IN_POD_MAX_MOUNTS", "0")
     settings = InPodPlaneSettings.from_env()
+    # The drain stays inside the Pod's 120 s grace period.
     assert (settings.cache_size, settings.drain_seconds, settings.max_mounts) == (
         "20Gi",
-        600,
+        90,
         1,
     )
-    assert settings.images_pinned
     monkeypatch.setenv("CONNECTOR_IN_POD_CACHE_SIZE", "lots")
     monkeypatch.setenv("CONNECTOR_IN_POD_DRAIN_SECONDS", "x")
     settings = InPodPlaneSettings.from_env()
     assert (settings.cache_size, settings.drain_seconds) == ("10Gi", 60)
+
+
+def test_the_supervisor_memory_scales_with_the_mounts_unless_set(monkeypatch):
+    monkeypatch.setenv("CONNECTOR_IN_POD_OPENER_IMAGE", OPENER)
+    monkeypatch.setenv("CONNECTOR_IN_POD_RCLONE_IMAGE", RCLONE)
+    settings = InPodPlaneSettings.from_env()
+    assert settings.supervisor_memory is None
+    assert settings.supervisor_memory_for(1) == "448Mi"
+    assert settings.supervisor_memory_for(2) == "640Mi"
+    assert settings.supervisor_memory_for(8) == "1792Mi"
+    assert settings.supervisor_memory_for(16) == "2048Mi"
+    manifest = build(ContainerProvisioner(), PLAN)
+    supervisor = init(manifest, RCLONE_CONTAINER)
+    assert supervisor["resources"]["limits"]["memory"] == "640Mi"
+    monkeypatch.setenv("CONNECTOR_IN_POD_SUPERVISOR_MEMORY", "1Gi")
+    assert InPodPlaneSettings.from_env().supervisor_memory_for(8) == "1Gi"
+    monkeypatch.setenv("CONNECTOR_IN_POD_SUPERVISOR_MEMORY", "plenty")
+    assert InPodPlaneSettings.from_env().supervisor_memory is None
 
 
 # --------------------------------------------------------------------------- #
@@ -281,7 +299,8 @@ def test_the_supervisor_runs_unprivileged_holds_the_credential_and_has_no_probe(
         WorkspaceOwner.session(THREAD_ID).pod_name, RESERVATION
     )
     assert "optional" not in credential
-    assert volume(manifest, CACHE_VOLUME)["emptyDir"] == {"sizeLimit": "10Gi"}
+    # No sizeLimit: past it the kubelet would evict the whole workspace Pod.
+    assert volume(manifest, CACHE_VOLUME)["emptyDir"] == {}
     assert "fsGroup" not in manifest["spec"].get("securityContext", {})
 
 
@@ -713,3 +732,30 @@ async def test_planning_is_for_sessions_and_its_failure_keeps_the_old_path(
             is None
         )
     assert "in-workspace mount path" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_fence_delete_gives_a_sidecar_pod_time_to_detach(plane_on):
+    from unittest.mock import AsyncMock, MagicMock
+
+    provisioner = ContainerProvisioner()
+    sidecar_pod = build(plane_on, PLAN)
+    plain_pod = build(plane_on)
+    deletes: list[dict] = []
+    reads = iter([sidecar_pod, plain_pod])
+    provisioner._core_api = MagicMock()
+    provisioner._core_api.read_namespaced_pod = MagicMock(
+        side_effect=lambda **kw: next(reads)
+    )
+    provisioner._core_api.delete_namespaced_pod = MagicMock(
+        side_effect=lambda **kw: deletes.append(kw)
+    )
+    provisioner._bounded_kubernetes_call = AsyncMock(
+        side_effect=lambda call, **kw: call(**kw)
+    )
+    for _ in range(2):
+        assert await provisioner._delete_workspace_provision_resource_exact(
+            resource="pod", name="ws-thread-x", namespace="srw", uid="u-1"
+        )
+    assert [d["grace_period_seconds"] for d in deletes] == [5, 0]
+    assert all(d["body"] == {"preconditions": {"uid": "u-1"}} for d in deletes)

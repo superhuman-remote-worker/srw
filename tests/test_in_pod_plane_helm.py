@@ -52,6 +52,10 @@ def test_on_by_default_the_orchestrator_gets_both_images_and_the_settings():
     assert env["CONNECTOR_IN_POD_CACHE_SIZE"] == "10Gi"
     assert env["CONNECTOR_IN_POD_DRAIN_SECONDS"] == "60"
     assert env["CONNECTOR_IN_POD_MAX_MOUNTS"] == "8"
+    # Empty: the orchestrator scales the supervisor's limit with the mounts.
+    assert env["CONNECTOR_IN_POD_SUPERVISOR_MEMORY"] == ""
+    set_env = orchestrator_env(render("connectors.inPodPlane.supervisorMemory=1Gi"))
+    assert set_env["CONNECTOR_IN_POD_SUPERVISOR_MEMORY"] == "1Gi"
 
 
 def test_a_stamped_digest_replaces_the_tag():
@@ -135,6 +139,9 @@ def test_on_without_an_image_repository_fails_to_render(named):
         "connectors.inPodPlane.opener.image.digest=sha256:nope",
         "connectors.inPodPlane.cacheSize=lots",
         "connectors.inPodPlane.drainSeconds=9999",
+        # Past 90 s the drain would not fit the workspace Pod's grace period.
+        "connectors.inPodPlane.drainSeconds=91",
+        "connectors.inPodPlane.supervisorMemory=lots",
         "connectors.inPodPlane.maxMounts=0",
     ],
 )

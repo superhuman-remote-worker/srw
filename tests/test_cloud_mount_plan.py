@@ -231,11 +231,11 @@ async def test_left_out_rows_are_named_and_extra_mounts_capped(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_the_shared_cache_keeps_every_mount_under_half_its_limit(monkeypatch):
+async def test_the_shared_cache_keeps_every_mount_under_its_share(monkeypatch):
     plan = await _resolve(monkeypatch, [_entry("a"), _entry("b")])
     flags = list(plan.mounts[0].flags)
-    # 10Gi / 2 / 2 mounts = 2560 MiB each, whatever the spec asked for.
-    assert flags[flags.index("--vfs-cache-max-size") + 1] == "2560M"
+    # 10Gi / 2 mounts = 5120 MiB each, whatever the spec asked for.
+    assert flags[flags.index("--vfs-cache-max-size") + 1] == "5120M"
     assert flags[flags.index("--vfs-cache-mode") + 1] == "full"
     assert "10G" not in flags
 
