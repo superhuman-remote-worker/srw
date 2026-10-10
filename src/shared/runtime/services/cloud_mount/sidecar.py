@@ -474,10 +474,14 @@ class SidecarMountWatcher:
     # ------------------------------------------------------------- requests
 
     def _request(self, command: str) -> str:
+        # The supervisor runs as another user (65534): the request must be
+        # readable by it whatever umask the claim's shell has (SRW's shells
+        # run with 077). It holds only a nonce.
         nonce = secrets.token_hex(8)
         target = f"{self.control_dir}/{command}"
         self._exec(
             f"printf '%s' {nonce} > {shlex.quote(target)}.tmp && "
+            f"chmod 0644 {shlex.quote(target)}.tmp && "
             f"mv {shlex.quote(target)}.tmp {shlex.quote(target)}",
             timeout=20,
             operation=f"request cloud {command}",

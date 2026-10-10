@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -79,6 +81,8 @@ func TestClassifyNamesOneClosedReason(t *testing.T) {
 		{1, "context deadline exceeded", false, reasonTimeout},
 		{-1, "", true, reasonTimeout},
 		{1, "500 Internal Server Error", false, reasonUnreachable},
+		{1, `couldn't list files: OC\User\DisabledUserException: Account disabled: Sabre\DAV\Exception\ServiceUnavailable: 503 Service Unavailable`, false, reasonCredentialRejected},
+		{1, `CRITICAL: Failed to create file system for "m0:": the remote url looks incorrect.`, false, reasonMountFailed},
 	}
 	for _, c := range cases {
 		if got := classify(c.code, c.stderr, c.timedOut); got != c.want {
@@ -523,5 +527,18 @@ func TestUploadsBehindAPermanentReasonAreReportedLost(t *testing.T) {
 	}
 	if h.s.lostUploads() != 2 {
 		t.Fatalf("lost %d", h.s.lostUploads())
+	}
+}
+
+func TestARequestThisUserMayNotReadIsAPermissionError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads any file")
+	}
+	path := filepath.Join(t.TempDir(), "drain")
+	if err := os.WriteFile(path, []byte("n-1"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readControl(path); !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("got %v, want a permission error", err)
 	}
 }

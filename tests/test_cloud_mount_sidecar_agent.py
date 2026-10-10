@@ -868,3 +868,34 @@ def test_a_drain_that_gave_uploads_up_for_good_says_so(caplog):
     with caplog.at_level(logging.WARNING):
         assert watcher.request_drain() == (True, 0)
     assert "2 upload(s) were lost" in caplog.text
+
+
+def test_a_control_request_is_readable_by_the_supervisor(tmp_path):
+    """The supervisor runs as another user: a request written under SRW's
+    umask 077 would never be read, and End would wait for it forever."""
+    import os
+    import stat
+    import subprocess
+
+    class _Local:
+        root = str(tmp_path)
+
+        def exec_claim_resource(self, command, *, timeout, operation):
+            done = subprocess.run(
+                ["sh", "-c", "umask 077; " + command],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            assert done.returncode == 0, done.stderr
+            return done.stdout
+
+    control = tmp_path / "control"
+    control.mkdir()
+    cfg = {**_cfg("project"), "control_dir": str(control)}
+    watcher = _watcher(_Local(), cfg)
+    nonce = watcher._request("drain")
+    request = control / "drain"
+    assert request.read_text() == nonce
+    assert stat.S_IMODE(os.stat(request).st_mode) == 0o644
+    assert not (control / "drain.tmp").exists()

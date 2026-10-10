@@ -371,6 +371,7 @@ func (s *supervisor) control(ctx context.Context) {
 		return
 	}
 	answered := map[string]string{}
+	refused := map[string]bool{}
 	ticker := time.NewTicker(s.controlEvery)
 	defer ticker.Stop()
 	for {
@@ -382,8 +383,15 @@ func (s *supervisor) control(ctx context.Context) {
 		for _, command := range []string{"drain", "refresh"} {
 			raw, err := readControl(filepath.Join(s.controlDir, command))
 			if err != nil {
+				// A request this user may not read (a workspace that wrote
+				// it 0600) is never answered: say so once.
+				if errors.Is(err, fs.ErrPermission) && !refused[command] {
+					refused[command] = true
+					s.logf("cannot read the %s request: %v", command, err)
+				}
 				continue
 			}
+			refused[command] = false
 			nonce := strings.TrimSpace(raw)
 			if !nonceRE.MatchString(nonce) || answered[command] == nonce {
 				continue

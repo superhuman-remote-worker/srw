@@ -80,9 +80,15 @@ func mountArgs(plan *Plan, m Mount, configPath, cacheDir, rcSocket, filterPath s
 }
 
 var (
-	credentialRE  = regexp.MustCompile(`\b(401|403)\b|Unauthorized|Forbidden`)
+	// Nextcloud answers a disabled account with 503 "Account disabled"
+	// (OC\User\DisabledUserException): the credential is refused, not the
+	// server down.
+	credentialRE  = regexp.MustCompile(`\b(401|403)\b|Unauthorized|Forbidden|Account disabled|DisabledUserException`)
 	notFoundRE    = regexp.MustCompile(`directory not found|object not found|\b404\b|Not Found`)
 	timeoutTextRE = regexp.MustCompile(`deadline exceeded|i/o timeout|Client\.Timeout|TLS handshake timeout`)
+	// rclone could not build the remote from its config at all (no server
+	// was asked): no retry cures that config.
+	remoteConfigRE = regexp.MustCompile(`Failed to create file system`)
 )
 
 // classify maps a failed rclone call to a reason. rclone's exit code 3 is
@@ -97,6 +103,8 @@ func classify(code int, stderr string, timedOut bool) string {
 		return reasonNotFound
 	case timeoutTextRE.MatchString(stderr):
 		return reasonTimeout
+	case remoteConfigRE.MatchString(stderr):
+		return reasonMountFailed
 	default:
 		return reasonUnreachable
 	}
