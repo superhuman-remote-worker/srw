@@ -219,3 +219,12 @@ async def test_a_hook_never_fails_its_caller():
         await folder_grants.revoke_folder_grants(
             store, object(), reason="because", project_id=PROJECT_ID
         )
+
+
+def test_the_agent_can_say_why_a_folder_has_no_grant():
+    """Every reason a plan may leave a folder out has the agent's words."""
+    from orchestrator.services.cloud_connector_mounts import EXCLUSION_REASONS
+    from shared.runtime.services.cloud_mount.sidecar import REASON_TEXT
+
+    assert {"grant_unavailable", "reader_unavailable"} <= set(EXCLUSION_REASONS)
+    assert set(EXCLUSION_REASONS) <= set(REASON_TEXT)

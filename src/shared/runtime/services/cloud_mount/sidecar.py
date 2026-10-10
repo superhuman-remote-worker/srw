@@ -79,6 +79,9 @@ REASON_TEXT = {
     "no_session_folder": "SRW has not created this session's outbox folder",
     "backend_unavailable": "the main cloud was not reachable when the session started",
     "beside_protected": "a protected session mounts only its protected folder",
+    # A project folder mounts only as its own per-folder account (slices 5, 7).
+    "grant_unavailable": "its account for this folder is not ready",
+    "reader_unavailable": "its read-only account for this folder is not ready",
 }
 
 #: What each kind of mounted folder is, for the agent's prompt.
