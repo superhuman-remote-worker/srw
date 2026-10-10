@@ -15,7 +15,7 @@ contract".
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Literal, Mapping, get_args
 
 #: The driver protocol SRW speaks: the envelope, not a driver's config
@@ -355,15 +355,36 @@ def strict_access(spec: DriverSpec) -> bool:
     )
 
 
-#: Why :func:`access_resolution` binds no level, as closed codes.
-#: ``read_only_unavailable``: the binding is read-only and no offered level
-#: writes nothing; ``level_not_offered``: the level asked for (or the
-#: driver's default) is not offered; ``no_level_offered``: the driver
-#: offers this connector no level at all here.
+#: Why :func:`access_resolution` (or :func:`resolve_access`) binds no level,
+#: as closed codes. ``read_only_unavailable``: the binding is read-only and
+#: no offered level writes nothing; ``level_not_offered``: the level asked
+#: for (or the driver's default) is not offered; ``no_level_offered``: the
+#: driver offers this connector no level at all here; ``above_ceiling``: the
+#: level is offered, but above the most this binding may have (a
+#: :func:`resolve_access` ceiling, or a read-only binding).
 ACCESS_REFUSALS: tuple[str, ...] = (
     "read_only_unavailable",
     "level_not_offered",
     "no_level_offered",
+    "above_ceiling",
+)
+
+#: Where :func:`resolve_access` took a strict driver's level from
+#: (``AccessResolution.origin``): ``explicit``, the level the execution asked
+#: for; ``materialized``, the level an execution stored when it was created,
+#: asked for again; ``link_default``, the project link's default
+#: (``project_datasources.access``); ``config``, the connector config's
+#: ``access``; ``driver_default``, the driver's default, else its highest
+#: offered level; ``clamped``, a default lowered to the highest level allowed
+#: below it. A default is only ever lowered, and a level asked for is never
+#: changed: it binds as asked or is refused.
+ACCESS_ORIGINS: tuple[str, ...] = (
+    "explicit",
+    "materialized",
+    "link_default",
+    "config",
+    "driver_default",
+    "clamped",
 )
 
 
@@ -375,11 +396,16 @@ class AccessResolution:
     (env and file delivery: nothing to refuse, ``code`` unset) and for a
     refusal, whose ``code`` is one of :data:`ACCESS_REFUSALS` and whose
     ``reason`` is a line a person can read.
+
+    ``origin`` is set by :func:`resolve_access` for a strict driver's level
+    (one of :data:`ACCESS_ORIGINS`); a ``clamped`` level's ``reason`` says
+    what it was lowered from. :func:`access_resolution` leaves it unset.
     """
 
     level: str | None
     code: str | None = None
     reason: str | None = None
+    origin: str | None = None
 
     @property
     def refused(self) -> bool:
@@ -436,18 +462,9 @@ def access_resolution(
     which clamps a read-only entry to the lowest level and fails closed to
     the lowest for a name it does not offer.
     """
-    levels = spec.ranked_access_ids()
-    if offered is not None:
-        narrowed = frozenset(offered)
-        levels = tuple(level for level in levels if level in narrowed)
-        if not levels and spec.access_levels:
-            return AccessResolution(
-                None,
-                "no_level_offered",
-                f"{spec.title} offers this connector no access level here",
-            )
-    if not levels:
-        return AccessResolution(None)
+    levels = _offered_levels(spec, offered)
+    if isinstance(levels, AccessResolution):
+        return levels
     if strict_access(spec):
         return strict_access_resolution(entry, spec, levels, requested=requested)
     if entry.get("project_read_only", False):
@@ -501,6 +518,37 @@ def strict_access_resolution(
     )
 
 
+def _offered_levels(
+    spec: DriverSpec, offered: Iterable[str] | None
+) -> tuple[str, ...] | AccessResolution:
+    """The spec's level ids ``offered`` keeps, lowest rank first, or the
+    resolution when none is left (a refusal, or no level for a driver that
+    has none)."""
+    levels = spec.ranked_access_ids()
+    if offered is not None:
+        narrowed = frozenset(offered)
+        levels = tuple(level for level in levels if level in narrowed)
+        if not levels and spec.access_levels:
+            return AccessResolution(
+                None,
+                "no_level_offered",
+                f"{spec.title} offers this connector no access level here",
+            )
+    if not levels:
+        return AccessResolution(None)
+    return levels
+
+
+def _config_level(entry: Mapping[str, Any], spec: DriverSpec) -> Any:
+    """The level the connector's config names, where its schema has an
+    ``access`` property (email), else ``None``."""
+    properties = spec.config_schema.get("properties")
+    if not (isinstance(properties, Mapping) and "access" in properties):
+        return None
+    config = entry.get("config")
+    return config.get("access") if isinstance(config, Mapping) else None
+
+
 def _wanted_level(
     entry: Mapping[str, Any],
     spec: DriverSpec,
@@ -510,13 +558,136 @@ def _wanted_level(
     """The level asked for, else the config's, else the default or the
     highest offered (the config's only where its schema has ``access``)."""
     wanted: Any = requested
-    properties = spec.config_schema.get("properties")
-    config = entry.get("config")
-    if wanted is None and isinstance(properties, Mapping) and "access" in properties:
-        wanted = config.get("access") if isinstance(config, Mapping) else None
+    if wanted is None:
+        wanted = _config_level(entry, spec)
     if wanted is None:
         wanted = spec.default_access or levels[-1]
     return wanted
+
+
+def read_only_ceiling(spec: DriverSpec) -> str | None:
+    """The highest level of a :func:`strict_access` spec that writes
+    nothing: the ceiling of a binding that may only read (a viewer's
+    folder), or ``None`` when the spec has none or is not strict."""
+    if not strict_access(spec):
+        return None
+    floor = [
+        level.id
+        for level in sorted(spec.access_levels, key=lambda lv: lv.rank)
+        if level.writes == "none"
+    ]
+    return floor[-1] if floor else None
+
+
+def resolve_access(
+    entry: Mapping[str, Any],
+    spec: DriverSpec,
+    *,
+    offered: Iterable[str] | None = None,
+    requested: str | None = None,
+    requested_origin: Literal["explicit", "materialized"] = "explicit",
+    link_default: str | None = None,
+    ceiling: str | None = None,
+) -> AccessResolution:
+    """The level an execution binds a connector at: what it asked for, else
+    its defaults, within what is offered and allowed here.
+
+    The strict rule (:func:`strict_access_resolution`) with the inputs an
+    execution's choice brings: ``requested`` is the level the execution asks
+    for (``requested_origin`` says whether it was chosen now or stored at
+    creation), ``link_default`` the project link's default level, and
+    ``ceiling`` the highest level this binding may have (a project viewer's
+    folder: :func:`read_only_ceiling`); ``offered`` is the driver's narrowed
+    set, as for :func:`access_resolution`.
+
+    * A level asked for binds as asked when it is allowed, and is refused
+      otherwise (``above_ceiling`` when offered but above the ceiling or a
+      read-only binding, ``level_not_offered`` when not offered): it is
+      never changed.
+    * Otherwise the link's default, else the config's, else the driver's
+      default, else the highest offered level. One that is not allowed is
+      lowered to the highest allowed level below it (``origin`` ``clamped``)
+      and refused when there is none; a default is never raised. A
+      read-only binding takes the strict rule's level, the lowest that
+      writes nothing.
+
+    A driver that is not :func:`strict_access` has no per-link level or
+    ceiling: it keeps :func:`access_resolution`'s rule exactly, ``origin``
+    unset.
+    """
+    if not strict_access(spec):
+        return access_resolution(entry, spec, offered=offered, requested=requested)
+    levels = _offered_levels(spec, offered)
+    if isinstance(levels, AccessResolution):
+        return levels
+    rank = {level.id: level.rank for level in spec.access_levels}
+    cap = rank.get(ceiling, -1) if ceiling is not None else None
+    capped = tuple(level for level in levels if cap is None or rank[level] <= cap)
+    read_only = bool(entry.get("project_read_only", False))
+    allowed = tuple(
+        level
+        for level in capped
+        if not read_only
+        or (
+            (declared := spec.access_level(level)) is not None
+            and declared.writes == "none"
+        )
+    )
+    most = allowed[-1] if allowed else None
+    if requested is not None:
+        if requested in allowed:
+            return AccessResolution(requested, origin=requested_origin)
+        if requested in levels:
+            return AccessResolution(
+                None,
+                "above_ceiling",
+                f"{spec.title} binds this connector at most at "
+                f"{most or 'no level'} here; {requested!r} is above it",
+            )
+        return strict_access_resolution({}, spec, levels, requested=requested)
+    if link_default is not None:
+        wanted, origin = link_default, "link_default"
+    elif (configured := _config_level(entry, spec)) is not None:
+        wanted, origin = configured, "config"
+    else:
+        wanted, origin = spec.default_access or levels[-1], "driver_default"
+    if read_only and capped:
+        resolved = strict_access_resolution(entry, spec, capped)
+        if resolved.refused or resolved.level == wanted:
+            return replace(resolved, origin=None if resolved.refused else origin)
+        return _clamped(resolved.level, wanted)
+    if wanted in allowed:
+        return AccessResolution(wanted, origin=origin)
+    if wanted not in rank:
+        return strict_access_resolution({}, spec, levels, requested=wanted)
+    below = [level for level in allowed if rank[level] < rank[wanted]]
+    if below:
+        return _clamped(below[-1], wanted)
+    if any(rank[level] <= rank[wanted] for level in levels):
+        # Offered at or below the default, but every such level is above
+        # what this binding may have.
+        return AccessResolution(
+            None,
+            "read_only_unavailable" if read_only else "above_ceiling",
+            f"{spec.title} offers this connector no level here at or below "
+            f"{most or 'its ceiling'}"
+            if not read_only
+            else f"{spec.title} cannot bind this connector read-only here",
+        )
+    return AccessResolution(
+        None,
+        "level_not_offered",
+        f"{spec.title} does not offer the access level {wanted!r} or any "
+        f"level below it here (offered: {', '.join(levels)})",
+    )
+
+
+def _clamped(level: str | None, wanted: Any) -> AccessResolution:
+    return AccessResolution(
+        level,
+        reason=f"the default {wanted!r} is not allowed here; lowered to {level!r}",
+        origin="clamped",
+    )
 
 
 def effective_access(

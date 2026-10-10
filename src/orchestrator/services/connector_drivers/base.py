@@ -35,7 +35,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -48,8 +48,8 @@ from shared.connectors.contract import (
     AccessContext,
     AccessResolution,
     DriverSpec,
-    access_resolution,
     bound_read_only,
+    resolve_access,
 )
 from shared.connectors.envelope import unsupported_check
 
@@ -649,14 +649,21 @@ def bound_access(
     *,
     ctx: AccessContext | None = None,
     requested: str | None = None,
+    requested_origin: Literal["explicit", "materialized"] = "explicit",
+    ceiling: str | None = None,
 ) -> AccessResolution:
     """The level ``row`` binds at through ``driver``, or why none.
 
-    The contract's rule (:func:`~shared.connectors.contract.access_resolution`)
+    The contract's rule (:func:`~shared.connectors.contract.resolve_access`)
     over the levels the driver offers this row in ``ctx`` (every level of
     its spec, unless it narrows them; no ``ctx``: any tier), read-only when
     the row's project link or its creator's tag says so
-    (``bound_read_only``).
+    (``bound_read_only``). ``requested`` is the level the execution asks
+    for; without one, a strict driver's row binds at its project link's
+    default (``project_access``, as the resolvers read it), lowered to what
+    is allowed but never raised. ``ceiling`` is the highest level the
+    binding may have (a project viewer's folder). A driver that is not
+    strict keeps the older rule, which has neither.
     """
     offered = (
         driver.offered_access(row, ctx or AccessContext())
@@ -664,4 +671,13 @@ def bound_access(
         else None
     )
     entry = {**row, "project_read_only": bound_read_only(row)}
-    return access_resolution(entry, driver.spec, offered=offered, requested=requested)
+    link_default = row.get("project_access")
+    return resolve_access(
+        entry,
+        driver.spec,
+        offered=offered,
+        requested=requested,
+        requested_origin=requested_origin,
+        link_default=str(link_default) if link_default else None,
+        ceiling=ceiling,
+    )

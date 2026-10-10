@@ -259,16 +259,23 @@ class CloudFolderDriver(DatasourceDriver):
         *,
         ctx: AccessContext,
         requested: str | None = None,
+        ceiling: str | None = None,
     ) -> CloudFolderMount | CloudFolderUnavailable:
         """What the mount plan mounts for one attached connector row, or why
         it mounts nothing.
 
-        ``requested`` is a level the execution asks for (``protected`` for
-        a protected session); without one the connector binds at its
-        highest offered level, and read-only when its project link or its
-        creator's tag says so. Only a row SRW created names a folder the
-        main cloud's credential may be used for: one with a managed key,
-        and for a project's folder the key of the project its config names.
+        ``requested`` is the level the session resolved for the connector
+        when it was created (``threads.metadata.datasource_access``): it
+        binds as stored or not at all (``access_unavailable``). Without one
+        the connector binds at its project link's default
+        (``project_access``), else its highest offered level, a default
+        lowered to what is allowed here but never raised, and read-only when
+        its project link or its creator's tag says so. ``ceiling`` is the
+        highest level the session's owner may have (a viewer of the
+        folder's project: ``read_only``). Only a row SRW created names a
+        folder the main cloud's credential may be used for: one with a
+        managed key, and for a project's folder the key of the project its
+        config names.
         """
         from orchestrator.services.thread_mount_rows import slugify_mount_name
 
@@ -293,7 +300,14 @@ class CloudFolderDriver(DatasourceDriver):
                 "config_invalid",
                 "This cloud folder connector is not its project's own folder",
             )
-        access = bound_access(self, row, ctx=ctx, requested=requested)
+        access = bound_access(
+            self,
+            row,
+            ctx=ctx,
+            requested=requested,
+            requested_origin="materialized",
+            ceiling=ceiling,
+        )
         if access.level is None:
             return CloudFolderUnavailable(
                 connector_id,
