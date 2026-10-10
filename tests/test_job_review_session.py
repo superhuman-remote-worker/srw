@@ -20,6 +20,8 @@ JOB_ID = "29c28492-df7c-4eb3-847f-38892557ac4e"
 REPO_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 DB_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 THREAD_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+CHECKOUT_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+OUTBOX_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
 
 
 def _job(job: dict) -> dict:
@@ -168,6 +170,130 @@ class TestReviewSessionEndpoint:
             "thread_id": THREAD_ID,
             "status": "created",
         }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reviewer", ["owner", "member"])
+    async def test_a_cloud_projects_job_opens_a_review_its_admission_accepts(
+        self, reviewer, user_a, user_b, job_a, fake_db, fake_request
+    ):
+        """A job admitted in a cloud project carries the project folder copy
+        (jobs only) and its owner's outbox. The review session takes only
+        what a session of the reviewer may attach, and session admission's
+        own selection rule accepts the list it is given."""
+        from orchestrator.services import job_review_session
+        from orchestrator.services.datasource_policy import (
+            authorize_datasource_selection,
+        )
+
+        project_id = str(job_a["project_id"])
+        owner_id = str(job_a["user_id"])
+        caller = user_a if reviewer == "owner" else user_b
+        policy_rows = {
+            REPO_ID: {
+                "id": REPO_ID,
+                "type": "repository",
+                "created_by": owner_id,
+                "is_global": False,
+                "config": {},
+                "scope_mode": "projects",
+                "auto_attach": True,
+                "policy_revision": 1,
+                "managed_key": None,
+                "project_ids": [project_id],
+            },
+            CHECKOUT_ID: {
+                "id": CHECKOUT_ID,
+                "type": "cloud_folder_checkout",
+                "created_by": None,
+                "is_global": False,
+                "config": {"project_id": project_id},
+                "scope_mode": "projects",
+                "auto_attach": True,
+                "policy_revision": 1,
+                "managed_key": f"project-cloud-checkout:{project_id}",
+                "project_ids": [project_id],
+            },
+            OUTBOX_ID: {
+                "id": OUTBOX_ID,
+                "type": "cloud_outbox",
+                "created_by": owner_id,
+                "is_global": False,
+                "config": {},
+                "scope_mode": "all",
+                "auto_attach": True,
+                "policy_revision": 1,
+                "managed_key": f"cloud-outbox:{owner_id}",
+                "project_ids": [],
+            },
+        }
+
+        async def policy_rows_for(ids, **_kwargs):
+            return [
+                policy_rows[str(value)] for value in ids if str(value) in policy_rows
+            ]
+
+        class _AdmissionStore:
+            get_datasource_policy_rows = staticmethod(policy_rows_for)
+
+            async def get_user(self, user_id):
+                return {**caller, "is_approved": True}
+
+            async def user_is_member_of_projects(self, user_id, project_ids):
+                return True
+
+            async def get_user_project_roles(self, user_id, project_ids):
+                return {pid: "editor" for pid in project_ids}
+
+        accepted = {}
+
+        async def create_thread(body, request, **_dependencies):
+            # Session admission's explicit-list rule (thread_admission).
+            accepted["ids"], _ = await authorize_datasource_selection(
+                _AdmissionStore(),
+                caller,
+                str(caller["id"]),
+                body.datasource_ids,
+                body.project_ids,
+                "sandbox",
+                allow_admin_explicit_override=True,
+                execution_kind="session",
+            )
+            return {"thread_id": THREAD_ID, "status": "created"}
+
+        job = _job(job_a)
+        repository = {**_repository(), "created_by": owner_id}
+        checkout = {
+            "id": CHECKOUT_ID,
+            "name": "Project files",
+            "type": "cloud_folder_checkout",
+        }
+        outbox = {"id": OUTBOX_ID, "name": "Outbox", "type": "cloud_outbox"}
+        fake_db.resolve_datasources_for_job = AsyncMock(
+            return_value=[checkout, outbox, repository]
+        )
+        fake_db.get_datasource_policy_rows = AsyncMock(side_effect=policy_rows_for)
+
+        with (
+            _authorized(caller, fake_db),
+            patch(
+                "orchestrator.services.thread_admission.create_thread", create_thread
+            ),
+        ):
+            dependencies = workspace_composition.job_review_dependencies(
+                orchestrator.main.app.state.resources
+            ).review_session
+            result = await job_review_session.create_job_review_session(
+                request=fake_request,
+                job_id=JOB_ID,
+                user=caller,
+                authorized_job=job,
+                dependencies=dependencies,
+            )
+
+        assert result["thread_id"] == THREAD_ID
+        # The folder copy is a job's; another user's outbox is theirs.
+        expected = [OUTBOX_ID, REPO_ID] if reviewer == "owner" else [REPO_ID]
+        assert accepted["ids"] == expected
 
     @pytest.mark.asyncio
     async def test_requires_a_recorded_pr_instead_of_guessing_from_model_prose(

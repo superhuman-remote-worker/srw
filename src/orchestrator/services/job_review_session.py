@@ -180,6 +180,38 @@ def _review_session_config_name(
     return "session_base"
 
 
+async def _review_session_datasource_ids(
+    store: Any, datasources: list[dict[str, Any]], *, owner_id: str
+) -> list[str]:
+    """The job's connectors its review session can attach, in job order.
+
+    The session takes them as an explicit list, which session admission
+    authorizes whole, so a row no session of ``owner_id`` may attach would
+    refuse the review: a connector its driver serves to jobs only (the
+    project folder copy, ``execution_kind_refuses``), and another user's own
+    connector (the job owner's outbox, when someone else reviews). An ID
+    without a policy row stays and fails closed there.
+    """
+    from orchestrator.services.datasource_policy import execution_kind_refuses
+    from shared.connectors.platform import native_user
+
+    ids = [str(datasource["id"]) for datasource in datasources]
+    rows = {
+        str(row["id"]): row
+        for row in (await store.get_datasource_policy_rows(ids) or [])
+    }
+
+    def attachable(row: Any) -> bool:
+        if row is None:
+            return True
+        if execution_kind_refuses(row, "session"):
+            return False
+        user = native_user(row)
+        return user is None or user == owner_id
+
+    return [value for value in ids if attachable(rows.get(value))]
+
+
 def _brief_text(value: Any, *, limit: int) -> str:
     """Bound one untrusted job string for a plain-text opening event."""
     if not isinstance(value, str):
@@ -263,6 +295,7 @@ async def create_job_review_session(
     *,
     request: Request,
     job_id: str,
+    user: dict[str, Any],
     authorized_job: dict[str, Any],
     dependencies: JobReviewSessionDependencies,
 ) -> dict[str, Any]:
@@ -270,7 +303,9 @@ async def create_job_review_session(
 
     There is intentionally no request body. Model, scope, connectors and the
     delivered branch are all derived from stored server state; the MCP session
-    tool remains unchanged and has no route to ``config_override``.
+    tool remains unchanged and has no route to ``config_override``. ``user``
+    is the caller, whose session it is: it takes the job's connectors a
+    session of theirs can attach (``_review_session_datasource_ids``).
     """
     job = authorized_job
     from orchestrator.services.job_delivery import (
@@ -311,6 +346,10 @@ async def create_job_review_session(
             detail="Could not resolve this job's connectors",
         )
 
+    session_datasource_ids = await _review_session_datasource_ids(
+        dependencies.store, datasources, owner_id=str(user["id"])
+    )
+
     model, temperature, dropped = _review_session_config_values(job)
     session_config_name = _review_session_config_name(
         job, bundled_expert_bundle=dependencies.bundled_expert_bundle
@@ -337,7 +376,7 @@ async def create_job_review_session(
         title=title,
         config_name=session_config_name,
         project_ids=[str(job["project_id"])] if job.get("project_id") else None,
-        datasource_ids=[str(datasource["id"]) for datasource in datasources],
+        datasource_ids=session_datasource_ids,
         model=model,
         temperature=temperature,
         permission_mode="supervised",

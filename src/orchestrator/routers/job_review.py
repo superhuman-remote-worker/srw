@@ -1,10 +1,11 @@
 """HTTP adapters for job delivery review — outbox re-sync, PR status, review session.
 
 All three routes are gated by ``require_job_access``, which enforces both user
-visibility AND the MCP/officer ``project:<uuid>`` scope. The export needs the
-authenticated *user* as well as the row (it provisions and shares a cloud
-folder in that user's name), so it keeps both halves of the gate's result; the
-other two need only the row.
+visibility AND the MCP/officer ``project:<uuid>`` scope. The export and the
+review session need the authenticated *user* as well as the row (the export
+acts in a user's name; the review session is the caller's, and attaches only
+the job's connectors a session of theirs may), so they keep both halves of the
+gate's result; the PR status needs only the row.
 """
 
 from __future__ import annotations
@@ -105,10 +106,13 @@ async def create_job_review_session(
     delivered branch are all derived from stored server state; the MCP session
     tool remains unchanged and has no route to ``config_override``.
     """
-    _, job = await dependencies.require_job_access(request, dependencies.store, job_id)
+    user, job = await dependencies.require_job_access(
+        request, dependencies.store, job_id
+    )
     return await job_review_session.create_job_review_session(
         request=request,
         job_id=job_id,
+        user=user,
         authorized_job=job,
         dependencies=dependencies.review_session,
     )
