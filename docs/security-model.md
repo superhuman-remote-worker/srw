@@ -117,8 +117,10 @@ container. It can't mount FUSE filesystems itself (`sshfs`, `rclone mount`
 and `fuse-overlayfs` fail there), and the system calls the default seccomp
 profile blocks fail too. Use a VM workspace for that, or turn the plane off.
 
-A Pod with nothing to mount (for instance with the main cloud off) gets no
-sidecars and keeps today's profile.
+A Pod that gets no sidecar mount keeps today's profile, FUSE and seccomp
+included: with nothing to mount (the main cloud off, say) it gets no plan at
+all; when every folder was left out (an unbuildable session folder, say) its
+plan only names them, so the Session can say why.
 
 These keep the old in-workspace path and `workspace.fuse`:
 
@@ -135,7 +137,14 @@ These keep the old in-workspace path and `workspace.fuse`:
   volume writable; being privileged, it was never held back by a read-only
   view. When that cloud layer does not come up, the Session starts with no
   cloud folder at all and says "protected cloud unavailable" with the reason;
-  nothing it writes reaches the cloud unreviewed.
+  nothing it writes reaches the cloud unreviewed. A capture overlay an earlier
+  attach left is unmounted first, its captured changes kept for the next
+  attach, and a `workspace/cloud` link to it is removed. Only the sidecar
+  lower starts without its cloud. A protected Session whose lower rclone runs
+  in the workspace (its grant was not active as the Pod was created) still
+  fails to attach when that lower fails. So does one whose protected mode is
+  refused before attach, its grant refused or replaced since the Pod was
+  made.
 
 The orchestrator needs `create` on Secrets in the workspace namespace. The
 chart grants nothing more: not `get`, `list` or `delete`. Each credential
@@ -148,9 +157,18 @@ a FIFO, and reads at most a small regular file. The caches of a Pod's
 folders share one emptyDir with no size limit: past a limit the kubelet
 would evict the whole workspace Pod, and rclone's cap is soft. They stay
 under `connectors.inPodPlane.cacheSize` together, on node disk. The
-supervisor's memory limit scales with the folders
-(`connectors.inPodPlane.supervisorMemory`). An out-of-memory kill restarts
-only the supervisor, and its folders come back.
+supervisor requests that much ephemeral storage, so the scheduler places the
+Pod on a node with the disk for it, and each rclone stops caching while the
+node has less than 2 GB free. The supervisor's memory limit scales with the
+folders (`connectors.inPodPlane.supervisorMemory`). An out-of-memory kill
+restarts only the supervisor, and its folders come back.
+
+End of a stateless Session waits until every writable folder has uploaded
+what it holds. A folder that is unreachable for now (a timeout, a refused
+mount, a dead rclone) with uploads still in its cache holds End back, and
+End can be retried. When the folder is gone or refuses its credential,
+retrying can't help: End goes ahead and logs how many uploads were lost, and
+the supervisor's termination message says so when the Pod stops.
 
 ## Defense in depth
 

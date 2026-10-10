@@ -311,7 +311,8 @@ connectors:
         digest: ""
     # -- What every mount's rclone cache in a Pod stays under together. The
     # cache emptyDir has no sizeLimit (the kubelet would evict the whole Pod
-    # past it, and rclone's cap is soft), so it uses node disk.
+    # past it, and rclone's cap is soft), so it uses node disk. The
+    # supervisor requests this much ephemeral storage for scheduling.
     cacheSize: 10Gi
     # -- How long the supervisor waits for pending uploads at a drain
     # request (End of a stateless session) and when it stops. At most 90:

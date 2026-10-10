@@ -609,7 +609,7 @@ registrations.
 | `connectors.customDrivers.privileged` | `false` | Lets images outside the trusted list have privilege too (for an in-pod driver; the in-pod plane below serves only SRW's own cloud mounts). |
 | `connectors.inPodPlane.enabled` | `true` | A Session's cloud folders are mounted by two sidecars of its workspace Pod, and its workspace runs without FUSE. See [Cloud folders from the in-pod plane](security-model.md#cloud-folders-from-the-in-pod-plane). |
 | `connectors.inPodPlane.opener.image` / `.rclone.image` | SRW's `srw-fuse-opener` and `srw-cloud-mount` | The two sidecar images; pin a digest in production. |
-| `connectors.inPodPlane.cacheSize` | `10Gi` | What every folder's cache in a Pod stays under together, on node disk (the emptyDir has no size limit, which would evict the Pod). |
+| `connectors.inPodPlane.cacheSize` | `10Gi` | What every folder's cache in a Pod stays under together, on node disk (the emptyDir has no size limit, which would evict the Pod). The supervisor requests it as ephemeral storage, so a node needs that much free disk to take the Pod. |
 | `connectors.inPodPlane.drainSeconds` | `60` | How long uploads may take to finish at End and when the Pod stops; at most 90, inside the Pod's 120 s grace period. |
 | `connectors.inPodPlane.maxMounts` | `8` | Folders per Pod; the rest are shown as left out. |
 | `connectors.inPodPlane.supervisorMemory` | `""` | The supervisor's memory limit; empty is 256Mi plus 192Mi per folder, at most 2Gi. |
