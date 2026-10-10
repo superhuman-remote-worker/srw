@@ -83,14 +83,19 @@ async def _ensure(db, project: dict, instance: str) -> str:
     )
 
 
-async def _native_rows(db, project_id: str) -> list[dict]:
+async def _native_rows(db, project_id: str, kind: str = "project-cloud") -> list[dict]:
     return [
         dict(row)
         for row in await db.fetch(
             "SELECT * FROM datasources WHERE managed_key=$1",
-            f"project-cloud:{project_id}",
+            f"{kind}:{project_id}",
         )
     ]
+
+
+async def _copy_id(db, project_id: str) -> str:
+    [copy] = await _native_rows(db, project_id, "project-cloud-checkout")
+    return str(copy["id"])
 
 
 @pytest.mark.asyncio
@@ -119,7 +124,14 @@ async def test_provisioning_creates_one_row_and_a_second_pass_none(database):
         "folder_handle": "nextcloud:Atlas",
     }
     assert stored["credentials"] == {}
-    assert await _links(database, project_id) == {str(row["id"])}
+    # The folder's copy into its jobs is created and linked beside it.
+    [copy] = await _native_rows(database, project_id, "project-cloud-checkout")
+    assert copy["type"] == "cloud_folder_checkout"
+    assert (copy["scope_mode"], copy["auto_attach"]) == ("projects", True)
+    assert (await database.get_datasource(str(copy["id"])))["config"] == {
+        "project_id": project_id
+    }
+    assert await _links(database, project_id) == {str(row["id"]), str(copy["id"])}
     link = await database.fetchrow(
         "SELECT read_only FROM project_datasources WHERE datasource_id=$1", row["id"]
     )
@@ -233,12 +245,14 @@ async def test_an_omitted_list_attaches_the_works_own_and_an_empty_one_nothing(
         ids, _ = await _job_selection(database, member, project_id, **fields)
         return set(ids)
 
+    copy = await _copy_id(database, project_id)
     assert await session() == {kb, cloud}
     assert await session(datasource_ids=[]) == set()
     assert await session(use_datasource_defaults=True) == {kb, cloud, own}
-    assert await job() == {kb}
+    # A job's own: the knowledge base and the folder's copy (slice 6.3).
+    assert await job() == {kb, copy}
     assert await job(datasource_ids=[]) == set()
-    assert await job(use_datasource_defaults=True) == {kb, own}
+    assert await job(use_datasource_defaults=True) == {kb, copy, own}
 
 
 @pytest.mark.asyncio

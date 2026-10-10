@@ -128,7 +128,7 @@ class TestEnsure:
         assert await _ensure(store, _project()) == "created"
         assert await _ensure(store, _project()) == "present"
 
-        [created] = store.created
+        [created, copy] = store.created
         assert created == {
             "name": f"Atlas cloud folder ({PROJECT[:8]})",
             "ds_type": "cloud_folder",
@@ -152,6 +152,43 @@ class TestEnsure:
             "project_ids": [PROJECT],
             "managed_key": f"project-cloud:{PROJECT}",
         }
+        # The folder's copy into its jobs, kept beside it (slice 6.3).
+        assert copy == {
+            "name": f"Atlas folder copy ({PROJECT[:8]})",
+            "ds_type": "cloud_folder_checkout",
+            "connection_url": None,
+            "description": (
+                "This project's cloud folder, copied into a job's repository "
+                "when the job starts."
+            ),
+            "credentials": {},
+            "config": {"project_id": PROJECT},
+            "created_by": EARLIER_OWNER,
+            "read_only": None,
+            "scope_mode": "projects",
+            "auto_attach": True,
+            "project_ids": [PROJECT],
+            "managed_key": f"project-cloud-checkout:{PROJECT}",
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_copy_row_is_ensured_on_its_own_too(self):
+        store = _Store()
+        store.rows[f"project-cloud:{PROJECT}"] = {"id": "folder"}
+
+        assert (
+            await connectors.ensure_project_checkout_connector(
+                store, _project(), active_instance_id=INSTANCE
+            )
+            == "created"
+        )
+        assert (
+            await connectors.ensure_project_checkout_connector(
+                store, _project(), active_instance_id=INSTANCE
+            )
+            == "present"
+        )
+        assert [row["ds_type"] for row in store.created] == ["cloud_folder_checkout"]
 
     @pytest.mark.asyncio
     async def test_a_listed_owner_is_used_and_none_is_none(self):
@@ -189,7 +226,11 @@ class TestEnsure:
             )
         ]
         assert await _ensure(store, moved) == "present"
-        assert len(store.created) == 1
+        # One folder row, one copy row: the copy names the project alone.
+        assert [row["ds_type"] for row in store.created] == [
+            "cloud_folder",
+            "cloud_folder_checkout",
+        ]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -211,8 +252,9 @@ class TestEnsure:
         store = _Store(fail=RuntimeError("db gone"))
 
         assert await _ensure(store, _project(), log=log) == "deferred"
-        log.warning.assert_called_once()
-        assert "db gone" in str(log.warning.call_args)
+        # Both rows deferred, each logged.
+        assert log.warning.call_count == 2
+        assert all("db gone" in str(call) for call in log.warning.call_args_list)
 
 
 class TestBackfill:
@@ -245,10 +287,13 @@ class TestBackfill:
             "deferred": 0,
         }
         assert rerun == {**first, "created": 0, "present": 2}
+        # One count line names both kinds; the copy rows follow the folder's.
         assert log.info.call_args_list[-1].args == (
-            "Project cloud folder connectors: %s",
+            "Project cloud folder connectors: %s; folder copy connectors: %s",
+            rerun,
             rerun,
         )
+        assert log.info.call_args_list[0].args[2] == first
         log.error.assert_not_called()
 
     @pytest.mark.asyncio
@@ -262,4 +307,8 @@ class TestBackfill:
         )
 
         assert counts["deferred"] == 1
-        log.error.assert_called_once_with("Project cloud folder connectors: %s", counts)
+        log.error.assert_called_once_with(
+            "Project cloud folder connectors: %s; folder copy connectors: %s",
+            counts,
+            counts,
+        )

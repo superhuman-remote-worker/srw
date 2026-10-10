@@ -1,4 +1,4 @@
-"""A project's own cloud folder connector (main cloud slice 3).
+"""A project's own cloud folder connectors (main cloud slices 3 and 6.3).
 
 A project with a folder in the main cloud has one ``cloud_folder`` connector
 SRW keeps for it, under the managed key ``project-cloud:<project>``
@@ -10,7 +10,14 @@ columns, verbatim; the credential stays the main cloud's, resolved when the
 folder is mounted. The API refuses to create, edit, link, unlink or delete
 it (``managed_refusal``).
 
-:func:`ensure_project_cloud_connector` keeps the row in step with its
+Beside it, the project's folder copy connector (``cloud_folder_checkout``,
+``project-cloud-checkout:<project>``): the same folder copied into a job's
+repository when the job starts, at the level its link allows (the driver
+offers it to jobs only). Its config names the project alone; it is linked,
+defaulted and recorded like the folder's row, and is created and kept with
+it.
+
+:func:`ensure_project_cloud_connector` keeps both rows in step with their
 project. ``ensure_project_cloud_resources`` calls it once the folder exists,
 so a project gets its row when it is created, on the project page's
 background heal and on promote; the row's config is repointed when the
@@ -39,12 +46,19 @@ from orchestrator.services.connector_drivers.registry import (
     ConnectorDriverRegistry,
     builtin_connector_drivers,
 )
-from shared.connectors.platform import project_cloud_key
+from shared.connectors.platform import (
+    PROJECT_CLOUD_CHECKOUT,
+    managed_key,
+    project_cloud_key,
+)
 
 logger = logging.getLogger(__name__)
 
 #: The stored type of the main cloud's folders (``srw.cloud-folder/v1``).
 CLOUD_FOLDER_TYPE = "cloud_folder"
+#: The stored type of a project folder's copy into its jobs
+#: (``srw.cloud-folder-checkout/v1``).
+CHECKOUT_TYPE = "cloud_folder_checkout"
 #: What :func:`ensure_project_cloud_connector` did, as the backfill counts it.
 OUTCOMES: tuple[str, ...] = (
     "created",
@@ -168,6 +182,74 @@ async def _ensure(
     return "created" if created else "present"
 
 
+async def _ensure_checkout(
+    store: Any, project: Mapping[str, Any], *, active_instance_id: Any
+) -> str:
+    reason = skip_reason(project, active_instance_id)
+    if reason is not None:
+        return reason
+    project_id = str(project["id"])
+    key = managed_key(PROJECT_CLOUD_CHECKOUT, project_id)
+    if await store.get_datasource_by_managed_key(key) is not None:
+        # Its config names the project alone, which never moves.
+        return "present"
+    name = f"{project['name']} folder copy ({project_id[:8]})"
+    normalized = await validate_platform_connector(
+        _registry(store),
+        CHECKOUT_TYPE,
+        name=name,
+        connection_url=None,
+        config={"project_id": project_id},
+    )
+    created = await store.create_datasource(
+        name=name,
+        ds_type=CHECKOUT_TYPE,
+        connection_url=None,
+        description=(
+            "This project's cloud folder, copied into a job's repository when "
+            "the job starts."
+        ),
+        credentials=normalized.credentials,
+        config=normalized.config or {},
+        created_by=await _project_owner_id(store, project),
+        read_only=None,
+        scope_mode="projects",
+        auto_attach=True,
+        project_ids=[project_id],
+        managed_key=key,
+    )
+    return "created" if created else "present"
+
+
+async def ensure_project_checkout_connector(
+    store: Any,
+    project: Mapping[str, Any],
+    *,
+    active_instance_id: Any,
+    log: Any = None,
+) -> str:
+    """Create ``project``'s folder copy connector when it has none.
+
+    Returns one of :data:`OUTCOMES` (never ``repointed``: the row names the
+    project alone). Skipped exactly when the folder's own row is
+    (:func:`skip_reason`); a failure is logged and answers ``deferred``.
+    Never raises.
+    """
+    log = log or logger
+    try:
+        return await _ensure_checkout(
+            store, project, active_instance_id=active_instance_id
+        )
+    except Exception as exc:
+        log.warning(
+            "Project %s: folder copy connector not ensured (%s); the next "
+            "provisioning pass retries it",
+            project.get("id"),
+            exc,
+        )
+        return "deferred"
+
+
 async def ensure_project_cloud_connector(
     store: Any,
     project: Mapping[str, Any],
@@ -175,15 +257,18 @@ async def ensure_project_cloud_connector(
     active_instance_id: Any,
     log: Any = None,
 ) -> str:
-    """Create or repoint ``project``'s own cloud folder connector.
+    """Create or repoint ``project``'s own cloud folder connector, and
+    create its folder copy connector beside it
+    (:func:`ensure_project_checkout_connector`).
 
-    Returns one of :data:`OUTCOMES`. A default project, or one whose folder
-    the active installation cannot name (:func:`skip_reason`), is skipped;
-    a failure is logged and answers ``deferred``. Never raises.
+    Returns the folder row's outcome, one of :data:`OUTCOMES`. A default
+    project, or one whose folder the active installation cannot name
+    (:func:`skip_reason`), is skipped; a failure is logged and answers
+    ``deferred``. Never raises.
     """
     log = log or logger
     try:
-        return await _ensure(store, project, active_instance_id=active_instance_id)
+        outcome = await _ensure(store, project, active_instance_id=active_instance_id)
     except Exception as exc:
         log.warning(
             "Project %s: cloud folder connector not ensured (%s); the next "
@@ -191,7 +276,11 @@ async def ensure_project_cloud_connector(
             project.get("id"),
             exc,
         )
-        return "deferred"
+        outcome = "deferred"
+    await ensure_project_checkout_connector(
+        store, project, active_instance_id=active_instance_id, log=log
+    )
+    return outcome
 
 
 async def backfill_project_cloud_connectors(
@@ -206,21 +295,39 @@ async def backfill_project_cloud_connectors(
     """
     log = log or logger
     counts = dict.fromkeys(OUTCOMES, 0)
+    copies = dict.fromkeys(OUTCOMES, 0)
     for project in await store.list_project_cloud_folders():
-        outcome = await ensure_project_cloud_connector(
+        try:
+            outcome = await _ensure(
+                store, project, active_instance_id=active_instance_id
+            )
+        except Exception as exc:
+            log.warning(
+                "Project %s: cloud folder connector not ensured (%s); the next "
+                "provisioning pass retries it",
+                project.get("id"),
+                exc,
+            )
+            outcome = "deferred"
+        counts[outcome] += 1
+        copy = await ensure_project_checkout_connector(
             store, project, active_instance_id=active_instance_id, log=log
         )
-        counts[outcome] += 1
-    (log.error if counts["deferred"] else log.info)(
-        "Project cloud folder connectors: %s", counts
+        copies[copy] += 1
+    (log.error if counts["deferred"] or copies["deferred"] else log.info)(
+        "Project cloud folder connectors: %s; folder copy connectors: %s",
+        counts,
+        copies,
     )
     return counts
 
 
 __all__ = [
+    "CHECKOUT_TYPE",
     "CLOUD_FOLDER_TYPE",
     "OUTCOMES",
     "backfill_project_cloud_connectors",
+    "ensure_project_checkout_connector",
     "ensure_project_cloud_connector",
     "project_cloud_folder_config",
     "skip_reason",
