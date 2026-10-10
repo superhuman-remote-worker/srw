@@ -213,20 +213,37 @@ def test_without_a_plan_the_pod_is_todays(monkeypatch, fuse):
     assert PLAN_ANNOTATION not in build(on)["metadata"]["annotations"]
 
 
-def test_an_empty_plan_has_no_sidecars_and_no_fuse(plane_on):
-    manifest = build(plane_on, EMPTY_PLAN)
+def test_a_plan_of_exclusions_only_has_no_sidecars_and_keeps_fuse(plane_on):
+    """Decision 43: a Pod that gets no sidecar mount keeps today's profile,
+    FUSE and seccomp included; its plan is still recorded so the user learns
+    what was left out."""
+    excluded_only = CloudMountPlan(
+        mounts=(),
+        excluded=(
+            {
+                "source_ref": "session-folder",
+                "mount_kind": "session_folder",
+                "reason": "unbuildable",
+            },
+        ),
+        drain_seconds=60,
+        cache_size="10Gi",
+    )
+    manifest = build(plane_on, excluded_only)
     assert "initContainers" not in manifest["spec"]
     assert recorded_plan_from_annotations(manifest["metadata"]["annotations"]) == (
-        EMPTY_PLAN.recorded()
+        excluded_only.recorded()
     )
-    context = manifest["spec"]["containers"][0]["securityContext"]
-    assert not context.get("privileged")
-    assert "SYS_ADMIN" not in context["capabilities"].get("add", [])
+    today = build(plane_on)
+    workspace = manifest["spec"]["containers"][0]
     assert (
-        manifest["spec"]["securityContext"]["seccompProfile"]["type"]
-        == "RuntimeDefault"
+        workspace["securityContext"]
+        == today["spec"]["containers"][0]["securityContext"]
     )
-    assert all(v["name"] != "fuse-device" for v in manifest["spec"]["volumes"])
+    assert manifest["spec"]["securityContext"] == today["spec"]["securityContext"]
+    assert [v["name"] for v in manifest["spec"]["volumes"]] == [
+        v["name"] for v in today["spec"]["volumes"]
+    ]
 
 
 def test_the_opener_starts_first_alone_is_privileged_and_owns_every_target(plane_on):
@@ -460,6 +477,7 @@ def test_only_a_sidecar_pod_loses_fuse_and_a_protected_one_keeps_it():
     assert ContainerProvisioner._profile_for_cloud_plan(profile, None) is profile
     plain = ContainerProvisioner._profile_for_cloud_plan(profile, PLAN)
     assert (plain.fuse_enabled, plain.fuse_privileged) == (False, False)
+    assert ContainerProvisioner._profile_for_cloud_plan(profile, EMPTY_PLAN) is profile
     protected = CloudMountPlan(
         mounts=(), excluded=(), drain_seconds=60, cache_size="10Gi", protected=True
     )
@@ -535,9 +553,7 @@ def test_the_plan_joins_the_fingerprint_and_digest_only_when_present(plane_on):
     assert _fingerprint(plane_on, PLAN) != _fingerprint(plane_on)
     assert _fingerprint(plane_on, PLAN) != _fingerprint(plane_on, EMPTY_PLAN)
     assert plane_on._cloud_plan_digest_input(None) is None
-    assert plane_on._cloud_plan_digest_input(PLAN) == PLAN.digest_input(
-        plane_on._in_pod_plane
-    )
+    assert plane_on._cloud_plan_digest_input(PLAN) == PLAN.digest_input()
 
 
 @pytest.mark.asyncio
@@ -554,7 +570,7 @@ async def test_the_creation_plan_digest_is_unchanged_without_a_plan(plane_on):
     with_plan = await plane_on._workspace_creation_plan(
         owner, profile=_profile(), stateless_creation_generation=None, cloud_plan=PLAN
     )
-    assert with_plan["cloud_mounts"] == PLAN.digest_input(plane_on._in_pod_plane)
+    assert with_plan["cloud_mounts"] == PLAN.digest_input()
     assert with_plan["digest"] != without["digest"]
 
 
@@ -978,3 +994,49 @@ async def test_a_continued_or_recovered_pod_gets_its_objects_and_record(plane_on
     # The plan was only read, never awaited a grant.
     for call in provisioner._cloud_mount_planner.await_args_list:
         assert call.kwargs == {"wait_for_grant": False}
+
+
+@pytest.mark.asyncio
+async def test_a_sidecar_image_bump_between_attempts_still_replays(plane_on):
+    """A deploy that bumps the opener or the supervisor image must not hold a
+    creation admitted before it: the images are in the Pod spec, not in the
+    digest or the pinned fingerprint."""
+    import dataclasses
+
+    owner = WorkspaceOwner.session(THREAD_ID)
+    admitted = _fingerprint(plane_on, PLAN, profile=_profile(fuse=False))
+    plane_on._in_pod_plane = dataclasses.replace(
+        plane_on._in_pod_plane,
+        opener_image="registry.example/srw-fuse-opener:2@sha256:" + "4" * 64,
+        rclone_image="registry.example/srw-cloud-mount:2@sha256:" + "3" * 64,
+    )
+    provisioner = _stable(plane_on, in_flight=admitted, pod_plan=PLAN)
+    plan, _profile_used, fingerprint = await provisioner._replay_cloud_plan(
+        owner,
+        PLAN,
+        _profile(),
+        pinned=True,
+        digest_of=lambda p, prof: _fingerprint_of(provisioner, p, prof),
+    )
+    assert fingerprint == admitted and plan is PLAN
+    # The Pod built for it runs today's images.
+    manifest = build(provisioner, PLAN)
+    assert init(manifest, OPENER_CONTAINER)["image"].endswith("4" * 64)
+
+
+@pytest.mark.asyncio
+async def test_a_fence_delete_that_cannot_read_the_pod_still_leaves_time():
+    from unittest.mock import MagicMock
+
+    provisioner = ContainerProvisioner()
+    provisioner._core_api = MagicMock()
+    provisioner._bounded_kubernetes_call = AsyncMock(
+        side_effect=lambda call, **kw: call(**kw)
+    )
+    unknown = RuntimeError("apiserver away")
+    provisioner._core_api.read_namespaced_pod = MagicMock(side_effect=unknown)
+    assert await provisioner._fence_delete_grace("ws-thread-x", "srw") == 5
+    gone = RuntimeError("not found")
+    gone.status = 404
+    provisioner._core_api.read_namespaced_pod = MagicMock(side_effect=gone)
+    assert await provisioner._fence_delete_grace("ws-thread-x", "srw") == 0

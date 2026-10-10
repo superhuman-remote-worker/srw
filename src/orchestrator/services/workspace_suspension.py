@@ -8,6 +8,7 @@ Requires both ContainerProvisioner (K8s) and SnapshotService (S3) to be
 available. Gracefully degrades: when S3 is unavailable, containers stay alive.
 """
 
+import inspect
 import json
 import logging
 import os
@@ -2166,6 +2167,16 @@ class WorkspaceSuspensionService:
         if thread.get("execution_lane") == "pinned" and not _pinned_runtime_lock_held:
             lock_impl = getattr(type(self._db), "thread_advisory_lock", None)
             if callable(lock_impl):
+                # A protected session's reader grant is minted by an engage
+                # that takes the same lock: let it land first, as create does
+                # (connector drivers D7); the restore's plan only reads it.
+                await_grant = getattr(
+                    self._container_provisioner, "await_cloud_mount_grant", None
+                )
+                if callable(await_grant):
+                    waiting = await_grant(thread_id)
+                    if inspect.isawaitable(waiting):
+                        await waiting
                 async with lock_impl(self._db, thread_id) as lock_acquired:
                     if lock_acquired is not True:
                         logger.error(

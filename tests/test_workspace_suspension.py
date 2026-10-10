@@ -3212,3 +3212,37 @@ class TestRestoreWithChangedBacking:
         svc._extract_snapshot.assert_awaited_once()
         svc._db.merge_thread_workspace_context_if_runtime.assert_not_awaited()
         svc._container_provisioner.complete_workspace_restore_work.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_pinned_restore_awaits_the_protected_grant_before_its_lock():
+    """The engage minting a protected reader grant takes the thread's
+    advisory lock: a restore (resume) awaits it before taking that lock, as
+    create does, so its plan can read the grant (connector drivers D7)."""
+    order: list[str] = []
+
+    class _Lock:
+        def __init__(self, db, thread_id):
+            pass
+
+        async def __aenter__(self):
+            order.append("lock")
+            return True
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Db:
+        thread_advisory_lock = _Lock
+        get_thread = AsyncMock(
+            side_effect=[{"id": "t1", "execution_lane": "pinned"}, None]
+        )
+
+    async def await_grant(thread_id):
+        order.append(f"grant:{thread_id}")
+
+    svc = WorkspaceSuspensionService()
+    svc._db = _Db()
+    svc._container_provisioner = MagicMock(await_cloud_mount_grant=await_grant)
+    assert await svc.restore_thread_workspace("t1", wake_operation_id="w-1") is False
+    assert order == ["grant:t1", "lock"]

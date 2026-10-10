@@ -307,7 +307,7 @@ async def test_no_password_leaves_the_credential_file(monkeypatch):
     for public in (
         json.dumps(plan.recorded()),
         json.dumps(plan.supervisor_plan()),
-        json.dumps(plan.digest_input(SETTINGS)),
+        json.dumps(plan.digest_input()),
         repr(plan),
         cloud_mount_plan.plan_annotation(plan),
     ):
@@ -332,10 +332,9 @@ async def test_the_recorded_plan_is_deterministic_and_fingerprinted(monkeypatch)
     assert first.recorded() == second.recorded()
     third = await _resolve(monkeypatch, [_entry("other")])
     assert third.recorded()["fingerprint"] != first.recorded()["fingerprint"]
-    other_images = InPodPlaneSettings(
-        opener_image="x@sha256:" + "3" * 64, rclone_image="y"
-    )
-    assert first.digest_input(SETTINGS) != first.digest_input(other_images)
+    # The sidecar images are not part of it: a deploy that bumps them must
+    # not hold a creation admitted before it.
+    assert first.digest_input() == {"plan": first.recorded()}
 
 
 @pytest.mark.asyncio

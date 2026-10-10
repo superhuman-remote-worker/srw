@@ -917,8 +917,11 @@ class ContainerProvisioner:
         profile: SandboxPodProfile, plan: CloudMountPlan | None
     ) -> SandboxPodProfile:
         """A Pod whose cloud mounts all come from the sidecars needs no FUSE in
-        its workspace. A protected Pod keeps it for its capture overlay."""
-        if plan is None or plan.protected:
+        its workspace. A protected Pod keeps it for its capture overlay, and a
+        Pod that gets no sidecar mount at all (a plan of exclusions only: an
+        unbuildable session folder, say) keeps today's profile, FUSE and
+        seccomp included (decision 43)."""
+        if plan is None or plan.protected or not plan.mounts:
             return profile
         return replace(profile, fuse_enabled=False, fuse_privileged=False)
 
@@ -927,7 +930,7 @@ class ContainerProvisioner:
     ) -> dict[str, Any] | None:
         if plan is None or self._in_pod_plane is None:
             return None
-        return plan.digest_input(self._in_pod_plane)
+        return plan.digest_input()
 
     async def _ensure_cloud_mount_objects(
         self,
@@ -11575,8 +11578,11 @@ class ContainerProvisioner:
             pod = await self._bounded_kubernetes_call(
                 self._core_api.read_namespaced_pod, name=name, namespace=namespace
             )
-        except Exception:
-            return 0
+        except Exception as exc:
+            # Gone: nothing to detach. Unknown: assume it may run the opener.
+            if getattr(exc, "status", None) == 404:
+                return 0
+            return SIDECAR_DELETE_GRACE_SECONDS
         return SIDECAR_DELETE_GRACE_SECONDS if pod_has_cloud_mount_sidecars(pod) else 0
 
     async def _delete_workspace_provision_resource_exact(

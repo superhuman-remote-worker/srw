@@ -234,16 +234,12 @@ class CloudMountPlan:
         }
         return {**body, "fingerprint": plan_fingerprint(body)}
 
-    def digest_input(self, settings: InPodPlaneSettings) -> dict[str, Any]:
+    def digest_input(self) -> dict[str, Any]:
         """What the creation digest and the pinned fingerprint cover: the
-        recorded plan and the two sidecar images (a new image is a new Pod)."""
-        return {
-            "plan": self.recorded(),
-            "images": {
-                "opener": settings.opener_image,
-                "rclone": settings.rclone_image,
-            },
-        }
+        recorded plan. The sidecar images are not in it: the Pod spec carries
+        them, and a deploy that bumps them must not hold a creation admitted
+        before it (its retry replays the plan with today's images)."""
+        return {"plan": self.recorded()}
 
     def sidecar_spec(self, objects_name: str) -> SidecarSpec:
         dirs: tuple[str, ...] = ()
