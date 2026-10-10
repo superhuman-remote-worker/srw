@@ -312,6 +312,41 @@ async def test_account_deletion_detaches_native_project_cloud_folder_creator(dat
 
 
 @pytest.mark.asyncio
+async def test_account_deletion_removes_the_users_own_session_outbox(database):
+    """A user's own connector (cloud-outbox:<user>) goes with the account:
+    its creator FK would otherwise refuse the deletion, and nobody else may
+    attach it. Another user's outbox stays."""
+
+    user, _project = await owner(database, "Outbox owner")
+    other, _other_project = await owner(database, "Other outbox owner")
+    outboxes = {}
+    for who in (user, other):
+        outboxes[who["id"]] = uuid4()
+        await database.execute(
+            "INSERT INTO datasources "
+            "(id,name,type,created_by,scope_mode,auto_attach,config,managed_key) "
+            "VALUES ($1,'Session outbox','cloud_outbox',$2,'all',TRUE,'{}'::jsonb,"
+            "'cloud-outbox:' || $2::uuid::text)",
+            outboxes[who["id"]],
+            who["id"],
+        )
+
+    assert await database.delete_user(str(user["id"])) is True
+    assert (
+        await database.fetchval(
+            "SELECT count(*) FROM datasources WHERE id=$1", outboxes[user["id"]]
+        )
+        == 0
+    )
+    assert (
+        await database.fetchval(
+            "SELECT created_by FROM datasources WHERE id=$1", outboxes[other["id"]]
+        )
+        == other["id"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_project_delete_ignores_only_settled_ownerless_session_history(
     database, monkeypatch
 ):

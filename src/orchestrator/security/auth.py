@@ -340,6 +340,9 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
             logger.info(
                 "Updated user %s from OIDC claims: %s", sub, list(needs_update.keys())
             )
+            if needs_update.get("is_approved"):
+                # Admitted on this request: the user's own session outbox.
+                await _ensure_user_outbox(db, user.get("id"))
             if needs_update.get("is_admin"):
                 # Promotion to admin: seed max-level grants so the grants data
                 # (and UI) reflect the bypass instead of an empty list that
@@ -373,7 +376,9 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
     )
     if effective_approved:
         # Approved on first login (admin, or a legacy `user` role-holder):
-        # pre-provision cloud + Gitea so their first thread/repo finds them.
+        # pre-provision cloud + Gitea so their first thread/repo finds them,
+        # and give them their session outbox.
+        await _ensure_user_outbox(db, user.get("id"))
         asyncio.create_task(
             _ensure_cloud_user(
                 sub=sub,
@@ -605,6 +610,24 @@ def _resolve_provisioning_backend(
         )
         return None
     return provider()
+
+
+async def _ensure_user_outbox(db: Any, user_id: Any) -> None:
+    """An admitted user's own session outbox connector, while a main cloud
+    is configured (main cloud slice 6.1). Never fails the login: a failure
+    is logged and the startup backfill retries it."""
+    try:
+        from orchestrator.services.cloud_outbox_connectors import (
+            ensure_outbox_if_cloud,
+        )
+
+        main_cloud_router = _resolve_provisioning_backend(
+            _cloud_router_provider, "main-cloud"
+        )
+        if main_cloud_router is not None:
+            await ensure_outbox_if_cloud(db, main_cloud_router, user_id)
+    except Exception as e:
+        logger.warning("Session outbox for user %s not ensured: %s", user_id, e)
 
 
 async def _ensure_cloud_user(

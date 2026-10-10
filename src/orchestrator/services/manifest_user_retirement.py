@@ -8,7 +8,7 @@ from orchestrator.services.manifest_execution_retirement import (
     execution_references_block_retirement,
     lock_manifest_execution_catalog,
 )
-from shared.connectors.platform import native_project_sql
+from shared.connectors.platform import native_project_sql, user_managed_keys
 
 
 async def retire_user_manifests(conn, user_id: UUID) -> bool:
@@ -189,5 +189,13 @@ async def retire_user_manifests(conn, user_id: UUID) -> bool:
            )
         """,
         user_id,
+    )
+    # A user's own connectors (their session outbox, their cloud root) are
+    # theirs alone: nobody else may attach them, so they go with the account
+    # rather than outlive it as ownerless platform rows. Their links, leases
+    # and job links cascade.
+    await conn.execute(
+        "DELETE FROM datasources WHERE managed_key = ANY($1::text[])",
+        user_managed_keys(user_id),
     )
     return True

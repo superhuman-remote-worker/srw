@@ -26,6 +26,7 @@ from typing import Any, Optional, Protocol
 
 from fastapi import HTTPException
 
+from orchestrator.services.cloud_outbox_connectors import ensure_outbox_if_cloud
 from orchestrator.services.connector_drivers import ConnectorDriverRegistry
 from orchestrator.services.connector_drivers.platform import (
     validate_platform_connector,
@@ -331,6 +332,10 @@ async def create_user(
         )
         user["is_approved"] = True
         await dependencies.provision_default_project_knowledge(user, project)
+        # The user's own session outbox (main cloud slice 6.1).
+        await ensure_outbox_if_cloud(
+            store, dependencies.main_cloud_router, user["id"], log=dependencies.logger
+        )
 
         # Create personal WebDAV datasource for the default project.
         # Fresh owner provisioning — resolve via the owner seam (Issue 16).
@@ -462,6 +467,12 @@ async def admin_patch_user(
         row = await dependencies.store.get_user(user_id)
         if row:
             await dependencies.ensure_user_provisioned(row)
+            await ensure_outbox_if_cloud(
+                dependencies.store,
+                dependencies.main_cloud_router,
+                user_id,
+                log=dependencies.logger,
+            )
     return {"status": "updated"}
 
 
@@ -487,6 +498,12 @@ async def admin_bulk_approve_users(
         row = await dependencies.store.get_user(uid)
         if row:
             await dependencies.ensure_user_provisioned(row)
+            await ensure_outbox_if_cloud(
+                dependencies.store,
+                dependencies.main_cloud_router,
+                uid,
+                log=dependencies.logger,
+            )
         # Every admin's "new user pending approval" row is settled by whoever
         # approved (D6: resolution is a property of the source).
         await dependencies.notification_service.resolve_source(

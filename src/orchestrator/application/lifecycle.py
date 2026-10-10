@@ -32,6 +32,7 @@ from orchestrator.application.resources import ApplicationResources, bound
 from orchestrator.services import (
     agent_provisioner as agent_provisioner_module,
     canvas_office,
+    cloud_outbox_connectors,
     container_provisioner as container_provisioner_module,
     default_experts,
     docker_provisioner as docker_provisioner_module,
@@ -365,6 +366,19 @@ async def bind_services(resources: ApplicationResources) -> None:
             logger.error(
                 "Project cloud folder connectors backfill failed; it retries "
                 "at the next start",
+                exc_info=True,
+            )
+        # Every approved user has their own session outbox (main cloud slice
+        # 6.1), idempotently on every replica (the key is unique).
+        try:
+            await cloud_outbox_connectors.backfill_cloud_outbox_connectors(
+                resources.postgres_db,
+                active_instance_id=resources.main_cloud_router.active_instance_id,
+            )
+        except Exception:
+            logger.error(
+                "Session outbox connectors backfill failed; it retries at the "
+                "next start",
                 exc_info=True,
             )
         if _legacy_overlay is not None:
