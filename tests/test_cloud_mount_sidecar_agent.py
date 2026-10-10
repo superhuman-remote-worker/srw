@@ -1156,3 +1156,69 @@ def test_a_sync_deployment_names_the_folders_it_does_not_deliver():
     nothing = session()
     PersistentSession._note_undelivered_cloud_folders(nothing, None)
     assert nothing.config.extra == {}
+
+
+@pytest.mark.asyncio
+async def test_an_in_workspace_set_that_mounts_nothing_starts_no_rclone():
+    """Every attached folder left out: the orchestrator hands such a set over
+    as ``cloud_folders_excluded``, but a ``cloud_mount`` with no mount (an
+    orchestrator mid-rollout) is safe too. Nothing runs in the workspace,
+    no rclone starts, and each folder is named for the prompt."""
+    excluded = [
+        {
+            "source_ref": "c-1",
+            "mount_kind": "project",
+            "reason": "reader_unavailable",
+            "name": "acme_launch",
+            "detail": "not_ready",
+            "level": "read_only",
+            "title": "Acme Launch cloud folder",
+        }
+    ]
+    backend = MagicMock(root="/home/agent-host/workspace")
+    session = SimpleNamespace(
+        thread_id="t1",
+        workspace_manager=SimpleNamespace(
+            backend=backend, path="/home/agent-host/workspace"
+        ),
+        shell_owner_token=None,
+        protected_cloud_required=False,
+        config=_Config(extra={}),
+        cloud_mount_manager=None,
+        cloud_mount_error=None,
+        _finish_protected_cloud=AsyncMock(),
+    )
+    await PersistentSession._setup_cloud_mount(
+        session,
+        {
+            "version": 1,
+            "driver": "rclone",
+            "cloud_root": "/cloud",
+            "workspace_entry": "cloud",
+            "fallback": False,
+            "required": False,
+            "mounts": [],
+            "excluded": excluded,
+        },
+    )
+    assert backend.mock_calls == []
+    assert session.cloud_mount_manager.active is False
+    assert session.cloud_mount_error is None
+    assert session.config.extra["_cloud_mounts_mounted"] == []
+    [row] = session.config.extra["_cloud_mounts_unavailable"]
+    assert (row["path"], row["reason"]) == (
+        "workspace/cloud/acme_launch",
+        "reader_unavailable",
+    )
+    floor = cloud_mount_system_floor(
+        session.config.extra["_cloud_mounts_unavailable"],
+        session.config.extra["_cloud_mounts_mounted"],
+    )
+    assert "workspace/cloud/acme_launch: its read-only account" in floor
+    # The way the orchestrator hands it over renders the same rows.
+    plain = SimpleNamespace(config=_Config(extra={}), protected_cloud_required=False)
+    PersistentSession._note_undelivered_cloud_folders(plain, excluded)
+    assert (
+        plain.config.extra["_cloud_mounts_unavailable"]
+        == session.config.extra["_cloud_mounts_unavailable"]
+    )

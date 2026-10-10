@@ -764,6 +764,63 @@ async def test_the_in_workspace_payload_names_what_it_left_out(denied, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_an_in_workspace_set_that_mounts_nothing_still_names_each_folder(
+    denied, monkeypatch
+):
+    """A VM whose folder's reader is not ready yet, beside an outbox no VM
+    is offered: nothing mounts, and the payload still names both, with the
+    name, level and detail each would have had. End has nothing to adopt."""
+    store = GrantStore([_folder_row(), _outbox_row()])
+    thread = _thread([FOLDER, OUTBOX])
+    vm = {"vm": {"status": "ready", "ssh_host": "vm-1"}}
+    metadata = {**thread["metadata"], **vm}
+    deps = _deps(store, backend=GrantBackend())
+    payload = await mounts._build_agent_cloud_mount(
+        thread, mount_rows=[], metadata=metadata, dependencies=deps
+    )
+    assert payload["mounts"] == [] and "outbox_shared" not in payload
+    assert [
+        (e["source_ref"], e["reason"], e["name"], e.get("level"), e["title"])
+        for e in payload["excluded"]
+    ] == [
+        (OUTBOX, "access_unavailable", "outbox", None, "Session outbox"),
+        (
+            FOLDER,
+            "reader_unavailable",
+            "acme_launch",
+            "read_only",
+            "Acme Launch cloud folder",
+        ),
+    ]
+    assert all(e.get("detail") for e in payload["excluded"])
+    monkeypatch.setattr(
+        mounts,
+        "_runtime_supports_terminal_rclone_retirement",
+        lambda *args, **kwargs: True,
+    )
+    assert (
+        await mounts._build_agent_cloud_mount(
+            thread,
+            mount_rows=[],
+            metadata=metadata,
+            terminal_retirement_token=7,
+            dependencies=deps,
+        )
+        is None
+    )
+    # Nothing attached: nothing to name, no payload.
+    assert (
+        await mounts._build_agent_cloud_mount(
+            _thread([]),
+            mount_rows=[],
+            metadata={**_thread([])["metadata"], **vm},
+            dependencies=deps,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
 async def test_a_protected_session_names_its_other_folders_beside_it(
     denied, monkeypatch
 ):

@@ -560,7 +560,8 @@ async def _settle_cloud_mount_record(
       remembered, so it costs one read, not one per poll.
     - A sandbox upgraded to a VM drops the Pod's folder state: the VM's
       folders are its own, and the cockpit must not show the Pod's. A
-      record of no Pod (the sync driver's, ``fingerprint: null``) stays.
+      record of no Pod (``fingerprint: null``: the sync driver's, or the
+      in-workspace path's) stays.
     """
     if InPodPlaneSettings.from_env() is None:
         return
@@ -1070,7 +1071,9 @@ async def agent_get_thread_workspace_locked(
         )
     mount_rows = await postgres_db.list_thread_mounts(thread_id)
     cloud_mount_sidecar_cfg: dict[str, Any] | None = None
-    # The attached cloud folders this deployment's sync does not deliver.
+    # The attached cloud folders named while none mounts: the ones this
+    # deployment's sync does not deliver, or every one an in-workspace mount
+    # set left out.
     cloud_folders_excluded: list[dict[str, Any]] = []
     suppress_disposable_cloud = bool(
         thread.get("execution_lane") == "stateless" and workspace_backend == "none"
@@ -1094,6 +1097,19 @@ async def agent_get_thread_workspace_locked(
             and cloud_mount_cfg.get("delivery") == "sidecar"
         ):
             cloud_mount_sidecar_cfg, cloud_mount_cfg = cloud_mount_cfg, None
+        elif isinstance(cloud_mount_cfg, dict) and not cloud_mount_cfg.get("protected"):
+            # The in-workspace path (a VM, a Pod without a recorded plan):
+            # what it left out is kept on a record of no Pod, so the session
+            # header names it. With nothing to mount, the folders reach the
+            # agent the way the sync driver's do, and the session folder is
+            # synced as whenever nothing mounts (main cloud, nothing missing
+            # silently).
+            left_out = list(cloud_mount_cfg.get("excluded") or [])
+            await cloud_mount_status.record_sync_exclusions(
+                postgres_db, thread_id, metadata, left_out
+            )
+            if not cloud_mount_cfg.get("mounts"):
+                cloud_folders_excluded, cloud_mount_cfg = left_out, None
         if cloud_mount_cfg or cloud_mount_sidecar_cfg:
             cloud_sync_cfg = None
         elif metadata.get("protected_cloud"):
@@ -1650,8 +1666,9 @@ async def agent_get_thread_workspace_locked(
         ),
         # True when cloud is up but no sync target resolved (Issue 13 follow-up).
         "cloud_sync_degraded": cloud_sync_degraded,
-        # The attached cloud folders this deployment's sync does not deliver
-        # (``delivery_unsupported``), for the agent's prompt.
+        # The attached cloud folders named while none mounts (the ones the
+        # sync driver does not deliver, ``delivery_unsupported``, or every
+        # one an in-workspace mount set left out), for the agent's prompt.
         "cloud_folders_excluded": (
             cloud_folders_excluded if final_protected_marker == "off" else []
         ),

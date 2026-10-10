@@ -24,7 +24,9 @@ Two writers, never more:
   driver (``CLOUD_WORKSPACE_DRIVER=sync``), which mounts nothing, the
   workspace delivery keeps a record of no Pod (``fingerprint: null``) whose
   ``excluded`` names every attached cloud folder the sync does not deliver
-  (:func:`record_sync_exclusions`);
+  (:func:`record_sync_exclusions`); on the in-workspace path (a VM, a Pod
+  without a recorded plan) the same record names what its mount set left
+  out;
 * the **agent**, after it reads the supervisor's status files: ``mounted``
   or ``unavailable`` with a reason (:func:`report_entries` checks every
   field against the plan and the closed reason set).
@@ -151,8 +153,9 @@ async def record_pod(
 def sync_status(
     excluded: list[Mapping[str, Any]], *, now: str | None = None
 ) -> dict[str, Any]:
-    """The record of a session under the sync driver: no Pod plan, no mount,
-    and every attached cloud folder the sync does not deliver."""
+    """A record of no Pod: no plan, no mount it tracks, and every attached
+    cloud folder that was left out (the sync driver's, or an in-workspace
+    mount set's), with the level it would have bound at once resolved."""
     return {
         "version": 1,
         "fingerprint": None,
@@ -163,7 +166,14 @@ def sync_status(
         "excluded": [
             {
                 key: entry.get(key)
-                for key in ("source_ref", "mount_kind", "reason", "detail", "title")
+                for key in (
+                    "source_ref",
+                    "mount_kind",
+                    "reason",
+                    "detail",
+                    "level",
+                    "title",
+                )
                 if entry.get(key)
             }
             for entry in excluded
@@ -177,9 +187,9 @@ async def record_sync_exclusions(
     metadata: Mapping[str, Any] | None,
     excluded: list[Mapping[str, Any]],
 ) -> None:
-    """Keep a sync-driver session's record current: written only when what
-    it names changed, removed when nothing is left out. Best effort, never
-    raises: the delivery it rides on must not fail."""
+    """Keep a record of no Pod current (:func:`sync_status`): written only
+    when what it names changed, removed when nothing is left out. Best
+    effort, never raises: the delivery it rides on must not fail."""
     setter = getattr(type(store), "set_thread_cloud_mount_status", None)
     if not callable(setter):
         return
@@ -200,7 +210,7 @@ async def record_sync_exclusions(
         await setter(store, thread_id, status)
     except Exception:
         logger.warning(
-            "Thread %s: could not record the cloud folders its sync does not deliver",
+            "Thread %s: could not record the cloud folders it left out",
             thread_id,
             exc_info=True,
         )

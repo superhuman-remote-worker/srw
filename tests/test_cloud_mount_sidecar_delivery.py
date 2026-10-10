@@ -314,14 +314,15 @@ async def _poll(
     cloud_sync: dict | None = None,
     thread_metadata: dict | None = None,
     session_folder: bool = True,
+    cloud_mount: dict | None = None,
 ) -> dict:
     """The real delivery under the application's composition, with the cloud
     payload of a sidecar Pod (``sidecar_pod``, by default under the mounting
-    driver); under the sync driver, with no mount, the connector folders it
-    does not deliver (``exclusions``), and the status record writes in
-    ``status_writes``. ``cloud_sync`` is what the sync builder answers,
-    ``thread_metadata`` joins the thread's, and ``session_folder`` says
-    whether it has one."""
+    driver) or else ``cloud_mount``, an in-workspace one; under the sync
+    driver, with no mount, the connector folders it does not deliver
+    (``exclusions``), and the status record writes in ``status_writes``.
+    ``cloud_sync`` is what the sync builder answers, ``thread_metadata``
+    joins the thread's, and ``session_folder`` says whether it has one."""
     import orchestrator.main as orch_main
     from orchestrator.application import preparation as preparation_composition
     from orchestrator.services import (
@@ -336,7 +337,9 @@ async def _poll(
     if sidecar_pod is None:
         sidecar_pod = driver == "rclone_mount"
     sidecar = (
-        agent_cloud_mounts.agent_payload(_plan().recorded()) if sidecar_pod else None
+        agent_cloud_mounts.agent_payload(_plan().recorded())
+        if sidecar_pod
+        else cloud_mount
     )
 
     async def write_status(_store, thread_id, status):
@@ -503,6 +506,75 @@ async def test_the_sync_driver_names_the_folders_it_does_not_deliver():
     # The mounting driver names nothing this way and writes no such record.
     writes.clear()
     response = await _poll("sidecar", status_writes=writes)
+    assert response["cloud_folders_excluded"] == [] and writes == []
+
+
+@pytest.mark.asyncio
+async def test_an_in_workspace_set_that_mounts_nothing_names_every_folder():
+    """On the in-workspace path (a VM, a Pod without a recorded plan) every
+    attached folder left out is still named: with nothing to mount they
+    reach the agent as the sync driver's do (no cloud_mount, the session
+    folder synced as whenever nothing mounts), and a record of no Pod keeps
+    them, each with the level it would have bound at, for the header."""
+    excluded = [
+        {
+            "source_ref": "00000000-0000-4000-8000-0000000000f1",
+            "mount_kind": "project",
+            "reason": "reader_unavailable",
+            "name": "acme_launch",
+            "detail": "not_ready",
+            "level": "read_only",
+            "title": "Acme Launch cloud folder",
+        }
+    ]
+    payload = {
+        "version": 1,
+        "driver": "rclone",
+        "cloud_root": "/cloud",
+        "workspace_entry": "cloud",
+        "fallback": False,
+        "required": False,
+        "mounts": [],
+        "excluded": excluded,
+    }
+    writes: list = []
+    response = await _poll(
+        "sidecar", sidecar_pod=False, cloud_mount=payload, status_writes=writes
+    )
+    assert response["cloud_mount"] is None and response["cloud_mount_sidecar"] is None
+    assert response["cloud_sync"] == {"version": 2, "mounts": []}
+    assert response["cloud_folders_excluded"] == excluded
+    [(thread_id, status)] = writes
+    assert thread_id == THREAD_ID
+    assert (status["fingerprint"], status["mounts"]) == (None, {})
+    assert status["excluded"] == [
+        {key: value for key, value in excluded[0].items() if key != "name"}
+    ]
+    # A set that mounts something is the agent's cloud_mount, and the
+    # record still names what it left out.
+    writes.clear()
+    outbox = {
+        "mount_id": "ob",
+        "mount_kind": "cloud_outbox",
+        "workspace_name": "outbox",
+    }
+    mixed = {**payload, "mounts": [outbox]}
+    response = await _poll(
+        "sidecar", sidecar_pod=False, cloud_mount=mixed, status_writes=writes
+    )
+    assert response["cloud_mount"]["mounts"] == [outbox]
+    assert response["cloud_sync"] is None and response["cloud_folders_excluded"] == []
+    assert [status["excluded"][0]["reason"] for _, status in writes] == [
+        "reader_unavailable"
+    ]
+    # Everything mounted: nothing to record.
+    writes.clear()
+    response = await _poll(
+        "sidecar",
+        sidecar_pod=False,
+        cloud_mount={**payload, "mounts": [outbox], "excluded": []},
+        status_writes=writes,
+    )
     assert response["cloud_folders_excluded"] == [] and writes == []
 
 

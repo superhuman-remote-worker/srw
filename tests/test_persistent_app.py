@@ -4712,6 +4712,48 @@ class TestHandleWorkspaceUpgradeVm:
         client.abort_thread_vm_upgrade.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_a_vm_that_mounts_no_folder_names_each_one_after_the_swap(self):
+        """Every attached folder left out on the new VM (main cloud): no
+        mount payload, so nothing remounts, and the prompt names each folder
+        the orchestrator listed rather than keeping the sandbox's set."""
+        import sys
+
+        ws = AsyncMock()
+        client = AsyncMock()
+        client.request_thread_workspace_upgrade.return_value = (True, None)
+        excluded = [{"source_ref": "c-1", "mount_kind": "project", "reason": "x"}]
+        client.get_thread_workspace.return_value = {
+            "cloud_mount": None,
+            "cloud_folders_excluded": excluded,
+        }
+        sess = self._session_with_backend(
+            SimpleNamespace(supports_shell=True, sudo_action="freeze")
+        )
+        sess.swap_backend = MagicMock()
+        sess.resetup_tools_for_backend = MagicMock()
+        sess._setup_cloud_mount = AsyncMock()
+        sess._note_undelivered_cloud_folders = MagicMock()
+        with (
+            patch("agent.api.persistent_app._session", sess),
+            patch("agent.api.persistent_app._orchestrator_client", client),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
+            patch(
+                "agent.api.persistent_app._poll_vm_ready",
+                new_callable=AsyncMock,
+                return_value={"ssh_host": "100.64.0.9", "ssh_port": 22},
+            ),
+            patch.dict(
+                sys.modules, {"shared.runtime.core.backends.remote": MagicMock()}
+            ),
+            patch("agent.core.backends.seed.seed_workspace", return_value=7),
+        ):
+            await _handle_workspace_upgrade(ws, target_tier="vm")
+
+        sess._setup_cloud_mount.assert_not_awaited()
+        sess._note_undelivered_cloud_folders.assert_called_once_with(excluded)
+        client.abort_thread_vm_upgrade.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_the_backend_swap_waits_for_a_live_connector_change(self):
         """live_connector_add_clones_on_the_event_loop: a live change clones
         its checkouts off the event loop onto the current backend; the seed

@@ -569,8 +569,8 @@ class PersistentSession:
         #    exists when the agent starts using the workspace.
         await self._setup_cloud_mount(cloud_mount_cfg)
         if not cloud_mount_cfg:
-            # A deployment that syncs files instead of mounting them delivers
-            # no cloud folder; the orchestrator names each one attached.
+            # No cloud folder mounts (a deployment that syncs files instead,
+            # or every attached folder left out); the orchestrator names each.
             self._note_undelivered_cloud_folders(
                 (workspace_override or {}).get("cloud_folders_excluded")
             )
@@ -1228,11 +1228,13 @@ class PersistentSession:
         await self._finish_protected_cloud(cloud_mount_cfg)
 
     def _note_undelivered_cloud_folders(self, excluded: Any) -> None:
-        """Name in the prompt each attached cloud folder this deployment's
-        sync does not deliver (``delivery_unsupported``, main cloud), so the
-        agent never says work is saved where nothing is mounted. Not for a
-        background officer, whose cloud is object plane, nor a protected
-        session, whose cloud has its own contract."""
+        """Name in the prompt each attached cloud folder the orchestrator
+        lists while none mounts (``cloud_folders_excluded``, main cloud): the
+        ones this deployment's sync does not deliver
+        (``delivery_unsupported``), or every one an in-workspace mount set
+        left out, so the agent never says work is saved where nothing is
+        mounted. Not for a background officer, whose cloud is object plane,
+        nor a protected session, whose cloud has its own contract."""
         if (
             not isinstance(excluded, list)
             or not excluded

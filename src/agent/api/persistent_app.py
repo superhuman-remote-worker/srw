@@ -11545,6 +11545,12 @@ async def _handle_workspace_upgrade(
                             "reason": _session.cloud_mount_error or "mount inactive",
                         },
                     )
+            elif _ws_info:
+                # Nothing mounts on the new runtime: each attached folder it
+                # left out is named in the prompt, not the old runtime's set.
+                _session._note_undelivered_cloud_folders(
+                    _ws_info.get("cloud_folders_excluded")
+                )
         except Exception as e:
             logger.warning(
                 f"Cloud remount after upgrade failed ({_session_identity.thread_id}): {e}"

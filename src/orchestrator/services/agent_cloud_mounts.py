@@ -1450,7 +1450,9 @@ async def _build_agent_cloud_mount(
 
     Each attached cloud connector mounts on its own
     (:func:`_resolve_live_mount_set`); the ones that cannot are named in
-    ``excluded``. A session created before the connector rule converts once
+    ``excluded``; when every one was, the payload has no mount and names
+    them all, so none goes missing silently (End's reconstruction gets no
+    payload then). A session created before the connector rule converts once
     here (``session_cloud_preparation.convert_to_connector_rule``) when its
     workspace has no recorded plan. A terminal token selects the narrower
     End-only reconstruction gate; it does not widen normal runtime delivery,
@@ -1561,7 +1563,9 @@ async def _build_agent_cloud_mount(
             runtime_is_vm=runtime_is_vm,
             dependencies=dependencies,
         )
-    if not live.mounts:
+    if not live.mounts and (
+        legacy or terminal_retirement_token is not None or not live.excluded
+    ):
         return None
 
     payload: dict[str, Any] = {
