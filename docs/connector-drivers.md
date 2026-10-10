@@ -209,7 +209,13 @@ The rules SRW applies when you register:
   must store a `required` slot.
 - **`access_levels`** say what `ReadOnly` and `ReadWrite` mean for your
   driver, and `enforced_by` says what makes each true. Mark a level `advisory`
-  when nothing enforces it.
+  when nothing enforces it. A binding gets one level: your lowest-ranked when
+  the connector is read-only for that execution (its project link or its
+  creator's tag says so); otherwise the level the connector's config names,
+  when your `config_schema` has an `access` property, else your
+  `default_access`, else your highest. A level your driver doesn't have binds
+  at your lowest, so rank the most restrictive level lowest. (SRW's own cloud
+  drivers follow a stricter rule; see [Platform drivers](#platform-drivers).)
 - **`supported_backends`** is a subset of `sandbox` and `vm`: what your driver
   returns goes into a shell workspace.
 - **`egress`** lists the hosts your driver's pod connects to; see
@@ -577,6 +583,110 @@ mcpb packages, remote servers and secret environment variables are refused
 with the reason. In this release an imported server is registered and listed;
 binding its connectors comes with the service plane's support for
 registrations.
+
+## Platform drivers
+
+SRW's main-cloud drivers use three spec fields that a registered spec can't
+set in this release (they are refused as unknown keys, like any other):
+`writes` on an access level, `executions` and `user_creatable`.
+`GET /api/datasources/drivers` lists them like every other driver.
+
+### Strict access levels
+
+A level may say what it lets through to the upstream: `writes` is `none`,
+`reviewed` (writes land only once their owner reviewed them) or `direct`. A
+spec declares it on every level or on none. A spec whose levels all declare
+it is *strict*, and its bindings follow a stricter rule than the one in
+step 1:
+
+- A read-only binding takes the lowest offered level that writes nothing.
+  When none is offered, the connector is refused (`read_only_unavailable`),
+  never bound at a level that writes.
+- A level that isn't offered here is refused (`level_not_offered`), never
+  mapped onto the lowest.
+
+A strict driver may narrow its levels per connector and execution: the
+folder's provider, the workspace tier, an officer's session, the
+installation's protected switch. The eligible list
+(`GET /api/datasources/eligible?execution=session&workspace_backend=sandbox`)
+gives each strict connector an `access` object: every level, whether it is
+offered and why not, the level it gets when nobody chooses one and where
+that came from, and the ceiling.
+
+### Choosing a level per execution
+
+A strict connector's level is resolved once, when the execution is
+created, from:
+
+1. **The level the Session asks for**: `datasource_access`
+   (`{"<connector id>": "<level>"}`) on `POST /api/persistent/threads`, or
+   `execution.connectors.<alias>.access`. It binds as asked, or the Session
+   is refused with 422 `connector_access_unavailable` and a closed reason
+   (`level_not_offered`, `above_ceiling`, `read_only_unavailable`,
+   `no_level_offered`); naming a connector the Session doesn't attach is 422
+   `connector_access_not_selected`. A Job and a manifest execution bind at
+   the link's level and refuse the field (422 `connector_access_unsupported`;
+   `UnsupportedField`).
+2. **Otherwise the project link's default**: `access` on
+   `PATCH /api/projects/<project>/datasources/<connector>` (project owners;
+   `null` clears it). A strict driver's link takes a level its driver offers
+   the connector on some tier (422 `link_access_not_offered`) and refuses
+   `read_only` (`link_access_is_a_level`); any other driver's link refuses a
+   level (`link_access_not_a_level`) and keeps `read_only`.
+3. **Otherwise** the config's level (where the schema has `access`), the
+   driver's `default_access`, else its highest offered level.
+
+A ceiling caps the result: a viewer of a cloud folder's project gets at most
+the highest level that writes nothing. A level asked for is never changed,
+so one above the ceiling is refused. A default is only ever lowered, to the
+highest allowed level below it, and is refused when there is none; it is
+never raised. The execution records each level and where it came from, and
+every later attach asks for the same level.
+
+### Executions and platform-owned connectors
+
+`executions` names what a connector of the driver attaches to: `job`,
+`session`, or both (the default). The eligible list takes
+`?execution=session|job` and leaves out what that kind can't attach. A
+request that names one anyway is refused with the reason, a Job that
+inherits a Session's selection drops it, and no Job's defaults hold one.
+
+`user_creatable: false` marks a driver whose connectors only SRW creates,
+for what it provisions itself: the API refuses to create one and no
+catalogue offers it. SRW keeps each such connector under a stable
+`managed_key`, `<kind>:<uuid>`:
+
+| Kind | The uuid names | The connector |
+| --- | --- | --- |
+| `project-kb` | a project | Its knowledge base |
+| `project-cloud` | a project | Its folder in the main cloud |
+| `project-cloud-checkout` | a project | Its folder, copied into a Job |
+| `user-cloud-root` | a user | Their own cloud root, "My cloud" |
+| `cloud-outbox` | a user | Their outbox |
+
+A project kind is in scope for, and a default of, that project's work. A
+user kind is its user's alone: only their work attaches it, whoever else can
+see it. Anyone allowed may attach a platform-owned connector, but the API
+refuses to edit, delete, link, unlink or re-point it (409, naming who manages
+it); a project owner may still set its project link's default level. A
+project's go with the project, a user's with their account.
+
+### The main cloud's drivers
+
+| Driver | Stored type | Plane, form | Levels (`writes`) | Executions |
+| --- | --- | --- | --- | --- |
+| `srw.cloud-folder/v1` | `cloud_folder` | `in_pod`, `cloud_mount` | `read_only` (none), `protected` (reviewed), `read_write` (direct) | sessions |
+| `srw.cloud-outbox/v1` | `cloud_outbox` | `in_pod`, `cloud_mount` | `read_write` (direct) | jobs and sessions |
+| `srw.cloud-folder-checkout/v1` | `cloud_folder_checkout` | `bind_time`, `cloud_checkout` | `read_only` (none), `reviewed_write_back` (reviewed) | jobs |
+
+None reaches the agent as a connector: no payload entry, no tools, no
+credential. The mount, or the copy, is the delivery. Their config names a
+folder, never a credential, and the outbox's names nothing: its folder is
+the execution's. Live attach is off, so a change takes effect at the next
+start. A spec's levels are the union of what any provider enforces; each
+connector is offered only what its provider declares for it on the
+workspace's tier. See [Cloud folders](cloud-folders.md) for what each one
+does and the provider support matrix.
 
 ## When it doesn't work
 

@@ -119,12 +119,13 @@ profile blocks fail too. Use a VM workspace for that, or turn the plane off.
 
 A Pod that gets no sidecar mount keeps today's profile, FUSE and seccomp
 included: with nothing to mount (the main cloud off, say) it gets no plan at
-all; when every folder was left out (an unbuildable session folder, say) its
-plan only names them, so the Session can say why.
+all; when every folder was left out (none has its account yet, say) its plan
+only names them, so the Session can say why.
 
 These keep the old in-workspace path and `workspace.fuse`:
 
-- Jobs.
+- Jobs, which mount no cloud folder: a Job gets its project's folder as a
+  copy in its repository.
 - VM and lite workspaces.
 - Officer sessions.
 - OpenCloud folders, whose bearer tokens the agent refreshes.
@@ -169,6 +170,81 @@ mount, a dead rclone) with uploads still in its cache holds End back, and
 End can be retried. When the folder is gone or refuses its credential,
 retrying can't help: End goes ahead and logs how many uploads were lost, and
 the supervisor's termination message says so when the Pod stops.
+
+### Cloud folders and their credentials
+
+Each cloud folder a Session mounts is a connector with one folder, one
+credential and one access level (see [Cloud folders](cloud-folders.md)). What
+that credential can reach is the boundary. SRW assists read-only; it never
+guarantees it.
+
+- **Read-only is the credential's job.** A Nextcloud project folder at
+  `read_only` mounts as a reader account of its own, one per folder and
+  project member, whose group the folder grants read permission only. It
+  becomes active only after a read-only probe passes as that account. SRW
+  never passes off an rclone `--read-only` flag on a credential that can
+  write as read-only: where no reader exists (OpenCloud), the level is not
+  offered, and a binding that may only read gets no folder.
+- **Project folders never mount as the service account** on Nextcloud. A
+  `read_write` folder mounts as a writer account per folder and member, which
+  may read, change, create and delete in that folder, never share, and can't
+  reach another project's folder. Without its account the folder is left out
+  (`grant_unavailable`, `reader_unavailable`); it never falls back to
+  `agent-service`. The accounts are revoked when the project is deleted, the
+  member leaves (or, for the writer, becomes a viewer), the connector goes,
+  the user is deleted or the installation changes; a sweep retries revokes
+  and removes half-made accounts.
+- **What still uses a service account**, plainly:
+  - Nextcloud's session outbox lives in `agent-service`'s home, and a Session
+    mounts it with `agent-service`'s password. That account is a member of
+    the group every project Group Folder grants, so it can still write every
+    project folder; the outbox is therefore not offered on a VM.
+  - The orchestrator's own work on Nextcloud project folders runs as
+    `agent-service`: a Job's folder copy and its reviewed write-back, a
+    protected Session's approved apply, and the canary file a reader's
+    read-only probe tries to change.
+  - OpenCloud reaches every project folder and outbox with the orchestrator's
+    Keycloak service account, a member of every project Space. A Session's
+    workspace holds its short-lived tokens, which reach every project Space
+    while they last.
+- **Where a credential sits.** With the in-pod plane, a folder's credential
+  reaches only the mount sidecar. On a VM (Nextcloud `read_only` only) the
+  reader's password is in the guest's rclone config, where it can read that
+  one folder. Where a Session mounts inside its workspace (the plane off, an
+  officer Session, OpenCloud), every folder's credential is in the
+  workspace; on Nextcloud that includes the outbox's `agent-service`
+  password.
+- **Protected is a connector level.** At most one folder per Session is
+  bound at `protected`, and that Session mounts only it: every other
+  attached cloud folder is left out as `beside_protected`, never mounted
+  beside it. The folder is frozen when the Session is created. The protected
+  lower layer is engaged only when the Session's owner is an owner or editor
+  of the folder's project, and applying a reviewed change requires the
+  person applying it to be one (403 `protected_cloud_apply_not_member`, an
+  administrator outside the project included).
+- **My cloud is one user's app password with full access.** Nextcloud's
+  Login Flow v2 has the user sign in to their own cloud and grant SRW an app
+  password. SRW keeps it only when the account's e-mail is the user's, the
+  account is enabled and doesn't administer the cloud, and the password reads
+  its files; any refusal revokes it at once. It can be limited neither to
+  read-only nor to one folder, so it is offered at full access only, and
+  only the owner's own Sessions attach it: no administrator or other member
+  of the personal project can. It is stored encrypted on the connector and
+  never logged, revoked when the user disconnects or their account is
+  deleted, and a probe before each new workspace Pod notices a revocation in
+  the cloud.
+- **Only SRW creates cloud folder connectors.** A folder handle someone
+  could point would mount with the main cloud's credential, so the API
+  refuses the types. The older connectors that held a service account's
+  credential to a whole cloud home ("Cloud Storage (Personal)", and the
+  bundled Nextcloud row at `admin`'s home) are deleted at startup.
+- **An explicit empty connector list means no connectors.** No folder
+  mounts and no connector binds. The project's knowledge base stays
+  reachable as project memory, which follows project membership, not the
+  connector list.
+- **Nothing takes a failed folder's place.** A folder that can't be bound
+  is shown left out, with the reason, and the others mount anyway; SRW
+  mounts no other folder in its stead.
 
 ## Defense in depth
 
