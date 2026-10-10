@@ -3,7 +3,7 @@ import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {AppButtonComponent} from '../../ui/button';
 import {AppBadgeComponent, type BadgeTone} from '../../ui/badge';
-import {CloudRootService} from '../../core/services/cloud-root.service';
+import {CloudRootService, isWebPage} from '../../core/services/cloud-root.service';
 import {CloudRootStatus} from '../../core/models/api.model';
 
 const FAILURES = new Set([
@@ -82,7 +82,7 @@ export function cloudRootDetail(status: CloudRootStatus): {key: string; params?:
               {{ line.key | transloco: line.params ?? {} }}
             </p>
           }
-          @if (s.state === 'connecting' && s.connecting) {
+          @if (s.state === 'connecting' && s.connecting && isWebPage(s.connecting.login_url)) {
             <a class="cloud-root__link" [href]="s.connecting.login_url" target="_blank" rel="noopener noreferrer" data-cloud-root-login>
               {{ 'cloudRoot.openLogin' | transloco }}
             </a>
@@ -159,6 +159,8 @@ export function cloudRootDetail(status: CloudRootStatus): {key: string; params?:
 export class CloudRootCardComponent implements OnInit {
   readonly cloudRoot = inject(CloudRootService);
   private readonly transloco = inject(TranslocoService);
+  /** The sign-in link is shown only for an http(s) page. */
+  protected readonly isWebPage = isWebPage;
 
   readonly status = this.cloudRoot.status;
 

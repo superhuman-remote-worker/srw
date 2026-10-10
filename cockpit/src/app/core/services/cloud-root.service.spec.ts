@@ -3,7 +3,7 @@ import {HttpErrorResponse} from '@angular/common/http';
 import {of, throwError} from 'rxjs';
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {ApiService} from './api.service';
-import {CLOUD_ROOT_POLL_MS, CloudRootService} from './cloud-root.service';
+import {CLOUD_ROOT_POLL_MS, CloudRootService, isWebPage} from './cloud-root.service';
 import {CloudRootStatus} from '../models/api.model';
 
 function status(over: Partial<CloudRootStatus> = {}): CloudRootStatus {
@@ -110,6 +110,32 @@ describe('CloudRootService', () => {
     expect(tab.close).toHaveBeenCalled();
     expect(service.actionError()).toBe('cloudRoot.errors.unsupported');
     expect(service.status()?.reason).toBe('grant_mode_off');
+  });
+
+  it.each(['javascript:alert(1)', 'data:text/html,hi', '/relative/login', ''])(
+    'never sends the tab to a sign-in page that is not a web page (%s)',
+    (loginUrl) => {
+      api['connectCloudRoot'].mockReturnValue(of({
+        state: 'connecting',
+        connector_id: 'root-1',
+        login_url: loginUrl,
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+      }));
+      const service = make();
+      service.connect();
+      expect(tab.location.href).toBe('');
+      expect(tab.close).toHaveBeenCalled();
+      expect(service.actionError()).toBe('cloudRoot.errors.startFailed');
+      expect(service.busy()).toBe(false);
+    },
+  );
+
+  it('opens only http(s) pages', () => {
+    expect(isWebPage('https://cloud.example/login')).toBe(true);
+    expect(isWebPage('http://cloud.localhost/login')).toBe(true);
+    expect(isWebPage('javascript:alert(1)')).toBe(false);
+    expect(isWebPage('not a url')).toBe(false);
+    expect(isWebPage(null)).toBe(false);
   });
 
   it('says the cloud could not start the connection', () => {

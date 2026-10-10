@@ -174,6 +174,24 @@ class NextcloudUserRootGrant:
         path = public.path.rstrip("/") + path
         return urlunsplit((public.scheme, public.netloc, path, page.query, ""))
 
+    def _on_public_host(self, url: str) -> bool:
+        """Whether ``url`` is an http(s) page of the main cloud's public
+        host (same host and port): the only page SRW sends a user to."""
+        try:
+            page, public = urlsplit(url), urlsplit(self._public_url or self._base_url)
+            page_port, public_port = page.port, public.port
+        except ValueError:
+            return False
+        defaults = {"http": 80, "https": 443}
+        return (
+            page.scheme in defaults
+            and public.scheme in defaults
+            and bool(page.hostname)
+            and page.hostname == public.hostname
+            and (page_port or defaults[page.scheme])
+            == (public_port or defaults[public.scheme])
+        )
+
     @staticmethod
     def _ocs_data(resp: httpx.Response) -> dict[str, Any]:
         try:
@@ -206,9 +224,15 @@ class NextcloudUserRootGrant:
             raise self._error(
                 CloudBackendErrorKind.UNKNOWN, "login flow start: unexpected answer"
             )
-        return LoginFlowStart(
-            login_url=self._public_page_url(login_url), poll_token=poll_token
-        )
+        login_url = self._public_page_url(login_url)
+        if not self._on_public_host(login_url):
+            # The page a user signs in on: never another host or scheme,
+            # whatever the cloud (or something in front of it) answered.
+            raise self._error(
+                CloudBackendErrorKind.UNKNOWN,
+                "login flow start: the sign-in page is not on the cloud's public host",
+            )
+        return LoginFlowStart(login_url=login_url, poll_token=poll_token)
 
     async def poll_login_flow(self, poll_token: str) -> Optional[LoginFlowGrant]:
         """Polled on the internal URL, never the ``poll.endpoint`` Nextcloud

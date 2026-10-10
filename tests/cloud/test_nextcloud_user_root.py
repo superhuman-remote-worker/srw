@@ -185,6 +185,54 @@ async def test_the_flow_starts_as_the_device_and_opens_the_public_page(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "login",
+    [
+        "javascript:alert(1)",
+        "data:text/html,<script>alert(1)</script>",
+        "https://evil.example/login/v2/flow/LOGIN-TOKEN",
+        "https://cloud.example.com.evil.example/login/v2/flow/X",
+        "https://cloud.example.com:8443/login/v2/flow/X",
+        "http://cloud.example.com/login/v2/flow/X",
+        "ftp://cloud.example.com/login/v2/flow/X",
+        "https://cloud.example.com:99999/login",
+        "//cloud.example.com/login/v2/flow/X",
+    ],
+)
+async def test_a_sign_in_page_off_the_public_host_is_refused(
+    host: Host, fake: FakeNc, login: str
+) -> None:
+    fake.fail["/index.php/login/v2"] = httpx.Response(
+        200, json={"poll": {"token": POLL}, "login": login}
+    )
+    with pytest.raises(CloudBackendError) as caught:
+        await host.start_login_flow()
+    assert "public host" in str(caught.value)
+    assert POLL not in str(caught.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "login",
+    [
+        # Already on the public host (overwritehost), any case, default port.
+        "https://cloud.example.com/login/v2/flow/X",
+        "https://CLOUD.example.com:443/login/v2/flow/X",
+        # The internal host, rewritten to the public one.
+        "http://srw-nextcloud/login/v2/flow/X",
+    ],
+)
+async def test_a_sign_in_page_on_the_public_host_is_kept(
+    host: Host, fake: FakeNc, login: str
+) -> None:
+    fake.fail["/index.php/login/v2"] = httpx.Response(
+        200, json={"poll": {"token": POLL}, "login": login}
+    )
+    started = await host.start_login_flow()
+    assert started.login_url.lower().startswith(NC_PUBLIC)
+
+
+@pytest.mark.asyncio
 async def test_a_poll_answers_nothing_until_the_user_finished(
     host: Host, fake: FakeNc
 ) -> None:

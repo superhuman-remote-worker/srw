@@ -57,6 +57,14 @@ export class CloudRootService {
     this.api.connectCloudRoot().subscribe({
       next: (start) => {
         this.busy.set(false);
+        if (!isWebPage(start.login_url)) {
+          // Never send the tab anywhere but a web page (the server checks
+          // the host; this keeps any other scheme out of the tab).
+          tab?.close();
+          this.actionError.set('cloudRoot.errors.startFailed');
+          this.load();
+          return;
+        }
         const before = this.status();
         this.apply({
           ...(before ?? emptyStatus()),
@@ -150,6 +158,18 @@ export class CloudRootService {
       clearTimeout(this.pollTimer);
       this.pollTimer = null;
     }
+  }
+}
+
+/** Whether `url` is an absolute http(s) URL: the only kind of page the
+ *  cloud's sign-in may be. */
+export function isWebPage(url: unknown): url is string {
+  if (typeof url !== 'string') return false;
+  try {
+    const {protocol} = new URL(url);
+    return protocol === 'https:' || protocol === 'http:';
+  } catch {
+    return false;
   }
 }
 

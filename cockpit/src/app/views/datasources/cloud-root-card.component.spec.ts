@@ -115,6 +115,15 @@ describe('CloudRootCardComponent', () => {
     expect(link.getAttribute('rel')).toContain('noopener');
   });
 
+  it('shows no sign-in link for anything but a web page', async () => {
+    const {root} = await render(status({
+      state: 'connecting',
+      connecting: {login_url: 'javascript:alert(1)', expires_at: '2026-10-10T23:00:00Z'},
+    }));
+    expect(actions(root)).toEqual(['cancel']);
+    expect(root.querySelector('[data-cloud-root-login]')).toBeNull();
+  });
+
   it('names the account it is connected as, and offers Disconnect behind a confirm', async () => {
     const {root, fixture, service} = await render(status({state: 'connected', account_id: 'alice'}));
     expect(actions(root)).toEqual(['disconnect']);
