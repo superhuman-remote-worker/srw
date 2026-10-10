@@ -352,6 +352,10 @@ GET    /api/mcp-tokens                                                          
 POST   /api/mcp-tokens                                                                  pat=refused         gated:require_approved_user
 DELETE /api/mcp-tokens/{token_id}                                                       pat=refused         gated:require_approved_user
 GET    /api/me/active-jobs                                                              pat=jobs:read       gated:require_approved_user
+DELETE /api/me/cloud-root                                                               pat=admin           gated:require_approved_user
+GET    /api/me/cloud-root                                                               pat=admin           gated:require_approved_user
+DELETE /api/me/cloud-root/connect                                                       pat=admin           gated:require_approved_user
+POST   /api/me/cloud-root/connect                                                       pat=admin           gated:require_approved_user
 POST   /api/media/remote-image                                                          pat=admin           gated:require_approved_user
 GET    /api/models                                                                      pat=jobs:read       gated:require_approved_user
 POST   /api/models/reload                                                               pat=admin           admin:_require_admin

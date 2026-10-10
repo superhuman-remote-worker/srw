@@ -49,6 +49,7 @@ from orchestrator.routers import (
     canvases_router,
     capacity as capacity_routes,
     citations as citations_routes,
+    cloud_user_root as cloud_user_root_routes,
     config_catalog as config_catalog_routes,
     connector_drivers as connector_drivers_routes,
     datasources as datasources_routes,
@@ -363,6 +364,13 @@ def bind_router_dependencies(app: FastAPI, resources: ApplicationResources) -> N
         role_base=lambda role: expert_catalog.role_base_or_empty(role),
         environ=os.environ,
     )
+    app.state.cloud_user_root_dependencies_factory = lambda: (
+        cloud_user_root_routes.CloudUserRootDependencies(
+            store=resources.postgres_db,
+            cloud_router=resources.main_cloud_router,
+            flows=resources.cloud_root_connect_flows,
+        )
+    )
     app.state.bench_dependencies_factory = lambda: jobs_composition.bench_dependencies(
         resources
     )
@@ -465,6 +473,7 @@ def include_routers(app: FastAPI) -> None:
     app.include_router(agent_cloud_stage_routes.router)
     app.include_router(thread_cloud_diff_routes.router)
     app.include_router(main_cloud_settings_routes.router)
+    app.include_router(cloud_user_root_routes.router)
     app.include_router(agent_thread_workspace_routes.router)
     app.include_router(agent_git_swap_routes.router)
     app.include_router(job_assignment_routes.router)

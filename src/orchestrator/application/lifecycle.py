@@ -33,6 +33,7 @@ from orchestrator.services import (
     agent_provisioner as agent_provisioner_module,
     canvas_office,
     cloud_outbox_connectors,
+    cloud_user_root,
     container_provisioner as container_provisioner_module,
     default_experts,
     docker_provisioner as docker_provisioner_module,
@@ -381,6 +382,19 @@ async def bind_services(resources: ApplicationResources) -> None:
                 "next start",
                 exc_info=True,
             )
+        # Every approved user whose main cloud has user roots has their own
+        # "My cloud" (main cloud slice 4), re-pointed when the installation
+        # changed; idempotently on every replica (the key is unique).
+        try:
+            await cloud_user_root.backfill_user_root_connectors(
+                resources.postgres_db, resources.main_cloud_router
+            )
+        except Exception:
+            logger.error(
+                "User cloud root connectors backfill failed; it retries at the "
+                "next start",
+                exc_info=True,
+            )
         if _legacy_overlay is not None:
             try:
                 await resources.postgres_db.delete_system_setting("main_cloud")
@@ -658,7 +672,8 @@ async def stop_application(
     3. attach-abort successor provisioning (``attach_abort_successor_tasks``);
     4. stateless workspace reconciles (``stateless_workspace_ensure_registry``);
     5. late session-folder provisioning (``late_cloud_setup_tasks``);
-    6. protected-cloud engages and cloud stages (``cloud_task_registry``);
+    6. protected-cloud engages and cloud stages (``cloud_task_registry``),
+       then "Connect your cloud" flows (``cloud_root_connect_flows``);
     7. background project repairs (``project_repair_state``);
     8. provider mints still running (C5,
        ``connector_minted_credentials.settle_background_mints``), waited for
@@ -706,6 +721,10 @@ async def stop_application(
             lambda: drain_task_mapping(resources.late_cloud_setup_tasks),
         ),
         ("cloud engage and stage tasks", lambda: resources.cloud_task_registry.drain()),
+        (
+            "cloud root connect flows",
+            lambda: resources.cloud_root_connect_flows.drain(),
+        ),
         ("background project repairs", lambda: resources.project_repair_state.drain()),
         (
             "provider mints",

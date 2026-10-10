@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from orchestrator.services.cloud import MainCloudRouter
     from orchestrator.services.cloud_pricing import CloudCostEstimator
     from orchestrator.services.cloud_task_registry import CloudTaskRegistry
+    from orchestrator.services.cloud_user_root import CloudRootConnectFlows
     from orchestrator.services.completion_runtime import (
         CompletionAlerts,
         CompletionControlBoundary,
@@ -60,6 +61,12 @@ if TYPE_CHECKING:
     from orchestrator.services.usage_rollup import UsageRollup
 
 T = TypeVar("T")
+
+
+def _cloud_root_connect_flows() -> CloudRootConnectFlows:
+    from orchestrator.services.cloud_user_root import CloudRootConnectFlows
+
+    return CloudRootConnectFlows()
 
 
 @dataclass(eq=False)
@@ -113,6 +120,11 @@ class ApplicationResources:
     #: The installed connector drivers; services receive it through their
     #: dependency dataclasses.
     connector_drivers: ConnectorDriverRegistry
+    #: "Connect your cloud" flows in flight, at most one per user (main cloud
+    #: slice 4); drained at shutdown.
+    cloud_root_connect_flows: CloudRootConnectFlows = field(
+        default_factory=_cloud_root_connect_flows
+    )
 
     # -- completion: one runtime and one control boundary per application,
     # wired right after construction because their callbacks close over this

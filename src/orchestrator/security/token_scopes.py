@@ -255,6 +255,8 @@ _RULES: tuple[_Rule, ...] = (
     # -- Account and operator surfaces the vocabulary does not name ---------
     _prefix("/api/users", _ADMIN),
     _prefix("/api/settings", _ADMIN),
+    # A user's own cloud root: connecting it grants SRW their whole account.
+    _prefix("/api/me/cloud-root", _ADMIN),
     _prefix("/api/contacts", _ADMIN),
     _prefix("/api/notifications", _ADMIN),
     _prefix("/api/media", _ADMIN),
