@@ -102,6 +102,10 @@ FOLDER_KIND_TEXT = {
     "session_folder": "this session's folder in the main cloud",
     "project_default": "the user's home in the main cloud",
 }
+#: Said of a folder mounted at the ``read_only`` level (main cloud slice
+#: 5): its own account may only read it, so a write fails rather than
+#: being refused later.
+READ_ONLY_TEXT = "read-only: its account may only read this folder, writes fail"
 #: Said of an outbox SRW could not share with the user yet.
 UNSHARED_OUTBOX_TEXT = (
     "the user can't see it yet: they need to sign in to the cloud once"
@@ -116,7 +120,7 @@ def describe_mounted(
     text = FOLDER_KIND_TEXT.get(mount_kind, "a folder in the main cloud")
     if mount_kind == "cloud_outbox" and shared is False:
         text = f"{text}; {UNSHARED_OUTBOX_TEXT}"
-    return f"{text} ({'read-only' if access == 'read_only' else 'read-write'})"
+    return f"{text} ({READ_ONLY_TEXT if access == 'read_only' else 'read-write'})"
 
 
 def excluded_row(entry: dict[str, Any]) -> dict[str, str]:
@@ -459,7 +463,7 @@ class SidecarMountWatcher:
         shared = self.cloud_cfg.get("outbox_shared")
         for row, mount in zip(self.report(), self.planned):
             where = self.path_of(mount)
-            access = "read-only" if mount.access == "read_only" else "read-write"
+            access = READ_ONLY_TEXT if mount.access == "read_only" else "read-write"
             what = FOLDER_KIND_TEXT.get(mount.mount_kind, "a folder in the main cloud")
             if row["state"] == "mounted":
                 note = (

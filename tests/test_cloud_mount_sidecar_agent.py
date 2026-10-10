@@ -1049,3 +1049,15 @@ def test_an_in_workspace_mount_set_is_named_for_the_prompt_too():
     assert updated is not config and config.extra == {"k": 1}
     assert updated.extra["_cloud_mounts_mounted"] == mounted
     assert _config_with_cloud_folders(config, [], []) is config
+
+
+def test_a_read_only_folder_tells_the_agent_its_writes_fail():
+    """Main cloud slice 5: a folder at the read_only level is its own
+    reader account's, so the agent is told a write fails, not that it is a
+    plain read-only view."""
+    from shared.runtime.services.cloud_mount.sidecar import describe_mounted
+
+    assert describe_mounted("project", "read_only").endswith(
+        "(read-only: its account may only read this folder, writes fail)"
+    )
+    assert describe_mounted("project", "read_write").endswith("(read-write)")
