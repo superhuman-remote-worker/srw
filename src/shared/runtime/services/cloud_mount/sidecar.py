@@ -56,7 +56,7 @@ REASON_TEXT = {
     "unreachable": "the cloud could not be reached",
     "timeout": "the cloud did not answer in time",
     "mount_failed": "the folder could not be mounted",
-    "config_missing": "its credential never reached the workspace",
+    "config_missing": "its credential never reached the cloud mount service",
     "sidecar_unavailable": "the workspace's cloud mount service is not running",
     "unbuildable": "it could not be prepared for this session",
     "set_fallback": "another folder of this session could not be prepared",
@@ -144,6 +144,11 @@ class SidecarMountWatcher:
             self.cloud_cfg.get("control_dir") or "/srw/cloud-control"
         )
         self.wait_seconds = float(self.cloud_cfg.get("wait_seconds") or 30)
+        # The Pod's UID: the orchestrator keeps a report only for this Pod.
+        self.runtime_incarnation = str(self.cloud_cfg.get("runtime_incarnation") or "")
+        # The orchestrator's record already saw every folder settle (a
+        # re-attach, e.g. a stateless claim): read once, never wait again.
+        self.settled_before = self.cloud_cfg.get("settled") is True
         self.drain_seconds = float(self.cloud_cfg.get("drain_seconds") or 60)
         self.skip_links = bool(self.cloud_cfg.get("skip_workspace_links"))
         self.excluded = [
@@ -167,6 +172,9 @@ class SidecarMountWatcher:
         self._seen: dict[int, dict[str, Any]] = {}
         self._settled = False
         self._monitor: asyncio.Task | None = None
+        # Set when a protected session runs without its cloud (decision 42):
+        # every planned mount reports unavailable with this reason.
+        self._unavailable_reason: str | None = None
 
     # ------------------------------------------------------------- the reads
 
@@ -261,6 +269,17 @@ class SidecarMountWatcher:
             and self._seen.get(mount.index, {}).get("live")
         ]
 
+    def mark_unavailable(self, reason: str) -> None:
+        """Report every planned mount unavailable with ``reason`` from now on
+        (a protected session that runs without its cloud, decision 42)."""
+        self._unavailable_reason = reason
+
+    def path_of(self, mount: SidecarMountState) -> str:
+        """Where the agent finds a folder in its workspace."""
+        if len(self.planned) == 1:
+            return "workspace/cloud"
+        return f"workspace/cloud/{mount.workspace_name}"
+
     def report(self) -> list[dict[str, Any]]:
         """Each mount's state for the orchestrator: mounted, pending, or
         unavailable with a closed reason (a missing status file after the
@@ -268,7 +287,15 @@ class SidecarMountWatcher:
         rows: list[dict[str, Any]] = []
         for mount in self.planned:
             entry = self._seen.get(mount.index) or {"state": "missing", "live": False}
-            if entry["state"] == "mounted" and entry.get("live"):
+            if self._unavailable_reason is not None:
+                rows.append(
+                    {
+                        "name": mount.workspace_name,
+                        "state": "unavailable",
+                        "reason": self._unavailable_reason,
+                    }
+                )
+            elif entry["state"] == "mounted" and entry.get("live"):
                 rows.append({"name": mount.workspace_name, "state": "mounted"})
             elif entry["state"] == "unavailable":
                 rows.append(
@@ -291,21 +318,31 @@ class SidecarMountWatcher:
         return rows
 
     def unavailable(self) -> list[dict[str, str]]:
-        """What did not mount, in plain words (for the agent's prompt)."""
-        rows = [
-            {
+        """What did not mount, in plain words (for the agent's prompt):
+        ``name``, its ``path`` in the workspace (``workspace/cloud`` for a
+        single folder), the closed ``reason`` and its ``text``; ``protected``
+        when it is a protected session's whole cloud."""
+        rows: list[dict[str, Any]] = []
+        for row, mount in zip(self.report(), self.planned):
+            if row["state"] != "unavailable":
+                continue
+            text = REASON_TEXT.get(row["reason"], REASON_TEXT["mount_failed"])
+            entry: dict[str, Any] = {
                 "name": row["name"],
+                "path": self.path_of(mount),
                 "reason": row["reason"],
-                "text": REASON_TEXT.get(row["reason"], REASON_TEXT["mount_failed"]),
+                "text": text,
             }
-            for row in self.report()
-            if row["state"] == "unavailable"
-        ]
-        for entry in self.excluded:
-            reason = str(entry.get("reason") or "")
+            if self.cloud_cfg.get("protected"):
+                entry["protected"] = True
+            rows.append(entry)
+        for excluded in self.excluded:
+            reason = str(excluded.get("reason") or "")
             rows.append(
                 {
                     "name": "",
+                    "path": "",
+                    "kind": str(excluded.get("mount_kind") or ""),
                     "reason": reason,
                     "text": REASON_TEXT.get(reason, REASON_TEXT["unbuildable"]),
                 }
@@ -320,19 +357,25 @@ class SidecarMountWatcher:
             self.read_states()
         except Exception as exc:
             return f"Cloud mount status is unavailable right now: {type(exc).__name__}."
+        if self._unavailable_reason is not None:
+            text = REASON_TEXT.get(
+                self._unavailable_reason, REASON_TEXT["mount_failed"]
+            )
+            return (
+                f"Protected cloud unavailable: {text}. This session has no cloud "
+                "folder; nothing it writes reaches the cloud."
+            )
         lines = ["Cloud folders (mounted by the workspace's cloud mount service):"]
         for row, mount in zip(self.report(), self.planned):
-            where = f"workspace/cloud/{mount.workspace_name}"
-            if len(self.planned) == 1:
-                where = "workspace/cloud"
+            where = self.path_of(mount)
             access = "read-only" if mount.access == "read_only" else "read-write"
             if row["state"] == "mounted":
                 lines.append(f"- {where} ({mount.target_path}, {access}): mounted")
             elif row["state"] == "unavailable":
                 text = REASON_TEXT.get(row["reason"], REASON_TEXT["mount_failed"])
-                lines.append(f"- {mount.target_path}: unavailable, {text}")
+                lines.append(f"- {where}: unavailable, {text} (read-only, empty)")
             else:
-                lines.append(f"- {mount.target_path}: still coming up")
+                lines.append(f"- {where}: still coming up (read-only until then)")
         for entry in self.excluded:
             text = REASON_TEXT.get(str(entry.get("reason")), REASON_TEXT["unbuildable"])
             lines.append(
@@ -348,7 +391,8 @@ class SidecarMountWatcher:
         await asyncio.to_thread(self._start_sync)
 
     def _start_sync(self) -> None:
-        deadline = self._clock() + self.wait_seconds
+        # A re-attach whose folders already settled once reads them once.
+        deadline = self._clock() + (0 if self.settled_before else self.wait_seconds)
         while True:
             states = self.read_states()
             if all(self._settled_entry(entry) for entry in states.values()):
@@ -357,30 +401,41 @@ class SidecarMountWatcher:
                 break
             self._sleep(1.0)
         self._settled = True
-        if self.mounts and not self.skip_links:
-            self._install_workspace_links(self.mounts)
+        if self.planned and not self.skip_links:
+            self._install_workspace_links()
 
-    def _install_workspace_links(self, mounts: list[SidecarMountState]) -> None:
+    def _install_workspace_links(self) -> None:
+        """Point ``workspace/cloud`` at the sidecars' folders, every planned
+        one, mounted or not: one still coming up (or unavailable) is the
+        opener's empty directory in a read-only view, so a write fails
+        instead of landing in a plain local directory nobody syncs. A single
+        folder is ``workspace/cloud`` itself; several are its entries, and
+        ``workspace/cloud`` is the read-only root of the sidecars' volume."""
         lines = [
             "set -e",
             f"workspace={shlex.quote(self.workspace_root)}",
             'mkdir -p "${workspace}/.srw"',
             'entry="${workspace}/cloud"',
             'if [ -L "${entry}" ]; then rm "${entry}"; fi',
-            'if [ -e "${entry}" ] && [ ! -d "${entry}" ]; then '
+            'if [ -e "${entry}" ]; then '
             'mv "${entry}" "${workspace}/.srw/cloud.pre-rclone.$(date +%s)"; fi',
         ]
+        roots = {mount.target_path.rsplit("/", 1)[0] for mount in self.planned}
+        names_match = all(
+            mount.target_path.rsplit("/", 1)[-1] == mount.workspace_name
+            for mount in self.planned
+        )
         if len(self.planned) == 1:
-            lines += [
-                'if [ -d "${entry}" ] && [ ! -L "${entry}" ]; then '
-                'mv "${entry}" "${workspace}/.srw/cloud.pre-rclone.$(date +%s)"; fi',
-                f"ln -sfn {shlex.quote(mounts[0].target_path)} " + '"${entry}"',
-            ]
+            lines.append(
+                f"ln -sfn {shlex.quote(self.planned[0].target_path)} " + '"${entry}"'
+            )
+        elif len(roots) == 1 and names_match:
+            lines.append(f"ln -sfn {shlex.quote(roots.pop())} " + '"${entry}"')
         else:
             lines.append('mkdir -p "${entry}"')
-            for mount in mounts:
+            for mount in self.planned:
                 lines += [
-                    f'link="${{entry}}/{mount.workspace_name}"',
+                    'link="${entry}"/' + shlex.quote(mount.workspace_name),
                     'if [ -L "${link}" ]; then rm "${link}"; fi',
                     f"ln -sfn {shlex.quote(mount.target_path)} " + '"${link}"',
                 ]
@@ -427,9 +482,11 @@ class SidecarMountWatcher:
             self._sleep(1.0)
 
     def request_drain(self, timeout: float | None = None) -> tuple[bool, int]:
-        """Ask the supervisor to flush every pending upload; returns whether
-        every mount answered drained, and how many uploads are known to be
-        pending."""
+        """Ask the supervisor to flush every pending upload. Returns whether
+        every planned folder answered ``drained`` (the supervisor answers so
+        for a read-only or unavailable one), and how many uploads are known
+        to be pending: -1 when that is unknown (a folder that did not
+        answer, or could not say). Strict: anything else is not drained."""
         if not self.planned:
             return True, 0
         nonce = self._request("drain")
@@ -439,21 +496,36 @@ class SidecarMountWatcher:
             (self.drain_seconds + 15) if timeout is None else timeout,
             {"drained", "incomplete"},
         )
-        pending = sum(max(0, int(ack.get("pending") or 0)) for ack in acks.values())
         complete = len(acks) == len(self.planned) and all(
             ack.get("state") == "drained" for ack in acks.values()
         )
-        return complete, pending
+        if complete:
+            return True, 0
+        counts = [ack.get("pending") for ack in acks.values()]
+        known = len(acks) == len(self.planned) and all(
+            type(count) is int and count >= 0 for count in counts
+        )
+        pending = sum(counts) if known else -1
+        logger.warning(
+            "Cloud folders not drained: %d of %d answered, %s upload(s) pending",
+            len(acks),
+            len(self.planned),
+            pending if pending >= 0 else "an unknown number of",
+        )
+        return False, pending
 
     def refresh_vfs(self, *args: Any, **kwargs: Any) -> None:
-        """Re-read every mounted folder (after an applied review). Best effort."""
+        """Re-read every folder (after an applied review). Raises unless
+        every planned folder answers ``done``: a protected review's upper
+        reset relies on the lower showing what was just written."""
         if not self.planned:
             return
-        try:
-            nonce = self._request("refresh")
-            self._await_acks("refresh", nonce, 60, {"done", "failed"})
-        except Exception as exc:
-            logger.warning("Cloud folder refresh failed: %s", type(exc).__name__)
+        nonce = self._request("refresh")
+        acks = self._await_acks("refresh", nonce, 60, {"done", "failed"})
+        if len(acks) != len(self.planned) or any(
+            ack.get("state") != "done" for ack in acks.values()
+        ):
+            raise SidecarMountError("the cloud folders did not refresh")
 
     def restart_mount(self, mount_id: str) -> None:
         """The supervisor restarts a lost mount by itself: wait for it."""
@@ -527,27 +599,28 @@ class SidecarMountWatcher:
         if not self.planned:
             return
         try:
-            complete, pending = await asyncio.to_thread(
-                self.request_drain, min(self.drain_seconds, 20.0)
-            )
-            if not complete:
-                logger.warning(
-                    "Cloud folders closed with %d upload(s) still pending", pending
-                )
+            # request_drain logs a flush that did not complete.
+            await asyncio.to_thread(self.request_drain, min(self.drain_seconds, 20.0))
         except Exception as exc:
             logger.warning("Cloud folder flush at close failed: %s", type(exc).__name__)
 
     async def retire_existing(self, *, drain: bool = True) -> dict[str, int]:
-        """End's terminal step: ask for a flush and require it when a mounted
-        folder still has uploads pending. Nothing of the session runs in the
-        workspace, so there is nothing to stop or count there."""
+        """End's terminal step: ask for a flush and require it. Every planned
+        read-write folder must answer drained (or be unavailable, which the
+        supervisor answers as drained); an unknown count or no answer is not
+        drained. Nothing of the session runs in the workspace, so there is
+        nothing to stop or count there."""
         await self._stop_monitor()
         counters = {"rclone_mounts": 0, "rclone_processes": 0}
         if not drain or not self.planned:
             return counters
         complete, pending = await asyncio.to_thread(self.request_drain)
-        if not complete and pending > 0:
-            raise SidecarMountError(f"{pending} upload(s) still pending")
+        if not complete:
+            raise SidecarMountError(
+                f"{pending} upload(s) still pending"
+                if pending > 0
+                else "the cloud folders did not confirm their flush"
+            )
         return counters
 
 

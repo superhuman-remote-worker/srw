@@ -1939,18 +1939,20 @@ class OrchestratorClient:
         thread_id: str,
         *,
         fingerprint: str,
+        pod_uid: str,
         mounts: list[dict[str, Any]],
     ) -> bool:
         """Report the state of the cloud folders a Pod's sidecars mounted
-        (connector drivers D7). The orchestrator keeps it only for the plan
-        ``fingerprint`` names. Best effort: False on any failure."""
+        (connector drivers D7). The orchestrator keeps it only for the Pod
+        ``pod_uid`` and its plan ``fingerprint`` name. Best effort: False on
+        any failure."""
         if not self._client:
             await self.connect()
         try:
             response = await self._client.post(
                 f"{self.orchestrator_url}/api/agents/threads/{thread_id}"
                 "/cloud-mount-status",
-                json={"fingerprint": fingerprint, "mounts": mounts},
+                json={"fingerprint": fingerprint, "pod_uid": pod_uid, "mounts": mounts},
                 timeout=15.0,
             )
         except Exception as e:

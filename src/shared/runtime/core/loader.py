@@ -5620,11 +5620,27 @@ def cloud_mount_system_floor(unavailable: Any) -> str:
     ]
     if not rows:
         return ""
+    if any(row.get("protected") for row in rows):
+        # Decision 42: a protected session runs without its cloud.
+        text = next(row["text"] for row in rows if row.get("protected"))
+        return "\n".join(
+            [
+                "<cloud_folders>",
+                f"Protected cloud unavailable: {text}.",
+                "This protected session has no cloud folder at all: workspace/"
+                "cloud does not exist and nothing you write reaches the cloud. "
+                "Tell the user plainly if their request needs the cloud; "
+                "srw_cloud_status shows the current state, and the user can "
+                "start a new session once it is fixed.",
+                "</cloud_folders>",
+            ]
+        )
     lines = ["<cloud_folders>", "Some cloud folders of this session are not available:"]
     for row in rows:
         name = str(row.get("name") or "")
-        if name:
-            lines.append(f"- workspace/cloud/{name}: {row['text']}.")
+        path = str(row.get("path") or "") or (f"workspace/cloud/{name}" if name else "")
+        if path:
+            lines.append(f"- {path}: {row['text']}.")
         else:
             lines.append(f"- a cloud folder was not attached: {row['text']}.")
     lines.append(

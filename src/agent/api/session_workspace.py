@@ -165,25 +165,35 @@ def protected_mount_payload(workspace: Dict[str, Any]) -> Dict[str, Any]:
     return validate_protected_cloud_mount(workspace.get("cloud_mount"))
 
 
+def _has_protected_lower(mount: Dict[str, Any]) -> bool:
+    mounts = mount.get("mounts")
+    return isinstance(mounts, list) and any(
+        isinstance(candidate, dict) and candidate.get("mount_kind") == "protected_lower"
+        for candidate in mounts
+    )
+
+
 def protected_workspace_delivery(payload: Dict[str, Any]) -> str:
     """Return ``off``, ``engaging`` or ``ready`` for a workspace response."""
 
     if protected_workspace_marker(payload) == "off":
-        mount = payload.get("cloud_mount")
         protected_mount_shape = False
+        mount = payload.get("cloud_mount")
         if isinstance(mount, dict):
-            mounts = mount.get("mounts")
             protected_mount_shape = (
                 ("protected" in mount and mount.get("protected") is not False)
                 or "overlay" in mount
-                or (
-                    isinstance(mounts, list)
-                    and any(
-                        isinstance(candidate, dict)
-                        and candidate.get("mount_kind") == "protected_lower"
-                        for candidate in mounts
-                    )
-                )
+                or _has_protected_lower(mount)
+            )
+        # A Pod's sidecar payload (D7) always names both keys; under the off
+        # marker it may carry neither a protected flag, an overlay nor a
+        # protected lower.
+        sidecar = payload.get("cloud_mount_sidecar")
+        if isinstance(sidecar, dict):
+            protected_mount_shape = protected_mount_shape or bool(
+                sidecar.get("protected") not in (False, None)
+                or sidecar.get("overlay") is not None
+                or _has_protected_lower(sidecar)
             )
         if (
             payload.get("protected_cloud_state") is not None

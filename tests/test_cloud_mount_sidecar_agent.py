@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -28,6 +29,7 @@ from shared.runtime.services.cloud_mount.sidecar import (
 )
 
 FINGERPRINT = "f" * 64
+POD_UID = "99999999-9999-4999-8999-999999999999"
 
 
 def _cfg(*names: str, excluded=()) -> dict:
@@ -35,6 +37,7 @@ def _cfg(*names: str, excluded=()) -> dict:
         "version": 1,
         "delivery": "sidecar",
         "fingerprint": FINGERPRINT,
+        "runtime_incarnation": POD_UID,
         "status_dir": "/srw/cloud-status",
         "control_dir": "/srw/cloud-control",
         "wait_seconds": 3,
@@ -90,6 +93,8 @@ class _Workspace:
             return ""
         if "ln -sfn" in command:
             return "SRW_LINKS_OK\n"
+        if "__SRW_SIDECAR_RCLONE_ZERO__" in command:
+            return "__SRW_SIDECAR_RCLONE_ZERO__\n"
         parts = []
         for index, _name in enumerate(self.names):
             parts.append(f"==/srw/cloud-status/{index}.json")
@@ -150,7 +155,8 @@ async def test_mounted_folders_are_linked_and_reported():
     assert watcher.active and [m.workspace_name for m in watcher.mounts] == ["project"]
     assert watcher.report() == [{"name": "project", "state": "mounted"}]
     links = next(c for c in workspace.commands if "ln -sfn" in c)
-    assert "/cloud/project" in links and "SRW_LINKS_OK" in links
+    # A single folder is workspace/cloud itself.
+    assert "ln -sfn /cloud/project" in links and "SRW_LINKS_OK" in links
     # Nothing here ever starts, stops or configures rclone.
     assert not any(_runs_rclone(c) for c in workspace.commands)
 
@@ -171,9 +177,13 @@ async def test_a_folder_that_did_not_mount_never_fails_the_attach():
         {"name": "home", "state": "unavailable", "reason": "mount_failed"},
         {"name": "gone", "state": "unavailable", "reason": "sidecar_unavailable"},
     ]
-    assert not any("ln -sfn" in c for c in workspace.commands)
+    # Linked all the same: a write into a folder that did not mount fails in
+    # the read-only view instead of landing in a plain local directory.
+    links = next(c for c in workspace.commands if "ln -sfn" in c)
+    assert "ln -sfn /cloud " in links
     text = watcher.status()
     assert "refused its credential" in text and "401" not in text
+    assert "workspace/cloud/project: unavailable" in text
 
 
 @pytest.mark.asyncio
@@ -185,8 +195,11 @@ async def test_a_mount_still_coming_up_stays_pending_and_unlinked():
     watcher = _watcher(workspace, _cfg("project", "slow"))
     await watcher.start_all()
     assert watcher.report()[1] == {"name": "slow", "state": "pending"}
+    # workspace/cloud is the sidecars' read-only root: the pending folder is
+    # there already, empty and read-only until it mounts.
     links = next(c for c in workspace.commands if "ln -sfn" in c)
-    assert "/cloud/project" in links and "/cloud/slow" not in links
+    assert "ln -sfn /cloud " in links and "mkdir" not in links.split("SRW")[0][-80:]
+    assert "workspace/cloud/slow: still coming up" in watcher.status()
 
 
 def test_the_prompt_rows_include_what_was_left_out():
@@ -205,12 +218,15 @@ def test_the_prompt_rows_include_what_was_left_out():
     rows = watcher.unavailable()
     assert rows[0] == {
         "name": "project",
+        "path": "workspace/cloud",
         "reason": "not_found",
         "text": "the folder no longer exists in the cloud",
     }
     assert rows[1]["name"] == "" and rows[1]["reason"] == "set_fallback"
+    assert rows[1]["kind"] == "project"
     floor = cloud_mount_system_floor(rows)
-    assert "workspace/cloud/project: the folder no longer exists" in floor
+    # One folder: it is workspace/cloud itself.
+    assert "- workspace/cloud: the folder no longer exists" in floor
     assert "was not attached" in floor and floor.startswith("<cloud_folders>")
     assert cloud_mount_system_floor([]) == "" and cloud_mount_system_floor(None) == ""
 
@@ -255,10 +271,13 @@ def test_a_drain_is_asked_with_a_nonce_and_answered():
     assert "mv " in request
     workspace.drain_answer = {"state": "incomplete", "pending": 2}
     assert watcher.request_drain() == (False, 2)
+    # Unknown is not a count: no clamp to zero.
+    workspace.drain_answer = {"state": "incomplete", "pending": -1}
+    assert watcher.request_drain() == (False, -1)
 
 
 @pytest.mark.asyncio
-async def test_end_requires_the_flush_only_when_uploads_are_known_pending():
+async def test_end_requires_every_folder_to_confirm_its_flush():
     workspace = _Workspace(["project"])
     workspace.status[0] = {"state": "mounted"}
     workspace.live = {"project"}
@@ -271,9 +290,11 @@ async def test_end_requires_the_flush_only_when_uploads_are_known_pending():
     workspace.drain_answer = {"state": "incomplete", "pending": 3}
     with pytest.raises(SidecarMountError, match="3 upload"):
         await watcher.retire_existing(drain=True)
-    # Unknown (rclone did not answer) is reported, not a reason to wedge End.
+    # Unknown (rclone did not answer, a folder still coming up) is not
+    # drained: End retries until the supervisor can say.
     workspace.drain_answer = {"state": "incomplete", "pending": -1}
-    await watcher.retire_existing(drain=True)
+    with pytest.raises(SidecarMountError, match="did not confirm"):
+        await watcher.retire_existing(drain=True)
 
 
 @pytest.mark.asyncio
@@ -380,6 +401,10 @@ async def test_stateless_end_flushes_sidecar_folders_and_proves_no_workspace_rcl
     assert proof.rclone_mounts == 0 and proof.rclone_processes == 0
     assert any("/srw/cloud-control/drain" in c for c in workspace.terminal)
     assert not any(_runs_rclone(c) for c in workspace.terminal)
+    # A session from before the deploy may keep in-workspace rclone
+    # identities in its home: End proves no rclone runs and clears them.
+    cleanup = next(c for c in workspace.terminal if "__SRW_SIDECAR_RCLONE_ZERO__" in c)
+    assert "resident.identity" in cleanup and "exit 85" in cleanup
     # Only the general resident zero proof: no per-mount rclone re-proof.
     assert workspace.verify_terminal_claim_resources_retired.call_count == 1
     workspace.drain_answer = {"state": "incomplete", "pending": 4}
@@ -500,19 +525,35 @@ def test_a_protected_response_with_both_deliveries_fails_closed():
         session_workspace.protected_mount_payload(payload)
 
 
+@dataclass(frozen=True)
+class _Config:
+    extra: dict
+
+
 def _protected_session(workspace: _Workspace, *, required: bool = True):
-    return SimpleNamespace(
+    session = SimpleNamespace(
         thread_id="t1",
         workspace_manager=SimpleNamespace(
             backend=workspace, path="/home/agent-host/workspace"
         ),
         shell_owner_token=None,
         protected_cloud_required=required,
-        config=SimpleNamespace(extra={}),
+        protected_cloud_unavailable=None,
+        config=_Config(extra={}),
         cloud_mount_manager=None,
+        sidecar_mount_watcher=None,
+        overlay_mount_manager=None,
+        _protected_mount_id=None,
+        _protected_cloud_health_ready=False,
         cloud_mount_error=None,
         _finish_protected_cloud=AsyncMock(),
     )
+    session._run_protected_without_cloud = (
+        lambda watcher, reason: PersistentSession._run_protected_without_cloud(
+            session, watcher, reason
+        )
+    )
+    return session
 
 
 @pytest.mark.asyncio
@@ -538,26 +579,59 @@ async def test_a_protected_session_mounts_its_overlay_on_the_sidecars_lower():
 
 
 @pytest.mark.asyncio
-async def test_a_protected_session_whose_lower_did_not_mount_gets_no_cloud():
-    from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
-
+async def test_a_protected_session_whose_lower_did_not_mount_starts_without_cloud():
+    """Decision 42: no cloud folder at all, so nothing reaches the cloud
+    unreviewed; the state, the prompt and the tool say why; the attach does
+    not fail."""
     workspace = _Workspace(["lower"])
     workspace.status[0] = {"state": "unavailable", "reason": "credential_rejected"}
+    session = _protected_session(workspace)
     with patch(
         "shared.runtime.services.cloud_mount.sidecar.SidecarMountWatcher._start_sync",
         lambda self: (self.read_states(), setattr(self, "_settled", True)),
     ):
-        required = _protected_session(workspace)
-        with pytest.raises(WorkspaceUnavailableError, match="refused its credential"):
-            await PersistentSession._setup_sidecar_cloud_mount(
-                required, _protected_cfg()
-            )
-        assert required.cloud_mount_manager is None
-        required._finish_protected_cloud.assert_not_awaited()
-        optional = _protected_session(workspace, required=False)
-        await PersistentSession._setup_sidecar_cloud_mount(optional, _protected_cfg())
-        assert optional.cloud_mount_manager is None
-        assert "refused its credential" in optional.cloud_mount_error
+        await PersistentSession._setup_sidecar_cloud_mount(session, _protected_cfg())
+    session._finish_protected_cloud.assert_not_awaited()
+    assert session.cloud_mount_manager is None
+    assert session.protected_cloud_unavailable == "credential_rejected"
+    watcher = session.sidecar_mount_watcher
+    assert watcher.report() == [
+        {"name": "lower", "state": "unavailable", "reason": "credential_rejected"}
+    ]
+    assert "Protected cloud unavailable" in watcher.status()
+    rows = session.config.extra["_cloud_mounts_unavailable"]
+    floor = cloud_mount_system_floor(rows)
+    assert "Protected cloud unavailable: the cloud refused its credential" in floor
+    assert "no cloud folder at all" in floor
+    # Ready, on purpose: no cloud manager and no overlay.
+    ready = PersistentSession.protected_cloud_ready(
+        SimpleNamespace(
+            protected_cloud_required=True,
+            protected_cloud_unavailable="credential_rejected",
+            cloud_mount_manager=None,
+            overlay_mount_manager=None,
+        )
+    )
+    assert ready is True
+
+
+@pytest.mark.asyncio
+async def test_a_protected_session_whose_overlay_failed_starts_without_cloud():
+    workspace = _Workspace(["lower"])
+    workspace.status[0] = {"state": "mounted"}
+    workspace.live = {"lower"}
+    session = _protected_session(workspace)
+    session._finish_protected_cloud = AsyncMock(side_effect=RuntimeError("overlay"))
+    with patch(
+        "shared.runtime.services.cloud_mount.sidecar.SidecarMountWatcher._start_sync",
+        lambda self: (self.read_states(), setattr(self, "_settled", True)),
+    ):
+        await PersistentSession._setup_sidecar_cloud_mount(session, _protected_cfg())
+    assert session.protected_cloud_unavailable == "protected_unavailable"
+    assert session.cloud_mount_manager is None
+    assert session.sidecar_mount_watcher.report()[0]["reason"] == (
+        "protected_unavailable"
+    )
 
 
 @pytest.mark.asyncio
@@ -598,3 +672,144 @@ async def test_stateless_end_retires_the_overlay_then_asks_the_sidecars_to_flush
     assert any("/srw/cloud-control/drain" in c for c in workspace.terminal)
     # The resident zero proof and the overlay's, never an rclone re-proof.
     assert workspace.verify_terminal_claim_resources_retired.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_reattach_whose_folders_settled_once_does_not_wait_again():
+    workspace = _Workspace(["project"])
+    workspace.status[0] = {"state": "pending"}
+    clock = [0.0]
+    watcher = SidecarMountWatcher(
+        thread_id="t1",
+        cloud_cfg={**_cfg("project"), "settled": True, "wait_seconds": 30},
+        workspace_backend=workspace,
+        workspace_root="/home/agent-host/workspace",
+        clock=lambda: clock[0],
+        sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
+    await watcher.start_all()
+    assert clock[0] == 0.0
+    # Without the record's word it waits its 30 s.
+    waiting = _watcher(workspace, {**_cfg("project"), "wait_seconds": 30})
+    await waiting.start_all()
+    assert waiting.report() == [{"name": "project", "state": "pending"}]
+
+
+def test_a_refresh_must_reach_every_folder():
+    workspace = _Workspace(["project", "home"])
+    workspace.status[0] = {"state": "mounted"}
+    workspace.status[1] = {"state": "mounted"}
+    watcher = _watcher(workspace, _cfg("project", "home"))
+    watcher.refresh_vfs()
+    original = workspace._answer
+
+    def one_failed(command: str) -> str:
+        out = original(command)
+        if "/srw/cloud-control/refresh" in command:
+            workspace.status[1]["refresh"]["state"] = "failed"
+        return out
+
+    workspace._answer = one_failed
+    with pytest.raises(SidecarMountError, match="did not refresh"):
+        watcher.refresh_vfs()
+
+
+def test_several_folders_named_oddly_are_linked_one_by_one_and_quoted():
+    workspace = _Workspace(["a b", "c"])
+    cfg = _cfg("a b", "c")
+    cfg["mounts"][0]["target_path"] = "/cloud/a-b"
+    watcher = _watcher(workspace, cfg)
+    watcher._start_sync()
+    links = next(c for c in workspace.commands if "ln -sfn" in c)
+    assert "'a b'" in links and "mkdir -p" in links
+
+
+@pytest.mark.asyncio
+async def test_the_state_report_names_its_pod_and_never_holds_the_attach():
+    from agent.api.session_attach import SessionAttachCoordinator
+
+    events: list = []
+    calls: list[dict] = []
+    gate = asyncio.Event()
+
+    async def report_cloud_mount_status(thread_id, **kwargs):
+        calls.append(kwargs)
+        await gate.wait()
+        return True
+
+    ports = MagicMock()
+    ports.broadcast = lambda name, payload: events.append((name, payload))
+    ports.identity.return_value = SimpleNamespace(thread_id="t1")
+    ports.orchestrator_client.return_value = SimpleNamespace(
+        report_cloud_mount_status=report_cloud_mount_status
+    )
+    coordinator = SessionAttachCoordinator(ports)
+    watcher = _watcher(_Workspace(["project"]), _cfg("project"))
+    await asyncio.wait_for(
+        coordinator._report_sidecar_mounts(watcher, [{"name": "project"}]), 1
+    )
+    assert events[0][0] == "cloud_mount.status"
+    await asyncio.sleep(0)
+    assert calls == [
+        {
+            "fingerprint": FINGERPRINT,
+            "pod_uid": POD_UID,
+            "mounts": [{"name": "project"}],
+        }
+    ]
+    gate.set()
+    await asyncio.gather(*coordinator._report_tasks)
+
+
+def test_a_protected_sidecar_shape_needs_the_marker():
+    from agent.api import session_contract, session_workspace
+
+    with pytest.raises(session_contract.ProtectedCloudUnavailable):
+        session_workspace.protected_workspace_delivery(
+            {"protected_cloud": False, "cloud_mount_sidecar": _protected_cfg()}
+        )
+    assert (
+        session_workspace.protected_workspace_delivery(
+            {"protected_cloud": False, "cloud_mount_sidecar": _cfg("project")}
+        )
+        == "off"
+    )
+
+
+def test_the_stale_identity_cleanup_removes_only_identities_and_refuses_a_live_rclone(
+    tmp_path,
+):
+    import os
+    import subprocess
+
+    from orchestrator.services import stateless_session_retirement as retirement
+
+    thread = "33333333-3333-4333-8333-333333333333"
+    base = tmp_path / ".cache/srw/rclone" / thread / "m0"
+    base.mkdir(parents=True)
+    (base / "resident.identity").write_text("old\n")
+    (base / "keep.txt").write_text("not an identity\n")
+    script = retirement._sidecar_stale_rclone_cleanup_command(thread)
+    env = {**os.environ, "HOME": str(tmp_path)}
+    done = subprocess.run(
+        ["sh", "-c", script], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert done.returncode == 0, done.stderr
+    assert retirement.SIDECAR_RCLONE_ZERO_MARKER in done.stdout
+    assert not (base / "resident.identity").exists()
+    assert (base / "keep.txt").exists()
+    # A process of the thread's rclone is a refusal, never cleaned up.
+    import sys
+
+    live = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)", str(base) + "/"],
+        env=env,
+    )
+    try:
+        refused = subprocess.run(
+            ["sh", "-c", script], env=env, capture_output=True, text=True, timeout=60
+        )
+    finally:
+        live.kill()
+        live.wait()
+    assert refused.returncode == 85

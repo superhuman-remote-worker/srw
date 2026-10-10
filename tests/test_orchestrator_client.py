@@ -1788,11 +1788,12 @@ class TestGetThreadWorkspace:
             assert await client.report_cloud_mount_status(
                 "tid-1",
                 fingerprint="f" * 64,
+                pod_uid="pod-1",
                 mounts=[{"name": "project", "state": "mounted"}],
             )
             mock_http.post.side_effect = RuntimeError("down")
             assert not await client.report_cloud_mount_status(
-                "tid-1", fingerprint="f" * 64, mounts=[]
+                "tid-1", fingerprint="f" * 64, pod_uid="pod-1", mounts=[]
             )
         url, kwargs = mock_http.post.await_args_list[0]
         assert url == (
@@ -1800,6 +1801,7 @@ class TestGetThreadWorkspace:
         )
         assert kwargs["json"] == {
             "fingerprint": "f" * 64,
+            "pod_uid": "pod-1",
             "mounts": [{"name": "project", "state": "mounted"}],
         }
 

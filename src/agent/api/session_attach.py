@@ -488,6 +488,9 @@ class SessionAttachCoordinator:
         # (batch settle, switch), held until the next turn start
         # (parallel_subagents.md §14.2 P5). None = nothing to apply.
         self._heartbeat_subagent_advertisement: Optional[tuple[Any, Any]] = None
+        # Background reports of the sidecar cloud folders' state (D7), held
+        # so the loop does not drop them mid-flight.
+        self._report_tasks: set[asyncio.Task[None]] = set()
 
     # --- Views ----------------------------------------------------------------
 
@@ -576,24 +579,48 @@ class SessionAttachCoordinator:
     async def _report_sidecar_mounts(
         self, watcher: Any, report: list[dict[str, Any]]
     ) -> None:
-        """Publish the sidecar cloud folders' state (D7): a cockpit event,
-        and the orchestrator's record for the Pod's plan. Never raises."""
+        """Publish the sidecar cloud folders' state (D7): a cockpit event at
+        once, and the orchestrator's record for this Pod in the background,
+        so a slow orchestrator never holds the attach. Never raises."""
         self._ports.broadcast(
             "cloud_mount.status",
-            {"mounts": report, "excluded": list(watcher.excluded)},
+            {
+                "mounts": report,
+                "excluded": list(watcher.excluded),
+                "protected": bool(watcher.cloud_cfg.get("protected")),
+            },
         )
         thread_id = self._identity.thread_id
         report_status = getattr(self._client, "report_cloud_mount_status", None)
-        if not (thread_id and watcher.fingerprint and callable(report_status)):
+        if not (
+            thread_id
+            and watcher.fingerprint
+            and watcher.runtime_incarnation
+            and callable(report_status)
+        ):
             return
-        try:
-            await report_status(
-                str(thread_id), fingerprint=watcher.fingerprint, mounts=report
-            )
-        except Exception as exc:
-            self._logger.warning(
-                "Could not report the cloud folders' state: %s", type(exc).__name__
-            )
+
+        async def send() -> None:
+            try:
+                accepted = await report_status(
+                    str(thread_id),
+                    fingerprint=watcher.fingerprint,
+                    pod_uid=watcher.runtime_incarnation,
+                    mounts=report,
+                )
+                if not accepted:
+                    self._logger.warning(
+                        "The orchestrator did not keep the cloud folders' state"
+                    )
+            except Exception as exc:
+                self._logger.warning(
+                    "Could not report the cloud folders' state: %s",
+                    type(exc).__name__,
+                )
+
+        task = asyncio.create_task(send(), name="cloud-mount-status-report")
+        self._report_tasks.add(task)
+        task.add_done_callback(self._report_tasks.discard)
 
     async def _poll_workspace(self, thread_id: str, **kwargs: Any) -> Any:
         """The readiness poll of this attach, fenced by the ending refusal."""
@@ -2028,7 +2055,12 @@ class SessionAttachCoordinator:
                 "cloud_mount.error",
                 {"message": self._session.cloud_mount_error, "degraded": True},
             )
-        sidecar_mounts = self._session.cloud_mount_manager
+        # The watcher stays on the session when a protected session runs
+        # without its cloud (decision 42): its state is reported all the same.
+        sidecar_mounts = (
+            getattr(self._session, "sidecar_mount_watcher", None)
+            or self._session.cloud_mount_manager
+        )
         if getattr(type(sidecar_mounts), "delivery", None) == "sidecar":
             # Folders the Pod's sidecars own (D7): tell the cockpit and the
             # orchestrator each one's state, and keep a pinned session's view

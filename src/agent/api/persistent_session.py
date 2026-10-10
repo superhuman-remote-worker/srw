@@ -316,6 +316,12 @@ class PersistentSession:
     # Lazy rclone cloud mounts (initialized from cloud_mount payload)
     cloud_mount_manager: Optional[Any] = None
     cloud_mount_error: Optional[str] = None
+    # The watcher of a Pod's sidecar folders (D7), kept for reporting their
+    # state even when no cloud manager is active.
+    sidecar_mount_watcher: Optional[Any] = None
+    # Decision 42: a protected session whose sidecar cloud layer did not come
+    # up runs with no cloud folder at all; the closed reason, else None.
+    protected_cloud_unavailable: Optional[str] = None
     # Capture overlay stacked on the RO lower for protected sessions (B9)
     overlay_mount_manager: Optional[Any] = None
     # Exact physical workspace identity that authorized this protected
@@ -1298,17 +1304,40 @@ class PersistentSession:
         try:
             await watcher.start_all()
         except Exception as e:
-            if self.shell_owner_token is not None and not watcher.planned:
-                raise
             # The folders may well be mounted; the session goes on without
             # links or a fresh state read rather than without its workspace.
             self.cloud_mount_error = f"cloud folders: {type(e).__name__}"
             logger.warning("Could not attach to the sidecar cloud folders: %s", e)
         self.cloud_mount_manager = watcher
+        self.sidecar_mount_watcher = watcher
+        if cloud_mount_cfg.get("protected") and cloud_mount_cfg.get("overlay"):
+            reason = None
+            if not watcher.active:
+                rows = watcher.report()
+                reason = next(
+                    (row["reason"] for row in rows if row.get("reason")),
+                    # Still coming up after the wait: it did not answer in
+                    # time; no status file at all: the service is not there.
+                    "timeout"
+                    if any(row["state"] == "pending" for row in rows)
+                    else "sidecar_unavailable",
+                )
+            else:
+                try:
+                    await self._finish_protected_cloud(cloud_mount_cfg)
+                except Exception as exc:
+                    # The overlay failed and was rolled back (the lower is
+                    # read-only and stays the sidecars').
+                    logger.warning(
+                        "Protected cloud overlay did not mount: %s", type(exc).__name__
+                    )
+                    reason = "protected_unavailable"
+            if reason is not None:
+                self._run_protected_without_cloud(watcher, reason)
         unavailable = watcher.unavailable()
         if unavailable:
             self.cloud_mount_error = "; ".join(
-                f"{row['name'] or 'a folder'}: {row['text']}" for row in unavailable
+                f"{row['path'] or 'a folder'}: {row['text']}" for row in unavailable
             )
             if _dc_is_dataclass(self.config) and hasattr(self.config, "extra"):
                 # A copy, never an in-place write: the config may be the
@@ -1325,21 +1354,21 @@ class PersistentSession:
             len(watcher.mounts),
             len(unavailable),
         )
-        if cloud_mount_cfg.get("protected") and cloud_mount_cfg.get("overlay"):
-            if not watcher.active:
-                # No lower: a protected session gets no cloud at all, never
-                # a half-protected one.
-                self.cloud_mount_manager = None
-                if self.protected_cloud_required:
-                    # The supervisor's closed reason, in plain words, so the
-                    # refusal says why.
-                    why = "; ".join(row["text"] for row in unavailable)
-                    raise WorkspaceUnavailableError(
-                        "protected-cloud lower did not mount in the workspace's "
-                        "sidecars" + (f": {why}" if why else "")
-                    )
-                return
-            await self._finish_protected_cloud(cloud_mount_cfg)
+
+    def _run_protected_without_cloud(self, watcher: Any, reason: str) -> None:
+        """Decision 42: a protected session whose cloud layer did not come up
+        starts with no cloud folder at all, so nothing reaches the cloud
+        unreviewed, and says why (the closed ``reason``) in its state, its
+        prompt and the cockpit, rather than failing the attach."""
+        logger.warning(
+            "Protected session %s runs without its cloud: %s", self.thread_id, reason
+        )
+        watcher.mark_unavailable(reason)
+        self.protected_cloud_unavailable = reason
+        self.cloud_mount_manager = None
+        self.overlay_mount_manager = None
+        self._protected_mount_id = None
+        self._protected_cloud_health_ready = False
 
     @staticmethod
     def _protected_cloud_config_valid(payload: Any) -> bool:
@@ -1386,9 +1415,19 @@ class PersistentSession:
         )
 
     def protected_cloud_ready(self) -> bool:
-        """Joined lower-controller + overlay readiness invariant."""
+        """Joined lower-controller + overlay readiness invariant.
+
+        Also ready when a protected session runs without its cloud on
+        purpose (decision 42): with no cloud manager and no overlay there is
+        no path by which anything reaches the cloud unreviewed."""
 
         if not self.protected_cloud_required:
+            return True
+        if (
+            self.protected_cloud_unavailable is not None
+            and self.cloud_mount_manager is None
+            and self.overlay_mount_manager is None
+        ):
             return True
         manager = self.cloud_mount_manager
         overlay = self.overlay_mount_manager
@@ -2085,7 +2124,9 @@ class PersistentSession:
                 "root": "/cloud",
                 "workspace_entry": "/workspace/cloud",
                 "scan_guard": self.config.extra.get("cloud_scan_guard", "block"),
-                "_manager": self.cloud_mount_manager,
+                # A protected session without its cloud (decision 42) keeps
+                # only the sidecar watcher, for srw_cloud_status to say why.
+                "_manager": self.cloud_mount_manager or self.sidecar_mount_watcher,
                 "protected": bool(
                     self.overlay_mount_manager and self.overlay_mount_manager.active
                 ),
@@ -2867,11 +2908,13 @@ class PersistentSession:
         if not _canvas_enabled(self.config):
             tool_names = [name for name in tool_names if name not in canvas_tools]
 
-        # Also for sidecar folders that did not mount: the tool is how the
-        # agent learns why (D7).
-        if self.cloud_mount_manager is not None and (
-            self.cloud_mount_manager.active
-            or getattr(type(self.cloud_mount_manager), "delivery", None) == "sidecar"
+        # Also for sidecar folders that did not mount, and a protected session
+        # that runs without its cloud: the tool is how the agent learns why
+        # (D7).
+        cloud_manager = self.cloud_mount_manager or self.sidecar_mount_watcher
+        if cloud_manager is not None and (
+            getattr(cloud_manager, "active", False)
+            or getattr(type(cloud_manager), "delivery", None) == "sidecar"
         ):
             if "srw_cloud_status" not in tool_names:
                 tool_names.append("srw_cloud_status")
@@ -4079,6 +4122,16 @@ class PersistentSession:
                 else:
                     logger.debug("overlay cleanup failed", exc_info=True)
                     self.overlay_mount_manager = None
+
+        if self.sidecar_mount_watcher is not None and self.cloud_mount_manager is None:
+            # A protected session without its cloud (decision 42) keeps only
+            # the watcher: stop its monitor; nothing of it runs in the
+            # workspace, so there is nothing to retire there.
+            try:
+                await self.sidecar_mount_watcher.detach_for_handoff()
+            except Exception:
+                logger.debug("sidecar watcher cleanup failed", exc_info=True)
+            self.sidecar_mount_watcher = None
 
         if self.cloud_mount_manager:
             if strict_resident_cleanup and resident_cleanup_error is not None:
