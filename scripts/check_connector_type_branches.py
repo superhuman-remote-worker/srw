@@ -104,14 +104,6 @@ PENDING_D3_D4_SITES: frozenset[tuple[str, str, str, str, str, int]] = frozenset(
             "31c49729257b",
             1,
         ),
-        (
-            "src/orchestrator/services/projects.py",
-            "update_project",
-            "compare",
-            "webdav",
-            "31c49729257b",
-            1,
-        ),
     }
 )
 UNCLASSIFIED = "unclassified"
