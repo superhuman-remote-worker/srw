@@ -70,8 +70,9 @@ PROTECTED_PROJECT_FOLDER = ("cloud_folder", "project", "protected")
 #: delivered (0 of 432 Mode A jobs) while nothing told jobs where the copy was.
 CHECKOUT_WRITE_BACK = (
     "the folder is copied into the job's repository; SRW writes back only a "
-    "diff the job's owner accepts, and refuses one whose files changed in the "
-    "cloud since the copy was made"
+    "diff an owner or editor of the job's project (or an administrator) "
+    "accepts, and refuses one whose files changed in the cloud since the copy "
+    "was made"
 )
 
 

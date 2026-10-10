@@ -69,13 +69,20 @@ def _project(**over):
 class _Store:
     """Records the order of every write the no-claim path makes."""
 
-    def __init__(self, project=None):
+    def __init__(self, project=None, *, role="editor"):
         self.calls: list[tuple[str, tuple, dict]] = []
         self._project = project
+        self.role = role
+        self.role_lookups: list[tuple[str, str]] = []
 
     async def get_project(self, project_id):
         self.calls.append(("get_project", (project_id,), {}))
         return self._project
+
+    async def get_user_role_in_project(self, project_id, user_id):
+        # Not a write: kept out of ``calls``, whose order the tests pin.
+        self.role_lookups.append((project_id, user_id))
+        return self.role
 
     async def update_job_cloud_diff(self, job_id, **kw):
         self.calls.append(("update_job_cloud_diff", (job_id,), kw))
@@ -157,12 +164,14 @@ def _ops(*, store=None, control=None, cloud_router=None, forge=None, advance=Non
     ), control
 
 
-def _deps(job=None, **kw):
+def _deps(job=None, *, user=None, **kw):
     ops, control = _ops(**kw)
     route_deps = JobDiffDependencies(
         store=SimpleNamespace(name="auth-store"),
         diff_review=ops,
-        require_job_access=AsyncMock(return_value=(USER, job if job else _job())),
+        require_job_access=AsyncMock(
+            return_value=(user or USER, job if job else _job())
+        ),
     )
     return route_deps, control
 
@@ -948,6 +957,87 @@ class TestRejectJobDiff:
 # =============================================================================
 # Wire: paths, greedy per-file route order, per-invocation dependency resolution
 # =============================================================================
+
+
+class TestWhoDecidesTheDiff:
+    """Seeing a job is not deciding its write-back: a viewer of the project,
+    and a job owner since demoted to one, can read the diff but neither
+    accept nor reject it; an editor, an owner and an administrator can."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", [accept_job_diff, reject_job_diff])
+    @pytest.mark.parametrize(
+        "job_over",
+        [{}, {"user_id": USER["id"]}],
+        ids=["another-members-job", "own-job-after-demotion"],
+    )
+    async def test_a_viewer_is_refused_before_any_gate_or_claim(
+        self, operation, job_over
+    ):
+        store = _Store(_project(), role="viewer")
+        deps, control = _deps(job=_job(**job_over), store=store)
+
+        with pytest.raises(HTTPException) as exc:
+            await operation(_request(), JOB_ID, dependencies=deps)
+
+        assert exc.value.status_code == 403
+        assert "owner or editor of the job's project" in exc.value.detail
+        assert store.role_lookups == [(PROJECT_ID, USER["id"])]
+        assert store.calls == []
+        assert not any(step.startswith("claim:") for step in control.order)
+
+    @pytest.mark.asyncio
+    async def test_a_non_member_is_refused(self):
+        store = _Store(_project(), role=None)
+        deps, _ = _deps(store=store)
+
+        with pytest.raises(HTTPException) as exc:
+            await accept_job_diff(_request(), JOB_ID, dependencies=deps)
+
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("user", "role"),
+        [
+            (USER, "editor"),
+            (USER, "owner"),
+            ({"id": "d6fa6f2a-9101-4c1e-9b9e-0000000000c4", "is_admin": True}, None),
+        ],
+        ids=["editor", "owner", "administrator-outside-the-project"],
+    )
+    async def test_an_editor_owner_or_administrator_may_reject(self, user, role):
+        store = _Store(_project(), role=role)
+        deps, _ = _deps(user=user, store=store)
+
+        async with _reject_patches():
+            result = await reject_job_diff(_request(), JOB_ID, dependencies=deps)
+
+        assert result["diff_status"] == "rejected"
+        if user.get("is_admin"):
+            assert store.role_lookups == []
+
+    @pytest.mark.asyncio
+    async def test_a_read_only_copys_diff_is_never_accepted(self):
+        """An older orchestrator captured a read-only copy's diff (rollout
+        overlap): the accept refuses it and writes nothing; rejecting it is
+        the job's way out."""
+        job = _job(context={"cloud_checkout": {"access": "read_only"}})
+        store = _Store(_project(), role="owner")
+        deps, control = _deps(job=job, store=store)
+
+        with pytest.raises(HTTPException) as exc:
+            await accept_job_diff(_request(), JOB_ID, dependencies=deps)
+
+        assert exc.value.status_code == 409
+        assert "read-only" in exc.value.detail
+        assert store.calls == []
+        assert not any(step.startswith("claim:") for step in control.order)
+
+        deps, _ = _deps(job=_job(context=job["context"]), store=store)
+        async with _reject_patches():
+            result = await reject_job_diff(_request(), JOB_ID, dependencies=deps)
+        assert result["diff_status"] == "rejected"
 
 
 class TestJobDiffWire:

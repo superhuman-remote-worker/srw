@@ -1622,9 +1622,10 @@ CLOUD_FOLDER_CHECKOUT_SPEC = DriverSpec(
         AccessLevel(
             "reviewed_write_back",
             20,
-            "The copy's changes become a diff the job's owner reviews; SRW "
-            "writes back only a diff the owner accepts, and refuses one whose "
-            "files changed in the cloud since the copy was made.",
+            "The copy's changes become a diff for review; SRW writes back "
+            "only a diff an owner or editor of the job's project (or an "
+            "administrator) accepts, and refuses one whose files changed in "
+            "the cloud since the copy was made.",
             writes="reviewed",
         ),
     ),

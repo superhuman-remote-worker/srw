@@ -8,7 +8,8 @@ Every route is gated by ``require_job_access``, which enforces both user
 visibility AND the MCP/officer ``project:<uuid>`` scope. The gate returns the
 row and the operation works on *that* row — the accept/reject paths mutate it
 in place before running the terminal side effects, so re-reading the job here
-would break the effect chain.
+would break the effect chain. Accept and reject also take the caller: seeing
+a job is not deciding its write-back (``job_diff_review``).
 """
 
 from __future__ import annotations
@@ -103,8 +104,12 @@ async def accept_job_diff(
 
     Gates:
 
+    * The caller is an administrator or a current owner or editor of the
+      job's project (403).
     * Job is ``pending_review`` and project-attached.
     * ``diff_status`` is ``pending`` (the diff capture flagged changes).
+    * The job's checkout sends its diff for review (a read-only copy's
+      changes are never written back).
     * Backend + Gitea are reachable.
     * No external modifications to the cloud folder since seed
       (etag map captured at seed time vs. fresh PROPFIND at accept). On
@@ -117,9 +122,14 @@ async def accept_job_diff(
 
     See knowledge-history/done/job_cloud_export.md §3.5.
     """
-    _, job = await dependencies.require_job_access(request, dependencies.store, job_id)
+    user, job = await dependencies.require_job_access(
+        request, dependencies.store, job_id
+    )
     return await job_diff_review.accept_job_diff(
-        job_id=job_id, authorized_job=job, dependencies=dependencies.diff_review
+        job_id=job_id,
+        user=user,
+        authorized_job=job,
+        dependencies=dependencies.diff_review,
     )
 
 
@@ -134,11 +144,17 @@ async def reject_job_diff(
 
     Stamps ``diff_status='rejected'`` and ``status='completed'``. The
     Gitea commits stay around as the audit trail of what the agent
-    tried to do (cheap; see §3.6).
+    tried to do (cheap; see §3.6). The caller must be an administrator or a
+    current owner or editor of the job's project, as for an accept.
 
     See knowledge-history/done/job_cloud_export.md §3.6.
     """
-    _, job = await dependencies.require_job_access(request, dependencies.store, job_id)
+    user, job = await dependencies.require_job_access(
+        request, dependencies.store, job_id
+    )
     return await job_diff_review.reject_job_diff(
-        job_id=job_id, authorized_job=job, dependencies=dependencies.diff_review
+        job_id=job_id,
+        user=user,
+        authorized_job=job,
+        dependencies=dependencies.diff_review,
     )

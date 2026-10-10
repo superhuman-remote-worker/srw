@@ -193,7 +193,7 @@
         "cells": {
           "nextcloud": {
             "status": "offered",
-            "note": "the folder is copied into the job's repository; SRW writes back only a diff the job's owner accepts, and refuses one whose files changed in the cloud since the copy was made",
+            "note": "the folder is copied into the job's repository; SRW writes back only a diff an owner or editor of the job's project (or an administrator) accepts, and refuses one whose files changed in the cloud since the copy was made",
             "workspace_backends": [
               "sandbox",
               "vm"
@@ -202,7 +202,7 @@
           },
           "opencloud": {
             "status": "offered",
-            "note": "the folder is copied into the job's repository; SRW writes back only a diff the job's owner accepts, and refuses one whose files changed in the cloud since the copy was made",
+            "note": "the folder is copied into the job's repository; SRW writes back only a diff an owner or editor of the job's project (or an administrator) accepts, and refuses one whose files changed in the cloud since the copy was made",
             "workspace_backends": [
               "sandbox",
               "vm"

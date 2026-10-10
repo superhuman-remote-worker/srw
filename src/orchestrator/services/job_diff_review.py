@@ -20,6 +20,13 @@ properties are load-bearing and moved unchanged:
 * **The in-memory job row is mutated to match the committed row** before the
   terminal side effects run, because ``_advance_project_loop`` and
   ``apply_terminal_job_side_effects`` read the dict, not the database.
+
+Seeing a job is not deciding its write-back: an accept writes the project
+folder with the main cloud's own credential, so only an administrator or a
+current owner or editor of the job's project may accept or reject its diff
+(the job's owner too only while they are one; a viewer never writes the
+folder through an accept), and only a diff the job's checkout sends for
+review is ever accepted (``job_cloud_checkout.capture_applies``).
 """
 
 from __future__ import annotations
@@ -41,6 +48,10 @@ class DiffStore(Protocol):
     """The store surface the diff review needs."""
 
     async def get_project(self, project_id: str) -> dict[str, Any] | None: ...
+
+    async def get_user_role_in_project(
+        self, project_id: str, user_id: str
+    ) -> str | None: ...
 
     async def update_job_cloud_diff(self, job_id: str, *, diff_status: str) -> Any: ...
 
@@ -77,6 +88,33 @@ class JobDiffReviewDependencies:
     claim_completion_control: Callable[..., Awaitable[Any]]
     abort_completion_control_claim: Callable[[Any], Awaitable[None]]
     advance_project_loop: Callable[..., Awaitable[Any]]
+
+
+#: The project roles whose members decide a job's write-back diff.
+DIFF_REVIEWER_ROLES = frozenset({"owner", "editor"})
+
+
+async def _require_diff_reviewer(
+    store: DiffStore, user: dict[str, Any], job: dict[str, Any], *, action: str
+) -> None:
+    """403 unless ``user`` may decide the job's diff: an administrator, or a
+    current owner or editor of the job's project. A project-less job has
+    no diff to decide; the gates below refuse it with their own 409."""
+    if user.get("is_admin"):
+        return
+    project_id = job.get("project_id")
+    if not project_id:
+        return
+    role = await store.get_user_role_in_project(str(project_id), str(user["id"]))
+    if role in DIFF_REVIEWER_ROLES:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"Only an owner or editor of the job's project, or an "
+            f"administrator, can {action} its project-folder diff."
+        ),
+    )
 
 
 async def get_job_diff(
@@ -196,6 +234,7 @@ async def get_job_diff_file(
 async def accept_job_diff(
     *,
     job_id: str,
+    user: dict[str, Any],
     authorized_job: dict[str, Any],
     dependencies: JobDiffReviewDependencies,
 ) -> dict[str, Any]:
@@ -203,8 +242,13 @@ async def accept_job_diff(
 
     Gates:
 
+    * ``user`` is an administrator or a current owner or editor of the
+      job's project (403).
     * Job is ``pending_review`` and project-attached.
     * ``diff_status`` is ``pending`` (the diff capture flagged changes).
+    * The job's checkout sends its diff for review (``capture_applies``): a
+      read-only copy's changes are never written back, even when an older
+      orchestrator captured them; reject discards them.
     * Backend + Gitea are reachable.
     * No external modifications to the cloud folder since seed
       (etag map captured at seed time vs. fresh PROPFIND at accept). On
@@ -219,6 +263,7 @@ async def accept_job_diff(
     """
     job = authorized_job
     await dependencies.guard_completion_control(job_id, source="mode_a_accept")
+    await _require_diff_reviewer(dependencies.store, user, job, action="accept")
 
     # --- Gates -------------------------------------------------------
     if job.get("status") != "pending_review":
@@ -247,6 +292,16 @@ async def accept_job_diff(
         raise HTTPException(
             status_code=409,
             detail="Job has no Mode A baseline; nothing to compare against.",
+        )
+    from orchestrator.services.job_cloud_checkout import capture_applies
+
+    if not capture_applies(job):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This job's project folder copy is read-only: SRW never writes "
+                "its changes back. Reject the diff to discard it."
+            ),
         )
 
     if not dependencies.forge.is_initialized:
@@ -480,6 +535,7 @@ async def accept_job_diff(
 async def reject_job_diff(
     *,
     job_id: str,
+    user: dict[str, Any],
     authorized_job: dict[str, Any],
     dependencies: JobDiffReviewDependencies,
 ) -> dict[str, Any]:
@@ -487,12 +543,15 @@ async def reject_job_diff(
 
     Stamps ``diff_status='rejected'`` and ``status='completed'``. The
     Gitea commits stay around as the audit trail of what the agent
-    tried to do (cheap; see §3.6).
+    tried to do (cheap; see §3.6). Decided by the same people as an
+    accept; a read-only copy's stray diff is rejected like any other, since
+    a pending diff blocks every other way to complete the job.
 
     See knowledge-history/done/job_cloud_export.md §3.6.
     """
     job = authorized_job
     await dependencies.guard_completion_control(job_id, source="mode_a_reject")
+    await _require_diff_reviewer(dependencies.store, user, job, action="reject")
 
     if job.get("status") != "pending_review":
         raise HTTPException(
@@ -611,6 +670,7 @@ async def reject_job_diff(
 
 
 __all__ = [
+    "DIFF_REVIEWER_ROLES",
     "DiffForge",
     "DiffStore",
     "JobDiffReviewDependencies",

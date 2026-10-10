@@ -773,7 +773,15 @@ class TestRejectStaysMergeFree:
                     workspace_composition.job_diff_dependencies(
                         orchestrator.main.app.state.resources
                     ),
-                    require_job_access=AsyncMock(return_value=({}, job)),
+                    require_job_access=AsyncMock(
+                        return_value=(
+                            {
+                                "id": "00000000-0000-4000-8000-0000000000ad",
+                                "is_admin": True,
+                            },
+                            job,
+                        )
+                    ),
                 ),
             )
 
