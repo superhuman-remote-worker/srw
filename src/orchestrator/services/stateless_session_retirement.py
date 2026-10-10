@@ -439,37 +439,44 @@ async def retire_stateless_workspace_residents(
                     workspace_root="/home/agent-host/workspace",
                 )
                 counters.update(await overlay.retire_existing())
-            if cloud_mount_cfg.get("delivery") == "sidecar":
-                # The Pod's sidecars own the folders (D7): nothing of the
-                # session runs in the workspace, but its writes must still
-                # reach the cloud while T is active, so ask for the flush
-                # and require it when a mounted folder has uploads pending.
-                watcher = SidecarMountWatcher(
-                    thread_id=authority.thread_id,
-                    cloud_cfg=dict(cloud_mount_cfg),
-                    workspace_backend=backend,
-                    workspace_root="/home/agent-host/workspace",
-                    terminal=True,
+        if cloud_mount_cfg and cloud_mount_cfg.get("delivery") == "sidecar":
+            # The Pod's sidecars own the folders (D7): nothing of the
+            # session runs in the workspace, but its writes must still
+            # reach the cloud while T is active, so ask for the flush
+            # and require it when a mounted folder has uploads pending.
+            watcher = SidecarMountWatcher(
+                thread_id=authority.thread_id,
+                cloud_cfg=dict(cloud_mount_cfg),
+                workspace_backend=backend,
+                workspace_root="/home/agent-host/workspace",
+                terminal=True,
+            )
+            counters.update(await watcher.retire_existing(drain=True))
+            cleared = await asyncio.to_thread(
+                backend.exec_terminal_claim_resource,
+                _sidecar_stale_rclone_cleanup_command(authority.thread_id),
+                30,
+                operation="stale in-workspace rclone state cleanup",
+            )
+            if SIDECAR_RCLONE_ZERO_MARKER not in str(cleared or ""):
+                raise ShellRetirementUnavailable(
+                    "stale in-workspace rclone state was not cleared"
                 )
-                counters.update(await watcher.retire_existing(drain=True))
-                cleared = await asyncio.to_thread(
-                    backend.exec_terminal_claim_resource,
-                    _sidecar_stale_rclone_cleanup_command(authority.thread_id),
-                    30,
-                    operation="stale in-workspace rclone state cleanup",
-                )
-                if SIDECAR_RCLONE_ZERO_MARKER not in str(cleared or ""):
-                    raise ShellRetirementUnavailable(
-                        "stale in-workspace rclone state was not cleared"
-                    )
-            else:
-                mount_manager = RcloneMountManager(
-                    thread_id=authority.thread_id,
-                    cloud_cfg=dict(cloud_mount_cfg),
-                    workspace_backend=backend,
-                    workspace_root="/home/agent-host/workspace",
-                )
-                counters.update(await mount_manager.retire_existing(drain=True))
+        else:
+            # Without a payload too: whatever an earlier claim mounted in
+            # the workspace and nothing names now is retired, never left to
+            # fail the zero proof below (its identity file) for good.
+            mount_manager = RcloneMountManager(
+                thread_id=authority.thread_id,
+                cloud_cfg=(
+                    dict(cloud_mount_cfg)
+                    if cloud_mount_cfg
+                    else {"driver": "rclone", "mounts": []}
+                ),
+                workspace_backend=backend,
+                workspace_root="/home/agent-host/workspace",
+            )
+            counters.update(await mount_manager.retire_existing(drain=True))
         await asyncio.to_thread(
             backend.exec_terminal_claim_resource,
             _resident_zero_command(authority.thread_id)

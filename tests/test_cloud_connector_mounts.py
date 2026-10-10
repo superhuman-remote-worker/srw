@@ -1350,6 +1350,96 @@ async def test_end_rebuilds_the_old_rule_only_for_a_session_it_mounted(
     assert {m["mount_id"] for m in payload["mounts"]} == {FOLDER, OUTBOX}
 
 
+@pytest.mark.asyncio
+async def test_end_retires_what_the_workspace_was_given_not_what_is_attached_now(
+    denied, monkeypatch
+):
+    """Each in-workspace delivery keeps its mounts on the thread, without a
+    secret; End rebuilds from that record, so a folder detached, revoked or
+    renamed since is still retired exactly as it was mounted."""
+    import json
+
+    from shared.runtime.services.cloud_mount import RcloneMountManager
+
+    monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
+    store = Store([_folder_row(), _outbox_row()])
+    thread = _thread([FOLDER, OUTBOX])
+    delivered = await mounts._build_agent_cloud_mount(
+        thread,
+        mount_rows=[],
+        metadata={**thread["metadata"], **_ready()},
+        dependencies=_deps(store),
+    )
+    ((_tid, patch),) = [
+        entry for entry in store.metadata if mounts.DELIVERED_KEY in entry[1]
+    ]
+    record = patch[mounts.DELIVERED_KEY]
+    assert "agent-pass" not in json.dumps(record)
+    assert [m["mount_id"] for m in record["mounts"]] == [
+        m["mount_id"] for m in delivered["mounts"]
+    ]
+    # The same delivery again writes nothing.
+    store.metadata.clear()
+    await mounts._build_agent_cloud_mount(
+        thread,
+        mount_rows=[],
+        metadata={**thread["metadata"], **_ready(), mounts.DELIVERED_KEY: record},
+        dependencies=_deps(store),
+    )
+    assert store.metadata == []
+
+    # The project folder is detached since; End still rebuilds it.
+    ended, metadata = _terminal_thread(
+        {
+            "cloud_mount_rule": "connectors",
+            "datasource_ids": [OUTBOX],
+            mounts.DELIVERED_KEY: record,
+        }
+    )
+    rebuilt = await mounts._build_agent_cloud_mount(
+        ended,
+        mount_rows=[],
+        metadata=metadata,
+        terminal_retirement_token=8,
+        dependencies=_deps(store),
+    )
+    assert [m["mount_id"] for m in rebuilt["mounts"]] == [
+        m["mount_id"] for m in delivered["mounts"]
+    ]
+    manager = RcloneMountManager(
+        thread_id=THREAD,
+        cloud_cfg=rebuilt,
+        workspace_backend=SimpleNamespace(
+            resolve_home_path=lambda rel: f"/home/agent-host/{rel}"
+        ),
+        workspace_root="/home/agent-host/workspace",
+    )
+    for index, (given, again) in enumerate(zip(delivered["mounts"], rebuilt["mounts"])):
+        assert (
+            manager._state_for_mount(given, index).resident_spec_digest
+            == manager._state_for_mount(again, index).resident_spec_digest
+        )
+    # Nothing was given last: nothing to rebuild (End's own pass retires
+    # whatever an earlier claim left).
+    ended, metadata = _terminal_thread(
+        {
+            "cloud_mount_rule": "connectors",
+            "datasource_ids": [FOLDER, OUTBOX],
+            mounts.DELIVERED_KEY: {"version": 1, "mounts": []},
+        }
+    )
+    assert (
+        await mounts._build_agent_cloud_mount(
+            ended,
+            mount_rows=[],
+            metadata=metadata,
+            terminal_retirement_token=8,
+            dependencies=_deps(store),
+        )
+        is None
+    )
+
+
 # --------------------------------------------------------------------------- #
 # The one-time conversion
 # --------------------------------------------------------------------------- #

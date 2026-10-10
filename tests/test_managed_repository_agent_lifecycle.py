@@ -1046,8 +1046,10 @@ def test_terminal_endpoint_rejects_unowned_process_zero_state() -> None:
 @pytest.mark.asyncio
 async def test_terminal_end_retires_then_reproves_all_credential_agents() -> None:
     backend = MagicMock()
-    backend.exec_terminal_claim_resource.return_value = ""
+    # Every terminal script acknowledges; rclone's own say so with its marker.
+    backend.exec_terminal_claim_resource.return_value = "__SRW_RCLONE_MOUNT_OK__\n"
     backend.verify_terminal_claim_resources_retired.return_value = ""
+    backend.resolve_home_path.side_effect = lambda rel: f"/home/agent-host/{rel}"
     thread = _terminal_thread()
     with patch(
         "orchestrator.services.stateless_session_retirement._build_terminal_backend",
@@ -1065,6 +1067,8 @@ async def test_terminal_end_retires_then_reproves_all_credential_agents() -> Non
     ]
     assert " all " in commands[0]
     assert "/home/agent-host/.ssh/srw-managed/sockets" in commands[0]
+    # Without a cloud payload, what an earlier claim mounted is still retired.
+    assert any("terminal_retire_unplanned_rclone.sh" in c for c in commands)
     assert " zero " in commands[-1]
     verify_command = backend.verify_terminal_claim_resources_retired.call_args.args[0]
     assert " zero " in verify_command

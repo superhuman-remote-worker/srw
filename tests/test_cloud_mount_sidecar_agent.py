@@ -1162,8 +1162,9 @@ def test_a_sync_deployment_names_the_folders_it_does_not_deliver():
 async def test_an_in_workspace_set_that_mounts_nothing_starts_no_rclone():
     """Every attached folder left out: the orchestrator hands such a set over
     as ``cloud_folders_excluded``, but a ``cloud_mount`` with no mount (an
-    orchestrator mid-rollout) is safe too. Nothing runs in the workspace,
-    no rclone starts, and each folder is named for the prompt."""
+    orchestrator mid-rollout) is safe too. No rclone starts (only what an
+    earlier claim mounted is retired), and each folder is named for the
+    prompt."""
     excluded = [
         {
             "source_ref": "c-1",
@@ -1176,6 +1177,7 @@ async def test_an_in_workspace_set_that_mounts_nothing_starts_no_rclone():
         }
     ]
     backend = MagicMock(root="/home/agent-host/workspace")
+    backend.resolve_home_path.side_effect = lambda rel: f"/home/agent-host/{rel}"
     session = SimpleNamespace(
         thread_id="t1",
         workspace_manager=SimpleNamespace(
@@ -1201,7 +1203,10 @@ async def test_an_in_workspace_set_that_mounts_nothing_starts_no_rclone():
             "excluded": excluded,
         },
     )
-    assert backend.mock_calls == []
+    staged = [call.args[0] for call in backend.write_home_file.call_args_list]
+    assert [path.rsplit("/", 1)[-1] for path in staged] == [
+        "retire_unplanned_rclone.sh"
+    ]
     assert session.cloud_mount_manager.active is False
     assert session.cloud_mount_error is None
     assert session.config.extra["_cloud_mounts_mounted"] == []
@@ -1222,6 +1227,41 @@ async def test_an_in_workspace_set_that_mounts_nothing_starts_no_rclone():
         plain.config.extra["_cloud_mounts_unavailable"]
         == session.config.extra["_cloud_mounts_unavailable"]
     )
+
+
+@pytest.mark.asyncio
+async def test_a_claim_given_no_cloud_mount_retires_what_an_earlier_one_mounted():
+    """No cloud payload (every folder detached, say): a resident an earlier
+    claim mounted is retired all the same, and nothing mounts. A workspace
+    without a shell is left alone."""
+    backend = MagicMock(root="/home/agent-host/workspace")
+    backend.resolve_home_path.side_effect = lambda rel: f"/home/agent-host/{rel}"
+    session = SimpleNamespace(
+        thread_id="t1",
+        workspace_manager=SimpleNamespace(
+            backend=backend, path="/home/agent-host/workspace"
+        ),
+        protected_cloud_required=False,
+        cloud_mount_manager=None,
+    )
+    session._retire_unplanned_cloud_mounts = (
+        lambda: PersistentSession._retire_unplanned_cloud_mounts(session)
+    )
+    await PersistentSession._setup_cloud_mount(session, None)
+    staged = [call.args[0] for call in backend.write_home_file.call_args_list]
+    assert [path.rsplit("/", 1)[-1] for path in staged] == [
+        "retire_unplanned_rclone.sh"
+    ]
+    assert session.cloud_mount_manager is None
+    scratch = SimpleNamespace(
+        thread_id="t1",
+        workspace_manager=SimpleNamespace(backend=object(), path="/w"),
+        protected_cloud_required=False,
+    )
+    scratch._retire_unplanned_cloud_mounts = (
+        lambda: PersistentSession._retire_unplanned_cloud_mounts(scratch)
+    )
+    await PersistentSession._setup_cloud_mount(scratch, None)
 
 
 def test_a_workspace_that_can_mount_no_folder_says_so_in_the_prompt():

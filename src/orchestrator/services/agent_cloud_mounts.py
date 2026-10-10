@@ -14,8 +14,10 @@ properties are load-bearing and moved unchanged:
 * **Per connector, never all-or-fallback** (main cloud slice 3). A
   session mounts the cloud connectors it has attached, each on its own; one
   that cannot be mounted is named with a closed reason and nothing takes its
-  place (``cloud_connector_mounts``). Only End's reconstruction of a session
-  the old rule mounted still builds the old set, to adopt its residents.
+  place (``cloud_connector_mounts``). Each in-workspace delivery is kept on
+  the thread without its secrets (:data:`DELIVERED_KEY`), and End retires
+  exactly that; only a session no delivery has recorded falls back to the
+  live set or, when the old rule mounted it, to the old set.
 * **A static password stays with the sidecars.** On a deployment with the
   in-pod plane, a session container Pod's workspace never gets a folder
   credential its sidecars would have held: a Pod created without a plan
@@ -97,6 +99,7 @@ from orchestrator.services.stateless_workspace_gate import (
 )
 from shared.backend_kinds import LITE_BACKENDS
 from shared.connectors.contract import AccessContext
+from shared.runtime.services.cloud_mount import resident_spec_record
 from shared.connectors.platform import native_project
 
 logger = logging.getLogger(__name__)
@@ -1620,11 +1623,16 @@ async def _build_agent_cloud_mount(
     them all, so none goes missing silently (End's reconstruction gets no
     payload then). A session created before the connector rule converts once
     here (``session_cloud_preparation.convert_to_connector_rule``) when its
-    workspace has no recorded plan. A terminal token selects the narrower
-    End-only reconstruction gate; it does not widen normal runtime delivery,
-    and for a session the old rule mounted (no ``cloud_mount_rule`` stamp)
-    End rebuilds the old rule's set (:func:`_legacy_live_mount_set`), which
-    its resident processes were mounted from.
+    workspace has no recorded plan. Each such delivery keeps its mounts on
+    the thread, without a secret (:func:`_record_delivery`). A terminal
+    token selects the narrower End-only reconstruction gate; it does not
+    widen normal runtime delivery. End rebuilds what the workspace was last
+    given (:func:`recorded_delivery`), whatever is attached now; without a
+    record, for a session the old rule mounted (no ``cloud_mount_rule``
+    stamp), the old rule's set (:func:`_legacy_live_mount_set`), which its
+    resident processes were mounted from. Any other resident of the thread
+    is retired by End's unplanned pass
+    (``RcloneMountManager.retire_existing``).
 
     A Pod created with the in-pod plane (connector drivers D7) records its
     plan; its mounts come from its sidecars, so this returns the sidecar
@@ -1723,6 +1731,15 @@ async def _build_agent_cloud_mount(
     vm_ctx = metadata.get("vm") or {}
     runtime_is_vm = vm_ctx.get("status") == "ready" and bool(vm_ctx.get("ssh_host"))
 
+    if terminal_retirement_token is not None:
+        delivered = recorded_delivery(metadata)
+        if delivered is not None:
+            # What the workspace was last given, as it was given: the live
+            # selection may have moved since (a folder detached, revoked or
+            # renamed), and End must rebuild the residents' exact identity.
+            # Anything else of the thread's is retired as unplanned.
+            return _in_workspace_payload(delivered) if delivered else None
+
     legacy = terminal_retirement_token is not None and not uses_connector_rule(metadata)
     if legacy:
         live = await _legacy_live_mount_set(
@@ -1752,6 +1769,12 @@ async def _build_agent_cloud_mount(
                 else None
             ),
         )
+        if terminal_retirement_token is None:
+            await _record_delivery(
+                {**thread, "metadata": metadata},
+                live.mounts,
+                dependencies=dependencies,
+            )
     if not live.mounts and (
         legacy or terminal_retirement_token is not None or not live.excluded
     ):
@@ -1766,6 +1789,52 @@ async def _build_agent_cloud_mount(
     if any(mount.get("mount_kind") == "cloud_outbox" for mount in live.mounts):
         payload["outbox_shared"] = bool(thread.get("main_cloud_share_handle"))
     return payload
+
+
+#: The thread metadata key of the in-workspace mounts last delivered.
+DELIVERED_KEY = "cloud_mount_delivered"
+
+
+def recorded_delivery(metadata: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """The in-workspace mounts the thread's workspace was last given, without
+    their secrets (``resident_spec_record``), or ``None`` for a thread that
+    has no record (one no delivery reached since it was kept)."""
+    record = metadata.get(DELIVERED_KEY)
+    if not isinstance(record, dict) or record.get("version") != 1:
+        return None
+    mounts = record.get("mounts")
+    if not isinstance(mounts, list) or not all(isinstance(m, dict) for m in mounts):
+        return None
+    return [dict(mount) for mount in mounts]
+
+
+async def _record_delivery(
+    thread: dict[str, Any],
+    mounts: list[dict[str, Any]],
+    *,
+    dependencies: AgentCloudMountDependencies,
+) -> None:
+    """Keep what an in-workspace delivery gives the workspace on the thread
+    (non-secret, :data:`DELIVERED_KEY`), for End to retire exactly that.
+    Written only when it changed. Best effort, never raises: without it End
+    rebuilds from the live selection and retires the rest as unplanned."""
+    record = {
+        "version": 1,
+        "mounts": [resident_spec_record(mount) for mount in mounts],
+    }
+    if thread_metadata_object(thread).get(DELIVERED_KEY) == record:
+        return
+    writer = getattr(type(dependencies.store), "merge_thread_cloud_metadata", None)
+    if not callable(writer):
+        return
+    try:
+        await writer(dependencies.store, str(thread["id"]), {DELIVERED_KEY: record})
+    except Exception:
+        logger.warning(
+            "Thread %s: what its workspace was given was not recorded",
+            thread.get("id"),
+            exc_info=True,
+        )
 
 
 def _in_workspace_payload(

@@ -1149,6 +1149,7 @@ class PersistentSession:
                 "protected-cloud mount contract is missing or malformed"
             )
         if not cloud_mount_cfg:
+            await self._retire_unplanned_cloud_mounts()
             return
         # Background officer (officer_knowledge_plane.md §4): the project/cloud
         # folder is object plane — never mounted for a commissioned officer,
@@ -1226,6 +1227,34 @@ class PersistentSession:
                 *_in_workspace_cloud_folders(cloud_mount_cfg, self.cloud_mount_manager),
             )
         await self._finish_protected_cloud(cloud_mount_cfg)
+
+    async def _retire_unplanned_cloud_mounts(self) -> None:
+        """No folder is mounted into this claim's workspace: a resident an
+        earlier claim mounted, for a folder detached, revoked or left out
+        since, is stopped and its rclone config with its credential removed
+        (``RcloneMountManager.retire_unplanned_sync``). Best effort, never
+        raises: what stays is retried at the next claim and at End."""
+        backend = getattr(self.workspace_manager, "backend", None)
+        if backend is None or not all(
+            callable(getattr(backend, name, None))
+            for name in ("exec_command", "write_home_file", "resolve_home_path")
+        ):
+            return
+        from shared.runtime.services.cloud_mount import RcloneMountManager
+
+        try:
+            manager = RcloneMountManager(
+                thread_id=self.thread_id,
+                cloud_cfg={"driver": "rclone", "mounts": []},
+                workspace_backend=backend,
+                workspace_root=self.workspace_manager.path,
+            )
+            await asyncio.to_thread(manager.retire_unplanned_sync, [])
+        except Exception:
+            logger.warning(
+                "Could not retire cloud mounts outside this claim's set",
+                exc_info=True,
+            )
 
     def _note_undelivered_cloud_folders(self, excluded: Any) -> None:
         """Name in the prompt each attached cloud folder the orchestrator
