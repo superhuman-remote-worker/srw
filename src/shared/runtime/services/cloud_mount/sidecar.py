@@ -87,6 +87,10 @@ REASON_TEXT = {
         "this deployment syncs files instead of mounting them; cloud folders "
         "aren't delivered here"
     ),
+    # A workspace that can mount none (container mounts off, FUSE denied).
+    "mount_unsupported": (
+        "this workspace can't mount cloud folders, so they aren't delivered here"
+    ),
 }
 
 #: What each kind of mounted folder is, for the agent's prompt.

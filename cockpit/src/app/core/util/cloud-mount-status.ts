@@ -88,6 +88,8 @@ export const CLOUD_FOLDER_REASONS = [
   // A deployment that syncs files instead of mounting them delivers no
   // cloud folder (CLOUD_WORKSPACE_DRIVER=sync).
   'delivery_unsupported',
+  // A workspace that can mount none (container mounts off, FUSE denied).
+  'mount_unsupported',
 ] as const;
 
 /** What a cloud folder is, as the notice names it: a project's folder, the

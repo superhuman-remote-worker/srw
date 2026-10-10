@@ -81,9 +81,11 @@ OUTBOX_FAILURE_REASONS: tuple[str, ...] = (
 #: writer, a reader) is not active (``detail``: the failed mint's code, or
 #: ``not_ready``), ``cloud_not_connected`` / ``cloud_grant_revoked`` for
 #: a user's own root its user has not connected, or whose credential the
-#: cloud refused (``cloud_user_root``), and ``delivery_unsupported`` for a
+#: cloud refused (``cloud_user_root``), ``delivery_unsupported`` for a
 #: cloud folder of a deployment that syncs files instead of mounting them
-#: (``CLOUD_WORKSPACE_DRIVER=sync``), which delivers no cloud folder.
+#: (``CLOUD_WORKSPACE_DRIVER=sync``), which delivers no cloud folder, and
+#: ``mount_unsupported`` for one of a workspace that can mount none
+#: (``detail``: ``container_mounts_disabled``, ``fuse_denied``).
 EXCLUSION_REASONS: tuple[str, ...] = (
     "access_unavailable",
     "config_invalid",
@@ -98,6 +100,7 @@ EXCLUSION_REASONS: tuple[str, ...] = (
     "cloud_not_connected",
     "cloud_grant_revoked",
     "delivery_unsupported",
+    "mount_unsupported",
 )
 
 _DRIVERS: dict[str, CloudFolderDriver | CloudOutboxDriver] = {

@@ -82,7 +82,11 @@ from orchestrator.services.session_runtime_admission import (
     protected_cloud_marker_state,
     thread_runtime_authority,
 )
-from orchestrator.services.stateless_workspace_gate import thread_metadata_object
+from orchestrator.services.stateless_workspace_gate import (
+    declared_thread_workspace_backend,
+    thread_metadata_object,
+)
+from shared.backend_kinds import LITE_BACKENDS
 from shared.connectors.contract import AccessContext
 from shared.connectors.platform import native_project
 
@@ -1241,6 +1245,77 @@ async def sync_delivery_exclusions(
     Its outbox is the session folder the sync already carries, so it is not
     named. A protected session has no sync at all and says so its own way.
     """
+    return await _synced_session_exclusions(
+        thread,
+        "delivery_unsupported",
+        mount_rows=mount_rows,
+        dependencies=dependencies,
+    )
+
+
+def _runtime_refusal(
+    thread: dict[str, Any],
+    metadata: dict[str, Any],
+    *,
+    fuse_denied: bool,
+    dependencies: AgentCloudMountDependencies,
+) -> str | None:
+    """Why this thread's workspace never mounts a cloud folder under the
+    ``rclone_mount`` driver, as a closed code, or ``None`` when it can, or
+    may once it is ready: ``container_mounts_disabled`` when this deployment
+    runs no rclone in a container workspace (``CLOUD_RCLONE_ALLOW_CONTAINER``
+    off), ``fuse_denied`` for a container whose custom image is denied
+    /dev/fuse (``container_denies_fuse``). A VM mounts its own, so one still
+    coming up says nothing yet."""
+    if dependencies.cloud_workspace_driver() != "rclone_mount":
+        return None
+    if fuse_denied:
+        return "fuse_denied"
+    if _vm_runtime_ready(metadata) or declared_thread_workspace_backend(
+        {**thread, "metadata": metadata}
+    ) in {"vm", *LITE_BACKENDS}:
+        return None
+    allow_container = os.getenv("CLOUD_RCLONE_ALLOW_CONTAINER", "true").lower()
+    if allow_container in {"0", "false", "no", "off"}:
+        return "container_mounts_disabled"
+    return None
+
+
+async def runtime_refusal_exclusions(
+    thread: dict[str, Any],
+    detail: str,
+    *,
+    mount_rows: list[dict[str, Any]] | None,
+    dependencies: AgentCloudMountDependencies,
+) -> list[dict[str, str]]:
+    """Every attached cloud folder of a session whose workspace can mount
+    none (``mount_unsupported``; ``detail`` is :func:`_runtime_refusal`'s).
+
+    Under the ``rclone_mount`` driver such a workspace gets only its session
+    folder's sync, so each ``cloud_folder`` connector it attached is named
+    instead of silently missing; its outbox is that session folder, so it is
+    not."""
+    return await _synced_session_exclusions(
+        thread,
+        "mount_unsupported",
+        detail=detail,
+        mount_rows=mount_rows,
+        dependencies=dependencies,
+    )
+
+
+async def _synced_session_exclusions(
+    thread: dict[str, Any],
+    reason: str,
+    *,
+    detail: str | None = None,
+    mount_rows: list[dict[str, Any]] | None,
+    dependencies: AgentCloudMountDependencies,
+) -> list[dict[str, str]]:
+    """Each attached ``cloud_folder`` connector of an unprotected session
+    under the connector rule whose workspace gets its session folder's sync
+    and no mount, excluded with ``reason``; the outbox is that session
+    folder. An older session keeps what the sync did for its rows."""
     metadata = thread_metadata_object(thread)
     if (
         not uses_connector_rule(metadata)
@@ -1257,14 +1332,15 @@ async def sync_delivery_exclusions(
     except Exception:
         # Naming them is the report; it never holds the workspace up.
         logger.warning(
-            "Thread %s: could not list the cloud folders its sync does not deliver",
+            "Thread %s: could not list the cloud folders its workspace gets "
+            "no mount of",
             thread.get("id"),
             exc_info=True,
         )
         return []
     return [
         {
-            **excluded_entry(connector, "delivery_unsupported"),
+            **excluded_entry(connector, reason, detail=detail),
             "title": str(connector.row.get("name") or ""),
         }
         for connector in selected
@@ -1446,7 +1522,9 @@ async def _build_agent_cloud_mount(
     terminal_retirement_token: int | None = None,
     dependencies: AgentCloudMountDependencies,
 ) -> Optional[dict[str, Any]]:
-    """Build the rclone ``cloud_mount`` payload for capable runtimes.
+    """Build the rclone ``cloud_mount`` payload for capable runtimes; a
+    runtime that can mount none (:func:`_runtime_refusal`) gets one that
+    names each attached cloud folder ``mount_unsupported``.
 
     Each attached cloud connector mounts on its own
     (:func:`_resolve_live_mount_set`); the ones that cannot are named in
@@ -1494,14 +1572,14 @@ async def _build_agent_cloud_mount(
             # identity, so it may change between attaches).
             payload["outbox_shared"] = bool(thread.get("main_cloud_share_handle"))
         return payload
+    fuse_denied = False
     if terminal_retirement_token is None:
         runtime_supported = _runtime_supports_rclone_mount(
             metadata, dependencies=dependencies
         )
         if runtime_supported and not _vm_runtime_ready(metadata):
-            runtime_supported = not await container_denies_fuse(
-                dependencies.store, thread
-            )
+            fuse_denied = await container_denies_fuse(dependencies.store, thread)
+            runtime_supported = not fuse_denied
     else:
         runtime_supported = _runtime_supports_terminal_rclone_retirement(
             thread,
@@ -1510,7 +1588,25 @@ async def _build_agent_cloud_mount(
             dependencies=dependencies,
         )
     if not runtime_supported:
-        return None
+        refusal = (
+            _runtime_refusal(
+                thread, metadata, fuse_denied=fuse_denied, dependencies=dependencies
+            )
+            if terminal_retirement_token is None
+            else None
+        )
+        if refusal is None:
+            return None
+        # A workspace that can mount no folder names each one (main cloud,
+        # nothing missing silently), as an in-workspace set that mounted
+        # none does below.
+        excluded = await runtime_refusal_exclusions(
+            {**thread, "metadata": metadata},
+            refusal,
+            mount_rows=mount_rows,
+            dependencies=dependencies,
+        )
+        return _in_workspace_payload([], excluded=excluded) if excluded else None
 
     # Protected cloud mode: the marker ALONE routes a thread into this branch —
     # never gate the branch on the feature flag, or a protected-marked thread
@@ -1568,19 +1664,34 @@ async def _build_agent_cloud_mount(
     ):
         return None
 
+    if legacy:
+        # The old rule's payload, exactly as it was delivered.
+        return _in_workspace_payload(live.mounts, fallback=live.fallback)
+    payload = _in_workspace_payload(
+        live.mounts, fallback=live.fallback, excluded=live.excluded
+    )
+    if any(mount.get("mount_kind") == "cloud_outbox" for mount in live.mounts):
+        payload["outbox_shared"] = bool(thread.get("main_cloud_share_handle"))
+    return payload
+
+
+def _in_workspace_payload(
+    mounts: list[dict[str, Any]],
+    *,
+    fallback: bool = False,
+    excluded: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """The in-workspace ``cloud_mount``; ``excluded`` is left off only for
+    the old rule's, which End rebuilds exactly as it was delivered."""
     payload: dict[str, Any] = {
         "version": 1,
         "driver": "rclone",
         "cloud_root": "/cloud",
         "workspace_entry": "cloud",
-        "fallback": live.fallback,
+        "fallback": fallback,
         "required": False,
-        "mounts": live.mounts,
+        "mounts": mounts,
     }
-    if legacy:
-        # The old rule's payload, exactly as it was delivered.
-        return payload
-    payload["excluded"] = live.excluded
-    if any(mount.get("mount_kind") == "cloud_outbox" for mount in live.mounts):
-        payload["outbox_shared"] = bool(thread.get("main_cloud_share_handle"))
+    if excluded is not None:
+        payload["excluded"] = excluded
     return payload

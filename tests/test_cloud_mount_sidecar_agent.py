@@ -1222,3 +1222,35 @@ async def test_an_in_workspace_set_that_mounts_nothing_starts_no_rclone():
         plain.config.extra["_cloud_mounts_unavailable"]
         == session.config.extra["_cloud_mounts_unavailable"]
     )
+
+
+def test_a_workspace_that_can_mount_no_folder_says_so_in_the_prompt():
+    """mount_unsupported (container mounts off, FUSE denied): each attached
+    folder is named with what the agent can tell the user, never the sync
+    driver's words."""
+    from shared.runtime.core.loader import AgentConfig
+
+    session = SimpleNamespace(
+        config=AgentConfig(agent_id="a", display_name="A", extra={}),
+        protected_cloud_required=False,
+    )
+    PersistentSession._note_undelivered_cloud_folders(
+        session,
+        [
+            {
+                "source_ref": "c-1",
+                "mount_kind": "project",
+                "reason": "mount_unsupported",
+                "detail": "fuse_denied",
+                "name": "",
+                "title": "Acme Launch cloud folder",
+            }
+        ],
+    )
+    [row] = session.config.extra["_cloud_mounts_unavailable"]
+    assert row["text"] == (
+        "this workspace can't mount cloud folders, so they aren't delivered here"
+    )
+    floor = cloud_mount_system_floor(session.config.extra["_cloud_mounts_unavailable"])
+    assert '"Acme Launch cloud folder" was not attached: this workspace' in floor
+    assert "syncs files" not in floor

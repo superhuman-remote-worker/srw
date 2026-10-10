@@ -16,6 +16,7 @@ import dataclasses
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -933,6 +934,108 @@ async def test_the_sync_driver_names_each_cloud_folder_it_does_not_deliver(denie
             )
             == []
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("allow", "fuse_denied", "detail"),
+    [
+        ("false", False, "container_mounts_disabled"),
+        ("true", True, "fuse_denied"),
+    ],
+)
+async def test_a_workspace_that_can_mount_no_folder_names_each_one(
+    denied, monkeypatch, allow, fuse_denied, detail
+):
+    """Under the rclone_mount driver a container that can mount nothing
+    (CLOUD_RCLONE_ALLOW_CONTAINER off, or a custom image denied /dev/fuse)
+    gets only its session folder's sync: the project's folder and the
+    owner's root are named mount_unsupported, never silently missing; the
+    outbox is that session folder."""
+    monkeypatch.setenv("CLOUD_RCLONE_ALLOW_CONTAINER", allow)
+    monkeypatch.setattr(
+        mounts, "container_denies_fuse", AsyncMock(return_value=fuse_denied)
+    )
+    store = Store([_folder_row(), _outbox_row(), _root_row()])
+    deps = _deps(store)
+    thread = _thread([FOLDER, OUTBOX, ROOT])
+    payload = await mounts._build_agent_cloud_mount(
+        thread,
+        mount_rows=[],
+        metadata={**thread["metadata"], **_ready()},
+        dependencies=deps,
+    )
+    assert payload["mounts"] == []
+    assert [
+        (e["source_ref"], e["reason"], e["detail"], e["title"])
+        for e in payload["excluded"]
+    ] == [
+        (FOLDER, "mount_unsupported", detail, "Acme Launch cloud folder"),
+        (ROOT, "mount_unsupported", detail, "My cloud"),
+    ]
+    assert "mount_unsupported" in rule.EXCLUSION_REASONS
+    # End reconstructs nothing from it, and a protected session keeps its
+    # own contract: no payload.
+    monkeypatch.setattr(
+        mounts,
+        "_runtime_supports_terminal_rclone_retirement",
+        lambda *args, **kwargs: False,
+    )
+    protected = _thread([FOLDER], metadata={"protected_cloud": True})
+    for target, token in ((thread, 7), (protected, None)):
+        assert (
+            await mounts._build_agent_cloud_mount(
+                target,
+                mount_rows=[],
+                metadata={**target["metadata"], **_ready()},
+                terminal_retirement_token=token,
+                dependencies=deps,
+            )
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_workspace_still_coming_up_names_nothing_yet(denied, monkeypatch):
+    """Only a runtime that can never mount names its folders: a container
+    not ready yet, or a VM session's VM still booting (its own folders, even
+    with container mounts off), says nothing until it is up; nor does the
+    sync driver, which names its own in the delivery."""
+    store = Store([_folder_row()])
+    thread = _thread([FOLDER])
+    booting_vm = {
+        "vm": {"status": "creating"},
+        "config_override": {"workspace": {"backend": "vm"}},
+    }
+    monkeypatch.setenv("CLOUD_RCLONE_ALLOW_CONTAINER", "true")
+    creating = {"workspace_container": {"status": "creating"}}
+    cases = [(creating, _deps(store))]
+    cases.append(
+        (
+            _ready(),
+            dataclasses.replace(_deps(store), cloud_workspace_driver=lambda: "sync"),
+        )
+    )
+    for extra, deps in cases:
+        assert (
+            await mounts._build_agent_cloud_mount(
+                thread,
+                mount_rows=[],
+                metadata={**thread["metadata"], **extra},
+                dependencies=deps,
+            )
+            is None
+        )
+    monkeypatch.setenv("CLOUD_RCLONE_ALLOW_CONTAINER", "false")
+    assert (
+        await mounts._build_agent_cloud_mount(
+            thread,
+            mount_rows=[],
+            metadata={**thread["metadata"], **booting_vm},
+            dependencies=_deps(store),
+        )
+        is None
+    )
 
 
 # --------------------------------------------------------------------------- #
