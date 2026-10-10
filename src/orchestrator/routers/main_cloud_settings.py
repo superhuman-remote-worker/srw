@@ -7,9 +7,10 @@ matrix; nothing here changes the configuration.
 
 The removed connection-form API answers **410 Gone** rather than 404: a
 cached cockpit or a script still calling it learns that the endpoint was
-retired on purpose and where the configuration lives now. The one-shot
-instance-authority backfill and thread-mount transport repair stay as
-operator operations until their work is done.
+retired on purpose and where the configuration lives now. So does the
+thread-mount transport repair, whose work is done (main cloud slice 8). The
+one-shot instance-authority backfill stays as an operator operation until its
+work is done.
 
 Every route awaits the admin gate first — before any body is inspected — so a
 non-admin learns nothing, not even that an endpoint was retired.
@@ -31,6 +32,11 @@ router = APIRouter()
 RETIRED_DETAIL = (
     "The main cloud is configured by Helm only; this endpoint was removed. "
     "GET /api/admin/main-cloud shows the active configuration."
+)
+#: The 410 body of the retired thread-mount transport repair.
+REPAIR_RETIRED_DETAIL = (
+    "A session's cloud folders are its attached cloud connectors; no "
+    "thread_mounts row is mounted any more, so this repair was removed."
 )
 
 
@@ -188,26 +194,16 @@ async def backfill_main_cloud_instance_authority(
 @router.post("/api/admin/system-settings/main_cloud/repair-thread-mounts")
 async def repair_thread_mount_transport(
     request: Request,
-    apply: bool = False,
     *,
     dependencies: MainCloudSettingsRouteDependencies = Depends(
         get_main_cloud_settings_dependencies
     ),
-) -> dict[str, Any]:
-    """Re-derive the transport of partial project mount rows.
+) -> None:
+    """Retired: the transport repair of partial ``thread_mounts`` rows (410).
 
-    Admin-only. **Dry run by default** — pass ``?apply=true`` to write.
-
-    The other half of the instance-authority backfill: stamping a project
-    does not touch the ``thread_mounts`` rows minted while it was unstamped,
-    and one such row (no installation, no WebDAV URL) makes workspace
-    delivery discard every mount the thread has and fall back to the legacy
-    session folder. Each row is rebuilt through the same builder thread
-    create uses, against the project's stamped installation, and written in
-    place only when every transport column resolved. Unstamped projects and
-    unresolvable installations are skipped and reported, never guessed.
+    One partial row used to take every mount of its session down
+    (all-or-fallback); a session mounts its attached connectors now, each on
+    its own, and no row is mounted (main cloud slice 8).
     """
     await dependencies.require_admin(request)
-    return await main_cloud_settings.repair_thread_mount_transport(
-        apply=apply, dependencies=dependencies.operations
-    )
+    raise HTTPException(status_code=410, detail=REPAIR_RETIRED_DETAIL)

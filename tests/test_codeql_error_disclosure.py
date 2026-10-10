@@ -244,7 +244,6 @@ def _main_cloud_client(health_check):
             get_active_main_cloud_backend_instance=AsyncMock(return_value=None)
         ),
         cloud_router=SimpleNamespace(active=active),
-        thread_mount_dependencies=lambda: None,
     )
     dependencies = route_module.MainCloudSettingsRouteDependencies(
         operations=operations,

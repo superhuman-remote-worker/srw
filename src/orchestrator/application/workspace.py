@@ -446,9 +446,6 @@ def main_cloud_settings_dependencies(
         operations=main_cloud_settings_operations.MainCloudSettingsDependencies(
             store=resources.postgres_db,
             cloud_router=resources.main_cloud_router,
-            thread_mount_dependencies=functools.partial(
-                preparation_composition.thread_mount_dependencies, resources
-            ),
             replace_installation=resources.settings.main_cloud_replace_installation,
         ),
         require_admin=functools.partial(access_composition.require_admin, resources),

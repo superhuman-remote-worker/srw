@@ -149,7 +149,6 @@ def _wire(*, store=None, cloud_router=None, admin_gate=None, replace_installatio
     operations = ops.MainCloudSettingsDependencies(
         store=backing,
         cloud_router=cloud_router if cloud_router is not None else _router(),
-        thread_mount_dependencies=lambda: None,
         replace_installation=replace_installation,
     )
     dependencies = route_module.MainCloudSettingsRouteDependencies(
@@ -238,8 +237,28 @@ def test_the_service_has_no_configuration_operation_left():
         "reload_main_cloud_settings",
         "delete_main_cloud_settings",
         "get_main_cloud_settings",
+        "repair_thread_mount_transport",
     ):
         assert not hasattr(ops, name), name
+
+
+def test_the_retired_thread_mount_repair_answers_410_and_writes_nothing():
+    """Main cloud slice 8: a session mounts its attached connectors, each on
+    its own, so no partial ``thread_mounts`` row takes its mounts down any
+    more and the repair is gone."""
+    store = _store(
+        survey_partial_thread_mounts=AsyncMock(),
+        repair_thread_mount_transport=AsyncMock(),
+    )
+    wired = _wire(store=store)
+
+    response = wired.client.post(f"{BASE}/repair-thread-mounts?apply=true")
+
+    assert response.status_code == 410
+    assert response.json()["detail"] == route_module.REPAIR_RETIRED_DETAIL
+    assert wired.calls.admin == 1
+    store.survey_partial_thread_mounts.assert_not_awaited()
+    store.repair_thread_mount_transport.assert_not_awaited()
 
 
 # --------------------------------------------------------------------------- #
@@ -575,7 +594,6 @@ def test_a_rebound_router_singleton_is_observed_by_the_next_request(monkeypatch)
             operations=ops.MainCloudSettingsDependencies(
                 store=_store(),
                 cloud_router=state["router"],
-                thread_mount_dependencies=lambda: None,
             ),
             require_admin=require_admin,
         )
