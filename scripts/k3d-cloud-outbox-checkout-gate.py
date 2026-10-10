@@ -469,29 +469,40 @@ async def main():
             from orchestrator.application import completion as completion_composition
             from orchestrator.schemas.job_runtime import JobCompleteRequest
             from orchestrator.services import legacy_job_completion
-            out["flipped"] = await db.execute(
-                "UPDATE jobs SET status='processing' WHERE id=$1 AND status='paused'",
-                UUID(request["job_id"]),
-            )
-            body = JobCompleteRequest(
-                should_stop=True, goal_achieved=True,
-                freeze_data={
-                    "status": "job_completed", "summary": "gate completion",
-                    "deliverables": request["deliverables"],
-                },
-            )
-            try:
-                result = await legacy_job_completion.complete_job_legacy(
-                    None, request["job_id"], body,
-                    dependencies=completion_composition.legacy_completion_dependencies(
-                        resources
-                    ),
-                    _authorized=True,
+            # Resumable: a retry after an orchestrator reload picks up where
+            # the job is (held: flip it; running: report; done: say so).
+            current = (await db.get_job(request["job_id"]) or {}).get("status")
+            if current in ("completed", "pending_review", "reviewing"):
+                out.update(status=200, body=json.dumps({"already": current}))
+            else:
+                out["flipped"] = await db.execute(
+                    "UPDATE jobs SET status='processing' "
+                    "WHERE id=$1 AND status='paused'",
+                    UUID(request["job_id"]),
                 )
-                out.update(status=200, body=json.dumps(result, default=str)[:4000])
-            except Exception as exc:
-                out.update(status=getattr(exc, "status_code", 500), body=str(exc)[:2000])
-            await _wait_tasks()
+                body = JobCompleteRequest(
+                    should_stop=True, goal_achieved=True,
+                    freeze_data={
+                        "status": "job_completed", "summary": "gate completion",
+                        "deliverables": request["deliverables"],
+                    },
+                )
+                try:
+                    result = await legacy_job_completion.complete_job_legacy(
+                        None, request["job_id"], body,
+                        dependencies=(
+                            completion_composition.legacy_completion_dependencies(
+                                resources
+                            )
+                        ),
+                        _authorized=True,
+                    )
+                    out.update(status=200, body=json.dumps(result, default=str)[:4000])
+                except Exception as exc:
+                    out.update(
+                        status=getattr(exc, "status_code", 500), body=str(exc)[:2000]
+                    )
+                await _wait_tasks(timeout=15)
         elif action == "read_shared":
             # What the owner sees: their own WebDAV, their own password.
             import httpx
@@ -619,7 +630,8 @@ asyncio.run(main())
 
 
 #: The runner's actions a retry repeats harmlessly: reads, idempotent writes
-#: (a commit of the same content, a re-sync) and the cleanup.
+#: (a commit of the same content, a re-sync), the completion (it resumes from
+#: the job's status) and the cleanup.
 _RETRY_SAFE = frozenset(
     {
         "project_state",
@@ -628,6 +640,7 @@ _RETRY_SAFE = frozenset(
         "job_state",
         "repo_files",
         "commit",
+        "complete",
         "read_shared",
         "discover",
         "cleanup",
