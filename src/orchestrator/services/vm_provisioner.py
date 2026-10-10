@@ -1778,7 +1778,13 @@ class VMProvisioner:
         if (
             self._lifecycle_hmac_secret is None
             or payload.get("action")
-            not in {"inspect", "inspect_initial_ready", "stop", "release"}
+            not in {
+                "inspect",
+                "inspect_initial_ready",
+                "inspect_never_app_ready_retained",
+                "stop",
+                "release",
+            }
             or _provision_generation(payload.get("provision_generation")) is None
             or not isinstance(payload.get("job_id"), str)
         ):
@@ -1977,11 +1983,40 @@ class VMProvisioner:
             )
             if committed is None:
                 return False
+            held_fields = {}
+            if committed["frozen"].get("kind") == (
+                "vm_job_never_app_ready_retained_stop_candidate_v1"
+            ):
+                from orchestrator.services.vm_job_cancel_retention import (
+                    current_policy1_stop_authority,
+                )
+                from shared.vm_cancel_retention import (
+                    never_app_ready_retention_authority_matches,
+                )
+
+                frozen = committed["frozen"]
+                authority = await current_policy1_stop_authority(
+                    self._db,
+                    parent_cleanup,
+                    job_id=job_id,
+                    generation=generation,
+                    vm_uid=frozen["vm_uid"],
+                    pvc_uid=frozen["pvc_uid"],
+                )
+                if not never_app_ready_retention_authority_matches(
+                    authority, parent_cleanup, frozen
+                ):
+                    return False
+                held_fields = {
+                    "held_stop_authority": authority,
+                    "parent_cleanup": dict(parent_cleanup),
+                }
             result = await self._request_pre_ssh_stop(
                 {
                     "action": "release",
                     "job_id": job_id,
                     "provision_generation": generation,
+                    **held_fields,
                     "frozen": committed["frozen"],
                     "frozen_digest": committed["frozen_digest"],
                     "terminal_evidence": committed["terminal_evidence"],
@@ -2001,6 +2036,135 @@ class VMProvisioner:
             )
         except Exception:
             logger.exception("VM pre-SSH finalizer remains held for job %s", job_id)
+            return False
+
+    async def _attempt_never_app_ready_retained_stop(
+        self,
+        job_id: str,
+        identity: VMTeardownIdentity,
+        parent_cleanup: Mapping[str, Any],
+    ) -> bool:
+        """Replay the exact held stop; never spend the older zero as proof."""
+        from orchestrator.services.vm_job_cancel_retention import (
+            current_policy1_stop_authority,
+        )
+        from orchestrator.services.vm_pre_ssh_stop_store import VMPreSSHStopStore
+        from shared.vm_cancel_retention import (
+            never_app_ready_retention_authority_matches,
+            valid_retention_preflight,
+        )
+
+        if (
+            self._db is None
+            or identity.vm_uid is None
+            or identity.rootdisk_pvc_uid is None
+        ):
+            return False
+        generation = identity.provision_generation
+        store = VMPreSSHStopStore(self._db)
+
+        async def authority():
+            return await current_policy1_stop_authority(
+                self._db,
+                parent_cleanup,
+                job_id=job_id,
+                generation=generation,
+                vm_uid=identity.vm_uid,
+                pvc_uid=identity.rootdisk_pvc_uid,
+            )
+
+        try:
+            current_authority = await authority()
+            if current_authority is None:
+                return False
+            proof = await store.committed_proof(job_id, generation, parent_cleanup)
+            if proof is not None:
+                return proof["frozen"].get("kind") == (
+                    "vm_job_never_app_ready_retained_stop_candidate_v1"
+                )
+            intent = await store.current_intent(job_id, generation, parent_cleanup)
+            if intent is None:
+                inspected = await self._request_pre_ssh_stop(
+                    {
+                        "action": "inspect_never_app_ready_retained",
+                        "job_id": job_id,
+                        "provision_generation": generation,
+                        "expected_vm_uid": identity.vm_uid,
+                        "expected_pvc_uid": identity.rootdisk_pvc_uid,
+                        "held_stop_authority": current_authority,
+                        "parent_cleanup": dict(parent_cleanup),
+                    }
+                )
+                frozen = inspected.get("frozen") if inspected else None
+                preflight = inspected.get("retention_preflight") if inspected else None
+                if (
+                    inspected is None
+                    or inspected.get("_identity_authenticated") is not True
+                    or inspected.get("status") != "candidate"
+                    or not never_app_ready_retention_authority_matches(
+                        current_authority, parent_cleanup, frozen
+                    )
+                    or not valid_retention_preflight(preflight, frozen)
+                ):
+                    return False
+                zero = await self._db.fetchrow(
+                    "SELECT id FROM managed_repository_process_zero_receipts "
+                    "WHERE owner_kind='job' AND owner_id=$1 AND scope='vm' "
+                    "AND provisioner='vm' AND runtime_incarnation=$2",
+                    UUID(job_id),
+                    generation,
+                )
+                intent = await store.admit_intent(
+                    job_id,
+                    generation,
+                    parent_cleanup,
+                    frozen,
+                    retention_preflight=preflight,
+                    prior_zero_receipt_id=str(zero["id"]) if zero else None,
+                )
+            frozen = intent.get("frozen")
+            if not never_app_ready_retention_authority_matches(
+                current_authority, parent_cleanup, frozen
+            ) or not valid_retention_preflight(
+                intent.get("retention_preflight"), frozen
+            ):
+                return False
+            # A nested admission transaction is only a savepoint. Read the
+            # committed intent again before any physical stop request.
+            committed = await store.current_intent(job_id, generation, parent_cleanup)
+            if committed != intent:
+                return False
+            current_authority = await authority()
+            if not never_app_ready_retention_authority_matches(
+                current_authority, parent_cleanup, frozen
+            ):
+                return False
+            stopped = await self._request_pre_ssh_stop(
+                {
+                    "action": "stop",
+                    "job_id": job_id,
+                    "provision_generation": generation,
+                    "held_stop_authority": current_authority,
+                    "parent_cleanup": dict(parent_cleanup),
+                    **committed,
+                }
+            )
+            if (
+                stopped is None
+                or stopped.get("_identity_authenticated") is not True
+                or stopped.get("status") != "positive_terminal_proof"
+                or not isinstance(stopped.get("terminal_evidence"), Mapping)
+            ):
+                return False
+            await store.commit_positive_proof(
+                job_id, generation, parent_cleanup, stopped["terminal_evidence"]
+            )
+            return (
+                await store.committed_proof(job_id, generation, parent_cleanup)
+                is not None
+            )
+        except Exception:
+            logger.exception("Held retained stop remains unproven for job %s", job_id)
             return False
 
     async def revalidate_vm_teardown_identity(
@@ -2492,20 +2656,23 @@ class VMProvisioner:
                 return VMTeardownResult("retention_preflight_unproven", False)
         if policy1_retention == "settled" and classification != "completed":
             return VMTeardownResult("retention_preflight_unproven", False)
+        if policy1_retention == "open":
+            if classification not in {"matched", "completed"}:
+                return VMTeardownResult("identity_unknown", False)
+            if not await self._attempt_never_app_ready_retained_stop(
+                job_id, identity, parent_cleanup
+            ) or not await self._release_pre_ssh_stop_finalizer(
+                job_id, generation, parent_cleanup
+            ):
+                return VMTeardownResult("process_zero_unproven", False)
+            return await self.delete_vm_captured(
+                job_id,
+                identity,
+                purge_disk=False,
+                entity_type="job",
+                parent_cleanup=parent_cleanup,
+            )
         if classification == "completed":
-            if policy1_retention == "open":
-                from orchestrator.services.vm_pre_ssh_stop_store import (
-                    VMPreSSHStopStore,
-                )
-
-                try:
-                    proof = await VMPreSSHStopStore(self._db).committed_proof(
-                        job_id, generation, parent_cleanup
-                    )
-                except Exception:
-                    proof = None
-                if proof is None:
-                    return VMTeardownResult("process_zero_unproven", False)
             contained = bool(
                 self._db
                 and await self._db.managed_repository_workspace_process_zero_is_current(
@@ -2539,12 +2706,7 @@ class VMProvisioner:
                 runtime_incarnation=generation,
             )
         ):
-            if policy1_retention == "open":
-                if not await self._release_pre_ssh_stop_finalizer(
-                    job_id, generation, parent_cleanup
-                ):
-                    return VMTeardownResult("process_zero_unproven", False)
-            elif entity_type == "job":
+            if entity_type == "job":
                 from orchestrator.services.vm_pre_ssh_stop_store import (
                     VMPreSSHStopStore,
                 )
@@ -2649,25 +2811,6 @@ class VMProvisioner:
             )
         ):
             return VMTeardownResult("process_zero_unproven", False)
-        if policy1_retention == "open":
-            if (
-                probe.identity is None
-                or probe.identity.credential_runtime_started is not True
-                or not await self._attempt_pre_ssh_positive_stop(
-                    job_id, identity, parent_cleanup
-                )
-                or not await self._release_pre_ssh_stop_finalizer(
-                    job_id, generation, parent_cleanup
-                )
-            ):
-                return VMTeardownResult("process_zero_unproven", False)
-            return await self.delete_vm_captured(
-                job_id,
-                identity,
-                purge_disk=False,
-                entity_type="job",
-                parent_cleanup=parent_cleanup,
-            )
         current_identity = probe.identity
         never_started = bool(
             current_identity is not None

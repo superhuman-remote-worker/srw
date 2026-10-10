@@ -401,6 +401,14 @@ async def test_reachable_ssh_policy1_retention_uses_typed_positive_stop(
     state = await cancelled(db, old=False)
     permit = await acquire(state)
     assert permit.allowed
+    state["frozen"] = {
+        **state["frozen"],
+        "kind": "vm_job_never_app_ready_retained_stop_candidate_v1",
+        "cleanup_admission_id": permit.parent_cleanup["admission_id"],
+        "cleanup_request_id": permit.parent_cleanup["request_id"],
+        "cleanup_intent_digest": permit.parent_cleanup["intent_digest"],
+        "kube_vm_ready_at_inspection": True,
+    }
     monkeypatch.setenv("VM_MODE", "same-cluster")
     provisioner = VMProvisioner()
     provisioner._db = db
@@ -428,9 +436,10 @@ async def test_reachable_ssh_policy1_retention_uses_typed_positive_stop(
     retire = AsyncMock(return_value=True)
     monkeypatch.setattr(module, "retire_managed_repository_processes", retire)
     qualification = preflight(state)
+    qualification["pvc_name"] = f"agent-vm-{state['job_id']}-rootdisk"
 
     async def controller_stop(payload):
-        if payload["action"] == "inspect":
+        if payload["action"] == "inspect_never_app_ready_retained":
             return {
                 "status": "candidate",
                 "frozen": state["frozen"],
@@ -440,9 +449,10 @@ async def test_reachable_ssh_policy1_retention_uses_typed_positive_stop(
         if payload["action"] == "stop":
             return {
                 "status": "positive_terminal_proof",
-                "terminal_evidence": terminal_proof(
-                    state["frozen"], payload["frozen_digest"]
-                ),
+                "terminal_evidence": {
+                    **terminal_proof(state["frozen"], payload["frozen_digest"]),
+                    "kind": "vm_job_never_app_ready_retained_positive_stop_v1",
+                },
                 "_identity_authenticated": True,
             }
         assert payload["action"] == "release"
@@ -536,14 +546,23 @@ async def test_policy1_pending_positive_proof_replays_without_generic_zero(
     state = await cancelled(db, old=False)
     permit = await acquire(state)
     provisioner, identity, retire = _policy1_release_fixture(db, state, monkeypatch)
+    state["frozen"] = {
+        **state["frozen"],
+        "kind": "vm_job_never_app_ready_retained_stop_candidate_v1",
+        "cleanup_admission_id": permit.parent_cleanup["admission_id"],
+        "cleanup_request_id": permit.parent_cleanup["request_id"],
+        "cleanup_intent_digest": permit.parent_cleanup["intent_digest"],
+        "kube_vm_ready_at_inspection": True,
+    }
     qualification = preflight(state)
+    qualification["pvc_name"] = f"agent-vm-{state['job_id']}-rootdisk"
     stopped = False
     actions = []
 
     async def controller_stop(payload):
         nonlocal stopped
         actions.append(payload["action"])
-        if payload["action"] == "inspect":
+        if payload["action"] == "inspect_never_app_ready_retained":
             return {
                 "status": "candidate",
                 "frozen": state["frozen"],
@@ -554,9 +573,10 @@ async def test_policy1_pending_positive_proof_replays_without_generic_zero(
             return (
                 {
                     "status": "positive_terminal_proof",
-                    "terminal_evidence": terminal_proof(
-                        state["frozen"], payload["frozen_digest"]
-                    ),
+                    "terminal_evidence": {
+                        **terminal_proof(state["frozen"], payload["frozen_digest"]),
+                        "kind": "vm_job_never_app_ready_retained_positive_stop_v1",
+                    },
                     "_identity_authenticated": True,
                 }
                 if stopped
@@ -579,7 +599,7 @@ async def test_policy1_pending_positive_proof_replays_without_generic_zero(
     }
     first = await provisioner.release_vm_captured(state["job_id"], identity, **kwargs)
     assert first == VMTeardownResult("process_zero_unproven", False)
-    assert actions == ["inspect", "stop"]
+    assert actions == ["inspect_never_app_ready_retained", "stop"]
     assert (
         await db.fetchval(
             "SELECT count(*) FROM vm_pre_ssh_stop_intents WHERE job_id=$1",
@@ -599,7 +619,7 @@ async def test_policy1_pending_positive_proof_replays_without_generic_zero(
     stopped = True
     second = await provisioner.release_vm_captured(state["job_id"], identity, **kwargs)
     assert second == VMTeardownResult("completed", True)
-    assert actions == ["inspect", "stop", "stop", "release"]
+    assert actions == ["inspect_never_app_ready_retained", "stop", "stop", "release"]
     assert (
         await db.fetchval(
             "SELECT count(*) FROM vm_pre_ssh_stop_proofs WHERE job_id=$1",
@@ -636,7 +656,7 @@ async def test_policy1_preexisting_generic_zero_without_intent_stays_held(
         state["generation"],
     )
     provisioner, identity, retire = _policy1_release_fixture(db, state, monkeypatch)
-    provisioner._request_pre_ssh_stop = AsyncMock()
+    provisioner._request_pre_ssh_stop = AsyncMock(return_value=None)
     provisioner.delete_vm_captured = AsyncMock()
     result = await provisioner.release_vm_captured(
         state["job_id"],
@@ -653,7 +673,9 @@ async def test_policy1_preexisting_generic_zero_without_intent_stays_held(
         )
         == 0
     )
-    provisioner._request_pre_ssh_stop.assert_not_awaited()
+    assert provisioner._request_pre_ssh_stop.await_args.args[0]["action"] == (
+        "inspect_never_app_ready_retained"
+    )
     provisioner.delete_vm_captured.assert_not_awaited()
     retire.assert_not_awaited()
 
