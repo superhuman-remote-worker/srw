@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -67,12 +68,13 @@ def enabled(monkeypatch):
     monkeypatch.setenv("VM_JOB_CANCEL_RETENTION_ENABLED", "true")
 
 
-async def cancelled(db, *, old=True, binding="null", retiring=True):
+async def cancelled(db, *, old=True, binding="null", retiring=True, bound=True):
     state = await seeded_stop(
         db,
         cleanup_source="job_terminal_vm_release" if old else None,
         purge_disk=True,
         retiring=retiring,
+        bound=bound,
     )
     owner = UUID(state["job_id"])
     context = json.loads(
@@ -115,6 +117,250 @@ async def authority_rows(db, state):
         "SELECT * FROM vm_workspace_cleanup_admissions WHERE owner_kind='job' "
         "AND owner_id=$1 ORDER BY id",
         owner,
+    )
+
+
+async def publish_cancelled_launcher(state, *, invalid=None):
+    """The guest starts after Cancel, independently of provisioning updates."""
+    from tests.test_vm_resource_inventory_real_postgres import publish
+
+    frozen = state["frozen"]
+    sample = deepcopy(state["snapshot"])
+    sample.update(snapshot_id=str(uuid4()), sequence=sample["sequence"] + 1)
+    sample["started_at"] = sample["finished_at"] = datetime.now(
+        timezone.utc
+    ).isoformat()
+    sample["vms"] = [
+        {
+            "uid": frozen["vm_uid"],
+            "name": "agent-vm-" + state["job_id"],
+            "owner_kind": "job",
+            "owner_id": state["job_id"],
+            "provision_generation": state["generation"],
+            "deleting": False,
+        }
+    ]
+    sample["vmis"] = [
+        {
+            "uid": frozen["vmi_uid"],
+            "name": "agent-vm-" + state["job_id"],
+            "vm_uid": frozen["vm_uid"],
+            "node_uid": frozen["node_uid"],
+            "node_name": frozen["node_name"],
+            "phase": "Running",
+            "deleting": False,
+        }
+    ]
+    sample["pods"] = [
+        {
+            "uid": frozen["launcher_uid"],
+            "namespace": frozen["namespace"],
+            "name": frozen["launcher_name"],
+            "node_uid": frozen["node_uid"],
+            "node_name": frozen["node_name"],
+            "terminal": False,
+            "deleting": False,
+            "requests": state["demand"].to_six_dict(),
+            "vmi_uid": frozen["vmi_uid"],
+            "reservation_id": state["reservation_id"],
+            "provision_generation": state["generation"],
+        }
+    ]
+    if invalid == "owner":
+        sample["vms"][0]["owner_id"] = str(uuid4())
+    elif invalid == "generation":
+        sample["vms"][0]["provision_generation"] = str(uuid4())
+    elif invalid == "reservation":
+        sample["pods"][0]["reservation_id"] = str(uuid4())
+    elif invalid == "duplicate_vmi":
+        sample["vmis"].append(
+            {**sample["vmis"][0], "uid": str(uuid4()), "name": "other-vmi"}
+        )
+    elif invalid == "duplicate_launcher":
+        sample["pods"].append(
+            {**sample["pods"][0], "uid": str(uuid4()), "name": "other-launcher"}
+        )
+    elif invalid == "pending":
+        sample["vmis"][0]["phase"] = "Pending"
+    elif invalid == "deleting":
+        sample["pods"][0]["deleting"] = True
+    elif invalid == "oversized":
+        sample["pods"][0]["requests"]["cpu_millicores"] += 1
+    await publish(state["inventory"], sample)
+    return sample
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("oversized", [False, True])
+@pytest.mark.parametrize("vm_status", ["created", "ssh_pending", "ssh_unreachable"])
+async def test_cancel_before_guest_boot_binds_occupancy_for_retaining_cleanup(
+    db, oversized, vm_status
+):
+    # Missing terminal observation leaves a real late-booted VM running forever.
+    state = await cancelled(db, old=False, retiring=False, bound=False)
+    owner = UUID(state["job_id"])
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',to_jsonb($2::text)) "
+        "WHERE id=$1",
+        owner,
+        vm_status,
+    )
+    before = json.loads(
+        await db.fetchval("SELECT context FROM jobs WHERE id=$1", owner)
+    )
+    assert not (await acquire(state)).allowed  # No runtime has been observed yet.
+    await publish_cancelled_launcher(state, invalid="oversized" if oversized else None)
+    permit = await acquire(state)
+    assert permit.allowed, permit.reason
+    assert permit.parent_cleanup["intent"]["purge_disk"] is False
+    charge = await db.fetchrow(
+        "SELECT * FROM vm_resource_reservations WHERE id=$1",
+        UUID(state["reservation_id"]),
+    )
+    # Retention admission moves the still-counted occupancy into teardown.
+    assert charge["state"] == "teardown"
+    assert charge["released_at"] is None
+    assert charge["observed_cpu_millicores"] == state["demand"].cpu_millicores + int(
+        oversized
+    )
+    for key in ("vm_uid", "vmi_uid", "launcher_uid"):
+        assert str(charge[key]) == state["frozen"][key]
+    after = await db.fetchrow("SELECT status,context FROM jobs WHERE id=$1", owner)
+    context = json.loads(after["context"])
+    assert after["status"] == "cancelled"
+    assert context == {
+        **before,
+        "vm": {**before["vm"], "vmi_uid": state["frozen"]["vmi_uid"]},
+    }
+    assert (
+        await db.fetchval(
+            "SELECT ready_at FROM vm_creation_retries WHERE job_id=$1", owner
+        )
+        is None
+    )
+    assert (
+        await db.fetchval("SELECT state FROM run_queue WHERE unit_id=$1", owner)
+        == "done"
+    )
+    assert await db.fetchval("SELECT count(*) FROM vm_pre_ssh_stop_intents") == 0
+    assert await acquire(state) == permit
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "owner",
+        "generation",
+        "reservation",
+        "duplicate_vmi",
+        "duplicate_launcher",
+        "pending",
+        "deleting",
+    ],
+)
+async def test_cancelled_late_boot_requires_exact_singular_inventory(db, invalid):
+    state = await cancelled(db, old=False, retiring=False, bound=False)
+    await publish_cancelled_launcher(state, invalid=invalid)
+    before = await authority_rows(db, state)
+    assert not (await acquire(state)).allowed
+    assert await authority_rows(db, state) == before
+    charge = await db.fetchrow(
+        "SELECT state,vm_uid,vmi_uid,launcher_uid FROM vm_resource_reservations WHERE id=$1",
+        UUID(state["reservation_id"]),
+    )
+    assert dict(charge) == {
+        "state": "reserved",
+        "vm_uid": None,
+        "vmi_uid": None,
+        "launcher_uid": None,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "disabled",
+        "unauthenticated",
+        "known_vmi_changed",
+        "prior_ssh",
+        "prior_launcher",
+        "request_changed",
+        "partial_binding",
+        "inventory_conflict",
+        "inventory_incomplete",
+    ],
+)
+async def test_cancelled_late_boot_never_overrides_prior_authority(
+    db, monkeypatch, invalid
+):
+    state = await cancelled(db, old=False, retiring=False, bound=False)
+    sample = await publish_cancelled_launcher(state)
+    owner = UUID(state["job_id"])
+    if invalid == "disabled":
+        monkeypatch.setenv("VM_JOB_CANCEL_RETENTION_ENABLED", "false")
+    elif invalid in {"inventory_conflict", "inventory_incomplete"}:
+        if invalid == "inventory_conflict":
+            await db.execute(
+                "UPDATE vm_resource_inventory_heads SET observation_conflict=true"
+            )
+        else:
+            from tests.test_vm_resource_inventory_real_postgres import (
+                publish,
+                successor,
+            )
+
+            incomplete = successor(sample, complete=False)
+            incomplete["installed_profile"] = None
+            await publish(state["inventory"], incomplete)
+    elif invalid == "partial_binding":
+        await db.execute(
+            "UPDATE vm_resource_reservations SET vm_uid=$2 WHERE id=$1",
+            UUID(state["reservation_id"]),
+            UUID(state["frozen"]["vm_uid"]),
+        )
+    else:
+        context = json.loads(
+            await db.fetchval("SELECT context FROM jobs WHERE id=$1", owner)
+        )
+        if invalid == "request_changed":
+            context["_vm_creation_pending"] = str(uuid4())
+        else:
+            field, value = {
+                "unauthenticated": ("identity_authenticated", False),
+                "known_vmi_changed": ("vmi_uid", str(uuid4())),
+                "prior_ssh": ("ssh_verified_at", "2026-10-09T20:00:00Z"),
+                "prior_launcher": ("active_pod_uid", str(uuid4())),
+            }[invalid]
+            context["vm"][field] = value
+        await db.execute(
+            "UPDATE jobs SET context=$2::jsonb WHERE id=$1", owner, json.dumps(context)
+        )
+    before = dict(
+        await db.fetchrow(
+            "SELECT * FROM vm_resource_reservations WHERE id=$1",
+            UUID(state["reservation_id"]),
+        )
+    )
+    context_before = await db.fetchval("SELECT context FROM jobs WHERE id=$1", owner)
+    assert not (await acquire(state)).allowed
+    assert (
+        dict(
+            await db.fetchrow(
+                "SELECT * FROM vm_resource_reservations WHERE id=$1",
+                UUID(state["reservation_id"]),
+            )
+        )
+        == before
+    )
+    assert (
+        await db.fetchval("SELECT context FROM jobs WHERE id=$1", owner)
+        == context_before
+    )
+    assert (
+        await db.fetchval("SELECT count(*) FROM vm_job_cancel_retention_authorities")
+        == 0
     )
 
 

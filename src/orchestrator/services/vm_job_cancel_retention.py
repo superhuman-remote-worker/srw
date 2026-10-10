@@ -435,6 +435,128 @@ async def _ready_purge_replay_on_conn(
     )
 
 
+async def _bind_cancelled_boot_occupancy(conn, store, *, job, identity):
+    """Account for a guest that booted after Cancel stopped phase polling.
+
+    The caller holds the normal owner/PVC/queue/Job locks. Only the signed,
+    current inventory can supply the missing VMI/launcher, through the same
+    exact reservation binding used before Ready. This grants neither Ready
+    nor cleanup: the complete retention predicate still runs afterwards.
+    """
+    from orchestrator.services.vm_resource_job_runtime import (
+        installed_job_resource_store,
+    )
+    from shared.vm_resource_inventory import InventoryError
+
+    context = _json(job["context"])
+    vm = context.get("vm") if isinstance(context, dict) else None
+    if (
+        job["status"] != "cancelled"
+        or job["execution_lane"] != "stateless"
+        or job["parent_job_id"] is not None
+        or job["assigned_agent_id"] is not None
+        or not isinstance(vm, dict)
+        or context.get("_stateless_cancel_cleanup_pending") is not True
+        or context.get("_vm_job_retained_resume") is not None
+        or vm.get("status") not in {"created", "ssh_pending", "ssh_unreachable"}
+        or vm.get("ssh_verified_at") is not None
+        or vm.get("active_pod_uid") is not None
+        or vm.get("workspace_storage") is not None
+        or vm.get("identity_authenticated") is not True
+        or vm.get("identity_provision_generation") != identity.provision_generation
+        or vm.get("provision_generation") != identity.provision_generation
+        or vm.get("vm_uid") != identity.vm_uid
+        or vm.get("rootdisk_pvc_uid") != identity.rootdisk_pvc_uid
+    ):
+        return
+    retry = await conn.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE owner_kind='job' AND job_id=$1 "
+        "ORDER BY created_at DESC,request_id DESC LIMIT 1 FOR UPDATE",
+        job["id"],
+    )
+    if (
+        retry is None
+        or str(retry["request_id"]) != vm.get("creation_request_id")
+        or str(retry["request_id"]) != context.get("_vm_creation_pending")
+        or retry["state"] != "succeeded"
+        or retry["reason"] != "creation_adopted"
+        or retry["ready_at"] is not None
+        or retry["claim_token"] is not None
+        or retry["claim_expires_at"] is not None
+        or str(retry["provision_generation"]) != identity.provision_generation
+        or str(retry["observed_vm_uid"]) != identity.vm_uid
+        or str(retry["observed_pvc_uid"]) != identity.rootdisk_pvc_uid
+        or _json(retry["canonical_request"]).get("workspace_storage") is not None
+        or not await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM run_queue WHERE unit_kind='worker_batch' "
+            "AND unit_id=$1 AND state='done' AND leased_by IS NULL AND leased_until IS NULL)",
+            job["id"],
+        )
+    ):
+        return
+    try:
+        resource = await installed_job_resource_store(
+            conn, store.db, retry["controller_configuration"], fresh=False
+        )
+        if resource is None:
+            return
+        await resource._lock_policy(conn, allow_off=True)
+        head = await conn.fetchrow(
+            "SELECT s.document,s.digest FROM vm_resource_inventory_heads h "
+            "JOIN vm_resource_inventory_snapshots s ON s.snapshot_id=h.current_snapshot_id "
+            "WHERE h.cluster_id=$1 AND h.policy_digest=$2 AND NOT h.observation_conflict FOR UPDATE OF h",
+            resource.inventory.cluster_id,
+            resource.inventory.policy_digest,
+        )
+        if head is None:
+            return
+        snapshot = resource.inventory._snapshot(_json(head["document"]), head["digest"])
+        candidates = [
+            vmi for vmi in snapshot["vmis"] if vmi["vm_uid"] == identity.vm_uid
+        ]
+        if len(candidates) != 1 or vm.get("vmi_uid") not in (
+            None,
+            candidates[0]["uid"],
+        ):
+            return
+        # Match the binder's waiter-before-reservation lock order.
+        await conn.fetchrow(
+            "SELECT request_id FROM vm_resource_waiters WHERE request_id=$1 FOR UPDATE",
+            retry["request_id"],
+        )
+        charge = await conn.fetchrow(
+            "SELECT state,vm_uid,vmi_uid,launcher_uid FROM vm_resource_reservations "
+            "WHERE request_id=$1 FOR UPDATE",
+            retry["request_id"],
+        )
+        if charge is None or dict(charge) != {
+            "state": "reserved",
+            "vm_uid": None,
+            "vmi_uid": None,
+            "launcher_uid": None,
+        }:
+            return
+        # Rechecks complete/fresh inventory, source/configuration, singular
+        # launcher, node, owner/generation, and immutable reservation identities.
+        vmi_uid = candidates[0]["uid"]
+        if not await resource.bind_observed_runtime_on_conn(
+            conn,
+            retry=retry,
+            vm={**vm, "vmi_uid": vmi_uid},
+            job_id=str(job["id"]),
+            generation=identity.provision_generation,
+        ):
+            return
+        await conn.execute(
+            "UPDATE jobs SET context=jsonb_set(context,'{vm,vmi_uid}',to_jsonb($2::text)),"
+            "updated_at=clock_timestamp() WHERE id=$1",
+            job["id"],
+            vmi_uid,
+        )
+    except (ResourceAdmissionError, InventoryError):
+        return
+
+
 async def acquire_cancel_retention(
     store, *, job_id: str, identity, retention_preflight=None
 ):
@@ -620,6 +742,10 @@ async def acquire_cancel_retention(
             )
         except VMCreationRetryConflict as exc:
             return CleanupPermit(allowed=False, reason=str(exc))
+        if not ready_root:
+            await _bind_cancelled_boot_occupancy(
+                conn, store, job=job, identity=identity
+            )
         candidate_function = (
             "vm_job_initial_ready_retention_candidate"
             if ready_root
