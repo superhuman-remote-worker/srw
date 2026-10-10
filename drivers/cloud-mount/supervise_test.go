@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -459,4 +460,68 @@ func TestAFifoInTheControlDirectoryNeverStallsTheLoop(t *testing.T) {
 		ack := h.statusFile(t, 0).Refresh
 		return ack != nil && ack.Nonce == "r-9"
 	})
+}
+
+// writeMeta places one VFS metadata file the way rclone does.
+func writeMeta(t *testing.T, cache string, path string, dirty bool) {
+	t.Helper()
+	full := filepath.Join(cache, "vfsMeta", "m0", path)
+	if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := fmt.Sprintf(`{"ModTime":"2026-10-10T00:00:00Z","Size":3,"Fingerprint":"","Dirty":%v}`, dirty)
+	if err := os.WriteFile(full, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDirtyEntriesCountsWhatTheCacheStillHasToUpload(t *testing.T) {
+	cache := t.TempDir()
+	if n, err := dirtyEntries(cache); err != nil || n != 0 {
+		t.Fatalf("an empty cache: %d %v", n, err)
+	}
+	writeMeta(t, cache, "a.txt", true)
+	writeMeta(t, cache, "dir/b.txt", true)
+	writeMeta(t, cache, "dir/c.txt", false)
+	if n, err := dirtyEntries(cache); err != nil || n != 2 {
+		t.Fatalf("dirty %d %v", n, err)
+	}
+}
+
+func TestAnUnavailableMountWithUploadsWaitingIsNotDrained(t *testing.T) {
+	h := newHarness(t, testPlan())
+	h.s.board.set(0, stateUnavailable, reasonUnreachable)
+	writeMeta(t, filepath.Join(h.dir, "cache", "0"), "report.md", true)
+	pending, complete := h.s.drainAll(context.Background(), "n-4", time.Now())
+	if complete || pending != 1 {
+		t.Fatalf("a transient reason with an upload waiting: pending %d complete %v", pending, complete)
+	}
+	if ack := h.statusFile(t, 0).Drain; ack == nil || ack.State != "incomplete" || ack.Pending != 1 {
+		t.Fatalf("ack %+v", ack)
+	}
+	// Nothing waiting: drained, whatever the reason.
+	h2 := newHarness(t, testPlan())
+	h2.s.board.set(0, stateUnavailable, reasonTimeout)
+	if _, complete := h2.s.drainAll(context.Background(), "n-5", time.Now()); !complete {
+		t.Fatal("an unavailable mount with an empty cache is drained")
+	}
+}
+
+func TestUploadsBehindAPermanentReasonAreReportedLost(t *testing.T) {
+	h := newHarness(t, testPlan())
+	h.s.board.set(0, stateUnavailable, reasonNotFound)
+	cache := filepath.Join(h.dir, "cache", "0")
+	writeMeta(t, cache, "a.txt", true)
+	writeMeta(t, cache, "b.txt", true)
+	pending, complete := h.s.drainAll(context.Background(), "n-6", time.Now())
+	if !complete || pending != 0 {
+		t.Fatalf("a permanent reason cannot be retried: pending %d complete %v", pending, complete)
+	}
+	ack := h.statusFile(t, 0).Drain
+	if ack == nil || ack.State != "drained" || ack.Lost != 2 {
+		t.Fatalf("ack %+v", ack)
+	}
+	if h.s.lostUploads() != 2 {
+		t.Fatalf("lost %d", h.s.lostUploads())
+	}
 }

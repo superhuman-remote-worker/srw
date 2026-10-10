@@ -104,6 +104,12 @@ func run(args []string, stderr io.Writer) int {
 	}
 	pending, complete := s.shutdown(cancel, &workers)
 	if complete {
+		if lost := s.lostUploads(); lost > 0 {
+			message := fmt.Sprintf("flushed, but %d upload(s) lost: their folder is gone or refuses the credential", lost)
+			s.logf("stopped: %s", message)
+			_ = os.WriteFile(*terminationLog, []byte(message+"\n"), 0o644)
+			return 0
+		}
 		s.logf("stopped: every upload flushed")
 		return 0
 	}

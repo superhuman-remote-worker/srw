@@ -35,6 +35,10 @@ type Ack struct {
 	// Pending counts uploads still queued when a drain gave up (-1:
 	// unknown, rclone did not answer).
 	Pending int `json:"pending"`
+	// Lost counts uploads a drain gave up for good: the mount is
+	// unavailable for a reason no retry cures (the folder is gone, its
+	// credential refused).
+	Lost int `json:"lost,omitempty"`
 }
 
 // Status is what /srw/cloud-status/<index>.json holds. The workspace reads

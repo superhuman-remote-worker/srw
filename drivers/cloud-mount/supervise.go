@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -40,6 +42,7 @@ type supervisor struct {
 
 	mu       sync.Mutex
 	children map[int]child
+	lost     int // under mu: uploads the last drain gave up for good
 }
 
 func newSupervisor(plan *Plan, board *statusBoard, r runner, rc rcClient, log io.Writer) *supervisor {
@@ -68,6 +71,59 @@ func (s *supervisor) logf(format string, args ...any) {
 
 func (s *supervisor) socket(m Mount) string {
 	return filepath.Join(s.runDir, "rc-"+strconv.Itoa(m.Index)+".sock")
+}
+
+func (s *supervisor) cacheOf(m Mount) string {
+	return filepath.Join(s.cacheDir, strconv.Itoa(m.Index))
+}
+
+// permanentReasons are the ones a retry cannot cure: the folder is gone,
+// the credential is refused, or it never reached the supervisor (its Secret
+// is immutable). Uploads waiting behind them are lost, not pending.
+var permanentReasons = map[string]bool{
+	reasonNotFound:           true,
+	reasonCredentialRejected: true,
+	reasonConfigMissing:      true,
+}
+
+// maxMetaBytes bounds what is read of one VFS metadata file.
+const maxMetaBytes = 64 << 10
+
+// dirtyEntries counts the files a mount's VFS cache still has to upload.
+// rclone keeps, per cached file, a JSON metadata file under vfsMeta/ whose
+// "Dirty" is true until the upload succeeded; the cache outlives rclone, so
+// this answers whether or not a rclone runs.
+func dirtyEntries(cacheDir string) (int, error) {
+	root := filepath.Join(cacheDir, "vfsMeta")
+	count := 0
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if path == root && errors.Is(err, fs.ErrNotExist) {
+				return fs.SkipDir
+			}
+			return err
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		raw, err := io.ReadAll(io.LimitReader(f, maxMetaBytes))
+		f.Close()
+		if err != nil {
+			return err
+		}
+		var meta struct {
+			Dirty bool `json:"Dirty"`
+		}
+		if json.Unmarshal(raw, &meta) == nil && meta.Dirty {
+			count++
+		}
+		return nil
+	})
+	return count, err
 }
 
 // worker keeps one mount up until ctx ends. A mount that failed stays
@@ -345,14 +401,35 @@ func (s *supervisor) control(ctx context.Context) {
 // drainAll flushes every writable mount; it returns how many uploads are
 // still pending (-1 if a mount could not say) and acknowledges nonce when
 // one is given.
+//
+// An unavailable writable mount is drained only if its cache holds nothing
+// to upload. With uploads waiting and a reason a retry may cure
+// (unreachable, timeout, a failed mount), it is incomplete with their count,
+// so End refuses and is retried. With a permanent reason (see
+// permanentReasons) it is drained, and the uploads it gives up are counted
+// as lost in its acknowledgement and logged: retrying cannot help.
 func (s *supervisor) drainAll(ctx context.Context, nonce string, deadline time.Time) (int, bool) {
-	total, complete := 0, true
+	total, complete, lost := 0, true, 0
 	for _, m := range s.plan.Mounts {
 		status := s.board.get(m.Index)
 		ack := Ack{Nonce: nonce, State: "drained"}
 		switch {
-		case m.ReadOnly || status.State == stateUnavailable:
-			// Nothing written through it waits in a cache.
+		case m.ReadOnly:
+			// Nothing is written through it.
+		case status.State == stateUnavailable:
+			dirty, err := dirtyEntries(s.cacheOf(m))
+			switch {
+			case err != nil:
+				s.logf("%s: reading its cache: %v", m.Name, err)
+				ack.State, ack.Pending = "incomplete", -1
+			case dirty == 0:
+			case permanentReasons[status.Reason]:
+				ack.Lost = dirty
+				lost += dirty
+				s.logf("%s: %d upload(s) lost: the folder is %s", m.Name, dirty, status.Reason)
+			default:
+				ack.State, ack.Pending = "incomplete", dirty
+			}
 		case status.State == statePending:
 			ack.State, ack.Pending = "incomplete", -1
 		default:
@@ -373,10 +450,20 @@ func (s *supervisor) drainAll(ctx context.Context, nonce string, deadline time.T
 			s.board.ack(m.Index, false, ack)
 		}
 	}
+	s.mu.Lock()
+	s.lost = lost
+	s.mu.Unlock()
 	if !complete && total == 0 {
 		return -1, false
 	}
 	return total, complete
+}
+
+// lostUploads is how many uploads the last drain gave up for good.
+func (s *supervisor) lostUploads() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lost
 }
 
 // refreshAll re-reads every mounted folder, for a view that must show what

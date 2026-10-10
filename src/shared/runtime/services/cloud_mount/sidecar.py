@@ -499,6 +499,19 @@ class SidecarMountWatcher:
         complete = len(acks) == len(self.planned) and all(
             ack.get("state") == "drained" for ack in acks.values()
         )
+        lost = sum(
+            ack["lost"]
+            for ack in acks.values()
+            if type(ack.get("lost")) is int and ack["lost"] > 0
+        )
+        if lost:
+            # Drained, but a folder that is gone or refuses its credential
+            # gave uploads up for good: retrying End cannot help.
+            logger.warning(
+                "Cloud folders drained, but %d upload(s) were lost: their folder "
+                "is gone or refuses its credential",
+                lost,
+            )
         if complete:
             return True, 0
         counts = [ack.get("pending") for ack in acks.values()]
