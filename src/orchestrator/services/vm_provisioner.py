@@ -1832,6 +1832,8 @@ class VMProvisioner:
         job_id: str,
         identity: VMTeardownIdentity,
         parent_cleanup: Mapping[str, Any],
+        *,
+        require_existing_intent: Mapping[str, Any] | None = None,
     ) -> bool:
         """Persist intent before physical stop, and zero only after signed proof."""
 
@@ -1870,6 +1872,11 @@ class VMProvisioner:
             intent = await store.current_intent(
                 job_id, identity.provision_generation, parent_cleanup
             )
+            if (
+                require_existing_intent is not None
+                and intent != require_existing_intent
+            ):
+                return False
             if intent is None:
                 inspected = await self._request_pre_ssh_stop(
                     {
@@ -2165,6 +2172,60 @@ class VMProvisioner:
             )
         except Exception:
             logger.exception("Held retained stop remains unproven for job %s", job_id)
+            return False
+
+    async def _policy1_stop_settlement_replay(
+        self,
+        job_id: str,
+        identity: VMTeardownIdentity,
+        parent_cleanup: Mapping[str, Any],
+    ) -> bool:
+        """Use a committed stop and fresh full absence for settlement only."""
+        from orchestrator.services.vm_pre_ssh_stop_store import VMPreSSHStopStore
+
+        if self._db is None:
+            return False
+        try:
+            proof = await VMPreSSHStopStore(
+                self._db
+            ).committed_policy1_settlement_proof(
+                job_id, identity.provision_generation, parent_cleanup
+            )
+            if proof is None:
+                return False
+            frozen = proof["frozen"]
+            if (
+                frozen["vm_uid"] != identity.vm_uid
+                or frozen["pvc_uid"] != identity.rootdisk_pvc_uid
+            ):
+                return False
+            evidence = await self.attest_vm_cleanup_stop(
+                {
+                    key: frozen[key]
+                    for key in (
+                        "job_id",
+                        "provision_generation",
+                        "vm_uid",
+                        "vmi_uid",
+                        "launcher_uid",
+                        "pvc_uid",
+                    )
+                }
+                | {
+                    "purge_disk": False,
+                    "retention_preflight": proof["retention_preflight"],
+                }
+            )
+            return bool(
+                evidence is not None
+                and evidence.get("controller_authenticated") is True
+                and evidence.get("vm_absent") is True
+                and evidence.get("vmi_absent") is True
+                and evidence.get("launcher_absent") is True
+                and evidence.get("pvc_disposition") == "retained"
+            )
+        except Exception:
+            logger.exception("Policy-1 settled stop replay unavailable for %s", job_id)
             return False
 
     async def revalidate_vm_teardown_identity(
@@ -2659,9 +2720,61 @@ class VMProvisioner:
         if policy1_retention == "open":
             if classification not in {"matched", "completed"}:
                 return VMTeardownResult("identity_unknown", False)
-            if not await self._attempt_never_app_ready_retained_stop(
-                job_id, identity, parent_cleanup
-            ) or not await self._release_pre_ssh_stop_finalizer(
+            if classification == "completed":
+                proven = await self._policy1_stop_settlement_replay(
+                    job_id, identity, parent_cleanup
+                )
+                return VMTeardownResult(
+                    "completed" if proven else "process_zero_unproven", proven
+                )
+            if (
+                classification == "matched"
+                and not await self._db.claim_managed_repository_workspace_retirement(
+                    job_id,
+                    owner_kind="job",
+                    scope="vm",
+                    provisioner="vm",
+                    runtime_incarnation=generation,
+                )
+            ):
+                return VMTeardownResult("process_zero_unproven", False)
+            from orchestrator.services.vm_pre_ssh_stop_store import VMPreSSHStopStore
+
+            store = VMPreSSHStopStore(self._db)
+            try:
+                existing = await store.current_intent(
+                    job_id, generation, parent_cleanup
+                )
+            except Exception:
+                return VMTeardownResult("process_zero_unproven", False)
+            if existing is not None and existing["frozen"].get("kind") == (
+                "vm_pre_ssh_stop_candidate_v1"
+            ):
+                try:
+                    proof = await store.committed_proof(
+                        job_id, generation, parent_cleanup
+                    )
+                except Exception:
+                    return VMTeardownResult("process_zero_unproven", False)
+                if proof is None and not await self._attempt_pre_ssh_positive_stop(
+                    job_id,
+                    identity,
+                    parent_cleanup,
+                    require_existing_intent=existing,
+                ):
+                    return VMTeardownResult("process_zero_unproven", False)
+                if proof is not None and proof["frozen"] != existing["frozen"]:
+                    return VMTeardownResult("process_zero_unproven", False)
+            elif existing is None or existing["frozen"].get("kind") == (
+                "vm_job_never_app_ready_retained_stop_candidate_v1"
+            ):
+                if not await self._attempt_never_app_ready_retained_stop(
+                    job_id, identity, parent_cleanup
+                ):
+                    return VMTeardownResult("process_zero_unproven", False)
+            else:
+                return VMTeardownResult("process_zero_unproven", False)
+            if not await self._release_pre_ssh_stop_finalizer(
                 job_id, generation, parent_cleanup
             ):
                 return VMTeardownResult("process_zero_unproven", False)

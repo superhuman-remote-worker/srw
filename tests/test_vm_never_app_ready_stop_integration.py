@@ -26,6 +26,11 @@ from shared.vm_cancel_retention import (
 from orchestrator.services.vm_lifecycle_auth import AUTH_FIELD, sign_payload
 from orchestrator.services.vm_pre_ssh_stop_store import VMPreSSHStopStore
 from orchestrator.services.vm_workspace_recovery_store import complete_vm_cleanup_permit
+from tests.test_vm_job_cancel_retention_real_postgres import (
+    acquire,
+    cancelled,
+    preflight,
+)
 from tests.test_vm_never_app_ready_stop_real_postgres import (  # noqa: F401
     _base_db,
     _db_fixture,
@@ -34,6 +39,7 @@ from tests.test_vm_never_app_ready_stop_real_postgres import (  # noqa: F401
     _retention_db,
     _resume_db,
     _schema_applied,
+    frozen_candidate,
     held_state,
     held_stop_schema,
     initial_ready_schema,
@@ -67,6 +73,8 @@ class FakeHeldController:
         self.lost_once = set()
         self.bad_once = set()
         self.wrong_once = set()
+        self.compute_absent = None
+        self.refuse_release_when_absent = False
 
     async def request(self, payload):
         self.actions.append(payload)
@@ -123,10 +131,38 @@ class FakeHeldController:
                 "_identity_authenticated": True,
             }
         assert self.stopped
+        if self.refuse_release_when_absent and self.compute_absent:
+            return {"status": "identity_refused", "_identity_authenticated": True}
         self.released = True
         if "release" in self.lost_once:
             self.lost_once.remove("release")
             return None
+        return {"status": "finalizer_released", "_identity_authenticated": True}
+
+
+class FakeLegacyController:
+    def __init__(self, state, *, ready=False):
+        self.state = state
+        self.ready = ready
+        self.stopped = False
+        self.actions = []
+
+    async def request(self, payload):
+        self.actions.append(payload)
+        assert payload["action"] in {"stop", "release"}
+        assert "held_stop_authority" not in payload
+        assert "parent_cleanup" not in payload
+        assert payload["frozen"] == self.state["frozen"]
+        if payload["action"] == "stop":
+            if self.ready:
+                return {"status": "identity_refused", "_identity_authenticated": True}
+            return {
+                "status": "positive_terminal_proof",
+                "terminal_evidence": terminal_proof(
+                    payload["frozen"], payload["frozen_digest"]
+                ),
+                "_identity_authenticated": True,
+            }
         return {"status": "finalizer_released", "_identity_authenticated": True}
 
 
@@ -137,8 +173,14 @@ def configured_provisioner(db, state, controller, monkeypatch):
     provisioner._request_pre_ssh_stop = controller.request
 
     async def probe(*_args):
+        compute_absent = getattr(controller, "compute_absent", None)
+        absent = (
+            getattr(controller, "released", controller.stopped)
+            if compute_absent is None
+            else compute_absent
+        )
         return _VMTeardownProbe(
-            "absent" if controller.stopped else "present",
+            "absent" if absent else "present",
             VMTeardownIdentity(
                 state["generation"],
                 state["frozen"]["vm_uid"],
@@ -146,10 +188,14 @@ def configured_provisioner(db, state, controller, monkeypatch):
                 credential_runtime_started=True,
             ),
             rootdisk_identity_known=True,
-            runtime_absence_known=controller.stopped,
-            vmi_absent=controller.stopped,
-            launcher_absent=controller.stopped,
-            retained_rootdisk=retained_rootdisk_from_preflight(state["preflight"]),
+            runtime_absence_known=absent,
+            vmi_absent=getattr(controller, "vmi_absent", absent),
+            launcher_absent=getattr(controller, "launcher_absent", absent),
+            retained_rootdisk=getattr(
+                controller,
+                "disk_evidence",
+                retained_rootdisk_from_preflight(state["preflight"]),
+            ),
         )
 
     provisioner._probe_vm_teardown_identity = probe
@@ -158,6 +204,413 @@ def configured_provisioner(db, state, controller, monkeypatch):
     provisioner._delete_vm_with_identity = delete
     monkeypatch.setattr(module, "retire_managed_repository_processes", retire)
     return provisioner, retire, delete
+
+
+async def fresh_policy1_state(db, status):
+    state = await cancelled(db, old=False, retiring=False)
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',to_jsonb($2::text)) "
+        "WHERE id=$1",
+        UUID(state["job_id"]),
+        status,
+    )
+    permit = await acquire(state)
+    assert permit.allowed
+    state["parent"] = permit.parent_cleanup
+    state["frozen"] = frozen_candidate(state, state["parent"])
+    state["preflight"] = preflight(state)
+    state["preflight"]["pvc_name"] = f"agent-vm-{state['job_id']}-rootdisk"
+    return state
+
+
+async def legacy_policy1_intent(db, *, with_proof):
+    state = await held_state(db, zero=False)
+    frozen = dict(state["frozen"])
+    frozen["kind"] = "vm_pre_ssh_stop_candidate_v1"
+    for key in (
+        "cleanup_admission_id",
+        "cleanup_request_id",
+        "cleanup_intent_digest",
+        "kube_vm_ready_at_inspection",
+    ):
+        frozen.pop(key)
+    state["frozen"] = frozen
+    state["preflight"] = preflight(state)
+    state["intent"] = await state["store"].admit_intent(
+        state["job_id"],
+        state["generation"],
+        state["parent"],
+        frozen,
+        retention_preflight=state["preflight"],
+    )
+    state["zero"] = None
+    if with_proof:
+        await state["store"].commit_positive_proof(
+            state["job_id"],
+            state["generation"],
+            state["parent"],
+            terminal_proof(frozen, state["intent"]["frozen_digest"]),
+        )
+        state["zero"] = await db.fetchrow(
+            "SELECT * FROM managed_repository_process_zero_receipts WHERE "
+            "owner_kind='job' AND owner_id=$1 AND scope='vm'",
+            UUID(state["job_id"]),
+        )
+    return state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_proof", [False, True])
+async def test_legacy_generic_intent_replays_immutable_kind_and_zero(
+    db, monkeypatch, with_proof
+):
+    state = await legacy_policy1_intent(db, with_proof=with_proof)
+    controller = FakeLegacyController(state)
+    provisioner, retire, _ = configured_provisioner(db, state, controller, monkeypatch)
+
+    async def delete(*_args, **_kwargs):
+        controller.stopped = True
+        return True
+
+    provisioner._delete_vm_with_identity = AsyncMock(side_effect=delete)
+    old_zero = dict(state["zero"]) if state["zero"] else None
+    assert await provisioner.release_vm_captured(
+        state["job_id"],
+        state["identity"],
+        purge_disk=False,
+        capture_snapshot=False,
+        parent_cleanup=state["parent"],
+    ) == VMTeardownResult("completed", True)
+    assert [item["action"] for item in controller.actions] == (
+        ["release"] if with_proof else ["stop", "release"]
+    )
+    assert (
+        await db.fetchval(
+            "SELECT frozen->>'kind' FROM vm_pre_ssh_stop_intents WHERE job_id=$1",
+            UUID(state["job_id"]),
+        )
+        == "vm_pre_ssh_stop_candidate_v1"
+    )
+    zero = await db.fetchrow(
+        "SELECT * FROM managed_repository_process_zero_receipts WHERE "
+        "owner_kind='job' AND owner_id=$1 AND scope='vm'",
+        UUID(state["job_id"]),
+    )
+    if old_zero:
+        assert dict(zero) == old_zero
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM managed_repository_process_zero_receipts WHERE "
+            "owner_kind='job' AND owner_id=$1 AND scope='vm'",
+            UUID(state["job_id"]),
+        )
+        == 1
+    )
+    retire.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_generic_ready_refuses_without_new_kind_or_zero(db, monkeypatch):
+    state = await legacy_policy1_intent(db, with_proof=False)
+    controller = FakeLegacyController(state, ready=True)
+    provisioner, retire, delete = configured_provisioner(
+        db, state, controller, monkeypatch
+    )
+    assert await provisioner.release_vm_captured(
+        state["job_id"],
+        state["identity"],
+        purge_disk=False,
+        capture_snapshot=False,
+        parent_cleanup=state["parent"],
+    ) == VMTeardownResult("process_zero_unproven", False)
+    assert [item["action"] for item in controller.actions] == ["stop"]
+    assert (
+        await db.fetchval(
+            "SELECT frozen->>'kind' FROM vm_pre_ssh_stop_intents WHERE job_id=$1",
+            UUID(state["job_id"]),
+        )
+        == "vm_pre_ssh_stop_candidate_v1"
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_pre_ssh_stop_proofs WHERE job_id=$1",
+            UUID(state["job_id"]),
+        )
+        == 0
+    )
+    retire.assert_not_awaited()
+    delete.assert_not_awaited()
+
+
+async def deleted_before_settlement(db, monkeypatch, *, status):
+    state = await held_state(db, zero=True)
+    controller = FakeHeldController(state)
+    controller.compute_absent = False
+    controller.refuse_release_when_absent = True
+    provisioner, retire, _ = configured_provisioner(db, state, controller, monkeypatch)
+
+    async def delete(*_args, **_kwargs):
+        controller.compute_absent = True
+        if status == "deleted":
+            await db.execute(
+                "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',"
+                "'\"deleted\"') WHERE id=$1",
+                UUID(state["job_id"]),
+            )
+        return True
+
+    delete_call = AsyncMock(side_effect=delete)
+    provisioner._delete_vm_with_identity = delete_call
+    assert await provisioner.release_vm_captured(
+        state["job_id"],
+        state["identity"],
+        purge_disk=False,
+        capture_snapshot=False,
+        parent_cleanup=state["parent"],
+    ) == VMTeardownResult("completed", True)
+    delete_call.assert_awaited_once()
+    return state, controller, provisioner, retire, delete_call
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["retiring_process_zero", "deleted"])
+async def test_post_delete_open_parent_settles_without_release_again(
+    db, monkeypatch, status
+):
+    state, controller, provisioner, retire, delete = await deleted_before_settlement(
+        db, monkeypatch, status=status
+    )
+    intent_before = dict(
+        await db.fetchrow(
+            "SELECT * FROM vm_pre_ssh_stop_intents WHERE job_id=$1",
+            UUID(state["job_id"]),
+        )
+    )
+    proof_before = dict(
+        await db.fetchrow(
+            "SELECT * FROM vm_pre_ssh_stop_proofs WHERE job_id=$1",
+            UUID(state["job_id"]),
+        )
+    )
+    zero_before = dict(
+        await db.fetchrow(
+            "SELECT * FROM managed_repository_process_zero_receipts WHERE "
+            "owner_kind='job' AND owner_id=$1 AND scope='vm'",
+            UUID(state["job_id"]),
+        )
+    )
+    calls_before = len(controller.actions)
+    assert await provisioner.release_vm_captured(
+        state["job_id"],
+        state["identity"],
+        purge_disk=False,
+        capture_snapshot=False,
+        parent_cleanup=state["parent"],
+    ) == VMTeardownResult("completed", True)
+    assert len(controller.actions) == calls_before
+    delete.assert_awaited_once()
+    assert (
+        dict(
+            await db.fetchrow(
+                "SELECT * FROM vm_pre_ssh_stop_intents WHERE job_id=$1",
+                UUID(state["job_id"]),
+            )
+        )
+        == intent_before
+    )
+    assert (
+        dict(
+            await db.fetchrow(
+                "SELECT * FROM vm_pre_ssh_stop_proofs WHERE job_id=$1",
+                UUID(state["job_id"]),
+            )
+        )
+        == proof_before
+    )
+    assert (
+        dict(
+            await db.fetchrow(
+                "SELECT * FROM managed_repository_process_zero_receipts WHERE id=$1",
+                zero_before["id"],
+            )
+        )
+        == zero_before
+    )
+    permit = await acquire(state)
+    await complete_vm_cleanup_permit(
+        state["recovery"], permit, outcome="completed", provisioner=provisioner
+    )
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE id=$1",
+            UUID(state["reservation_id"]),
+        )
+        == "released"
+    )
+    retire.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["vmi", "launcher", "disk", "foreign_disk"])
+async def test_post_delete_incomplete_absence_or_disk_keeps_charge(
+    db, monkeypatch, missing
+):
+    state, controller, provisioner, retire, delete = await deleted_before_settlement(
+        db, monkeypatch, status="deleted"
+    )
+    if missing == "vmi":
+        controller.vmi_absent = False
+    elif missing == "launcher":
+        controller.launcher_absent = False
+    elif missing == "disk":
+        controller.disk_evidence = None
+    else:
+        controller.disk_evidence = {
+            **retained_rootdisk_from_preflight(state["preflight"]),
+            "pvc_uid": str(uuid4()),
+        }
+    calls_before = len(controller.actions)
+    result = await provisioner.release_vm_captured(
+        state["job_id"],
+        state["identity"],
+        purge_disk=False,
+        capture_snapshot=False,
+        parent_cleanup=state["parent"],
+    )
+    assert result != VMTeardownResult("completed", True)
+    assert len(controller.actions) == calls_before
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE id=$1",
+            UUID(state["reservation_id"]),
+        )
+        == "teardown"
+    )
+    assert (
+        await db.fetchval(
+            "SELECT completed_at FROM vm_workspace_cleanup_admissions WHERE id=$1",
+            UUID(state["parent"]["admission_id"]),
+        )
+        is None
+    )
+    delete.assert_awaited_once()
+    retire.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["retiring_process_zero", "deleted"])
+async def test_absent_vm_and_old_zero_without_positive_proof_cannot_settle(
+    db, monkeypatch, status
+):
+    state = await held_state(db, zero=True)
+    if status == "deleted":
+        await db.execute(
+            "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',"
+            "'\"deleted\"') WHERE id=$1",
+            UUID(state["job_id"]),
+        )
+    controller = FakeHeldController(state)
+    controller.compute_absent = True
+    provisioner, retire, delete = configured_provisioner(
+        db, state, controller, monkeypatch
+    )
+    result = await provisioner.release_vm_captured(
+        state["job_id"],
+        state["identity"],
+        purge_disk=False,
+        capture_snapshot=False,
+        parent_cleanup=state["parent"],
+    )
+    assert result != VMTeardownResult("completed", True)
+    assert controller.actions == []
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE id=$1",
+            UUID(state["reservation_id"]),
+        )
+        == "teardown"
+    )
+    retire.assert_not_awaited()
+    delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["created", "ssh_pending", "ssh_unreachable"])
+async def test_fresh_policy1_status_claims_retirement_before_typed_stop(
+    db, monkeypatch, status
+):
+    state = await fresh_policy1_state(db, status)
+    controller = FakeHeldController(state)
+    provisioner, retire, delete = configured_provisioner(
+        db, state, controller, monkeypatch
+    )
+    assert await provisioner.release_vm_captured(
+        state["job_id"],
+        state["identity"],
+        purge_disk=False,
+        capture_snapshot=False,
+        parent_cleanup=state["parent"],
+    ) == VMTeardownResult("completed", True)
+    assert (
+        await db.fetchval(
+            "SELECT context->'vm'->>'status' FROM jobs WHERE id=$1",
+            UUID(state["job_id"]),
+        )
+        == "retiring_process_zero"
+    )
+    assert [item["action"] for item in controller.actions] == [
+        "inspect_never_app_ready_retained",
+        "stop",
+        "release",
+    ]
+    retire.assert_not_awaited()
+    delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_denied_fresh_retirement_claim_dispatches_nothing(db, monkeypatch):
+    state = await fresh_policy1_state(db, "created")
+    controller = FakeHeldController(state)
+    provisioner, retire, delete = configured_provisioner(
+        db, state, controller, monkeypatch
+    )
+    claim = AsyncMock(return_value=False)
+    monkeypatch.setattr(db, "claim_managed_repository_workspace_retirement", claim)
+    assert await provisioner.release_vm_captured(
+        state["job_id"],
+        state["identity"],
+        purge_disk=False,
+        capture_snapshot=False,
+        parent_cleanup=state["parent"],
+    ) == VMTeardownResult("process_zero_unproven", False)
+    claim.assert_awaited_once()
+    assert controller.actions == []
+    retire.assert_not_awaited()
+    delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_superseded_fresh_generation_dispatches_nothing(db, monkeypatch):
+    state = await fresh_policy1_state(db, "ssh_pending")
+    controller = FakeHeldController(state)
+    provisioner, retire, delete = configured_provisioner(
+        db, state, controller, monkeypatch
+    )
+    stale_identity = VMTeardownIdentity(
+        str(uuid4()),
+        state["identity"].vm_uid,
+        state["identity"].rootdisk_pvc_uid,
+    )
+    assert await provisioner.release_vm_captured(
+        state["job_id"],
+        stale_identity,
+        purge_disk=False,
+        capture_snapshot=False,
+        parent_cleanup=state["parent"],
+    ) == VMTeardownResult("identity_superseded", False)
+    assert controller.actions == []
+    retire.assert_not_awaited()
+    delete.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -226,7 +679,7 @@ async def test_old_zero_and_kube_ready_stop_through_typed_intent_and_proof(
         (
             "release",
             ["inspect_never_app_ready_retained", "stop", "release"],
-            ["release"],
+            [],
         ),
     ],
 )

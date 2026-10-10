@@ -671,3 +671,166 @@ class VMPreSSHStopStore:
                         else {}
                     ),
                 }
+
+    async def committed_policy1_settlement_proof(
+        self,
+        job_id: str,
+        generation: str,
+        parent_cleanup: Mapping[str, Any],
+    ) -> dict | None:
+        """Read an exact proof for physical-absence settlement, never actuation.
+
+        The active-stop reader intentionally rejects a deleted VM projection.
+        Native policy-1 replay validation has a narrower deleted-state allowance
+        once the original stop and zero are durable; use it only with a proven
+        immutable intent/proof pair and the still-open exact parent.
+        """
+        from orchestrator.services.vm_workspace_recovery_store import (
+            CleanupPermit,
+            bind_vm_cleanup_permit,
+        )
+
+        owner, incarnation = _uuid(job_id), _uuid(generation)
+        if not isinstance(parent_cleanup, Mapping):
+            return None
+        try:
+            cleanup_id = _uuid(parent_cleanup["admission_id"])
+        except (KeyError, TypeError, ValueError, VMPreSSHStopConflict):
+            return None
+        async with self.db.acquire() as conn:
+            if conn.is_in_transaction():
+                return None
+            async with conn.transaction():
+                locator = await conn.fetchrow(
+                    "SELECT pvc_uid FROM vm_job_cancel_retention_authorities "
+                    "WHERE cleanup_admission_id=$1 AND job_id=$2 "
+                    "AND provision_generation=$3 AND policy_version=1",
+                    cleanup_id,
+                    owner,
+                    incarnation,
+                )
+                if locator is None:
+                    return None
+                for key in (
+                    f"workspace-recovery:job:{owner}",
+                    f"workspace-recovery-pvc:{locator['pvc_uid']}",
+                ):
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1,0))", key
+                    )
+                await conn.fetchrow(
+                    "SELECT unit_id FROM run_queue WHERE unit_id=$1 FOR UPDATE", owner
+                )
+                job = await conn.fetchrow(
+                    "SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner
+                )
+                cleanup = await conn.fetchrow(
+                    "SELECT * FROM vm_workspace_cleanup_admissions "
+                    "WHERE id=$1 FOR UPDATE",
+                    cleanup_id,
+                )
+                authority = await conn.fetchrow(
+                    "SELECT * FROM vm_job_cancel_retention_authorities "
+                    "WHERE cleanup_admission_id=$1",
+                    cleanup_id,
+                )
+                retry = await conn.fetchrow(
+                    "SELECT * FROM vm_creation_retries WHERE job_id=$1 "
+                    "AND provision_generation=$2 FOR UPDATE",
+                    owner,
+                    incarnation,
+                )
+                charge = await conn.fetchrow(
+                    "SELECT * FROM vm_resource_reservations WHERE id=$1 FOR UPDATE",
+                    authority["reservation_id"] if authority else None,
+                )
+                if (
+                    job is None
+                    or cleanup is None
+                    or authority is None
+                    or retry is None
+                    or charge is None
+                    or cleanup["completed_at"] is not None
+                    or charge["state"] != "teardown"
+                    or charge["id"] != authority["reservation_id"]
+                    or charge["revision"] != authority["reservation_revision"]
+                    or locator["pvc_uid"] != authority["pvc_uid"]
+                ):
+                    return None
+                expected = bind_vm_cleanup_permit(
+                    CleanupPermit(allowed=True, admission_id=cleanup_id),
+                    request_id=authority["cleanup_request_id"],
+                    intent=_json_object(authority["retaining_intent"]),
+                ).parent_cleanup
+                if dict(parent_cleanup) != expected or not await conn.fetchval(
+                    "SELECT public.validate_vm_job_cancel_retention($1,false)",
+                    cleanup_id,
+                ):
+                    return None
+                row = await conn.fetchrow(
+                    "SELECT i.*,p.job_id AS proof_job_id,"
+                    "p.provision_generation AS proof_generation,"
+                    "p.frozen_digest AS proof_frozen_digest,"
+                    "p.terminal_evidence,p.evidence_digest,z.id AS zero_id "
+                    "FROM vm_pre_ssh_stop_intents i "
+                    "JOIN vm_pre_ssh_stop_proofs p "
+                    "ON p.cleanup_admission_id=i.cleanup_admission_id "
+                    "JOIN managed_repository_process_zero_receipts z "
+                    "ON z.owner_kind='job' AND z.owner_id=i.job_id "
+                    "AND z.scope='vm' AND z.provisioner='vm' "
+                    "AND z.runtime_incarnation=i.provision_generation::text "
+                    "WHERE i.cleanup_admission_id=$1 AND i.job_id=$2 "
+                    "AND i.provision_generation=$3",
+                    cleanup_id,
+                    owner,
+                    incarnation,
+                )
+                if row is None:
+                    return None
+                _require_intent_current(row, cleanup, retry, charge)
+                frozen = _json_object(row["frozen"])
+                proof = _json_object(row["terminal_evidence"])
+                kind = frozen.get("kind")
+                if (
+                    kind
+                    not in {
+                        "vm_pre_ssh_stop_candidate_v1",
+                        "vm_job_never_app_ready_retained_stop_candidate_v1",
+                    }
+                    or row["proof_job_id"] != owner
+                    or row["proof_generation"] != incarnation
+                    or row["proof_frozen_digest"] != row["frozen_digest"]
+                    or (
+                        row["prior_zero_receipt_id"] is not None
+                        and row["zero_id"] != row["prior_zero_receipt_id"]
+                    )
+                    or not valid_retention_preflight(
+                        _json_object(row["retention_preflight"]), frozen
+                    )
+                    or not valid_positive_stop_proof(
+                        frozen, proof, frozen_digest=row["frozen_digest"]
+                    )
+                ):
+                    return None
+                if kind == "vm_job_never_app_ready_retained_stop_candidate_v1":
+                    current_xact = await conn.fetchval("SELECT pg_current_xact_id()")
+                    if (
+                        row["held_stop_xact_id"] is None
+                        or row["held_stop_xact_id"] == current_xact
+                        or not await conn.fetchval(
+                            "SELECT held_stop_xact_id IS NOT NULL "
+                            "AND held_stop_xact_id<>$2 FROM vm_pre_ssh_stop_proofs "
+                            "WHERE cleanup_admission_id=$1",
+                            cleanup_id,
+                            current_xact,
+                        )
+                    ):
+                        return None
+                return {
+                    "frozen": frozen,
+                    "frozen_digest": row["frozen_digest"],
+                    "terminal_evidence": proof,
+                    "evidence_digest": row["evidence_digest"],
+                    "process_zero_receipt_id": str(row["zero_id"]),
+                    "retention_preflight": _json_object(row["retention_preflight"]),
+                }
