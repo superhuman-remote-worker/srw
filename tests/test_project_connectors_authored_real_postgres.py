@@ -697,3 +697,60 @@ async def test_an_apply_naming_a_hidden_knowledge_base_answers_403(
         await _apply(db, document, stranger, expected=expected)
     assert refused.value.status_code == 409
     assert kb not in await _links(db, own)
+
+
+@pytest.mark.asyncio
+async def test_the_knowledge_base_leads_the_effective_defaults(database):
+    """The view promises the knowledge base first, then the cloud folder. Ids
+    are random: ordered by id alone, slice 6's job-only checkout row led about
+    two times in three (k3d connector-selection gate, 2026-10-11)."""
+    from orchestrator.services.project_connector_defaults import (
+        effective_project_connector_defaults,
+    )
+    from shared.connectors.platform import (
+        PROJECT_CLOUD,
+        PROJECT_CLOUD_CHECKOUT,
+        PROJECT_KB,
+    )
+
+    db = database
+    owner = await _user(db, "Owner")
+    project = await _project(db, "Ordered", owner)
+    # Ids that sort the wrong way round: checkout lowest, knowledge base highest.
+    rows = {
+        PROJECT_CLOUD_CHECKOUT: (
+            "00000000-0000-4000-8000-000000000001",
+            "cloud_folder_checkout",
+        ),
+        PROJECT_CLOUD: ("00000000-0000-4000-8000-000000000002", "cloud_folder"),
+        PROJECT_KB: ("00000000-0000-4000-8000-000000000003", "kb"),
+    }
+    for kind, (row_id, ds_type) in rows.items():
+        await db.execute(
+            "INSERT INTO datasources (id, name, type, config, read_only, "
+            "scope_mode, managed_key) VALUES ($1, $2, $3, '{}'::jsonb, true, "
+            "'projects', $4)",
+            UUID(row_id),
+            f"Ordered {kind}",
+            ds_type,
+            f"{kind}:{project}",
+        )
+        await db.execute(
+            "INSERT INTO project_datasources (project_id, datasource_id) "
+            "VALUES ($1, $2)",
+            UUID(project),
+            UUID(row_id),
+        )
+    linked = await _connector(db, "Linked", owner, project_ids=[project])
+    await save_settings_connector_defaults(db, project, [linked], actor_id=owner["id"])
+
+    effective = [
+        row["id"] for row in await effective_project_connector_defaults(db, project)
+    ]
+
+    assert effective == [
+        rows[PROJECT_KB][0],
+        rows[PROJECT_CLOUD][0],
+        rows[PROJECT_CLOUD_CHECKOUT][0],
+        linked,
+    ]

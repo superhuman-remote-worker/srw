@@ -27,7 +27,7 @@ from uuid import UUID
 from fastapi import HTTPException
 
 from orchestrator.services.project_status import project_is_archived
-from shared.connectors.platform import platform_owned_sql
+from shared.connectors.platform import PROJECT_CLOUD, PROJECT_KB, platform_owned_sql
 
 MANAGED_BY_MANIFEST = "These defaults are managed by the Project manifest."
 NOT_LINKED = (
@@ -50,14 +50,20 @@ ON CONFLICT (project_id) DO UPDATE SET
     updated_at = now(),
     updated_by = EXCLUDED.updated_by
 """
-#: The project's linked connectors, with the platform marker, in link order
-#: of id. ``platform_owned_sql`` is the predicate the datasource API refuses
+#: The project's linked connectors, with the platform marker: the knowledge
+#: base first, then the project's cloud folder, then the rest in order of id
+#: (ids are random, so they alone put a checkout or other platform row
+#: first). ``platform_owned_sql`` is the predicate the datasource API refuses
 #: link changes with.
 _LINKED = f"""
 SELECT d.id, {platform_owned_sql("d")} AS platform_owned
 FROM project_datasources pd JOIN datasources d ON d.id = pd.datasource_id
 WHERE pd.project_id = $1
-ORDER BY d.id
+ORDER BY CASE split_part(d.managed_key, ':', 1)
+    WHEN '{PROJECT_KB}' THEN 0
+    WHEN '{PROJECT_CLOUD}' THEN 1
+    ELSE 2
+END, d.id
 """
 
 
