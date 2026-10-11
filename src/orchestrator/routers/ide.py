@@ -351,7 +351,7 @@ async def stop_ide_session(
     user, job = await dependencies.require_job_access(
         request, dependencies.store, job_id
     )
-    if _vm_job(job):
+    if lease_id is not None or _vm_job(job):
         from orchestrator.services.vm_idle_access import VMIdleAccessStore
 
         if lease_id is None or not await VMIdleAccessStore(
