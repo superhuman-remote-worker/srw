@@ -5370,6 +5370,26 @@ class PostgresDB:
                 )
             )
 
+    async def has_active_job_workspace_access(self, job_id: str) -> bool:
+        """Read the existing Cancel fence for truthful rejection reporting.
+
+        This fresh diagnostic read does not authorize cancellation or replace
+        the queue/Job locks held by the actual cancellation transactions.
+        """
+        try:
+            job_uuid = UUID(job_id)
+        except ValueError:
+            return False
+        async with self.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases "
+                    "WHERE owner_kind='job' AND owner_id=$1 AND closed_at IS NULL "
+                    "AND expires_at>clock_timestamp())",
+                    job_uuid,
+                )
+            )
+
     async def cancel_job(self, job_id: str) -> bool:
         """Cancel a job by setting its status to 'cancelled'.
 

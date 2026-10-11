@@ -309,6 +309,83 @@ async def test_cancel_waiting_on_writer_owner_lock_sees_committed_lease(db, path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind,claim",
+    [("ide", "tab"), ("ide", "operation"), ("ssh", "connection"), ("sftp", "connection")],
+)
+async def test_cancel_rejection_access_read_counts_all_exact_owner_live_leases(
+    db, kind, claim
+):
+    await db.execute("TRUNCATE vm_idle_access_leases, vm_idle_operations CASCADE")
+    owner, _, identity = await seed_wait(db)
+    lease_id = uuid4()
+    await db.execute(
+        "INSERT INTO vm_idle_access_leases "
+        "(id,owner_kind,owner_id,provision_generation,vm_uid,kind,claimed_by,"
+        "expires_at,max_expires_at) VALUES "
+        "($1,'job',$2,$3,$4,$5,$6,clock_timestamp()+interval '2 minutes',"
+        "clock_timestamp()+interval '1 hour')",
+        lease_id,
+        owner,
+        UUID(identity["generation"]),
+        UUID(identity["vm_uid"]),
+        kind,
+        f"{uuid4()}:{claim}:{uuid4()}",
+    )
+    before = await db.fetchrow("SELECT * FROM vm_idle_access_leases WHERE id=$1", lease_id)
+    assert await db.has_active_job_workspace_access(str(owner)) is True
+    assert await db.has_active_job_workspace_access(str(uuid4())) is False
+    assert (
+        await db.fetchrow("SELECT * FROM vm_idle_access_leases WHERE id=$1", lease_id)
+        == before
+    )
+    assert (
+        await db.fetchval("SELECT status::text FROM jobs WHERE id=$1", owner)
+        == "waiting_for_reply"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inactive", ["expired", "closed", "thread_owner"])
+async def test_cancel_rejection_access_read_does_not_count_inactive_or_other_owner_kind(
+    db, inactive
+):
+    await db.execute("TRUNCATE vm_idle_access_leases, vm_idle_operations CASCADE")
+    owner, _, identity = await seed_wait(db)
+    lease_id = uuid4()
+    await db.execute(
+        "INSERT INTO vm_idle_access_leases "
+        "(id,owner_kind,owner_id,provision_generation,vm_uid,kind,claimed_by,"
+        "expires_at,max_expires_at) VALUES "
+        "($1,$2,$3,$4,$5,'ide',$6,clock_timestamp()+interval '2 minutes',"
+        "clock_timestamp()+interval '1 hour')",
+        lease_id,
+        "thread" if inactive == "thread_owner" else "job",
+        owner,
+        UUID(identity["generation"]),
+        UUID(identity["vm_uid"]),
+        f"{uuid4()}:tab",
+    )
+    if inactive == "expired":
+        await db.execute(
+            "UPDATE vm_idle_access_leases SET acquired_at=clock_timestamp()-interval '3 minutes', "
+            "expires_at=clock_timestamp()-interval '1 second' WHERE id=$1",
+            lease_id,
+        )
+    elif inactive == "closed":
+        await db.execute(
+            "UPDATE vm_idle_access_leases SET closed_at=clock_timestamp() WHERE id=$1",
+            lease_id,
+        )
+    before = await db.fetchrow("SELECT * FROM vm_idle_access_leases WHERE id=$1", lease_id)
+    assert await db.has_active_job_workspace_access(str(owner)) is False
+    assert (
+        await db.fetchrow("SELECT * FROM vm_idle_access_leases WHERE id=$1", lease_id)
+        == before
+    )
+
+
+@pytest.mark.asyncio
 async def test_ide_writer_survives_tab_close_and_blocks_ready_recycle_and_cleanup(db):
     from orchestrator.services.vm_idle_access import VMIdleAccessStore
     from orchestrator.services.vm_workspace_recovery_store import (

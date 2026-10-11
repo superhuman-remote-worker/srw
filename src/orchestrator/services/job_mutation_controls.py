@@ -749,6 +749,28 @@ class JobControlOperations:
                 return False
             await asyncio.sleep(min(max(0.01, poll_seconds), remaining))
 
+    async def _raise_cancel_rejection(
+        self, job_id: str, refreshed: dict[str, Any] | None
+    ) -> None:
+        if not refreshed or refreshed.get("status") == "completed":
+            raise HTTPException(
+                status_code=400,
+                detail="Job cannot be cancelled (already completed or cancelled)",
+            )
+        # A CAS refusal may be a live access fence, or that access may already
+        # have closed. Neither makes this still-live Job a terminal owner.
+        active_access = await self.dependencies.store.has_active_job_workspace_access(
+            job_id
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Close active workspace access, then retry cancellation"
+                if active_access
+                else "Job cancellation blocked because workspace state changed"
+            ),
+        )
+
     async def cancel(
         self, job_id: str, *, job: dict[str, Any], expected_execution_deadline=None
     ) -> JobCancelResponse:
@@ -802,10 +824,7 @@ class JobControlOperations:
                             detail=d.completion_control.claim_detail(refreshed),
                         )
                     elif not refreshed or refreshed.get("status") != "cancelled":
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Job cannot be cancelled (already completed or cancelled)",
-                        )
+                        await self._raise_cancel_rejection(job_id, refreshed)
                     else:
                         job = refreshed
                 if job.get("execution_lane") == "stateless":
@@ -850,10 +869,7 @@ class JobControlOperations:
                             detail=d.completion_control.claim_detail(refreshed),
                         )
                     if not refreshed or refreshed.get("status") != "cancelled":
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Job cannot be cancelled (already completed or cancelled)",
-                        )
+                        await self._raise_cancel_rejection(job_id, refreshed)
                     pinned_cancel_committed = True
                     job = refreshed
 
@@ -906,10 +922,7 @@ class JobControlOperations:
             if not success:
                 refreshed = await d.store.get_job(job_id)
                 if not refreshed or refreshed.get("status") != "cancelled":
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Job cannot be cancelled (already completed or cancelled)",
-                    )
+                    await self._raise_cancel_rejection(job_id, refreshed)
             if pinned_cancel_committed:
                 try:
                     await d.store.delete_checkpoint_thread(job_id)

@@ -154,6 +154,7 @@ async def test_root_cancel_cas_loser_does_not_retire_or_prune(
         get_job=AsyncMock(side_effect=[_job(), _job(winner)]),
         linearize_pinned_cancel=AsyncMock(return_value=False),
         cancel_job=AsyncMock(return_value=False),
+        has_active_job_workspace_access=AsyncMock(return_value=False),
         delete_checkpoint_thread=AsyncMock(),
     )
     main = _bind_runtime(monkeypatch, store, enabled)
@@ -171,7 +172,11 @@ async def test_root_cancel_cas_loser_does_not_retire_or_prune(
     )
     async with _cancel_client(main, monkeypatch, store) as client:
         response = await client.put(f"/api/jobs/{JOB_ID}/cancel")
-    assert response.status_code == 400
+    assert response.status_code == (400 if winner == "completed" else 409)
+    if winner == "processing":
+        assert response.json() == {
+            "detail": "Job cancellation blocked because workspace state changed"
+        }
     cleanup.assert_not_awaited()
     cascade.assert_not_awaited()
     store.cancel_job.assert_not_awaited()
