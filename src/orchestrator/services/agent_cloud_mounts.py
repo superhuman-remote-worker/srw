@@ -99,7 +99,10 @@ from orchestrator.services.stateless_workspace_gate import (
 )
 from shared.backend_kinds import LITE_BACKENDS
 from shared.connectors.contract import AccessContext
-from shared.runtime.services.cloud_mount import resident_spec_record
+from shared.runtime.services.cloud_mount import (
+    mount_state_name,
+    resident_spec_record,
+)
 from shared.connectors.platform import native_project
 
 logger = logging.getLogger(__name__)
@@ -661,14 +664,63 @@ def _static_password(mount: dict[str, Any]) -> bool:
     return isinstance(auth, dict) and auth.get("type") == "basic"
 
 
-def _unique_name(base: str, used: set[str]) -> str:
-    name = base
-    suffix = 2
-    while name in used:
-        name = f"{base}-{suffix}"
-        suffix += 1
-    used.add(name)
-    return name
+#: The thread metadata key of each cloud connector's workspace name.
+NAMES_KEY = "cloud_mount_names"
+
+
+class _MountNames:
+    """Each cloud connector's name under workspace/cloud, stable for the
+    thread's life: the first one it gets is recorded on the thread
+    (:data:`NAMES_KEY`) and kept whatever happens later (its project
+    renamed, another folder of the same name attached first, its own
+    binding failing for a while), so nothing the agent did in one folder
+    ever lands in another. A new name is unique against every recorded one
+    by the state directory it maps to (``mount_state_name``: ``docs-2`` and
+    ``docs_2`` would share one)."""
+
+    def __init__(self, thread: dict[str, Any]) -> None:
+        recorded = thread_metadata_object(thread).get(NAMES_KEY)
+        self.names: dict[str, str] = (
+            {str(cid): str(name) for cid, name in recorded.items() if name}
+            if isinstance(recorded, dict)
+            else {}
+        )
+        self._used = {mount_state_name(name) for name in self.names.values()}
+        self.changed = False
+
+    def name_for(self, connector_id: str, base: str) -> str:
+        if connector_id in self.names:
+            return self.names[connector_id]
+        name = base
+        suffix = 2
+        while mount_state_name(name) in self._used:
+            name = f"{base}-{suffix}"
+            suffix += 1
+        self._used.add(mount_state_name(name))
+        self.names[connector_id] = name
+        self.changed = True
+        return name
+
+    async def record(
+        self, thread: dict[str, Any], *, dependencies: AgentCloudMountDependencies
+    ) -> None:
+        """Keep the names given now on the thread. Best effort, never
+        raises: unrecorded, a name is given again the same way next time."""
+        if not self.changed or not thread.get("id"):
+            return
+        writer = getattr(type(dependencies.store), "merge_thread_cloud_metadata", None)
+        if not callable(writer):
+            return
+        try:
+            await writer(
+                dependencies.store, str(thread["id"]), {NAMES_KEY: dict(self.names)}
+            )
+        except Exception:
+            logger.warning(
+                "Thread %s: its cloud folders' names were not recorded",
+                thread.get("id"),
+                exc_info=True,
+            )
 
 
 def _project_scope(
@@ -743,10 +795,11 @@ async def _bind_cloud_connectors(
     withholding: InWorkspaceWithholding | None = None,
 ) -> LiveMountSet:
     """``selected`` mounted one by one; the outbox first, so it keeps
-    ``cloud/outbox`` whatever a project is called."""
+    ``cloud/outbox`` whatever a project is called. Each keeps the name the
+    thread recorded for it (:class:`_MountNames`)."""
     ctx = _access_context(thread, runtime_is_vm=runtime_is_vm)
     withholding = withholding or InWorkspaceWithholding()
-    used: set[str] = set()
+    names = _MountNames(thread)
     mounts: list[dict[str, Any]] = []
     excluded: list[dict[str, Any]] = []
     ordered = sorted(
@@ -764,17 +817,20 @@ async def _bind_cloud_connectors(
             built = excluded_entry(connector, "mount_unsupported", detail=NEXT_START)
         elif isinstance(connector.driver, CloudOutboxDriver):
             built = await _bind_outbox(
-                thread, connector, ctx=ctx, used=used, dependencies=dependencies
+                thread, connector, ctx=ctx, names=names, dependencies=dependencies
             )
         else:
             built = await _bind_folder(
                 thread,
                 connector,
                 ctx=ctx,
-                used=used,
+                names=names,
                 runtime_is_vm=runtime_is_vm,
                 dependencies=dependencies,
             )
+        if "mount_id" not in built and not built.get("name"):
+            # Where it mounts once it can: the name it keeps.
+            built = {**built, "name": names.names.get(connector.connector_id, "")}
         if (
             "mount_id" in built
             and withholding.static_password
@@ -792,6 +848,7 @@ async def _bind_cloud_connectors(
             mounts.append(built)
         else:
             excluded.append({**built, "title": str(connector.row.get("name") or "")})
+    await names.record(thread, dependencies=dependencies)
     return LiveMountSet(mounts=mounts, excluded=excluded)
 
 
@@ -814,13 +871,14 @@ async def _bind_folder(
     connector: SelectedCloudConnector,
     *,
     ctx: AccessContext,
-    used: set[str],
+    names: _MountNames,
     runtime_is_vm: bool,
     dependencies: AgentCloudMountDependencies,
 ) -> dict[str, Any]:
     """A ``cloud_folder`` connector's mount, or its exclusion: at the level
     the session resolved for it, else its project link's default, within
-    what its owner may have now (``ceiling``)."""
+    what its owner may have now (``ceiling``). Once its binder names it,
+    the name is the thread's for it, also while its grant is not ready."""
     binding = _folder_binding(connector, ctx=ctx)
     if isinstance(binding, CloudFolderUnavailable):
         return excluded_entry(connector, binding.reason, detail=binding.detail)
@@ -845,6 +903,7 @@ async def _bind_folder(
     )
     if isinstance(bound, CloudFolderUnavailable):
         return excluded_entry(connector, bound.reason, detail=bound.detail, level=level)
+    name = names.name_for(binding.connector_id, bound.name)
     granted = await _folder_grant_subject(
         thread, bound.row, binding, dependencies=dependencies
     )
@@ -852,11 +911,10 @@ async def _bind_folder(
         return excluded_entry(
             connector,
             granted.reason,
-            name=bound.name,
+            name=name,
             detail=granted.detail,
             level=level,
         )
-    name = _unique_name(bound.name, used)
     failures: list[str] = []
     built = await _build_rclone_mount_from_row(
         bound.row,
@@ -1117,7 +1175,7 @@ async def _bind_outbox(
     connector: SelectedCloudConnector,
     *,
     ctx: AccessContext,
-    used: set[str],
+    names: _MountNames,
     dependencies: AgentCloudMountDependencies,
 ) -> dict[str, Any]:
     """The session's outbox mount at ``cloud/outbox``, or its exclusion.
@@ -1125,7 +1183,9 @@ async def _bind_outbox(
     The folder is the one SRW created for the session
     (``main_cloud_session_handle``), on the main cloud stamped on it; a
     session whose folder SRW could not create says why
-    (``cloud_outbox.reason``)."""
+    (``cloud_outbox.reason``). Its name is reserved first, whether it
+    mounts now or not."""
+    name = names.name_for(connector.connector_id, OUTBOX_WORKSPACE_NAME)
     binding = connector.driver.mount_binding(
         connector.row,
         ctx=ctx,
@@ -1147,10 +1207,9 @@ async def _bind_outbox(
         return excluded_entry(
             connector,
             binding.reason,
-            name=OUTBOX_WORKSPACE_NAME,
+            name=name,
             detail=detail,
         )
-    name = _unique_name(binding.name, used)
     failures: list[str] = []
     built = await _build_rclone_outbox_mount(
         thread,

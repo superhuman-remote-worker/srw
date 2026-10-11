@@ -593,6 +593,88 @@ async def test_names_never_collide_and_the_outbox_keeps_its_own(denied):
     assert names == {OUTBOX: "outbox", FOLDER: "outbox-2", FOLDER_2: "outbox-3"}
 
 
+def _with_recorded_names(thread, store):
+    """The thread as it is after the names its last binding recorded."""
+    recorded = [
+        patch[mounts.NAMES_KEY]
+        for tid, patch in store.metadata
+        if tid == thread["id"] and mounts.NAMES_KEY in patch
+    ]
+    if not recorded:
+        return thread
+    return {
+        **thread,
+        "metadata": {**thread["metadata"], mounts.NAMES_KEY: recorded[-1]},
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_folders_path_never_moves_to_another_folder(denied):
+    """Two projects called "Docs". At the first attach A's writer is not
+    ready: it still keeps cloud/docs, and B mounts at cloud/docs-2. At the
+    next, with A's writer ready, neither moves; nor after B's project is
+    renamed."""
+    projects = {
+        PROJECT: _project(PROJECT, "Docs"),
+        OTHER_PROJECT: _project(OTHER_PROJECT, "Docs"),
+    }
+    store = GrantStore(
+        [_folder_row(), _folder_row(FOLDER_2, OTHER_PROJECT)],
+        projects=projects,
+        grants=[
+            _grant("writer", WRITER)
+            | {"datasource_id": FOLDER_2, "project_id": OTHER_PROJECT}
+        ],
+    )
+    thread = _thread([FOLDER, FOLDER_2])
+    live, _ = await _live(thread, store, backend=GrantBackend())
+    assert {m["mount_id"]: m["workspace_name"] for m in live.mounts} == {
+        FOLDER_2: "docs-2"
+    }
+    assert [(e["source_ref"], e["name"]) for e in live.excluded] == [(FOLDER, "docs")]
+    thread = _with_recorded_names(thread, store)
+    store.grants[(FOLDER, USER, "writer")] = _grant("writer", WRITER)
+    projects[OTHER_PROJECT] = _project(OTHER_PROJECT, "Renamed")
+    live, _ = await _live(thread, store, backend=GrantBackend())
+    assert {m["mount_id"]: m["workspace_name"] for m in live.mounts} == {
+        FOLDER: "docs",
+        FOLDER_2: "docs-2",
+    }
+    # A folder the session may no longer use is still named where it was.
+    denied.add(FOLDER_2)
+    live, _ = await _live(thread, store, backend=GrantBackend())
+    assert [(e["source_ref"], e["reason"], e["name"]) for e in live.excluded] == [
+        (FOLDER_2, "not_eligible", "docs-2")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_two_names_never_share_a_state_directory(denied):
+    """``docs-2`` (a second "Docs") and ``docs_2`` (a project "Docs 2") map
+    to one rclone state directory, config and remote: never both in a set."""
+    from shared.runtime.services.cloud_mount import mount_state_name
+
+    third = "00000000-0000-4000-8000-0000000000b3"
+    folder_3 = "00000000-0000-4000-8000-0000000000f4"
+    projects = {
+        PROJECT: _project(PROJECT, "Docs 2"),
+        OTHER_PROJECT: _project(OTHER_PROJECT, "Docs"),
+        third: _project(third, "Docs"),
+    }
+    store = Store(
+        [
+            _folder_row(),
+            _folder_row(FOLDER_2, OTHER_PROJECT),
+            _folder_row(folder_3, third),
+        ],
+        projects=projects,
+    )
+    live, _ = await _live(_thread([FOLDER, FOLDER_2, folder_3]), store)
+    names = [m["workspace_name"] for m in live.mounts]
+    assert names == ["docs_2", "docs", "docs-3"]
+    assert len({mount_state_name(name) for name in names}) == 3
+
+
 ROOT = "00000000-0000-4000-8000-0000000000f9"
 
 
@@ -1455,11 +1537,19 @@ async def test_end_retires_what_the_workspace_was_given_not_what_is_attached_now
         m["mount_id"] for m in delivered["mounts"]
     ]
     # The same delivery again writes nothing.
+    ((_tid, named),) = [
+        entry for entry in store.metadata if mounts.NAMES_KEY in entry[1]
+    ]
     store.metadata.clear()
     await mounts._build_agent_cloud_mount(
         thread,
         mount_rows=[],
-        metadata={**thread["metadata"], **_ready(), mounts.DELIVERED_KEY: record},
+        metadata={
+            **thread["metadata"],
+            **_ready(),
+            mounts.DELIVERED_KEY: record,
+            **named,
+        },
         dependencies=_deps(store),
     )
     assert store.metadata == []

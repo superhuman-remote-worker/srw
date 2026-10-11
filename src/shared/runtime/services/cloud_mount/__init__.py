@@ -144,6 +144,15 @@ _IDENTITY_SOURCE_KEYS = frozenset(
 _IDENTITY_AUTH_KEYS = ("type", "issuer", "client_id", "target_user_sub")
 
 
+def mount_state_name(workspace_name: str, index: int = 0) -> str:
+    """The state directory (and rclone remote suffix) a mount's workspace
+    name maps to: lowercase letters and digits, anything else ``-``. Two
+    names that map to one would share a config, a cache and a remote, so a
+    set's names must map to distinct ones."""
+    safe = "".join(ch.lower() if ch.isalnum() else "-" for ch in workspace_name)
+    return safe.strip("-") or f"mount-{index}"
+
+
 def resident_spec_record(mount: dict[str, Any]) -> dict[str, Any]:
     """A delivered in-workspace mount without its secrets.
 
@@ -1315,10 +1324,7 @@ fi
         cache = self._cache_for_mount(mount)
         mount_id = str(mount.get("mount_id") or f"mount-{index}")
         workspace_name = str(mount.get("workspace_name") or f"mount-{index}")
-        safe_name = "".join(
-            ch.lower() if ch.isalnum() else "-" for ch in workspace_name
-        ).strip("-")
-        safe_name = safe_name or f"mount-{index}"
+        safe_name = mount_state_name(workspace_name, index)
         remote_name = f"srw-{self.thread_id[:8]}-{safe_name}"
         state_rel = f".cache/srw/rclone/{self.thread_id}/{safe_name}"
         state_dir = self.workspace_backend.resolve_home_path(state_rel)
