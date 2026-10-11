@@ -37,7 +37,10 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
              API returns, each access level with its "Enforced by" line, and
              the Connectors page links to it
   picker     Playwright: Connectors -> New connector -> Public, then for every
-             publishable type, a managed MCP server's included: the access
+             publishable type a user may create (a driver whose connectors
+             only SRW creates, ``user_creatable: false`` -- the main cloud's
+             folder, outbox and folder copy -- is in no form), a managed MCP
+             server's included: the access
              choices (the creator's read-only tag, decisions 31 and 32) shown
              are exactly the levels the driver's spec offers, literally MCP
              read-write only, KB read-only only, Postgres both. A managed MCP
@@ -60,8 +63,9 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
              set, shows a read-only badge with the creator note under a
              read-write or unset link, while one published read-write keeps
              the switch. The link rows are synthetic, served to the gate's own
-             browser over the test account's first active project; nothing is
-             linked.
+             browser over a project the test account belongs to (its personal
+             project; an administrator lists every project, and the cockpit
+             opens only a member's); nothing is linked.
 
 Run with the repository venv (Playwright and its Chromium installed):
 
@@ -744,10 +748,12 @@ class MatrixGate:
             # (not a variant such as srw.mcp-remote/v1 or the git swap
             # driver) is the type's; a development driver (the lease probe)
             # is in no catalogue. Its label is the api check's business, so
-            # either sign skips it.
+            # either sign skips it. Nor does the form offer a type only SRW
+            # creates (the main cloud's folder, outbox and folder copy).
             if (
                 not kind
                 or kind in UNPUBLISHED_IN_FORM
+                or driver.get("user_creatable") is False
                 or not owns_type(driver)
                 or is_development(driver)
                 or driver.get("name") in self.specs.development
@@ -890,14 +896,20 @@ class MatrixGate:
             for p in (projects if isinstance(projects, list) else [])
             if isinstance(p, dict) and p.get("status", "active") == "active"
         ]
-        if status != 200 or not active:
+        # An administrator lists every project, other gates' leftovers first,
+        # and the cockpit opens only a member's: take the account's own
+        # personal project.
+        _status, me = self.api_get("/api/auth/me")
+        personal = str(((me or {}).get("user") or {}).get("default_project_id") or "")
+        own = [p for p in active if str(p.get("id")) == personal]
+        if status != 200 or not own:
             self.report.check(
                 "links (Playwright): a project's link access follows the driver",
                 False,
-                f"no active project for {self.args.user} (HTTP {status})",
+                f"no active personal project for {self.args.user} (HTTP {status})",
             )
             return
-        project = str(active[0]["id"])
+        project = str(own[0]["id"])
         drivers = {
             d["legacy_type"]: d
             for d in self.matrix["drivers"]
