@@ -322,6 +322,47 @@ async def test_abort_successor_rechecks_initial_vm_marker_after_project_lookup()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("protocol", "prepared"),
+    [
+        ("workspace_process_zero_v1", True),
+        ("agent_attach_not_started_v1", False),
+    ],
+)
+async def test_a_successor_pod_has_its_cloud_prepared_before_the_lock(
+    protocol, prepared
+):
+    """The successor Pod is planned under the thread's lock, where the
+    planner only reads: the session's cloud (its conversion, outbox, root,
+    grants) is prepared first, outside it, as every other creation does
+    (P3-21). A protocol that keeps the workspace plans no Pod."""
+    order: list[str] = []
+    container = MagicMock()
+
+    async def prepare(thread_id):
+        order.append(f"prepare:{thread_id}")
+
+    container.await_cloud_mount_grant = prepare
+    store = MagicMock()
+    store.get_thread = AsyncMock(return_value=_successor_thread())
+
+    @asynccontextmanager
+    async def lock(_thread_id):
+        order.append("lock")
+        yield False
+
+    store.try_thread_advisory_lock = lock
+    deps = _deps(store=store, container=container)
+    assert (
+        await reconcile_attach_abort_successor(
+            _candidate(quiescence_protocol=protocol), dependencies=deps
+        )
+        is False
+    )
+    assert order == ([f"prepare:{THREAD_ID}", "lock"] if prepared else ["lock"])
+
+
+@pytest.mark.asyncio
 async def test_direct_abort_workspace_preparation_holds_old_initial_vm_marker():
     current = _successor_thread()
     current["metadata"]["vm"] = {

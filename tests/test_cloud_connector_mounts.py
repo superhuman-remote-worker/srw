@@ -1774,6 +1774,31 @@ async def test_the_stamp_waits_for_a_connector_that_is_not_there_yet(denied, aut
 
 
 @pytest.mark.asyncio
+async def test_an_in_workspace_attach_converts_before_it_prepares_grants(
+    denied, authorize, monkeypatch
+):
+    """The attach's pre-lock preparation converts an old session first, so
+    the project folder the conversion adds gets its writer now, not one
+    attach later (P3-21)."""
+    from orchestrator.services.cloud import folder_grants
+
+    minted = []
+
+    async def ensure(store, router, target, *, user_id, kind):
+        minted.append((target.datasource_id, kind))
+
+    monkeypatch.setattr(folder_grants, "ensure_folder_grant", ensure)
+    thread = _old_thread()
+    store = GrantStore([_folder_row(), _outbox_row()], threads={THREAD: thread})
+    store.list_thread_mounts = AsyncMock(return_value=_PROJECT_ROW)
+    await mounts.prepare_thread_folder_grants(
+        THREAD, dependencies=_deps(store, backend=GrantBackend())
+    )
+    assert store.threads[THREAD]["metadata"]["cloud_mount_rule"] == "connectors"
+    assert minted == [(FOLDER, "writer")]
+
+
+@pytest.mark.asyncio
 async def test_conversion_adds_only_what_is_missing_and_allowed(denied, authorize):
     denied.add(OUTBOX)
     thread = _old_thread(metadata={"datasource_ids": [FOLDER]})

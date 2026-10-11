@@ -641,4 +641,9 @@ def thread_workspace_delivery_dependencies(
             workspace_composition.agent_cloud_mount_dependencies,
             resources,
         ),
+        beside_protected_exclusions=bound(
+            agent_cloud_mounts.beside_protected_exclusions,
+            workspace_composition.agent_cloud_mount_dependencies,
+            resources,
+        ),
     )

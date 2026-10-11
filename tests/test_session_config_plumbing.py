@@ -2362,6 +2362,247 @@ class TestColdSessionDatasourceDelivery:
         )
 
     @pytest.mark.asyncio
+    async def test_an_in_workspace_protected_payload_names_the_folders_beside_it(
+        self,
+    ):
+        """The prepared protected mount replaces the built payload at the
+        response boundary; the other attached folders it named
+        (``beside_protected``) stay on it, and on the session header, never
+        dropped silently (main cloud slice 5, P3-22)."""
+
+        thread_id = "00000000-0000-4000-8000-0000000000c3"
+        agent_id = "00000000-0000-4000-8000-0000000000a1"
+        generation = "00000000-0000-4000-8000-0000000000d4"
+        attach_token = "00000000-0000-4000-8000-0000000000e5"
+        attempt_a1 = "00000000-0000-4000-8000-0000000000f1"
+        backend_instance_id = "00000000-0000-4000-8000-000000000061"
+        project_id = "00000000-0000-4000-8000-000000000062"
+        mount_rows = [
+            {
+                "id": "00000000-0000-4000-8000-000000000071",
+                "mount_kind": "project",
+                "backend_id": "nextcloud",
+                "backend_instance_id": backend_instance_id,
+                "source_kind": "project_folder",
+                "source_ref": project_id,
+                "target_path": "projects/proj",
+                "cloud_handle": (
+                    '{"backend":"nextcloud","native_id":"42",'
+                    '"vendor_meta":{"mountpoint":"Proj"}}'
+                ),
+            }
+        ]
+        source = ProtectedMountSourceIdentity.from_mount_row(mount_rows[0])
+        assert source is not None
+        plan = ProtectedNextcloudReaderGrantPlan(
+            engage_attempt=attempt_a1,
+            backend_instance_id=backend_instance_id,
+            source=source,
+        )
+        ro_a1 = {
+            "id": "00000000-0000-4000-8000-000000000081",
+            "selected_mount_id": mount_rows[0]["id"],
+            "thread_id": thread_id,
+            "user_id": "user-1",
+            "backend": "nextcloud",
+            "backend_instance_id": backend_instance_id,
+            "reader_id": plan.reader_id,
+            "grant_group_id": plan.group_id,
+            "grant_handle": plan.grant_handle,
+            "grant_handle_sha256": plan.grant_handle_sha256,
+            "source_binding": source.binding,
+            "source_binding_sha256": source.sha256,
+            "credentials": "credential-a1-sentinel",
+            "webdav_url": (
+                "https://nc.internal/remote.php/dav/files/"
+                f"{plan.reader_id}/{plan.mountpoint}/"
+            ),
+            "auth_kind": "basic",
+            "status": "active",
+            "etag_baseline": {},
+            "runtime_generation": generation,
+            "engage_attempt": attempt_a1,
+        }
+        workspace = {
+            "status": "ready",
+            # A ready pinned sandbox workspace declares its provisioner; the
+            # attach path refuses an undeclared one (503) before it reaches
+            # this credential boundary.
+            "provisioner": "k8s",
+            "pod_ip": "10.42.0.10",
+            "pod_port": 30022,
+            "_canvas_workspace_generation": ("00000000-0000-4000-8000-000000000091"),
+            "_runtime_incarnation": "00000000-0000-4000-8000-000000000092",
+        }
+        attestation = container_provisioner_module.WorkspaceRuntimeAttestation(
+            backing_id="k8s-pvc:agent-workspaces:pvc-uid-a1",
+            workspace_generation=workspace["_canvas_workspace_generation"],
+            runtime_incarnation=workspace["_runtime_incarnation"],
+            ssh_host_key_fingerprint="SHA256:trusted-a1",
+            host="workspace-session.agent-workspaces.svc.cluster.local",
+            pod_ip=workspace["pod_ip"],
+            port=workspace["pod_port"],
+        )
+        thread = {
+            "id": thread_id,
+            "execution_lane": "pinned",
+            "status": "created",
+            "agent_id": agent_id,
+            "runtime_generation": generation,
+            "runtime_attach_token": attach_token,
+            "runtime_retirement_token": None,
+            "user_id": "user-1",
+            "project_id": None,
+            "metadata": {
+                "protected_cloud": True,
+                "config_override": {"workspace": {"backend": "sandbox"}},
+                "workspace_container": workspace,
+                "_workspace_binding": {
+                    "generation": workspace["_canvas_workspace_generation"],
+                    "kind": "remote",
+                    "backing_id": "k8s-pvc:agent-workspaces:pvc-uid-a1",
+                    "ssh_host_key_fingerprint": "SHA256:trusted-a1",
+                    "runtime_incarnation": workspace["_runtime_incarnation"],
+                },
+            },
+        }
+
+        async def get_thread(_thread_id):
+            return thread
+
+        async def reciprocal(_thread_id, _agent_id, **kwargs):
+            return True
+
+        beside = [
+            {
+                "source_ref": "00000000-0000-4000-8000-0000000000b9",
+                "mount_kind": "cloud_outbox",
+                "reason": "beside_protected",
+                "name": "",
+                "title": "Session outbox",
+            }
+        ]
+        recorded: list = []
+
+        async def record(_store, _thread_id, _metadata, excluded):
+            recorded.append(list(excluded))
+
+        reciprocal_check = AsyncMock(side_effect=reciprocal)
+        with (
+            patch.object(
+                orch_main.app.state.resources.postgres_db,
+                "get_thread",
+                AsyncMock(side_effect=get_thread),
+            ),
+            patch.object(
+                container_provisioner_module.container_provisioner,
+                "attest_workspace_runtime",
+                AsyncMock(return_value=attestation),
+            ),
+            patch.object(
+                orch_main.app.state.resources.postgres_db,
+                "pinned_thread_agent_is_reciprocal",
+                reciprocal_check,
+            ),
+            patch.object(
+                protected_cloud_engage_module,
+                "_protected_cloud_delivery_state",
+                AsyncMock(return_value=("ready", None)),
+            ),
+            patch.object(
+                orch_main.app.state.resources.postgres_db,
+                "get_ro_mount_by_thread",
+                AsyncMock(return_value=ro_a1),
+            ),
+            patch.object(
+                orch_main.app.state.resources.postgres_db,
+                "list_thread_mounts",
+                AsyncMock(return_value=mount_rows),
+            ),
+            patch.object(
+                orch_main.app.state.resources.postgres_db,
+                "list_protected_selection_rows",
+                AsyncMock(return_value=mount_rows),
+            ),
+            patch.object(
+                thread_mount_rows_module,
+                "thread_project_ids",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                thread_project_authorization_module,
+                "revalidate_thread_project_ids",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                thread_workspace_delivery,
+                "agent_canvas_workspace_capabilities",
+                return_value=(False, False, False),
+            ),
+            patch.object(
+                thread_mount_rows_module,
+                "resolve_thread_datasources",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                agent_cloud_mounts_module,
+                "_build_agent_cloud_mount",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                agent_cloud_mounts_module,
+                "beside_protected_exclusions",
+                AsyncMock(return_value=beside),
+            ),
+            patch.object(
+                thread_workspace_delivery.cloud_mount_status,
+                "record_sync_exclusions",
+                AsyncMock(side_effect=record),
+            ),
+            patch.object(
+                agent_cloud_mounts_module, "_build_agent_cloud_sync", return_value=None
+            ),
+            patch.object(
+                dispatch_credentials_module,
+                "inject_thread_dispatch_credentials",
+                AsyncMock(return_value={"workspace": {"backend": "sandbox"}}),
+            ),
+            patch.object(
+                session_config_resolution_module,
+                "resolve_session_config",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                thread_mount_rows_module,
+                "resolve_thread_repositories",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                orch_main.app.state.resources.postgres_db,
+                "managed_repository_authorities_are_current",
+                AsyncMock(return_value=True),
+            ),
+            patch.object(
+                workspace_tier_policy_module,
+                "inject_lite_workspace_config",
+                side_effect=lambda value, **_kwargs: value,
+            ),
+        ):
+            payload = await control_seams.agent_get_thread_workspace_locked(
+                thread_id,
+                presented_agent_id=agent_id,
+                presented_runtime_generation=generation,
+                presented_attach_token=attach_token,
+            )
+
+        cloud_mount = payload["cloud_mount"]
+        assert cloud_mount["protected"] is True
+        assert cloud_mount["excluded"] == beside
+        assert recorded == [beside]
+        # Only the protected lower crosses: no credential of another folder.
+        assert [m["mount_kind"] for m in cloud_mount["mounts"]] == ["protected_lower"]
+
+    @pytest.mark.asyncio
     async def test_live_detach_commits_before_cold_handler_refetches(self):
         thread_id = _ATTACH_THREAD_ID
         datasource_a = "11111111-2222-4333-8444-555555555555"

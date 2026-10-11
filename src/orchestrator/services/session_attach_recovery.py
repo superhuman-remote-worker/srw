@@ -50,6 +50,7 @@ captures one at import (§P1).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -405,6 +406,19 @@ async def reconcile_attach_abort_successor(
         return False
     if successor_generation == retired_generation:
         return False
+
+    if str(candidate.get("quiescence_protocol") or "") == "workspace_process_zero_v1":
+        # A new Pod may be planned under the lock below, where the planner
+        # only reads: the session's cloud is prepared first (its one-time
+        # conversion, outbox, root, grants; a protected grant landed), as
+        # every other creation does before taking the lock. Never raises.
+        await_grant = getattr(
+            dependencies.container_provisioner, "await_cloud_mount_grant", None
+        )
+        if callable(await_grant):
+            waiting = await_grant(thread_id)
+            if inspect.isawaitable(waiting):
+                await waiting
 
     async with store.try_thread_advisory_lock(thread_id) as lock_owner:
         if not lock_owner:

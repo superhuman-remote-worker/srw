@@ -174,6 +174,11 @@ class ThreadWorkspaceDeliveryDependencies:
     # (``agent_cloud_mounts.sync_delivery_exclusions``). A composition
     # without it names none.
     cloud_sync_exclusions: Any = None
+    # ``(thread, *, mount_rows) -> [excluded]``: every other attached cloud
+    # folder of a protected session, ``beside_protected``
+    # (``agent_cloud_mounts.beside_protected_exclusions``), named on the
+    # in-workspace protected payload. A composition without it names none.
+    beside_protected_exclusions: Any = None
 
 
 def agent_canvas_workspace_capabilities(
@@ -1532,7 +1537,34 @@ async def agent_get_thread_workspace_locked(
                 )
             cloud_mount_cfg = None
         else:
-            cloud_mount_cfg = prepared_protected_mount
+            # Its other attached folders are named, never dropped silently
+            # (slice 5): the prepared mount carries the list the built one
+            # had, else one read now; the session header keeps it too.
+            beside = (
+                cloud_mount_cfg.get("excluded")
+                if isinstance(cloud_mount_cfg, dict)
+                and cloud_mount_cfg.get("protected")
+                else None
+            )
+            if beside is None and dependencies.beside_protected_exclusions is not None:
+                try:
+                    beside = await dependencies.beside_protected_exclusions(
+                        final_thread, mount_rows=mount_rows
+                    )
+                except Exception:
+                    logger.warning(
+                        "Thread %s: could not name the folders beside its "
+                        "protected one",
+                        thread_id,
+                        exc_info=True,
+                    )
+                    beside = None
+            cloud_mount_cfg = dict(prepared_protected_mount)
+            if beside is not None:
+                cloud_mount_cfg["excluded"] = list(beside)
+                await cloud_mount_status.record_sync_exclusions(
+                    postgres_db, thread_id, final_metadata, list(beside)
+                )
         cloud_sync_cfg = None
         cloud_sync_degraded = False
     final_runtime_authority = thread_runtime_authority(final_thread)

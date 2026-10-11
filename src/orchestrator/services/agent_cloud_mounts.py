@@ -1155,9 +1155,19 @@ async def prepare_thread_folder_grants(
         runtime_is_vm = _vm_runtime_ready(metadata)
         if recorded_sidecar_plan(metadata) is not None and not runtime_is_vm:
             return
+        mount_rows = await dependencies.store.list_thread_mounts(thread_id)
+        if not uses_connector_rule(metadata):
+            # Converted first, as the locked response would: the folders it
+            # gains get their grants now, not one attach later.
+            converted = await _convert_once(
+                thread, mount_rows=mount_rows, dependencies=dependencies
+            )
+            if converted is not None:
+                thread = converted
+                metadata = thread_metadata_object(converted)
         await prepare_folder_grants(
             thread,
-            mount_rows=await dependencies.store.list_thread_mounts(thread_id),
+            mount_rows=mount_rows,
             runtime_is_vm=runtime_is_vm,
             dependencies=dependencies,
             withholding=in_workspace_withholding(metadata),
