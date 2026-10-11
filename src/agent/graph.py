@@ -2074,9 +2074,11 @@ def create_execute_node(
                 # Surface it distinctly + recoverable so the job pauses for review
                 # (raise the cap / lower reasoning / regenerate) instead of dying
                 # after 3. Tolerant substring detects the "lengthlength" merge (§7.1).
-                _finish_reason = (
-                    getattr(response, "response_metadata", None) or {}
-                ).get("finish_reason")
+                _response_meta = getattr(response, "response_metadata", None) or {}
+                # Anthropic reports stop_reason ("max_tokens" when capped).
+                _finish_reason = _response_meta.get(
+                    "finish_reason"
+                ) or _response_meta.get("stop_reason")
                 _is_length_trunc = _is_output_truncated(_finish_reason)
                 if _is_length_trunc and content_len == 0 and tool_calls_count == 0:
                     _cap = _resolve_max_output_tokens(config.llm, config.limits)

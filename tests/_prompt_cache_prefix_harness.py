@@ -207,6 +207,8 @@ class Family:
     # cache such as vLLM APC can reuse when only the last few prompt tokens
     # differ). False: the strict check, generation prompt included.
     history_only: bool = False
+    # Environment the family needs set while it runs (FakeProvider.install).
+    env: Dict[str, str] = dataclasses.field(default_factory=dict)
 
     def llm_config(self):
         from shared.runtime.core import loader
@@ -230,9 +232,20 @@ FAMILIES: Dict[str, Family] = {
     for f in (
         # GPT on first-party OpenAI Chat Completions.
         Family("openai-chat", "openai_chat", "gpt-5.6-sol", "openai", None, "high"),
-        # Claude through the subscription proxy: Chat Completions plus the
-        # explicit cache_control breakpoints SRW moves every request.
-        Family("openai-chat-claude-proxy", "openai_chat", "claude-opus-5-5", "openai", PROXY_URL),
+        # Claude through the subscription proxy on its OpenAI-compatible route:
+        # Chat Completions plus the explicit cache_control breakpoints SRW
+        # moves every request. Kill-switch fallback since the native route.
+        Family(
+            "openai-chat-claude-proxy",
+            "openai_chat",
+            "claude-opus-5-5",
+            "openai",
+            PROXY_URL,
+            env={"SRW_CLAUDE_NATIVE_TRANSPORT": "0"},
+        ),
+        # Claude through the subscription proxy on the native Messages API
+        # (the default; thinking blocks replay between steps).
+        Family("anthropic-claude-proxy", "anthropic", "claude-opus-5-5", "openai", PROXY_URL),
         # GPT-5.6 through the Codex lane: the Responses API shape the proxy takes.
         Family("responses-codex", "responses", "codex/gpt-5.6-sol", "codex", PROXY_URL, "high"),
         Family("anthropic", "anthropic", "claude-opus-5-5", "anthropic"),
@@ -272,6 +285,8 @@ class Captured:
 
 
 def _api_of(url: str) -> Optional[str]:
+    # The beta client adds ?beta=true; the route is the path.
+    url = url.split("?", 1)[0]
     if "/chat/completions" in url:
         return "openai_chat"
     if url.rstrip("/").endswith("/responses"):
@@ -599,6 +614,9 @@ class FakeProvider:
 
     def install(self, monkeypatch: Any) -> None:
         from shared.runtime.llm import reasoning_chat
+
+        for name, value in self.family.env.items():
+            monkeypatch.setenv(name, value)
 
         # httpx2 is the transport of openai>=3 and anthropic>=1 when they build
         # their own client (openai still takes SRW's legacy httpx clients).

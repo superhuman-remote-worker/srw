@@ -6,7 +6,7 @@ asyncpg>=0.29.0
 langchain>=0.1.0
 langchain-community>=0.0.16
 langchain-openai>=1.1.12,<2.0  # 1.1.12 ships PR #35281 fix for langchain#34807 (merge_dicts parallel tool call corruption); also pulls newer openai SDK
-langchain-anthropic>=0.1.0
+langchain-anthropic>=1.7.5,<2  # native Claude: adaptive thinking, xhigh/max effort, thinking-token usage
 langchain-google-genai>=1.0.0
 langchain-groq>=0.1.0
 # Exact compatible trio: checkpoints are a cross-pod persisted wire format.

@@ -38,6 +38,7 @@ from agent.core.context import (
     repair_tool_call_arguments,
     repair_tool_pairing,
     scrub_history_tool_call_arguments,
+    strip_unreplayable_blocks,
 )
 from agent.core.context_injection import (
     ContextSources,
@@ -3517,8 +3518,12 @@ async def _execute_turn(
                         break
                     chunks.append(chunk)
                     _chunk_meta = getattr(chunk, "response_metadata", None) or {}
-                    if _chunk_meta.get("finish_reason"):
-                        stream_finish_reason = _chunk_meta["finish_reason"]
+                    # Anthropic reports stop_reason ("max_tokens" when capped).
+                    _chunk_finish = _chunk_meta.get("finish_reason") or _chunk_meta.get(
+                        "stop_reason"
+                    )
+                    if _chunk_finish:
+                        stream_finish_reason = _chunk_finish
                     # Extract and stream text content
                     if hasattr(chunk, "content") and chunk.content:
                         content = chunk.content
@@ -3694,6 +3699,10 @@ async def _execute_turn(
                             response.tool_calls = []
                         if hasattr(response, "invalid_tool_calls"):
                             response.invalid_tool_calls = []
+                        if hasattr(response, "content"):
+                            response.content = strip_unreplayable_blocks(
+                                response.content, set()
+                            )
                         final = finalize_streamed_response(response)
                         if final is not None:
                             messages.append(_adopt(final))
@@ -3841,7 +3850,9 @@ async def _execute_turn(
             _resolve_max_output_tokens,
         )
 
-        _finish_reason = stream_finish_reason or meta.get("finish_reason")
+        _finish_reason = (
+            stream_finish_reason or meta.get("finish_reason") or meta.get("stop_reason")
+        )
         _is_length = _is_output_truncated(_finish_reason)
         _output_cap = (
             _resolve_max_output_tokens(config.llm, config.limits)

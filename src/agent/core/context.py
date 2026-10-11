@@ -23,7 +23,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from langchain_core.messages import (
     AIMessage,
@@ -415,6 +415,41 @@ def sanitize_message_history(messages: List[BaseMessage]) -> List[BaseMessage]:
     return result
 
 
+def strip_unreplayable_blocks(content: Any, keep_tool_use_ids: Set[str]) -> Any:
+    """List ``content`` minus blocks a provider must not see again.
+
+    Drops ``tool_use`` blocks whose id is not in ``keep_tool_use_ids`` (their
+    call was stripped, so Anthropic would see a call without a result) and
+    ``thinking`` blocks without a signature (an interrupted stream's partial
+    block, which fails signature validation on replay). Returns ``""`` when
+    neither text nor a kept ``tool_use`` remains: a thinking block alone is no
+    turn to replay. A string is returned unchanged.
+    """
+    if not isinstance(content, list):
+        return content
+    kept = []
+    for block in content:
+        if isinstance(block, dict):
+            kind = block.get("type")
+            if kind == "tool_use" and block.get("id") not in keep_tool_use_ids:
+                continue
+            if kind == "thinking" and not block.get("signature"):
+                continue
+        kept.append(block)
+    substantive = any(
+        (isinstance(b, str) and b.strip())
+        or (
+            isinstance(b, dict)
+            and (
+                b.get("type") == "tool_use"
+                or (b.get("type") == "text" and str(b.get("text", "")).strip())
+            )
+        )
+        for b in kept
+    )
+    return kept if substantive else ""
+
+
 def repair_tool_pairing(messages: List[BaseMessage]) -> List[BaseMessage]:
     """Drop tool calls/results that lost their partner.
 
@@ -462,7 +497,16 @@ def repair_tool_pairing(messages: List[BaseMessage]) -> List[BaseMessage]:
                 # name and response ids. Reconstructing a bare AIMessage here
                 # fixed pairing while silently discarding everything else on
                 # the turn; model_copy changes only the poisoned field.
-                m = m.model_copy(update={"tool_calls": kept})
+                # Anthropic content carries the calls again as tool_use
+                # blocks, which a provider would still receive.
+                m = m.model_copy(
+                    update={
+                        "tool_calls": kept,
+                        "content": strip_unreplayable_blocks(
+                            m.content, {tc.get("id") for tc in kept}
+                        ),
+                    }
+                )
             if not kept and not m.content:
                 continue  # empty assistant turn carries no information
             repaired.append(m)
@@ -632,11 +676,23 @@ def sanitize_history_for_provider_boundary(
 
             content = m.content
             if isinstance(content, list):
+                # A Claude turn replayed to the Claude family that produced it
+                # keeps its thinking blocks: they are the model's own reasoning
+                # and the native route replays them unchanged.
+                produced_by = (m.response_metadata or {}).get("model_name") or ""
+                own_thinking = target_family.startswith("claude") and (
+                    family_of(produced_by) == target_family
+                )
                 kept = [
                     b
                     for b in content
                     if not (
-                        isinstance(b, dict) and b.get("type") in _REASONING_BLOCK_TYPES
+                        isinstance(b, dict)
+                        and b.get("type") in _REASONING_BLOCK_TYPES
+                        and not (
+                            own_thinking
+                            and b.get("type") in ("thinking", "redacted_thinking")
+                        )
                     )
                 ]
                 if len(kept) != len(content):

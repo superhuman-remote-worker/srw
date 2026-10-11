@@ -4328,7 +4328,7 @@ def create_llm(
     else:
         provider = "openai"
 
-    if provider == "anthropic":
+    if provider == "anthropic" or _claude_native_via_proxy(config, provider):
         return _create_anthropic_llm(config, limits)
     elif provider == "google":
         return _create_google_llm(config, limits)
@@ -4812,51 +4812,157 @@ def _create_openai_llm(
     return llm
 
 
+# Claude behind the subscription proxy runs on the native Messages API, which
+# CLIProxyAPI also serves, so the thinking blocks of each step are replayed in
+# the next. Through the proxy's OpenAI-compatible endpoints every step arrived
+# without the earlier reasoning and rebuilt it: a replay of the same turn cost
+# 235.6k output tokens and no mockup, against 56.0k and a mockup with thinking
+# replayed (knowledge-base/knowledge/issues/website_demo_findings_2026_10_11.md,
+# F1). SRW_CLAUDE_NATIVE_TRANSPORT=0 restores the OpenAI-compatible route.
+_CLAUDE_MODEL_RE = re.compile(
+    r"^claude-(opus|sonnet|haiku|fable|mythos)-(\d+)(?:-(\d{1,2}))?(?:$|-)"
+)
+_THINKING_BINDING_BETA = "thinking-binding-controls-2026-08-01"
+_CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27"
+
+
+def _claude_native_via_proxy(config: LLMConfig, provider: str) -> bool:
+    if provider not in ("codex", "openai"):
+        return False
+    switch = os.getenv("SRW_CLAUDE_NATIVE_TRANSPORT", "1").strip().lower()
+    if switch in ("0", "false", "no", "off"):
+        return False
+    return bool(
+        config.base_url
+        and _is_codex_proxy_url(config.base_url)
+        and family_of(config.model).startswith("claude")
+    )
+
+
+def _claude_thinking_profile(model: str) -> Dict[str, bool]:
+    """What a Claude model accepts for thinking, by tier and version.
+
+    ``adaptive``: ``thinking: {type: adaptive}`` (Opus/Sonnet 4.6 and later,
+    Haiku 5.5, Fable, Mythos). ``display``: the ``display`` field, new with
+    Opus 4.7, whose default hides the reasoning. ``binding``: preserved
+    thinking's history-editing check (Opus/Sonnet/Haiku 5.5, Fable 5.1), which
+    takes ``block_binding``.
+    """
+    match = _CLAUDE_MODEL_RE.match((model or "").lower())
+    if not match:
+        return {"adaptive": False, "display": False, "binding": False}
+    tier, major, minor = match.group(1), int(match.group(2)), int(match.group(3) or 0)
+    version = (major, minor)
+    if tier in ("fable", "mythos"):
+        return {"adaptive": True, "display": True, "binding": version >= (5, 1)}
+    if tier == "opus":
+        adaptive, display = version >= (4, 6), version >= (4, 7)
+    elif tier == "sonnet":
+        adaptive, display = version >= (4, 6), version >= (5, 0)
+    else:  # haiku
+        adaptive = display = version >= (5, 5)
+    return {"adaptive": adaptive, "display": display, "binding": version >= (5, 5)}
+
+
 def _create_anthropic_llm(
     config: LLMConfig,
     limits: Optional[LimitsConfig] = None,
 ) -> BaseChatModel:
-    """Create Anthropic Claude LLM.
+    """Create a Claude LLM on the native Anthropic Messages API.
 
-    Requires ANTHROPIC_API_KEY environment variable or config.api_key.
+    Serves provider ``anthropic`` (an Anthropic API key) and Claude behind the
+    subscription proxy (``_claude_native_via_proxy``). A thinking-capable model
+    runs adaptive thinking with a summarized display, effort from the reasoning
+    plan, and no sampling parameters, which thinking models reject. Each
+    response keeps its content blocks (thinking with its signature, text,
+    tool_use) on the AIMessage, so the next request replays them unchanged.
     """
     # Lazy import to avoid requiring the package when not used
     from langchain_anthropic import ChatAnthropic
+    from shared.runtime.llm.key_ring import parse_key_string
 
-    api_key = config.api_key or os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
+    via_proxy = bool(config.base_url and _is_codex_proxy_url(config.base_url))
+    raw_key = config.api_key or os.getenv("ANTHROPIC_API_KEY")
+    if not raw_key and via_proxy:
+        raw_key = "not-needed"  # the proxy authenticates upstream itself
+    keys = parse_key_string(raw_key) if raw_key else []
+    if not keys:
         raise ValueError(
             "ANTHROPIC_API_KEY environment variable required for Anthropic provider. "
             "Set it in your environment or provide api_key in config."
         )
 
-    llm_kwargs = {
+    llm_kwargs: Dict[str, Any] = {
         "model": config.model,
-        "temperature": config.temperature,
-        "api_key": api_key,
+        "api_key": keys[0],
         "max_retries": config.max_retries,
+        # Anthropic requires max_tokens. Route through the shared resolver so
+        # the family/per-model max_output_tokens, the compaction-aligned
+        # backstop, and the absolute ceiling apply identically across providers.
+        "max_tokens": _resolve_max_output_tokens(config, limits),
     }
-    if config.top_p is not None:
-        llm_kwargs["top_p"] = config.top_p
-    if config.top_k is not None:
-        llm_kwargs["top_k"] = config.top_k
-
+    if config.base_url:
+        # The SDK appends /v1/messages itself.
+        base_url = config.base_url.rstrip("/")
+        llm_kwargs["base_url"] = base_url[:-3] if base_url.endswith("/v1") else base_url
     if config.timeout is not None:
         llm_kwargs["timeout"] = _resolve_timeout(config, limits)
 
-    # Anthropic requires max_tokens. Route through the shared resolver so the
-    # family/per-model max_output_tokens, the compaction-aligned backstop, and
-    # the absolute ceiling apply identically across providers (the old
-    # per-model-class ladder pre-dated the reasoning-aware policy; Anthropic
-    # families set their own max_output_tokens in the matrix).
-    llm_kwargs["max_tokens"] = _resolve_max_output_tokens(config, limits)
+    profile = _claude_thinking_profile(config.model)
+    reasoning_mode = "none"
+    if profile["adaptive"]:
+        thinking: Dict[str, Any] = {"type": "adaptive"}
+        if profile["display"]:
+            thinking["display"] = "summarized"
+        if profile["binding"]:
+            # SRW edits history in places (restore repair, compaction). A block
+            # whose conversation prefix changed is dropped, not a 400, which is
+            # the default for accounts created on or after 2026-08-31.
+            thinking["block_binding"] = {"prefix_mismatch_behavior": "drop_block"}
+        llm_kwargs["thinking"] = thinking
+        plan = resolve_reasoning_plan(config)
+        if plan["method"] == "effort_enum" and plan.get("value"):
+            level = _clamp_reasoning_level(
+                plan["value"], _supported_efforts(plan["cap"])
+            )
+            llm_kwargs["reasoning_effort"] = level
+            reasoning_mode = f"adaptive(effort={level})"
+        else:
+            reasoning_mode = "adaptive"
+    else:
+        llm_kwargs["temperature"] = config.temperature
+        if config.top_p is not None:
+            llm_kwargs["top_p"] = config.top_p
+        if config.top_k is not None:
+            llm_kwargs["top_k"] = config.top_k
+
+    # Always a beta request: the beta client's stream events type the
+    # `context_management` the API adds to `message_delta`, while the stable
+    # parser calls `.model_dump()` on it as a plain dict and every stream
+    # crashes (langchain-anthropic 1.7.5 with anthropic 1.13). A dispatch
+    # `Anthropic-Beta` header joins the same list.
+    headers: Dict[str, str] = dict(
+        _subscription_proxy_session_headers(config, config.base_url)
+    )
+    if config.extra_headers:
+        headers.update(config.extra_headers)
+    betas = [_THINKING_BINDING_BETA if profile["binding"] else _CONTEXT_MANAGEMENT_BETA]
+    for key in [k for k in headers if k.lower() == "anthropic-beta"]:
+        for beta in headers.pop(key).split(","):
+            if beta.strip() and beta.strip() not in betas:
+                betas.append(beta.strip())
+    llm_kwargs["betas"] = betas
+    if headers:
+        llm_kwargs["default_headers"] = headers
 
     llm = ChatAnthropic(**llm_kwargs)
 
     logger.info(
-        f"Created Anthropic LLM: model={config.model}, temp={config.temperature}, "
+        f"Created Anthropic LLM: model={config.model}, "
+        f"base_url={llm_kwargs.get('base_url', 'default')}, "
         f"timeout={llm_kwargs.get('timeout')}s, max_retries={config.max_retries}, "
-        f"max_tokens={llm_kwargs['max_tokens']}"
+        f"max_tokens={llm_kwargs['max_tokens']}, reasoning={reasoning_mode}, "
+        f"betas={betas}, headers={sorted(headers) if headers else 'none'}"
     )
 
     return llm

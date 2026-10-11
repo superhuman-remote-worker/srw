@@ -74,6 +74,37 @@ _ROLE_MAP = {
 }
 
 
+#: provider_raw key for an Anthropic turn's native content blocks.
+ANTHROPIC_CONTENT_KEY = "anthropic_content"
+_ANTHROPIC_NATIVE_BLOCKS = frozenset({"thinking", "redacted_thinking", "tool_use"})
+
+
+def _anthropic_provider_raw(msg: Any) -> Optional[Dict[str, Any]]:
+    """The native content blocks of an Anthropic turn, for ``provider_raw``.
+
+    ``content`` stores the flattened text, which a restore cannot replay as the
+    turn the provider produced: its thinking blocks (with their signatures)
+    are gone and the text block becomes a string, so the next request no longer
+    starts with the previous one (a cache miss at that turn) and the model
+    loses its earlier reasoning. The blocks and the producing model are kept
+    here and restored by ``_db_rows_to_lc_messages``.
+    """
+    content = getattr(msg, "content", None)
+    if not isinstance(content, list):
+        return None
+    metadata = getattr(msg, "response_metadata", None) or {}
+    # A text-only Claude turn (adaptive thinking skipped) is a list too.
+    if metadata.get("model_provider") != "anthropic" and not any(
+        isinstance(b, dict) and b.get("type") in _ANTHROPIC_NATIVE_BLOCKS
+        for b in content
+    ):
+        return None
+    return {
+        ANTHROPIC_CONTENT_KEY: [b for b in content if isinstance(b, (dict, str))],
+        "model": metadata.get("model_name") or metadata.get("model"),
+    }
+
+
 def _serialize_message_row(
     msg: Any,
     turn_number: int,
@@ -125,12 +156,15 @@ def _serialize_message_row(
     # Extract reasoning content + tool-call back-reference BEFORE we flatten
     # Anthropic's list-of-dicts content (which drops the thinking blocks).
     thinking = _extract_thinking(msg) if role == "ai" else None
+    provider_raw = _anthropic_provider_raw(msg) if role == "ai" else None
     tool_call_id = getattr(msg, "tool_call_id", None) if role == "tool" else None
     # Normalize content for Anthropic list-of-dicts format
+    # Only text-bearing parts join: a [thinking, tool_use] turn persisted as
+    # " ", which a restore replays as a whitespace-only text block that
+    # Anthropic rejects.
     if isinstance(content, list):
-        content = " ".join(
-            b.get("text", "") if isinstance(b, dict) else str(b) for b in content
-        )
+        parts = [b.get("text", "") if isinstance(b, dict) else str(b) for b in content]
+        content = " ".join(part for part in parts if part)
     # Attach metrics only to AI messages (not tool results)
     msg_metrics = metrics if role == "ai" else None
     row: Dict[str, Any] = {
@@ -143,6 +177,8 @@ def _serialize_message_row(
         "tool_call_id": tool_call_id,
         "thinking": thinking,
     }
+    if provider_raw is not None:
+        row["provider_raw"] = provider_raw
     if role == PERSIST_ROLE_CONTEXT:
         # A typed context entry: restore rebuilds it from its schema, so that
         # one key is persisted (and read back for 'context' rows only). The

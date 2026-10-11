@@ -253,7 +253,12 @@ def _llm_config(model: str, base_url: str, **overrides) -> loader.LLMConfig:
 
 
 class TestSubscriptionProxyWire:
+    """The OpenAI-compatible proxy route. Claude takes it only with the native
+    route switched off (SRW_CLAUDE_NATIVE_TRANSPORT=0); see
+    tests/test_native_claude_transport.py for the default."""
+
     def test_claude_request_carries_breakpoints_and_session_header(self, monkeypatch):
+        monkeypatch.setenv("SRW_CLAUDE_NATIVE_TRANSPORT", "0")
         captured = _capture(monkeypatch)
         llm = loader.create_llm(
             _llm_config("claude-opus-5-5", PROXY_URL, prompt_cache_key="srw-job-j1")
@@ -310,6 +315,7 @@ class TestSubscriptionProxyWire:
         assert not any("cache_control" in m for m in request["body"]["messages"])
 
     def test_no_conversation_key_means_no_session_header(self, monkeypatch):
+        monkeypatch.setenv("SRW_CLAUDE_NATIVE_TRANSPORT", "0")
         captured = _capture(monkeypatch)
         llm = loader.create_llm(_llm_config("claude-opus-5-5", PROXY_URL))
         try:

@@ -128,7 +128,8 @@ def _session_history() -> List[tuple]:
 
 def _db_projection(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """What the history query's projection returns for the stored rows:
-    jsonb as text, ``additional_kwargs`` NULL unless the row is context."""
+    jsonb as text, ``additional_kwargs`` NULL unless the row is context, and
+    ``provider_raw`` as stored."""
     projected = []
     for row in rows:
         stored = json.loads(json.dumps(row))  # the jsonb / text round trip
@@ -145,6 +146,10 @@ def _db_projection(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "admitted_turn_number": None,
                 "additional_kwargs": json.dumps(stored["additional_kwargs"])
                 if stored["role"] == "context"
+                else None,
+                # Projected when the reader asks for it (session restore does).
+                "provider_raw": json.dumps(stored["provider_raw"])
+                if stored.get("provider_raw") is not None
                 else None,
             }
         )
@@ -652,7 +657,13 @@ class TestTurnThreeAfterRestore:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("lane", ["pinned", "stateless"])
     @pytest.mark.parametrize(
-        "family_id", ["openai-chat", "openai-chat-claude-proxy", "glm-5.2"]
+        "family_id",
+        [
+            "openai-chat",
+            "openai-chat-claude-proxy",
+            "anthropic-claude-proxy",
+            "glm-5.2",
+        ],
     )
     async def test_restored_turn_three_matches_the_live_request(
         self, family_id, lane, monkeypatch

@@ -135,6 +135,7 @@ from agent.agent import UniversalAgent
 # import the thread_messages serialiser from here (lifted to src/core in U3 WP1
 # so the subagent runtime shares it).
 from agent.core.thread_messages import (  # noqa: F401
+    ANTHROPIC_CONTENT_KEY,
     _ROLE_MAP,
     _extract_thinking,
     _persist_one_message,
@@ -8877,8 +8878,23 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
                     for tc in tool_calls
                 ]
             pending_tool_call_ids = [tc["id"] for tc in lc_tool_calls]
+            # An Anthropic turn comes back as the blocks the provider produced
+            # (thinking with its signature, text, tool_use), so the restored
+            # request starts with the live one and keeps its reasoning.
+            raw = db_msg.get("provider_raw")
+            native = raw.get(ANTHROPIC_CONTENT_KEY) if isinstance(raw, dict) else None
+            response_metadata = {}
+            if isinstance(native, list) and native:
+                content = native
+                if raw.get("model"):
+                    response_metadata["model_name"] = raw["model"]
             restored.append(
-                AIMessage(content=content, tool_calls=lc_tool_calls, id=msg_id)
+                AIMessage(
+                    content=content,
+                    tool_calls=lc_tool_calls,
+                    id=msg_id,
+                    response_metadata=response_metadata,
+                )
             )
 
         elif role == "tool":
@@ -8970,6 +8986,7 @@ async def _restore_session_messages() -> None:
                     limit=_resume_message_limit,
                     seq_gt=boundary_seq,
                     newest_first=True,
+                    include_provider_raw=True,
                 )
             else:
                 # Back-compat: summary rows written before boundary_seq shipped
@@ -8979,6 +8996,7 @@ async def _restore_session_messages() -> None:
                     limit=_resume_message_limit,
                     since_turn=boundary_turn,
                     newest_first=True,
+                    include_provider_raw=True,
                 )
             if len(db_messages) >= _resume_message_limit:
                 logger.warning(
@@ -9082,6 +9100,7 @@ async def _restore_session_messages() -> None:
             thread_id=_session_identity.thread_id,
             limit=_resume_message_limit,
             newest_first=True,
+            include_provider_raw=True,
         )
         if len(db_messages) >= _resume_message_limit:
             logger.warning(
