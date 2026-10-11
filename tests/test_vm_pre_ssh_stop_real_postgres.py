@@ -85,6 +85,7 @@ async def seeded_stop(
     purge_disk=False,
     retiring=True,
     bound=True,
+    cancel_before_adoption=False,
 ):
     policy, inventory, snapshot, demand = await environment(db, installation_count=2)
     retry = await waiter(db, policy, inventory, lane="stateless", user_id=uuid4())
@@ -104,14 +105,22 @@ async def seeded_stop(
             "expected_pvc_uid": None,
         },
     )
+    if cancel_before_adoption:
+        await db.execute(
+            "UPDATE vm_creation_retries SET state='cancel_requested',"
+            "claim_token=NULL,claim_expires_at=NULL,revision=revision+1 "
+            "WHERE request_id=$1",
+            retry["request_id"],
+        )
     await db.execute(
-        "UPDATE vm_creation_retries SET state='succeeded',reason='creation_adopted',"
+        "UPDATE vm_creation_retries SET state=$4,reason='creation_adopted',"
         "boot_counted=TRUE,revision=revision+1,observed_vm_uid=$2,"
         "observed_pvc_uid=$3,resolved_at=clock_timestamp(),"
         "claim_token=NULL,claim_expires_at=NULL WHERE request_id=$1",
         retry["request_id"],
         UUID(vm_uid),
         UUID(pvc_uid),
+        "settled" if cancel_before_adoption else "succeeded",
     )
     await db.execute(
         "UPDATE vm_workspace_cleanup_admissions SET completed_at=clock_timestamp(),"
@@ -132,7 +141,7 @@ async def seeded_stop(
         await db.fetchval("SELECT context FROM jobs WHERE id=$1", UUID(job_id))
     )
     context["vm"].update(
-        status="created",
+        status="waiting_creation_configuration" if cancel_before_adoption else "created",
         provision_generation=generation,
         vm_uid=vm_uid,
         vmi_uid=vmi_uid,

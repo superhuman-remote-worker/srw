@@ -529,7 +529,16 @@ async def retention_settlement_is_current_on_conn(
             "AND j.context->'vm'->>'rootdisk_pvc_uid'=a.pvc_uid::text "
             "AND q.unit_kind='worker_batch' AND q.state='done' "
             "AND q.leased_by IS NULL AND q.leased_until IS NULL "
-            f"AND r.state='succeeded' AND {ready_scope} "
+            f"AND {ready_scope} AND (r.state='succeeded' OR ("
+            "a.policy_version=1 AND r.state='settled' "
+            "AND r.reason='creation_adopted' AND r.resolved_at IS NOT NULL "
+            "AND r.claim_token IS NULL AND r.claim_expires_at IS NULL "
+            "AND r.observed_vm_uid=a.vm_uid AND r.observed_pvc_uid=a.pvc_uid "
+            "AND j.context->>'_vm_creation_pending'=r.request_id::text "
+            "AND j.context->'vm'->>'creation_request_id'=r.request_id::text "
+            "AND j.context->'vm'->>'status'='deleted' "
+            "AND NOT EXISTS(SELECT 1 FROM vm_creation_effects e "
+            "WHERE e.request_id=r.request_id AND e.state='issued'))) "
             "AND NOT EXISTS(SELECT 1 FROM vm_creation_retries later WHERE later.owner_kind='job' "
             "AND later.job_id=a.job_id AND (later.created_at,later.request_id)>(r.created_at,r.request_id))) "
             "AND public.vm_job_cancel_retention_settled($1)",
@@ -653,7 +662,9 @@ async def _bind_cancelled_boot_occupancy(conn, store, *, job, identity):
         or not isinstance(vm, dict)
         or context.get("_stateless_cancel_cleanup_pending") is not True
         or context.get("_vm_job_retained_resume") is not None
-        or vm.get("status") not in {"created", "ssh_pending", "ssh_unreachable"}
+        or vm.get("status") not in {
+            "created", "ssh_pending", "ssh_unreachable", "waiting_creation_configuration"
+        }
         or vm.get("ssh_verified_at") is not None
         or vm.get("active_pod_uid") is not None
         or vm.get("workspace_storage") is not None
@@ -673,7 +684,7 @@ async def _bind_cancelled_boot_occupancy(conn, store, *, job, identity):
         retry is None
         or str(retry["request_id"]) != vm.get("creation_request_id")
         or str(retry["request_id"]) != context.get("_vm_creation_pending")
-        or retry["state"] != "succeeded"
+        or retry["state"] not in {"succeeded", "settled"}
         or retry["reason"] != "creation_adopted"
         or retry["ready_at"] is not None
         or retry["claim_token"] is not None
@@ -688,6 +699,18 @@ async def _bind_cancelled_boot_occupancy(conn, store, *, job, identity):
             job["id"],
         )
     ):
+        return
+    late_adopted = retry["state"] == "settled"
+    if late_adopted and (
+        vm.get("status") != "waiting_creation_configuration"
+        or not await conn.fetchval(
+            "SELECT public.vm_cancel_late_adopted_source($1,$2,$3,$4,$5)",
+            job["id"], retry["provision_generation"], retry["observed_vm_uid"],
+            retry["observed_pvc_uid"], retry["request_id"],
+        )
+    ):
+        return
+    if not late_adopted and vm.get("status") == "waiting_creation_configuration":
         return
     try:
         resource = await installed_job_resource_store(
@@ -740,6 +763,7 @@ async def _bind_cancelled_boot_occupancy(conn, store, *, job, identity):
             vm={**vm, "vmi_uid": vmi_uid},
             job_id=str(job["id"]),
             generation=identity.provision_generation,
+            cancel_late_adopted=late_adopted,
         ):
             return
         await conn.execute(
@@ -1086,11 +1110,20 @@ async def complete_cancel_retention_marker(db, job_id: str):
             authority["cleanup_admission_id"],
         )
         await conn.execute(
-            "UPDATE jobs SET context=jsonb_set(context-'_stateless_cancel_cleanup_pending','{vm}',"
+            "UPDATE jobs SET context=jsonb_set(context-'_stateless_cancel_cleanup_pending'"
+            "-(CASE WHEN $3::boolean THEN '_vm_creation_pending' "
+            "ELSE '_stateless_cancel_cleanup_pending' END),'{vm}',"
             "(context->'vm')||$2::jsonb),updated_at=clock_timestamp() WHERE id=$1",
             owner,
             json.dumps(
                 {"status": "deleted", "compute_released": True, "disk_kept": disk_kept}
             ),
+            bool(await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_creation_retries r JOIN jobs j ON j.id=r.job_id "
+                "WHERE r.request_id=$1 AND r.state='settled' AND r.reason='creation_adopted' "
+                "AND j.context->>'_vm_creation_pending'=r.request_id::text "
+                "AND j.context->'vm'->>'creation_request_id'=r.request_id::text)",
+                authority["creation_request_id"],
+            )),
         )
         return True

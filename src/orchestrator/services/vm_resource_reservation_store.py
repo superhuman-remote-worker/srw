@@ -548,7 +548,7 @@ class VMResourceReservationStore:
             raise ResourceAdmissionError("resource_reservation_changed")
 
     async def bind_observed_runtime_on_conn(
-        self, conn, *, retry, vm, job_id, generation
+        self, conn, *, retry, vm, job_id, generation, cancel_late_adopted=False
     ):
         """Charge one signed, physically running Job launcher before SSH Ready.
 
@@ -562,15 +562,16 @@ class VMResourceReservationStore:
             or retry["provision_generation"] != UUID(generation)
             or retry["reason"] != "creation_adopted"
             or retry["ready_at"] is not None
+            or (cancel_late_adopted and retry["state"] != "settled")
             or vm.get("status")
-            not in {
+            not in ({
                 "created",
                 "provisioning",
                 "starting",
                 "ssh_pending",
                 "running",
                 "ssh_unreachable",
-            }
+            } | ({"waiting_creation_configuration"} if cancel_late_adopted else set()))
             or vm.get("ssh_verified_at") is not None
             or vm.get("active_pod_uid") is not None
         ):
@@ -582,11 +583,13 @@ class VMResourceReservationStore:
             job_id=job_id,
             generation=generation,
             observed_before_ready=True,
+            cancel_late_adopted=cancel_late_adopted,
         )
 
     async def bind_ready_on_conn(
         self, conn, *, retry, vm, job_id, generation,
         observed_before_ready=False,
+        cancel_late_adopted=False,
     ):
         """Bind one genuine signed-inventory launcher before owner Ready commits.
 
@@ -595,7 +598,19 @@ class VMResourceReservationStore:
         instead of raising when authentic demand exceeds the reservation.
         """
         await self._lock_policy(conn, allow_off=True)
-        if retry["state"] != "succeeded":
+        if (cancel_late_adopted and retry["state"] != "settled") or (
+            retry["state"] != "succeeded" and not (
+                cancel_late_adopted
+                and retry["state"] == "settled"
+                and observed_before_ready
+                and vm.get("status") == "waiting_creation_configuration"
+                and await conn.fetchval(
+                    "SELECT public.vm_cancel_late_adopted_source($1,$2,$3,$4,$5)",
+                    retry["job_id"], retry["provision_generation"],
+                    retry["observed_vm_uid"], retry["observed_pvc_uid"], retry["request_id"],
+                )
+            )
+        ):
             return False
         head = await conn.fetchrow(
             "SELECT * FROM vm_resource_inventory_heads WHERE cluster_id=$1 "
@@ -1157,7 +1172,16 @@ class VMResourceReservationStore:
             or cleanup["request_id"] != UUID(str(intent["request_id"]))
             or cleanup["intent_digest"] != intent["intent_digest"]
             or retry["job_id"] != job["id"]
-            or retry["state"] != "succeeded"
+            or (retry["state"] != "succeeded" and not (
+                retry["state"] == "settled"
+                and cleanup["source"] == "job_terminal_vm_release"
+                and await conn.fetchval(
+                    "SELECT public.vm_cancel_late_adopted_source($1,$2,$3,$4,$5)",
+                    job["id"], retry["provision_generation"],
+                    retry["observed_vm_uid"], retry["observed_pvc_uid"],
+                    retry["request_id"],
+                )
+            ))
             or str(retry["provision_generation"])
             != intent["intent"]["provision_generation"]
             or str(retry["observed_vm_uid"]) != intent["intent"]["vm_uid"]
