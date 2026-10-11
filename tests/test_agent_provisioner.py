@@ -2204,6 +2204,152 @@ class TestNeverScheduledPinnedAgentPod:
         assert api.pods[self.NAME].metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
 
 
+class TestNeverStartedPinnedAgentPod:
+    """A delete racing the agent container's start retires the Pod it stopped.
+
+    k3d 2026-10-11 (``srw-agent-s-0213361e``): deleted at 09:53:39, its
+    ``wait-for-orchestrator`` init still ran at 09:53:40 and exited 0, then the
+    kubelet stopped the Pod (``Failed``, ``Initialized=True``) without ever
+    starting the agent, whose status stays ``waiting: PodInitializing``. That
+    status never reads terminal, so DELETE retried forever.
+    """
+
+    NAME = "srw-agent-s-0213361e"
+    UID = "0213361e-5d1c-4f43-9a51-5b3f5e1f0c2a"
+
+    def _pod(self):
+        pod = executor_pod(
+            name=self.NAME,
+            uid=self.UID,
+            finalizers=[PINNED_AUTHORITY_FINALIZER],
+            phase="Failed",
+            node_name="k3d-srw-server-0",
+            deleting=True,
+            init=(("wait-for-orchestrator", "terminated", 0),),
+            containers=(("agent", "waiting"),),
+        )
+        pod.spec.restart_policy = "Never"
+        pod.status.conditions = [
+            SimpleNamespace(type="Initialized", status="True", reason=None),
+            SimpleNamespace(
+                type="ContainersReady", status="False", reason="ContainersNotReady"
+            ),
+        ]
+        return pod
+
+    @staticmethod
+    def _provisioner(api):
+        p = AgentProvisioner()
+        p._core_api = api
+        p._k8s_available = True
+        p._namespace = EXECUTOR_NAMESPACE
+        return p
+
+    @pytest.mark.asyncio
+    async def test_delete_racing_agent_start_releases_the_pod(self):
+        from orchestrator.services.pinned_retirement import PinnedRetirementOperations
+
+        api = FakeExecutorCoreApi(self._pod())
+        operations = PinnedRetirementOperations(
+            SimpleNamespace(agent_provisioner=self._provisioner(api))
+        )
+        agent_pod = {
+            "pod_name": self.NAME,
+            "pod_uid": self.UID,
+            "namespace": EXECUTOR_NAMESPACE,
+            "protection_protocol": "finalizer_v1",
+        }
+
+        await operations._stop_captured_retirement_agent(
+            {"context": {"agent_pod": agent_pod}}
+        )
+
+        assert api.removed == [self.NAME]
+        [(name, patch)] = api.patches
+        assert name == self.NAME
+        assert {"op": "test", "path": "/metadata/uid", "value": self.UID} in patch
+
+    @pytest.mark.asyncio
+    async def test_stopped_never_started_pod_is_process_zero(self):
+        api = FakeExecutorCoreApi(self._pod())
+        p = self._provisioner(api)
+        exact = {"expected_pod_uid": self.UID, "namespace": EXECUTOR_NAMESPACE}
+
+        assert await p.agent_pod_authority(self.NAME, **exact) == "exact_terminal"
+        assert await p.agent_pod_terminal_process_zero(self.NAME, **exact)
+        assert await p.release_agent_pod_finalizer_exact(self.NAME, **exact)
+        assert api.removed == [self.NAME]
+
+    @staticmethod
+    def _podgc(pod):
+        pod.status.conditions.append(
+            SimpleNamespace(type="DisruptionTarget", reason="DeletionByPodGC")
+        )
+
+    @staticmethod
+    def _not_terminal(pod):
+        pod.status.phase = "Pending"
+
+    @staticmethod
+    def _not_deleting(pod):
+        pod.metadata.deletion_timestamp = None
+
+    @staticmethod
+    def _init_running(pod):
+        pod.status.init_container_statuses = [
+            container_status("wait-for-orchestrator", "running")
+        ]
+
+    @staticmethod
+    def _agent_has_container_id(pod):
+        pod.status.container_statuses[0].container_id = "containerd://agent"
+
+    @staticmethod
+    def _agent_started(pod):
+        pod.status.container_statuses[0].started = True
+
+    @staticmethod
+    def _agent_has_last_state(pod):
+        pod.status.container_statuses[0].last_state.terminated = SimpleNamespace(
+            exit_code=137
+        )
+
+    @staticmethod
+    def _agent_status_missing(pod):
+        pod.status.container_statuses = []
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            # PodGC writes Failed over frozen statuses on a lost node.
+            _podgc,
+            # Without the kubelet's terminal phase it may still start the agent.
+            _not_terminal,
+            _not_deleting,
+            _init_running,
+            # Any start evidence: the agent may have run.
+            _agent_has_container_id,
+            _agent_started,
+            _agent_has_last_state,
+            # A declared container with no status is not evidence of zero.
+            _agent_status_missing,
+        ],
+        ids=lambda mutate: mutate.__name__.lstrip("_"),
+    )
+    @pytest.mark.asyncio
+    async def test_proof_stays_narrow(self, mutate):
+        pod = self._pod()
+        mutate(pod)
+        api = FakeExecutorCoreApi(pod)
+        p = self._provisioner(api)
+        exact = {"expected_pod_uid": self.UID, "namespace": EXECUTOR_NAMESPACE}
+
+        assert await p.agent_pod_authority(self.NAME, **exact) != "exact_terminal"
+        assert not await p.agent_pod_terminal_process_zero(self.NAME, **exact)
+        assert not await p.release_agent_pod_finalizer_exact(self.NAME, **exact)
+        assert api.pods[self.NAME].metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
+
+
 # =============================================================================
 # config_name at the provisioner boundary
 # (security audit 2026-08-27, finding #3: caller-controlled config_name was

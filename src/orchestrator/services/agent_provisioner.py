@@ -217,16 +217,19 @@ def _deleting_executor_never_scheduled(pod: Any) -> bool:
     return True
 
 
-def _deleting_executor_never_initialized(pod: Any) -> bool:
-    """A Pod killed inside ``wait-for-orchestrator`` never ran the executor.
+def _terminal_pod_never_started(pod: Any) -> bool:
+    """A Pod stopped around ``wait-for-orchestrator`` never ran its main process.
 
-    The kubelet's terminal status rewrite marks only initialized Pods' waiting
-    containers terminated; a Pod deleted during init keeps its regular
-    containers ``waiting: PodInitializing`` forever, so the strict all-terminal
-    rule would retain it indefinitely. Require the kubelet's own terminal
-    phase, every init container terminated with at least one failure (a
-    successful init would have initialized the Pod and moved the containers
-    past ``PodInitializing``), and no start evidence on any regular container.
+    A Pod deleted during init, or between its init's exit and the first
+    regular container's start, keeps that container ``waiting:
+    PodInitializing`` forever: the kubelet's terminal rewrite never marks a
+    never-created container terminated, so the strict all-terminal rule would
+    retain the Pod indefinitely. The init exit code proves nothing (k3d
+    2026-10-11: deleted 09:53:39, init ran 09:53:40 and exited 0,
+    ``Initialized=True``, the agent never started). Require the kubelet's own
+    terminal phase, written only after every container stopped and never
+    followed by a start, every init container terminated, and no start
+    evidence on any regular container.
     """
 
     spec = getattr(pod, "spec", None)
@@ -253,11 +256,9 @@ def _deleting_executor_never_initialized(pod: Any) -> bool:
         declared = {str(c.name) for c in getattr(spec, declared_field, None) or []}
         if not declared.issubset({str(getattr(s, "name", "")) for s in observed}):
             return False
-    init_terminal = [
-        getattr(getattr(s, "state", None), "terminated", None) for s in init_statuses
-    ]
-    if any(item is None for item in init_terminal) or all(
-        int(getattr(item, "exit_code", 0) or 0) == 0 for item in init_terminal
+    if any(
+        getattr(getattr(s, "state", None), "terminated", None) is None
+        for s in init_statuses
     ):
         return False
     for container in statuses:
@@ -291,31 +292,32 @@ def stateless_executor_process_zero(pod: Any) -> bool:
     return (
         _executor_containers_quiescent(pod)
         or _deleting_executor_never_scheduled(pod)
-        or _deleting_executor_never_initialized(pod)
+        or _terminal_pod_never_started(pod)
     )
 
 
-def _deleting_agent_pod_never_scheduled(pod: Any) -> bool:
-    """A deleting dedicated agent Pod without ``nodeName`` never ran a process.
+def _deleting_agent_pod_never_started(pod: Any) -> bool:
+    """A deleting dedicated agent Pod that never ran its agent process.
 
-    The executor rule above, applied to the pinned session/job agent Pod: an
-    End that races the Pod's create deletes it before the scheduler binds it,
-    and the binding subresource refuses a Pod that is being deleted. Such a Pod
-    never gains a container status that could read terminal, so without this
+    The executor rules above, applied to the pinned session/job agent Pod. An
+    End that races the Pod's create deletes it before the scheduler binds it
+    (the binding subresource refuses a deleting Pod), or before the kubelet
+    starts the agent container after ``wait-for-orchestrator``. Neither Pod
+    ever gains an agent status that could read terminal, so without this
     proof its pinned-authority finalizer is never released and End retries
     forever.
     """
 
     if getattr(getattr(pod, "metadata", None), "deletion_timestamp", None) is None:
         return False
-    return _deleting_executor_never_scheduled(pod)
+    return _deleting_executor_never_scheduled(pod) or _terminal_pod_never_started(pod)
 
 
 def classify_agent_pod_authority(pod: Any, expected_pod_uid: str) -> str:
     """Classify one read of a claimant Pod name against the expected UID.
 
     ``exact_terminal`` requires the exact UID with every container observed
-    terminated, or a deleting Pod that was never scheduled; ``replacement`` is
+    terminated, or a deleting Pod that never started its agent; ``replacement`` is
     a same-name successor; deletion grace and phase Unknown remain ``unknown``
     because the old process may still run.
     """
@@ -335,7 +337,7 @@ def classify_agent_pod_authority(pod: Any, expected_pod_uid: str) -> str:
     # terminal phase update.  Exact UID plus every container's terminated
     # state is the process-level proof we need; deletionTimestamp alone is
     # deliberately not proof.
-    if all_containers_terminated or _deleting_agent_pod_never_scheduled(pod):
+    if all_containers_terminated or _deleting_agent_pod_never_started(pod):
         return "exact_terminal"
     if getattr(getattr(pod, "metadata", None), "deletion_timestamp", None):
         return "unknown"
@@ -1158,8 +1160,8 @@ class AgentProvisioner:
 
         A 404, offline row or terminal phase alone is insufficient. Require
         every declared regular/init/ephemeral container's termination and the
-        production Never restart policy, or a deleting Pod that was never
-        scheduled. This says nothing about remote writers.
+        production Never restart policy, or a deleting Pod that never started
+        its agent. This says nothing about remote writers.
         """
         try:
             state, pod = await self.observe_agent_pod_exact(
@@ -1169,7 +1171,7 @@ class AgentProvisioner:
             return False
         if state != "exact_terminal" or pod is None:
             return False
-        if _deleting_agent_pod_never_scheduled(pod):
+        if _deleting_agent_pod_never_started(pod):
             return True
         if getattr(getattr(pod, "spec", None), "restart_policy", None) != "Never":
             return False
@@ -1968,7 +1970,7 @@ class AgentProvisioner:
         if (
             terminal_required
             and not pod_containers_are_terminal(pod)
-            and not _deleting_agent_pod_never_scheduled(pod)
+            and not _deleting_agent_pod_never_started(pod)
         ):
             return False
         patch = finalizer_release_patch(

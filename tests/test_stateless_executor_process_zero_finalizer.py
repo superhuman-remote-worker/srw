@@ -183,9 +183,20 @@ def test_podgc_terminal_phase_is_not_kubelet_evidence():
     assert not stateless_executor_process_zero(pod)
 
 
-def test_waiting_container_after_a_successful_init_is_ambiguous():
+def test_successful_init_does_not_mean_the_executor_started():
+    # k3d 2026-10-11: a delete landing between the init's exit 0 and the main
+    # container's start leaves it waiting: PodInitializing under the kubelet's
+    # terminal phase, exactly as a failed init does.
     pod = _killed_during_init()
     pod.status.init_container_statuses[0].state.terminated.exit_code = 0
+    assert stateless_executor_process_zero(pod)
+
+
+def test_init_still_running_is_ambiguous():
+    pod = _killed_during_init()
+    pod.status.init_container_statuses = [
+        container_status("wait-for-orchestrator", "running")
+    ]
     assert not stateless_executor_process_zero(pod)
 
 
