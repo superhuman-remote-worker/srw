@@ -314,7 +314,10 @@ async def _prepare_session_cloud(
     store = resources.postgres_db
     try:
         converted = await session_cloud_preparation.convert_to_connector_rule(
-            thread, mount_rows=mount_rows, store=store
+            thread,
+            mount_rows=mount_rows,
+            store=store,
+            cloud_router=resources.main_cloud_router,
         )
     except Exception:
         logger.warning(

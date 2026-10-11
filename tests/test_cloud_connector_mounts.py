@@ -123,6 +123,26 @@ class Store:
         thread["metadata"] = {**thread["metadata"], "datasource_ids": list(ids)}
         return True
 
+    async def add_thread_datasource_ids(
+        self, thread_id, added, *, datasource_policy_revisions, provenance=None
+    ):
+        """Like the real store: appended to the selection as it is now."""
+        thread = self.threads.setdefault(thread_id, {"id": thread_id, "metadata": {}})
+        current = list(thread["metadata"].get("datasource_ids") or [])
+        selected = current + [cid for cid in added if cid not in current]
+        thread["metadata"] = {**thread["metadata"], "datasource_ids": selected}
+        self.selections.append(
+            (
+                thread_id,
+                selected,
+                {
+                    "datasource_policy_revisions": dict(datasource_policy_revisions),
+                    "provenance": provenance,
+                },
+            )
+        )
+        return selected
+
     async def merge_thread_cloud_metadata(self, thread_id, patch):
         self.metadata.append((thread_id, dict(patch)))
         thread = self.threads.setdefault(thread_id, {"id": thread_id, "metadata": {}})
@@ -1656,8 +1676,9 @@ async def test_an_old_session_converts_once_to_what_it_mounted(denied, authorize
         thread, mount_rows=_PROJECT_ROW, store=store
     )
     assert store.selections[0][1] == ["kb-1", FOLDER, OUTBOX]
+    # Only the additions are authorized, and only theirs are snapshot.
+    assert authorize.calls == [[FOLDER, OUTBOX]]
     assert store.selections[0][2]["datasource_policy_revisions"] == {
-        "kb-1": 1,
         FOLDER: 1,
         OUTBOX: 1,
     }
@@ -1672,6 +1693,84 @@ async def test_an_old_session_converts_once_to_what_it_mounted(denied, authorize
         is None
     )
     assert len(store.selections) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_revoked_connector_or_a_live_edit_never_holds_the_conversion_back(
+    denied, authorize
+):
+    """Only the additions are authorized: a connector of the selection
+    revoked since stays as it is (attach reports it) and the conversion
+    goes on; and the additions join the selection as it is when they land,
+    so a live edit made meanwhile is kept, never undone."""
+    denied.add("revoked-1")
+    thread = _old_thread(metadata={"datasource_ids": ["revoked-1"]})
+    # A live edit landed after the snapshot above: revoked-1 out, kb-2 in.
+    stored = _old_thread(metadata={"datasource_ids": ["kb-2"]})
+    store = Store([_folder_row(), _outbox_row()], threads={THREAD: stored})
+    router = SimpleNamespace(active_instance_id=INSTANCE)
+    converted = await prep.convert_to_connector_rule(
+        thread, mount_rows=_PROJECT_ROW, store=store, cloud_router=router
+    )
+    assert authorize.calls == [[FOLDER, OUTBOX]]
+    assert converted["metadata"]["datasource_ids"] == ["kb-2", FOLDER, OUTBOX]
+    assert converted["metadata"]["cloud_mount_rule"] == "connectors"
+
+
+@pytest.mark.asyncio
+async def test_the_stamp_waits_for_a_connector_that_is_not_there_yet(denied, authorize):
+    """A project folder in the active installation whose connector the
+    backfill has not made yet, or an owner whose outbox connector is not
+    there: what is there is added, the stamp waits, and the next pass
+    finishes. No active main cloud: nothing is decided now."""
+    router = SimpleNamespace(active_instance_id=INSTANCE)
+    thread = _old_thread()
+    store = Store([_outbox_row()], threads={THREAD: dict(thread)})
+    converted = await prep.convert_to_connector_rule(
+        thread, mount_rows=_PROJECT_ROW, store=store, cloud_router=router
+    )
+    assert converted["metadata"]["datasource_ids"] == ["kb-1", OUTBOX]
+    assert "cloud_mount_rule" not in converted["metadata"]
+    # The project's connector appears: the next pass adds it and stamps.
+    store.rows[FOLDER] = _folder_row()
+    again = await prep.convert_to_connector_rule(
+        converted, mount_rows=_PROJECT_ROW, store=store, cloud_router=router
+    )
+    assert again["metadata"]["datasource_ids"] == ["kb-1", OUTBOX, FOLDER]
+    assert again["metadata"]["cloud_mount_rule"] == "connectors"
+
+    # No outbox connector for its owner yet, beside its session folder.
+    store = Store([_folder_row()], threads={THREAD: dict(thread)})
+    waiting = await prep.convert_to_connector_rule(
+        thread, mount_rows=_PROJECT_ROW, store=store, cloud_router=router
+    )
+    assert "cloud_mount_rule" not in waiting["metadata"]
+
+    # A project naming no folder, or one in another installation: nothing
+    # stands for it, nothing is waited for.
+    for project in (
+        _project(PROJECT, "Acme Launch", handle=None),
+        _project(PROJECT, "Acme Launch", instance="another-installation"),
+    ):
+        store = Store(
+            [_outbox_row()], projects={PROJECT: project}, threads={THREAD: dict(thread)}
+        )
+        stamped = await prep.convert_to_connector_rule(
+            thread, mount_rows=_PROJECT_ROW, store=store, cloud_router=router
+        )
+        assert stamped["metadata"]["cloud_mount_rule"] == "connectors"
+
+    store = Store([_folder_row(), _outbox_row()], threads={THREAD: dict(thread)})
+    assert (
+        await prep.convert_to_connector_rule(
+            thread,
+            mount_rows=_PROJECT_ROW,
+            store=store,
+            cloud_router=SimpleNamespace(active_instance_id=None),
+        )
+        is None
+    )
+    assert store.selections == [] and store.metadata == []
 
 
 @pytest.mark.asyncio

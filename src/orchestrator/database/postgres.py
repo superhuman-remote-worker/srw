@@ -26784,6 +26784,89 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def add_thread_datasource_ids(
+        self,
+        thread_id: str,
+        added_ids: List[str],
+        *,
+        datasource_policy_revisions: Dict[str, int],
+        provenance: Dict[str, Any] | None = None,
+    ) -> List[str] | None:
+        """Append connectors to a thread's selection and keep the rest of it
+        exactly as it is now: the server-side additions of the one-time cloud
+        conversion (``session_cloud_preparation``).
+
+        Under the thread's datasource lock, the selection is read again and
+        each added id not already in it is appended; only the added rows are
+        locked and compared with ``datasource_policy_revisions`` (an
+        authorization of the additions alone), and their revisions join the
+        stored snapshot. A connector of the selection revoked or deleted
+        meanwhile stays in it, reported as before; a live edit that landed
+        first is kept. ``provenance`` keys join ``datasource_selection``.
+        The selection after the write, or ``None`` for a thread not found.
+        """
+        try:
+            thread_uuid = UUID(thread_id)
+        except (TypeError, ValueError):
+            return None
+        added_uuids = _uuid_list(added_ids)
+        revisions = {
+            UUID(str(key)): int(value)
+            for key, value in (datasource_policy_revisions or {}).items()
+        }
+        async with self.thread_datasource_lock(thread_id):
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    row = await conn.fetchrow(
+                        "SELECT metadata FROM threads WHERE id = $1 FOR UPDATE",
+                        thread_uuid,
+                    )
+                    if row is None:
+                        return None
+                    metadata = row["metadata"]
+                    if isinstance(metadata, str):
+                        metadata = json.loads(metadata)
+                    metadata = dict(metadata or {})
+                    current = [
+                        str(value) for value in metadata.get("datasource_ids") or []
+                    ]
+                    new = [value for value in added_uuids if str(value) not in current]
+                    if not new:
+                        return current
+                    if any(value not in revisions for value in new):
+                        raise DatasourcePolicyValidationError(
+                            "The connector policy revision snapshot must match "
+                            "the connectors added"
+                        )
+                    expected = {value: revisions[value] for value in new}
+                    await _lock_and_compare_policy_snapshot(conn, new, expected)
+                    selected = current + [str(value) for value in new]
+                    selection = metadata.get("datasource_selection")
+                    selection = dict(selection) if isinstance(selection, dict) else {}
+                    stored = selection.get("policy_revisions")
+                    selection.update(provenance or {})
+                    selection["datasource_ids"] = selected
+                    selection["policy_revisions"] = {
+                        **(dict(stored) if isinstance(stored, dict) else {}),
+                        **{str(value): expected[value] for value in new},
+                    }
+                    await conn.execute(
+                        """
+                        UPDATE threads
+                        SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb,
+                            last_activity = CURRENT_TIMESTAMP
+                        WHERE id = $2
+                        """,
+                        json.dumps(
+                            {
+                                "datasource_ids": selected,
+                                "datasource_selection": selection,
+                            }
+                        ),
+                        thread_uuid,
+                    )
+                    return selected
+
     async def get_job_progress(self, job_id: str) -> Dict[str, Any] | None:
         """Get the control-row basis for a job's progress/liveness answer.
 

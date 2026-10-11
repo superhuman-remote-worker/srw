@@ -1304,7 +1304,10 @@ async def _convert_once(
 
     try:
         return await convert_to_connector_rule(
-            thread, mount_rows=mount_rows, store=dependencies.store
+            thread,
+            mount_rows=mount_rows,
+            store=dependencies.store,
+            cloud_router=dependencies.cloud_router,
         )
     except Exception:
         logger.warning(

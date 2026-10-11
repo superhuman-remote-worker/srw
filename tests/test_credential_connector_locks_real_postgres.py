@@ -108,6 +108,57 @@ async def _selection(db: PostgresDB, thread_id: str) -> list[str]:
 
 
 @pytest.mark.asyncio
+async def test_an_addition_joins_the_selection_as_it_is_and_checks_itself_only(db):
+    """The cloud conversion's additions: appended to the selection as it is
+    when they land (a connector of it deleted meanwhile stays, as attach
+    reports it), only the added rows' revisions compared, merged into the
+    stored snapshot beside the provenance."""
+    kept, kept_revision = await _connector(db, "postgresql")
+    gone, _ = await _connector(db, "postgresql")
+    added, added_revision = await _connector(db, "cloud_folder")
+    thread_id = await _session(db, [kept, gone])
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET metadata = metadata || $2::jsonb WHERE id = $1",
+            UUID(thread_id),
+            json.dumps(
+                {
+                    "datasource_selection": {
+                        "origin": "explicit",
+                        "policy_revisions": {kept: kept_revision},
+                    }
+                }
+            ),
+        )
+        await conn.execute("DELETE FROM datasources WHERE id = $1", UUID(gone))
+    selected = await db.add_thread_datasource_ids(
+        thread_id,
+        [added, kept],
+        datasource_policy_revisions={added: added_revision},
+        provenance={"cloud_connector_conversion": {"added": [added]}},
+    )
+    assert selected == [kept, gone, added]
+    assert await _selection(db, thread_id) == [kept, gone, added]
+    async with db.acquire() as conn:
+        record = json.loads(
+            await conn.fetchval(
+                "SELECT metadata->'datasource_selection' FROM threads WHERE id = $1",
+                UUID(thread_id),
+            )
+        )
+    assert record["origin"] == "explicit"
+    assert record["policy_revisions"] == {kept: kept_revision, added: added_revision}
+    assert record["cloud_connector_conversion"] == {"added": [added]}
+    # Its own revision moved: refused, nothing written.
+    other, _ = await _connector(db, "cloud_folder")
+    with pytest.raises(postgres_module.DatasourcePolicyConflictError):
+        await db.add_thread_datasource_ids(
+            thread_id, [other], datasource_policy_revisions={other: 99}
+        )
+    assert await _selection(db, thread_id) == [kept, gone, added]
+
+
+@pytest.mark.asyncio
 async def test_a_live_session_cannot_detach_a_credentials_connector(db):
     credentials, _ = await _connector(db, "credentials")
     database, database_revision = await _connector(db, "postgresql")

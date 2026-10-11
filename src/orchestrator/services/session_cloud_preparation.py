@@ -8,12 +8,18 @@ when no lock is held), so the planner itself only reads:
   session created before cloud folders became connectors mounted its
   project's ``thread_mounts`` row and the session folder. At its next new
   Pod (or its next in-workspace delivery) it gets the connectors that stand
-  for them: its project's own ``project-cloud:`` folder when it mounted a
-  project row and has no cloud folder attached, and its owner's
-  ``cloud-outbox:`` when it has a session folder and no outbox attached.
-  Each is added only if the owner may attach it. The session is then
-  stamped ``cloud_mount_rule: "connectors"`` so it never converts again; a
-  protected or officer session is left alone (slice 5 moves protected).
+  for them: each project's own ``project-cloud:`` folder it mounted a row
+  of and has not attached, and its owner's ``cloud-outbox:`` when it has a
+  session folder and no outbox attached. Each is added only if the owner
+  may attach it; only the additions are authorized, and they are appended
+  to the selection as it is then (``add_thread_datasource_ids``, under the
+  thread's datasource lock). The session is then stamped
+  ``cloud_mount_rule: "connectors"`` so it never converts again, unless a
+  connector that stands for one of them is not there yet (a project folder
+  in the active installation whose connector the backfill has not made, an
+  owner without an outbox connector) or no main cloud is active: it
+  converts at a later pass. A protected or officer session is left alone
+  (slice 5 moves protected).
 * **The session's outbox folder** (:func:`create_session_outbox`,
   :func:`prepare_session_outbox`). Admission creates it only when the
   outbox is selected; a failure is recorded on the session
@@ -53,7 +59,6 @@ from orchestrator.services.cloud_connector_mounts import (
     selected_ids,
     uses_connector_rule,
 )
-from orchestrator.services.connector_drivers.cloud_folder import CloudFolderDriver
 from orchestrator.services.connector_drivers.cloud_outbox import CloudOutboxDriver
 from orchestrator.services.officer_metadata import officer_meta_enabled
 from orchestrator.services.session_runtime_admission import (
@@ -108,22 +113,43 @@ async def outbox_selected(
 # --------------------------------------------------------------------------- #
 
 
+async def _project_folder_pending(
+    store: Any, project_id: str, *, cloud_router: Any
+) -> bool:
+    """Whether a project the session mounted a row of should have a folder
+    connector that is not there yet: it names a folder in the active main
+    cloud (the startup backfill or the project's provisioning has not made
+    it). One that names none, or one in another installation, gets nothing
+    in its place: no wait for it."""
+    project = await store.get_project(project_id)
+    if not project or not project.get("main_cloud_folder_handle"):
+        return False
+    active = getattr(cloud_router, "active_instance_id", None)
+    if active is None:
+        return True
+    return str(project.get("main_cloud_backend_instance_id") or "") == str(active)
+
+
 async def convert_to_connector_rule(
     thread: Mapping[str, Any],
     *,
     mount_rows: list[dict[str, Any]] | None,
     store: Any,
+    cloud_router: Any = None,
 ) -> dict[str, Any] | None:
     """Give a session created before cloud connectors the connectors that
     stand for what it mounted, once; the thread as it now is, or ``None``
     when nothing was written.
 
-    A connector its owner may not attach (a revoked membership, a project
-    without its folder connector yet) is not added; the session is stamped
-    anyway, since what it may attach is the connector rule's to report from
-    now on. When the selection as a whole no longer authorises (another
-    connector of it was revoked), nothing is written and the next pass
-    tries again.
+    Only the additions are authorized and written, appended to the
+    selection as it is when they land (``add_thread_datasource_ids``): a
+    connector of the selection that was revoked since stays reported as
+    before and never holds the conversion back, and a live edit is never
+    undone. A connector its owner may not attach (a revoked membership) is
+    not added, and nothing takes its place. The stamp waits while a
+    connector that should stand for what the session mounted is not there
+    yet (:func:`_conversion_pending`) or no main cloud is active
+    (``cloud_router.active_instance_id``): the next pass converts it then.
     """
     metadata = thread_metadata_object(thread)
     if (
@@ -131,6 +157,9 @@ async def convert_to_connector_rule(
         or protected_cloud_marker_state(metadata) != "off"
         or _officer(metadata)
     ):
+        return None
+    if cloud_router is not None and cloud_router.active_instance_id is None:
+        # Which connectors stand for its folders is not known now.
         return None
     from orchestrator.services.datasource_policy import (
         DatasourceUnavailableError,
@@ -146,24 +175,30 @@ async def convert_to_connector_rule(
         thread, datasource_ids=ids, project_ids=project_ids, store=store
     )
     candidates: list[str] = []
-    if not any(isinstance(c.driver, CloudFolderDriver) for c in attached):
-        for row in mount_rows or []:
-            if row.get("mount_kind") != "project" or not row.get("source_ref"):
-                continue
-            try:
-                native = await store.get_datasource_by_managed_key(
-                    project_cloud_key(row["source_ref"])
-                )
-            except ValueError:
-                native = None
-            if native is not None:
-                candidates.append(str(native["id"]))
+    pending: list[str] = []
+    for row in mount_rows or []:
+        if row.get("mount_kind") != "project" or not row.get("source_ref"):
+            continue
+        try:
+            native = await store.get_datasource_by_managed_key(
+                project_cloud_key(row["source_ref"])
+            )
+        except ValueError:
+            continue
+        if native is not None:
+            candidates.append(str(native["id"]))
+        elif await _project_folder_pending(
+            store, str(row["source_ref"]), cloud_router=cloud_router
+        ):
+            pending.append(f"project-cloud:{row['source_ref']}")
     has_folder = bool(
         thread.get("main_cloud_session_handle") or thread.get("nc_session_folder")
     )
     outbox_id = await owner_outbox_id(store, owner_id) if has_folder else None
     if outbox_id and not any(isinstance(c.driver, CloudOutboxDriver) for c in attached):
         candidates.append(outbox_id)
+    elif has_folder and owner_id and outbox_id is None:
+        pending.append(f"cloud-outbox:{owner_id}")
     candidates = [cid for cid in dict.fromkeys(candidates) if cid not in ids]
 
     added: list[str] = []
@@ -175,11 +210,13 @@ async def convert_to_connector_rule(
     if added:
         owner = await store.get_user(owner_id) if owner_id else None
         try:
-            selection, revisions = await authorize_datasource_selection(
+            # The additions alone: the rest of the selection is the
+            # session's, and attach reports what of it was revoked.
+            added, revisions = await authorize_datasource_selection(
                 store,
                 owner,
                 owner_id,
-                ids + added,
+                added,
                 project_ids,
                 None,
                 allow_admin_explicit_override=owner is not None,
@@ -187,40 +224,50 @@ async def convert_to_connector_rule(
             )
         except DatasourceUnavailableError:
             logger.info(
-                "Session %s: its connector selection no longer authorises; "
-                "its cloud folders convert at a later pass",
+                "Session %s: what stands for its cloud folders no longer "
+                "authorises; they convert at a later pass",
                 thread_id,
             )
             return None
-        written = await store.set_thread_datasource_ids(
+        written = await store.add_thread_datasource_ids(
             thread_id,
-            selection,
+            added,
             datasource_policy_revisions=revisions,
-            datasource_selection_provenance={
-                "origin": "cloud_connector_conversion",
-                "creation_path": "cloud_connector_conversion",
-                "effective_work_owner_id": owner_id,
-                "target_project_ids": project_ids,
-                "datasource_ids": selection,
-                "policy_revisions": revisions,
-                "added": added,
-                "resolved_at": _now().isoformat(),
+            provenance={
+                "cloud_connector_conversion": {
+                    "effective_work_owner_id": owner_id,
+                    "target_project_ids": project_ids,
+                    "added": added,
+                    "policy_revisions": revisions,
+                    "resolved_at": _now().isoformat(),
+                }
             },
         )
-        if not written:
+        if written is None:
             return None
-    patch: dict[str, Any] = {CLOUD_MOUNT_RULE_KEY: CONNECTOR_RULE}
+    patch: dict[str, Any] = {}
     if outbox_id and has_folder:
         patch[CLOUD_OUTBOX_KEY] = {
             **outbox_record(metadata),
             "connector_id": outbox_id,
             "state": "ready",
         }
-    if not await store.merge_thread_cloud_metadata(thread_id, patch):
+    if pending:
+        logger.info(
+            "Session %s: %s not there yet; its cloud folders convert at a later pass",
+            thread_id,
+            ", ".join(pending),
+        )
+    else:
+        patch[CLOUD_MOUNT_RULE_KEY] = CONNECTOR_RULE
+    if patch and not await store.merge_thread_cloud_metadata(thread_id, patch):
+        return None
+    if not added and not patch:
         return None
     logger.info(
-        "Session %s: its cloud folders are its connectors now (added %d: %s)",
+        "Session %s: its cloud folders are its connectors%s (added %d: %s)",
         thread_id,
+        "" if not pending else " in part",
         len(added),
         ", ".join(added) or "none",
     )
