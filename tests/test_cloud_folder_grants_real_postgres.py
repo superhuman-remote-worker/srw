@@ -650,6 +650,47 @@ async def test_a_lost_mint_is_revoked_by_the_sweep(database, probe, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_every_move_to_revoking_drops_the_password(database, probe, monkeypatch):
+    """0520 would let a revoking row keep its password; none of the three
+    moves to ``revoking`` (a hook's request, the lost-mint sweep, a user's
+    delete) does, even while the revoke itself keeps failing."""
+    world = await _world(database)
+    world.backend.fail_revoke = CloudBackendError(
+        CloudBackendErrorKind.UNAVAILABLE, "down", backend="nextcloud"
+    )
+    requested = await _insert(database, world)
+    await database.activate_cloud_folder_grant(requested["id"], verified=False)
+    member = await _user(database, "Retiring")
+    await database.execute(
+        "INSERT INTO project_members(project_id,user_id,role) VALUES($1,$2,'editor')",
+        UUID(world.target.project_id),
+        UUID(member["id"]),
+    )
+    retired = await _insert(database, world, user_id=member["id"])
+    lost = await _insert(database, world, kind="reader")
+
+    await revoke_folder_grants(
+        database,
+        world.router,
+        reason="connector_gone",
+        datasource_id=world.target.datasource_id,
+        user_id=world.owner["id"],
+        kind="writer",
+    )
+    assert await database.delete_user(member["id"])
+    monkeypatch.setattr(folder_grants, "MINT_ABANDON_SECONDS", 0.0)
+    report = await sweep_folder_grants_once(database, world.router)
+    # The hook's own attempt already failed (its next one is later); the
+    # user's and the lost mint's fail now.
+    assert report.abandoned_mints == 1 and report.retried == 2
+
+    rows = {str(g["id"]): g for g in await _grants(database)}
+    for grant in (requested, retired, lost):
+        row = rows[grant["id"]]
+        assert (row["status"], row["credentials"]) == ("revoking", None)
+
+
+@pytest.mark.asyncio
 async def test_a_users_delete_requests_its_revokes(database, probe):
     world = await _world(database)
     member = await _user(database, "Retiring")

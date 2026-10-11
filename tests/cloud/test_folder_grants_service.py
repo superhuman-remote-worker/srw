@@ -282,6 +282,40 @@ async def test_a_given_up_revoke_is_audited_once_and_tried_again_later(monkeypat
     assert [name for name, _ in calls] == ["finish"]
 
 
+def test_every_move_to_revoking_drops_the_password():
+    """0520 lets a ``revoking`` row keep its password (only a minting or
+    active one must hold it, only a done one must not); the code never
+    does: nothing may mount a grant once its revoke is requested. Every
+    statement that sets ``status = 'revoking'`` on ``cloud_folder_grants``,
+    anywhere in the orchestrator, sets ``credentials = NULL`` with it."""
+    import pathlib
+    import re
+
+    import orchestrator
+
+    root = pathlib.Path(orchestrator.__file__).parent
+    statement = re.compile(
+        r"UPDATE\s+(?:public\.)?cloud_folder_grants\b(.*?)(?:\bWHERE\b|$)",
+        re.S | re.I,
+    )
+    moves = []
+    for path in sorted(root.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        for match in statement.finditer(source):
+            set_clause = match.group(1)
+            # ``status = 'revoking'``, or a CASE that may yield it.
+            if "'revoking'" in set_clause.lower():
+                moves.append((path.name, set_clause))
+    # The member/project/connector request, the lost-mint sweep and a
+    # user's delete: a move added elsewhere must be named here too.
+    assert len(moves) == 3, [name for name, _ in moves]
+    for name, set_clause in moves:
+        assert re.search(r"\bcredentials\s*=\s*NULL\b", set_clause, re.I), (
+            name,
+            set_clause,
+        )
+
+
 def test_the_agent_can_say_why_a_folder_has_no_grant():
     """Every reason a plan may leave a folder out has the agent's words."""
     from orchestrator.services.cloud_connector_mounts import EXCLUSION_REASONS
