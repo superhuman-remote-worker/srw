@@ -211,15 +211,21 @@ class VMPreSSHStopStore:
             or cleanup["source"] != cleanup_intent.get("source")
             or cleanup["intent_digest"] != cleanup_digest
             or cleanup["completed_at"] is not None
-            or (retry["state"] != "succeeded" and not (
-                held_stop
-                and retry["state"] == "settled"
-                and await conn.fetchval(
-                    "SELECT public.vm_cancel_late_adopted_source($1,$2,$3,$4,$5)",
-                    job_id, generation, retry["observed_vm_uid"],
-                    retry["observed_pvc_uid"], retry["request_id"],
+            or (
+                retry["state"] != "succeeded"
+                and not (
+                    held_stop
+                    and retry["state"] == "settled"
+                    and await conn.fetchval(
+                        "SELECT public.vm_cancel_late_adopted_source($1,$2,$3,$4,$5)",
+                        job_id,
+                        generation,
+                        retry["observed_vm_uid"],
+                        retry["observed_pvc_uid"],
+                        retry["request_id"],
+                    )
                 )
-            ))
+            )
             or (
                 retry["ready_at"] is None
                 if ready_stop

@@ -68,7 +68,15 @@ def enabled(monkeypatch):
     monkeypatch.setenv("VM_JOB_CANCEL_RETENTION_ENABLED", "true")
 
 
-async def cancelled(db, *, old=True, binding="null", retiring=True, bound=True, cancel_before_adoption=False):
+async def cancelled(
+    db,
+    *,
+    old=True,
+    binding="null",
+    retiring=True,
+    bound=True,
+    cancel_before_adoption=False,
+):
     state = await seeded_stop(
         db,
         cleanup_source="job_terminal_vm_release" if old else None,

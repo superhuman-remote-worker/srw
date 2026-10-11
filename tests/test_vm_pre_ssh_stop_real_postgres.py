@@ -141,7 +141,9 @@ async def seeded_stop(
         await db.fetchval("SELECT context FROM jobs WHERE id=$1", UUID(job_id))
     )
     context["vm"].update(
-        status="waiting_creation_configuration" if cancel_before_adoption else "created",
+        status="waiting_creation_configuration"
+        if cancel_before_adoption
+        else "created",
         provision_generation=generation,
         vm_uid=vm_uid,
         vmi_uid=vmi_uid,

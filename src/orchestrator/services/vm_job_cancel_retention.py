@@ -683,8 +683,12 @@ async def _bind_cancelled_boot_occupancy(conn, store, *, job, identity):
         or not isinstance(vm, dict)
         or context.get("_stateless_cancel_cleanup_pending") is not True
         or context.get("_vm_job_retained_resume") is not None
-        or vm.get("status") not in {
-            "created", "ssh_pending", "ssh_unreachable", "waiting_creation_configuration"
+        or vm.get("status")
+        not in {
+            "created",
+            "ssh_pending",
+            "ssh_unreachable",
+            "waiting_creation_configuration",
         }
         or vm.get("ssh_verified_at") is not None
         or vm.get("active_pod_uid") is not None
@@ -726,8 +730,11 @@ async def _bind_cancelled_boot_occupancy(conn, store, *, job, identity):
         vm.get("status") != "waiting_creation_configuration"
         or not await conn.fetchval(
             "SELECT public.vm_cancel_late_adopted_source($1,$2,$3,$4,$5)",
-            job["id"], retry["provision_generation"], retry["observed_vm_uid"],
-            retry["observed_pvc_uid"], retry["request_id"],
+            job["id"],
+            retry["provision_generation"],
+            retry["observed_vm_uid"],
+            retry["observed_pvc_uid"],
+            retry["request_id"],
         )
     ):
         return
@@ -1139,12 +1146,14 @@ async def complete_cancel_retention_marker(db, job_id: str):
             json.dumps(
                 {"status": "deleted", "compute_released": True, "disk_kept": disk_kept}
             ),
-            bool(await conn.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM vm_creation_retries r JOIN jobs j ON j.id=r.job_id "
-                "WHERE r.request_id=$1 AND r.state='settled' AND r.reason='creation_adopted' "
-                "AND j.context->>'_vm_creation_pending'=r.request_id::text "
-                "AND j.context->'vm'->>'creation_request_id'=r.request_id::text)",
-                authority["creation_request_id"],
-            )),
+            bool(
+                await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_creation_retries r JOIN jobs j ON j.id=r.job_id "
+                    "WHERE r.request_id=$1 AND r.state='settled' AND r.reason='creation_adopted' "
+                    "AND j.context->>'_vm_creation_pending'=r.request_id::text "
+                    "AND j.context->'vm'->>'creation_request_id'=r.request_id::text)",
+                    authority["creation_request_id"],
+                )
+            ),
         )
         return True

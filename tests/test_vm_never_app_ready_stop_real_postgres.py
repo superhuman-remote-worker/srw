@@ -130,7 +130,9 @@ async def held_state(db, *, zero=True):
 
 async def late_adopted_state(db, *, issued=False, wrong_effect=False):
     """The persisted Cancel-before-adoption shape, including an unbound charge."""
-    state = await cancelled(db, old=False, retiring=False, bound=False, cancel_before_adoption=True)
+    state = await cancelled(
+        db, old=False, retiring=False, bound=False, cancel_before_adoption=True
+    )
     owner = UUID(state["job_id"])
     request = await db.fetchval(
         "SELECT request_id FROM vm_creation_retries WHERE job_id=$1", owner
@@ -142,15 +144,35 @@ async def late_adopted_state(db, *, issued=False, wrong_effect=False):
             "effect_kind,carrier_uid,carrier_namespace,carrier_intent,state,evidence,"
             "resolved_at) VALUES($1,$2,$3,$4,$5,$6,'{}'::jsonb,$7,$8::jsonb,"
             "CASE WHEN $7='issued' THEN NULL ELSE clock_timestamp() END)",
-            uuid4(), request, number, kind, uuid4(), state["frozen"]["namespace"],
+            uuid4(),
+            request,
+            number,
+            kind,
+            uuid4(),
+            state["frozen"]["namespace"],
             "issued" if is_issued else "observed",
-            "{}" if is_issued else json.dumps({
-                "outcome": "observed", "kind": kind,
-                **({"pvc_uid": state["frozen"]["pvc_uid"]}
-                   if kind in {"rootdisk", "vm"} else {}),
-                **({"uid": str(uuid4()) if wrong_effect else state["frozen"]["vm_uid"]}
-                   if kind == "vm" else {}),
-            }),
+            "{}"
+            if is_issued
+            else json.dumps(
+                {
+                    "outcome": "observed",
+                    "kind": kind,
+                    **(
+                        {"pvc_uid": state["frozen"]["pvc_uid"]}
+                        if kind in {"rootdisk", "vm"}
+                        else {}
+                    ),
+                    **(
+                        {
+                            "uid": str(uuid4())
+                            if wrong_effect
+                            else state["frozen"]["vm_uid"]
+                        }
+                        if kind == "vm"
+                        else {}
+                    ),
+                }
+            ),
         )
     return state
 
@@ -163,20 +185,29 @@ async def complete_synthetic_retained_delete(db, recovery, purge):
 
     candidate = await read_job_retained_disk_purge_candidate(recovery, purge)
     evidence = {
-        "version": 1, "kind": "vm_cleanup_physical_stop",
+        "version": 1,
+        "kind": "vm_cleanup_physical_stop",
         "job_id": candidate["job_id"],
         "provision_generation": candidate["provision_generation"],
-        "vm_uid": candidate["vm_uid"], "vmi_uid": candidate["vmi_uid"],
-        "launcher_uid": candidate["launcher_uid"], "pvc_uid": candidate["pvc_uid"],
-        "vm_absent": True, "vmi_absent": True, "launcher_absent": True,
+        "vm_uid": candidate["vm_uid"],
+        "vmi_uid": candidate["vmi_uid"],
+        "launcher_uid": candidate["launcher_uid"],
+        "pvc_uid": candidate["pvc_uid"],
+        "vm_absent": True,
+        "vmi_absent": True,
+        "launcher_absent": True,
         "same_generation_replacement": False,
         "controller_authenticated": True,
         "pvc_disposition": "purged",
         "controller_scope": candidate["controller_scope"],
     }
     await complete_job_retained_disk_purge(
-        recovery, purge, outcome="completed",
-        provisioner=SimpleNamespace(attest_vm_cleanup_stop=AsyncMock(return_value=evidence)),
+        recovery,
+        purge,
+        outcome="completed",
+        provisioner=SimpleNamespace(
+            attest_vm_cleanup_stop=AsyncMock(return_value=evidence)
+        ),
     )
     assert await db.fetchval(
         "SELECT public.validate_vm_job_retained_disk_purge($1,true)",
@@ -191,7 +222,9 @@ async def test_cancel_before_late_adoption_binds_then_commits_held_stop(
 ):
     state = await late_adopted_state(db)
     assert not (await acquire(state)).allowed  # No signed runtime inventory yet.
-    from tests.test_vm_job_cancel_retention_real_postgres import publish_cancelled_launcher
+    from tests.test_vm_job_cancel_retention_real_postgres import (
+        publish_cancelled_launcher,
+    )
 
     await publish_cancelled_launcher(state)
     permit = await acquire(state)
@@ -205,23 +238,35 @@ async def test_cancel_before_late_adoption_binds_then_commits_held_stop(
     assert str(charge["vm_uid"]) == state["frozen"]["vm_uid"]
     assert str(charge["vmi_uid"]) == state["frozen"]["vmi_uid"]
     assert str(charge["launcher_uid"]) == state["frozen"]["launcher_uid"]
-    assert await db.fetchval(
-        "SELECT ready_at FROM vm_creation_retries WHERE job_id=$1", UUID(state["job_id"])
-    ) is None
-    assert await db.fetchval(
-        "SELECT context->'vm'->>'status' FROM jobs WHERE id=$1", UUID(state["job_id"])
-    ) == "waiting_creation_configuration"
+    assert (
+        await db.fetchval(
+            "SELECT ready_at FROM vm_creation_retries WHERE job_id=$1",
+            UUID(state["job_id"]),
+        )
+        is None
+    )
+    assert (
+        await db.fetchval(
+            "SELECT context->'vm'->>'status' FROM jobs WHERE id=$1",
+            UUID(state["job_id"]),
+        )
+        == "waiting_creation_configuration"
+    )
     # The ordinary release path moves only this cancelled owner into retirement.
     await db.execute(
         "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',"
-        "'\"retiring_process_zero\"') WHERE id=$1", UUID(state["job_id"]),
+        "'\"retiring_process_zero\"') WHERE id=$1",
+        UUID(state["job_id"]),
     )
     frozen = frozen_candidate(state, permit.parent_cleanup)
     state["frozen"] = frozen
     preflight_value = preflight(state)
     preflight_value["pvc_name"] = f"agent-vm-{state['job_id']}-rootdisk"
     intent = await state["store"].admit_intent(
-        state["job_id"], state["generation"], permit.parent_cleanup, frozen,
+        state["job_id"],
+        state["generation"],
+        permit.parent_cleanup,
+        frozen,
         retention_preflight=preflight_value,
     )
     assert intent["frozen"] == frozen
@@ -240,30 +285,50 @@ async def test_cancel_before_late_adoption_binds_then_commits_held_stop(
         # before the retention cleanup receipt/charge release transaction.
         await db.execute(
             "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',"
-            "'\"deleted\"') WHERE id=$1", UUID(state["job_id"]),
+            "'\"deleted\"') WHERE id=$1",
+            UUID(state["job_id"]),
         )
         open_replay = await acquire(state)
         assert open_replay.allowed and open_replay.admission_id == permit.admission_id
-    from orchestrator.services.vm_job_cancel_retention import complete_cancel_retention_marker
-    from orchestrator.services.vm_workspace_recovery_store import complete_vm_cleanup_permit
+    from orchestrator.services.vm_job_cancel_retention import (
+        complete_cancel_retention_marker,
+    )
+    from orchestrator.services.vm_workspace_recovery_store import (
+        complete_vm_cleanup_permit,
+    )
 
     evidence = {
-        "version": 1, "kind": "vm_cleanup_physical_stop",
-        "job_id": state["job_id"], "provision_generation": state["generation"],
-        "vm_uid": frozen["vm_uid"], "vmi_uid": frozen["vmi_uid"],
-        "launcher_uid": frozen["launcher_uid"], "pvc_uid": frozen["pvc_uid"],
-        "vm_absent": True, "vmi_absent": True, "launcher_absent": True,
-        "same_generation_replacement": False, "pvc_disposition": "retained",
+        "version": 1,
+        "kind": "vm_cleanup_physical_stop",
+        "job_id": state["job_id"],
+        "provision_generation": state["generation"],
+        "vm_uid": frozen["vm_uid"],
+        "vmi_uid": frozen["vmi_uid"],
+        "launcher_uid": frozen["launcher_uid"],
+        "pvc_uid": frozen["pvc_uid"],
+        "vm_absent": True,
+        "vmi_absent": True,
+        "launcher_absent": True,
+        "same_generation_replacement": False,
+        "pvc_disposition": "retained",
         "controller_authenticated": True,
         "retained_rootdisk": {
-            "version": 1, "kind": "vm_retained_rootdisk_v1",
-            "namespace": frozen["namespace"], "owner_kind": "job",
-            "owner_id": state["job_id"], "pvc_name": preflight_value["pvc_name"],
-            "pvc_uid": frozen["pvc_uid"], "dv_uid": preflight_value["dv_uid"],
-            "ownership": "standalone_dv", "deleting": False, "no_consumers": True,
+            "version": 1,
+            "kind": "vm_retained_rootdisk_v1",
+            "namespace": frozen["namespace"],
+            "owner_kind": "job",
+            "owner_id": state["job_id"],
+            "pvc_name": preflight_value["pvc_name"],
+            "pvc_uid": frozen["pvc_uid"],
+            "dv_uid": preflight_value["dv_uid"],
+            "ownership": "standalone_dv",
+            "deleting": False,
+            "no_consumers": True,
         },
     }
-    provisioner = SimpleNamespace(attest_vm_cleanup_stop=AsyncMock(return_value=evidence))
+    provisioner = SimpleNamespace(
+        attest_vm_cleanup_stop=AsyncMock(return_value=evidence)
+    )
     await complete_vm_cleanup_permit(
         state["recovery"], permit, outcome="completed", provisioner=provisioner
     )
@@ -271,9 +336,9 @@ async def test_cancel_before_late_adoption_binds_then_commits_held_stop(
         "SELECT public.vm_job_cancel_retention_settled($1)", permit.admission_id
     )
     assert await complete_cancel_retention_marker(db, state["job_id"]) is True
-    context = json.loads(await db.fetchval(
-        "SELECT context FROM jobs WHERE id=$1", UUID(state["job_id"])
-    ))
+    context = json.loads(
+        await db.fetchval("SELECT context FROM jobs WHERE id=$1", UUID(state["job_id"]))
+    )
     assert "_stateless_cancel_cleanup_pending" not in context
     assert "_vm_creation_pending" not in context
     assert context["vm"]["status"] == "deleted"
@@ -281,13 +346,18 @@ async def test_cancel_before_late_adoption_binds_then_commits_held_stop(
     assert replay.allowed and replay.completed_outcome == "completed"
     assert replay.admission_id == permit.admission_id
     assert await complete_cancel_retention_marker(db, state["job_id"]) is True
-    assert await db.fetchval(
-        "SELECT count(*) FROM vm_job_cancel_retention_authorities WHERE job_id=$1",
-        UUID(state["job_id"]),
-    ) == 1
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_job_cancel_retention_authorities WHERE job_id=$1",
+            UUID(state["job_id"]),
+        )
+        == 1
+    )
     await db.execute(
         "UPDATE jobs SET context=jsonb_set(context,'{_vm_creation_pending}',"
-        "to_jsonb($2::text)) WHERE id=$1", UUID(state["job_id"]), str(uuid4()),
+        "to_jsonb($2::text)) WHERE id=$1",
+        UUID(state["job_id"]),
+        str(uuid4()),
     )
     changed_replay = await acquire(state)
     assert not changed_replay.allowed
@@ -295,6 +365,7 @@ async def test_cancel_before_late_adoption_binds_then_commits_held_stop(
         "UPDATE jobs SET context=context-'_vm_creation_pending' WHERE id=$1",
         UUID(state["job_id"]),
     )
+
     class RollBackHold(Exception):
         pass
 
@@ -302,11 +373,13 @@ async def test_cancel_before_late_adoption_binds_then_commits_held_stop(
         async with db.acquire() as conn, conn.transaction():
             await conn.execute(
                 "UPDATE jobs SET context=context||"
-                "'{\"_worker_execution_hold\":{\"version\":1}}'::jsonb WHERE id=$1",
+                '\'{"_worker_execution_hold":{"version":1}}\'::jsonb WHERE id=$1',
                 UUID(state["job_id"]),
             )
             operation_id = uuid4()
-            with pytest.raises(asyncpg.CheckViolationError, match="Retained Job Resume authority"):
+            with pytest.raises(
+                asyncpg.CheckViolationError, match="Retained Job Resume authority"
+            ):
                 await conn.execute(
                     "INSERT INTO vm_job_retained_resumes "
                     "(id,job_id,root_retention_admission_id,physical_cleanup_admission_id,"
@@ -317,8 +390,11 @@ async def test_cancel_before_late_adoption_binds_then_commits_held_stop(
                     "j.user_id,r.revision,j.context->'vm' FROM vm_job_cancel_retention_authorities a "
                     "JOIN jobs j ON j.id=a.job_id JOIN vm_creation_retries r "
                     "ON r.request_id=a.creation_request_id WHERE a.cleanup_admission_id=$5",
-                    operation_id, uuid5(operation_id, "source"),
-                    uuid5(operation_id, "provision"), uuid4(), permit.admission_id,
+                    operation_id,
+                    uuid5(operation_id, "source"),
+                    uuid5(operation_id, "provision"),
+                    uuid4(),
+                    permit.admission_id,
                 )
             raise RollBackHold
     except RollBackHold:
@@ -330,14 +406,16 @@ async def test_cancel_before_late_adoption_binds_then_commits_held_stop(
         from orchestrator.services.vm_provisioner import VMTeardownIdentity
 
         wrong_identity = await acquire_job_retained_disk_purge(
-            state["recovery"], job_id=state["job_id"],
+            state["recovery"],
+            job_id=state["job_id"],
             identity=VMTeardownIdentity(
                 state["generation"], str(uuid4()), frozen["pvc_uid"]
             ),
         )
         assert not wrong_identity.allowed
         purge = await acquire_job_retained_disk_purge(
-            state["recovery"], job_id=state["job_id"],
+            state["recovery"],
+            job_id=state["job_id"],
             identity=VMTeardownIdentity(
                 state["generation"], frozen["vm_uid"], frozen["pvc_uid"]
             ),
@@ -350,7 +428,9 @@ async def test_cancel_before_late_adoption_binds_then_commits_held_stop(
         "SELECT user_id FROM jobs WHERE id=$1", UUID(state["job_id"])
     )
     assert await db.prepare_stateless_job_for_workspace_resume(
-        state["job_id"], "vm", expected_status="cancelled",
+        state["job_id"],
+        "vm",
+        expected_status="cancelled",
         owner_resume_user_id=actor,
     )
     operation = await db.fetchrow(
@@ -381,10 +461,12 @@ async def test_cancel_before_late_adoption_binds_then_commits_held_stop(
     # Public Delete records this intent before acquiring the retained purge.
     await db.execute(
         "UPDATE jobs SET context=jsonb_set(context,'{_stateless_delete_pending}',"
-        "'true'::jsonb) WHERE id=$1", UUID(state["job_id"]),
+        "'true'::jsonb) WHERE id=$1",
+        UUID(state["job_id"]),
     )
     purge = await acquire_job_retained_disk_purge(
-        state["recovery"], job_id=state["job_id"],
+        state["recovery"],
+        job_id=state["job_id"],
         identity=VMTeardownIdentity(
             state["generation"], frozen["vm_uid"], frozen["pvc_uid"]
         ),
@@ -396,26 +478,39 @@ async def test_cancel_before_late_adoption_binds_then_commits_held_stop(
 @pytest.mark.asyncio
 async def test_fresh_deleted_late_adoption_requires_process_zero(db):
     state = await late_adopted_state(db)
-    from tests.test_vm_job_cancel_retention_real_postgres import publish_cancelled_launcher
+    from tests.test_vm_job_cancel_retention_real_postgres import (
+        publish_cancelled_launcher,
+    )
 
     await publish_cancelled_launcher(state)
     with pytest.raises(asyncpg.CheckViolationError, match="process-zero authority"):
         await db.execute(
             "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',"
-            "'\"deleted\"') WHERE id=$1", UUID(state["job_id"]),
+            "'\"deleted\"') WHERE id=$1",
+            UUID(state["job_id"]),
         )
     charge = await db.fetchrow(
         "SELECT state,vm_uid,vmi_uid,launcher_uid FROM vm_resource_reservations WHERE id=$1",
         UUID(state["reservation_id"]),
     )
-    assert dict(charge) == {"state": "reserved", "vm_uid": None, "vmi_uid": None, "launcher_uid": None}
-    assert await db.fetchval("SELECT count(*) FROM vm_job_cancel_retention_authorities") == 0
+    assert dict(charge) == {
+        "state": "reserved",
+        "vm_uid": None,
+        "vmi_uid": None,
+        "launcher_uid": None,
+    }
+    assert (
+        await db.fetchval("SELECT count(*) FROM vm_job_cancel_retention_authorities")
+        == 0
+    )
 
 
 @pytest.mark.asyncio
 async def test_open_late_adoption_missing_marker_cannot_continue_before_proof(db):
     state = await late_adopted_state(db)
-    from tests.test_vm_job_cancel_retention_real_postgres import publish_cancelled_launcher
+    from tests.test_vm_job_cancel_retention_real_postgres import (
+        publish_cancelled_launcher,
+    )
 
     await publish_cancelled_launcher(state)
     permit = await acquire(state)
@@ -426,29 +521,47 @@ async def test_open_late_adoption_missing_marker_cannot_continue_before_proof(db
     )
     with pytest.raises(asyncpg.CheckViolationError, match="current authority changed"):
         await acquire(state)
-    assert await db.fetchval(
-        "SELECT count(*) FROM vm_pre_ssh_stop_proofs WHERE job_id=$1",
-        UUID(state["job_id"]),
-    ) == 0
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_pre_ssh_stop_proofs WHERE job_id=$1",
+            UUID(state["job_id"]),
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", [
-    "issued", "request", "queue", "owner", "generation", "inventory",
-    "inherited", "effect_vm", "reason",
-])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "issued",
+        "request",
+        "queue",
+        "owner",
+        "generation",
+        "inventory",
+        "inherited",
+        "effect_vm",
+        "reason",
+    ],
+)
 async def test_cancel_before_late_adoption_refuses_inexact_scope(db, fault):
     state = await late_adopted_state(
         db, issued=fault == "issued", wrong_effect=fault == "effect_vm"
     )
-    from tests.test_vm_job_cancel_retention_real_postgres import publish_cancelled_launcher
+    from tests.test_vm_job_cancel_retention_real_postgres import (
+        publish_cancelled_launcher,
+    )
 
-    await publish_cancelled_launcher(state, invalid="owner" if fault == "inventory" else None)
+    await publish_cancelled_launcher(
+        state, invalid="owner" if fault == "inventory" else None
+    )
     owner = UUID(state["job_id"])
     if fault == "request":
         await db.execute(
             "UPDATE jobs SET context=jsonb_set(context,'{_vm_creation_pending}',to_jsonb($2::text)) WHERE id=$1",
-            owner, str(uuid4()),
+            owner,
+            str(uuid4()),
         )
     elif fault == "queue":
         await db.execute("UPDATE run_queue SET state='queued' WHERE unit_id=$1", owner)
@@ -457,12 +570,15 @@ async def test_cancel_before_late_adoption_refuses_inexact_scope(db, fault):
     elif fault == "generation":
         await db.execute(
             "UPDATE jobs SET context=jsonb_set(context,'{vm,identity_provision_generation}',"
-            "to_jsonb($2::text)) WHERE id=$1", owner, str(uuid4()),
+            "to_jsonb($2::text)) WHERE id=$1",
+            owner,
+            str(uuid4()),
         )
     elif fault == "inherited":
         await db.execute(
             "UPDATE jobs SET context=jsonb_set(context,'{inherits_parent_workspace}',"
-            "'true'::jsonb) WHERE id=$1", owner,
+            "'true'::jsonb) WHERE id=$1",
+            owner,
         )
     elif fault == "reason":
         await db.execute(
@@ -475,11 +591,17 @@ async def test_cancel_before_late_adoption_refuses_inexact_scope(db, fault):
     )
     permit = await acquire(state)
     assert permit is None or not permit.allowed
-    assert await db.fetchrow(
-        "SELECT state,vm_uid,vmi_uid,launcher_uid FROM vm_resource_reservations WHERE id=$1",
-        UUID(state["reservation_id"]),
-    ) == before
-    assert await db.fetchval("SELECT count(*) FROM vm_job_cancel_retention_authorities") == 0
+    assert (
+        await db.fetchrow(
+            "SELECT state,vm_uid,vmi_uid,launcher_uid FROM vm_resource_reservations WHERE id=$1",
+            UUID(state["reservation_id"]),
+        )
+        == before
+    )
+    assert (
+        await db.fetchval("SELECT count(*) FROM vm_job_cancel_retention_authorities")
+        == 0
+    )
 
 
 @pytest.mark.asyncio
