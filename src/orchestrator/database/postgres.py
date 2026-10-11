@@ -11176,6 +11176,9 @@ class PostgresDB:
                     "staged_epoch": 0,
                     "staged_summary": None,
                 }
+                # Bind the exposure the locked read proved, not ``false``: the
+                # pre-registration and pre-provision proofs above hold only
+                # for an exposed runtime whose exact Pod is receipted zero.
                 result = await conn.execute(
                     """
                     UPDATE threads
@@ -11184,7 +11187,7 @@ class PostgresDB:
                        AND runtime_generation=$2::uuid
                        AND runtime_retirement_token=$3::uuid
                        AND runtime_retirement_authorized_at IS NOT NULL
-                       AND runtime_authority_exposed=false
+                       AND runtime_authority_exposed=$5
                        AND runtime_retirement_permanent=false
                        AND runtime_retirement_stage_receipt IS NULL
                     """,
@@ -11192,6 +11195,7 @@ class PostgresDB:
                     parsed_generation,
                     parsed_token,
                     json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+                    bool(row["runtime_authority_exposed"]),
                 )
                 return receipt if result == "UPDATE 1" else None
 

@@ -6191,6 +6191,73 @@ async def test_never_delivered_reader_can_publish_never_engaged_receipt(
 
 
 @pytest.mark.asyncio
+async def test_protected_end_racing_agent_pod_create_publishes_never_engaged(db):
+    """End after the agent Pod's create, before it registered (k3d 2026-10-11).
+
+    The exact Pod-zero receipt is the actor proof and no workspace ever
+    existed, so the reader credential reached nobody. Runtime authority was
+    exposed to that Pod, which the receipt write must accept, or a protected
+    End retries "lacks exact staging authority" forever.
+    """
+    ids = await _seed(
+        db, bind_agent=False, protected_agent_pod=True, workspace_claim=False
+    )
+    row_id, plan, generation, _mount_id = await _seed_protected_ro_attempt(
+        db, ids, status="active"
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET status='created' WHERE id=$1::uuid",
+            UUID(ids["thread"]),
+        )
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    context = retirement["context"]
+    assert context["protected_cloud"] is True
+    assert context["runtime_authority_exposed"] is True
+    assert context["agent_id"] is None
+    pod = context["agent_pod"]
+    exact = {
+        "expected_runtime_generation": retirement["generation"],
+        "expected_retirement_token": retirement["token"],
+    }
+    assert await db.acknowledge_pinned_thread_pre_registration_pod_zero(
+        ids["thread"],
+        **exact,
+        expected_pod_name=pod["pod_name"],
+        expected_pod_uid=pod["pod_uid"],
+        expected_workspace_generation=None,
+        expected_workspace_runtime_incarnation=None,
+    )
+    for step in (
+        db.begin_ro_mount_revocation_if_matches,
+        db.finish_ro_mount_revocation_if_matches,
+    ):
+        assert await step(
+            row_id,
+            expected_thread_id=ids["thread"],
+            expected_runtime_generation=generation,
+            plan=plan,
+        )
+
+    receipt = await db.publish_never_engaged_retirement_stage_receipt(
+        ids["thread"], **exact
+    )
+
+    assert receipt is not None
+    assert receipt["kind"] == "never_engaged"
+    assert receipt["mount_id"] == row_id
+    recorded = await db.get_thread(ids["thread"])
+    assert recorded["runtime_authority_exposed"] is True
+    assert _json(recorded["runtime_retirement_stage_receipt"]) == receipt
+
+
+@pytest.mark.asyncio
 async def test_never_engaged_receipt_rejects_preexisting_staged_overlay(db):
     ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
     row_id, plan, generation, _mount_id = await _seed_protected_ro_attempt(
