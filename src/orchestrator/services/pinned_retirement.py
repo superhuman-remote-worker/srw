@@ -35,7 +35,11 @@ from orchestrator.services.vm_workspace_recovery_store import (
     completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
-from shared.pinned_workspace_evidence import has_pinned_physical_workspace_evidence
+from shared.pinned_workspace_evidence import (
+    has_pinned_physical_workspace_evidence,
+    never_published_workspace_create,
+    soft_fenced_workspace,
+)
 from shared.pinned_vm_creation_retirement import (
     initial_vm_creation_retirement_source,
     pre_registration_vm_agent_zero_source,
@@ -232,7 +236,9 @@ class PinnedRetirementOperations:
         ``cloud_ro_mounts.status='active'`` records backend probe completion, not
         credential delivery.  A retirement that captured no actor, workspace,
         binding, VM, or staged overlay may revoke that exact reader first and then
-        publish a zero-stage receipt.  This predicate is shared by the pre-stage
+        publish a zero-stage receipt.  A first workspace create soft-fenced before
+        it published its address counts as no workspace; its Pod held the reader
+        only in SRW's own sidecar.  This predicate is shared by the pre-stage
         actuator and receipt replay so a later/replacement row cannot be relabelled
         as the captured source.
         """
@@ -353,14 +359,23 @@ class PinnedRetirementOperations:
             and thread.get("agent_id") is None
             and thread.get("control_admission_agent_id") is None
             and thread.get("runtime_attach_token") is None
-            and captured_workspace == current_workspace
+            and (
+                captured_workspace == current_workspace
+                and self._retirement_json_status_is_absent(captured_workspace)
+                and not any(
+                    self._retirement_json_field_is_nonnull(captured_workspace, field)
+                    for field in workspace_fields
+                )
+                # SQL also requires the attempt's recorded Pod fence.
+                or never_published_workspace_create(
+                    captured_workspace,
+                    context.get("workspace_provision_intent"),
+                    runtime_generation=str(retirement.get("generation") or ""),
+                )
+                and current_workspace == soft_fenced_workspace(captured_workspace)
+            )
             and captured_binding == current_binding == {}
             and captured_vm == current_vm
-            and self._retirement_json_status_is_absent(captured_workspace)
-            and not any(
-                self._retirement_json_field_is_nonnull(captured_workspace, field)
-                for field in workspace_fields
-            )
             and self._retirement_json_status_is_absent(captured_vm)
             and not any(
                 self._retirement_json_field_is_nonnull(captured_vm, field)
@@ -1661,6 +1676,43 @@ class PinnedRetirementOperations:
             raise RuntimeError("workspace provision fence publication is retryable")
         return True
 
+    async def _fence_never_published_protected_workspace(
+        self,
+        retirement: Mapping[str, Any],
+    ) -> bool:
+        """Exact-stop a protected soft End's unpublished first workspace create.
+
+        Staging needs a ready workspace, and a create that never reached
+        ``ready`` handed out no address: no agent, IDE or user reached its
+        overlay, only the image and SRW's read-only reader sidecar ran. Fence
+        that captured attempt (exact Pod stop, soft-retained volume) before the
+        zero-stage receipt, which requires this fence under the row lock.
+        """
+
+        context = retirement.get("context")
+        if bool(retirement.get("permanent")) or not isinstance(context, Mapping):
+            return False
+        captured = self._captured_workspace_provision_intent(retirement)
+        if captured is None:
+            return False
+        workspace = context.get("workspace_container")
+        if not (
+            context.get("protected_cloud") is True
+            and str(context.get("workspace_backend") or "") == "sandbox"
+            and context.get("workspace_binding") in (None, {})
+            and context.get("vm") in (None, {})
+            and isinstance(workspace, Mapping)
+            and never_published_workspace_create(
+                workspace,
+                captured,
+                runtime_generation=str(retirement.get("generation") or ""),
+            )
+        ):
+            return False
+        return await self._reconcile_workspace_provision_intent_for_retirement(
+            retirement
+        )
+
     def _captured_virtual_binding_agent_zero_only(
         self,
         context: Mapping[str, Any],
@@ -2920,6 +2972,9 @@ class PinnedRetirementOperations:
     retirement_context_runtime_exposed = _retirement_context_runtime_exposed
     never_delivered_protected_reader_shape = _never_delivered_protected_reader_shape
     revoke_never_delivered_protected_reader = _revoke_never_delivered_protected_reader
+    fence_never_published_protected_workspace = (
+        _fence_never_published_protected_workspace
+    )
     retirement_has_exact_local_quiescence = _retirement_has_exact_local_quiescence
     wait_for_captured_agent_pod_retired = _wait_for_captured_agent_pod_retired
     captured_retirement_agent_pods = _captured_retirement_agent_pods

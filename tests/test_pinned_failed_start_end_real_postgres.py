@@ -725,6 +725,244 @@ async def test_disconnected_end_with_later_actor_finishes_through_durable_retry(
 
 
 @pytest.mark.asyncio
+async def test_protected_end_during_first_workspace_create_receipts_zero(
+    db, monkeypatch
+):
+    """Protected soft End while the first workspace create is pending (k3d 2026-10-11).
+
+    That Pod ran only its image and SRW's reader sidecar, and no address was
+    ever handed out. Staging needs a ready workspace, so End exact-fences the
+    attempt and receipts zero instead of retrying "lacks exact staging
+    authority" forever. The volume is soft-retained as in any soft End.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    from orchestrator.services import protected_cloud_engage
+    from orchestrator.services import stale_agent_detector
+    from orchestrator.services.session_router import SessionRouterService
+
+    ids, cluster, provider, intent = await _failed_start(db, monkeypatch)
+    row_id, plan, _generation, _mount_id = await fixtures._seed_protected_ro_attempt(
+        db, ids, status="active"
+    )
+    reader = MagicMock()
+    reader.revoke_protected_reader_attempt = AsyncMock()
+
+    async def _resolve_reader(_plan, **_):
+        return reader
+
+    monkeypatch.setattr(
+        protected_cloud_engage, "_resolve_protected_reader_backend", _resolve_reader
+    )
+    routes = MagicMock()
+    routes.read_namespaced_service.side_effect = fixtures._K8sError(404)
+    networking = MagicMock()
+    networking.read_namespaced_ingress.side_effect = fixtures._K8sError(404)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(provider_module, "container_provisioner", provider)
+    monkeypatch.setattr(
+        main.app.state.resources,
+        "session_router",
+        SessionRouterService(
+            namespace="agents-a",
+            ingress_host="unused.example",
+            core_api=routes,
+            networking_api=networking,
+        ),
+    )
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    context = retirement["context"]
+    assert context["protected_cloud"] is True
+    assert context["workspace_container"]["status"] == "pending"
+    assert context["protected_ro"]["id"] == row_id
+    # The wedge: with the Pod live, nothing proves the workspace zero.
+    assert (
+        await db.publish_never_engaged_retirement_stage_receipt(
+            ids["thread"],
+            expected_runtime_generation=retirement["generation"],
+            expected_retirement_token=retirement["token"],
+        )
+        is None
+    )
+
+    candidate = dict(await db.get_thread(ids["thread"]))
+    assert await stale_agent_detector.retry_pending_pinned_retirement(
+        candidate,
+        dependencies=controls.stale_agent_detector_dependencies(
+            main.app.state.resources
+        ),
+    )
+
+    thread = await db.get_thread(ids["thread"])
+    assert thread["status"] == "ended"
+    assert cluster.objects["pod"].metadata.uid != intent["pod_uid"]
+    assert cluster.objects["pvc"].metadata.uid == intent["pvc_uid"]
+    reader.revoke_protected_reader_attempt.assert_awaited_once_with(plan)
+    assert (await db.get_ro_mount_by_thread(ids["thread"]))["status"] == "revoked"
+    async with db.acquire() as conn:
+        staged = await conn.fetchrow(
+            "SELECT payload FROM thread_events WHERE thread_id=$1::uuid "
+            "AND kind='cloud.diff_staged'",
+            UUID(ids["thread"]),
+        )
+    assert staged is not None
+    assert fixtures._json(staged["payload"])["file_count"] == 0
+    assert fixtures._json(staged["payload"])["mount_id"] == row_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tamper", [None, "workspace_published", "fence_not_owned"])
+async def test_never_engaged_requires_the_exact_soft_workspace_fence(
+    db, monkeypatch, tamper
+):
+    ids, _cluster, provider, _intent = await _failed_start(db, monkeypatch)
+    row_id, plan, generation, _mount_id = await fixtures._seed_protected_ro_attempt(
+        db, ids, status="active"
+    )
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    attempt = retirement["context"]["workspace_provision_intent"]["attempt_id"]
+    current = await db.revoke_pinned_thread_workspace_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=retirement["generation"],
+        expected_retirement_token=retirement["token"],
+        expected_attempt_id=attempt,
+    )
+    fences = await provider.fence_pinned_workspace_provision_intent(
+        current,
+        permanent=False,
+        expected_retirement_token=retirement["token"],
+        expected_retirement_generation=retirement["generation"],
+    )
+    assert await db.fence_pinned_thread_workspace_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=retirement["generation"],
+        expected_retirement_token=retirement["token"],
+        expected_attempt_id=attempt,
+        **fences,
+        permanent=False,
+    )
+    for step in (
+        db.begin_ro_mount_revocation_if_matches,
+        db.finish_ro_mount_revocation_if_matches,
+    ):
+        assert await step(
+            row_id,
+            expected_thread_id=ids["thread"],
+            expected_runtime_generation=generation,
+            plan=plan,
+        )
+    if tamper == "workspace_published":
+        await db.execute(
+            "UPDATE threads SET metadata=jsonb_set(metadata,"
+            "'{workspace_container,pod_ip}','\"10.0.0.9\"') WHERE id=$1::uuid",
+            UUID(ids["thread"]),
+        )
+    elif tamper == "fence_not_owned":
+        # A same-shape fence recorded under a different End proves nothing
+        # about this retirement's stop.
+        await db.execute(
+            "ALTER TABLE thread_workspace_provision_intents DISABLE TRIGGER USER"
+        )
+        try:
+            await db.execute(
+                "UPDATE thread_workspace_provision_intents "
+                "SET cleanup_retirement_token=$2 WHERE attempt_id=$1::uuid",
+                UUID(attempt),
+                uuid4(),
+            )
+        finally:
+            await db.execute(
+                "ALTER TABLE thread_workspace_provision_intents ENABLE TRIGGER USER"
+            )
+
+    receipt = await db.publish_never_engaged_retirement_stage_receipt(
+        ids["thread"],
+        expected_runtime_generation=retirement["generation"],
+        expected_retirement_token=retirement["token"],
+    )
+
+    if tamper is None:
+        assert receipt is not None and receipt["kind"] == "never_engaged"
+        assert receipt["mount_id"] == row_id
+    else:
+        assert receipt is None
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        None,
+        {"status": "ready"},
+        {"pod_ip": "10.0.0.9"},
+        {"_runtime_incarnation": "6e1b1f0e-2f5d-4b8e-9c52-0a3f3c4d5e6f"},
+        {"_workspace_provision_attempt": "another-attempt"},
+        {"_workspace_provision_generation": "another-generation"},
+    ],
+)
+def test_never_published_workspace_create_is_the_untouched_pending_marker(change):
+    from shared.pinned_workspace_evidence import (
+        never_published_workspace_create,
+        soft_fenced_workspace,
+    )
+
+    attempt, generation = str(uuid4()), str(uuid4())
+    workspace = {
+        "status": "pending",
+        "provisioner": "k8s",
+        "repo_name": "thread-1",
+        "_workspace_provision_attempt": attempt,
+        "_workspace_provision_generation": generation,
+        **dict.fromkeys(
+            (
+                "_runtime_incarnation",
+                "_canvas_workspace_generation",
+                "pod_ip",
+                "pod_name",
+                "host",
+                "port",
+                "ide_host",
+                "ide_port",
+            )
+        ),
+    }
+    intent = {
+        "attempt_id": attempt,
+        "runtime_generation": generation,
+        "previous_binding": {},
+    }
+    expected = change is None
+    workspace.update(change or {})
+
+    assert (
+        never_published_workspace_create(
+            workspace, intent, runtime_generation=generation
+        )
+        is expected
+    )
+    # A re-create inherits its prior life's overlay, so it never qualifies.
+    assert not never_published_workspace_create(
+        workspace,
+        {**intent, "previous_binding": {"kind": "remote"}},
+        runtime_generation=generation,
+    )
+    fenced = soft_fenced_workspace(workspace)
+    assert fenced["status"] == "deleted"
+    assert fenced["repo_name"] == "thread-1"
+    assert "_workspace_provision_attempt" not in fenced
+
+
+@pytest.mark.asyncio
 async def test_rolling_upgrade_adopts_exact_already_revoking_intent(db, monkeypatch):
     ids, cluster, provider, intent = await _failed_start(db, monkeypatch)
     retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)

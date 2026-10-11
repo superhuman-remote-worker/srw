@@ -33,3 +33,58 @@ def has_pinned_physical_workspace_evidence(
             for field in _PHYSICAL_WORKSPACE_FIELDS
         )
     )
+
+
+_PROVISION_MARKER_FIELDS = (
+    "_workspace_provision_attempt",
+    "_workspace_provision_generation",
+)
+
+
+def never_published_workspace_create(
+    workspace: Mapping[str, Any],
+    intent: Any,
+    *,
+    runtime_generation: str,
+) -> bool:
+    """Whether a first K8s workspace create never handed out its address.
+
+    The pending marker names the captured attempt, no physical field was ever
+    published and the create had no prior binding to inherit an overlay from.
+    """
+
+    if not isinstance(intent, Mapping) or not intent.get("attempt_id"):
+        return False
+    return bool(
+        workspace.get("status") == "pending"
+        and workspace.get("provisioner") == "k8s"
+        and workspace.get("_workspace_provision_attempt")
+        == str(intent.get("attempt_id"))
+        and workspace.get("_workspace_provision_generation") == runtime_generation
+        and str(intent.get("runtime_generation") or "") == runtime_generation
+        and intent.get("previous_binding") == {}
+        and not has_pinned_physical_workspace_evidence(
+            workspace, provision_intent_pending=True
+        )
+    )
+
+
+def soft_fenced_workspace(workspace: Mapping[str, Any]) -> dict[str, Any]:
+    """The metadata a soft provision fence leaves in place of a pending create."""
+
+    cleared = {
+        key: value
+        for key, value in workspace.items()
+        if key not in _PROVISION_MARKER_FIELDS
+    }
+    cleared.update(
+        {
+            "status": "deleted",
+            **{
+                field: None
+                for field in _PHYSICAL_WORKSPACE_FIELDS
+                if field != "_docker_workspace_lease_id"
+            },
+        }
+    )
+    return cleared

@@ -1611,6 +1611,9 @@ async def _end_thread_flow_owned(
     _revoke_never_delivered_protected_reader = (
         pinned.revoke_never_delivered_protected_reader
     )
+    _fence_never_published_protected_workspace = (
+        pinned.fence_never_published_protected_workspace
+    )
     _reconcile_stateless_thread_retirement = partial(
         reconcile_stateless_thread_retirement, dependencies=dependencies
     )
@@ -2325,6 +2328,16 @@ async def _end_thread_flow_owned(
                                 # captured attempt before publishing the distinct
                                 # zero-stage receipt.  This deliberately does not
                                 # run the rest of cleanup before mandatory staging.
+                                # A workspace create that never published can
+                                # never stage; exact-stop its Pod (and reader
+                                # sidecar) first so the receipt can prove it.
+                                if await _fence_never_published_protected_workspace(
+                                    retirement
+                                ):
+                                    authoritative_thread = (
+                                        await postgres_db.get_thread(thread_id)
+                                        or authoritative_thread
+                                    )
                                 await _revoke_never_delivered_protected_reader(
                                     retirement,
                                     authoritative_thread,

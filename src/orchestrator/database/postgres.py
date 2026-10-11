@@ -133,7 +133,11 @@ from shared.db_url import build_postgres_url, postgres_database_name
 from shared.job_freeze_types import AUTO_REDISPATCH_FREEZE_TYPES
 from shared.job_steering import context_delivery_key, queued_reply_key
 from shared.pinned_session_identity import PinnedJobRecipient, PinnedSessionBinding
-from shared.pinned_workspace_evidence import has_pinned_physical_workspace_evidence
+from shared.pinned_workspace_evidence import (
+    has_pinned_physical_workspace_evidence,
+    never_published_workspace_create,
+    soft_fenced_workspace,
+)
 from shared.session_retirement import stateless_settled_retirement_authority
 from shared.subagent_parent_authority import (
     ParentExecutionAuthority,
@@ -10828,6 +10832,11 @@ class PostgresDB:
         no-actor/no-workspace shape may therefore exact-revoke that captured
         grant first and publish this zero-stage receipt.  Any staged overlay,
         replacement reader, or physical/actor evidence remains fail-closed.
+
+        A first workspace create that never published its address counts as
+        no workspace once its exact attempt is soft-fenced: only the image and
+        SRW's own read-only reader sidecar ran in it, and the fence proves that
+        Pod is gone. Its retained volume is left for Resume as in any soft End.
         """
 
         try:
@@ -10948,6 +10957,45 @@ class PostgresDB:
                         ),
                     )
                 )
+                captured_workspace_intent = context.get("workspace_provision_intent")
+                workspace_provision_fenced = False
+                if never_published_workspace_create(
+                    captured_workspace,
+                    captured_workspace_intent,
+                    runtime_generation=str(parsed_generation),
+                ):
+                    try:
+                        workspace_attempt = UUID(
+                            str(captured_workspace_intent.get("attempt_id") or "")
+                        )
+                    except (TypeError, ValueError):
+                        return None
+                    # The soft fence clears exactly the pending marker, in the
+                    # transaction that records its same-name Pod fence; any
+                    # other workspace change since Begin is refused.
+                    workspace_provision_fenced = bool(
+                        current_workspace == soft_fenced_workspace(captured_workspace)
+                        and await conn.fetchval(
+                            "SELECT EXISTS (SELECT 1 FROM "
+                            "thread_workspace_provision_intents WHERE "
+                            "attempt_id=$1::uuid AND thread_id=$2::uuid AND "
+                            "runtime_generation=$3::uuid AND "
+                            "status IN ('fenced','retired') AND "
+                            "cleanup_disposition='retain' AND "
+                            "cleanup_retirement_token=$4::uuid AND "
+                            "fence_pod_uid IS NOT NULL AND pod_name=$5)",
+                            workspace_attempt,
+                            parsed_thread,
+                            parsed_generation,
+                            parsed_token,
+                            str(captured_workspace_intent.get("pod_name") or ""),
+                        )
+                    )
+                workspace_zero = bool(
+                    captured_workspace == current_workspace
+                    and workspace_absent
+                    or workspace_provision_fenced
+                )
                 vm_absent = bool(
                     _status_absent(captured_vm)
                     and _fields_absent(
@@ -11044,10 +11092,9 @@ class PostgresDB:
                     and row["control_admission_agent_id"] is None
                     and row["runtime_attach_token"] is None
                     and _empty_actor(metadata.get("agent_pod"))
-                    and captured_workspace == current_workspace
                     and captured_binding == current_binding
                     and captured_vm == current_vm
-                    and workspace_absent
+                    and workspace_zero
                     and captured_binding == {}
                     and vm_absent
                 )
@@ -25683,24 +25730,10 @@ class PostgresDB:
                             and "_workspace_provision_attempt" not in workspace
                             and "_workspace_provision_generation" not in workspace
                         )
-                    cleared = dict(workspace)
-                    cleared.pop("_workspace_provision_attempt", None)
-                    cleared.pop("_workspace_provision_generation", None)
-                    cleared.update(
-                        {
-                            "status": "deleted",
-                            "pod_ip": None,
-                            "pod_name": None,
-                            "host": None,
-                            "port": None,
-                            "ide_host": None,
-                            "ide_port": None,
-                            "_runtime_incarnation": None,
-                            "_canvas_workspace_generation": None,
-                        }
-                    )
                     updated_metadata = dict(metadata)
-                    updated_metadata["workspace_container"] = cleared
+                    updated_metadata["workspace_container"] = soft_fenced_workspace(
+                        workspace
+                    )
                     if intent["cleanup_disposition"] == "retain" and (
                         intent["pvc_uid"] is not None
                         or intent["retained_pvc_uid"] is not None
