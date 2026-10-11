@@ -1500,13 +1500,14 @@ async def test_an_old_session_converts_at_its_first_in_workspace_delivery(
 
 
 class CloudBackend(Backend):
-    def __init__(self, *, share=True, full=False, fail=False):
+    def __init__(self, *, share=True, full=False, fail=False, existing=()):
         super().__init__()
         self.share_ok, self.full, self.fail = share, full, fail
         self.folders: list[str] = []
         self.shares: list[str] = []
+        self.existing = set(existing)
 
-    async def ensure_session_folder(self, *, session_id):
+    async def ensure_session_folder(self, *, session_id, exclusive=False):
         from orchestrator.services.cloud import (
             CloudBackendError,
             CloudBackendErrorKind,
@@ -1517,6 +1518,11 @@ class CloudBackend(Backend):
             raise CloudBackendError(
                 CloudBackendErrorKind.UNAVAILABLE, "down", backend="nextcloud"
             )
+        if exclusive and session_id in self.existing:
+            raise CloudBackendError(
+                CloudBackendErrorKind.ALREADY_EXISTS, "there", backend="nextcloud"
+            )
+        self.existing.add(session_id)
         self.folders.append(session_id)
         return SessionFolderHandle(
             backend="nextcloud", native_id=f"sessions/{session_id}"
@@ -1554,10 +1560,22 @@ async def test_admission_creates_shares_and_records_the_outbox():
     assert await prep.create_session_outbox(
         THREAD, {"id": USER}, connector_id=OUTBOX, backend=backend, store=store
     )
-    assert backend.folders == [THREAD[:8]] and backend.shares
+    # The session's full id names its folder, recorded before it is made.
+    assert backend.folders == [THREAD] and backend.shares
     assert store.main_cloud[0]["share_handle"]
+    assert store.main_cloud[0]["session_handle"] == f"sessions/{THREAD}"
     assert store.metadata == [
-        (THREAD, {"cloud_outbox": {"connector_id": OUTBOX, "state": "ready"}})
+        (
+            THREAD,
+            {
+                "cloud_outbox": {
+                    "connector_id": OUTBOX,
+                    "state": "creating",
+                    "folder": THREAD,
+                }
+            },
+        ),
+        (THREAD, {"cloud_outbox": {"connector_id": OUTBOX, "state": "ready"}}),
     ]
 
 
@@ -1572,11 +1590,63 @@ async def test_a_folder_srw_could_not_create_is_recorded_and_nothing_raises():
         store=store,
     )
     assert store.main_cloud == []
-    assert store.metadata[0][1]["cloud_outbox"] == {
+    assert store.metadata[-1][1]["cloud_outbox"] == {
         "connector_id": OUTBOX,
         "state": "unavailable",
         "reason": "create_failed",
+        # Its MKCOL may have landed: the next attempt takes it.
+        "folder": THREAD,
     }
+
+
+@pytest.mark.asyncio
+async def test_a_folder_already_at_a_new_sessions_name_is_never_taken_over():
+    """A new session's outbox must be new: a folder already at its name is
+    not reused (and never shared), unless this session recorded it as the
+    one it was creating."""
+    store = IdentityStore()
+    backend = CloudBackend(existing={THREAD})
+    assert not await prep.create_session_outbox(
+        THREAD, {"id": USER}, connector_id=OUTBOX, backend=backend, store=store
+    )
+    assert backend.folders == [] and backend.shares == []
+    assert store.main_cloud == []
+    assert store.metadata[-1][1]["cloud_outbox"] == {
+        "connector_id": OUTBOX,
+        "state": "unavailable",
+        "reason": "folder_exists",
+    }
+    assert "folder_exists" in rule.OUTBOX_FAILURE_REASONS
+    # An earlier attempt of this session made it, then stopped: it is taken.
+    store = IdentityStore()
+    assert await prep.create_session_outbox(
+        THREAD,
+        {"id": USER},
+        connector_id=OUTBOX,
+        backend=backend,
+        store=store,
+        recorded_folder=THREAD,
+    )
+    assert backend.folders == [THREAD] and backend.shares == [f"sessions/{THREAD}"]
+    # The pre-plan step passes what the session recorded.
+    store = IdentityStore([_outbox_row()])
+    backend = CloudBackend(existing={THREAD})
+    await prep.prepare_session_outbox(
+        _attached(
+            main_cloud_session_handle=None,
+            main_cloud_share_handle=None,
+            metadata={
+                "cloud_outbox": {
+                    "connector_id": OUTBOX,
+                    "state": "creating",
+                    "folder": THREAD,
+                }
+            },
+        ),
+        store=store,
+        cloud_router=_router(backend),
+    )
+    assert backend.folders == [THREAD]
 
 
 @pytest.mark.asyncio
@@ -1590,7 +1660,7 @@ async def test_a_full_share_limit_never_blocks_admission():
         store=store,
     )
     assert store.main_cloud[0]["share_handle"] is None
-    record = store.metadata[0][1]["cloud_outbox"]
+    record = store.metadata[-1][1]["cloud_outbox"]
     assert record["state"] == "ready" and record["share_retry_at"]
 
 
@@ -1652,7 +1722,7 @@ async def test_the_pre_plan_step_creates_a_missing_folder_and_leaves_others_alon
         store=store,
         cloud_router=_router(backend),
     )
-    assert backend.folders == [THREAD[:8]]
+    assert backend.folders == [THREAD]
     # Shared already, no outbox attached, or protected: nothing to do.
     for thread in (
         _attached(),

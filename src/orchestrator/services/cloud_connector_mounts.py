@@ -69,10 +69,13 @@ CONNECTOR_RULE = "connectors"
 CLOUD_OUTBOX_KEY = "cloud_outbox"
 #: What a session's outbox folder may record as ``cloud_outbox.reason``
 #: when SRW could not create it: no main cloud served the session, the
-#: provider refused the folder, or something else failed.
+#: provider refused the folder, a folder was already at its name (never
+#: taken over: a new session's folder must be new), or something else
+#: failed.
 OUTBOX_FAILURE_REASONS: tuple[str, ...] = (
     "backend_unavailable",
     "create_failed",
+    "folder_exists",
     "error",
 )
 

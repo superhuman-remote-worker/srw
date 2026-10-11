@@ -16,11 +16,16 @@ from orchestrator.schemas.thread_lifecycle import (
     ThreadResumeRequest,
     ThreadRewindRequest,
 )
-from orchestrator.services.cloud import SessionFolderHandle
+from orchestrator.services.cloud import (
+    CloudBackendError,
+    CloudBackendErrorKind,
+    SessionFolderHandle,
+)
 from orchestrator.services.cloud.identity import resolve_user_identity_cached
 from orchestrator.services.cloud_connector_mounts import (
     CLOUD_OUTBOX_KEY,
     outbox_attached,
+    outbox_record,
     selected_ids,
     uses_connector_rule,
 )
@@ -34,7 +39,10 @@ from orchestrator.services.datasource_policy import classify_datasource_selectio
 from orchestrator.services.grant_enforcement import GrantDenied
 from orchestrator.services.model_availability import ModelUnavailable
 from orchestrator.services.manifest_runtime_ownership import require_srw_runtime
-from orchestrator.services.session_cloud_preparation import outbox_selected
+from orchestrator.services.session_cloud_preparation import (
+    ensure_new_outbox_folder,
+    outbox_selected,
+)
 from orchestrator.services.session_provisioner import ensure_session_workspace
 from orchestrator.services.session_runtime_admission import (
     protected_cloud_marker_state,
@@ -694,9 +702,35 @@ async def resume_thread(
                         existing_handle, backend=backend.backend_id
                     )
                 else:
-                    session_handle = await backend.ensure_session_folder(
-                        session_id=tid[:8]
-                    )
+                    # A new folder, named by the session's full id; one
+                    # already there is never taken over.
+                    try:
+                        session_handle = await ensure_new_outbox_folder(
+                            tid,
+                            connector_id=str(outbox_id),
+                            backend=backend,
+                            store=postgres_db,
+                            recorded_folder=outbox_record(metadata).get("folder"),
+                        )
+                    except CloudBackendError as e:
+                        if e.kind != CloudBackendErrorKind.ALREADY_EXISTS:
+                            raise
+                        logger.warning(
+                            "Thread %s: a folder is already at its outbox's "
+                            "name; it is not taken over",
+                            tid,
+                        )
+                        await postgres_db.merge_thread_cloud_metadata(
+                            tid,
+                            {
+                                CLOUD_OUTBOX_KEY: {
+                                    "connector_id": outbox_id,
+                                    "state": "unavailable",
+                                    "reason": "folder_exists",
+                                }
+                            },
+                        )
+                        return
                     if not await _resume_runtime_is_current():
                         return
                 share_handle = None

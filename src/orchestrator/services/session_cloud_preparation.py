@@ -38,7 +38,11 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from orchestrator.services.cloud import CloudBackendError, SessionFolderHandle
+from orchestrator.services.cloud import (
+    CloudBackendError,
+    CloudBackendErrorKind,
+    SessionFolderHandle,
+)
 from orchestrator.services.cloud.retry import BucketFull, bounded_wait
 from orchestrator.services.cloud_connector_mounts import (
     CLOUD_MOUNT_RULE_KEY,
@@ -229,7 +233,46 @@ async def convert_to_connector_rule(
 
 
 def _failure_reason(exc: BaseException) -> str:
-    return "create_failed" if isinstance(exc, CloudBackendError) else "error"
+    if isinstance(exc, CloudBackendError):
+        return (
+            "folder_exists"
+            if exc.kind == CloudBackendErrorKind.ALREADY_EXISTS
+            else "create_failed"
+        )
+    return "error"
+
+
+def outbox_folder_id(thread_id: str) -> str:
+    """The name of a new session's outbox folder under ``sessions/``: the
+    session's full id. (Sessions before it used its first eight characters,
+    32 random bits; they keep the folder recorded on them.)"""
+    return str(thread_id)
+
+
+async def ensure_new_outbox_folder(
+    thread_id: str,
+    *,
+    connector_id: str,
+    backend: Any,
+    store: Any,
+    recorded_folder: Any = None,
+) -> Any:
+    """Create a session's outbox folder, which must be new, and return its
+    handle.
+
+    A folder already at that name is taken only when this session recorded
+    it as the one it was creating (``cloud_outbox.folder``: an earlier
+    attempt made it and stopped before recording its handle); otherwise
+    ``ALREADY_EXISTS`` is raised and nothing of another's is shared."""
+    folder = outbox_folder_id(thread_id)
+    claimed = str(recorded_folder or "") == folder
+    if not claimed:
+        await _record_outbox(
+            store,
+            thread_id,
+            {"connector_id": connector_id, "state": "creating", "folder": folder},
+        )
+    return await backend.ensure_session_folder(session_id=folder, exclusive=not claimed)
 
 
 async def _share(
@@ -252,32 +295,43 @@ async def create_session_outbox(
     connector_id: str,
     backend: Any,
     store: Any,
+    recorded_folder: Any = None,
 ) -> bool:
     """Create a new session's outbox folder, share it with its owner and
     record both on the session. True when the folder exists.
 
-    The owner's cloud account is ensured first (``ensure_user``), so a
-    user's very first session is shared too. A share that does not land
-    (the rate limit, an account the cloud does not know yet) leaves the
-    share empty for :func:`prepare_session_outbox` to retry. A failure to
-    create the folder is recorded as ``cloud_outbox.state: "unavailable"``.
-    Never raises.
+    The folder is ``sessions/<the session's id>`` and must be new
+    (:func:`ensure_new_outbox_folder`; ``recorded_folder`` is the one an
+    earlier attempt of this session recorded). The owner's cloud account
+    is ensured first (``ensure_user``), so a user's very first session is
+    shared too. A share that does not land (the rate limit, an account the
+    cloud does not know yet) leaves the share empty for
+    :func:`prepare_session_outbox` to retry. A failure to create the folder
+    is recorded as ``cloud_outbox.state: "unavailable"`` with its reason
+    (``folder_exists`` for a folder that was already there). Never raises.
     """
     try:
-        session_handle = await backend.ensure_session_folder(session_id=thread_id[:8])
+        session_handle = await ensure_new_outbox_folder(
+            thread_id,
+            connector_id=connector_id,
+            backend=backend,
+            store=store,
+            recorded_folder=recorded_folder,
+        )
     except Exception as exc:
         logger.warning(
             "Session %s: its outbox folder was not created: %s", thread_id, exc
         )
-        await _record_outbox(
-            store,
-            thread_id,
-            {
-                "connector_id": connector_id,
-                "state": "unavailable",
-                "reason": _failure_reason(exc),
-            },
-        )
+        reason = _failure_reason(exc)
+        failed: dict[str, Any] = {
+            "connector_id": connector_id,
+            "state": "unavailable",
+            "reason": reason,
+        }
+        if reason != "folder_exists":
+            # Its MKCOL may have landed: the next attempt may take it.
+            failed["folder"] = outbox_folder_id(thread_id)
+        await _record_outbox(store, thread_id, failed)
         return False
     share_handle = None
     rate_limited = False
@@ -312,7 +366,12 @@ async def create_session_outbox(
         await _record_outbox(
             store,
             thread_id,
-            {"connector_id": connector_id, "state": "unavailable", "reason": "error"},
+            {
+                "connector_id": connector_id,
+                "state": "unavailable",
+                "reason": "error",
+                "folder": outbox_folder_id(thread_id),
+            },
         )
         return False
     record: dict[str, Any] = {"connector_id": connector_id, "state": "ready"}
@@ -415,6 +474,7 @@ async def prepare_session_outbox(
                 connector_id=connector_id,
                 backend=backend,
                 store=store,
+                recorded_folder=record.get("folder"),
             )
             return
         await _retry_share(
@@ -494,6 +554,8 @@ __all__ = [
     "SHARE_WAIT_SECONDS",
     "convert_to_connector_rule",
     "create_session_outbox",
+    "ensure_new_outbox_folder",
+    "outbox_folder_id",
     "outbox_selected",
     "owner_outbox_id",
     "prepare_session_outbox",
