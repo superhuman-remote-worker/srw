@@ -630,12 +630,15 @@ async def test_forward_0336_upgrade_releases_existing_held_charge_without_rewrit
     migrations = (
         Path(__file__).resolve().parents[1] / "src/orchestrator/database/migrations/app"
     )
-    prior = tmp_path / "through-0335"
+    prior = tmp_path / "before-stop-guard-upgrades"
     prior.mkdir()
+    through_0336 = tmp_path / "through-0336"
+    through_0336.mkdir()
     for path in discover(migrations):
-        if path.name.startswith("0336_"):
-            continue
-        (prior / path.name).write_bytes(path.read_bytes())
+        if not path.name.startswith(("0336_", "0433_")):
+            (prior / path.name).write_bytes(path.read_bytes())
+        if not path.name.startswith("0433_"):
+            (through_0336 / path.name).write_bytes(path.read_bytes())
     name = "adopted_stop_upgrade_" + uuid4().hex[:12]
     admin = await asyncpg.connect(pg_dsn)
     await admin.execute(f'CREATE DATABASE "{name}"')
@@ -666,13 +669,23 @@ async def test_forward_0336_upgrade_releases_existing_held_charge_without_rewrit
                 provisioner=provisioner,
             )
         assert await durable_state(db, state) == held
-        await run_migrations(pool, migrations)
+        # Prove 0336 itself replaces the historical guard. A later migration
+        # also recreates this function, so it cannot be present in the prior
+        # fixture or substitute for the 0336 upgrade assertion.
+        await run_migrations(pool, through_0336)
         assert [
             dict(r)
             for r in await db.fetch(
                 "SELECT * FROM schema_migrations WHERE filename NOT LIKE '0336_%' ORDER BY filename"
             )
         ] == old_ledger
+        guard_0336_ledger = [
+            dict(r)
+            for r in await db.fetch(
+                "SELECT * FROM schema_migrations WHERE filename LIKE '0336_%'"
+            )
+        ]
+        assert len(guard_0336_ledger) == 1
         await complete_vm_cleanup_permit(
             VMWorkspaceRecoveryStore(db),
             state["cleanup_permit"],
@@ -684,6 +697,21 @@ async def test_forward_0336_upgrade_releases_existing_held_charge_without_rewrit
         assert released["cleanup"]["outcome"] == "completed"
         assert len(released["receipts"]) == released["proofs"] == released["zeros"] == 1
         assert released["context"] == held["context"]
+        await run_migrations(pool, migrations)
+        assert [
+            dict(r)
+            for r in await db.fetch(
+                "SELECT * FROM schema_migrations WHERE filename LIKE '0336_%'"
+            )
+        ] == guard_0336_ledger
+        assert [
+            dict(r)
+            for r in await db.fetch(
+                "SELECT * FROM schema_migrations "
+                "WHERE filename NOT LIKE '0336_%' AND filename NOT LIKE '0433_%' "
+                "ORDER BY filename"
+            )
+        ] == old_ledger
         ledger = [
             dict(r)
             for r in await db.fetch("SELECT * FROM schema_migrations ORDER BY filename")

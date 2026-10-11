@@ -41,6 +41,7 @@ async def test_unreachable_guest_still_requires_inventory_for_occupancy(
         job_id=str(owner),
         generation=str(generation),
         observed_before_ready=True,
+        cancel_late_adopted=False,
     )
     assert vm == {"status": "ssh_unreachable"}
     assert retry["ready_at"] is None
