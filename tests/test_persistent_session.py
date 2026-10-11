@@ -395,6 +395,58 @@ class TestDeployBoundSkillWithoutDeploymentDir:
         assert "CITE BODY" in session.workspace_manager.read_file(path)
 
 
+class TestDeployLiteralInstructionFileWithoutDeploymentDir:
+    """A literal ``file:`` instruction reaches a session workspace from the blob.
+
+    Session 2c6d3e06 (2026-10-11): Design Studio's ``design_guide.md`` sat in
+    the frozen blob, but the session deploy only read literal files through a
+    deployment dir a session never has. The file never landed, and its
+    ``before_tool:write_file`` gate refused every write.
+    """
+
+    @staticmethod
+    def _session(tmp_path, resolved_instructions):
+        from shared.runtime.core.loader import InstructionFileEntry
+        from agent.core.workspace import WorkspaceManager
+        from tests._fs_backend import FilesystemTestBackend
+
+        cfg = _make_config(
+            extra={
+                "_resolved_skills": {},
+                "_resolved_instructions": resolved_instructions,
+            }
+        )
+        cfg._deployment_dir = None
+        cfg.instruction_files = [
+            InstructionFileEntry(
+                file="design_guide.md",
+                trigger="before_tool:write_file",
+                enforce=True,
+            )
+        ]
+        session = _make_session(config=cfg)
+        session.workspace_manager = WorkspaceManager(
+            job_id="t", backend=FilesystemTestBackend(tmp_path)
+        )
+        return session
+
+    def test_literal_file_deploys_from_the_frozen_blob(self, tmp_path):
+        session = self._session(tmp_path, {"design_guide": "GUIDE BODY"})
+
+        session._deploy_instruction_files()
+
+        assert "GUIDE BODY" in session.workspace_manager.read_file("design_guide.md")
+        assert [e.file for e in session.config.instruction_files] == ["design_guide.md"]
+
+    def test_undeliverable_file_drops_its_gate(self, tmp_path):
+        session = self._session(tmp_path, {})
+
+        session._deploy_instruction_files()
+
+        assert not session.workspace_manager.get_path("design_guide.md").exists()
+        assert session.config.instruction_files == []
+
+
 class TestSessionRegistersNoInstructionsProviders:
     """Slice 1 is a passive migration for the session path: sessions never
     wrote instructions.md or task_brief.md as real files (their instructions

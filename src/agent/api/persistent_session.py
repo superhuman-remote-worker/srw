@@ -2038,7 +2038,11 @@ class PersistentSession:
                 deployment_dir=self.config._deployment_dir,
                 framework_dir=templates_dir,
             )
+        resolved_instructions = (
+            self.config.extra.get("_resolved_instructions", {}) or {}
+        )
         missing_bound_skills: list[str] = []
+        undeliverable_files: list[str] = []
         for entry in self.config.instruction_files:
             try:
                 if entry.skill:
@@ -2048,9 +2052,7 @@ class PersistentSession:
                     # workspaces, which would redeploy (clobber) on resume.
                     if self.workspace_manager.exists(entry.path):
                         continue  # don't overwrite on session resume
-                    content = (
-                        self.config.extra.get("_resolved_instructions", {}) or {}
-                    ).get(entry.skill)
+                    content = resolved_instructions.get(entry.skill)
                     if not content:
                         logger.warning(
                             f"Bound skill content missing from blob: {entry.skill}"
@@ -2071,13 +2073,19 @@ class PersistentSession:
                 # Backend-aware for the same reason as the skill branch above.
                 if self.workspace_manager.exists(entry.file):
                     continue
-                if file_resolver is None:
-                    logger.warning(
-                        f"Cannot deploy instruction file {entry.file}: "
-                        "no deployment dir"
-                    )
-                    continue
-                content = file_resolver.load(Path(entry.file).name)
+                # The frozen blob first, as the worker does: resolution froze
+                # the file from the expert directory, and a session never has
+                # a deployment dir of its own.
+                content = resolved_instructions.get(Path(entry.file).stem)
+                if not content:
+                    if file_resolver is None:
+                        logger.warning(
+                            f"Cannot deploy instruction file {entry.file}: not in "
+                            "the frozen blob and no deployment dir"
+                        )
+                        undeliverable_files.append(entry.file)
+                        continue
+                    content = file_resolver.load(Path(entry.file).name)
                 content = render_instruction_content(
                     content, [], origin=f"instruction file {entry.file!r}"
                 )
@@ -2089,8 +2097,29 @@ class PersistentSession:
                 logger.debug(f"Deployed instruction file to workspace: {entry.file}")
             except FileNotFoundError:
                 logger.warning(f"Instruction file not found: {entry.file}")
+                undeliverable_files.append(entry.file)
             except Exception as e:
                 logger.warning(f"Failed to deploy instruction file {entry.file}: {e}")
+
+        if undeliverable_files:
+            # A gate on a file that never reached the workspace cannot open:
+            # read_file reports "not found" and the gated tool refuses every
+            # call (session 2c6d3e06 lost write_file to design_guide.md this
+            # way). Drop such bindings, as subagents do
+            # (drop_missing_before_tool_bindings), so the tool keeps working.
+            kept = [
+                entry
+                for entry in self.config.instruction_files
+                if entry.skill or entry.file not in undeliverable_files
+            ]
+            logger.warning(
+                "Dropped instruction binding(s) whose file could not be delivered: %s",
+                ", ".join(sorted(set(undeliverable_files))),
+            )
+            if _dc_is_dataclass(self.config):
+                self.config = _dc_replace(self.config, instruction_files=kept)
+            else:  # Lightweight test/config adapters may not be real dataclasses.
+                self.config.instruction_files = kept
 
         if missing_bound_skills:
             # Fail closed when a fresh session needs a bound skill the frozen
