@@ -1,5 +1,6 @@
 """A retained, already-released Job charge needs separate final disk proof."""
 
+import asyncio
 import json
 import hashlib
 from copy import deepcopy
@@ -14,7 +15,9 @@ import pytest_asyncio
 import asyncpg
 from fastapi import HTTPException
 
+from orchestrator.database.postgres import JobVMAuditNotReady
 from orchestrator.services.job_controls import JobControlOperations
+from orchestrator.services.vm_idle_access import VMIdleAccessStore
 from orchestrator.services.manifest_workspaces import ManifestWorkspaceService
 from orchestrator.services.retained_vm_workspaces import record_detached
 from orchestrator.services.vm_creation_request import (
@@ -935,7 +938,15 @@ async def test_two_retained_generations_share_one_final_purge_after_workspace_re
         job_id,
     )
     assert await db.prepare_stateless_job_for_delete(str(job_id)) is True
+    first_tab = await _expired_ide_tab(db, first)
+    second_tab = await _expired_ide_tab(db, {**first, **second})
     assert await db.delete_job(str(job_id), prepared_stateless=True) is True
+    closed_tabs = await db.fetch(
+        "SELECT id FROM vm_idle_access_leases WHERE id=ANY($1::uuid[]) "
+        "AND closed_at IS NOT NULL",
+        [first_tab, second_tab],
+    )
+    assert {row["id"] for row in closed_tabs} == {first_tab, second_tab}
     receipt = json.loads(
         await db.fetchval(
             "SELECT deletion_receipt FROM vm_job_creation_owners WHERE job_id=$1",
@@ -964,6 +975,410 @@ async def test_two_retained_generations_share_one_final_purge_after_workspace_re
     assert await db.fetchval(
         "SELECT count(*) FROM vm_pre_ssh_stop_proofs WHERE job_id=$1", job_id
     ) == int(first_pre_ssh)
+
+
+async def _prepared_retained_job_for_expired_ide_delete(db):
+    """A real retained stop, workspace release and typed late purge."""
+    state = await _seed_bound_initial_stop(db, pre_ssh=True)
+    job_id, instance_id = state["job_id"], state["instance_id"]
+    await record_detached(db, str(job_id), state["binding"])
+    workspace_service = ManifestWorkspaceService(
+        db,
+        None,
+        namespace="workers",
+        default_image="pinned:image",
+        vm_provisioner=SimpleNamespace(
+            release_workspace_storage=AsyncMock(return_value=True)
+        ),
+    )
+    assert (
+        await workspace_service._delete_vm(
+            str(instance_id),
+            {"id": str(state["user_id"]), "is_admin": True},
+            expected_generation=1,
+        )
+    )["deleted"] is True
+    purged = {
+        **state["stop"],
+        "pvc_disposition": "purged",
+        "captured_workspace_storage": {
+            **state["binding"],
+            "pvc_uid": state["identity"].rootdisk_pvc_uid,
+        },
+        "controller_scope": await _controller_scope(db, state["retry_id"]),
+    }
+    provisioner = SimpleNamespace(
+        lifecycle_available=True,
+        capture_vm_teardown_identity=AsyncMock(return_value=state["identity"]),
+        release_vm_captured=AsyncMock(),
+        delete_vm_captured=AsyncMock(),
+        attest_vm_cleanup_stop=AsyncMock(return_value=purged),
+    )
+    controls = JobControlOperations(
+        SimpleNamespace(
+            vm_provisioner=provisioner,
+            recovery_store=VMWorkspaceRecoveryStore(db),
+        )
+    )
+    assert (await controls.delete_vm(str(job_id)))["status"] == "deleting"
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',"
+        "'\"deleted\"'::jsonb,true) WHERE id=$1",
+        job_id,
+    )
+    assert await db.prepare_stateless_job_for_delete(str(job_id)) is True
+    return state
+
+
+async def _expired_ide_tab(
+    db,
+    state,
+    *,
+    kind="ide",
+    claimant=None,
+    generation=None,
+    vm_uid=None,
+    owner_kind="job",
+    owner_id=None,
+):
+    return await db.fetchval(
+        "INSERT INTO vm_idle_access_leases "
+        "(owner_kind,owner_id,provision_generation,vm_uid,kind,claimed_by,"
+        "acquired_at,expires_at,max_expires_at) VALUES "
+        "($6,$1,$2,$3,$4,$5,clock_timestamp()-interval '5 minutes',"
+        "clock_timestamp()-interval '3 minutes',"
+        "clock_timestamp()-interval '1 minute') RETURNING id",
+        owner_id or state["job_id"],
+        generation or state["generation"],
+        UUID(vm_uid or state["identity"].vm_uid),
+        kind,
+        claimant or f"{state['user_id']}:{uuid4()}",
+        owner_kind,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["cancelled", "completed", "failed"])
+async def test_prepared_job_delete_closes_expired_ordinary_ide_tab_after_late_purge(
+    db, status
+):
+    state = await _prepared_retained_job_for_expired_ide_delete(db)
+    await db.execute("UPDATE jobs SET status=$2 WHERE id=$1", state["job_id"], status)
+    # A tab claimant need not be the Job owner (for example, a project member).
+    claimant = f"{uuid4()}:{uuid4()}" if status == "completed" else None
+    lease_id = await _expired_ide_tab(db, state, claimant=claimant)
+    before = await db.fetchrow(
+        "SELECT * FROM vm_idle_access_leases WHERE id=$1", lease_id
+    )
+
+    assert await db.delete_job(str(state["job_id"]), prepared_stateless=True) is True
+
+    after = await db.fetchrow(
+        "SELECT * FROM vm_idle_access_leases WHERE id=$1", lease_id
+    )
+    assert after["closed_at"] is not None
+    assert {key: value for key, value in after.items() if key != "closed_at"} == {
+        key: value for key, value in before.items() if key != "closed_at"
+    }
+    assert (
+        await db.fetchval("SELECT count(*) FROM jobs WHERE id=$1", state["job_id"]) == 0
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM run_queue WHERE unit_id=$1", state["job_id"]
+        )
+        == 0
+    )
+    receipt = json.loads(
+        await db.fetchval(
+            "SELECT deletion_receipt FROM vm_job_creation_owners WHERE job_id=$1",
+            state["job_id"],
+        )
+    )
+    assert receipt["generations"][0]["kind"] == "retained_late_purge"
+    assert receipt["generations"][0]["vm_uid"] == state["identity"].vm_uid
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "active_ide",
+        "ssh",
+        "sftp",
+        "operation",
+        "unknown",
+        "wrong_generation",
+        "wrong_vm",
+    ],
+)
+async def test_prepared_delete_leaves_all_access_unchanged_if_any_row_is_held(
+    db, blocker
+):
+    state = await _prepared_retained_job_for_expired_ide_delete(db)
+    candidate = await _expired_ide_tab(db, state)
+    options = {}
+    if blocker in {"ssh", "sftp"}:
+        options["kind"] = blocker
+    elif blocker == "operation":
+        options["claimant"] = f"{state['user_id']}:operation:{uuid4()}:{uuid4()}"
+    elif blocker == "unknown":
+        options["claimant"] = "legacy-tab"
+    elif blocker == "wrong_generation":
+        options["generation"] = uuid4()
+    elif blocker == "wrong_vm":
+        options["vm_uid"] = str(uuid4())
+    held = await _expired_ide_tab(db, state, **options)
+    if blocker == "active_ide":
+        await db.execute(
+            "UPDATE vm_idle_access_leases SET "
+            "expires_at=clock_timestamp()+interval '2 minutes',"
+            "max_expires_at=clock_timestamp()+interval '3 minutes' WHERE id=$1",
+            held,
+        )
+    before = [
+        dict(row)
+        for row in await db.fetch(
+            "SELECT * FROM vm_idle_access_leases WHERE id=ANY($1::uuid[]) ORDER BY id",
+            [candidate, held],
+        )
+    ]
+
+    with pytest.raises((JobVMAuditNotReady, asyncpg.CheckViolationError)):
+        await db.delete_job(str(state["job_id"]), prepared_stateless=True)
+
+    after = [
+        dict(row)
+        for row in await db.fetch(
+            "SELECT * FROM vm_idle_access_leases WHERE id=ANY($1::uuid[]) ORDER BY id",
+            [candidate, held],
+        )
+    ]
+    assert after == before
+    assert (
+        await db.fetchval("SELECT count(*) FROM jobs WHERE id=$1", state["job_id"]) == 1
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_job_creation_terminal_packets WHERE job_id=$1",
+            state["job_id"],
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_prepared_delete_does_not_touch_foreign_or_preclosed_tabs(db):
+    state = await _prepared_retained_job_for_expired_ide_delete(db)
+    candidate = await _expired_ide_tab(db, state)
+    thread_same_uuid = await _expired_ide_tab(
+        db, state, owner_kind="thread", owner_id=state["job_id"]
+    )
+    foreign_job = await _expired_ide_tab(db, state, owner_id=uuid4())
+    preclosed = await _expired_ide_tab(db, state)
+    await db.execute(
+        "UPDATE vm_idle_access_leases SET closed_at=clock_timestamp() WHERE id=$1",
+        preclosed,
+    )
+    before = [
+        dict(row)
+        for row in await db.fetch(
+            "SELECT * FROM vm_idle_access_leases WHERE id=ANY($1::uuid[]) ORDER BY id",
+            [thread_same_uuid, foreign_job, preclosed],
+        )
+    ]
+
+    assert await db.delete_job(str(state["job_id"]), prepared_stateless=True)
+
+    assert (
+        await db.fetchval(
+            "SELECT closed_at IS NOT NULL FROM vm_idle_access_leases WHERE id=$1",
+            candidate,
+        )
+        is True
+    )
+    after = [
+        dict(row)
+        for row in await db.fetch(
+            "SELECT * FROM vm_idle_access_leases WHERE id=ANY($1::uuid[]) ORDER BY id",
+            [thread_same_uuid, foreign_job, preclosed],
+        )
+    ]
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_failed_final_job_delete_rolls_back_expired_tab_retirement(db):
+    state = await _prepared_retained_job_for_expired_ide_delete(db)
+    lease_id = await _expired_ide_tab(db, state)
+    await db.execute(
+        "INSERT INTO jobs(id,parent_job_id,description,status) "
+        "VALUES($1,$2,'blocking child','created')",
+        uuid4(),
+        state["job_id"],
+    )
+
+    with pytest.raises(asyncpg.ForeignKeyViolationError):
+        await db.delete_job(str(state["job_id"]), prepared_stateless=True)
+
+    assert (
+        await db.fetchval(
+            "SELECT closed_at IS NULL FROM vm_idle_access_leases WHERE id=$1", lease_id
+        )
+        is True
+    )
+    assert (
+        await db.fetchval("SELECT count(*) FROM jobs WHERE id=$1", state["job_id"]) == 1
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM run_queue WHERE unit_id=$1", state["job_id"]
+        )
+        == 1
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_job_creation_terminal_packets WHERE job_id=$1",
+            state["job_id"],
+        )
+        == 0
+    )
+    assert (
+        await db.fetchval(
+            "SELECT deleted_at IS NULL FROM vm_job_creation_owners WHERE job_id=$1",
+            state["job_id"],
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_unprepared_job_delete_cannot_close_expired_ide_tab(db):
+    state = await _prepared_retained_job_for_expired_ide_delete(db)
+    lease_id = await _expired_ide_tab(db, state)
+    with pytest.raises(JobVMAuditNotReady, match="cleanup or access remains open"):
+        await db.delete_job(str(state["job_id"]), prepared_stateless=False)
+    assert (
+        await db.fetchval(
+            "SELECT closed_at IS NULL FROM vm_idle_access_leases WHERE id=$1", lease_id
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_typed_process_zero_proof_leaves_expired_tab_open(db):
+    state = await _prepared_retained_job_for_expired_ide_delete(db)
+    lease_id = await _expired_ide_tab(db, state)
+    removed = await db.execute(
+        "DELETE FROM managed_repository_process_zero_receipts "
+        "WHERE owner_kind='job' AND owner_id=$1 AND scope='vm' "
+        "AND runtime_incarnation=$2",
+        state["job_id"],
+        str(state["generation"]),
+    )
+    assert removed == "DELETE 1"
+
+    with pytest.raises(asyncpg.CheckViolationError, match="predecessor changed"):
+        await db.delete_job(str(state["job_id"]), prepared_stateless=True)
+
+    assert (
+        await db.fetchval(
+            "SELECT closed_at IS NULL FROM vm_idle_access_leases WHERE id=$1",
+            lease_id,
+        )
+        is True
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_job_creation_terminal_packets WHERE job_id=$1",
+            state["job_id"],
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_preparation_marker_leaves_expired_tab_open(db):
+    state = await _prepared_retained_job_for_expired_ide_delete(db)
+    lease_id = await _expired_ide_tab(db, state)
+    await db.execute(
+        "UPDATE jobs SET context=context-'_stateless_delete_pending' WHERE id=$1",
+        state["job_id"],
+    )
+    with pytest.raises(RuntimeError, match="stateless deletion marker missing"):
+        await db.delete_job(str(state["job_id"]), prepared_stateless=True)
+    assert (
+        await db.fetchval(
+            "SELECT closed_at IS NULL FROM vm_idle_access_leases WHERE id=$1", lease_id
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_reclassifies_lease_row_after_lock_wait(db):
+    state = await _prepared_retained_job_for_expired_ide_delete(db)
+    lease_id = await _expired_ide_tab(db, state)
+    async with db.acquire() as holder:
+        async with holder.transaction():
+            await holder.execute(
+                "UPDATE vm_idle_access_leases SET claimed_by='legacy-tab' WHERE id=$1",
+                lease_id,
+            )
+            deleting = asyncio.create_task(
+                db.delete_job(str(state["job_id"]), prepared_stateless=True)
+            )
+            await asyncio.sleep(0.05)
+            assert not deleting.done()
+    with pytest.raises(JobVMAuditNotReady, match="cleanup or access remains open"):
+        await deleting
+    assert (
+        await db.fetchval(
+            "SELECT closed_at IS NULL AND claimed_by='legacy-tab' "
+            "FROM vm_idle_access_leases WHERE id=$1",
+            lease_id,
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_exact_close_and_delete_never_reopen_tab(db):
+    state = await _prepared_retained_job_for_expired_ide_delete(db)
+    lease_id = await _expired_ide_tab(db, state)
+    claimant = await db.fetchval(
+        "SELECT claimed_by FROM vm_idle_access_leases WHERE id=$1", lease_id
+    )
+    async with db.acquire() as holder:
+        async with holder.transaction():
+            await holder.fetchrow(
+                "SELECT id FROM vm_idle_access_leases WHERE id=$1 FOR UPDATE",
+                lease_id,
+            )
+            deleting = asyncio.create_task(
+                db.delete_job(str(state["job_id"]), prepared_stateless=True)
+            )
+            closing = asyncio.create_task(
+                VMIdleAccessStore(db).close(
+                    str(lease_id),
+                    owner_kind="job",
+                    owner_id=str(state["job_id"]),
+                    kind="ide",
+                    claimant=claimant,
+                )
+            )
+            await asyncio.sleep(0.05)
+            assert not deleting.done() and not closing.done()
+    deleted, _ = await asyncio.gather(deleting, closing)
+    assert deleted is True
+    assert (
+        await db.fetchval(
+            "SELECT closed_at IS NOT NULL FROM vm_idle_access_leases WHERE id=$1",
+            lease_id,
+        )
+        is True
+    )
 
 
 async def _released_bound_stop(db):

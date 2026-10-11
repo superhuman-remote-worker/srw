@@ -8,6 +8,8 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
+from orchestrator.database.postgres import JobVMAuditNotReady
+from orchestrator.services.vm_idle_access import VMIdleAccessStore
 from tests.test_vm_job_cancel_retention_real_postgres import (
     _base_db,  # noqa: F401
     _db_fixture,  # noqa: F401
@@ -1282,6 +1284,36 @@ async def test_explicit_delete_purges_physical_disk_and_audits_logical_noeffect_
             store, job_id=state["job_id"], identity=state["identity"]
         )
     ).completed_outcome == "completed"
+    if tail == "never_issued":
+        claimant = f"{uuid4()}:{uuid4()}"
+        no_effect_tab = await db.fetchval(
+            "INSERT INTO vm_idle_access_leases "
+            "(owner_kind,owner_id,provision_generation,vm_uid,kind,claimed_by,"
+            "acquired_at,expires_at,max_expires_at) VALUES "
+            "('job',$1,$2,$3,'ide',$4,clock_timestamp()-interval '5 minutes',"
+            "clock_timestamp()-interval '3 minutes',"
+            "clock_timestamp()-interval '1 minute') RETURNING id",
+            UUID(state["job_id"]),
+            state["resume"]["provision_generation"],
+            uuid4(),
+            claimant,
+        )
+        with pytest.raises(JobVMAuditNotReady, match="cleanup or access remains open"):
+            await db.delete_job(state["job_id"], prepared_stateless=True)
+        assert (
+            await db.fetchval(
+                "SELECT closed_at IS NULL FROM vm_idle_access_leases WHERE id=$1",
+                no_effect_tab,
+            )
+            is True
+        )
+        assert await VMIdleAccessStore(db).close(
+            str(no_effect_tab),
+            owner_kind="job",
+            owner_id=state["job_id"],
+            kind="ide",
+            claimant=claimant,
+        )
     assert await db.delete_job(state["job_id"], prepared_stateless=True)
     assert (
         await db.fetchval(

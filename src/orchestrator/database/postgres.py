@@ -4800,6 +4800,7 @@ class PostgresDB:
         *,
         status: str,
         deletion_reason: str,
+        retire_expired_ide_tabs: bool = False,
     ) -> None:
         """Freeze every typed generation and cascaded terminal field before Delete."""
         owner = await conn.fetchrow(
@@ -4853,8 +4854,6 @@ class PostgresDB:
             "AND owner_id=$1 AND resolved_at IS NULL) OR "
             "EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs WHERE job_id=$1 "
             "AND resolved_at IS NULL) OR "
-            "EXISTS(SELECT 1 FROM vm_idle_access_leases WHERE owner_kind='job' "
-            "AND owner_id=$1 AND closed_at IS NULL) OR "
             "EXISTS(SELECT 1 FROM vm_idle_operations WHERE owner_kind='job' "
             "AND owner_id=$1 AND closed_at IS NULL) OR "
             "EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
@@ -4883,7 +4882,8 @@ class PostgresDB:
                 job_id,
             )
         retries = await conn.fetch(
-            "SELECT request_id,provision_generation FROM vm_creation_retries "
+            "SELECT request_id,provision_generation,observed_vm_uid "
+            "FROM vm_creation_retries "
             "WHERE owner_kind='job' AND job_id=$1 ORDER BY request_id FOR SHARE",
             job_id,
         )
@@ -4978,6 +4978,7 @@ class PostgresDB:
             job_id,
         )
         packets: list[dict[str, Any]] = []
+        physical_identities: set[tuple[UUID, UUID]] = set()
         for retry in retries:
             raw = await conn.fetchval(
                 "SELECT vm_job_terminal_packet_evidence($1)",
@@ -4989,6 +4990,41 @@ class PostgresDB:
                 )
             packet = json.loads(raw) if isinstance(raw, str) else raw
             packets.append(packet)
+            if packet["kind"] in {"physical_stop", "retained_late_purge"}:
+                if (
+                    packet.get("job_id") != str(job_id)
+                    or packet.get("request_id") != str(retry["request_id"])
+                    or packet.get("provision_generation")
+                    != str(retry["provision_generation"])
+                ):
+                    raise JobVMAuditNotReady("VM Job physical packet identity changed")
+                try:
+                    vm_uid = UUID(packet["vm_uid"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise JobVMAuditNotReady(
+                        "VM Job physical packet has no VM identity"
+                    ) from exc
+                if vm_uid != retry["observed_vm_uid"]:
+                    raise JobVMAuditNotReady(
+                        "VM Job physical packet VM identity changed"
+                    )
+                physical_identities.add((retry["provision_generation"], vm_uid))
+
+        if retire_expired_ide_tabs:
+            from orchestrator.services.vm_idle_access import VMIdleAccessStore
+
+            if not await VMIdleAccessStore.close_expired_job_ide_tabs_on_conn(
+                conn, job_id, physical_identities=physical_identities
+            ):
+                raise JobVMAuditNotReady("VM Job cleanup or access remains open")
+        # This strict predicate remains the final access gate for all callers.
+        if await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases WHERE owner_kind='job' "
+            "AND owner_id=$1 AND closed_at IS NULL)",
+            job_id,
+        ):
+            raise JobVMAuditNotReady("VM Job cleanup or access remains open")
+        for retry, packet in zip(retries, packets):
             await conn.execute(
                 "INSERT INTO vm_job_creation_terminal_packets "
                 "(request_id,job_id,provision_generation,terminal_kind,cleanup_admission_id,evidence) "
@@ -5184,6 +5220,7 @@ class PostgresDB:
                         uuid_val,
                         status=str(deleting_job["status"]),
                         deletion_reason=str(deletion_reason or "database_delete"),
+                        retire_expired_ide_tabs=prepared_stateless,
                     )
                     # Deletion is never a release. This update and the jobs
                     # DELETE share the transaction, so a fault cannot leave an

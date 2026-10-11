@@ -672,9 +672,28 @@ async def test_logical_cancel_then_charged_physical_successor_final_disposition(
             second["execution_id"],
         )
     assert await db.prepare_stateless_job_for_delete(str(owner))
+    lease_id = await db.fetchval(
+        "INSERT INTO vm_idle_access_leases "
+        "(owner_kind,owner_id,provision_generation,vm_uid,kind,claimed_by,"
+        "acquired_at,expires_at,max_expires_at) VALUES "
+        "('job',$1,$2,$3,'ide',$4,clock_timestamp()-interval '5 minutes',"
+        "clock_timestamp()-interval '3 minutes',"
+        "clock_timestamp()-interval '1 minute') RETURNING id",
+        owner,
+        second["provision_generation"],
+        vm_uid,
+        f"{uuid4()}:{uuid4()}",
+    )
     if unattributed_delivery is not None:
         with pytest.raises(JobVMAuditNotReady):
             await db.delete_job(str(owner), prepared_stateless=True)
+        assert (
+            await db.fetchval(
+                "SELECT closed_at IS NULL FROM vm_idle_access_leases WHERE id=$1",
+                lease_id,
+            )
+            is True
+        )
         assert await db.fetchval("SELECT count(*) FROM jobs WHERE id=$1", owner) == 1
         assert (
             await db.fetchval(
@@ -685,6 +704,13 @@ async def test_logical_cancel_then_charged_physical_successor_final_disposition(
         )
         return
     assert await db.delete_job(str(owner), prepared_stateless=True)
+    assert (
+        await db.fetchval(
+            "SELECT closed_at IS NOT NULL FROM vm_idle_access_leases WHERE id=$1",
+            lease_id,
+        )
+        is True
+    )
     packets = await db.fetch(
         "SELECT request_id,terminal_kind FROM vm_job_creation_terminal_packets "
         "WHERE job_id=$1",

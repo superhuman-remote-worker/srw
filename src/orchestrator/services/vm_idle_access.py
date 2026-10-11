@@ -74,6 +74,97 @@ class VMIdleAccessStore:
     def __init__(self, db: Any) -> None:
         self.db = db
 
+    @staticmethod
+    async def close_expired_job_ide_tabs_on_conn(
+        conn: Any,
+        job_id: UUID,
+        *,
+        physical_identities: set[tuple[UUID, UUID]],
+    ) -> bool:
+        """Retire only proven expired ordinary tabs inside final Job Delete.
+
+        The caller owns the queue and Job locks and the transaction. Refusal
+        changes no row; any later Delete failure rolls closures back with the
+        terminal audit.
+        """
+        job = await conn.fetchrow(
+            "SELECT status,execution_lane,"
+            "COALESCE(context,'{}'::jsonb) @> "
+            "'{\"_stateless_delete_pending\": true}'::jsonb AS delete_pending "
+            "FROM jobs WHERE id=$1",
+            job_id,
+        )
+        queue = await conn.fetchrow(
+            "SELECT unit_kind,state FROM run_queue WHERE unit_id=$1", job_id
+        )
+        owner = await conn.fetchrow(
+            "SELECT live_job_id,deleted_at FROM vm_job_creation_owners WHERE job_id=$1",
+            job_id,
+        )
+        if (
+            job is None
+            or job["status"] not in {"completed", "cancelled", "failed"}
+            or job["execution_lane"] != "stateless"
+            or job["delete_pending"] is not True
+            or queue is None
+            or queue["unit_kind"] != "worker_batch"
+            or queue["state"] != "done"
+            or owner is None
+            or owner["live_job_id"] != job_id
+            or owner["deleted_at"] is not None
+        ):
+            return False
+
+        rows = await conn.fetch(
+            "SELECT id,owner_kind,owner_id,kind,claimed_by,provision_generation,"
+            "vm_uid,expires_at,closed_at FROM vm_idle_access_leases "
+            "WHERE owner_kind='job' AND owner_id=$1 ORDER BY id FOR UPDATE",
+            job_id,
+        )
+        cutoff = await conn.fetchval("SELECT clock_timestamp()")
+        eligible = []
+        for row in rows:
+            if row["closed_at"] is not None:
+                continue
+            claimant = row["claimed_by"]
+            parts = claimant.split(":") if isinstance(claimant, str) else []
+            try:
+                ordinary_tab = len(parts) == 2 and all(
+                    str(UUID(part)) == part for part in parts
+                )
+            except ValueError:
+                ordinary_tab = False
+            if (
+                row["kind"] != "ide"
+                or not ordinary_tab
+                or row["expires_at"] > cutoff
+                or (row["provision_generation"], row["vm_uid"])
+                not in physical_identities
+            ):
+                return False
+            eligible.append(row)
+
+        updated = []
+        for row in eligible:
+            closed = await conn.fetchval(
+                "UPDATE vm_idle_access_leases SET closed_at=$7 "
+                "WHERE id=$1 AND owner_kind='job' AND owner_id=$2 "
+                "AND kind='ide' AND claimed_by=$3 AND provision_generation=$4 "
+                "AND vm_uid=$5 AND expires_at=$6 AND expires_at<=$7 "
+                "AND closed_at IS NULL RETURNING id",
+                row["id"],
+                job_id,
+                row["claimed_by"],
+                row["provision_generation"],
+                row["vm_uid"],
+                row["expires_at"],
+                cutoff,
+            )
+            updated.append(closed)
+        if updated != [row["id"] for row in eligible]:
+            raise RuntimeError("VM Job IDE tab retirement lost its locked rows")
+        return True
+
     @asynccontextmanager
     async def ide_operation(
         self,
@@ -423,7 +514,11 @@ class VMIdleAccessStore:
                 "AND wake_id IS NOT DISTINCT FROM $7 AND closed_at IS NULL "
                 "AND expires_at>clock_timestamp() AND max_expires_at>clock_timestamp() "
                 "FOR UPDATE",
-                writer_id, owner_kind, owner, operation_claimant, *identity,
+                writer_id,
+                owner_kind,
+                owner,
+                operation_claimant,
+                *identity,
             )
             if writer is None:
                 return False
@@ -432,7 +527,11 @@ class VMIdleAccessStore:
                 "WHERE id=$1 AND owner_kind=$2 AND owner_id=$3 AND kind='ide' "
                 "AND claimed_by=$4 AND provision_generation=$5 AND vm_uid=$6 "
                 "AND wake_id IS NOT DISTINCT FROM $7 FOR UPDATE",
-                tab_id, owner_kind, owner, tab_claimant, *identity,
+                tab_id,
+                owner_kind,
+                owner,
+                tab_claimant,
+                *identity,
             )
             if tab is None:
                 return False
@@ -443,7 +542,8 @@ class VMIdleAccessStore:
                 "expires_at=LEAST(max_expires_at,clock_timestamp()+interval '2 minutes') "
                 "WHERE id=$1 AND closed_at IS NULL "
                 "AND expires_at>clock_timestamp() AND max_expires_at>clock_timestamp() "
-                "RETURNING id", tab_id,
+                "RETURNING id",
+                tab_id,
             )
             return updated is not None
 
