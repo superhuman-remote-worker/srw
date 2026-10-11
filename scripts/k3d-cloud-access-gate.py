@@ -818,7 +818,7 @@ class AccessGate:
         finally:
             if not self.args.keep:
                 self.cleanup()
-        return 0 if self.report.passed() else 1
+        return 0 if self.report.passed else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
