@@ -6363,13 +6363,23 @@ async def test_soft_end_revokes_never_delivered_reader_before_zero_stage(
     assert _json(staged["payload"])["file_count"] == 0
 
 
-async def _end_thread(db, cloud_router, thread_id, *, permanent):
+async def _end_thread(db, cloud_router, thread_id, *, permanent, cleanup=None):
+    """Run End or DELETE; ``cleanup`` stands in for the Kubernetes cleanup.
+
+    Every staged review's manifest is present in S3.
+    """
+    import contextlib
+
     import orchestrator.main as orch_main
 
     thread = await db.get_thread(thread_id)
     assert thread is not None
+    snapshots = MagicMock()
+    snapshots.get_blob = AsyncMock(return_value=b"{}")
     with (
+        contextlib.ExitStack() as stack,
         patch.object(orch_main.app.state.resources, "postgres_db", db),
+        patch.object(snapshot_service_module, "snapshot_service", snapshots),
         patch.object(orch_main.app.state.resources, "main_cloud_router", cloud_router),
         patch.object(
             orch_main.app.state.resources.session_router,
@@ -6387,6 +6397,14 @@ async def _end_thread(db, cloud_router, thread_id, *, permanent):
             AsyncMock(return_value=False),
         ),
     ):
+        if cleanup is not None:
+            stack.enter_context(
+                patch.object(
+                    pinned_retirement_module.PinnedRetirementOperations,
+                    "cleanup_pinned_thread_retirement",
+                    cleanup,
+                )
+            )
         return await controls_composition.thread_retirement_operations(
             orch_main.app.state.resources
         ).end_thread_flow(thread_id, thread, permanent=permanent, force=True)
@@ -6548,6 +6566,249 @@ async def test_delete_accepts_only_the_exact_revoked_earlier_reader(
         row_id: "revoked",
         **({str(other_row): "revoked"} if tamper == "other_thread" else {}),
     }
+
+
+async def _run_current_life(db, ids):
+    """Start the resumed life's agent Pod and a ready sandbox workspace."""
+
+    generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
+    attempt = str(uuid4())
+    pod_name = f"persistent-{ids['thread'][:12]}"
+    assert await db.reserve_pinned_agent_pod_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=generation,
+        attempt_id=attempt,
+        pod_name=pod_name,
+        provisioner="persistent",
+        namespace="agents-a",
+        pvc_name=None,
+    )
+    assert await db.publish_pinned_agent_pod_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=generation,
+        attempt_id=attempt,
+        pod_name=pod_name,
+        pod_uid="second-pod",
+        namespace="agents-a",
+    )
+    workspace_generation = str(uuid4())
+    workspace_runtime = str(uuid4())
+    async with db.acquire() as conn:
+        metadata = _json(
+            await conn.fetchval(
+                "SELECT metadata FROM threads WHERE id=$1::uuid",
+                UUID(ids["thread"]),
+            )
+        )
+        metadata["workspace_container"] = {
+            "status": "ready",
+            "provisioner": "k8s",
+            "namespace": "default",
+            "pod_name": f"ws-thread-{ids['thread'][:12]}",
+            "_runtime_incarnation": workspace_runtime,
+            "_canvas_workspace_generation": workspace_generation,
+        }
+        metadata["_workspace_binding"] = {
+            "kind": "remote",
+            "generation": workspace_generation,
+            "backing_id": f"k8s-pod:default:{workspace_runtime}",
+            "ssh_host_key_fingerprint": "SHA256:readerless-life",
+        }
+        await conn.execute(
+            "INSERT INTO agents "
+            "(id,config_name,hostname,pod_ip,pod_uid,status,agent_mode,last_heartbeat) "
+            "VALUES ($1,'centurion',$2,'127.0.0.1','second-pod','session',"
+            "'persistent',now())",
+            UUID(ids["agent"]),
+            pod_name,
+        )
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE threads SET status='active', metadata=$4::jsonb, "
+                "agent_id=$2, control_admission_agent_id=$2, "
+                "runtime_attach_token=$3 WHERE id=$1",
+                UUID(ids["thread"]),
+                UUID(ids["agent"]),
+                UUID(ids["attach_token"]),
+                json.dumps(metadata),
+            )
+            await conn.execute(
+                "UPDATE agents SET thread_id=$2::uuid WHERE id=$1::uuid",
+                UUID(ids["agent"]),
+                UUID(ids["thread"]),
+            )
+    await runtime_actor.mint_thread_runtime_actor(
+        db, thread_id=ids["thread"], agent_id=ids["agent"]
+    )
+
+
+async def _begin_soft_end_of_running_life(db, ids):
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
+    assert retirement.get("state") == "pending", retirement
+    assert retirement["context"]["runtime_authority_exposed"] is True
+    await _authorize_and_ack(db, ids, retirement)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE agents SET status='offline' WHERE id=$1::uuid", UUID(ids["agent"])
+        )
+    return retirement
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_ran", [False, True], ids=["no_agent", "agent_ran"])
+async def test_resume_with_a_refused_re_engage_can_end(db, agent_ran):
+    """End of a life whose re-engage was refused (k3d 2026-10-11, wedge G).
+
+    That life minted no reader, so it never had the folder mounted. End
+    retried "lacks exact staging authority" forever, which kept Resume closed
+    and DELETE refused (409 ``retirement_mode_changed``). It now receipts an
+    empty stage; the first life's pending review stays on its row untouched.
+    """
+    (
+        ids,
+        row_id,
+        first_generation,
+        cloud_router,
+        backend,
+        plan,
+    ) = await _resume_after_a_refused_re_engage(db)
+    review = {
+        "signature": "first-life-review",
+        "source_binding": plan.source.binding,
+        "source_binding_sha256": plan.source_sha256,
+        "counts": {"added": 1, "modified": 0, "deleted": 0},
+    }
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE cloud_ro_mounts SET staged_epoch=3, staged_at=now(), "
+            "staged_summary=$2::jsonb WHERE id=$1::uuid",
+            UUID(row_id),
+            json.dumps(review),
+        )
+    second_generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
+    cleanup = None
+    if agent_ran:
+        await _run_current_life(db, ids)
+        await _begin_soft_end_of_running_life(db, ids)
+        cleanup = AsyncMock(return_value=None)
+
+    result = await _end_thread(
+        db, cloud_router, ids["thread"], permanent=False, cleanup=cleanup
+    )
+
+    assert result == {"status": "ended"}
+    if cleanup is not None:
+        cleanup.assert_awaited_once()
+    assert (await db.get_thread(ids["thread"]))["status"] == "ended"
+    backend.revoke_protected_reader_attempt.assert_awaited_once_with(plan)
+    reader = await db.get_ro_mount_by_thread(ids["thread"])
+    assert str(reader["id"]) == row_id
+    assert str(reader["runtime_generation"]) == first_generation
+    assert reader["status"] == "revoked"
+    assert reader["staged_epoch"] == 3
+    assert reader["staged_summary"] == review
+    async with db.acquire() as conn:
+        staged = await conn.fetch(
+            "SELECT payload FROM thread_events WHERE thread_id=$1::uuid "
+            "AND kind='cloud.diff_staged' ORDER BY seq",
+            UUID(ids["thread"]),
+        )
+    payload = _json(staged[-1]["payload"])
+    assert payload["session_runtime_generation"] == second_generation
+    assert payload["mount_id"] == row_id
+    assert payload["staged_epoch"] == 0
+    assert payload["file_count"] == 0
+    assert await db.resume_thread(ids["thread"])
+
+
+async def _soft_end_receipt(db, ids, retirement):
+    return await db.publish_never_engaged_retirement_stage_receipt(
+        ids["thread"],
+        expected_runtime_generation=retirement["generation"],
+        expected_retirement_token=retirement["token"],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reader_status", ["engaging", "revoked"])
+async def test_a_reader_of_this_life_still_needs_real_staging(db, reader_status):
+    """Only a life that minted no reader skips staging after its agent ran."""
+
+    (
+        ids,
+        row_id,
+        _generation,
+        _router,
+        _backend,
+        plan,
+    ) = await _resume_after_a_refused_re_engage(db)
+    reader = await db.get_ro_mount_by_thread(ids["thread"])
+    second_generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
+    this_life = ProtectedNextcloudReaderGrantPlan(
+        engage_attempt=str(uuid4()),
+        backend_instance_id=plan.backend_instance_id,
+        source=plan.source,
+    )
+    assert await db.install_ro_mount_engage_intent(
+        thread_id=ids["thread"],
+        user_id=ids["user"],
+        selected_mount_id=str(reader["selected_mount_id"]),
+        expected_runtime_generation=second_generation,
+        plan=this_life,
+        credentials="this-life-secret",
+        webdav_url="https://cloud.internal.invalid/dav/this-life",
+    )
+    if reader_status == "revoked":
+        for step in (
+            db.begin_ro_mount_revocation_if_matches,
+            db.finish_ro_mount_revocation_if_matches,
+        ):
+            assert await step(
+                row_id,
+                expected_thread_id=ids["thread"],
+                expected_runtime_generation=second_generation,
+                plan=this_life,
+            )
+    await _run_current_life(db, ids)
+    retirement = await _begin_soft_end_of_running_life(db, ids)
+    captured = retirement["context"]["protected_ro"]
+    assert captured["runtime_generation"] == second_generation
+    assert captured["status"] == reader_status
+
+    assert await _soft_end_receipt(db, ids, retirement) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tamper", ["captured_live", "another_attempt"])
+async def test_the_readerless_receipt_needs_the_exact_earlier_row(db, tamper):
+    (
+        ids,
+        row_id,
+        _generation,
+        _router,
+        _backend,
+        _plan,
+    ) = await _resume_after_a_refused_re_engage(db)
+    await _run_current_life(db, ids)
+    retirement = await _begin_soft_end_of_running_life(db, ids)
+    assert retirement["context"]["protected_ro"]["id"] == row_id
+    path, value = {
+        "captured_live": (["protected_ro", "status"], "active"),
+        "another_attempt": (["protected_ro", "engage_attempt"], str(uuid4())),
+    }[tamper]
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SET LOCAL session_replication_role = replica")
+            await conn.execute(
+                "UPDATE threads SET runtime_retirement_context=jsonb_set("
+                "runtime_retirement_context, $2::text[], to_jsonb($3::text)) "
+                "WHERE id=$1::uuid",
+                UUID(ids["thread"]),
+                path,
+                value,
+            )
+
+    assert await _soft_end_receipt(db, ids, retirement) is None
 
 
 @pytest.mark.asyncio

@@ -251,3 +251,43 @@ class ProtectedNextcloudReaderGrantPlan:
         ):
             return None
         return plan
+
+
+def readerless_protected_life(
+    captured: Mapping[str, Any] | None,
+    current: Mapping[str, Any] | None,
+    *,
+    thread_id: str,
+    runtime_generation: str,
+) -> bool:
+    """Whether one protected life minted no reader, so it never had the folder.
+
+    Main cloud slice 5 refuses a demoted owner's re-engage on Resume, which
+    leaves the thread's only reader row an earlier life's, revoked; a session
+    whose first engage never installed a row has none. Rows are never deleted,
+    and only a new engage moves the row to the current generation, which a
+    pending retirement refuses. Begin's ``captured`` copy and the locked
+    ``current`` row of either shape therefore prove that no credential for the
+    folder reached this life's runtime, whatever its agent did.
+    """
+
+    if captured is None:
+        return current is None
+    if not isinstance(captured, Mapping) or not isinstance(current, Mapping):
+        return False
+    plan = ProtectedNextcloudReaderGrantPlan.from_ro_mount_row(captured)
+    generation = str(captured.get("runtime_generation") or "")
+    return bool(
+        plan is not None
+        and generation
+        and generation != str(runtime_generation)
+        and str(captured.get("thread_id") or "") == str(thread_id)
+        and captured.get("status") == "revoked"
+        and str(current.get("id") or "") == str(captured.get("id") or "")
+        and str(current.get("thread_id") or "") == str(thread_id)
+        and str(current.get("runtime_generation") or "") == generation
+        and str(current.get("engage_attempt") or "")
+        == str(captured.get("engage_attempt") or "")
+        and current.get("status") == "revoked"
+        and ProtectedNextcloudReaderGrantPlan.from_ro_mount_row(current) == plan
+    )

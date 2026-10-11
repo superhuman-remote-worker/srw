@@ -183,6 +183,7 @@ from orchestrator.services.cloud.protected_effect_contract import (
 )
 from orchestrator.services.cloud.protected_reader_authority import (
     ProtectedNextcloudReaderGrantPlan,
+    readerless_protected_life,
 )
 from orchestrator.services.cloud_staging.source_identity import (
     ProtectedMountSourceIdentity,
@@ -10837,6 +10838,10 @@ class PostgresDB:
         no workspace once its exact attempt is soft-fenced: only the image and
         SRW's own read-only reader sidecar ran in it, and the fence proves that
         Pod is gone. Its retained volume is left for Resume as in any soft End.
+
+        A life that minted no reader (``readerless_protected_life``: a refused
+        re-engage after Resume) receipts zero even after its agent ran. The
+        receipt still names the captured earlier row, the source Begin bound.
         """
 
         try:
@@ -11193,7 +11198,21 @@ class PostgresDB:
                             and current_stage_epoch == 0
                             and current_ro.get("staged_summary") is None
                         )
-                if not no_runtime_exposed or not no_reader_exposed:
+                # A life that minted no reader never had the folder mounted,
+                # whatever its agent and workspace did: it has nothing to
+                # stage. An earlier life's review stays on its row untouched.
+                readerless_life = bool(
+                    context.get("protected_cloud") is True
+                    and readerless_protected_life(
+                        captured_ro,
+                        current_ro,
+                        thread_id=str(parsed_thread),
+                        runtime_generation=str(parsed_generation),
+                    )
+                )
+                if not readerless_life and (
+                    not no_runtime_exposed or not no_reader_exposed
+                ):
                     return None
                 receipt = {
                     "version": 1,

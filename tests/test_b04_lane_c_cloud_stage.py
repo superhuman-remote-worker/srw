@@ -666,6 +666,140 @@ class TestNeverEngagedReceipt:
         )
 
 
+EARLIER_GENERATION = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+
+
+class TestReaderlessLife:
+    """A resumed life whose re-engage was refused minted no reader.
+
+    It never had the folder mounted, so its End receipts zero even after its
+    agent ran (k3d access gate, 2026-10-11). The receipt names the earlier
+    row Begin captured, whose own review stays untouched.
+    """
+
+    def _fixture(self):
+        retirement, thread, _row = TestNeverEngagedReceipt()._fixture()
+        earlier_review = {"counts": {"added": 1, "modified": 0, "deleted": 0}}
+        earlier = {
+            **retirement["context"]["protected_ro"],
+            "status": "revoked",
+            "runtime_generation": EARLIER_GENERATION,
+            "staged_epoch": 3,
+            "staged_summary": earlier_review,
+        }
+        retirement["context"]["protected_ro"] = earlier
+        retirement["context"]["protected_cloud"] = True
+        thread["runtime_generation"] = GENERATION
+        return retirement, thread, deepcopy(earlier)
+
+    def test_an_earlier_revoked_reader_receipts_zero_for_this_life(self):
+        retirement, thread, row = self._fixture()
+
+        assert _validate(retirement, thread, row) == (
+            True,
+            {
+                "thread_id": THREAD,
+                "session_runtime_generation": GENERATION,
+                "staged_epoch": 0,
+                "file_count": 0,
+                "counts": {"added": 0, "modified": 0, "deleted": 0},
+                "mount_id": MOUNT,
+            },
+        )
+
+    def test_a_life_with_no_reader_row_receipts_zero(self):
+        retirement, thread, _row = self._fixture()
+        retirement["context"]["protected_ro"] = None
+        thread["runtime_retirement_stage_receipt"].update(
+            mount_id=None, engage_attempt=None, source_binding_sha256=None
+        )
+
+        valid, event = _validate(retirement, thread, None)
+
+        assert valid is True
+        assert event["mount_id"] is None
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            pytest.param(
+                lambda c, r: (
+                    c.__setitem__("runtime_generation", GENERATION),
+                    r.__setitem__("runtime_generation", GENERATION),
+                ),
+                id="a reader of this life",
+            ),
+            pytest.param(
+                lambda c, r: c.__setitem__("status", "active"),
+                id="captured live",
+            ),
+            pytest.param(
+                lambda c, r: r.__setitem__("status", "engaging"),
+                id="re-engaged since",
+            ),
+            pytest.param(
+                lambda c, r: r.__setitem__("runtime_generation", GENERATION),
+                id="the row moved to this life",
+            ),
+            pytest.param(lambda c, r: r.__setitem__("id", SELECTED_MOUNT), id="row"),
+            pytest.param(
+                lambda c, r: r.__setitem__("engage_attempt", SELECTED_MOUNT),
+                id="attempt",
+            ),
+            pytest.param(
+                lambda c, r: c.__setitem__("thread_id", SELECTED_MOUNT),
+                id="another thread",
+            ),
+            pytest.param(
+                lambda c, r: r.__setitem__("reader_id", "someone-else"),
+                id="another grant",
+            ),
+        ],
+    )
+    def test_refuses_anything_but_the_exact_earlier_row(self, mutate):
+        retirement, thread, row = self._fixture()
+        mutate(retirement["context"]["protected_ro"], row)
+
+        assert _validate(retirement, thread, row) == (False, None)
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            pytest.param(
+                lambda ret, t: ret["context"].__setitem__("protected_cloud", False),
+                id="not protected",
+            ),
+            pytest.param(
+                lambda ret, t: t.__setitem__("runtime_generation", EARLIER_GENERATION),
+                id="the thread moved",
+            ),
+        ],
+    )
+    def test_refuses_outside_this_protected_life(self, mutate):
+        retirement, thread, row = self._fixture()
+        mutate(retirement, thread)
+
+        assert _validate(retirement, thread, row) == (False, None)
+
+    @pytest.mark.parametrize(
+        ("captured", "current"),
+        [
+            pytest.param("row", None, id="the captured row is gone"),
+            pytest.param(None, "row", id="a row appeared"),
+        ],
+    )
+    def test_a_missing_side_is_not_readerless(self, captured, current):
+        retirement, thread, row = self._fixture()
+        retirement["context"]["protected_ro"] = (
+            retirement["context"]["protected_ro"] if captured else None
+        )
+
+        assert _validate(retirement, thread, row if current else None) == (
+            False,
+            None,
+        )
+
+
 # =============================================================================
 # _cloud_stage_task_key / _thread_selected_vm_workspace / broadcast
 # =============================================================================
