@@ -372,6 +372,46 @@ class TestRemoteShellCompletionRecords:
     def test_wrapped_or_malformed_command_echo_never_completes(self, line):
         assert _parse_shell_completion_record(line, self._SENTINEL) is None
 
+    def test_a_long_command_runs_from_a_workspace_file(self, remote_backend):
+        # tmux refuses a send-keys message over ~16 KiB; the pane guard then
+        # waited for a command it never received (dev session 2c6d3e06).
+        backend, _, _ = remote_backend
+        long_command = "cat > page.html <<'EOF'\n" + "<p>x</p>\n" * 3000 + "EOF"
+        with patch.object(backend, "write_file") as write_file:
+            command = backend._build_guarded_shell_command(
+                long_command, self._SENTINEL, None
+            )
+
+        (relative, content), _ = write_file.call_args
+        assert relative.startswith(".srw/shell/cmd-")
+        assert content == long_command + "\n"
+        assert len(command.encode()) < 1024
+        assert f". /home/agent-host/workspace/{relative};" in command
+        assert "(exit $_srw_spill_rc)" in command
+
+    def test_a_short_command_is_typed_as_is(self, remote_backend):
+        backend, _, _ = remote_backend
+        with patch.object(backend, "write_file") as write_file:
+            command = backend._build_guarded_shell_command(
+                "echo ok", self._SENTINEL, None
+            )
+
+        write_file.assert_not_called()
+        assert "echo ok" in command
+
+    def test_a_command_tmux_cannot_type_never_sets_the_guard(self, remote_backend):
+        backend, _, _ = remote_backend
+        with patch.object(backend, "_tmux_mutate_checked") as mutate:
+            with pytest.raises(ValueError, match="too long"):
+                backend._reserve_and_send_shell_command(
+                    "default",
+                    expected=None,
+                    sentinel=self._SENTINEL,
+                    command="x" * 20000,
+                )
+
+        mutate.assert_not_called()
+
     def test_only_exact_newline_separated_record_completes(self, remote_backend):
         backend, _, _ = remote_backend
         command = backend._build_guarded_shell_command("echo ok", self._SENTINEL, None)

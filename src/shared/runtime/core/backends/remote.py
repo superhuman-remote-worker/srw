@@ -61,6 +61,14 @@ from shared.runtime.core.workspace_backend import (
 
 logger = logging.getLogger(__name__)
 
+#: Bytes a command may have to be typed into a pane with ``tmux send-keys``.
+#: tmux refuses a longer message ("command too long", about 16 KiB), and the
+#: guard script's trailing Enter still succeeded, so the pane guard waited for
+#: a command the shell never received and the tab refused every later command
+#: (dev session 2c6d3e06, 16.7 KB and 23.4 KB heredocs). A longer command runs
+#: from a workspace file instead (``_spill_long_command``).
+_SEND_KEYS_INLINE_LIMIT = 8 * 1024
+
 # Stall/timeout constants, interactive-prompt patterns and message templates
 # are shared from shell_protocol (imported above) to keep the local and remote
 # shell backends in lock-step.
@@ -3413,6 +3421,14 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         command: str,
     ) -> None:
         """CAS the pane guard and type a command under one remote lock."""
+        if len(command.encode("utf-8")) > 2 * _SEND_KEYS_INLINE_LIMIT - 1024:
+            # The guard is set in the same script as the send; a send tmux
+            # refuses would leave the tab waiting for a command it never got.
+            raise ValueError(
+                f"Command too long to type into tab {tab_name!r} "
+                f"({len(command.encode('utf-8'))} bytes); write it to a file "
+                "and run the file instead."
+            )
         pane = self._tmux_pane_target(tab_name)
         expected_value = expected or ""
         output = self._tmux_mutate_checked(
@@ -4289,6 +4305,11 @@ __SRW_WORKSPACE_UID_ZERO_PY__
 
     def _tmux_send_keys(self, tab_name: str, text: str, enter: bool = True) -> None:
         """Send keys to a remote tmux pane."""
+        if len(text.encode("utf-8")) > _SEND_KEYS_INLINE_LIMIT:
+            raise ValueError(
+                f"Input too long to type into tab {tab_name!r} "
+                f"({len(text.encode('utf-8'))} bytes); write it to a file instead."
+            )
         pane = self._tmux_pane_target(tab_name)
         tab = self._tabs[tab_name]
         assert tab.pane_id is not None
@@ -4394,6 +4415,21 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 self._tab_sync_locks[tab_name] = lock
             return lock
 
+    def _spill_long_command(self, command: str) -> str:
+        """``command``, or a short line that runs it from a workspace file.
+
+        A command over ``_SEND_KEYS_INLINE_LIMIT`` is written over SFTP and
+        sourced in the same shell, so its cwd and variables behave as if it
+        had been typed. The file is removed afterwards and the command's exit
+        status is kept for the completion record.
+        """
+        if len(command.encode("utf-8")) <= _SEND_KEYS_INLINE_LIMIT:
+            return command
+        relative = posixpath.join(".srw", "shell", f"cmd-{uuid.uuid4().hex[:12]}.sh")
+        self.write_file(relative, command if command.endswith("\n") else command + "\n")
+        path = shlex.quote(self._resolve(relative))
+        return f". {path}; _srw_spill_rc=$?; rm -f {path}; (exit $_srw_spill_rc)"
+
     def _build_guarded_shell_command(
         self,
         command: str,
@@ -4402,7 +4438,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         start_marker: Optional[str] = None,
     ) -> str:
         """Build one command whose sentinel follows any requested cwd restore."""
-        command = self._with_credential_environment(command)
+        command = self._with_credential_environment(self._spill_long_command(command))
         if not working_dir:
             return build_sentinel_command(command, sentinel, start_marker)
 
