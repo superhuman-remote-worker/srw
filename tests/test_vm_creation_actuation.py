@@ -1139,6 +1139,7 @@ async def test_vm_creation_run_logs_closed_stage_and_family_without_secret_or_gr
 ):
     from vm_controller.creation_actuation import CreationActuator
 
+    caplog.set_level(logging.INFO, logger="vm_controller.creation_actuation")
     ctrl, api, authority, payload = profiled_setup
     actuator = CreationActuator(ctrl)
     original_publish = CreationActuator.publish
@@ -1234,6 +1235,7 @@ async def test_vm_creation_run_logs_closed_stage_and_family_without_secret_or_gr
         record.getMessage()
         for record in caplog.records
         if record.name == "vm_controller.creation_actuation"
+        and record.getMessage().startswith("VM creation evidence refusal:")
     ]
     assert len(messages) == 1
     assert f"stage={stage}" in messages[0]
@@ -1251,6 +1253,7 @@ async def test_creation_source_validation_refusal_has_closed_stage_without_grant
     from vm_controller.creation_actuation import CreationActuator
     from vm_controller.creation_sources import GoldenSources
 
+    caplog.set_level(logging.INFO, logger="vm_controller.creation_actuation")
     ctrl, api, authority, payload = profiled_setup
 
     async def reject_source(self, row, source):
@@ -1267,6 +1270,7 @@ async def test_creation_source_validation_refusal_has_closed_stage_without_grant
         record.getMessage()
         for record in caplog.records
         if record.name == "vm_controller.creation_actuation"
+        and record.getMessage().startswith("VM creation evidence refusal:")
     ]
     assert len(messages) == 1
     assert "stage=rootdisk_source_validate" in messages[0]
