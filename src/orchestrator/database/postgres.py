@@ -48289,8 +48289,15 @@ class PostgresDB:
                             captured_ro.get("source_binding_sha256") or ""
                         )
                         captured_summary = captured_ro.get("staged_summary")
+                        # A Resume whose re-engage was refused (its owner was
+                        # demoted, say) mints no reader, so Begin captures the
+                        # earlier life's row, already revoked. The exact
+                        # staging clear below names that row's own generation.
                         if (
-                            captured_ro_generation != thread["runtime_generation"]
+                            (
+                                captured_ro_generation != thread["runtime_generation"]
+                                and captured_ro.get("status") != "revoked"
+                            )
                             or not re.fullmatch(r"[0-9a-f]{64}", captured_source_sha)
                             or captured_summary is not None
                             and not isinstance(captured_summary, dict)

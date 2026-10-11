@@ -6363,6 +6363,193 @@ async def test_soft_end_revokes_never_delivered_reader_before_zero_stage(
     assert _json(staged["payload"])["file_count"] == 0
 
 
+async def _end_thread(db, cloud_router, thread_id, *, permanent):
+    import orchestrator.main as orch_main
+
+    thread = await db.get_thread(thread_id)
+    assert thread is not None
+    with (
+        patch.object(orch_main.app.state.resources, "postgres_db", db),
+        patch.object(orch_main.app.state.resources, "main_cloud_router", cloud_router),
+        patch.object(
+            orch_main.app.state.resources.session_router,
+            "teardown_route",
+            AsyncMock(return_value=True),
+        ),
+        patch.object(
+            officer_conference_module,
+            "conclude_conference_if_any",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(
+            thread_retirement_module,
+            "thread_turn_in_flight",
+            AsyncMock(return_value=False),
+        ),
+    ):
+        return await controls_composition.thread_retirement_operations(
+            orch_main.app.state.resources
+        ).end_thread_flow(thread_id, thread, permanent=permanent, force=True)
+
+
+async def _resume_after_a_refused_re_engage(db):
+    """End a protected session, demote its owner to viewer and Resume it.
+
+    Main cloud slice 5 refuses the viewer's re-engage, so the new life mints
+    no reader and the thread's only row is the first life's, already revoked.
+    """
+    from orchestrator.services import protected_cloud_engage
+
+    ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
+    row_id, plan, first_generation, _mount_id = await _seed_protected_ro_attempt(
+        db, ids, status="active"
+    )
+    backend = MagicMock()
+    backend.revoke_protected_reader_attempt = AsyncMock()
+    cloud_router = MagicMock()
+    cloud_router.for_backend_instance.return_value = backend
+    assert await _end_thread(db, cloud_router, ids["thread"], permanent=False) == {
+        "status": "ended"
+    }
+    backend.revoke_protected_reader_attempt.assert_awaited_once_with(plan)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE project_members SET role='viewer' "
+            "WHERE project_id=$1::uuid AND user_id=$2::uuid",
+            UUID(ids["project"]),
+            UUID(ids["user"]),
+        )
+    assert await db.resume_thread(ids["thread"])
+    resumed = await db.get_thread(ids["thread"])
+    second_generation = str(resumed["runtime_generation"])
+    assert second_generation != first_generation
+    await protected_cloud_engage._engage_protected_cloud_for_thread(
+        ids["thread"],
+        user_id=ids["user"],
+        mount_rows=await db.list_protected_selection_rows(ids["thread"]),
+        metadata=_json(resumed["metadata"]),
+        runtime_generation=second_generation,
+        dependencies=protected_cloud_engage.ProtectedCloudEngageDependencies(
+            store=db,
+            cloud_router=cloud_router,
+            cloud_tasks=MagicMock(),
+            is_protected_cloud_mode_enabled=lambda: True,
+            thread_workspace_backend=lambda _thread: "sandbox",
+        ),
+    )
+    refused = await db.get_thread(ids["thread"])
+    assert _json(refused["metadata"])["protected_cloud_error_code"] == "engage_refused"
+    reader = await db.get_ro_mount_by_thread(ids["thread"])
+    assert str(reader["id"]) == row_id
+    assert str(reader["runtime_generation"]) == first_generation
+    assert reader["status"] == "revoked"
+    return ids, row_id, first_generation, cloud_router, backend, plan
+
+
+@pytest.mark.asyncio
+async def test_resume_with_a_refused_re_engage_can_be_deleted(db):
+    """DELETE accepts the earlier life's revoked reader (k3d 2026-10-11).
+
+    Begin captures the thread's only reader row, which names an earlier
+    generation, and DELETE refused it as "reader context is malformed"
+    forever.
+    """
+    (
+        ids,
+        row_id,
+        first_generation,
+        cloud_router,
+        backend,
+        plan,
+    ) = await _resume_after_a_refused_re_engage(db)
+
+    assert await _end_thread(db, cloud_router, ids["thread"], permanent=True) == {
+        "status": "deleted"
+    }
+
+    assert await db.get_thread(ids["thread"]) is None
+    backend.revoke_protected_reader_attempt.assert_awaited_once_with(plan)
+    reader = await db.get_ro_mount_by_thread(ids["thread"])
+    assert str(reader["id"]) == row_id
+    assert str(reader["runtime_generation"]) == first_generation
+    assert reader["status"] == "revoked"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tamper", "refusal"),
+    [
+        ("live_at_begin", "reader context is malformed"),
+        ("other_thread", "reader staging cleanup lost exact authority"),
+    ],
+)
+async def test_delete_accepts_only_the_exact_revoked_earlier_reader(
+    db, tamper, refusal
+):
+    (
+        ids,
+        row_id,
+        _generation,
+        cloud_router,
+        _backend,
+        _plan,
+    ) = await _resume_after_a_refused_re_engage(db)
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    assert retirement["context"]["protected_ro"]["id"] == row_id
+    other_row = uuid4()
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SET LOCAL session_replication_role = replica")
+            if tamper == "live_at_begin":
+                path, value = ["protected_ro", "status"], "active"
+            else:
+                # The same revoked shape, but another thread's row.
+                await conn.execute(
+                    "INSERT INTO cloud_ro_mounts SELECT (jsonb_populate_record("
+                    "NULL::cloud_ro_mounts, to_jsonb(r) || jsonb_build_object("
+                    "'id', $2::uuid, 'thread_id', $3::uuid))).* "
+                    "FROM cloud_ro_mounts r WHERE r.id=$1::uuid",
+                    UUID(row_id),
+                    other_row,
+                    uuid4(),
+                )
+                path, value = ["protected_ro", "id"], str(other_row)
+            await conn.execute(
+                "UPDATE threads SET runtime_retirement_context=jsonb_set("
+                "runtime_retirement_context, $2::text[], to_jsonb($3::text)) "
+                "WHERE id=$1::uuid",
+                UUID(ids["thread"]),
+                path,
+                value,
+            )
+
+    with pytest.raises(fastapi_module.HTTPException):
+        await _end_thread(db, cloud_router, ids["thread"], permanent=True)
+    with pytest.raises(RuntimeError, match=refusal):
+        await db.delete_thread(
+            ids["thread"],
+            expected_runtime_retirement_token=retirement["token"],
+            expected_runtime_generation=retirement["generation"],
+        )
+
+    assert await db.get_thread(ids["thread"]) is not None
+    async with db.acquire() as conn:
+        statuses = await conn.fetch(
+            "SELECT id, status FROM cloud_ro_mounts WHERE id = ANY($1::uuid[])",
+            [UUID(row_id), other_row],
+        )
+    assert {str(row["id"]): row["status"] for row in statuses} == {
+        row_id: "revoked",
+        **({str(other_row): "revoked"} if tamper == "other_thread" else {}),
+    }
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("manifest_blob", [b"{}", None], ids=["present", "missing"])
 async def test_soft_end_adopts_exact_review_after_reader_quiescence(db, manifest_blob):
