@@ -3,6 +3,8 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+import json
+import logging
 from threading import Barrier, BrokenBarrierError, Lock
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -21,6 +23,17 @@ from shared.vm_creation_issuance import (
 
 SECRET = b"creation-actuation-test-secret-at-least-32-bytes"
 ISSUER_RECEIPT = "7" * 64
+
+
+def creation_invocation_markers(caplog):
+    prefix = "VM creation reconcile marker "
+    return [
+        json.loads(message[len(prefix) :])
+        for record in caplog.records
+        if record.name == "vm_controller.creation_actuation"
+        for message in (record.getMessage(),)
+        if message.startswith(prefix)
+    ]
 
 
 async def poll_until_terminal(create, payload, *, limit=4):
@@ -757,7 +770,88 @@ async def test_protocol_authority_denial_performs_no_job_effect(setup):
 
 
 @pytest.mark.asyncio
-async def test_new_disk_secret_vm_each_have_one_durable_effect(setup):
+async def test_malformed_creation_request_has_no_unverified_scope_marker(setup, caplog):
+    caplog.set_level(logging.INFO, logger="vm_controller.creation_actuation")
+    ctrl, api, _, payload = setup
+    malformed = deepcopy(payload)
+    malformed["job_id"] = "token=private-auth-value"
+
+    result = await ctrl._do_create_serialized(malformed)
+
+    assert result["status"] == "creation_attention"
+    assert api.writes == []
+    markers = creation_invocation_markers(caplog)
+    assert [row["phase"] for row in markers] == ["entry", "complete"]
+    assert markers[0]["invocation_id"] == markers[1]["invocation_id"]
+    assert "token=private-auth-value" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_creation_marker_logger_failure_does_not_change_created_result_or_writes(
+    setup, monkeypatch
+):
+    ctrl, api, authority, payload = setup
+    logger = logging.getLogger("vm_controller.creation_actuation")
+    attempted = 0
+
+    def fail_marker(*_args, **_kwargs):
+        nonlocal attempted
+        attempted += 1
+        raise RuntimeError("marker logger unavailable")
+
+    monkeypatch.setattr(logger, "info", fail_marker)
+    result = await poll_until_terminal(ctrl._do_create_serialized, payload)
+
+    assert attempted > 0
+    assert result["status"] == "created"
+    assert api.writes == ["Lease", "DataVolume", "Secret", "VirtualMachine"]
+    assert authority.settled
+
+
+@pytest.mark.asyncio
+async def test_creation_invocation_cancellation_keeps_cancelled_error_and_safe_completion(
+    setup, monkeypatch, caplog
+):
+    from vm_controller.creation_actuation import CreationActuator
+
+    caplog.set_level(logging.INFO, logger="vm_controller.creation_actuation")
+    ctrl, api, _, payload = setup
+    actuator = CreationActuator(ctrl)
+
+    async def cancelled_authority(*_args, **_kwargs):
+        raise asyncio.CancelledError("token=private-auth-value")
+
+    monkeypatch.setattr(actuator, "authority", cancelled_authority)
+    with pytest.raises(asyncio.CancelledError):
+        await actuator.run(payload)
+    assert api.writes == []
+    markers = creation_invocation_markers(caplog)
+    assert [row["phase"] for row in markers] == ["entry", "complete"]
+    assert markers[-1]["outcome"] == "raised"
+    assert markers[-1]["exception_family"] == "cancelled"
+    assert "private-auth-value" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_carrier_invocation_exception_preserves_type_without_unverified_scope(
+    setup, caplog
+):
+    from vm_controller.creation_actuation import reconcile_creation_carrier
+
+    caplog.set_level(logging.INFO, logger="vm_controller.creation_actuation")
+    ctrl, api, _, _ = setup
+    with pytest.raises(KeyError):
+        await reconcile_creation_carrier(ctrl, {})
+    assert api.writes == []
+    markers = creation_invocation_markers(caplog)
+    assert [row["phase"] for row in markers] == ["entry", "complete"]
+    assert markers[-1]["exception_family"] == "key_error"
+    assert "scope" not in {row["phase"] for row in markers}
+
+
+@pytest.mark.asyncio
+async def test_new_disk_secret_vm_each_have_one_durable_effect(setup, caplog):
+    caplog.set_level(logging.INFO, logger="vm_controller.creation_actuation")
     ctrl, api, authority, payload = setup
     first = await ctrl._do_create_serialized(payload)
     assert first["status"] == "creation_pending"
@@ -766,12 +860,49 @@ async def test_new_disk_secret_vm_each_have_one_durable_effect(setup):
     second = await ctrl._do_create_serialized(payload)
     assert second["status"] == "creation_pending"
     assert api.writes == ["Lease", "DataVolume", "Secret"]
-    assert [effect["state"] for effect in authority.row["effects"]] == ["observed", "observed"]
+    assert [effect["state"] for effect in authority.row["effects"]] == [
+        "observed",
+        "observed",
+    ]
     result = await ctrl._do_create_serialized(payload)
     assert result["status"] == "created"
     assert api.writes == ["Lease", "DataVolume", "Secret", "VirtualMachine"]
     assert authority.settled
     assert [x["state"] for x in authority.row["effects"]] == ["observed"] * 3
+    markers = creation_invocation_markers(caplog)
+    entries = [
+        row for row in markers if row["phase"] == "entry" and row["path"] == "create"
+    ]
+    scopes = [
+        row for row in markers if row["phase"] == "scope" and row["path"] == "create"
+    ]
+    completed = [
+        row for row in markers if row["phase"] == "complete" and row["path"] == "create"
+    ]
+    assert len(entries) == len(scopes) == len(completed) == 3
+    assert len({row["invocation_id"] for row in entries}) == 3
+    assert {row["invocation_id"] for row in entries} == {
+        row["invocation_id"] for row in completed
+    }
+    assert all(
+        row["request_id"] == payload["creation_retry"]["request_id"] for row in scopes
+    )
+    assert all(
+        row["provision_generation"] == payload["provision_generation"] for row in scopes
+    )
+    assert all(
+        row["logical_vm_name"] == "agent-vm-" + payload["job_id"] for row in scopes
+    )
+    vm_effect = authority.row["effects"][-1]["carrier_intent"]
+    assert any(
+        row["phase"] == "effect"
+        and row["effect_kind"] == "vm"
+        and row["effect_nonce"] == vm_effect["effect_nonce"]
+        for row in markers
+    )
+    assert completed[-1]["outcome"] == "created"
+    assert completed[-1]["vm_uid"] == result["vm_uid"]
+    assert "private-host-key" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1154,6 +1285,7 @@ async def test_creation_run_stages_are_isolated_across_concurrent_invocations(
 
     ctrl, api, authority, payload = profiled_setup
     actuator = CreationActuator(ctrl)
+    caplog.set_level(logging.INFO, logger="vm_controller.creation_actuation")
     original_body = CreationActuator.body
 
     async def seed_previous_effects(self, row, values):
@@ -1162,7 +1294,9 @@ async def test_creation_run_stages_are_isolated_across_concurrent_invocations(
         return await original_body(self, row, values)
 
     monkeypatch.setattr(CreationActuator, "body", seed_previous_effects)
-    assert (await poll_until_terminal(actuator.run, payload))["status"] == "creation_attention"
+    assert (await poll_until_terminal(actuator.run, payload))[
+        "status"
+    ] == "creation_attention"
     assert len(authority.row["effects"]) == 2
     caplog.clear()
     entered_body = asyncio.Event()
@@ -1203,6 +1337,7 @@ async def test_creation_run_stages_are_isolated_across_concurrent_invocations(
         record.getMessage()
         for record in caplog.records
         if record.name == "vm_controller.creation_actuation"
+        and record.getMessage().startswith("VM creation evidence refusal:")
     ]
     assert len(messages) == 2
     assert any(
@@ -1216,6 +1351,13 @@ async def test_creation_run_stages_are_isolated_across_concurrent_invocations(
     assert "private-auth-value" not in caplog.text
     assert api.writes == ["Lease", "DataVolume", "Secret"]
     assert len(authority.row["effects"]) == 2
+    entries = [
+        row
+        for row in creation_invocation_markers(caplog)
+        if row["phase"] == "entry" and row["path"] == "create"
+    ]
+    assert len(entries) == 2
+    assert entries[0]["invocation_id"] != entries[1]["invocation_id"]
 
 
 @pytest.mark.asyncio
@@ -1501,7 +1643,10 @@ async def test_retained_exact_disk_reuses_same_permit_without_dv_write(
 
 
 @pytest.mark.asyncio
-async def test_periodic_carrier_observer_adopts_after_lost_vm_reply_without_post(setup):
+async def test_periodic_carrier_observer_adopts_after_lost_vm_reply_without_post(
+    setup, caplog
+):
+    caplog.set_level(logging.INFO, logger="vm_controller.creation_actuation")
     from vm_controller.creation_actuation import (
         carrier_record,
         reconcile_creation_carrier,
@@ -1521,6 +1666,32 @@ async def test_periodic_carrier_observer_adopts_after_lost_vm_reply_without_post
     await reconcile_creation_carrier(ctrl, carrier)
     assert authority.settled
     assert api.writes == writes
+    carrier_entries = [
+        row
+        for row in creation_invocation_markers(caplog)
+        if row["phase"] == "entry" and row["path"] == "carrier"
+    ]
+    assert len(carrier_entries) == 2
+    assert carrier_entries[0]["invocation_id"] != carrier_entries[1]["invocation_id"]
+    carrier_scopes = [
+        row
+        for row in creation_invocation_markers(caplog)
+        if row["phase"] == "scope" and row["path"] == "carrier"
+    ]
+    assert len(carrier_scopes) == 2
+    assert all(
+        row["request_id"] == payload["creation_retry"]["request_id"]
+        and row["logical_vm_name"] == "agent-vm-" + payload["job_id"]
+        for row in carrier_scopes
+    )
+    vm_effect_nonce = authority.row["effects"][-1]["carrier_intent"]["effect_nonce"]
+    carrier_effects = [
+        row
+        for row in creation_invocation_markers(caplog)
+        if row["phase"] == "effect" and row["path"] == "carrier"
+    ]
+    assert len(carrier_effects) == 2
+    assert all(row["effect_nonce"] == vm_effect_nonce for row in carrier_effects)
 
 
 @pytest.mark.asyncio

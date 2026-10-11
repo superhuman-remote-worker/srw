@@ -7,9 +7,10 @@ release database transactions before controller I/O; unknown results stay held.
 import asyncio
 from contextvars import ContextVar
 from copy import deepcopy
+from functools import wraps
 import json
 import logging
-from uuid import UUID, uuid5
+from uuid import UUID, uuid4, uuid5
 
 from kubernetes.client import ApiClient
 from kubernetes.client.exceptions import ApiException
@@ -94,6 +95,7 @@ _SAFE_CREATION_REASON_CODES = frozenset(
 # Only these literal labels may reach the log; request or exception data cannot
 # become a stage. In particular, concurrent retries share an actuator instance.
 _CREATION_DIAGNOSTIC_STAGE = ContextVar("creation_diagnostic_stage", default="unknown")
+_CREATION_INVOCATION_ID = ContextVar("creation_invocation_id", default=None)
 _SAFE_CREATION_STAGES = frozenset(
     {
         "protocol",
@@ -249,6 +251,104 @@ def _creation_exception_location(exc):
             location = f"{allowed[0]}.{code.co_name}:{traceback.tb_lineno}"
         traceback = traceback.tb_next
     return location
+
+
+def _marker_uuid(value):
+    try:
+        return value if type(value) is str and str(UUID(value)) == value else None
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _creation_marker(phase, path, **fields):
+    """Log only bounded identifiers; diagnostics cannot affect reconciliation."""
+    try:
+        invocation_id = _CREATION_INVOCATION_ID.get()
+        if invocation_id is None:
+            return
+        row = {"phase": phase, "path": path, "invocation_id": invocation_id, **fields}
+        logging.getLogger(__name__).info(
+            "VM creation reconcile marker %s",
+            json.dumps(row, sort_keys=True, separators=(",", ":")),
+        )
+    except Exception:
+        pass
+
+
+def _creation_scope_marker(path, row):
+    job_id = _marker_uuid(row.get("job_id"))
+    request_id = _marker_uuid(row.get("request_id"))
+    generation = _marker_uuid(row.get("provision_generation"))
+    if job_id and request_id and generation:
+        _creation_marker(
+            "scope",
+            path,
+            job_id=job_id,
+            request_id=request_id,
+            provision_generation=generation,
+            logical_vm_name="agent-vm-" + job_id,
+        )
+
+
+def _creation_vm_effect_marker(path, latest):
+    if type(latest) is not dict or type(latest.get("carrier_intent")) is not dict:
+        return False
+    intent = latest["carrier_intent"]
+    nonce = _marker_uuid(intent.get("effect_nonce"))
+    if intent.get("effect_kind") != "vm" or nonce is None:
+        return False
+    _creation_marker("effect", path, effect_kind="vm", effect_nonce=nonce)
+    return True
+
+
+def _creation_invocation(path):
+    def decorate(fn):
+        @wraps(fn)
+        async def tracked(*args, **kwargs):
+            try:
+                invocation_id = str(uuid4())
+            except Exception:
+                return await fn(*args, **kwargs)
+            token = _CREATION_INVOCATION_ID.set(invocation_id)
+            _creation_marker("entry", path)
+            try:
+                result = await fn(*args, **kwargs)
+            except BaseException as exc:
+                family = (
+                    "cancelled"
+                    if isinstance(exc, asyncio.CancelledError)
+                    else _creation_exception_family(exc)
+                )
+                _creation_marker(
+                    "complete", path, outcome="raised", exception_family=family
+                )
+                raise
+            else:
+                outcome = (
+                    result.get("status")
+                    if path == "create" and type(result) is dict
+                    else "returned"
+                )
+                if outcome not in {
+                    "created",
+                    "creation_pending",
+                    "creation_attention",
+                    "returned",
+                }:
+                    outcome = "unknown"
+                fields = {"outcome": outcome}
+                if outcome == "created":
+                    vm_uid = _marker_uuid(result.get("vm_uid"))
+                    if vm_uid:
+                        fields["vm_uid"] = vm_uid
+                _creation_marker("complete", path, **fields)
+                return result
+            finally:
+                _CREATION_INVOCATION_ID.reset(token)
+
+        return tracked
+
+    return decorate
 
 
 def document(value):
@@ -794,6 +894,7 @@ class CreationActuator:
         if await self.read("vm", "agent-vm-" + row["job_id"]) is not None:
             raise CreationUnproven("creation_existing_vm_unproven")
 
+    @_creation_invocation("create")
     async def run(self, payload, *, observe_only=False):
         base = {
             "job_id": payload.get("job_id"),
@@ -878,6 +979,8 @@ class CreationActuator:
             "reason": "creation_observation_pending",
         }
         issued_this_poll = False
+        scope_marked = False
+        vm_effect_marked = False
         for _ in range(9):
             _mark_creation_stage("inspect")
             row = await self.authority("inspect", request_id=envelope["request_id"])
@@ -896,12 +999,17 @@ class CreationActuator:
                 or row["request"] != request
             ):
                 raise CreationUnproven("creation_request_changed")
+            if not scope_marked:
+                _creation_scope_marker("create", row)
+                scope_marked = True
             if observe_only:
                 if row["state"] != "reconciling":
                     raise CreationUnproven("creation_source_not_active")
                 return pending
             effects = row["effects"]
             latest = effects[-1] if effects else None
+            if not vm_effect_marked:
+                vm_effect_marked = _creation_vm_effect_marker("create", latest)
             lease = None
             if row.get("creation_carrier_uid"):
                 _mark_creation_stage("carrier_read")
@@ -1242,6 +1350,7 @@ class CreationActuator:
         return pending
 
 
+@_creation_invocation("carrier")
 async def reconcile_creation_carrier(controller, carrier, *, _observe_only=False):
     """Restart observation/cancellation entry; never grants another create."""
     actuator = CreationActuator(controller)
@@ -1254,6 +1363,7 @@ async def reconcile_creation_carrier(controller, carrier, *, _observe_only=False
     row = await actuator.authority("inspect", request_id=values["retry_request_id"])
     if row.get("creation_carrier_uid") != current["metadata"]["uid"]:
         raise CreationUnproven("creation_carrier_changed")
+    _creation_scope_marker("carrier", row)
     if row["state"] == "cancel_requested" and not _observe_only:
         from shared.vm_creation_disposition import disposition_identity
         from vm_controller.creation_disposition import CreationDisposer
@@ -1265,6 +1375,7 @@ async def reconcile_creation_carrier(controller, carrier, *, _observe_only=False
 
     await source_manager(controller, row).release_completed(row)
     latest = row["effects"][-1] if row["effects"] else None
+    _creation_vm_effect_marker("carrier", latest)
     if latest and latest["state"] == "issued":
         observation = await actuator.observation(row, latest, current)
         if observation is not None:
