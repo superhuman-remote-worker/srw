@@ -14,6 +14,7 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
+from orchestrator.database.postgres import JobVMAuditNotReady
 from orchestrator.services.vm_pre_ssh_stop_store import (
     VMPreSSHStopConflict,
     VMPreSSHStopStore,
@@ -67,6 +68,13 @@ async def held_stop_schema(pg_dsn, initial_ready_schema):  # noqa: F811
             "'public.vm_cancel_late_adopted_retained_terminal(uuid)') IS NOT NULL"
         ):
             await conn.execute(late.read_text())
+        audit = root / "0434_vm_job_late_adopted_terminal_audit.sql"
+        if audit.exists() and not await conn.fetchval(
+            "SELECT position('vm_cancel_late_adopted_retained_terminal' IN "
+            "pg_get_functiondef('public.vm_job_terminal_packet_without_retained_noeffect(uuid)'"
+            "::regprocedure)) > 0"
+        ):
+            await conn.execute(audit.read_text())
         assert (
             await conn.fetchval(
                 "SELECT convalidated FROM pg_constraint "
@@ -212,6 +220,65 @@ async def complete_synthetic_retained_delete(db, recovery, purge):
     assert await db.fetchval(
         "SELECT public.validate_vm_job_retained_disk_purge($1,true)",
         purge.admission_id,
+    )
+
+
+async def replica_write(db, sql, *args):
+    """Model a legacy/corrupt source row without weakening production guards."""
+    async with db.acquire() as conn:
+        await conn.execute("SET session_replication_role=replica")
+        try:
+            return await conn.execute(sql, *args)
+        finally:
+            await conn.execute("SET session_replication_role=origin")
+
+
+async def assert_late_adopted_delete_audit(
+    db, state, source_request, old_parent, effect_nonces
+):
+    row = await db.fetchrow(
+        "SELECT terminal_kind,evidence FROM vm_job_creation_terminal_packets "
+        "WHERE request_id=$1",
+        source_request,
+    )
+    assert row["terminal_kind"] == "retained_late_purge"
+    packet = (
+        json.loads(row["evidence"])
+        if isinstance(row["evidence"], str)
+        else row["evidence"]
+    )
+    assert packet["kind"] == "retained_late_purge"
+    assert packet["job_id"] == state["job_id"]
+    assert packet["request_id"] == str(source_request)
+    assert packet["provision_generation"] == state["generation"]
+    assert packet["vm_uid"] == state["frozen"]["vm_uid"]
+    assert packet["pvc_uid"] == state["frozen"]["pvc_uid"]
+    assert packet["old_cleanup_admission_id"] == str(old_parent)
+    owner = await db.fetchrow(
+        "SELECT deleted_at,deletion_receipt FROM vm_job_creation_owners "
+        "WHERE job_id=$1",
+        UUID(state["job_id"]),
+    )
+    assert owner["deleted_at"] is not None
+    receipt = (
+        json.loads(owner["deletion_receipt"])
+        if isinstance(owner["deletion_receipt"], str)
+        else owner["deletion_receipt"]
+    )
+    assert receipt["generations"] == [packet]
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM jobs WHERE id=$1", UUID(state["job_id"])
+        )
+        == 0
+    )
+    assert (
+        await db.fetch(
+            "SELECT effect_nonce FROM vm_creation_effects WHERE request_id=$1 "
+            "ORDER BY effect_nonce",
+            source_request,
+        )
+        == effect_nonces
     )
 
 
@@ -516,9 +583,27 @@ async def test_late_adopted_first_stop_refuses_inexact_source_before_controller(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("deleted_before_completion", [False, True])
+@pytest.mark.parametrize(
+    ("deleted_before_completion", "audit_fault"),
+    [(False, None), (True, None)]
+    + [
+        (True, fault)
+        for fault in (
+            "policy",
+            "reason",
+            "parent",
+            "vm_uid",
+            "pvc_uid",
+            "generation",
+            "issued",
+            "charge",
+            "missing_predecessor",
+            "null_reason",
+        )
+    ],
+)
 async def test_cancel_before_late_adoption_binds_then_commits_held_stop(
-    db, deleted_before_completion
+    db, deleted_before_completion, audit_fault
 ):
     state = await late_adopted_state(db)
     assert not (await acquire(state)).allowed  # No signed runtime inventory yet.
@@ -723,6 +808,208 @@ async def test_cancel_before_late_adoption_binds_then_commits_held_stop(
         assert purge.allowed, purge.reason
         assert purge.parent_cleanup["intent"]["purge_disk"] is True
         await complete_synthetic_retained_delete(db, state["recovery"], purge)
+        source_request = await db.fetchval(
+            "SELECT request_id FROM vm_creation_retries WHERE owner_kind='job' "
+            "AND job_id=$1 ORDER BY created_at,request_id LIMIT 1",
+            UUID(state["job_id"]),
+        )
+        effect_nonces = await db.fetch(
+            "SELECT effect_nonce FROM vm_creation_effects WHERE request_id=$1 "
+            "ORDER BY effect_nonce",
+            source_request,
+        )
+        assert await db.prepare_stateless_job_for_delete(state["job_id"])
+        if audit_fault is not None:
+            parent = permit.admission_id
+            charge_id = UUID(state["reservation_id"])
+            if audit_fault == "policy":
+                old = await db.fetchrow(
+                    "SELECT policy_version,ready_retention_preflight "
+                    "FROM vm_job_cancel_retention_authorities "
+                    "WHERE cleanup_admission_id=$1",
+                    parent,
+                )
+                assert (
+                    await replica_write(
+                        db,
+                        "UPDATE vm_job_cancel_retention_authorities SET "
+                        "policy_version=3,ready_retention_preflight='{}'::jsonb "
+                        "WHERE cleanup_admission_id=$1",
+                        parent,
+                    )
+                    == "UPDATE 1"
+                )
+                repair_sql = (
+                    "UPDATE vm_job_cancel_retention_authorities SET "
+                    "policy_version=$2,ready_retention_preflight=$3::jsonb "
+                    "WHERE cleanup_admission_id=$1"
+                )
+                repair_args = (
+                    parent,
+                    old["policy_version"],
+                    old["ready_retention_preflight"],
+                )
+            elif audit_fault == "charge":
+                old = await db.fetchrow(
+                    "SELECT state,released_at,release_evidence "
+                    "FROM vm_resource_reservations WHERE id=$1",
+                    charge_id,
+                )
+                assert (
+                    await replica_write(
+                        db,
+                        "UPDATE vm_resource_reservations SET state='reserved',"
+                        "released_at=NULL,release_evidence=NULL WHERE id=$1",
+                        charge_id,
+                    )
+                    == "UPDATE 1"
+                )
+                repair_sql = (
+                    "UPDATE vm_resource_reservations SET state=$2,released_at=$3,"
+                    "release_evidence=$4::jsonb WHERE id=$1"
+                )
+                repair_args = (
+                    charge_id,
+                    old["state"],
+                    old["released_at"],
+                    old["release_evidence"]
+                    if isinstance(old["release_evidence"], str)
+                    else json.dumps(old["release_evidence"]),
+                )
+            elif audit_fault == "issued":
+                old = await db.fetchrow(
+                    "SELECT state,resolved_at,evidence FROM vm_creation_effects "
+                    "WHERE request_id=$1 AND effect_kind='vm'",
+                    source_request,
+                )
+                assert (
+                    await replica_write(
+                        db,
+                        "UPDATE vm_creation_effects SET state='issued',resolved_at=NULL,"
+                        "evidence='{}'::jsonb WHERE request_id=$1 AND effect_kind='vm'",
+                        source_request,
+                    )
+                    == "UPDATE 1"
+                )
+                repair_sql = (
+                    "UPDATE vm_creation_effects SET state=$2,resolved_at=$3,"
+                    "evidence=$4::jsonb WHERE request_id=$1 AND effect_kind='vm'"
+                )
+                repair_args = (
+                    source_request,
+                    old["state"],
+                    old["resolved_at"],
+                    old["evidence"]
+                    if isinstance(old["evidence"], str)
+                    else json.dumps(old["evidence"]),
+                )
+            elif audit_fault == "missing_predecessor":
+                foreign_request = uuid4()
+                assert (
+                    await replica_write(
+                        db,
+                        "UPDATE vm_job_retained_disk_purge_predecessors "
+                        "SET source_request_id=$2 WHERE source_request_id=$1",
+                        source_request,
+                        foreign_request,
+                    )
+                    == "UPDATE 1"
+                )
+                repair_sql = (
+                    "UPDATE vm_job_retained_disk_purge_predecessors "
+                    "SET source_request_id=$2 WHERE source_request_id=$1"
+                )
+                repair_args = (foreign_request, source_request)
+            else:
+                table, key, column, identity, wrong = {
+                    "reason": (
+                        "vm_creation_retries",
+                        "request_id",
+                        "reason",
+                        source_request,
+                        "creation_disposed",
+                    ),
+                    "null_reason": (
+                        "vm_creation_retries",
+                        "request_id",
+                        "reason",
+                        source_request,
+                        None,
+                    ),
+                    "parent": (
+                        "vm_job_retained_disk_purge_predecessors",
+                        "source_request_id",
+                        "old_cleanup_admission_id",
+                        source_request,
+                        uuid4(),
+                    ),
+                    "vm_uid": (
+                        "vm_creation_retries",
+                        "request_id",
+                        "observed_vm_uid",
+                        source_request,
+                        uuid4(),
+                    ),
+                    "pvc_uid": (
+                        "vm_creation_retries",
+                        "request_id",
+                        "observed_pvc_uid",
+                        source_request,
+                        uuid4(),
+                    ),
+                    "generation": (
+                        "vm_creation_retries",
+                        "request_id",
+                        "provision_generation",
+                        source_request,
+                        uuid4(),
+                    ),
+                }[audit_fault]
+                old = await db.fetchval(
+                    f"SELECT {column} FROM {table} WHERE {key}=$1", identity
+                )
+                repair_sql = f"UPDATE {table} SET {column}=$2 WHERE {key}=$1"
+                repair_args = (identity, old)
+                assert (
+                    await replica_write(db, repair_sql, identity, wrong) == "UPDATE 1"
+                )
+            try:
+                assert (
+                    await db.fetchval(
+                        "SELECT vm_job_terminal_packet_evidence($1)", source_request
+                    )
+                    is None
+                )
+                with pytest.raises(JobVMAuditNotReady, match="no exact terminal proof"):
+                    await db.delete_job(state["job_id"], prepared_stateless=True)
+                assert (
+                    await db.fetchval(
+                        "SELECT count(*) FROM jobs WHERE id=$1", UUID(state["job_id"])
+                    )
+                    == 1
+                )
+                assert (
+                    await db.fetchval(
+                        "SELECT count(*) FROM vm_job_creation_terminal_packets "
+                        "WHERE job_id=$1",
+                        UUID(state["job_id"]),
+                    )
+                    == 0
+                )
+                assert (
+                    await db.fetchval(
+                        "SELECT deleted_at IS NULL FROM vm_job_creation_owners "
+                        "WHERE job_id=$1",
+                        UUID(state["job_id"]),
+                    )
+                    is True
+                )
+            finally:
+                assert await replica_write(db, repair_sql, *repair_args) == "UPDATE 1"
+        assert await db.delete_job(state["job_id"], prepared_stateless=True)
+        await assert_late_adopted_delete_audit(
+            db, state, source_request, permit.admission_id, effect_nonces
+        )
         return
     actor = await db.fetchval(
         "SELECT user_id FROM jobs WHERE id=$1", UUID(state["job_id"])
@@ -773,6 +1060,21 @@ async def test_cancel_before_late_adoption_binds_then_commits_held_stop(
     )
     assert purge.allowed, purge.reason
     await complete_synthetic_retained_delete(db, state["recovery"], purge)
+    source_request = await db.fetchval(
+        "SELECT request_id FROM vm_creation_retries WHERE owner_kind='job' "
+        "AND job_id=$1 ORDER BY created_at,request_id LIMIT 1",
+        UUID(state["job_id"]),
+    )
+    effect_nonces = await db.fetch(
+        "SELECT effect_nonce FROM vm_creation_effects WHERE request_id=$1 "
+        "ORDER BY effect_nonce",
+        source_request,
+    )
+    assert await db.prepare_stateless_job_for_delete(state["job_id"])
+    assert await db.delete_job(state["job_id"], prepared_stateless=True)
+    await assert_late_adopted_delete_audit(
+        db, state, source_request, permit.admission_id, effect_nonces
+    )
 
 
 @pytest.mark.asyncio

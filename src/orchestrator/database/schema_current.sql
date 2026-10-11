@@ -24979,10 +24979,18 @@ BEGIN
     prior := public.vm_job_terminal_prior_packet_evidence(source_request);
     IF prior IS NOT NULL THEN RETURN prior; END IF;
     SELECT * INTO r FROM public.vm_creation_retries WHERE request_id=source_request;
-    IF r.request_id IS NULL OR r.owner_kind IS DISTINCT FROM 'job'
-       OR r.state IS DISTINCT FROM 'succeeded' THEN RETURN NULL; END IF;
+    IF r.request_id IS NULL OR r.owner_kind IS DISTINCT FROM 'job' THEN RETURN NULL; END IF;
     SELECT * INTO p FROM public.vm_job_retained_disk_purge_predecessors
       WHERE source_request_id=source_request;
+    -- 0433 admits a cancelled, late-adopted policy-1 source to typed disk
+    -- purge only after its original retained physical/custody parent settles.
+    -- Keep all older succeeded paths unchanged and reject every other settled
+    -- retry before constructing a terminal packet.
+    IF r.state IS DISTINCT FROM 'succeeded'
+       AND NOT (r.state='settled' AND r.reason='creation_adopted'
+           AND p.source_request_id IS NOT DISTINCT FROM r.request_id
+           AND public.vm_cancel_late_adopted_retained_terminal(
+               p.old_cleanup_admission_id)) THEN RETURN NULL; END IF;
     SELECT * INTO d FROM public.vm_job_retained_disk_purge_authorities
       WHERE cleanup_admission_id=p.cleanup_admission_id;
     SELECT * INTO parent FROM public.vm_workspace_cleanup_admissions
