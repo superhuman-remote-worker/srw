@@ -39,9 +39,11 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               preselected, with every offered level; a session of a2 binding
               b's folder at protected engages b's folder; as a viewer, b's
               read_write is 422 (above_ceiling) and the resumed protected
-              session's engage is refused (engage_refused); removed from b,
-              the folder is not listed and naming it is 403; b's knowledge
-              base is never eligible in a2
+              session's engage is refused (engage_refused); that readerless
+              life Ends and the session resumes again; removed from b, the
+              folder is not listed and naming it is 403; b's knowledge base
+              is never eligible in a2. Cleanup then deletes a resumed session
+              whose engage was refused
   alias       the legacy ``protected_cloud: true`` still engages the
               project's own folder; with that folder not attached it is 422
               protected_cloud_requires_folder, and with a conflicting level
@@ -140,6 +142,8 @@ SERVED = (
     "src/orchestrator/services/protected_cloud_engage.py",
     "src/orchestrator/services/projects.py",
     "src/orchestrator/services/datasources.py",
+    "src/orchestrator/services/cloud_stage_authority.py",
+    "src/orchestrator/services/cloud/protected_reader_authority.py",
     "src/orchestrator/database/postgres.py",
 )
 PLAN = (
@@ -149,7 +153,8 @@ PLAN = (
     "chip: protected from datasource_access, through staging, apply, End and Resume",
     "default: a project link's protected default, and an explicit level over it",
     "exclusion: a second folder beside a protected one; two protected folders",
-    "cross: another project's folder for its editor, viewer and a non-member",
+    "cross: another project's folder for its editor, viewer and a non-member; "
+    "End and Resume of a life whose engage was refused",
     "alias: protected_cloud as an alias, and its refusals",
     "cleanup: sessions, projects, the second account and the client",
 )
@@ -706,6 +711,28 @@ class AccessGate:
             code == "engage_refused"
             and (self.grant(thread) or {}).get("status") != "active",
             str(code),
+        )
+        # That life minted no reader, so it never had the folder: its End
+        # stages nothing and settles, and the session can be resumed again.
+        try:
+            self.d4.other.call("DELETE", f"/api/persistent/threads/{thread}?force=true")
+            wait_for(
+                "the refused life ended",
+                lambda: sql(f"SELECT status FROM threads WHERE id = {lit(thread)}")
+                == "ended",
+                timeout=600,
+                interval=10,
+            )
+            status_resume, body = self.resume(self.d4.other, thread)
+            detail = f"resume HTTP {status_resume} {str(body)[:200]}"
+            ended_and_resumed = status_resume == 200
+        except GateError as exc:
+            detail, ended_and_resumed = str(exc), False
+        self.report.check(
+            "cross: the life whose engage was refused Ends, and the session "
+            "resumes again",
+            ended_and_resumed,
+            detail,
         )
         self.d4.owner.ok("DELETE", f"/api/projects/{b}/members/{other_id}")
         listed = eligible()
