@@ -295,12 +295,29 @@ def stateless_executor_process_zero(pod: Any) -> bool:
     )
 
 
+def _deleting_agent_pod_never_scheduled(pod: Any) -> bool:
+    """A deleting dedicated agent Pod without ``nodeName`` never ran a process.
+
+    The executor rule above, applied to the pinned session/job agent Pod: an
+    End that races the Pod's create deletes it before the scheduler binds it,
+    and the binding subresource refuses a Pod that is being deleted. Such a Pod
+    never gains a container status that could read terminal, so without this
+    proof its pinned-authority finalizer is never released and End retries
+    forever.
+    """
+
+    if getattr(getattr(pod, "metadata", None), "deletion_timestamp", None) is None:
+        return False
+    return _deleting_executor_never_scheduled(pod)
+
+
 def classify_agent_pod_authority(pod: Any, expected_pod_uid: str) -> str:
     """Classify one read of a claimant Pod name against the expected UID.
 
     ``exact_terminal`` requires the exact UID with every container observed
-    terminated; ``replacement`` is a same-name successor; deletion grace and
-    phase Unknown remain ``unknown`` because the old process may still run.
+    terminated, or a deleting Pod that was never scheduled; ``replacement`` is
+    a same-name successor; deletion grace and phase Unknown remain ``unknown``
+    because the old process may still run.
     """
 
     actual_uid = str(getattr(getattr(pod, "metadata", None), "uid", "") or "")
@@ -318,7 +335,7 @@ def classify_agent_pod_authority(pod: Any, expected_pod_uid: str) -> str:
     # terminal phase update.  Exact UID plus every container's terminated
     # state is the process-level proof we need; deletionTimestamp alone is
     # deliberately not proof.
-    if all_containers_terminated:
+    if all_containers_terminated or _deleting_agent_pod_never_scheduled(pod):
         return "exact_terminal"
     if getattr(getattr(pod, "metadata", None), "deletion_timestamp", None):
         return "unknown"
@@ -1141,7 +1158,8 @@ class AgentProvisioner:
 
         A 404, offline row or terminal phase alone is insufficient. Require
         every declared regular/init/ephemeral container's termination and the
-        production Never restart policy. This says nothing about remote writers.
+        production Never restart policy, or a deleting Pod that was never
+        scheduled. This says nothing about remote writers.
         """
         try:
             state, pod = await self.observe_agent_pod_exact(
@@ -1151,6 +1169,8 @@ class AgentProvisioner:
             return False
         if state != "exact_terminal" or pod is None:
             return False
+        if _deleting_agent_pod_never_scheduled(pod):
+            return True
         if getattr(getattr(pod, "spec", None), "restart_policy", None) != "Never":
             return False
         if any(
@@ -1945,7 +1965,11 @@ class AgentProvisioner:
         ]
         if uid != str(expected_pod_uid) or not resource_version:
             return False
-        if terminal_required and not pod_containers_are_terminal(pod):
+        if (
+            terminal_required
+            and not pod_containers_are_terminal(pod)
+            and not _deleting_agent_pod_never_scheduled(pod)
+        ):
             return False
         patch = finalizer_release_patch(
             uid=uid, resource_version=resource_version, finalizers=finalizers

@@ -23,6 +23,12 @@ from orchestrator.services.pinned_k8s_effect import (
     K8S_MUTATION_REQUEST_TIMEOUT,
     PINNED_AUTHORITY_FINALIZER,
 )
+from tests._fake_executor_k8s import (
+    EXECUTOR_NAMESPACE,
+    FakeExecutorCoreApi,
+    container_status,
+    executor_pod,
+)
 
 
 # =============================================================================
@@ -2093,6 +2099,109 @@ class TestExactClaimantPodAuthority:
             body={"preconditions": {"uid": "uid-a"}},
             _request_timeout=K8S_MUTATION_REQUEST_TIMEOUT,
         )
+
+
+class TestNeverScheduledPinnedAgentPod:
+    """An End racing the agent Pod create retires the Pod it deleted unbound.
+
+    The scheduler cannot bind a deleting Pod, so it never gains a container
+    status; its pinned-authority finalizer must still be released, or End
+    retries forever (k3d 2026-10-11: five ``srw-agent-s-*`` Pods, phase
+    Failed after PodGC, no node, no statuses, held for hours).
+    """
+
+    NAME = "srw-agent-s-094b7c34"
+    UID = "54a56354-7ce1-4141-928f-fb28e550a3f6"
+
+    def _api(self, *, deleting=False, node_name=None, status=None):
+        pod = executor_pod(
+            name=self.NAME,
+            uid=self.UID,
+            finalizers=[PINNED_AUTHORITY_FINALIZER],
+            phase="Failed" if deleting else "Pending",
+            node_name=node_name,
+            deleting=deleting,
+        )
+        pod.status.init_container_statuses = None
+        pod.status.container_statuses = None
+        pod.status.conditions = [
+            SimpleNamespace(type="PodScheduled", reason="SchedulerError")
+        ]
+        if status is not None:
+            field, name, state = status
+            setattr(pod.status, field, [container_status(name, state)])
+        return FakeExecutorCoreApi(pod)
+
+    @staticmethod
+    def _provisioner(api):
+        p = AgentProvisioner()
+        p._core_api = api
+        p._k8s_available = True
+        p._namespace = EXECUTOR_NAMESPACE
+        return p
+
+    @pytest.mark.asyncio
+    async def test_end_racing_create_releases_the_unbound_pod(self):
+        from orchestrator.services.pinned_retirement import PinnedRetirementOperations
+
+        api = self._api()
+        operations = PinnedRetirementOperations(
+            SimpleNamespace(agent_provisioner=self._provisioner(api))
+        )
+        agent_pod = {
+            "pod_name": self.NAME,
+            "pod_uid": self.UID,
+            "namespace": EXECUTOR_NAMESPACE,
+            "protection_protocol": "finalizer_v1",
+        }
+
+        await operations._stop_captured_retirement_agent(
+            {"context": {"agent_pod": agent_pod}}
+        )
+
+        assert api.removed == [self.NAME]
+        [(name, patch)] = api.patches
+        assert name == self.NAME
+        assert {"op": "test", "path": "/metadata/uid", "value": self.UID} in patch
+
+    @pytest.mark.asyncio
+    async def test_deleting_unbound_pod_is_process_zero(self):
+        api = self._api(deleting=True)
+        p = self._provisioner(api)
+        exact = {"expected_pod_uid": self.UID, "namespace": EXECUTOR_NAMESPACE}
+
+        assert await p.agent_pod_authority(self.NAME, **exact) == "exact_terminal"
+        assert await p.agent_pod_terminal_process_zero(self.NAME, **exact)
+        assert await p.release_agent_pod_finalizer_exact(self.NAME, **exact)
+        assert api.removed == [self.NAME]
+
+    @pytest.mark.parametrize(
+        ("deleting", "node_name", "status", "authority"),
+        [
+            # Bound before the delete: its kubelet may still run the agent.
+            (True, "node-a", None, "unknown"),
+            # A status the kubelet wrote contradicts "never scheduled".
+            (True, None, ("container_statuses", "agent", "running"), "unknown"),
+            (
+                True,
+                None,
+                ("init_container_statuses", "wait-for-orchestrator", "terminated"),
+                "unknown",
+            ),
+            # Not deleting: the scheduler may still bind it.
+            (False, None, None, "exact_live"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_proof_stays_narrow(self, deleting, node_name, status, authority):
+        api = self._api(deleting=deleting, node_name=node_name, status=status)
+        p = self._provisioner(api)
+        exact = {"expected_pod_uid": self.UID, "namespace": EXECUTOR_NAMESPACE}
+
+        assert await p.agent_pod_authority(self.NAME, **exact) == authority
+        assert not await p.agent_pod_terminal_process_zero(self.NAME, **exact)
+        assert not await p.release_agent_pod_finalizer_exact(self.NAME, **exact)
+        assert api.pods[self.NAME].metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
 
 
 # =============================================================================
