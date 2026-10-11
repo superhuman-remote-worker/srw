@@ -829,6 +829,52 @@ def test_a_truncated_s3_snapshot_is_never_read_as_clean(tmp_path, monkeypatch) -
         gate.scan_s3_snapshot_stream(MARKERS, job_id=str(uuid4()))
 
 
+@pytest.mark.parametrize("script_bytes", [1, 65536], ids=["close", "write"])
+def test_a_closed_producer_input_fails_cleanly_and_reaps_the_process(
+    monkeypatch, script_bytes
+) -> None:
+    command = [
+        sys.executable,
+        "-c",
+        "import os, sys, time; os.close(0); "
+        "print('stdin closed', flush=True); time.sleep(60)",
+    ]
+    popen = subprocess.Popen
+    processes = []
+
+    def start_with_closed_input(arguments, **kwargs):
+        assert arguments == command
+        process = popen(arguments, **kwargs)
+        processes.append(process)
+        assert process.stdout.readline() == b"stdin closed\n"
+        return process
+
+    monkeypatch.setattr(gate, "s3_snapshot_producer", lambda: command)
+    monkeypatch.setattr(
+        gate, "s3_snapshot_stream_script", lambda **_kwargs: "x" * script_bytes
+    )
+    monkeypatch.setattr(gate.subprocess, "Popen", start_with_closed_input)
+    try:
+        with pytest.raises(gate.GateFailure, match="incomplete"):
+            gate.scan_s3_snapshot_stream(MARKERS, job_id=str(uuid4()))
+        assert len(processes) == 1
+        process = processes[0]
+        assert process.stdin.closed
+        assert process.returncode is not None and process.returncode < 0
+        with pytest.raises(ChildProcessError):
+            os.waitpid(process.pid, os.WNOHANG)
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            try:
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
+            process.stdout.close()
+
+
 def test_a_failed_producer_is_never_read_as_clean(tmp_path, monkeypatch) -> None:
     """The whole archive arrived, but the pod side did not exit cleanly."""
     _needs("tar", "zstd")

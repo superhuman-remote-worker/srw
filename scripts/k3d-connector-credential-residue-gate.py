@@ -638,8 +638,17 @@ def scan_s3_snapshot_stream(
         processes = [producer]
         try:
             assert producer.stdin is not None and producer.stdout is not None
-            producer.stdin.write(s3_snapshot_stream_script(job_id=job_id).encode())
-            producer.stdin.close()
+            try:
+                try:
+                    producer.stdin.write(
+                        s3_snapshot_stream_script(job_id=job_id).encode()
+                    )
+                finally:
+                    producer.stdin.close()
+            except BrokenPipeError:
+                raise GateFailure(
+                    "S3 snapshot stream incomplete (producer input closed)"
+                ) from None
             try:
                 decoder = subprocess.Popen(
                     ["zstd", "-dcq"],
