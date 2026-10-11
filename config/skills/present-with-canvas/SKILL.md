@@ -49,6 +49,14 @@ every required CSS, script, image, and font. `auto` never selects this mode.
 Keep the file bounded and self-contained, and do not describe it as a live
 workspace application.
 
+When the mockup is for a real organization, place, or product, show its real
+material instead of drawn stand-ins. Download its logo, a few key photos, and
+the web fonts its own site already serves with the shell, downscale the photos
+(for example to 1600 px wide JPEG at quality 75), and inline them as data URLs.
+The document must stay under 2 MiB including the base64, which grows each file
+by a third, so plan on three to five photos. Tell the user which images came
+from their site.
+
 Use only source types and fields present in the current `set_canvas` schema;
 never guess app, port, browser, or routing fields that are not advertised.
 
