@@ -1317,6 +1317,10 @@ class CreationActuator:
                 except Exception:
                     return pending
                 return pending
+            if kind == "vm" and not vm_effect_marked:
+                vm_effect_marked = _creation_vm_effect_marker(
+                    "create", {"carrier_intent": current_values}
+                )
             if body is not None:
                 try:
                     _effect_stage(kind, "api_create")

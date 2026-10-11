@@ -1695,6 +1695,128 @@ async def test_periodic_carrier_observer_adopts_after_lost_vm_reply_without_post
 
 
 @pytest.mark.asyncio
+async def test_lost_vm_reply_marks_winning_nonce_before_create_and_in_later_observer(
+    setup, monkeypatch, caplog
+):
+    from vm_controller.creation_actuation import carrier_record, reconcile_creation_carrier
+
+    caplog.set_level(logging.INFO, logger="vm_controller.creation_actuation")
+    ctrl, api, authority, payload = setup
+    api.lost.add("VirtualMachine")
+    original_create = api.create
+    before_vm_send = []
+
+    def record_before_create(body):
+        if body["kind"] == "VirtualMachine":
+            lease = api.read(
+                "Lease",
+                "srw-cleanup-"
+                + authority.row["creation_admission_id"].replace("-", ""),
+            )
+            signed = verify_creation_carrier(lease, secret=SECRET)
+            entries = [
+                row
+                for row in creation_invocation_markers(caplog)
+                if row["path"] == "create" and row["phase"] == "entry"
+            ]
+            invocation_id = entries[-1]["invocation_id"]
+            before_vm_send.append(
+                {
+                    "invocation_id": invocation_id,
+                    "signed_nonce": signed["effect_nonce"],
+                    "effect_markers": [
+                        row
+                        for row in creation_invocation_markers(caplog)
+                        if row["invocation_id"] == invocation_id
+                        and row["phase"] == "effect"
+                    ],
+                }
+            )
+        return original_create(body)
+
+    monkeypatch.setattr(api, "create", record_before_create)
+    for _ in range(3):
+        assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+    assert api.writes.count("VirtualMachine") == 1
+    assert len(before_vm_send) == 1
+    issued = authority.row["effects"][-1]
+    assert issued["state"] == "issued"
+    assert issued["carrier_intent"]["effect_kind"] == "vm"
+    assert before_vm_send[0]["signed_nonce"] == issued["carrier_intent"]["effect_nonce"]
+    assert [row["effect_nonce"] for row in before_vm_send[0]["effect_markers"]] == [
+        before_vm_send[0]["signed_nonce"]
+    ]
+
+    lease = api.read(
+        "Lease", "srw-cleanup-" + authority.row["creation_admission_id"].replace("-", "")
+    )
+    carrier = carrier_record(lease, secret=SECRET)
+    await reconcile_creation_carrier(ctrl, carrier)
+    assert authority.row["effects"][-1]["state"] == "observed"
+    await reconcile_creation_carrier(ctrl, carrier)
+    assert authority.settled
+    assert api.writes.count("VirtualMachine") == 1
+    observer_effects = [
+        row
+        for row in creation_invocation_markers(caplog)
+        if row["path"] == "carrier" and row["phase"] == "effect"
+    ]
+    assert len(observer_effects) == 2
+    assert all(
+        row["effect_nonce"] == before_vm_send[0]["signed_nonce"]
+        and row["invocation_id"] != before_vm_send[0]["invocation_id"]
+        for row in observer_effects
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", ["denied_grant", "unvalidated_carrier"])
+async def test_vm_effect_marker_requires_winning_grant_and_validated_carrier(
+    setup, monkeypatch, caplog, refusal
+):
+    from vm_controller import creation_actuation
+
+    caplog.set_level(logging.INFO, logger="vm_controller.creation_actuation")
+    ctrl, api, authority, payload = setup
+    for _ in range(2):
+        assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+    assert api.writes == ["Lease", "DataVolume", "Secret"]
+    caplog.clear()
+
+    if refusal == "denied_grant":
+        original_authority = ctrl._workspace_cleanup_authority_request
+
+        async def deny_vm_grant(path, body, *, operation):
+            if path.endswith("begin-effect") and verify_creation_carrier(
+                body["carrier"], secret=SECRET
+            )["effect_kind"] == "vm":
+                return {"actuation_allowed": False}
+            return await original_authority(path, body, operation=operation)
+
+        ctrl._workspace_cleanup_authority_request = deny_vm_grant
+    else:
+        original_verify = creation_actuation.verify_creation_carrier
+
+        def reject_unvalidated_carrier(*args, **kwargs):
+            if authority.row["effects"][-1]["carrier_intent"]["effect_kind"] == "vm":
+                raise ValueError("token=private-auth-value")
+            return original_verify(*args, **kwargs)
+
+        monkeypatch.setattr(
+            creation_actuation, "verify_creation_carrier", reject_unvalidated_carrier
+        )
+
+    await ctrl._do_create_serialized(payload)
+    assert api.writes == ["Lease", "DataVolume", "Secret"]
+    assert not [
+        row
+        for row in creation_invocation_markers(caplog)
+        if row["phase"] == "effect" and row["effect_kind"] == "vm"
+    ]
+    assert "private-auth-value" not in caplog.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", [422, 500])
 async def test_only_matching_definitive_api_status_resolves_effect(setup, status):
     import json
