@@ -222,6 +222,42 @@ def _claimant_soft_settlement(
     return next(iter(matches)) if matches else None
 
 
+def _claimant_agentless_settlement(
+    intent: Mapping[str, Any],
+    claim: Mapping[str, Any],
+    outcomes: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Match a claim-bearing Pod that never registered to its soft outcome.
+
+    End stopped that exact Pod before any agent bound, and the settlement
+    recorded it from the orchestrator's pre-registration receipt (0526).
+    There is no agent to join on, so require the one related outcome to be
+    exactly that agentless proof.
+    """
+
+    attempt = str(intent["attempt_id"])
+    related = []
+    for outcome in outcomes:
+        proof = _json(outcome["retired_agent_pod"])
+        if str(outcome["runtime_generation"]) == str(intent["runtime_generation"]) or (
+            isinstance(proof, dict)
+            and (
+                str(proof.get("pod_uid") or "") == str(intent["pod_uid"] or "")
+                or str(proof.get("provision_attempt") or "") == attempt
+            )
+        ):
+            related.append((outcome, proof))
+    if len(related) != 1:
+        return False
+    outcome, proof = related[0]
+    return bool(
+        proof == _expected_soft_pod_proof(intent, claim)
+        and str(outcome["runtime_generation"]) == str(intent["runtime_generation"])
+        and outcome["agent_id"] is None
+        and outcome["runtime_attach_token"] is None
+    )
+
+
 def _claimless_soft_settlement(
     intent: Mapping[str, Any], outcomes: Sequence[Mapping[str, Any]]
 ) -> str | None:
@@ -520,6 +556,9 @@ async def retire_historical_claimant_pods(
         ):
             raise RuntimeError("historical claimant intent is incomplete")
         old_agent_id = _claimant_soft_settlement(intent, claim, outcomes)
+        agentless_proof = old_agent_id is None and _claimant_agentless_settlement(
+            intent, claim, outcomes
+        )
         recycle_proof = any(
             str(handoff["predecessor_attempt_id"]) == attempt
             and handoff["predecessor_pod_uid"] == intent["pod_uid"]
@@ -528,7 +567,7 @@ async def retire_historical_claimant_pods(
             and handoff["pod_name"] == intent["pod_name"]
             for handoff in handoffs
         )
-        if not (old_agent_id or recycle_proof):
+        if not (old_agent_id or recycle_proof or agentless_proof):
             raise RuntimeError("historical claimant lacks immutable actor settlement")
         candidates.append((intent, old_agent_id))
 

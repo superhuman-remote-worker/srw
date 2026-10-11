@@ -611,3 +611,269 @@ async def test_historical_patch_refuses_a_status_change_at_its_resource_version(
         ).reconcile_agent_workspace_claim_for_retirement(permanent)
     assert pod.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
     assert not k8s.deleted_pvcs
+
+
+async def _bind_preregistration_generation(db, ids, *, claim_bearing=True):
+    """A published agent Pod that never registered: End raced its create."""
+
+    generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
+    identity = {
+        **ids,
+        "generation": generation,
+        "attempt": str(uuid4()),
+        "pod_name": f"agent-{uuid4().hex[:12]}",
+        "pod_uid": str(uuid4()),
+    }
+    reserved = await db.reserve_pinned_agent_pod_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=generation,
+        attempt_id=identity["attempt"],
+        pod_name=identity["pod_name"],
+        provisioner="agent",
+        namespace="agents-a",
+        pvc_name=f"pvc-agent-{ids['thread'][:12]}" if claim_bearing else None,
+    )
+    assert reserved
+    claim = reserved["workspace_claim"]
+    if claim is not None:
+        assert await db.publish_pinned_agent_workspace_claim(
+            ids["thread"],
+            expected_runtime_generation=generation,
+            claim_id=str(claim["claim_id"]),
+            pvc_name=claim["pvc_name"],
+            pvc_uid=f"pvc-{ids['thread']}",
+            namespace="agents-a",
+        )
+    assert await db.publish_pinned_agent_pod_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=generation,
+        attempt_id=identity["attempt"],
+        pod_name=identity["pod_name"],
+        pod_uid=identity["pod_uid"],
+        namespace="agents-a",
+    )
+    return identity, claim
+
+
+async def _preregistration_soft_end(db, monkeypatch, *, claim_bearing=True):
+    ids = {key: str(uuid4()) for key in ("user", "thread")}
+    await db.execute(
+        "INSERT INTO users (id,display_name,email) VALUES ($1::uuid,'owner',$2)",
+        ids["user"],
+        f"{ids['user']}@example.test",
+    )
+    await db.execute(
+        "INSERT INTO threads (id,user_id,status,execution_lane,config_name,metadata) "
+        "VALUES ($1::uuid,$2::uuid,'created','pinned','session_base',$3::jsonb)",
+        ids["thread"],
+        ids["user"],
+        json.dumps({"config_override": {"workspace": {"backend": "none"}}}),
+    )
+    old, claim = await _bind_preregistration_generation(
+        db, ids, claim_bearing=claim_bearing
+    )
+    k8s = ClaimantK8sApi()
+    if claim is not None:
+        k8s.install_claimant(old, claim)
+        k8s.install_pvc(
+            namespace="agents-a",
+            name=claim["pvc_name"],
+            uid=f"pvc-{ids['thread']}",
+            labels={
+                "srw.io/thread-id": ids["thread"],
+                "srw.io/runtime-generation": str(claim["created_runtime_generation"]),
+                "srw.io/workspace-claim": str(claim["claim_id"]),
+                "srw.io/provision-attempt": str(claim["create_attempt"]),
+                "srw.io/claim-provisioner": "agent",
+            },
+        )
+    else:
+        k8s.install_claimant(old, {"pvc_name": None})
+    provider = AgentProvisioner()
+    provider._k8s_available = True
+    provider._core_api = k8s
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(agent_provisioner_module, "agent_provisioner", provider)
+    core_api = MagicMock()
+    networking_api = MagicMock()
+    core_api.read_namespaced_service.side_effect = authority_fixtures._K8sError(404)
+    networking_api.read_namespaced_ingress.side_effect = authority_fixtures._K8sError(
+        404
+    )
+    monkeypatch.setattr(
+        main.app.state.resources,
+        "session_router",
+        SessionRouterService(
+            namespace="agents-a",
+            ingress_host="unused.example",
+            core_api=core_api,
+            networking_api=networking_api,
+        ),
+    )
+    operations = controls_composition.pinned_retirement_operations(
+        main.app.state.resources
+    )
+    soft = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=soft["token"],
+        generation=soft["generation"],
+        settle_status="ended",
+    )
+    assert soft["context"]["agent_id"] is None
+    assert soft["context"]["agent_pod"]["pod_uid"] == old["pod_uid"]
+    k8s.mark_terminal("agents-a", old["pod_name"])
+    # End stops the exact Pod and receipts it: no agent ever bound.
+    assert await operations.recover_pre_registration_agent_pod_zero(
+        soft, await db.get_thread(ids["thread"])
+    )
+    assert old["pod_uid"] in k8s.removed_pods
+    await operations.reconcile_agent_workspace_claim_for_retirement(soft)
+    assert await db.settle_pinned_thread_retirement(
+        ids["thread"],
+        token=soft["token"],
+        generation=soft["generation"],
+        final_status="ended",
+    )
+    outcome = await db.fetchrow(
+        "SELECT * FROM thread_runtime_retirement_outcomes WHERE thread_id=$1::uuid",
+        ids["thread"],
+    )
+    return ids, old, claim, k8s, operations, outcome
+
+
+@pytest.mark.asyncio
+async def test_permanent_end_after_a_preregistration_soft_end_retires_the_claimant(
+    db, monkeypatch
+):
+    """k3d 2026-10-11 (``41fd1107``; the access gate's cross session): End
+    raced a claim-bearing agent Pod's create and settled on the
+    orchestrator's exact pre-registration receipt, but the outcome named no
+    Pod (no agent), so DELETE refused "historical claimant lacks immutable
+    actor settlement" forever."""
+
+    ids, old, claim, k8s, operations, outcome = await _preregistration_soft_end(
+        db, monkeypatch
+    )
+    assert outcome["agent_id"] is None
+    assert _json(outcome["retired_agent_pod"]) == {
+        "version": 1,
+        "pod_name": old["pod_name"],
+        "pod_uid": old["pod_uid"],
+        "namespace": "agents-a",
+        "provisioner": "agent",
+        "provision_attempt": old["attempt"],
+        "protection_protocol": "finalizer_v1",
+        "workspace_claim_id": str(claim["claim_id"]),
+        "workspace_create_attempt": str(claim["create_attempt"]),
+        "workspace_created_runtime_generation": str(
+            claim["created_runtime_generation"]
+        ),
+        "pvc_name": claim["pvc_name"],
+        "pvc_uid": f"pvc-{ids['thread']}",
+    }
+
+    permanent = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=permanent["token"],
+        generation=permanent["generation"],
+        settle_status="ended",
+    )
+    await operations.cleanup_pinned_thread_retirement(permanent)
+
+    assert k8s.deleted_pvcs == [f"pvc-{ids['thread']}"]
+    fence = next(iter(k8s.pvcs.values()))
+    assert fence.metadata.labels["srw.io/workspace-claim-fence"] == "true"
+    await db.delete_thread(
+        ids["thread"],
+        expected_runtime_retirement_token=permanent["token"],
+        expected_runtime_generation=permanent["generation"],
+    )
+    assert await db.get_thread(ids["thread"]) is None
+
+
+@pytest.mark.asyncio
+async def test_a_claimless_preregistration_soft_end_still_records_no_pod(
+    db, monkeypatch
+):
+    # The claim-less historical sweep leaves an unrelated intent alone; a
+    # recorded relation without an agent would refuse its whole set.
+    *_rest, outcome = await _preregistration_soft_end(
+        db, monkeypatch, claim_bearing=False
+    )
+    assert outcome["agent_id"] is None
+    assert outcome["retired_agent_pod"] is None
+
+
+def _agentless_case(**changes):
+    from orchestrator.services.historical_agent_pod_cleanup import (
+        _claimant_agentless_settlement,
+        _expected_soft_pod_proof,
+    )
+
+    intent = {
+        "attempt_id": "a-1",
+        "runtime_generation": "g-1",
+        "pod_name": "agent-1",
+        "pod_uid": "pod-1",
+        "namespace": "agents-a",
+        "provisioner": "agent",
+    }
+    claim = {
+        "claim_id": "c-1",
+        "create_attempt": "a-1",
+        "created_runtime_generation": "g-1",
+        "pvc_name": "pvc-1",
+        "pvc_uid": "pvc-uid-1",
+        "namespace": "agents-a",
+        "provisioner": "agent",
+    }
+    extra = changes.pop("_extra", None)
+    outcome = {
+        "runtime_generation": "g-1",
+        "agent_id": None,
+        "runtime_attach_token": None,
+        "retired_agent_pod": _expected_soft_pod_proof(intent, claim),
+        **changes,
+    }
+    outcomes = [outcome] + ([extra] if extra else [])
+    return _claimant_agentless_settlement(intent, claim, outcomes)
+
+
+@pytest.mark.parametrize(
+    ("changes", "accepted"),
+    [
+        ({}, True),
+        # An attach token or agent means a registered actor: the agent join.
+        ({"runtime_attach_token": "t-1"}, False),
+        ({"agent_id": "agent-x"}, False),
+        # The proof must name this exact Pod and claim.
+        ({"retired_agent_pod": None}, False),
+        (
+            {
+                "retired_agent_pod": {
+                    "version": 1,
+                    "pod_uid": "pod-1",
+                    "pvc_uid": "another",
+                }
+            },
+            False,
+        ),
+        ({"runtime_generation": "g-2"}, False),
+        # A second related outcome is ambiguous.
+        (
+            {
+                "_extra": {
+                    "runtime_generation": "g-1",
+                    "agent_id": None,
+                    "runtime_attach_token": None,
+                    "retired_agent_pod": None,
+                }
+            },
+            False,
+        ),
+    ],
+)
+def test_the_agentless_join_accepts_only_the_exact_proof(changes, accepted):
+    assert _agentless_case(**changes) is accepted
