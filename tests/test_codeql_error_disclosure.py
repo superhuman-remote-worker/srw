@@ -312,6 +312,8 @@ def _job_diff_client():
 
     store = SimpleNamespace(
         get_project=AsyncMock(return_value=project),
+        # The caller decides the diff as an editor of the job's project.
+        get_user_role_in_project=AsyncMock(return_value="editor"),
         update_job_cloud_diff=AsyncMock(),
         update_job_merge_status=AsyncMock(),
         update_job_status=AsyncMock(),
