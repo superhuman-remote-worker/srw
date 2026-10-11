@@ -216,6 +216,306 @@ async def complete_synthetic_retained_delete(db, recovery, purge):
 
 
 @pytest.mark.asyncio
+async def test_late_adopted_policy1_release_bootstraps_exact_stop_before_retention(
+    db, monkeypatch
+):
+    """A settled creation retry must enter the real release path without a stop intent."""
+    from orchestrator.services import vm_provisioner as module
+    from orchestrator.services.vm_provisioner import (
+        VMProvisioner,
+        VMTeardownIdentity,
+        VMTeardownResult,
+        _VMTeardownProbe,
+    )
+    from orchestrator.services.vm_workspace_recovery_store import (
+        complete_vm_cleanup_permit,
+    )
+    from tests.test_vm_job_cancel_retention_real_postgres import (
+        publish_cancelled_launcher,
+    )
+
+    state = await late_adopted_state(db)
+    await publish_cancelled_launcher(state)
+    permit = await acquire(state)
+    assert permit.allowed, permit.reason
+    job_id = UUID(state["job_id"])
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_creation_retries WHERE job_id=$1", job_id
+        )
+        == "settled"
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_pre_ssh_stop_intents WHERE job_id=$1", job_id
+        )
+        == 0
+    )
+
+    frozen = frozen_candidate(state, permit.parent_cleanup)
+    state["frozen"] = frozen
+    preflight_value = preflight(state)
+    preflight_value["pvc_name"] = f"agent-vm-{state['job_id']}-rootdisk"
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    provisioner = VMProvisioner()
+    provisioner._db = db
+    provisioner._snapshot_service = None
+    identity = VMTeardownIdentity(
+        state["generation"],
+        frozen["vm_uid"],
+        frozen["pvc_uid"],
+        ssh_host="100.64.1.9",
+        ssh_port=22,
+        ssh_host_key_fingerprint="SHA256:retained-test-key",
+    )
+    provisioner._probe_vm_teardown_identity = AsyncMock(
+        return_value=_VMTeardownProbe(
+            "present",
+            VMTeardownIdentity(
+                state["generation"],
+                frozen["vm_uid"],
+                frozen["pvc_uid"],
+                credential_runtime_started=True,
+            ),
+            rootdisk_identity_known=True,
+        )
+    )
+    monkeypatch.setattr(
+        module, "retire_managed_repository_processes", AsyncMock(return_value=True)
+    )
+    actions = []
+    checks = []
+
+    async def controller_stop(payload):
+        actions.append(payload["action"])
+        if payload["action"] == "inspect_never_app_ready_retained":
+            from shared.vm_cancel_retention import (
+                never_app_ready_retention_authority_matches,
+                valid_retention_preflight,
+            )
+
+            checks.append(
+                (
+                    never_app_ready_retention_authority_matches(
+                        payload["held_stop_authority"], permit.parent_cleanup, frozen
+                    ),
+                    valid_retention_preflight(preflight_value, frozen),
+                )
+            )
+            return {
+                "status": "candidate",
+                "frozen": frozen,
+                "retention_preflight": preflight_value,
+                "_identity_authenticated": True,
+            }
+        if payload["action"] == "stop":
+            return {
+                "status": "positive_terminal_proof",
+                "terminal_evidence": {
+                    **terminal_proof(frozen, payload["frozen_digest"]),
+                    "kind": "vm_job_never_app_ready_retained_positive_stop_v1",
+                },
+                "_identity_authenticated": True,
+            }
+        assert payload["action"] == "release"
+        return {"status": "finalizer_released", "_identity_authenticated": True}
+
+    provisioner._request_pre_ssh_stop = AsyncMock(side_effect=controller_stop)
+
+    async def delete_after_proof(*_args, **_kwargs):
+        assert (
+            await db.fetchval(
+                "SELECT count(*) FROM vm_pre_ssh_stop_proofs WHERE job_id=$1", job_id
+            )
+            == 1
+        )
+        return VMTeardownResult("completed", True)
+
+    provisioner.delete_vm_captured = AsyncMock(side_effect=delete_after_proof)
+    result = await provisioner.release_vm_captured(
+        state["job_id"],
+        identity,
+        purge_disk=False,
+        capture_snapshot=False,
+        parent_cleanup=permit.parent_cleanup,
+    )
+    assert result == VMTeardownResult("completed", True), (actions, checks)
+    assert actions == ["inspect_never_app_ready_retained", "stop", "release"]
+    assert checks == [(True, True)]
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_pre_ssh_stop_intents WHERE job_id=$1", job_id
+        )
+        == 1
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_pre_ssh_stop_proofs WHERE job_id=$1", job_id
+        )
+        == 1
+    )
+
+    evidence = {
+        "version": 1,
+        "kind": "vm_cleanup_physical_stop",
+        "job_id": state["job_id"],
+        "provision_generation": state["generation"],
+        "vm_uid": frozen["vm_uid"],
+        "vmi_uid": frozen["vmi_uid"],
+        "launcher_uid": frozen["launcher_uid"],
+        "pvc_uid": frozen["pvc_uid"],
+        "vm_absent": True,
+        "vmi_absent": True,
+        "launcher_absent": True,
+        "same_generation_replacement": False,
+        "pvc_disposition": "retained",
+        "controller_authenticated": True,
+        "retained_rootdisk": {
+            "version": 1,
+            "kind": "vm_retained_rootdisk_v1",
+            "namespace": frozen["namespace"],
+            "owner_kind": "job",
+            "owner_id": state["job_id"],
+            "pvc_name": preflight_value["pvc_name"],
+            "pvc_uid": frozen["pvc_uid"],
+            "dv_uid": preflight_value["dv_uid"],
+            "ownership": "standalone_dv",
+            "deleting": False,
+            "no_consumers": True,
+        },
+    }
+    await complete_vm_cleanup_permit(
+        state["recovery"],
+        permit,
+        outcome="completed",
+        provisioner=SimpleNamespace(
+            attest_vm_cleanup_stop=AsyncMock(return_value=evidence)
+        ),
+    )
+    assert await db.fetchval(
+        "SELECT public.vm_job_cancel_retention_settled($1)", permit.admission_id
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault", ["issued", "wrong_effect", "wrong_generation", "legacy_intent"]
+)
+async def test_late_adopted_first_stop_refuses_inexact_source_before_controller(
+    db, monkeypatch, fault
+):
+    """A committed parent cannot bootstrap a stop from an inexact creation source."""
+    from orchestrator.services.vm_provisioner import (
+        VMProvisioner,
+        VMTeardownIdentity,
+        _VMTeardownProbe,
+    )
+    from tests.test_vm_job_cancel_retention_real_postgres import (
+        publish_cancelled_launcher,
+    )
+
+    state = await late_adopted_state(db)
+    await publish_cancelled_launcher(state)
+    permit = await acquire(state)
+    assert permit.allowed, permit.reason
+    request = await db.fetchval(
+        "SELECT request_id FROM vm_creation_retries WHERE job_id=$1",
+        UUID(state["job_id"]),
+    )
+    if fault == "issued":
+        # Model corrupted persisted evidence after parent admission. Ordinary
+        # writers cannot rewrite an observed effect; the SQL source must
+        # still refuse if a legacy import violates that invariant.
+        async with db.acquire() as conn:
+            await conn.execute("SET session_replication_role=replica")
+            try:
+                await conn.execute(
+                    "UPDATE vm_creation_effects SET state='issued',resolved_at=NULL,"
+                    "evidence='{}'::jsonb "
+                    "WHERE request_id=$1 AND effect_kind='vm'",
+                    request,
+                )
+            finally:
+                await conn.execute("SET session_replication_role=origin")
+    elif fault == "wrong_effect":
+        async with db.acquire() as conn:
+            await conn.execute("SET session_replication_role=replica")
+            try:
+                await conn.execute(
+                    "UPDATE vm_creation_effects SET evidence=jsonb_set(evidence,'{uid}',"
+                    "to_jsonb($2::text)) WHERE request_id=$1 AND effect_kind='vm'",
+                    request,
+                    str(uuid4()),
+                )
+            finally:
+                await conn.execute("SET session_replication_role=origin")
+    elif fault == "legacy_intent":
+        # This is a migrated pre-policy stop row, not an invitation to replace
+        # it with a newly typed held-stop intent for the same owner.
+        async with db.acquire() as conn:
+            await conn.execute("SET session_replication_role=replica")
+            try:
+                await conn.execute(
+                    "INSERT INTO vm_pre_ssh_stop_intents "
+                    "(cleanup_admission_id,job_id,provision_generation,creation_request_id,"
+                    "reservation_id,reservation_revision,vm_uid,vmi_uid,launcher_uid,pvc_uid,"
+                    "node_uid,cleanup_intent_digest,frozen,frozen_digest) "
+                    "SELECT cleanup_admission_id,job_id,provision_generation,"
+                    "creation_request_id,reservation_id,reservation_revision,vm_uid,"
+                    "vmi_uid,launcher_uid,pvc_uid,node_uid,intent_digest,$2::jsonb,"
+                    "'sha256:'||encode(sha256(convert_to($2::jsonb::text,'UTF8')),'hex') "
+                    "FROM vm_job_cancel_retention_authorities WHERE cleanup_admission_id=$1",
+                    permit.admission_id,
+                    json.dumps(state["frozen"]),
+                )
+            finally:
+                await conn.execute("SET session_replication_role=origin")
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    provisioner = VMProvisioner()
+    provisioner._db = db
+    provisioner._snapshot_service = None
+    generation = str(uuid4()) if fault == "wrong_generation" else state["generation"]
+    identity = VMTeardownIdentity(
+        generation, state["frozen"]["vm_uid"], state["frozen"]["pvc_uid"]
+    )
+    provisioner._probe_vm_teardown_identity = AsyncMock(
+        return_value=_VMTeardownProbe(
+            "present",
+            VMTeardownIdentity(
+                generation,
+                state["frozen"]["vm_uid"],
+                state["frozen"]["pvc_uid"],
+                credential_runtime_started=True,
+            ),
+            rootdisk_identity_known=True,
+        )
+    )
+    provisioner._request_pre_ssh_stop = AsyncMock()
+    provisioner.delete_vm_captured = AsyncMock()
+    result = await provisioner.release_vm_captured(
+        state["job_id"],
+        identity,
+        purge_disk=False,
+        capture_snapshot=False,
+        parent_cleanup=permit.parent_cleanup,
+    )
+    assert result.deleted is False
+    provisioner._request_pre_ssh_stop.assert_not_awaited()
+    provisioner.delete_vm_captured.assert_not_awaited()
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_pre_ssh_stop_intents WHERE job_id=$1",
+        UUID(state["job_id"]),
+    ) == int(fault == "legacy_intent")
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_pre_ssh_stop_proofs WHERE job_id=$1",
+            UUID(state["job_id"]),
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("deleted_before_completion", [False, True])
 async def test_cancel_before_late_adoption_binds_then_commits_held_stop(
     db, deleted_before_completion

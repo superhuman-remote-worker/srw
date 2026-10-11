@@ -196,6 +196,36 @@ class VMPreSSHStopStore:
         )
         if job is None or cleanup is None or retry is None:
             raise VMPreSSHStopConflict("retirement_authority_absent")
+        # A Cancel-before-adoption retry can settle after its policy-1 parent
+        # was committed, before any retained stop intent exists. Admit only
+        # that first read, under the ordinary owner/Job/retry locks and the
+        # complete 0433 late-adoption source predicate. An existing legacy
+        # intent must never be reclassified as a held stop.
+        if (
+            policy1_stop
+            and frozen is None
+            and not held_stop
+            and retry["state"] == "settled"
+            and authority["cleanup_admission_id"] == cleanup_id
+            and authority["admitted_xact_id"]
+            != await conn.fetchval("SELECT pg_current_xact_id()")
+            and await conn.fetchval(
+                "SELECT NOT EXISTS(SELECT 1 FROM vm_pre_ssh_stop_intents "
+                "WHERE job_id=$1 AND provision_generation=$2)",
+                job_id,
+                generation,
+            )
+            and await conn.fetchval(
+                "SELECT public.vm_cancel_late_adopted_source($1,$2,$3,$4,$5,$6,false)",
+                job_id,
+                generation,
+                retry["observed_vm_uid"],
+                retry["observed_pvc_uid"],
+                retry["request_id"],
+                cleanup_id,
+            )
+        ):
+            held_stop = True
         context = _json_object(job["context"])
         vm = context.get("vm")
         if not isinstance(vm, dict):
