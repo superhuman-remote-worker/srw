@@ -3050,9 +3050,12 @@ export class PersistentChatService {
         this.sessionTitle.set(thread.title || null);
         const model = thread.metadata?.config_override?.llm?.model;
         // `config_name` is an expert profile (normally `session_base`),
-        // not an LLM model.  Leave the display unknown until the resolved
-        // session-state snapshot supplies the effective model.
-        this.modelName.set(model || null);
+        // not an LLM model.  Only a pinned override names the model here;
+        // otherwise the resolved session-state snapshot supplies it. A
+        // recovery read (SSE reconnect, End reconciliation) must not erase
+        // that resolved value, or the live pane falls back to a bare
+        // "Default". A thread switch already clears it.
+        if (model) this.modelName.set(model);
         const officer = thread.metadata?.config_override?.officer;
         this.isOfficerThread.set(officer?.enabled === true || officer?.enabled === 'true');
         const temperature = thread.metadata?.config_override?.llm?.temperature;

@@ -13167,6 +13167,17 @@ describe('PersistentChatService — pending End visibility reconciliation', () =
     expect(ctx.service.turnCount()).toBe(12);
   });
 
+  it('keeps the snapshot-resolved model when a full recovery read pins none', async () => {
+    // A session on its default model has no llm.model in its override; only
+    // the session-state snapshot names it. An SSE-reconnect hydration used to
+    // reset it to null, and the live settings pane then showed bare "Default".
+    await connected();
+    ctx.service.modelName.set('resolved-live-model');
+    meta = { ...meta, metadata: { config_override: { workspace: { backend: 'virtual' } } } };
+    await (ctx.service as any).loadThreadMeta('watched', undefined, { fresh: true });
+    expect(ctx.service.modelName()).toBe('resolved-live-model');
+  });
+
   it('replaces typed workspace creation with null when a newer metadata read omits it', async () => {
     meta = {...meta, workspace_creation: {
       stage: 'scheduling', state: 'waiting_capacity', reason_code: 'scheduler_unschedulable',
