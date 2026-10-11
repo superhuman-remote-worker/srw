@@ -985,7 +985,17 @@ class PinnedRetirementOperations:
             return False
         workspace_generation = str(binding.get("generation") or "")
         workspace_runtime = str(workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY) or "")
-        physical_workspace_evidence = bool(
+        # A first workspace create that never published handed this Pod no
+        # address; cleanup's attempt fence stops that workspace Pod later.
+        workspace_create_pending = bool(
+            not binding
+            and never_published_workspace_create(
+                workspace,
+                context.get("workspace_provision_intent"),
+                runtime_generation=str(retirement.get("generation") or ""),
+            )
+        )
+        physical_workspace_evidence = not workspace_create_pending and bool(
             binding
             or str(workspace.get("status") or "") not in {"", "deleted"}
             or any(

@@ -44299,7 +44299,9 @@ class PostgresDB:
         that Pod before this CAS; registration remains closed by T throughout.
         When Begin also captured a physical sandbox, permanent recovery must
         first prove that exact workspace Pod absent and supply its generation
-        and UID, producing the stronger sandbox-actuator receipt.
+        and UID, producing the stronger sandbox-actuator receipt. A captured
+        first workspace create that never published is not one: this Pod
+        never received its address, and cleanup's attempt fence stops it.
         """
 
         try:
@@ -44351,6 +44353,18 @@ class PostgresDB:
                 workspace_provision_intent = context.get("workspace_provision_intent")
                 workspace = {} if workspace is None else workspace
                 binding = {} if binding is None else binding
+                # A first workspace create still pending never handed this
+                # unregistered Pod its address; cleanup's attempt fence stops
+                # the workspace Pod, so the receipt proves the agent alone.
+                workspace_create_pending = bool(
+                    isinstance(workspace, dict)
+                    and binding == {}
+                    and never_published_workspace_create(
+                        workspace,
+                        workspace_provision_intent,
+                        runtime_generation=str(parsed_generation),
+                    )
+                )
                 if not (
                     str(row["status"] or "") == "created"
                     and str(context.get("entry_status") or "") == "created"
@@ -44371,7 +44385,10 @@ class PostgresDB:
                     and row["runtime_attach_token"] is None
                     and isinstance(workspace, dict)
                     and isinstance(binding, dict)
-                    and workspace_provision_intent in (None, {})
+                    and (
+                        workspace_provision_intent in (None, {})
+                        or workspace_create_pending
+                    )
                 ):
                     return None
                 matching_agent = await conn.fetchval(
@@ -44385,7 +44402,7 @@ class PostgresDB:
                     return None
                 workspace_generation = str(binding.get("generation") or "")
                 workspace_runtime = str(workspace.get("_runtime_incarnation") or "")
-                physical_workspace_evidence = bool(
+                physical_workspace_evidence = not workspace_create_pending and bool(
                     binding
                     or str(workspace.get("status") or "") not in {"", "deleted"}
                     or any(

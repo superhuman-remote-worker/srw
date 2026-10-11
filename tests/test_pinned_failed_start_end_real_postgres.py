@@ -815,6 +815,196 @@ async def test_protected_end_during_first_workspace_create_receipts_zero(
     assert fixtures._json(staged["payload"])["mount_id"] == row_id
 
 
+async def _pre_registration_agent_pod(db, thread_id):
+    """Publish an agent Pod that never registered, as a create races End."""
+
+    # A session whose agent never registered is still ``created``.
+    await db.execute(
+        "UPDATE threads SET status='created' WHERE id=$1::uuid", UUID(thread_id)
+    )
+    thread = await db.get_thread(thread_id)
+    generation = str(thread["runtime_generation"])
+    attempt = str(uuid4())
+    pod_name = f"agent-{thread_id[:12]}"
+    assert await db.reserve_pinned_agent_pod_provision_intent(
+        thread_id,
+        expected_runtime_generation=generation,
+        attempt_id=attempt,
+        pod_name=pod_name,
+        provisioner="agent",
+        namespace="agents-a",
+    )
+    assert await db.publish_pinned_agent_pod_provision_intent(
+        thread_id,
+        expected_runtime_generation=generation,
+        attempt_id=attempt,
+        pod_name=pod_name,
+        pod_uid="agent-original",
+        namespace="agents-a",
+    )
+    return pod_name
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permanent", [True, False], ids=["delete", "protected_end"])
+async def test_end_with_agent_pod_and_first_workspace_create_in_flight_finishes(
+    db, monkeypatch, permanent
+):
+    """End/DELETE while both creates are in flight (k3d 2026-10-11, ``a6f838f6``).
+
+    The agent Pod never registered, so it never received the workspace's
+    address; its exact stop is the actor proof. The workspace create never
+    published, and its attempt fence stops that Pod in cleanup. The
+    pre-registration receipt refused any captured workspace create, so the
+    durable retry logged "could not prove process zero" forever.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    from orchestrator.services import agent_provisioner as agent_module
+    from orchestrator.services import protected_cloud_engage
+    from orchestrator.services import stale_agent_detector
+    from orchestrator.services.session_router import SessionRouterService
+
+    ids, cluster, provider, intent = await _failed_start(db, monkeypatch)
+    row_id = plan = None
+    if not permanent:
+        (
+            row_id,
+            plan,
+            _generation,
+            _mount_id,
+        ) = await fixtures._seed_protected_ro_attempt(db, ids, status="active")
+    name = await _pre_registration_agent_pod(db, ids["thread"])
+    reader = MagicMock()
+    reader.revoke_protected_reader_attempt = AsyncMock()
+
+    async def _resolve_reader(_plan, **_):
+        return reader
+
+    monkeypatch.setattr(
+        protected_cloud_engage, "_resolve_protected_reader_backend", _resolve_reader
+    )
+    actor_api = fixtures.StatefulPinnedK8sApi()
+    actor_api.install_old_pod(
+        namespace="agents-a",
+        name=name,
+        uid="agent-original",
+        labels={"srw/managed-by": "agent-provisioner", "srw/purpose": "job"},
+    )
+    actor_api.mark_terminal("agents-a", name)
+    actor_provider = fixtures._production_warm_provisioner(db, actor_api)
+    routes = MagicMock()
+    routes.read_namespaced_service.side_effect = fixtures._K8sError(404)
+    networking = MagicMock()
+    networking.read_namespaced_ingress.side_effect = fixtures._K8sError(404)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(provider_module, "container_provisioner", provider)
+    monkeypatch.setattr(agent_module, "agent_provisioner", actor_provider)
+    monkeypatch.setattr(
+        main.app.state.resources,
+        "session_router",
+        SessionRouterService(
+            namespace="agents-a",
+            ingress_host="unused.example",
+            core_api=routes,
+            networking_api=networking,
+        ),
+    )
+    retirement = await db.begin_pinned_thread_retirement(
+        ids["thread"], permanent=permanent
+    )
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    context = retirement["context"]
+    assert context["entry_status"] == "created"
+    assert context["runtime_authority_exposed"] is True
+    assert context["agent_id"] is None
+    assert context["agent_pod"]["pod_name"] == name
+    assert context["workspace_container"]["status"] == "pending"
+    assert context["workspace_provision_intent"]["attempt_id"] == str(
+        intent["attempt_id"]
+    )
+
+    candidate = dict(await db.get_thread(ids["thread"]))
+    assert await stale_agent_detector.retry_pending_pinned_retirement(
+        candidate,
+        dependencies=controls.stale_agent_detector_dependencies(
+            main.app.state.resources
+        ),
+    )
+
+    assert ("agents-a", name) not in actor_api.pods
+    assert cluster.objects["pod"].metadata.uid != intent["pod_uid"]
+    thread = await db.get_thread(ids["thread"])
+    if permanent:
+        assert thread is None
+        assert cluster.objects["pvc"].metadata.uid != intent["pvc_uid"]
+        return
+    assert thread["status"] == "ended"
+    assert cluster.objects["pvc"].metadata.uid == intent["pvc_uid"]
+    reader.revoke_protected_reader_attempt.assert_awaited_once_with(plan)
+    async with db.acquire() as conn:
+        staged = await conn.fetchrow(
+            "SELECT payload FROM thread_events WHERE thread_id=$1::uuid "
+            "AND kind='cloud.diff_staged'",
+            UUID(ids["thread"]),
+        )
+    assert fixtures._json(staged["payload"])["file_count"] == 0
+    assert fixtures._json(staged["payload"])["mount_id"] == row_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tamper", [None, "registered", "workspace_identity"])
+async def test_pre_registration_receipt_beside_a_pending_create_names_no_workspace(
+    db, monkeypatch, tamper
+):
+    ids, _cluster, _provider, _intent = await _failed_start(db, monkeypatch)
+    name = await _pre_registration_agent_pod(db, ids["thread"])
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    workspace_identity = {}
+    if tamper == "registered":
+        # A registration that raced End leaves its row: not a never-bound Pod.
+        await db.execute(
+            "INSERT INTO agents(id,config_name,hostname,pod_ip,pod_uid,status,"
+            "agent_mode,last_heartbeat) VALUES($1,'assistant',$2,'127.0.0.2',"
+            "'agent-original','offline','persistent',now())",
+            uuid4(),
+            name,
+        )
+    elif tamper == "workspace_identity":
+        workspace_identity = {
+            "expected_workspace_generation": str(uuid4()),
+            "expected_workspace_runtime_incarnation": str(uuid4()),
+        }
+
+    receipt = await db.acknowledge_pinned_thread_pre_registration_pod_zero(
+        ids["thread"],
+        expected_runtime_generation=retirement["generation"],
+        expected_retirement_token=retirement["token"],
+        expected_pod_name=name,
+        expected_pod_uid="agent-original",
+        **workspace_identity,
+    )
+
+    if tamper is not None:
+        assert receipt is None
+        return
+    assert receipt["quiescence_protocol"] == "agent_runtime_zero_v1"
+    assert receipt["quiescence_actor"] == "orchestrator"
+    assert receipt["workspace_generation"] is None
+    assert receipt["workspace_runtime_incarnation"] is None
+    assert receipt["agent_pod_name"] == name
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tamper", [None, "workspace_published", "fence_not_owned"])
 async def test_never_engaged_requires_the_exact_soft_workspace_fence(
