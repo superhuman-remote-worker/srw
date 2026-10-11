@@ -4173,6 +4173,22 @@ async def _execute_turn(
             except Exception as e:
                 logger.warning("Permission batch announce failed: %s", e)
 
+        # A tool's image rides a follow-up HumanMessage, held until every call
+        # of the batch has its result. Anthropic rejects anything between two
+        # results of one batch ("tool_use ids were found without tool_result
+        # blocks immediately after"); the worker graph appends after the batch
+        # the same way.
+        batch_images: List[BaseMessage] = []
+
+        async def _flush_batch_images(*, persist: bool = True) -> int:
+            flushed = len(batch_images)
+            for image_message in batch_images:
+                messages.append(_adopt(image_message))
+                if persist:
+                    await _persist(image_message)
+            batch_images.clear()
+            return flushed
+
         if _execute_delegation_batch:
             # Permission decisions stay serial (the transport owns their
             # durable/card lifecycle), but no child starts until the whole
@@ -4448,17 +4464,15 @@ async def _execute_turn(
                         _persist_failure = exc
 
                 if extracted_images:
-                    image_message = _ensure_msg_id(
-                        make_multimodal_user_message(
-                            text=f"Image content from tool call {slot.tool_call_id}:",
-                            images=extracted_images,
-                            max_edge=resolve_image_max_edge(config),
+                    batch_images.append(
+                        _ensure_msg_id(
+                            make_multimodal_user_message(
+                                text=f"Image content from tool call {slot.tool_call_id}:",
+                                images=extracted_images,
+                                max_edge=resolve_image_max_edge(config),
+                            )
                         )
                     )
-                    messages.append(_adopt(image_message))
-                    messages_added += 1
-                    if _persist_failure is None:
-                        await _persist(image_message)
 
                 await callbacks.on_tool_result(
                     "delegate_agent",
@@ -4474,6 +4488,10 @@ async def _execute_turn(
                         "workspace_upgrade_required",
                     ):
                         await callbacks.on_workspace_upgrade_needed(freeze_req)
+
+            messages_added += await _flush_batch_images(
+                persist=_persist_failure is None
+            )
 
             # Every call now has its result. A batch that could not go on ends
             # the turn with its error, and an unsaved result ends it before any
@@ -4504,6 +4522,7 @@ async def _execute_turn(
             # Check for interrupt before each tool
             if callbacks.check_interrupt():
                 logger.info(f"Interrupt received before tool {tool_call['name']}")
+                messages_added += await _flush_batch_images()
                 await _record_unexecuted_tool_batch(
                     list(response.tool_calls[i:]),
                     reason="interrupted before tool execution",
@@ -4608,6 +4627,7 @@ async def _execute_turn(
                     tool_call_id,
                     len(response.tool_calls) - i,
                 )
+                messages_added += await _flush_batch_images()
                 return TurnResult(
                     turn_id=0,
                     messages_added=messages_added,
@@ -4672,19 +4692,15 @@ async def _execute_turn(
             await _persist(messages[-1])
 
             if extracted_images:
-                messages.append(
-                    _adopt(
-                        _ensure_msg_id(
-                            make_multimodal_user_message(
-                                text=(f"Image content from tool call {tool_call_id}:"),
-                                images=extracted_images,
-                                max_edge=resolve_image_max_edge(config),
-                            )
+                batch_images.append(
+                    _ensure_msg_id(
+                        make_multimodal_user_message(
+                            text=(f"Image content from tool call {tool_call_id}:"),
+                            images=extracted_images,
+                            max_edge=resolve_image_max_edge(config),
                         )
                     )
                 )
-                messages_added += 1
-                await _persist(messages[-1])
 
             await callbacks.on_tool_result(
                 tool_name, cleaned_str, tool_call_id, is_error=is_error
@@ -4703,6 +4719,8 @@ async def _execute_turn(
                     "workspace_upgrade_required",
                 ):
                     await callbacks.on_workspace_upgrade_needed(freeze_req)
+
+        messages_added += await _flush_batch_images()
 
         # Officer sleep: the sleep tool parked a wake request — end the turn
         # after the batch instead of paying another LLM iteration. Peek only;

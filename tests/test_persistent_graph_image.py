@@ -266,3 +266,94 @@ class TestPersistentImagePostProcessor:
         on_tool_result.assert_called()
         passed_content = on_tool_result.call_args_list[0].args[1]
         assert passed_content == plain_result
+
+
+class TestImagesWaitForTheWholeBatch:
+    """A batch's image follow-ups come after its last tool result.
+
+    Session 2c6d3e06 (2026-10-11) died on Anthropic's 400 "tool_use ids
+    were found without tool_result blocks immediately after" because the
+    image of the first ``read_file`` landed between that call's result and
+    the next one's.
+    """
+
+    @pytest.mark.asyncio
+    async def test_every_result_precedes_the_batch_images(self):
+        b64_a, b64_b = _b64("first-png"), _b64("second-png")
+
+        def _image(name: str, b64: str) -> str:
+            return f"[IMAGE: {name}]\n" + IMAGE_DATA_TAG_TEMPLATE.format(
+                mime="image/png", b64=b64
+            )
+
+        batch = AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "read_file", "args": {"path": "a.png"}, "id": "tc_a"},
+                {"name": "view_image", "args": {"path": "b.png"}, "id": "tc_b"},
+                {"name": "get_canvas", "args": {}, "id": "tc_c"},
+            ],
+        )
+        provider_inputs: list[list[BaseMessage]] = []
+
+        async def _astream(provider_messages, **kw):
+            provider_inputs.append(list(provider_messages))
+            if len(provider_inputs) == 1:
+                yield batch
+            else:
+                yield AIMessage(content="Both screenshots look fine.")
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+
+        turns = 0
+
+        async def _input():
+            nonlocal turns
+            turns += 1
+            if turns == 1:
+                return "look at both screenshots"
+            raise asyncio.CancelledError
+
+        messages: list[BaseMessage] = []
+        await run_persistent_loop(
+            llm_with_tools=llm,
+            tools=[
+                _make_tool("read_file", _image("a.png", b64_a)),
+                _make_tool("view_image", _image("b.png", b64_b)),
+                _make_tool("get_canvas", ""),
+            ],
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            config=_make_config(),
+            system_prompt="sys",
+            callbacks=_make_callbacks(get_user_input=_input),
+            messages=messages,
+        )
+
+        assert len(provider_inputs) == 2
+        second = provider_inputs[1]
+        call_index = next(
+            i for i, m in enumerate(second) if isinstance(m, AIMessage) and m.tool_calls
+        )
+        after_call = second[call_index + 1 :]
+        assert [m.tool_call_id for m in after_call[:3]] == ["tc_a", "tc_b", "tc_c"]
+        images = [
+            m
+            for m in after_call[3:]
+            if isinstance(m, HumanMessage) and isinstance(m.content, list)
+        ]
+        assert len(images) == 2
+        assert images[0].content[1]["image_url"]["url"].endswith(b64_a)
+        assert images[1].content[1]["image_url"]["url"].endswith(b64_b)
+        # The durable transcript keeps the same order, so a restore needs no repair.
+        durable_call = next(
+            i
+            for i, m in enumerate(messages)
+            if isinstance(m, AIMessage) and m.tool_calls
+        )
+        assert [
+            type(m).__name__ for m in messages[durable_call + 1 : durable_call + 6]
+        ] == ["ToolMessage"] * 3 + ["HumanMessage"] * 2
