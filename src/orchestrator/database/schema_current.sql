@@ -10581,7 +10581,9 @@ BEGIN
        OR NEW.predecessor_request_id IS DISTINCT FROM a.creation_request_id
        OR NEW.predecessor_generation IS DISTINCT FROM a.provision_generation
        OR NEW.source_revision IS DISTINCT FROM r.revision
-       OR r.request_id IS NULL OR r.state IS DISTINCT FROM 'succeeded'
+       OR r.request_id IS NULL OR (r.state IS DISTINCT FROM 'succeeded'
+           AND NOT (r.state='settled' AND a.policy_version=1
+               AND public.vm_cancel_late_adopted_retained_terminal(a.cleanup_admission_id)))
        OR COALESCE(r.canonical_request->'workspace_storage','null'::jsonb)<>'null'::jsonb
        OR q.unit_id IS NULL OR q.unit_kind IS DISTINCT FROM 'worker_batch' OR q.state IS DISTINCT FROM 'done'
        OR q.leased_by IS NOT NULL OR q.leased_until IS NOT NULL
@@ -10901,7 +10903,13 @@ BEGIN
        OR admission.intent_digest IS DISTINCT FROM NEW.cleanup_intent_digest
        OR retry.request_id IS NULL OR retry.job_id IS DISTINCT FROM NEW.job_id
        OR retry.provision_generation IS DISTINCT FROM NEW.provision_generation
-       OR retry.state IS DISTINCT FROM 'succeeded'
+       OR (retry.state IS DISTINCT FROM 'succeeded'
+           AND NOT (retry.state='settled'
+               AND NEW.frozen->>'kind'='vm_job_never_app_ready_retained_stop_candidate_v1'
+               AND public.vm_cancel_late_adopted_source(
+                   NEW.job_id,NEW.provision_generation,
+                   NEW.vm_uid,NEW.pvc_uid,
+                   NEW.creation_request_id)))
        OR retry.observed_vm_uid IS DISTINCT FROM NEW.vm_uid
        OR retry.observed_pvc_uid IS DISTINCT FROM NEW.pvc_uid
        OR (CASE WHEN NEW.frozen->>'kind'='vm_initial_ready_positive_stop_candidate_v1'
@@ -11005,7 +11013,13 @@ BEGIN
        OR retry.request_id IS NULL
        OR retry.job_id IS DISTINCT FROM intent.job_id
        OR retry.provision_generation IS DISTINCT FROM intent.provision_generation
-       OR retry.state IS DISTINCT FROM 'succeeded'
+       OR (retry.state IS DISTINCT FROM 'succeeded'
+           AND NOT (retry.state='settled'
+               AND intent.frozen->>'kind'='vm_job_never_app_ready_retained_stop_candidate_v1'
+               AND public.vm_cancel_late_adopted_source(
+                   intent.job_id,intent.provision_generation,
+                   intent.vm_uid,intent.pvc_uid,
+                   intent.creation_request_id)))
        OR (CASE WHEN intent.frozen->>'kind'='vm_initial_ready_positive_stop_candidate_v1'
            THEN retry.ready_at IS NULL OR NOT public.vm_initial_ready_stop_authorized(intent)
                OR NOT public.valid_vm_initial_ready_positive_stop(intent.frozen,NEW.terminal_evidence,NEW.frozen_digest)
@@ -11124,7 +11138,10 @@ BEGIN
        OR COALESCE(successor.successor_launcher_uid,charge.launcher_uid) IS DISTINCT FROM NEW.launcher_uid
        OR source.job_id IS DISTINCT FROM NEW.job_id
        OR source.provision_generation IS DISTINCT FROM NEW.provision_generation
-       OR source.retry_state<>'succeeded'
+       OR (source.retry_state<>'succeeded' AND NOT (source.retry_state='settled'
+           AND cleanup.source='job_terminal_vm_release'
+           AND public.vm_cancel_late_adopted_source(NEW.job_id,NEW.provision_generation,
+               NEW.vm_uid,NEW.pvc_uid,NEW.request_id,NEW.cleanup_admission_id,true,true)))
        OR source.observed_vm_uid IS DISTINCT FROM NEW.vm_uid
        OR source.observed_pvc_uid IS DISTINCT FROM NEW.pvc_uid
        OR owner_vm->>'provision_generation' IS DISTINCT FROM NEW.provision_generation::text
@@ -22405,7 +22422,13 @@ BEGIN
        OR retry.request_id IS NULL OR retry.owner_kind IS DISTINCT FROM 'job'
        OR retry.job_id IS DISTINCT FROM d.job_id
        OR retry.provision_generation IS DISTINCT FROM d.provision_generation
-       OR retry.state IS DISTINCT FROM 'succeeded' OR retry.resolved_at IS NULL
+       OR (retry.state IS DISTINCT FROM 'succeeded' AND NOT (retry.state='settled'
+           AND EXISTS (SELECT 1 FROM public.vm_job_cancel_retention_authorities a
+               WHERE a.creation_request_id=retry.request_id AND a.job_id=d.job_id
+                 AND a.provision_generation=d.provision_generation
+                 AND a.vm_uid=d.vm_uid AND a.pvc_uid=d.pvc_uid
+                 AND public.vm_cancel_late_adopted_retained_terminal(a.cleanup_admission_id))))
+       OR retry.resolved_at IS NULL
        OR retry.observed_vm_uid IS DISTINCT FROM d.vm_uid
        OR retry.observed_pvc_uid IS DISTINCT FROM d.pvc_uid
        OR retry.creation_admission_id IS NULL
@@ -22523,7 +22546,9 @@ BEGIN
          WHERE id=link.reservation_id FOR SHARE;
         IF old_retry.request_id IS NULL OR old_retry.owner_kind IS DISTINCT FROM 'job'
            OR old_retry.job_id IS DISTINCT FROM d.job_id
-           OR old_retry.state IS DISTINCT FROM 'succeeded'
+           OR (old_retry.state IS DISTINCT FROM 'succeeded'
+               AND NOT (old_retry.state='settled'
+                   AND public.vm_cancel_late_adopted_retained_terminal(old_parent.id)))
            OR old_retry.resolved_at IS NULL
            OR old_retry.observed_pvc_uid IS DISTINCT FROM d.pvc_uid
            OR old_retry.observed_vm_uid IS DISTINCT FROM old_stop.vm_uid
@@ -23375,6 +23400,161 @@ $$;
 
 
 --
+-- Name: vm_cancel_late_adopted_retained_terminal(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_cancel_late_adopted_retained_terminal(parent_id uuid) RETURNS boolean
+    LANGUAGE sql
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.vm_job_cancel_retention_authorities a
+        JOIN public.vm_creation_retries r ON r.request_id=a.creation_request_id
+        JOIN public.vm_workspace_cleanup_admissions c ON c.id=r.creation_admission_id
+        JOIN public.vm_resource_reservations v ON v.id=a.reservation_id
+        JOIN public.vm_pre_ssh_stop_intents i ON i.cleanup_admission_id=a.cleanup_admission_id
+        JOIN public.vm_pre_ssh_stop_proofs p ON p.cleanup_admission_id=a.cleanup_admission_id
+        WHERE a.cleanup_admission_id=parent_id AND a.policy_version=1
+          AND a.job_retained_resume_id IS NULL
+          AND r.owner_kind='job' AND r.job_id=a.job_id
+          AND r.provision_generation=a.provision_generation
+          AND r.state='settled' AND r.reason='creation_adopted'
+          AND r.resolved_at IS NOT NULL AND r.boot_counted
+          AND r.ready_at IS NULL AND r.claim_token IS NULL AND r.claim_expires_at IS NULL
+          AND r.observed_vm_uid=a.vm_uid AND r.observed_pvc_uid=a.pvc_uid
+          AND c.owner_kind='job' AND c.owner_id=a.job_id
+          AND c.completed_at IS NOT NULL AND c.outcome='adopted'
+          AND v.request_id=r.request_id AND v.state='released'
+          AND v.revision=a.reservation_revision
+          AND i.job_id=a.job_id AND i.provision_generation=a.provision_generation
+          AND i.creation_request_id=r.request_id
+          AND i.frozen->>'kind'='vm_job_never_app_ready_retained_stop_candidate_v1'
+          AND p.job_id=a.job_id AND p.provision_generation=a.provision_generation
+          AND p.frozen_digest=i.frozen_digest
+          AND p.terminal_evidence->>'kind'='vm_job_never_app_ready_retained_positive_stop_v1'
+          AND (SELECT count(*) FROM public.vm_creation_effects e
+              WHERE e.request_id=r.request_id)=3
+          AND (SELECT count(DISTINCT e.effect_kind) FROM public.vm_creation_effects e
+              WHERE e.request_id=r.request_id AND e.effect_kind IN ('rootdisk','cloud_init','vm')
+                AND e.state='observed' AND e.resolved_at IS NOT NULL
+                AND e.evidence<>'{}'::jsonb)=3
+          AND NOT EXISTS (SELECT 1 FROM public.vm_creation_effects e
+              WHERE e.request_id=r.request_id AND e.state='issued')
+          AND public.vm_job_cancel_retention_settled(parent_id)
+    );
+$$;
+
+
+--
+-- Name: vm_cancel_late_adopted_source(uuid, uuid, uuid, uuid, uuid, uuid, boolean, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_cancel_late_adopted_source(owner uuid, generation uuid, expected_vm uuid, pvc uuid, expected_request uuid, retaining_parent uuid DEFAULT NULL::uuid, existing_stop boolean DEFAULT false, receipt_completion boolean DEFAULT false) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.jobs j
+        JOIN public.run_queue q ON q.unit_id=j.id
+        JOIN public.vm_creation_retries r ON r.owner_kind='job' AND r.job_id=j.id
+        JOIN public.vm_resource_reservations v ON v.request_id=r.request_id
+        JOIN public.vm_workspace_cleanup_admissions c ON c.id=r.creation_admission_id
+        WHERE j.id=owner AND j.status='cancelled' AND j.execution_lane='stateless'
+          AND j.parent_job_id IS NULL AND j.assigned_agent_id IS NULL
+          AND COALESCE(j.context->'inherits_parent_workspace','false'::jsonb)='false'::jsonb
+          AND j.context->'_stateless_cancel_cleanup_pending'='true'::jsonb
+          AND j.context->'_vm_job_retained_resume' IS NULL
+          AND j.context->>'_vm_creation_pending'=expected_request::text
+          AND j.context->'vm'->>'creation_request_id'=expected_request::text
+          AND (j.context->'vm'->>'status' IN ('waiting_creation_configuration','retiring_process_zero')
+            OR (j.context->'vm'->>'status'='deleted'
+              AND retaining_parent IS NOT NULL AND existing_stop IS TRUE
+              AND EXISTS (
+                SELECT 1 FROM public.vm_job_cancel_retention_authorities a
+                JOIN public.vm_workspace_cleanup_admissions held
+                  ON held.id=a.cleanup_admission_id
+                JOIN public.vm_pre_ssh_stop_intents i
+                  ON i.cleanup_admission_id=a.cleanup_admission_id
+                JOIN public.vm_pre_ssh_stop_proofs p
+                  ON p.cleanup_admission_id=i.cleanup_admission_id
+                JOIN public.managed_repository_process_zero_receipts z
+                  ON z.owner_kind='job' AND z.owner_id=a.job_id
+                 AND z.scope='vm' AND z.provisioner='vm'
+                 AND z.runtime_incarnation=a.provision_generation::text
+                WHERE a.cleanup_admission_id=retaining_parent
+                  AND a.policy_version=1 AND a.admitted_xact_id<>pg_current_xact_id()
+                  AND a.job_id=owner AND a.provision_generation=generation
+                  AND a.creation_request_id=expected_request
+                  AND a.reservation_id=v.id AND a.reservation_revision=v.revision
+                  AND a.vm_uid=expected_vm AND a.vmi_uid=v.vmi_uid
+                  AND a.launcher_uid=v.launcher_uid AND a.node_uid=v.node_uid
+                  AND a.pvc_uid=pvc
+                  AND held.owner_kind='job' AND held.owner_id=owner
+                  AND held.pvc_uid=pvc AND held.source='job_terminal_vm_release'
+                  AND held.parent_admission_id IS NULL
+                  AND held.request_id=a.cleanup_request_id
+                  AND held.intent_digest=a.intent_digest
+                  AND i.job_id=owner AND i.provision_generation=generation
+                  AND i.creation_request_id=expected_request
+                  AND i.reservation_id=v.id AND i.reservation_revision=v.revision
+                  AND i.vm_uid=expected_vm AND i.vmi_uid=v.vmi_uid
+                  AND i.launcher_uid=v.launcher_uid AND i.pvc_uid=pvc
+                  AND i.node_uid=v.node_uid
+                  AND i.frozen->>'kind'='vm_job_never_app_ready_retained_stop_candidate_v1'
+                  AND i.held_stop_xact_id IS NOT NULL
+                  AND i.held_stop_xact_id<>pg_current_xact_id()
+                  AND p.job_id=owner AND p.provision_generation=generation
+                  AND p.frozen_digest=i.frozen_digest
+                  AND p.terminal_evidence->>'kind'='vm_job_never_app_ready_retained_positive_stop_v1'
+                  AND p.held_stop_xact_id IS NOT NULL
+                  AND p.held_stop_xact_id<>i.held_stop_xact_id
+                  AND p.held_stop_xact_id<>pg_current_xact_id()
+                  AND ((NOT receipt_completion AND
+                    public.vm_job_deleted_retention_replay_allowed(
+                      1,owner,generation,expected_vm,pvc,retaining_parent,
+                      existing_stop,expected_request,v.id,v.revision,
+                      v.vmi_uid,v.launcher_uid,v.node_uid))
+                    OR (receipt_completion AND held.completed_at IS NOT NULL
+                      AND held.outcome='completed'))
+              )))
+          AND j.context->'vm'->>'provision_generation'=generation::text
+          AND j.context->'vm'->>'identity_provision_generation'=generation::text
+          AND j.context->'vm'->'identity_authenticated'='true'::jsonb
+          AND j.context->'vm'->>'vm_uid'=expected_vm::text
+          AND j.context->'vm'->>'rootdisk_pvc_uid'=pvc::text
+          AND COALESCE(j.context->'vm'->'workspace_storage','null'::jsonb)='null'::jsonb
+          AND q.unit_kind='worker_batch' AND q.state='done'
+          AND q.leased_by IS NULL AND q.leased_until IS NULL
+          AND r.request_id=expected_request AND r.provision_generation=generation
+          AND r.state='settled' AND r.reason='creation_adopted'
+          AND r.resolved_at IS NOT NULL AND r.boot_counted
+          AND r.ready_at IS NULL AND r.claim_token IS NULL AND r.claim_expires_at IS NULL
+          AND r.observed_vm_uid=expected_vm AND r.observed_pvc_uid=pvc
+          AND COALESCE(r.canonical_request->'workspace_storage','null'::jsonb)='null'::jsonb
+          AND c.owner_kind='job' AND c.owner_id=owner
+          AND c.completed_at IS NOT NULL AND c.outcome='adopted'
+          AND v.state IN ('reserved','active','warm','teardown')
+          AND NOT EXISTS (SELECT 1 FROM public.vm_creation_retries later
+              WHERE later.owner_kind='job' AND later.job_id=owner
+                AND (later.created_at,later.request_id)>(r.created_at,r.request_id))
+          AND (SELECT count(*) FROM public.vm_creation_effects e
+               WHERE e.request_id=r.request_id)=3
+          AND (SELECT count(DISTINCT e.effect_kind) FROM public.vm_creation_effects e
+               WHERE e.request_id=r.request_id AND e.effect_kind IN ('rootdisk','cloud_init','vm')
+                 AND e.state='observed' AND e.resolved_at IS NOT NULL
+                 AND e.evidence<>'{}'::jsonb)=3
+          AND EXISTS (SELECT 1 FROM public.vm_creation_effects e
+              WHERE e.request_id=r.request_id AND e.effect_kind='rootdisk'
+                AND e.evidence->>'pvc_uid'=pvc::text)
+          AND EXISTS (SELECT 1 FROM public.vm_creation_effects e
+              WHERE e.request_id=r.request_id AND e.effect_kind='vm'
+                AND e.evidence->>'uid'=expected_vm::text
+                AND e.evidence->>'pvc_uid'=pvc::text)
+          AND NOT EXISTS (SELECT 1 FROM public.vm_creation_effects e
+              WHERE e.request_id=r.request_id AND e.state='issued')
+    );
+$$;
+
+
+--
 -- Name: vm_ide_heartbeat_cleanup_is_authorized(text, uuid, jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -23534,6 +23714,8 @@ BEGIN
        OR vm->>'vm_uid' IS DISTINCT FROM expected_vm::text
        OR vm->>'rootdisk_pvc_uid' IS DISTINCT FROM pvc::text
        OR vm->>'status' IS NULL OR (vm->>'status' NOT IN ('created','ssh_pending','ssh_unreachable','retiring_process_zero')
+           AND NOT (vm->>'status'='waiting_creation_configuration' AND r.state='settled'
+               AND public.vm_cancel_late_adopted_source(owner,generation,expected_vm,pvc,r.request_id))
            AND NOT (vm->>'status'='deleted' AND v.state='teardown'
                AND public.vm_job_deleted_retention_replay_allowed(1,owner,generation,
                    expected_vm,pvc,retaining_parent,existing_stop,r.request_id,
@@ -23544,7 +23726,10 @@ BEGIN
        OR COALESCE(r.canonical_request->'workspace_storage','null'::jsonb)<>'null'::jsonb
        OR q.unit_id IS NULL OR q.unit_kind IS DISTINCT FROM 'worker_batch'
        OR q.state IS DISTINCT FROM 'done' OR q.leased_by IS NOT NULL OR q.leased_until IS NOT NULL
-       OR r.request_id IS NULL OR r.state IS DISTINCT FROM 'succeeded'
+       OR r.request_id IS NULL OR (r.state IS DISTINCT FROM 'succeeded'
+           AND NOT (r.state='settled'
+               AND public.vm_cancel_late_adopted_source(owner,generation,expected_vm,pvc,
+                   r.request_id,retaining_parent,existing_stop)))
        OR r.reason IS DISTINCT FROM 'creation_adopted' OR r.resolved_at IS NULL
        OR r.ready_at IS NOT NULL OR r.claim_token IS NOT NULL OR r.claim_expires_at IS NOT NULL
        OR r.observed_vm_uid IS DISTINCT FROM expected_vm OR r.observed_pvc_uid IS DISTINCT FROM pvc

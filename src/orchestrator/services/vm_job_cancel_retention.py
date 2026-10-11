@@ -490,14 +490,32 @@ async def guard_retention_cleanup_on_conn(
             and {r["cleanup_admission_id"] for r in rows}
             == bootstrap.retention_admission_ids
             and all(r["job_id"] == owner_id and r["pvc_uid"] == pvc_uid for r in rows)
-            and await conn.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM vm_creation_retries WHERE request_id=$1 "
-                "AND owner_kind='job' AND job_id=$2 AND provision_generation=$3 "
-                "AND observed_pvc_uid=$4 AND state='succeeded')",
-                bootstrap.final_request_id,
-                owner_id,
-                bootstrap.provision_generation,
-                pvc_uid,
+            and (
+                await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_creation_retries WHERE request_id=$1 "
+                    "AND owner_kind='job' AND job_id=$2 AND provision_generation=$3 "
+                    "AND observed_pvc_uid=$4 AND state='succeeded')",
+                    bootstrap.final_request_id,
+                    owner_id,
+                    bootstrap.provision_generation,
+                    pvc_uid,
+                )
+                or (
+                    await conn.fetchval(
+                        "SELECT to_regprocedure("
+                        "'public.vm_cancel_late_adopted_retained_terminal(uuid)') IS NOT NULL"
+                    )
+                    and await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_job_cancel_retention_authorities a "
+                        "WHERE a.job_id=$1 AND a.pvc_uid=$2 "
+                        "AND a.creation_request_id=$3 AND a.provision_generation=$4 "
+                        "AND public.vm_cancel_late_adopted_retained_terminal(a.cleanup_admission_id))",
+                        owner_id,
+                        pvc_uid,
+                        bootstrap.final_request_id,
+                        bootstrap.provision_generation,
+                    )
+                )
             )
         ):
             return
@@ -534,9 +552,12 @@ async def retention_settlement_is_current_on_conn(
             "AND r.reason='creation_adopted' AND r.resolved_at IS NOT NULL "
             "AND r.claim_token IS NULL AND r.claim_expires_at IS NULL "
             "AND r.observed_vm_uid=a.vm_uid AND r.observed_pvc_uid=a.pvc_uid "
-            "AND j.context->>'_vm_creation_pending'=r.request_id::text "
             "AND j.context->'vm'->>'creation_request_id'=r.request_id::text "
             "AND j.context->'vm'->>'status'='deleted' "
+            "AND (j.context->>'_vm_creation_pending'=r.request_id::text OR ("
+            "NOT j.context ? '_vm_creation_pending' "
+            "AND NOT j.context ? '_stateless_cancel_cleanup_pending' "
+            "AND j.context->'vm'->'compute_released'='true'::jsonb)) "
             "AND NOT EXISTS(SELECT 1 FROM vm_creation_effects e "
             "WHERE e.request_id=r.request_id AND e.state='issued'))) "
             "AND NOT EXISTS(SELECT 1 FROM vm_creation_retries later WHERE later.owner_kind='job' "

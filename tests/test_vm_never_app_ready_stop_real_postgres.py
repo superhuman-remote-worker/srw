@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 import asyncpg
 import pytest
@@ -62,7 +62,10 @@ async def held_stop_schema(pg_dsn, initial_ready_schema):  # noqa: F811
             ):
                 await conn.execute((root / name).read_text())
         late = root / "0433_vm_cancel_late_adopted_retention.sql"
-        if late.exists():
+        if late.exists() and not await conn.fetchval(
+            "SELECT to_regprocedure("
+            "'public.vm_cancel_late_adopted_retained_terminal(uuid)') IS NOT NULL"
+        ):
             await conn.execute(late.read_text())
         assert (
             await conn.fetchval(
@@ -152,8 +155,40 @@ async def late_adopted_state(db, *, issued=False, wrong_effect=False):
     return state
 
 
+async def complete_synthetic_retained_delete(db, recovery, purge):
+    from orchestrator.services.vm_job_retained_disk_purge import (
+        complete_job_retained_disk_purge,
+        read_job_retained_disk_purge_candidate,
+    )
+
+    candidate = await read_job_retained_disk_purge_candidate(recovery, purge)
+    evidence = {
+        "version": 1, "kind": "vm_cleanup_physical_stop",
+        "job_id": candidate["job_id"],
+        "provision_generation": candidate["provision_generation"],
+        "vm_uid": candidate["vm_uid"], "vmi_uid": candidate["vmi_uid"],
+        "launcher_uid": candidate["launcher_uid"], "pvc_uid": candidate["pvc_uid"],
+        "vm_absent": True, "vmi_absent": True, "launcher_absent": True,
+        "same_generation_replacement": False,
+        "controller_authenticated": True,
+        "pvc_disposition": "purged",
+        "controller_scope": candidate["controller_scope"],
+    }
+    await complete_job_retained_disk_purge(
+        recovery, purge, outcome="completed",
+        provisioner=SimpleNamespace(attest_vm_cleanup_stop=AsyncMock(return_value=evidence)),
+    )
+    assert await db.fetchval(
+        "SELECT public.validate_vm_job_retained_disk_purge($1,true)",
+        purge.admission_id,
+    )
+
+
 @pytest.mark.asyncio
-async def test_cancel_before_late_adoption_binds_then_commits_held_stop(db):
+@pytest.mark.parametrize("deleted_before_completion", [False, True])
+async def test_cancel_before_late_adoption_binds_then_commits_held_stop(
+    db, deleted_before_completion
+):
     state = await late_adopted_state(db)
     assert not (await acquire(state)).allowed  # No signed runtime inventory yet.
     from tests.test_vm_job_cancel_retention_real_postgres import publish_cancelled_launcher
@@ -196,6 +231,19 @@ async def test_cancel_before_late_adoption_binds_then_commits_held_stop(db):
         state["job_id"], state["generation"], permit.parent_cleanup, proof
     )
     assert committed["process_zero_receipt_id"]
+    assert not await db.fetchval(
+        "SELECT public.vm_cancel_late_adopted_retained_terminal($1)",
+        permit.admission_id,
+    )  # Stop proof alone is not a completed retained cleanup.
+    if deleted_before_completion:
+        # _delete_http projects deleted after genuine Controller DELETE and
+        # before the retention cleanup receipt/charge release transaction.
+        await db.execute(
+            "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',"
+            "'\"deleted\"') WHERE id=$1", UUID(state["job_id"]),
+        )
+        open_replay = await acquire(state)
+        assert open_replay.allowed and open_replay.admission_id == permit.admission_id
     from orchestrator.services.vm_job_cancel_retention import complete_cancel_retention_marker
     from orchestrator.services.vm_workspace_recovery_store import complete_vm_cleanup_permit
 
@@ -229,12 +277,165 @@ async def test_cancel_before_late_adoption_binds_then_commits_held_stop(db):
     assert "_stateless_cancel_cleanup_pending" not in context
     assert "_vm_creation_pending" not in context
     assert context["vm"]["status"] == "deleted"
+    replay = await acquire(state)
+    assert replay.allowed and replay.completed_outcome == "completed"
+    assert replay.admission_id == permit.admission_id
+    assert await complete_cancel_retention_marker(db, state["job_id"]) is True
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_job_cancel_retention_authorities WHERE job_id=$1",
+        UUID(state["job_id"]),
+    ) == 1
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{_vm_creation_pending}',"
+        "to_jsonb($2::text)) WHERE id=$1", UUID(state["job_id"]), str(uuid4()),
+    )
+    changed_replay = await acquire(state)
+    assert not changed_replay.allowed
+    await db.execute(
+        "UPDATE jobs SET context=context-'_vm_creation_pending' WHERE id=$1",
+        UUID(state["job_id"]),
+    )
+    class RollBackHold(Exception):
+        pass
+
+    try:
+        async with db.acquire() as conn, conn.transaction():
+            await conn.execute(
+                "UPDATE jobs SET context=context||"
+                "'{\"_worker_execution_hold\":{\"version\":1}}'::jsonb WHERE id=$1",
+                UUID(state["job_id"]),
+            )
+            operation_id = uuid4()
+            with pytest.raises(asyncpg.CheckViolationError, match="Retained Job Resume authority"):
+                await conn.execute(
+                    "INSERT INTO vm_job_retained_resumes "
+                    "(id,job_id,root_retention_admission_id,physical_cleanup_admission_id,"
+                    "predecessor_request_id,predecessor_generation,pvc_uid,request_id,"
+                    "provision_generation,explicit_resume_id,requested_by,source_revision,retained_vm) "
+                    "SELECT $1,a.job_id,a.cleanup_admission_id,a.cleanup_admission_id,"
+                    "a.creation_request_id,a.provision_generation,a.pvc_uid,$2,$3,$4,"
+                    "j.user_id,r.revision,j.context->'vm' FROM vm_job_cancel_retention_authorities a "
+                    "JOIN jobs j ON j.id=a.job_id JOIN vm_creation_retries r "
+                    "ON r.request_id=a.creation_request_id WHERE a.cleanup_admission_id=$5",
+                    operation_id, uuid5(operation_id, "source"),
+                    uuid5(operation_id, "provision"), uuid4(), permit.admission_id,
+                )
+            raise RollBackHold
+    except RollBackHold:
+        pass
+    if deleted_before_completion:
+        from orchestrator.services.vm_job_retained_disk_purge import (
+            acquire_job_retained_disk_purge,
+        )
+        from orchestrator.services.vm_provisioner import VMTeardownIdentity
+
+        wrong_identity = await acquire_job_retained_disk_purge(
+            state["recovery"], job_id=state["job_id"],
+            identity=VMTeardownIdentity(
+                state["generation"], str(uuid4()), frozen["pvc_uid"]
+            ),
+        )
+        assert not wrong_identity.allowed
+        purge = await acquire_job_retained_disk_purge(
+            state["recovery"], job_id=state["job_id"],
+            identity=VMTeardownIdentity(
+                state["generation"], frozen["vm_uid"], frozen["pvc_uid"]
+            ),
+        )
+        assert purge.allowed, purge.reason
+        assert purge.parent_cleanup["intent"]["purge_disk"] is True
+        await complete_synthetic_retained_delete(db, state["recovery"], purge)
+        return
+    actor = await db.fetchval(
+        "SELECT user_id FROM jobs WHERE id=$1", UUID(state["job_id"])
+    )
+    assert await db.prepare_stateless_job_for_workspace_resume(
+        state["job_id"], "vm", expected_status="cancelled",
+        owner_resume_user_id=actor,
+    )
+    operation = await db.fetchrow(
+        "SELECT * FROM vm_job_retained_resumes WHERE job_id=$1",
+        UUID(state["job_id"]),
+    )
+    assert operation["predecessor_request_id"] == await db.fetchval(
+        "SELECT request_id FROM vm_creation_retries WHERE job_id=$1",
+        UUID(state["job_id"]),
+    )
+    assert operation["physical_cleanup_admission_id"] == permit.admission_id
+    assert (await db.cancel_stateless_job(state["job_id"]))[0]
+    assert await db.complete_stateless_cancel_cleanup(state["job_id"])
+    from orchestrator.services.vm_job_retained_disk_purge import (
+        acquire_job_retained_disk_purge,
+    )
+    from orchestrator.services.vm_provisioner import VMTeardownIdentity
+
+    tail = await db.fetchrow(
+        "SELECT * FROM vm_job_retained_resume_terminals WHERE resume_id=$1",
+        operation["id"],
+    )
+    assert tail["terminal_kind"] == "source_absent"
+    assert await db.fetchval(
+        "SELECT public.vm_cancel_late_adopted_retained_terminal($1)",
+        permit.admission_id,
+    )
+    # Public Delete records this intent before acquiring the retained purge.
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{_stateless_delete_pending}',"
+        "'true'::jsonb) WHERE id=$1", UUID(state["job_id"]),
+    )
+    purge = await acquire_job_retained_disk_purge(
+        state["recovery"], job_id=state["job_id"],
+        identity=VMTeardownIdentity(
+            state["generation"], frozen["vm_uid"], frozen["pvc_uid"]
+        ),
+    )
+    assert purge.allowed, purge.reason
+    await complete_synthetic_retained_delete(db, state["recovery"], purge)
+
+
+@pytest.mark.asyncio
+async def test_fresh_deleted_late_adoption_requires_process_zero(db):
+    state = await late_adopted_state(db)
+    from tests.test_vm_job_cancel_retention_real_postgres import publish_cancelled_launcher
+
+    await publish_cancelled_launcher(state)
+    with pytest.raises(asyncpg.CheckViolationError, match="process-zero authority"):
+        await db.execute(
+            "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',"
+            "'\"deleted\"') WHERE id=$1", UUID(state["job_id"]),
+        )
+    charge = await db.fetchrow(
+        "SELECT state,vm_uid,vmi_uid,launcher_uid FROM vm_resource_reservations WHERE id=$1",
+        UUID(state["reservation_id"]),
+    )
+    assert dict(charge) == {"state": "reserved", "vm_uid": None, "vmi_uid": None, "launcher_uid": None}
+    assert await db.fetchval("SELECT count(*) FROM vm_job_cancel_retention_authorities") == 0
+
+
+@pytest.mark.asyncio
+async def test_open_late_adoption_missing_marker_cannot_continue_before_proof(db):
+    state = await late_adopted_state(db)
+    from tests.test_vm_job_cancel_retention_real_postgres import publish_cancelled_launcher
+
+    await publish_cancelled_launcher(state)
+    permit = await acquire(state)
+    assert permit.allowed
+    await db.execute(
+        "UPDATE jobs SET context=context-'_vm_creation_pending' WHERE id=$1",
+        UUID(state["job_id"]),
+    )
+    with pytest.raises(asyncpg.CheckViolationError, match="current authority changed"):
+        await acquire(state)
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_pre_ssh_stop_proofs WHERE job_id=$1",
+        UUID(state["job_id"]),
+    ) == 0
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", [
     "issued", "request", "queue", "owner", "generation", "inventory",
-    "inherited", "effect_vm",
+    "inherited", "effect_vm", "reason",
 ])
 async def test_cancel_before_late_adoption_refuses_inexact_scope(db, fault):
     state = await late_adopted_state(
@@ -262,6 +463,11 @@ async def test_cancel_before_late_adoption_refuses_inexact_scope(db, fault):
         await db.execute(
             "UPDATE jobs SET context=jsonb_set(context,'{inherits_parent_workspace}',"
             "'true'::jsonb) WHERE id=$1", owner,
+        )
+    elif fault == "reason":
+        await db.execute(
+            "UPDATE vm_creation_retries SET reason='creation_disposed' WHERE job_id=$1",
+            owner,
         )
     before = await db.fetchrow(
         "SELECT state,vm_uid,vmi_uid,launcher_uid FROM vm_resource_reservations WHERE id=$1",

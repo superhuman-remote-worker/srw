@@ -1176,10 +1176,10 @@ class VMResourceReservationStore:
                 retry["state"] == "settled"
                 and cleanup["source"] == "job_terminal_vm_release"
                 and await conn.fetchval(
-                    "SELECT public.vm_cancel_late_adopted_source($1,$2,$3,$4,$5)",
+                    "SELECT public.vm_cancel_late_adopted_source($1,$2,$3,$4,$5,$6,$7)",
                     job["id"], retry["provision_generation"],
                     retry["observed_vm_uid"], retry["observed_pvc_uid"],
-                    retry["request_id"],
+                    retry["request_id"], cleanup["id"], True,
                 )
             ))
             or str(retry["provision_generation"])
