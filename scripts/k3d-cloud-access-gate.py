@@ -64,6 +64,8 @@ import re
 import secrets
 import shutil
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -196,6 +198,66 @@ class AccessGate:
     # -- helpers -----------------------------------------------------------
     def name(self, label: str) -> str:
         return f"{self.gate_id} {label}"
+
+    def resume(self, api, thread: str, *, timeout: int = 900) -> tuple[int, Any]:
+        """Resume as a client must: an End that landed during the workspace
+        create holds Resume for the create-fence horizon (409
+        ``workspace_predecessor_cleanup_pending`` with ``retry_after``)."""
+
+        deadline = time.monotonic() + timeout
+        while True:
+            status, body = api.call(
+                "POST", f"/api/persistent/threads/{thread}/resume", {}
+            )
+            detail = body.get("detail") if isinstance(body, dict) else None
+            if not (
+                status == 409
+                and isinstance(detail, dict)
+                and detail.get("code") == "workspace_predecessor_cleanup_pending"
+            ):
+                return status, body
+            try:
+                wait = (
+                    datetime.fromisoformat(str(detail.get("retry_after")))
+                    - datetime.now(timezone.utc)
+                ).total_seconds() + 5
+            except (TypeError, ValueError):
+                wait = 30
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return status, body
+            self.report.note(
+                f"resume of {thread} held until {detail.get('retry_after')}; retrying"
+            )
+            time.sleep(min(max(wait, 5), remaining))
+
+    def apply(self, thread: str, filename: str) -> tuple[int, Any]:
+        """Apply the staged diff once more if an end-of-turn stage moved the
+        epoch during the first apply: apply then refuses its baseline
+        publication (fail closed, retryable), and its writes are idempotent."""
+
+        status, applied = 0, None
+        for _attempt in range(2):
+            status, diff = self.d7.api.call(
+                "GET", f"/api/agents/threads/{thread}/cloud-diff"
+            )
+            if status != 200 or not any(
+                f.get("path") == filename for f in (diff.get("files") or [])
+            ):
+                return status, diff
+            status, applied = self.d7.api.call(
+                "POST",
+                f"/api/agents/threads/{thread}/cloud-diff/apply",
+                {"epoch": diff.get("epoch")},
+            )
+            if not (
+                status == 502
+                and "staging authority changed before baseline publication"
+                in str(applied)
+            ):
+                return status, applied
+            self.report.note("apply raced an end-of-turn stage; applying again")
+        return status, applied
 
     def api(self, who: str):
         return self.d4.owner if who == "owner" else self.d4.other
@@ -399,11 +461,7 @@ class AccessGate:
             rc == 0 and bool(diff),
             f"rc={rc}",
         )
-        status, applied = self.d7.api.call(
-            "POST",
-            f"/api/agents/threads/{thread}/cloud-diff/apply",
-            {"epoch": diff.get("epoch")},
-        )
+        status, applied = self.apply(thread, filename)
         native = json.loads(source["cloud_handle"])["native_id"]
         landed = self.d7.nextcloud_file(native, filename)
         self.report.check(
@@ -415,9 +473,7 @@ class AccessGate:
             "DELETE", f"/api/persistent/threads/{thread}?force=true", timeout=400
         )
         revoked = self.wait_grant(thread, "revoked", timeout=600)
-        status_resume, _body = self.d7.api.call(
-            "POST", f"/api/persistent/threads/{thread}/resume", {}, timeout=400
-        )
+        status_resume, _body = self.resume(self.d7.api, thread)
         resumed = self.wait_grant(thread, "active", timeout=600)
         self.report.check(
             "chip: End revokes the grant and Resume re-engages under the same "
@@ -629,7 +685,9 @@ class AccessGate:
                 timeout=600,
                 interval=10,
             )
-            self.d4.other.call("POST", f"/api/persistent/threads/{thread}/resume", {})
+            status_resume, body = self.resume(self.d4.other, thread)
+            if status_resume != 200:
+                raise d7.GateError(f"resume answered HTTP {status_resume} {body}")
             code = wait_for(
                 "the resumed engage refused",
                 lambda: (
