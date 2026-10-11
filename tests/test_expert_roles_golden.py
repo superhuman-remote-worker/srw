@@ -150,6 +150,17 @@ _POST_SPLIT_OVERLAY_REMOVALS: dict[str, tuple[str, ...]] = {
         "context_management.keep_recent_tool_results",
     ),
 }
+#: Keys whose overlay VALUE changed after the baseline was frozen (role ->
+#: dotted paths, with the work that changed them). Present on both sides with
+#: different values: asserted present on each side first (a stale entry cannot
+#: hide a leak), then stripped from both before the comparison.
+_POST_SPLIT_OVERLAY_CHANGES: dict[str, tuple[str, ...]] = {
+    # Website demo findings F10 (2026-10-11): a session's browser runs in its
+    # own workspace container, so the session overlay opens localhost as the
+    # worker overlay does (only cloud metadata stays blocked).
+    "worker": (),
+    "session": ("browser.security.blocked_domains",),
+}
 #: Tool names later work packages added to a tool CATEGORY on top of the
 #: frozen baseline (role -> category -> names, with the work that added them).
 #: A category list replaces wholesale on merge, so a dotted path cannot name
@@ -240,6 +251,11 @@ def _without_post_split_additions(
             assert not _dotted_present(out, dotted), (
                 f"{dotted} is listed as removed but present"
             )
+    for dotted in _POST_SPLIT_OVERLAY_CHANGES.get(role, ()):
+        present = _dotted_present(out, dotted)
+        assert present or not require, f"{dotted} is listed as changed but absent"
+        if present:
+            _delete_dotted(out, dotted)
     out = _without_post_split_tools(out, role)
     return _without_post_split_bindings(out, role, require=require)
 
@@ -269,7 +285,10 @@ def _without_post_split_removals(data: dict, role: str, *, require: bool) -> dic
     role-base compare); an expert leaf on the frozen base is stripped without
     the assertion."""
     out = copy.deepcopy(data)
-    for dotted in _POST_SPLIT_OVERLAY_REMOVALS.get(role, ()):
+    for dotted in (
+        *_POST_SPLIT_OVERLAY_REMOVALS.get(role, ()),
+        *_POST_SPLIT_OVERLAY_CHANGES.get(role, ()),
+    ):
         present = _dotted_present(out, dotted)
         assert present or not require, f"{dotted} is listed as removed but absent"
         if present:
@@ -309,6 +328,7 @@ def _without_effective_additions(agent: dict, role: str) -> dict:
     for dotted in (
         *_POST_SPLIT_OVERLAY_ADDITIONS.get(role, ()),
         *_POST_SPLIT_OVERLAY_REMOVALS.get(role, ()),
+        *_POST_SPLIT_OVERLAY_CHANGES.get(role, ()),
     ):
         *parents, leaf = dotted.split(".")
         node = out
