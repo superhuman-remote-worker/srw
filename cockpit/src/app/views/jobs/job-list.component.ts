@@ -11,10 +11,11 @@ import {
   viewChild,
 } from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
-import {forkJoin} from 'rxjs';
+import {catchError, forkJoin, of} from 'rxjs';
 import {DatePipe} from '@angular/common';
 import {ActivatedRoute, ParamMap, Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
+import {CallService} from '../../core/services/call.service';
 import {DataService} from '../../core/services/data.service';
 import {UserService} from '../../core/services/user.service';
 import {environment} from '../../core/environment';
@@ -1217,6 +1218,7 @@ export type {JobCloudAction};
 export class JobListComponent implements OnInit, OnDestroy {
   readonly workspaceCreationMessageKey = workspaceCreationMessageKey;
   private readonly api = inject(ApiService);
+  private readonly callService = inject(CallService);
   private readonly data = inject(DataService);
   private readonly userService = inject(UserService);
   private readonly transloco = inject(TranslocoService);
@@ -1478,7 +1480,8 @@ export class JobListComponent implements OnInit, OnDestroy {
    *
    * `liveOnly` is what separates the two callers. An explicit Refresh means
    * "show me current numbers", so it reloads every open panel. The 30s poller
-   * reloads only non-terminal jobs: a finished job's figures cannot change, and
+   * reloads non-terminal jobs and jobs with calls (post-call work can arrive).
+   * An ordinary finished job's figures cannot change, and
    * refetching three endpoints per open panel every half minute to re-render
    * identical numbers is a poor trade.
    *
@@ -1493,16 +1496,17 @@ export class JobListComponent implements OnInit, OnDestroy {
     for (const jobId of expanded) {
       const state = cache[jobId];
       if (!state || state.loading) continue;
-      if (opts.liveOnly && isTerminalJobStatus(rows.get(jobId)?.status)) continue;
+      // Ended calls can gain post-call answers/follow-ups, including after the
+      // parent job completes. Keep their existing panel refresh alive.
+      if (
+        opts.liveOnly &&
+        isTerminalJobStatus(rows.get(jobId)?.status) &&
+        !state.calls?.length
+      ) continue;
       // Whether the reader had asked for the subtree figure; a refresh that
       // silently dropped them back to own-spend would be its own small lie.
       const wantSubtree = state.subtreeAttempted;
-      this.jobDetails.update((current) => {
-        const next = {...current};
-        delete next[jobId];
-        return next;
-      });
-      this.loadJobDetail(jobId);
+      this.loadJobDetail(jobId, true);
       if (wantSubtree) this.loadSubtreeUsage(jobId);
     }
   }
@@ -1747,8 +1751,9 @@ export class JobListComponent implements OnInit, OnDestroy {
    * error inside ApiService, so one failing source still renders the rest. Only
    * a total failure sets `error`.
    */
-  private loadJobDetail(jobId: string): void {
-    if (this.jobDetails()[jobId]) return; // cached, including a failed attempt
+  private loadJobDetail(jobId: string, refresh = false): void {
+    if (this.jobDetails()[jobId] && !refresh) return; // cached, including a failed attempt
+    const previousCalls = this.jobDetails()[jobId]?.calls;
     this.jobDetails.update((cache) => ({
       ...cache,
       [jobId]: {
@@ -1762,6 +1767,9 @@ export class JobListComponent implements OnInit, OnDestroy {
         subtreeAttempted: false,
         subjobs: null,
         subagents: null,
+        // Preserve mounted streams and the reader's scroll position while the
+        // job panel poll is in flight, including a failed calls list read.
+        calls: previousCalls ?? null,
       },
     }));
     forkJoin({
@@ -1775,6 +1783,7 @@ export class JobListComponent implements OnInit, OnDestroy {
       // explains the status they opened the panel to understand.
       subjobs: this.api.getJobSubjobs(jobId),
       subagents: this.api.getJobSubagents(jobId),
+      calls: this.callService.getCalls(jobId).pipe(catchError(() => of(null))),
     })
       .pipe(takeUntilDestroyed(this.destroyRef))
       .subscribe((result) => {
@@ -1794,6 +1803,7 @@ export class JobListComponent implements OnInit, OnDestroy {
             progress: result.progress,
             subjobs: result.subjobs?.subjobs ?? null,
             subagents: result.subagents?.subagents ?? null,
+            calls: result.calls?.calls ?? cache[jobId]?.calls ?? null,
           },
         }));
       });
