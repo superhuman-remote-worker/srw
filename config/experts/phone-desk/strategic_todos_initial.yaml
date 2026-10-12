@@ -2,7 +2,10 @@
 #
 # The call is already connected when the job starts: the history begins with
 # the delegate_agent call that attached it as the background subagent `phone`
-# and its receipt (handle in the receipt). The first todo IS the call.
+# and its receipt (handle in the receipt). The first todo IS the call. The
+# datasource tools (sql_schema / sql_query / sql_execute) are allowed in this
+# phase (phase_settings.strategic_tools), so the whole job — the call and its
+# follow-ups — runs here and ends with job_complete; no tactical phase.
 todos:
   - id: 1
     content: >-
@@ -11,24 +14,30 @@ todos:
       Loop: call wait_agent(handle, timeout_s=600).
       - result "question": answer it at once with
         message_agent(handle, message=<what the voice should tell the caller>,
-        reply_to=<question.delegation_id>). Look things up or act with your
-        tools first if needed (knowledge base, datasources), but answer before
-        answer_by; send a holding message first if you need longer.
+        reply_to=<question.delegation_id>). Look things up or act first if
+        needed: sql_schema / sql_query / sql_execute on the attached datasource,
+        kb_search for clinic knowledge. Answer before answer_by; send a holding
+        message first if you need longer.
       - result "timeout": the call is still running; wait again.
       - result "ready" (or the call's report arrives): the call has ended.
       COMPLETION CRITERIA: the phone subagent has ended and you have its final
       report (transcript, questions, follow-ups).
-      INSTEAD OF: planning, exploring or writing files while the call is live —
-      the caller is waiting.
+      INSTEAD OF: planning or exploring while the call is live — the caller is
+      waiting.
 
   - id: 2
     content: >-
-      PLAN THE FOLLOW-UPS with next_phase_todos. Read the call's final report.
-      Create one execution todo per request or follow-up the caller made that
-      still needs action (for example "cancel the appointment on Tuesday for
-      <name> in the appointments datasource", "note the callback request for
-      <topic>"), naming the exact tool and data. If nothing needs action,
-      create a single todo to verify that every question in the report was
-      answered.
-      COMPLETION CRITERIA: next_phase_todos called with todos covering every
-      open request from the call.
+      CARRY OUT THE FOLLOW-UPS. Read the call's final report. For every request
+      the caller made that still needs action, act now with the datasource
+      tools: find the record with sql_query (by name, phone number and date),
+      change it with sql_execute (for a cancellation set status='abgesagt' and
+      add a note with the reason and "per Telefon"; never delete rows), and
+      verify the change with sql_query. A callback wish goes into the callbacks
+      table. Something you cannot do with your tools stays open.
+      COMPLETION CRITERIA: every request in the report is done and verified,
+      or recorded as open with the reason.
+
+  - id: 3
+    content: >-
+      FINISH with job_complete. The summary names the caller, each request,
+      what you did (with the record it changed) and what is still open.

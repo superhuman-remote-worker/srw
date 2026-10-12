@@ -63,6 +63,15 @@ spec:
           enabled: true
           max_concurrent: 2
 
+        # The live call is the strategic phase (the first todo), and the
+        # caller cannot wait for a phase switch: the datasource tools answer
+        # "when is my appointment?" and do "cancel it" while the call lasts.
+        phase_settings:
+          strategic_tools:
+            - sql_schema
+            - sql_query
+            - sql_execute
+
         # No workspace means no read_file: the worker overlay's read-before-tool
         # gates (todo-guide before next_phase_todos, verify-before-done before
         # todo_complete/job_complete) could never open, and the job could not

@@ -660,3 +660,46 @@ class TestDelegationBatch:
             "Not executed: `read_file` was batched with delegate_probe; re-issue "
             "it in the next turn — delegation runs in a turn of its own"
         )
+
+
+class TestStrategicTools:
+    """``phase_settings.strategic_tools`` opens named tactical tools in the
+    strategic phase for one expert (the phone desk answers a caller from its
+    datasources before it ever plans)."""
+
+    @pytest.mark.asyncio
+    async def test_a_listed_tactical_tool_runs_in_the_strategic_phase(self, tool_node):
+        tool_node.ainvoke = AsyncMock(
+            return_value={"messages": [result_for("request_replan", "c1")]}
+        )
+        config = FakeConfig()
+        config.phase_settings = SimpleNamespace(strategic_tools=["request_replan"])
+        audited = create_audited_tool_node([tool("request_replan")], config)
+        result = await audited(
+            state([tc("request_replan", "c1")], is_strategic=True, phase_number=3)
+        )
+        assert [m.content for m in tool_messages(result)] == ["ok"]
+
+    @pytest.mark.asyncio
+    async def test_unlisted_tools_keep_their_phase(self, tool_node):
+        tool_node.ainvoke = AsyncMock(return_value={"messages": []})
+        config = FakeConfig()
+        config.phase_settings = SimpleNamespace(strategic_tools=["sql_query"])
+        audited = create_audited_tool_node([tool("request_replan")], config)
+        result = await audited(
+            state([tc("request_replan", "c1")], is_strategic=True, phase_number=3)
+        )
+        assert [m.content for m in tool_messages(result)] == [TACTICAL_IN_STRATEGIC]
+
+    def test_a_listed_tool_carries_no_phase_prefix(self):
+        from agent.tools.description_manager import apply_phase_description_prefixes
+
+        replan = MagicMock()
+        replan.name = "request_replan"
+        replan.description = "Ask for a replan."
+        plain = apply_phase_description_prefixes(
+            [replan], both_phases=["request_replan"]
+        )
+        assert plain[0].description == "Ask for a replan."
+        prefixed = apply_phase_description_prefixes([replan])
+        assert prefixed[0].description.startswith("[tactical-phase tool] ")

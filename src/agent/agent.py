@@ -4869,7 +4869,8 @@ class UniversalAgent:
             # Same as before: a tool without registry phases was never bound.
             logger.debug(f"Tools without a registry phase are not bound: {dropped}")
         bound_tools = apply_phase_description_prefixes(
-            [t for t in self._tools if t.name in union]
+            [t for t in self._tools if t.name in union],
+            both_phases=self.config.phase_settings.strategic_tools,
         )
         bound_tools = apply_guardrails_to_tools(bound_tools, model=llm_cfg.model)
         self._llm_with_tools = self._llm.bind_tools(bound_tools, **bind_kwargs)

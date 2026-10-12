@@ -5451,7 +5451,16 @@ def create_audited_tool_node(
 
     _all_tool_names = [t.name for t in tools]
     _phase_allowed: Dict[str, set] = {
-        "strategic": set(_filter_phase(_all_tool_names, "strategic")),
+        "strategic": set(_filter_phase(_all_tool_names, "strategic"))
+        | (
+            set(
+                getattr(
+                    getattr(config, "phase_settings", None), "strategic_tools", None
+                )
+                or ()
+            )
+            & set(_all_tool_names)
+        ),
         "tactical": set(_filter_phase(_all_tool_names, "tactical")),
     }
     # Only gate tools that have phase metadata in the registry.
