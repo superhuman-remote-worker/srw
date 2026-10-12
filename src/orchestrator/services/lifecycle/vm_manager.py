@@ -500,7 +500,7 @@ class VMInstanceManager:
                             "VM lifecycle identity capture failed for job %s",
                             inst.bound_to,
                         )
-                        permit.skip("vm_identity_unknown")
+                        permit.skip("vm_identity_unknown", settled=True)
                     else:
                         listed_generation = inst.metadata.get("provision_generation")
                         listed_vm_uid = inst.metadata.get("vm_uid")

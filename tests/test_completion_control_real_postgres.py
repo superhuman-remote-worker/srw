@@ -383,6 +383,57 @@ async def test_vm_lifecycle_refuses_same_name_successor_with_real_claim(pg):
 
 
 @pytest.mark.asyncio
+async def test_vm_lifecycle_releases_own_claim_after_read_only_identity_refusal(pg):
+    async with pg.acquire() as conn:
+        job_id = await _pinned_job(conn, status="completed", agent_id=None)
+
+    identity = VMTeardownIdentity(
+        provision_generation="00000000-0000-4000-8000-000000000001",
+        vm_uid="vm-uid-original",
+        rootdisk_pvc_uid="00000000-0000-4000-8000-000000000003",
+    )
+    manager, provisioner = _real_pg_vm_manager(
+        pg, identity=identity, outcome=VMTeardownResult("completed", True)
+    )
+
+    captured_claim_ids = []
+
+    async def refuse_identity(_job_id):
+        marker, db_now = await _claim_clock_snapshot(pg, job_id)
+        assert marker["source"] == "lifecycle_vm_delete"
+        assert marker["fence_value"] == identity.vm_uid
+        assert float(marker["expires_epoch"]) > db_now
+        captured_claim_ids.append(marker["claim_id"])
+        raise RuntimeError("synthetic read-only identity refusal")
+
+    provisioner.capture_vm_teardown_identity.side_effect = refuse_identity
+    listed = Instance(
+        kind="vm",
+        id="agent-vm-original",
+        bound_to=str(job_id),
+        metadata={
+            "scope": "job",
+            "job_status": "completed",
+            "execution_lane": "pinned",
+            "provision_generation": identity.provision_generation,
+            "vm_uid": identity.vm_uid,
+            "rootdisk_pvc_uid": identity.rootdisk_pvc_uid,
+        },
+    )
+
+    await manager.delete(listed, grace_s=0)
+
+    assert len(captured_claim_ids) == 1
+    provisioner.capture_vm_teardown_identity.assert_awaited_once_with(str(job_id))
+    provisioner.release_vm_captured.assert_not_awaited()
+    async with pg.acquire() as conn:
+        context = _context(
+            await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id)
+        )
+    assert COMPLETION_CONTROL_CLAIM_KEY not in context
+
+
+@pytest.mark.asyncio
 async def test_vm_lifecycle_retains_real_claim_for_ambiguous_teardown(pg):
     async with pg.acquire() as conn:
         job_id = await _pinned_job(conn, status="completed", agent_id=None)
