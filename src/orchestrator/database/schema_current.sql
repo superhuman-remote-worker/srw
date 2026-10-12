@@ -1358,6 +1358,13 @@ BEGIN
     SELECT * INTO c FROM public.vm_workspace_cleanup_admissions WHERE id=NEW.id;
     SELECT * INTO a FROM public.vm_job_cancel_retention_authorities
      WHERE cleanup_admission_id=c.id OR superseded_admission_id=c.id;
+    IF c.source='job_terminal_vm_release' AND c.parent_admission_id IS NULL
+       AND public.vm_job_pinned_cancel_retention_pending(c.owner_kind,c.owner_id,c.pvc_uid)
+       AND c.outcome IS DISTINCT FROM 'superseded_by_retention'
+       AND NOT EXISTS(SELECT 1 FROM public.vm_job_cancel_retention_authorities exact
+           WHERE exact.cleanup_admission_id=c.id AND exact.policy_version=4) THEN
+        RAISE EXCEPTION 'Pinned Ready retention bootstrap is incomplete' USING ERRCODE='23514';
+    END IF;
     IF c.outcome='superseded_by_retention' AND
        (a.cleanup_admission_id IS NULL OR a.superseded_admission_id IS DISTINCT FROM c.id) THEN
         RAISE EXCEPTION 'Superseded purge has no immutable retention successor' USING ERRCODE='23514';
@@ -1394,13 +1401,20 @@ BEGIN
              ON r.owner_kind='job' AND r.job_id=j.id
             AND r.provision_generation::text=j.context->'vm'->>'provision_generation'
            WHERE j.id=NEW.owner_id AND j.status='cancelled'
-             AND j.context->'_stateless_cancel_cleanup_pending'='true'::jsonb
+             AND ((j.execution_lane='stateless'
+                 AND j.context->'_stateless_cancel_cleanup_pending'='true'::jsonb)
+               OR (j.execution_lane='pinned'
+                 AND j.context->'_job_terminal_vm_cleanup'->>'retention_policy'='4'))
              AND r.ready_at IS NOT NULL AND r.job_retained_resume_id IS NULL
              AND NOT j.context ? '_vm_job_retained_resume'
              AND r.observed_pvc_uid=NEW.pvc_uid)
        AND NOT EXISTS(SELECT 1 FROM public.vm_job_cancel_retention_authorities a
            WHERE (a.cleanup_admission_id=NEW.id OR a.superseded_admission_id=NEW.id)
-             AND a.policy_version=3) THEN
+             AND a.policy_version=CASE
+                 WHEN EXISTS(SELECT 1 FROM public.jobs j
+                     WHERE j.id=NEW.owner_id AND j.execution_lane='pinned'
+                       AND j.context->'_job_terminal_vm_cleanup'->>'retention_policy'='4')
+                 THEN 4 ELSE 3 END) THEN
         RAISE EXCEPTION 'Initial Ready stop bootstrap is incomplete' USING ERRCODE='23514';
     END IF;
     RETURN NULL;
@@ -10156,7 +10170,8 @@ BEGIN
     END IF;
     IF NOT public.vm_job_cancel_retention_cleanup_allowed(
         row.owner_kind,row.owner_id,row.pvc_uid,row.source,row.request_id,row.intent_digest,row.parent_admission_id,
-        TG_OP='INSERT' AND row.source='public_vm_delete' AND row.parent_admission_id IS NULL) THEN
+        (TG_OP='INSERT' AND row.source IN ('public_vm_delete','job_terminal_vm_release') AND row.parent_admission_id IS NULL)
+        OR (TG_OP='UPDATE' AND row.outcome='superseded_by_retention')) THEN
         -- Exact retaining/superseded row completion is checked at commit below.
         IF NOT (TG_OP='UPDATE' AND protected AND row.parent_admission_id IS NULL) THEN
             RAISE EXCEPTION 'Cancelled Job disk is protected by retention' USING ERRCODE='23514';
@@ -10179,7 +10194,7 @@ DECLARE a public.vm_job_cancel_retention_authorities%ROWTYPE;
 BEGIN
     SELECT * INTO a FROM public.vm_job_cancel_retention_authorities WHERE cleanup_admission_id=NEW.cleanup_admission_id;
     IF a.cleanup_admission_id IS NULL THEN RETURN NEW; END IF;
-    IF a.policy_version=3 THEN
+    IF a.policy_version IN (3,4) THEN
         IF NOT public.vm_initial_ready_stop_authorized(NEW) THEN
             RAISE EXCEPTION 'Initial Ready stop requires committed exact custody authority' USING ERRCODE='23514';
         END IF;
@@ -10265,6 +10280,78 @@ BEGIN
     IF OLD.live_job_id IS NOT NULL AND NEW.live_job_id IS NULL
        AND OLD.deleted_at IS NULL THEN
         RAISE EXCEPTION 'Job VM audit owner cannot detach before tombstone' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_job_pinned_cancel_retention(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_pinned_cancel_retention() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE pending boolean;
+        held boolean;
+        settled boolean;
+BEGIN
+    pending := COALESCE(OLD.context->'_job_terminal_vm_cleanup'->>'retention_policy'='4',false);
+    SELECT EXISTS(SELECT 1 FROM public.vm_job_cancel_retention_authorities a
+        WHERE a.job_id=OLD.id AND a.policy_version=4
+          AND NOT public.vm_job_cancel_retention_discharged(a.cleanup_admission_id))
+      INTO held;
+    IF TG_OP='DELETE' THEN
+        IF pending OR held THEN
+            RAISE EXCEPTION 'Pinned Ready rootdisk requires completed typed Delete before Job deletion'
+                USING ERRCODE='23514';
+        END IF;
+        RETURN OLD;
+    END IF;
+    IF NOT pending AND NOT held THEN RETURN NEW; END IF;
+    IF NEW.execution_lane IS DISTINCT FROM 'pinned'
+       OR NEW.status IS DISTINCT FROM 'cancelled'
+       OR NEW.assigned_agent_id IS NOT NULL
+       OR NEW.user_id IS DISTINCT FROM OLD.user_id
+       OR NEW.project_id IS DISTINCT FROM OLD.project_id
+       OR NEW.parent_job_id IS DISTINCT FROM OLD.parent_job_id
+       OR NEW.context->'vm'->>'provision_generation' IS DISTINCT FROM OLD.context->'vm'->>'provision_generation'
+       OR NEW.context->'vm'->>'creation_request_id' IS DISTINCT FROM OLD.context->'vm'->>'creation_request_id'
+       OR NEW.context->'vm'->>'vm_uid' IS DISTINCT FROM OLD.context->'vm'->>'vm_uid'
+       OR NEW.context->'vm'->>'vmi_uid' IS DISTINCT FROM OLD.context->'vm'->>'vmi_uid'
+       OR NEW.context->'vm'->>'rootdisk_pvc_uid' IS DISTINCT FROM OLD.context->'vm'->>'rootdisk_pvc_uid'
+       OR NEW.context->'vm'->>'identity_authenticated' IS DISTINCT FROM OLD.context->'vm'->>'identity_authenticated'
+       OR NEW.context->'vm'->>'identity_provision_generation' IS DISTINCT FROM OLD.context->'vm'->>'identity_provision_generation'
+       OR NEW.context ? '_vm_job_retained_resume'
+       OR NEW.context ? 'worker_resume_id' THEN
+        RAISE EXCEPTION 'Pinned Ready retention owner or runtime identity changed'
+            USING ERRCODE='23514';
+    END IF;
+    IF pending THEN
+        IF NEW.context ? '_job_terminal_vm_cleanup' THEN
+            IF ((NEW.context->'_job_terminal_vm_cleanup')-'admission_id')
+                 IS DISTINCT FROM ((OLD.context->'_job_terminal_vm_cleanup')-'admission_id')
+               OR (NEW.context->'_job_terminal_vm_cleanup'->>'admission_id' IS NOT NULL
+                   AND NOT EXISTS(SELECT 1 FROM public.vm_job_cancel_retention_authorities a
+                       WHERE a.job_id=OLD.id AND a.policy_version=4
+                         AND a.cleanup_admission_id::text=
+                             NEW.context->'_job_terminal_vm_cleanup'->>'admission_id')) THEN
+                RAISE EXCEPTION 'Pinned Ready Cancel decision is immutable'
+                    USING ERRCODE='23514';
+            END IF;
+        ELSE
+            SELECT bool_and(public.vm_job_cancel_retention_settled(a.cleanup_admission_id))
+              INTO settled FROM public.vm_job_cancel_retention_authorities a
+             WHERE a.job_id=OLD.id AND a.policy_version=4;
+            IF settled IS DISTINCT FROM true
+               OR NEW.context->'vm'->>'status' IS DISTINCT FROM 'deleted'
+               OR NEW.context->'vm'->'compute_released' IS DISTINCT FROM 'true'::jsonb
+               OR NEW.context->'vm'->'disk_kept' IS DISTINCT FROM 'true'::jsonb THEN
+                RAISE EXCEPTION 'Pinned Ready marker removal lacks retained stop'
+                    USING ERRCODE='23514';
+            END IF;
+        END IF;
     END IF;
     RETURN NEW;
 END;
@@ -10855,7 +10942,7 @@ BEGIN
     NEW.admitted_xact_id := pg_current_xact_id();
     IF NEW.policy_version=1 THEN RETURN NEW; END IF;
     SELECT * INTO r FROM public.vm_creation_retries WHERE request_id=NEW.creation_request_id;
-    IF NEW.policy_version=3 THEN
+    IF NEW.policy_version IN (3,4) THEN
         IF NEW.job_retained_resume_id IS NOT NULL OR r.job_retained_resume_id IS NOT NULL
            OR r.ready_at IS NULL OR r.request_id IS NULL
            OR r.job_id IS DISTINCT FROM NEW.job_id
@@ -22406,7 +22493,10 @@ BEGIN
         END IF;
     END IF;
     IF c.completed_at IS NULL THEN
-        IF a.policy_version=3 THEN
+        IF a.policy_version=4 THEN
+            candidate := public.vm_job_pinned_ready_retention_candidate(
+                a.job_id,a.provision_generation,a.vm_uid,a.pvc_uid,a.superseded_admission_id,a.cleanup_admission_id,NOT fresh);
+        ELSIF a.policy_version=3 THEN
             candidate := public.vm_job_initial_ready_retention_candidate(
                 a.job_id,a.provision_generation,a.vm_uid,a.pvc_uid,a.superseded_admission_id,a.cleanup_admission_id,NOT fresh);
         ELSIF a.policy_version=2 THEN
@@ -23760,7 +23850,7 @@ BEGIN
     PERFORM 1 FROM public.vm_workspace_cleanup_admissions WHERE id=i.cleanup_admission_id FOR UPDATE;
     SELECT * INTO a FROM public.vm_job_cancel_retention_authorities
      WHERE cleanup_admission_id=i.cleanup_admission_id;
-    IF a.policy_version IS DISTINCT FROM 3 OR a.admitted_xact_id=pg_current_xact_id()
+    IF (a.policy_version IS NULL OR a.policy_version NOT IN (3,4)) OR a.admitted_xact_id=pg_current_xact_id()
        OR a.job_retained_resume_id IS NOT NULL OR i.retention_preflight IS DISTINCT FROM a.ready_retention_preflight
        OR i.job_id IS DISTINCT FROM a.job_id OR i.provision_generation IS DISTINCT FROM a.provision_generation
        OR i.creation_request_id IS DISTINCT FROM a.creation_request_id
@@ -23910,7 +24000,55 @@ $_$;
 CREATE FUNCTION public.vm_job_cancel_retention_cleanup_allowed(kind text, owner uuid, pvc uuid, cleanup_source text, cleanup_request uuid, digest text, parent_id uuid, provisional boolean DEFAULT false) RETURNS boolean
     LANGUAGE plpgsql
     AS $$
+DECLARE j public.jobs%ROWTYPE;
+        expected_digest text;
+        original_request uuid;
 BEGIN
+    IF public.vm_job_pinned_cancel_retention_pending(kind,owner,pvc) THEN
+        SELECT * INTO j FROM public.jobs WHERE id=owner;
+        IF kind='job' AND j.execution_lane='pinned' AND j.status='cancelled'
+           AND j.context->'_job_terminal_vm_cleanup'->>'retention_policy'='4'
+           AND pvc::text=j.context->'vm'->>'rootdisk_pvc_uid'
+           AND parent_id IS NULL AND cleanup_source='job_terminal_vm_release' THEN
+            expected_digest := 'sha256:'||encode(sha256(convert_to(format(
+                '{"owner_id":"%s","owner_kind":"job","provision_generation":"%s","purge_disk":false,"pvc_uid":"%s","resource":"vm_workspace","source":"job_terminal_vm_release","vm_uid":"%s"}',
+                owner,j.context->'vm'->>'provision_generation',pvc,
+                j.context->'vm'->>'vm_uid'),'UTF8')),'hex');
+            original_request := public.uuid_generate_v5(public.uuid_ns_url(),
+                'vm-workspace-cleanup:job_terminal_vm_release:job:'||owner||':'||
+                (j.context->'vm'->>'provision_generation')||':'||
+                (j.context->'vm'->>'vm_uid')||':'||pvc);
+            IF digest=expected_digest AND (cleanup_request=original_request
+                OR EXISTS(SELECT 1 FROM public.vm_workspace_cleanup_admissions old
+                    WHERE old.owner_kind='job' AND old.owner_id=owner
+                      AND old.pvc_uid=pvc AND old.source='job_terminal_vm_release'
+                      AND old.outcome='superseded_by_retention'
+                      AND cleanup_request=public.uuid_generate_v5(public.uuid_ns_url(),
+                          'vm-job-cancel-retain-v1:'||old.id||':'||digest))) THEN
+                -- Admission is provisional until the deferred parent check
+                -- sees the exact policy-4 authority in this transaction.
+                RETURN true;
+            END IF;
+            -- The exact old purge parent can be superseded in this transaction;
+            -- the deferred check requires its matching immutable successor.
+            IF provisional AND cleanup_request=original_request
+               AND EXISTS(SELECT 1 FROM public.vm_workspace_cleanup_admissions old
+                   WHERE old.owner_kind='job' AND old.owner_id=owner
+                     AND old.pvc_uid=pvc AND old.request_id=cleanup_request
+                     AND old.intent_digest=digest
+                     AND old.outcome='superseded_by_retention'
+                     AND NOT EXISTS(SELECT 1 FROM public.vm_workspace_cleanup_admissions child
+                         WHERE child.parent_admission_id=old.id)) THEN RETURN true; END IF;
+        END IF;
+        IF kind='job' AND cleanup_source='public_vm_delete' AND parent_id IS NULL
+           AND EXISTS(SELECT 1 FROM public.vm_job_cancel_retention_authorities a
+               WHERE a.job_id=owner AND a.pvc_uid=pvc
+                 AND public.vm_job_cancel_retention_settled(a.cleanup_admission_id)) THEN
+            RETURN public.vm_job_cancel_retention_cleanup_allowed_v1(
+                kind,owner,pvc,cleanup_source,cleanup_request,digest,parent_id,provisional);
+        END IF;
+        RETURN false;
+    END IF;
     IF kind='job' AND cleanup_source='terminal_checkpoint_prune'
        AND EXISTS(SELECT 1 FROM public.vm_job_retained_resumes WHERE job_id=owner)
        AND NOT public.vm_job_retained_terminal_is_current(owner) THEN RETURN false; END IF;
@@ -23918,7 +24056,8 @@ BEGIN
        AND public.vm_job_retained_stop_allowed(owner,pvc,cleanup_request,digest) THEN RETURN true; END IF;
     IF kind='job' AND cleanup_source='controller_vm_create' AND parent_id IS NULL
        AND public.vm_job_retained_creation_allowed(owner,pvc,cleanup_request,digest) THEN RETURN true; END IF;
-    RETURN public.vm_job_cancel_retention_cleanup_allowed_v1(kind,owner,pvc,cleanup_source,cleanup_request,digest,parent_id,provisional);
+    RETURN public.vm_job_cancel_retention_cleanup_allowed_v1(
+        kind,owner,pvc,cleanup_source,cleanup_request,digest,parent_id,provisional);
 END;
 $$;
 
@@ -24298,6 +24437,129 @@ CREATE FUNCTION public.vm_job_logical_final_history_safe(requested_job uuid, req
           )
     );
 $$;
+
+
+--
+-- Name: vm_job_pinned_cancel_retention_pending(text, uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_pinned_cancel_retention_pending(kind text, owner uuid, pvc uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS(SELECT 1 FROM public.jobs j
+        WHERE j.execution_lane='pinned' AND j.status='cancelled'
+          AND j.context->'_job_terminal_vm_cleanup'->>'retention_policy'='4'
+          AND ((kind='job' AND j.id=owner)
+               OR (pvc IS NOT NULL AND j.context->'vm'->>'rootdisk_pvc_uid'=pvc::text)));
+$$;
+
+
+--
+-- Name: vm_job_pinned_ready_retention_candidate(uuid, uuid, uuid, uuid, uuid, uuid, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_pinned_ready_retention_candidate(owner uuid, generation uuid, expected_vm uuid, pvc uuid, old_parent uuid, retaining_parent uuid DEFAULT NULL::uuid, existing_stop boolean DEFAULT false) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE j public.jobs%ROWTYPE;
+        r public.vm_creation_retries%ROWTYPE;
+        v public.vm_resource_reservations%ROWTYPE;
+        q public.run_queue%ROWTYPE;
+        vm jsonb;
+BEGIN
+    SELECT * INTO q FROM public.run_queue WHERE unit_id=owner FOR UPDATE;
+    SELECT * INTO j FROM public.jobs WHERE id=owner FOR UPDATE;
+    SELECT * INTO r FROM public.vm_creation_retries
+     WHERE owner_kind='job' AND job_id=owner AND provision_generation=generation FOR UPDATE;
+    SELECT * INTO v FROM public.vm_resource_reservations WHERE request_id=r.request_id FOR UPDATE;
+    vm := j.context->'vm';
+    IF j.id IS NULL OR j.status IS DISTINCT FROM 'cancelled'
+       OR j.context->'_job_terminal_vm_cleanup'->>'retention_policy' IS DISTINCT FROM '4'
+       OR j.context->'_job_terminal_vm_cleanup'->>'source' IS DISTINCT FROM 'cancel'
+       OR j.context->'_job_terminal_vm_cleanup'->>'version' IS DISTINCT FROM '1'
+       OR j.execution_lane IS DISTINCT FROM 'pinned'
+       OR j.assigned_agent_id IS NOT NULL OR j.parent_job_id IS NOT NULL
+       OR COALESCE(j.context->'inherits_parent_workspace','false'::jsonb) IS DISTINCT FROM 'false'::jsonb
+       OR jsonb_typeof(vm) IS DISTINCT FROM 'object'
+       OR vm->>'provision_generation' IS DISTINCT FROM generation::text
+       OR vm->>'vm_uid' IS DISTINCT FROM expected_vm::text
+       OR vm->>'rootdisk_pvc_uid' IS DISTINCT FROM pvc::text
+       OR vm->>'status' IS NULL OR (vm->>'status' NOT IN ('created','ssh_pending','ssh_unreachable','ready','retiring_process_zero')
+           AND NOT (vm->>'status'='deleted' AND v.state='teardown'
+               AND public.vm_job_deleted_retention_replay_allowed(4,owner,generation,
+                   expected_vm,pvc,retaining_parent,existing_stop,r.request_id,
+                   v.id,v.revision,v.vmi_uid,v.launcher_uid,v.node_uid)))
+       OR vm->'identity_authenticated' IS DISTINCT FROM 'true'::jsonb
+       OR vm->>'identity_provision_generation' IS DISTINCT FROM generation::text
+       OR COALESCE(vm->'workspace_storage','null'::jsonb)<>'null'::jsonb
+       OR COALESCE(r.canonical_request->'workspace_storage','null'::jsonb)<>'null'::jsonb
+       OR (q.unit_id IS NOT NULL AND (q.state IS DISTINCT FROM 'done'
+           OR q.leased_by IS NOT NULL OR q.leased_until IS NOT NULL))
+       OR r.request_id IS NULL OR r.state IS DISTINCT FROM 'succeeded'
+       OR vm->>'creation_request_id' IS DISTINCT FROM r.request_id::text
+       OR r.reason IS DISTINCT FROM 'creation_adopted' OR r.resolved_at IS NULL
+       OR r.claim_token IS NOT NULL OR r.claim_expires_at IS NOT NULL
+       OR r.ready_at IS NULL OR r.job_retained_resume_id IS NOT NULL
+       OR (old_parent IS NOT NULL AND NOT EXISTS (
+           SELECT 1 FROM public.vm_workspace_cleanup_admissions old
+           WHERE old.id=old_parent AND r.ready_at<=old.admitted_at))
+       OR j.context ? '_vm_job_retained_resume'
+       OR r.observed_vm_uid IS DISTINCT FROM expected_vm OR r.observed_pvc_uid IS DISTINCT FROM pvc
+       OR r.controller_configuration->'version' IS DISTINCT FROM '3'::jsonb
+       OR r.controller_configuration->'persistent_rootdisk' IS DISTINCT FROM 'true'::jsonb
+       OR r.controller_configuration->'headscale_enabled' IS DISTINCT FROM 'false'::jsonb
+       OR v.id IS NULL OR v.resource_version IS DISTINCT FROM 2
+       OR v.state NOT IN ('reserved','active','warm','teardown')
+       OR v.vm_uid IS DISTINCT FROM expected_vm OR v.vmi_uid IS NULL OR v.launcher_uid IS NULL
+       OR vm->>'vmi_uid' IS DISTINCT FROM v.vmi_uid::text
+       OR (vm->>'active_pod_uid' IS NOT NULL AND vm->>'active_pod_uid'<>v.launcher_uid::text)
+       OR r.controller_configuration->'resource_admission'->>'cluster_id' IS DISTINCT FROM v.cluster_id
+       OR COALESCE(r.controller_configuration->>'namespace','') !~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+       OR length(r.controller_configuration->>'namespace')>63
+       OR EXISTS (SELECT 1 FROM public.srw_execution_specs e
+           JOIN public.srw_execution_workspace_bindings b ON b.execution_id=e.id
+           WHERE e.work_kind='Job' AND e.work_id=owner)
+       OR EXISTS (SELECT 1 FROM public.srw_workspace_instances w WHERE w.pvc_uid=pvc::text)
+       OR EXISTS (SELECT 1 FROM public.vm_resource_recovery_successors s WHERE s.reservation_id=v.id)
+       OR EXISTS (SELECT 1 FROM public.vm_creation_retries later WHERE later.owner_kind='job'
+           AND later.job_id=owner AND (later.created_at,later.request_id)>(r.created_at,r.request_id))
+       OR EXISTS (SELECT 1 FROM public.vm_creation_effects e WHERE e.request_id=r.request_id AND e.state='issued')
+       OR EXISTS (SELECT 1 FROM public.agents a WHERE a.current_job_id=owner AND a.status NOT IN ('offline','failed','completed'))
+       OR EXISTS (SELECT 1 FROM public.jobs other WHERE other.id<>owner AND
+           (other.context->'vm'->>'inherited_from_job_id'=owner::text
+            OR other.context->'vm'->>'rootdisk_pvc_uid'=pvc::text))
+       OR EXISTS (SELECT 1 FROM public.vm_idle_access_leases l WHERE l.owner_kind='job' AND l.owner_id=owner
+           AND l.closed_at IS NULL AND l.expires_at>clock_timestamp())
+       OR EXISTS (SELECT 1 FROM public.vm_remote_operation_leases l WHERE l.owner_kind='job' AND l.owner_id=owner
+           AND l.settled_at IS NULL AND l.lease_expires_at>clock_timestamp())
+       OR EXISTS (SELECT 1 FROM public.vm_idle_operations o WHERE o.owner_kind='job' AND o.owner_id=owner AND o.closed_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recoveries h WHERE h.resolved_at IS NULL
+           AND ((h.owner_kind='job' AND h.owner_id=owner) OR h.root_pvc_uid=pvc))
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recovery_retention_pins p WHERE p.pvc_uid=pvc AND p.released_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recovery_jobs h WHERE h.job_id=owner AND h.resolved_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+           WHERE ((c.owner_kind='job' AND c.owner_id=owner) OR c.pvc_uid=pvc)
+           AND c.completed_at IS NULL AND c.id IS DISTINCT FROM old_parent
+           AND c.id IS DISTINCT FROM retaining_parent)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c WHERE
+           c.parent_admission_id=old_parent OR c.parent_admission_id=retaining_parent)
+       OR EXISTS (SELECT 1 FROM public.vm_pre_ssh_stop_intents i WHERE i.job_id=owner
+           AND i.provision_generation=generation
+           AND (NOT existing_stop OR i.cleanup_admission_id IS DISTINCT FROM retaining_parent))
+       OR (NOT existing_stop AND EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts z
+           WHERE z.owner_kind='job' AND z.owner_id=owner AND z.scope='vm'
+           AND z.provisioner='vm' AND z.runtime_incarnation=generation::text))
+       OR j.context->'_job_terminal_vm_cleanup'->>'provision_generation' IS DISTINCT FROM generation::text
+       OR (j.context->'_job_terminal_vm_cleanup'->>'admission_id' IS NOT NULL
+           AND j.context->'_job_terminal_vm_cleanup'->>'admission_id' IS DISTINCT FROM old_parent::text
+           AND j.context->'_job_terminal_vm_cleanup'->>'admission_id' IS DISTINCT FROM retaining_parent::text) THEN
+        RETURN NULL;
+    END IF;
+    RETURN jsonb_build_object('creation_request_id',r.request_id,'reservation_id',v.id,
+        'reservation_revision',v.revision,'vmi_uid',v.vmi_uid,'launcher_uid',v.launcher_uid,
+        'node_uid',v.node_uid,'namespace',r.controller_configuration->>'namespace','cluster_id',v.cluster_id);
+END;
+$_$;
 
 
 --
@@ -24713,7 +24975,7 @@ CREATE TABLE public.vm_job_cancel_retention_authorities (
 CREATE FUNCTION public.vm_job_retained_ready_candidate(parent public.vm_job_cancel_retention_authorities) RETURNS jsonb
     LANGUAGE sql IMMUTABLE
     AS $$
-    SELECT (jsonb_build_object('version',1,'kind',CASE WHEN parent.policy_version=3
+    SELECT (jsonb_build_object('version',1,'kind',CASE WHEN parent.policy_version IN (3,4)
         THEN 'vm_job_initial_ready_stop_candidate_v1' ELSE 'vm_job_retained_ready_stop_candidate_v1' END,
         'owner_kind','job','job_id',parent.job_id,'namespace',parent.namespace,'cluster_id',parent.cluster_id,
         'continuation_id',parent.job_retained_resume_id,'request_id',parent.creation_request_id,
@@ -24721,7 +24983,7 @@ CREATE FUNCTION public.vm_job_retained_ready_candidate(parent public.vm_job_canc
         'reservation_revision',parent.reservation_revision,'vm_uid',parent.vm_uid,'vmi_uid',parent.vmi_uid,
         'launcher_uid',parent.launcher_uid,'node_uid',parent.node_uid,'pvc_uid',parent.pvc_uid,
         'cleanup_request_id',parent.cleanup_request_id,'cleanup_intent_digest',parent.intent_digest)
-        - CASE WHEN parent.policy_version=3 THEN ARRAY['continuation_id'] ELSE ARRAY[]::text[] END);
+        - CASE WHEN parent.policy_version IN (3,4) THEN ARRAY['continuation_id'] ELSE ARRAY[]::text[] END);
 $$;
 
 
@@ -36749,7 +37011,7 @@ ALTER TABLE ONLY public.vm_job_cancel_retention_authorities
 --
 
 ALTER TABLE public.vm_job_cancel_retention_authorities
-    ADD CONSTRAINT vm_job_cancel_retention_policy CHECK ((((policy_version = 1) AND (job_retained_resume_id IS NULL) AND (ready_retention_preflight IS NULL)) OR ((policy_version = 2) AND (job_retained_resume_id IS NOT NULL)) OR ((policy_version = 3) AND (job_retained_resume_id IS NULL) AND (ready_retention_preflight IS NOT NULL)))) NOT VALID;
+    ADD CONSTRAINT vm_job_cancel_retention_policy CHECK ((((policy_version = 1) AND (job_retained_resume_id IS NULL) AND (ready_retention_preflight IS NULL)) OR ((policy_version = 2) AND (job_retained_resume_id IS NOT NULL)) OR ((policy_version = ANY (ARRAY[3, 4])) AND (job_retained_resume_id IS NULL) AND (ready_retention_preflight IS NOT NULL)))) NOT VALID;
 
 
 --
@@ -40034,6 +40296,13 @@ CREATE TRIGGER a_vm_job_cancel_retention_cleanup_guard BEFORE INSERT OR DELETE O
 --
 
 CREATE TRIGGER a_vm_job_creation_owner BEFORE INSERT ON public.vm_creation_retries FOR EACH ROW EXECUTE FUNCTION public.ensure_vm_job_creation_owner();
+
+
+--
+-- Name: jobs a_vm_job_pinned_cancel_retention_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_pinned_cancel_retention_guard BEFORE DELETE OR UPDATE ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_pinned_cancel_retention();
 
 
 --

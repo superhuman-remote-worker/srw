@@ -2886,6 +2886,21 @@ async def archive_and_cleanup_workspace(
             return actions
         ws_ctx = _get_container_context(job)
         vm_ctx = _get_vm_context(job)
+        terminal_marker = (
+            raw_context.get("_job_terminal_vm_cleanup")
+            if isinstance(raw_context, dict)
+            else None
+        )
+        pinned_ready_cancel = bool(
+            job.get("status") == "cancelled"
+            and job.get("execution_lane") == "pinned"
+            and isinstance(terminal_marker, dict)
+            and terminal_marker.get("retention_policy") == 4
+        )
+        if pinned_ready_cancel and (
+            not isinstance(vm_ctx, dict) or vm_ctx.get("workspace_storage") is not None
+        ):
+            raise RuntimeError("pinned Ready Cancel retention identity remains held")
 
         never_issued_terminal = False
         if (
@@ -2952,7 +2967,7 @@ async def archive_and_cleanup_workspace(
                     entity_id
                 )
                 retaining = None
-                if (
+                if pinned_ready_cancel or (
                     (
                         job.get("status") == "cancelled"
                         or raw_context.get("_vm_job_retained_resume") is not None
@@ -2973,6 +2988,8 @@ async def archive_and_cleanup_workspace(
                     )
                     if retaining is not None and not retaining.allowed:
                         raise RuntimeError("job VM cancel retention remains held")
+                    if pinned_ready_cancel and retaining is None:
+                        raise RuntimeError("pinned Ready Cancel retention remains held")
                 purge_disk = True
                 if retaining is not None:
                     purge_disk = False
@@ -3056,6 +3073,9 @@ async def archive_and_cleanup_workspace(
         if (
             job.get("execution_lane") == "stateless"
             and raw_context.get("_stateless_delete_pending") is True
+        ) or (
+            job.get("execution_lane") == "pinned"
+            and raw_context.get("_pinned_retained_delete_pending") is True
         ):
             from orchestrator.services.vm_job_retained_disk_purge import (
                 acquire_job_retained_disk_purge,
@@ -3072,7 +3092,11 @@ async def archive_and_cleanup_workspace(
                     postgres_db, entity_id, clear_pending=False
                 ):
                     raise RuntimeError("retained VM Delete terminal remains held")
-            identity = await retained_delete_identity(postgres_db, entity_id)
+            identity = (
+                await vm_provisioner.capture_vm_teardown_identity(entity_id)
+                if job.get("execution_lane") == "pinned"
+                else await retained_delete_identity(postgres_db, entity_id)
+            )
             if identity is None and vm_ctx:
                 identity = await vm_provisioner.capture_vm_teardown_identity(entity_id)
             purge = (
@@ -3082,6 +3106,8 @@ async def archive_and_cleanup_workspace(
                     recovery_store, job_id=entity_id, identity=identity
                 )
             )
+            if job.get("execution_lane") == "pinned" and purge is None:
+                raise RuntimeError("pinned Ready retained disk Delete remains held")
             if purge is not None:
                 await execute_job_retained_disk_purge(
                     recovery_store,

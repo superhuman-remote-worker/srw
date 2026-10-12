@@ -342,6 +342,26 @@ class JobControlOperations:
                     status_code=409,
                     detail="Stateless job changed while deletion was being prepared",
                 )
+            if job.get("execution_lane") == "pinned":
+                prepare_pinned = getattr(
+                    store, "prepare_pinned_retained_job_for_delete", None
+                )
+                if prepare_pinned is not None:
+                    context = job.get("context") or {}
+                    if isinstance(context, str):
+                        context = json.loads(context)
+                    marker = context.get("_job_terminal_vm_cleanup")
+                    if isinstance(marker, dict) and marker.get("retention_policy") == 4:
+                        await store.complete_terminal_vm_cleanup_marker(
+                            job_id,
+                            expected_generation=marker.get("provision_generation"),
+                        )
+                    pinned_prepared = await prepare_pinned(job_id)
+                    if pinned_prepared is False:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Pinned Ready retained stop or Delete authority is incomplete",
+                        )
 
             try:
                 await d.archive_and_cleanup_workspace(job_id)

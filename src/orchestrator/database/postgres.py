@@ -5603,6 +5603,23 @@ class PostgresDB:
         recovery_cancellation = None
         async with self.acquire() as conn:
             async with conn.transaction():
+                tentative_pvc = await conn.fetchval(
+                    "SELECT context->'vm'->>'rootdisk_pvc_uid' FROM jobs WHERE id=$1",
+                    uuid_val,
+                )
+                try:
+                    locked_pvc = UUID(tentative_pvc) if tentative_pvc else None
+                except ValueError:
+                    locked_pvc = None
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                    f"workspace-recovery:job:{uuid_val}",
+                )
+                if locked_pvc is not None:
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                        f"workspace-recovery-pvc:{locked_pvc}",
+                    )
                 await conn.fetchrow(
                     "SELECT unit_id FROM run_queue WHERE unit_id=$1 FOR UPDATE",
                     uuid_val,
@@ -5619,13 +5636,63 @@ class PostgresDB:
                 # The separate lease read must follow a Job row lock. A single
                 # UPDATE with NOT EXISTS can evaluate against a snapshot taken
                 # before a concurrent IDE writer commits while it waits here.
-                if (
-                    await conn.fetchrow(
-                        "SELECT id FROM jobs WHERE id=$1 FOR UPDATE", uuid_val
-                    )
-                    is None
-                ):
+                locked_job = await conn.fetchrow(
+                    "SELECT * FROM jobs WHERE id=$1 FOR UPDATE", uuid_val
+                )
+                if locked_job is None:
                     return False
+                context = locked_job["context"]
+                if isinstance(context, str):
+                    context = json.loads(context)
+                vm = context.get("vm") if isinstance(context, dict) else None
+                vm = vm if isinstance(vm, dict) else {}
+                retry = await conn.fetchrow(
+                    "SELECT * FROM vm_creation_retries WHERE owner_kind='job' "
+                    "AND job_id=$1 ORDER BY created_at DESC,request_id DESC "
+                    "LIMIT 1 FOR UPDATE",
+                    uuid_val,
+                )
+                ready_claim = vm.get("status") in {
+                    "ready",
+                    "retiring_process_zero",
+                } or (retry is not None and retry["ready_at"] is not None)
+                retain_ready = False
+                if ready_claim and vm.get("workspace_storage") is None:
+                    reservation = (
+                        await conn.fetchrow(
+                            "SELECT * FROM vm_resource_reservations WHERE request_id=$1 FOR UPDATE",
+                            retry["request_id"],
+                        )
+                        if retry is not None
+                        else None
+                    )
+                    canonical = retry["canonical_request"] if retry else None
+                    if isinstance(canonical, str):
+                        canonical = json.loads(canonical)
+                    if (
+                        locked_pvc is None
+                        or vm.get("rootdisk_pvc_uid") != str(locked_pvc)
+                        or retry is None
+                        or retry["ready_at"] is None
+                        or retry["state"] != "succeeded"
+                        or retry["job_retained_resume_id"] is not None
+                        or vm.get("provision_generation")
+                        != str(retry["provision_generation"])
+                        or vm.get("vm_uid") != str(retry["observed_vm_uid"])
+                        or vm.get("rootdisk_pvc_uid") != str(retry["observed_pvc_uid"])
+                        or vm.get("creation_request_id") != str(retry["request_id"])
+                        or vm.get("identity_authenticated") is not True
+                        or vm.get("identity_provision_generation")
+                        != str(retry["provision_generation"])
+                        or locked_job["parent_job_id"] is not None
+                        or context.get("inherits_parent_workspace") is True
+                        or not isinstance(canonical, dict)
+                        or canonical.get("workspace_storage") is not None
+                        or reservation is None
+                        or reservation["vm_uid"] != retry["observed_vm_uid"]
+                    ):
+                        return False
+                    retain_ready = True
                 if await conn.fetchval(
                     "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases "
                     "WHERE owner_kind='job' AND owner_id=$1 AND closed_at IS NULL "
@@ -5650,7 +5717,10 @@ class PostgresDB:
                             jsonb_build_object(
                               'version',1,'source','cancel',
                               'provision_generation',
-                                context->'vm'->>'provision_generation'), true)
+                                context->'vm'->>'provision_generation')
+                            || CASE WHEN $3::boolean
+                                THEN '{{"retention_policy":4}}'::jsonb
+                                ELSE '{{}}'::jsonb END, true)
                           ELSE context END,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = $1
@@ -5661,6 +5731,7 @@ class PostgresDB:
                     """,
                     uuid_val,
                     expected_status,
+                    retain_ready,
                 )
                 if result == "UPDATE 1":
                     from orchestrator.services.connector_credential_leases import (
@@ -6774,6 +6845,110 @@ class PostgresDB:
                     and job["status"] == "cancelled"
                     and job["cleanup_pending"] is not True
                 )
+
+    async def prepare_pinned_retained_job_for_delete(self, job_id: str) -> bool | None:
+        """Pin an authorized policy-4 owner Delete after its retained stop settles.
+
+        None means this is an unrelated pinned Job; False is a recognized hold.
+        The typed disk purge still has to prove and complete its whole chain.
+        """
+        try:
+            owner = UUID(job_id)
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn, conn.transaction():
+            tentative = await conn.fetchrow(
+                "SELECT a.pvc_uid FROM vm_job_cancel_retention_authorities a "
+                "WHERE a.job_id=$1 AND a.policy_version=4 LIMIT 1",
+                owner,
+            )
+            marker = await conn.fetchval(
+                "SELECT context->'_job_terminal_vm_cleanup'->>'retention_policy' "
+                "FROM jobs WHERE id=$1",
+                owner,
+            )
+            if tentative is None and marker != "4":
+                return None
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                f"workspace-recovery:job:{owner}",
+            )
+            if tentative is None:
+                return False
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                f"workspace-recovery-pvc:{tentative['pvc_uid']}",
+            )
+            await conn.fetchrow(
+                "SELECT unit_id FROM run_queue WHERE unit_id=$1 FOR UPDATE", owner
+            )
+            job = await conn.fetchrow(
+                "SELECT * FROM jobs WHERE id=$1 FOR UPDATE", owner
+            )
+            authority = await conn.fetchrow(
+                "SELECT * FROM vm_job_cancel_retention_authorities "
+                "WHERE job_id=$1 AND policy_version=4",
+                owner,
+            )
+            if job is None or authority is None:
+                return False
+            context = job["context"]
+            if isinstance(context, str):
+                context = json.loads(context)
+            vm = context.get("vm") if isinstance(context, dict) else None
+            if (
+                job["execution_lane"] != "pinned"
+                or job["status"] != "cancelled"
+                or job["assigned_agent_id"] is not None
+                or job["parent_job_id"] is not None
+                or not isinstance(vm, dict)
+                or context.get("_job_terminal_vm_cleanup") is not None
+                or vm.get("provision_generation")
+                != str(authority["provision_generation"])
+                or vm.get("vm_uid") != str(authority["vm_uid"])
+                or vm.get("rootdisk_pvc_uid") != str(authority["pvc_uid"])
+                or vm.get("compute_released") is not True
+                or vm.get("disk_kept") is not True
+                or not await conn.fetchval(
+                    "SELECT public.vm_job_cancel_retention_settled($1)",
+                    authority["cleanup_admission_id"],
+                )
+            ):
+                return False
+            if await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases WHERE "
+                "owner_kind='job' AND owner_id=$1 AND closed_at IS NULL "
+                "AND expires_at>clock_timestamp())",
+                owner,
+            ):
+                return False
+            return (
+                await conn.execute(
+                    "UPDATE jobs SET context=jsonb_set(context,"
+                    "'{_pinned_retained_delete_pending}','true'::jsonb,true) "
+                    "WHERE id=$1 AND execution_lane='pinned' AND status='cancelled'",
+                    owner,
+                )
+                == "UPDATE 1"
+            )
+
+    async def pinned_ready_cancel_retention_held(self, job_id: str) -> bool:
+        """Recognize a pending or active policy-4 fence before any Resume work."""
+        try:
+            owner = UUID(job_id)
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM jobs j WHERE j.id=$1 AND ("
+                    "j.context->'_job_terminal_vm_cleanup'->>'retention_policy'='4' "
+                    "OR EXISTS(SELECT 1 FROM vm_job_cancel_retention_authorities a "
+                    "WHERE a.job_id=j.id AND a.policy_version=4 AND NOT "
+                    "public.vm_job_cancel_retention_discharged(a.cleanup_admission_id))))",
+                    owner,
+                )
+            )
 
     async def prepare_stateless_job_for_delete(self, job_id: str) -> bool:
         """Fence a stateless worker and prune its checkpoint before row deletion.
@@ -13261,6 +13436,10 @@ class PostgresDB:
             "    updated_at = CURRENT_TIMESTAMP "
             "WHERE id = $1 "
             "AND ($2::text <> 'vm' OR NOT (COALESCE(context, '{}'::jsonb) ? '_vm_creation_pending'))"
+            " AND COALESCE(context->'_job_terminal_vm_cleanup'->>'retention_policy','') <> '4'"
+            " AND NOT EXISTS (SELECT 1 FROM vm_job_cancel_retention_authorities a "
+            "WHERE a.job_id=jobs.id AND a.policy_version=4 AND NOT "
+            "public.vm_job_cancel_retention_discharged(a.cleanup_admission_id))"
             f" AND ($2::text <> 'workspace_container' OR {container_recovery_resume_allowed_sql('context')})"
             f" AND NOT {worker_execution_held_sql('context')}"
         )
@@ -35330,6 +35509,12 @@ class PostgresDB:
         retirement_guard = (
             " AND COALESCE(context->'vm'->>'retirement_cleanup_pending', '') <> 'true'"
         )
+        pinned_retention_guard = (
+            " AND COALESCE(context->'_job_terminal_vm_cleanup'->>'retention_policy','') <> '4'"
+            " AND NOT EXISTS (SELECT 1 FROM vm_job_cancel_retention_authorities a "
+            "WHERE a.job_id=jobs.id AND a.policy_version=4 AND NOT "
+            "public.vm_job_cancel_retention_discharged(a.cleanup_admission_id))"
+        )
         context_base = "COALESCE(context, '{}'::jsonb)"
         hold_guard = ""
         if lift_operator_pause_hold is not None:
@@ -35365,7 +35550,7 @@ class PostgresDB:
                    freeze_data = NULL,
                    {idle_exit}
                    updated_at = CURRENT_TIMESTAMP
-             WHERE id = $1{lane_guard}{lifecycle_guard}{status_guard}{route_guard}{completion_guard}{control_guard}{trip_guard}{retirement_guard}{hold_guard}
+             WHERE id = $1{lane_guard}{lifecycle_guard}{status_guard}{route_guard}{completion_guard}{control_guard}{trip_guard}{retirement_guard}{pinned_retention_guard}{hold_guard}
                AND (jobs.execution_lane <> 'pinned' OR NOT EXISTS (
                    SELECT 1 FROM vm_idle_operations idle
                    WHERE idle.owner_kind='job' AND idle.owner_id=jobs.id
@@ -36070,6 +36255,10 @@ class PostgresDB:
                           AND execution_lane='pinned'
                           AND status::text=$3::text
                           AND ($2::text <> 'vm' OR NOT (COALESCE(context, '{{}}'::jsonb) ? '_vm_creation_pending'))
+                          AND COALESCE(context->'_job_terminal_vm_cleanup'->>'retention_policy','') <> '4'
+                          AND NOT EXISTS (SELECT 1 FROM vm_job_cancel_retention_authorities a
+                              WHERE a.job_id=jobs.id AND a.policy_version=4 AND NOT
+                              public.vm_job_cancel_retention_discharged(a.cleanup_admission_id))
                           AND ({_completion_control_owned_active_sql("context", "$4")})
                           AND ($2::text <> 'workspace_container' OR {container_recovery_resume_allowed_sql("context")})
                           AND NOT {worker_execution_held_sql("context")}

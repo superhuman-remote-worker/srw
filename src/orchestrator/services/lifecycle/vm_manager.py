@@ -1177,6 +1177,10 @@ class VMInstanceManager:
                         WHERE status = ANY($1::text[])
                           AND context->'vm'->>'rootdisk' = 'kept'
                           AND execution_lane IS DISTINCT FROM 'stateless'
+                          AND COALESCE(context->'_job_terminal_vm_cleanup'->>'retention_policy','') <> '4'
+                          AND NOT EXISTS (SELECT 1 FROM vm_job_cancel_retention_authorities a
+                              WHERE a.job_id=jobs.id AND a.policy_version=4 AND NOT
+                              public.vm_job_cancel_retention_discharged(a.cleanup_admission_id))
                           AND NOT EXISTS (SELECT 1 FROM vm_idle_operations retained
                               WHERE retained.owner_kind='job' AND retained.owner_id=jobs.id
                                 AND retained.provision_generation::text=jobs.context->'vm'->>'provision_generation'
@@ -1196,6 +1200,10 @@ class VMInstanceManager:
                         WHERE status = ANY($1::text[])
                           AND context->'vm'->>'rootdisk' = 'kept'
                           AND execution_lane IS DISTINCT FROM 'stateless'
+                          AND COALESCE(context->'_job_terminal_vm_cleanup'->>'retention_policy','') <> '4'
+                          AND NOT EXISTS (SELECT 1 FROM vm_job_cancel_retention_authorities a
+                              WHERE a.job_id=jobs.id AND a.policy_version=4 AND NOT
+                              public.vm_job_cancel_retention_discharged(a.cleanup_admission_id))
                           AND NOT EXISTS (SELECT 1 FROM vm_idle_operations retained
                               WHERE retained.owner_kind='job' AND retained.owner_id=jobs.id
                                 AND retained.provision_generation::text=jobs.context->'vm'->>'provision_generation'
@@ -1346,6 +1354,17 @@ class VMInstanceManager:
         permit: LifecycleActionPermit | None = None,
     ) -> Any | None:
         """Serialize an exact VM delete/prune before controller side effects."""
+
+        pinned_retention_held = getattr(
+            type(self._db), "pinned_ready_cancel_retention_held", None
+        )
+        if (
+            purge_disk
+            and owner_kind == "job"
+            and pinned_retention_held
+            and await pinned_retention_held(self._db, owner_id)
+        ):
+            return None
 
         if purge_disk and owner_kind == "job":
             from orchestrator.services.vm_idle_lifecycle import (
