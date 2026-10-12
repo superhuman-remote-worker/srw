@@ -63,6 +63,18 @@ spec:
           enabled: true
           max_concurrent: 2
 
+        # No workspace means no read_file: the worker overlay's read-before-tool
+        # gates (todo-guide before next_phase_todos, verify-before-done before
+        # todo_complete/job_complete) could never open, and the job could not
+        # finish. Keep only the phase skills, which arrive as messages.
+        instruction_files:
+          - skill: strategic-phase
+            trigger: phase_start:strategic
+            enforce: false
+          - skill: tactical-phase
+            trigger: phase_start:tactical
+            enforce: false
+
         subagents:
           default: phone
           roster:

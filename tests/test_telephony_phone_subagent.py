@@ -524,3 +524,38 @@ class TestBackfillFollowUps:
         report = runtime._background[handle].envelope
         assert "[follow_up] Bitte rufen Sie mich zurück." in report
         await runtime.close()
+
+
+class TestRequestText:
+    def test_the_request_is_the_callers_last_stretch_before_the_delegation(self):
+        from unittest.mock import MagicMock
+
+        from agent.subagents.phone import PhoneDriver
+
+        settings = PhoneCallSettings.from_config(
+            {"telephony": {"call_id": "c", "session_id": "s", "api_key": "k"}}
+        )
+        driver = PhoneDriver(
+            settings,
+            handle="phone-1",
+            subagent_type="phone",
+            subagent_id="x",
+            record=FakeRecord(),
+            client=MagicMock(),
+        )
+        for speaker, text in [
+            ("assistant", "Guten Tag."),
+            ("caller", "Haben Sie ein Schwimmbad?"),
+            ("assistant", "Ja, ein Solebad."),
+            ("caller", "Ich bin krank. "),
+            ("caller", "Ich muss den Termin am Dienstag absagen."),
+            ("assistant", "Einen Moment bitte."),
+        ]:
+            driver.transcript.add(speaker, text)
+        assert (
+            driver._request_upto(None)
+            == "Ich bin krank. Ich muss den Termin am Dienstag absagen."
+        )
+        # The next delegation only looks at what was said after this one.
+        driver.transcript.add("caller", "Und wann ist Abreise?")
+        assert driver._request_upto(None) == "Und wann ist Abreise?"

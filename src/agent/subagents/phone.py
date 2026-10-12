@@ -622,14 +622,19 @@ class PhoneDriver:
         """What the caller said since the previous delegation (advances the mark)."""
 
         end = len(self.transcript.turns) if upto_turn is None else upto_turn
-        request = (
-            " ".join(
-                t.text.strip()
-                for t in self.transcript.turns[self._last_delegation_turn : end]
-                if t.speaker == "caller" and t.text.strip()
-            )
-            or self.transcript.last_caller_text()
-        )
+        turns = self.transcript.turns[self._last_delegation_turn : end]
+        # The caller's last stretch of speech before the delegation: skip the
+        # voice's holding phrase, then take caller turns back to the voice's
+        # previous reply (earlier questions the voice already answered are
+        # not part of this request; the transcript tail still shows them).
+        index = len(turns) - 1
+        while index >= 0 and turns[index].speaker != "caller":
+            index -= 1
+        block: List[str] = []
+        while index >= 0 and turns[index].speaker == "caller":
+            block.insert(0, turns[index].text.strip())
+            index -= 1
+        request = " ".join(t for t in block if t) or self.transcript.last_caller_text()
         self._last_delegation_turn = end
         return request
 
