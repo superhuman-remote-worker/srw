@@ -486,7 +486,11 @@ jobs:
   test-python-shards:
     needs: [lint]
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 45 like develop's shards (915f29699). main always runs the whole suite:
+    # on PR #143, shard 0 was cancelled at the former 25 minutes, after 22.9
+    # minutes of test time on develop's full run of the same tree; develop's
+    # full shards have taken 25-31 minutes.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
