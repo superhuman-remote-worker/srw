@@ -108,11 +108,12 @@ async def play(args: argparse.Namespace) -> int:
             _step("FAIL: the job never attached")
             failures += 1
 
-        await fake.say(
-            session_id,
-            "caller",
-            "Ich bin krank und muss meinen Termin am Dienstag absagen. Mein Name ist Erika Muster.",
+        request = (
+            "Ich möchte bitte mit einem Menschen sprechen."
+            if args.scenario == "human"
+            else "Ich bin krank und muss meinen Termin am Dienstag absagen. Mein Name ist Erika Muster."
         )
+        await fake.say(session_id, "caller", request)
         await fake.say(
             session_id, "assistant", "Einen Moment, ich gebe das an unser Büro weiter."
         )
@@ -138,6 +139,16 @@ async def play(args: argparse.Namespace) -> int:
         except asyncio.TimeoutError:
             _step("FAIL: no answer for the delegation")
             failures += 1
+        if args.scenario == "human":
+            # A6: the back office hands the caller to the line's human.
+            try:
+                await fake.wait_until(
+                    session_id, lambda s: s.refer_target is not None, timeout=60
+                )
+                _step(f"transferred to {fake.session(session_id).refer_target}")
+            except asyncio.TimeoutError:
+                _step("FAIL: the call was not transferred")
+                failures += 1
 
         await fake.say(
             session_id, "assistant", "Alles klar, ich habe das weitergegeben."
@@ -167,6 +178,12 @@ def main() -> int:
         help="Host/IP the cluster uses to reach this machine",
     )
     parser.add_argument("--port", type=int, default=18440)
+    parser.add_argument(
+        "--scenario",
+        choices=("cancel", "human"),
+        default="cancel",
+        help="cancel: cancel an appointment (A3); human: ask for a person (A6)",
+    )
     parser.add_argument("--webhook-secret", required=True)
     parser.add_argument("--api-key", default="sk-fake-gpt-live")
     parser.add_argument("--to-number", default="+4960521829990")
