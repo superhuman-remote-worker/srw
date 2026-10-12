@@ -1,0 +1,7 @@
+# Formatting-only commits that git blame skips. GitHub reads this file
+# automatically; locally: git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# A rebase rewrites these hashes: update this file if one of them is rebased.
+
+# style: format the 163 files develop's auto-format bot never pushed
+f3d40eabc13a536386c5f1d4651c12f950b30760
