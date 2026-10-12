@@ -374,3 +374,108 @@ class TestPhoneSubagent:
         result = await runtime.message_agent("explorer-0000", "x", reply_to="item_1")
         assert result["result"] in {"invalid", "not_found"}
         await runtime.close()
+
+
+class TestPhoneJob:
+    """P4: a phone-mode job starts with its call attached as the phone subagent."""
+
+    @pytest.mark.asyncio
+    async def test_attach_job_call_seeds_a_delegate_exchange(
+        self, tmp_path, fake, record
+    ):
+        from langchain_core.messages import AIMessage, ToolMessage
+
+        from agent.subagents.phone import attach_job_call
+
+        session_id = await accepted_call(fake)
+        ctx = parent_with_call(tmp_path, fake, session_id)
+        runtime = runtime_for(ctx, ledger=StrictLedger())
+        exchange = await attach_job_call(ctx)
+        assert isinstance(exchange[0], AIMessage) and isinstance(
+            exchange[1], ToolMessage
+        )
+        call_ = exchange[0].tool_calls[0]
+        assert call_["name"] == "delegate_agent"
+        assert (
+            call_["args"]["subagent_type"] == "phone"
+            and call_["args"]["run_in_background"] is True
+        )
+        assert exchange[1].tool_call_id == call_["id"]
+        assert "queued" in exchange[1].content
+        await wait_attached(fake, session_id)
+        # The call's questions now reach the parent through wait_agent.
+        await fake.say(session_id, "caller", "Wann ist mein Termin?")
+        await fake.delegate(session_id)
+        handle = exchange[1].content.split("[subagent ", 1)[1].split(" ", 1)[0]
+        assert (await runtime.wait_agent(handle, 10))["result"] == "question"
+        await fake.remote_hangup(session_id)
+        await runtime.wait_agent(handle, 10)
+        await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_other_jobs_are_untouched(self, tmp_path):
+        from agent.subagents.phone import attach_job_call
+
+        ctx, _ = make_parent(tmp_path)
+        assert await attach_job_call(ctx) is None
+
+    def test_init_node_appends_the_exchange_after_the_task(self, tmp_path):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+        from agent.graph import create_init_strategic_todos_node
+
+        workspace = MagicMock()
+        workspace.read_file.side_effect = (
+            lambda name: "Phone call on line Empfang."
+            if name == "task_brief.md"
+            else ""
+        )
+        todo = MagicMock()
+        todo.format_for_injection.return_value = ""
+        exchange = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "delegate_agent",
+                        "args": {},
+                        "id": "call_phone_1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content="[subagent phone-ab12 · phone · queued]",
+                tool_call_id="call_phone_1",
+            ),
+        ]
+        tool_context = SimpleNamespace(_initial_tool_exchange=exchange)
+        config = MagicMock()
+        config.agent_id = "phone-desk"
+        node = create_init_strategic_todos_node(
+            workspace, todo, config, tool_context=tool_context
+        )
+        import agent.graph as graph_mod
+
+        original = graph_mod.get_initial_strategic_todos
+        graph_mod.get_initial_strategic_todos = lambda *a, **k: []
+        try:
+            result = node({"job_id": "j"})
+        finally:
+            graph_mod.get_initial_strategic_todos = original
+        assert isinstance(result["messages"][0], HumanMessage)
+        assert result["messages"][1:] == exchange
+        assert tool_context._initial_tool_exchange is None
+
+    def test_phone_desk_expert(self):
+        from shared.runtime.core.loader import load_agent_config
+
+        cfg = load_agent_config("config/experts/phone-desk/config.yaml")
+        assert cfg.delegation.enabled is True
+        assert is_phone_entry(cfg.subagents.roster["phone"])
+        assert {"wait_agent", "message_agent", "delegate_agent"} <= set(
+            cfg.tools.delegation
+        )

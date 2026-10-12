@@ -1,0 +1,34 @@
+# Strategic todos for a phone call job (phone-desk).
+#
+# The call is already connected when the job starts: the history begins with
+# the delegate_agent call that attached it as the background subagent `phone`
+# and its receipt (handle in the receipt). The first todo IS the call.
+todos:
+  - id: 1
+    content: >-
+      HANDLE THE LIVE CALL. The phone subagent is already attached (see the
+      delegate_agent call and its receipt above; its handle starts with "phone-").
+      Loop: call wait_agent(handle, timeout_s=600).
+      - result "question": answer it at once with
+        message_agent(handle, message=<what the voice should tell the caller>,
+        reply_to=<question.delegation_id>). Look things up or act with your
+        tools first if needed (knowledge base, datasources), but answer before
+        answer_by; send a holding message first if you need longer.
+      - result "timeout": the call is still running; wait again.
+      - result "ready" (or the call's report arrives): the call has ended.
+      COMPLETION CRITERIA: the phone subagent has ended and you have its final
+      report (transcript, questions, follow-ups).
+      INSTEAD OF: planning, exploring or writing files while the call is live —
+      the caller is waiting.
+
+  - id: 2
+    content: >-
+      PLAN THE FOLLOW-UPS with next_phase_todos. Read the call's final report.
+      Create one execution todo per request or follow-up the caller made that
+      still needs action (for example "cancel the appointment on Tuesday for
+      <name> in the appointments datasource", "note the callback request for
+      <topic>"), naming the exact tool and data. If nothing needs action,
+      create a single todo to verify that every question in the report was
+      answered.
+      COMPLETION CRITERIA: next_phase_todos called with todos covering every
+      open request from the call.

@@ -815,3 +815,74 @@ class PhoneDriver:
             if status != "error"
             else (self.attach_error or "the call ended without a close event"),
         )
+
+
+async def attach_job_call(context: Any) -> Optional[List[Any]]:
+    """Start the job's call as its phone subagent; return the history to seed.
+
+    A phone-mode job (``config.telephony`` set at dispatch) is born with its
+    call already connected. The agent sees the call as something it started
+    itself: a ``delegate_agent`` call to the roster's phone entry plus the
+    receipt, appended after the task message (model-natural). Returns ``None``
+    for every other job, and when the job has no phone roster entry or no
+    subagent runtime (logged: the recorder then covers the call alone).
+    """
+
+    config = getattr(context, "config", None) or {}
+    telephony = config.get("telephony") if isinstance(config, Mapping) else None
+    if not isinstance(telephony, Mapping) or not telephony.get("session_id"):
+        return None
+    runtime = getattr(context, "subagent_runtime", None)
+    if runtime is None:
+        logger.error(
+            "phone job without a subagent runtime: the call stays with the recorder"
+        )
+        return None
+    name = next((n for n, e in runtime.roster.items() if is_phone_entry(e)), None)
+    if name is None:
+        logger.error(
+            "phone job whose expert has no phone roster entry: the call stays with the recorder"
+        )
+        return None
+
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    from agent.subagents.runtime import SubagentCall
+
+    call_id = str(telephony.get("call_id") or "")
+    line = telephony.get("line") if isinstance(telephony.get("line"), Mapping) else {}
+    tool_call_id = f"call_phone_{(call_id or uuid.uuid4().hex).replace('-', '')[:24]}"
+    args = {
+        "description": f"Live phone call{' on ' + str(line.get('name')) if line.get('name') else ''}",
+        "prompt": (
+            "Attach to the live phone call and hand me every question the voice "
+            "assistant delegates; report the transcript and follow-ups when it ends."
+        ),
+        "subagent_type": name,
+        "run_in_background": True,
+    }
+    receipt = await runtime.run_background(
+        SubagentCall(
+            tool_call_id=tool_call_id,
+            subagent_type=name,
+            prompt=args["prompt"],
+            description=args["description"],
+            run_in_background=True,
+        )
+    )
+    return [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "delegate_agent",
+                    "args": args,
+                    "id": tool_call_id,
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(
+            content=str(receipt), tool_call_id=tool_call_id, name="delegate_agent"
+        ),
+    ]

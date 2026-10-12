@@ -1390,6 +1390,8 @@ class UniversalAgent:
                     await self._recover_subagent_orphans()
                     if worker_terminal_state is not None:
                         return worker_terminal_state
+                    if graph_input is not None:
+                        await self._attach_job_call()
                     final_state = await self._graph.ainvoke(
                         graph_input,
                         config=thread_config,
@@ -2282,6 +2284,32 @@ class UniversalAgent:
             ) from exc
         self._subagent_recovered_runtime = runtime
 
+    async def _attach_job_call(self) -> None:
+        """A phone-mode job: start its live call as the ``phone`` subagent.
+
+        Fresh starts only (a resumed job's call child was settled by orphan
+        recovery; the orchestrator's recorder covers the call meanwhile). The
+        resulting ``delegate_agent`` exchange is seeded into the history by
+        ``init_strategic_todos``.
+        """
+
+        context = getattr(self, "_tool_context", None)
+        if context is None:
+            return
+        from agent.subagents.phone import attach_job_call
+
+        try:
+            exchange = await attach_job_call(context)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "[%s] could not attach the phone call; the recorder covers it",
+                self._current_job_id,
+            )
+            return
+        context._initial_tool_exchange = exchange
+
     async def _quiesce_subagent_runtime(self, reason: str) -> None:
         """Settle a claim's children once while parent authority is current."""
 
@@ -2602,6 +2630,8 @@ class UniversalAgent:
             # resumed checkpoint may enter directly at a provider/tool node and
             # cannot be allowed to race predecessor child generations.
             await self._recover_subagent_orphans()
+            if graph_input is not None:
+                await self._attach_job_call()
             # At most one in-process upgrade per run: virtual → sandbox flips the
             # backend to supports_shell=True, after which the request tool drops
             # out and the supports_shell guard below short-circuits anyway.
