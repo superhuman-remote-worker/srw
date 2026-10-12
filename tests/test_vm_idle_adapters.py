@@ -32,8 +32,10 @@ async def test_authorized_ide_start_requests_access_only_idle_wake(db, monkeypat
         monkeypatch.setenv(key, value)
     owner, episode, identity = await seed_wait(db)
     operation = await VMIdleLifecycleStore(db).admit_release(
-        str(owner), episode_id=episode.episode_id,
-        revision=episode.revision, identity=identity,
+        str(owner),
+        episode_id=episode.episode_id,
+        revision=episode.revision,
+        identity=identity,
     )
     assert operation
     # Disabling new idle releases must not strand an existing access-only wake.
@@ -62,19 +64,31 @@ async def test_authorized_ide_start_requests_access_only_idle_wake(db, monkeypat
     assert lease["owner_kind"] == "job" and lease["owner_id"] == owner
     assert lease["kind"] == "ide" and lease["wake_id"] is not None
     assert lease["wake_id"] == await db.fetchval(
-        "SELECT wake_id FROM vm_idle_operations WHERE id=$1", operation["id"],
+        "SELECT wake_id FROM vm_idle_operations WHERE id=$1",
+        operation["id"],
     )
     assert lease["claimed_by"].startswith(user_id + ":")
     assert lease["closed_at"] is None
-    assert await db.fetchval(
-        "SELECT wake_execution_requested FROM vm_idle_operations WHERE id=$1",
-        operation["id"],
-    ) is False
-    assert await db.fetchval(
-        "SELECT state FROM run_queue WHERE unit_id=$1", owner,
-    ) == "done"
-    assert await db.fetchval(
-        "SELECT status FROM jobs WHERE id=$1", owner,
-    ) == "waiting_for_reply"
+    assert (
+        await db.fetchval(
+            "SELECT wake_execution_requested FROM vm_idle_operations WHERE id=$1",
+            operation["id"],
+        )
+        is False
+    )
+    assert (
+        await db.fetchval(
+            "SELECT state FROM run_queue WHERE unit_id=$1",
+            owner,
+        )
+        == "done"
+    )
+    assert (
+        await db.fetchval(
+            "SELECT status FROM jobs WHERE id=$1",
+            owner,
+        )
+        == "waiting_for_reply"
+    )
     transport.start_and_probe.assert_not_awaited()
     ide_sessions.start_session.assert_not_awaited()

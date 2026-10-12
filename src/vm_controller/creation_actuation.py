@@ -711,7 +711,8 @@ class CreationActuator:
                     "thread_attach_token": row["thread_attach_token"],
                     "thread_wake_operation_id": row["thread_wake_operation_id"],
                 }
-                if row.get("owner_kind") == "thread" else {}
+                if row.get("owner_kind") == "thread"
+                else {}
             ),
             "provision_generation": row["provision_generation"],
             "request_digest": row["request_digest"],
@@ -862,8 +863,10 @@ class CreationActuator:
             raise CreationUnproven("creation_object_name_changed")
         metadata["namespace"] = self.namespace
         metadata.setdefault("labels", {}).update(
-            {"srw.io/owner-kind": row.get("owner_kind", "job"),
-             "srw.io/owner-id": row["job_id"]}
+            {
+                "srw.io/owner-kind": row.get("owner_kind", "job"),
+                "srw.io/owner-id": row["job_id"],
+            }
         )
         metadata.setdefault("annotations", {}).update(
             {
@@ -1282,7 +1285,9 @@ class CreationActuator:
                         ) from None
                 if "resource_grant" in values:
                     from shared.vm_resource_admission import ResourceAdmissionError
-                    from shared.vm_resource_effect_node import targeted_resource_effect_node
+                    from shared.vm_resource_effect_node import (
+                        targeted_resource_effect_node,
+                    )
 
                     try:
                         _mark_creation_stage("resource_node")

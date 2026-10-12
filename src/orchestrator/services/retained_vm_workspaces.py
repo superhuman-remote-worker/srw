@@ -142,7 +142,9 @@ async def reserve(db, snapshot):
         )
         from shared.vm_network_profile import selected_profile
 
-        from orchestrator.services.manifest_execution_snapshot import srw_snapshot_config
+        from orchestrator.services.manifest_execution_snapshot import (
+            srw_snapshot_config,
+        )
 
         _, policy = srw_snapshot_config(snapshot)
         vm_options = (policy.get("workspace") or {}).get("vm") or {}
@@ -160,7 +162,12 @@ async def reserve(db, snapshot):
             content_revision(recipe),
             storage_name(binding),
             snapshot["id"],
-            json.dumps({"storage": binding, **({"network_profile": network_profile} if network_profile else {})}),
+            json.dumps(
+                {
+                    "storage": binding,
+                    **({"network_profile": network_profile} if network_profile else {}),
+                }
+            ),
         )
     await db.execute(
         "INSERT INTO srw_execution_workspace_bindings(execution_id,instance_id) VALUES($1,$2)",

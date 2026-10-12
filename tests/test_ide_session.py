@@ -741,12 +741,13 @@ async def test_first_repo_ide_restore_uses_atomic_attempt_receipt(
 
     assert result["status"] == "restoring"
     svc._db.begin_managed_ide_restore_attempt.assert_awaited_once()
-    assert svc._db.begin_managed_ide_restore_attempt.await_args.kwargs[
-        "desired_manifest_digest"
-    ] == "a" * 64
     assert (
-        svc._restore_session.await_args.kwargs["creation_reservation"] == reservation
+        svc._db.begin_managed_ide_restore_attempt.await_args.kwargs[
+            "desired_manifest_digest"
+        ]
+        == "a" * 64
     )
+    assert svc._restore_session.await_args.kwargs["creation_reservation"] == reservation
     svc._db.merge_ide_session_context.assert_not_awaited()
 
 
@@ -760,15 +761,20 @@ async def test_stop_uidless_ide_restore_cancels_exact_attempt(
 ):
     svc = service_factory
     attempt_id = "44444444-4444-4444-8444-444444444444"
-    svc._db.get_job = AsyncMock(return_value={
-        "id": "job-uidless-stop",
-        "context": {"ide_session": {
-            "status": "restoring", "restore_type": "k8s_container",
-            "_restore_attempt_id": attempt_id,
-            "_creation_reservation_id": IDE_RESERVATION,
-            "_creation_claim_token": str(IDE_CLAIM_TOKEN),
-        }},
-    })
+    svc._db.get_job = AsyncMock(
+        return_value={
+            "id": "job-uidless-stop",
+            "context": {
+                "ide_session": {
+                    "status": "restoring",
+                    "restore_type": "k8s_container",
+                    "_restore_attempt_id": attempt_id,
+                    "_creation_reservation_id": IDE_RESERVATION,
+                    "_creation_claim_token": str(IDE_CLAIM_TOKEN),
+                }
+            },
+        }
+    )
     svc._container_provisioner.cancel_ide_restore_attempt = AsyncMock(
         return_value={"reconciliation_outcome": outcome}
     )
@@ -794,23 +800,35 @@ async def test_post_after_exact_uidless_abort_admits_new_ide_attempt(
 ):
     svc = service_factory
     svc.get_session_status = AsyncMock(return_value={"status": "available"})
-    svc._db.get_job = AsyncMock(return_value={
-        "id": "job-after-zero-abort", "repo_name": "demo/repo",
-        "context": {"ide_session": {
-            "status": "expired", "restore_type": "k8s_container",
-            "source": "gitea", "snapshot_type": "gitea",
-            "_restore_attempt_id": "44444444-4444-4444-8444-444444444444",
-        }},
-    })
+    svc._db.get_job = AsyncMock(
+        return_value={
+            "id": "job-after-zero-abort",
+            "repo_name": "demo/repo",
+            "context": {
+                "ide_session": {
+                    "status": "expired",
+                    "restore_type": "k8s_container",
+                    "source": "gitea",
+                    "snapshot_type": "gitea",
+                    "_restore_attempt_id": "44444444-4444-4444-8444-444444444444",
+                }
+            },
+        }
+    )
     svc._container_provisioner._ide_creation_plan = AsyncMock(
         return_value={"digest": "a" * 64}
     )
-    svc._db.begin_managed_ide_restore_attempt = AsyncMock(return_value={
-        "disposition": "accepted", "reservation": {
-            "id": IDE_RESERVATION, "claim_token": IDE_CLAIM_TOKEN,
-            "reservation_generation": 2, "desired_manifest_digest": "a" * 64,
+    svc._db.begin_managed_ide_restore_attempt = AsyncMock(
+        return_value={
+            "disposition": "accepted",
+            "reservation": {
+                "id": IDE_RESERVATION,
+                "claim_token": IDE_CLAIM_TOKEN,
+                "reservation_generation": 2,
+                "desired_manifest_digest": "a" * 64,
+            },
         }
-    })
+    )
     svc._restore_session = AsyncMock()
 
     result = await svc.start_session("job-after-zero-abort")
@@ -818,7 +836,10 @@ async def test_post_after_exact_uidless_abort_admits_new_ide_attempt(
 
     assert result["status"] == "restoring"
     svc._db.begin_managed_ide_restore_attempt.assert_awaited_once()
-    assert svc._restore_session.await_args.kwargs["creation_reservation"]["id"] == IDE_RESERVATION
+    assert (
+        svc._restore_session.await_args.kwargs["creation_reservation"]["id"]
+        == IDE_RESERVATION
+    )
 
 
 @pytest.mark.asyncio
@@ -826,12 +847,19 @@ async def test_concurrent_ide_post_loser_reports_winners_restoring_state(
     service_factory, browser_ide_transport_available
 ):
     svc = service_factory
-    svc.get_session_status = AsyncMock(side_effect=[
-        {"status": "available"}, {"status": "restoring", "estimated_seconds": 45},
-    ])
-    svc._db.get_job = AsyncMock(return_value={
-        "id": "job-concurrent-post", "repo_name": "demo/repo", "context": {},
-    })
+    svc.get_session_status = AsyncMock(
+        side_effect=[
+            {"status": "available"},
+            {"status": "restoring", "estimated_seconds": 45},
+        ]
+    )
+    svc._db.get_job = AsyncMock(
+        return_value={
+            "id": "job-concurrent-post",
+            "repo_name": "demo/repo",
+            "context": {},
+        }
+    )
     svc._container_provisioner._ide_creation_plan = AsyncMock(
         return_value={"digest": "a" * 64}
     )

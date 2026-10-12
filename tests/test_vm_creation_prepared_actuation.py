@@ -152,7 +152,10 @@ async def finish_prepared(prepared):
         # A lost VM reply must remain visible to the caller before adoption.
         if "VirtualMachine" in api.writes:
             return result
-        if authority.row["effects"] and authority.row["effects"][-1]["state"] == "issued":
+        if (
+            authority.row["effects"]
+            and authority.row["effects"][-1]["state"] == "issued"
+        ):
             return result
     raise AssertionError("Prepared source did not finish")
 

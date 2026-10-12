@@ -96,7 +96,10 @@ async def test_cancelled_disposition_guard_protects_network_profile_even_without
     _, _, _, disposition = await frozen_attachment(db, attached)
     uid = UUID(disposition["workspace_instance_id"])
     async with db.acquire() as conn:
-        with pytest.raises(asyncpg.CheckViolationError, match="Creation disposition instance remains held"):
+        with pytest.raises(
+            asyncpg.CheckViolationError,
+            match="Creation disposition instance remains held",
+        ):
             async with conn.transaction():
                 # Isolate the deferred disposition guard: the ordinary BEFORE
                 # trigger independently rejects this legacy upgrade.
@@ -105,10 +108,14 @@ async def test_cancelled_disposition_guard_protects_network_profile_even_without
                 )
                 await conn.execute(
                     "UPDATE srw_workspace_instances SET backend_state=backend_state || $2::jsonb WHERE id=$1",
-                    uid, json.dumps({"network_profile": NETWORK_PROFILE}),
+                    uid,
+                    json.dumps({"network_profile": NETWORK_PROFILE}),
                 )
                 await conn.execute("SET CONSTRAINTS ALL IMMEDIATE")
-    assert await db.fetchval(
-        "SELECT backend_state->'network_profile' FROM srw_workspace_instances WHERE id=$1",
-        uid,
-    ) is None
+    assert (
+        await db.fetchval(
+            "SELECT backend_state->'network_profile' FROM srw_workspace_instances WHERE id=$1",
+            uid,
+        )
+        is None
+    )

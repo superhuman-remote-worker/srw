@@ -146,7 +146,9 @@ async def inherited(db, *, length=2, network_profile=False, original_profile=Tru
                 }
             )
             if network_profile:
-                from orchestrator.services.vm_creation_request import build_vm_creation_request
+                from orchestrator.services.vm_creation_request import (
+                    build_vm_creation_request,
+                )
                 from shared.vm_creation_retry import canonical_request_digest
 
                 prior_storage = {
@@ -155,12 +157,20 @@ async def inherited(db, *, length=2, network_profile=False, original_profile=Tru
                     "pvc_uid": None if number == 1 else binding["pvc_uid"],
                 }
                 prior_request = build_vm_creation_request(
-                    job_id=str(job), provision_generation=generation,
-                    agent_config="worker_base", vm_image="registry.example/srw-vm@sha256:" + "a" * 64,
-                    cpu_cores=2, memory="2Gi", description="initial",
-                    network_tier="restricted", workspace_storage=prior_storage,
-                    **({"network_profile": NETWORK_PROFILE}
-                       if number != 1 or original_profile else {}),
+                    job_id=str(job),
+                    provision_generation=generation,
+                    agent_config="worker_base",
+                    vm_image="registry.example/srw-vm@sha256:" + "a" * 64,
+                    cpu_cores=2,
+                    memory="2Gi",
+                    description="initial",
+                    network_tier="restricted",
+                    workspace_storage=prior_storage,
+                    **(
+                        {"network_profile": NETWORK_PROFILE}
+                        if number != 1 or original_profile
+                        else {}
+                    ),
                 )
                 await conn.execute(
                     "INSERT INTO vm_creation_retries "
@@ -169,11 +179,17 @@ async def inherited(db, *, length=2, network_profile=False, original_profile=Tru
                     "admission_deadline,expected_pvc_uid,creation_admission_id,state,observed_vm_uid,observed_pvc_uid,resolved_at) "
                     "VALUES($1,$2,$3,'initial',$4,$5::jsonb,$6,$7,'revision-1',1,"
                     "clock_timestamp()+interval '1 hour',$8,$9,'succeeded',$10,$11,clock_timestamp())",
-                    uuid4(), job, UUID(generation), canonical_request_digest(prior_request),
-                    json.dumps(prior_request), "sha256:" + "a" * 64,
+                    uuid4(),
+                    job,
+                    UUID(generation),
+                    canonical_request_digest(prior_request),
+                    json.dumps(prior_request),
+                    "sha256:" + "a" * 64,
                     previous_execution,
                     None if number == 1 else UUID(binding["pvc_uid"]),
-                    ids[0], UUID(vm_uid), UUID(binding["pvc_uid"]),
+                    ids[0],
+                    UUID(vm_uid),
+                    UUID(binding["pvc_uid"]),
                 )
     return jobs, request, fresh, history
 
@@ -181,19 +197,26 @@ async def inherited(db, *, length=2, network_profile=False, original_profile=Tru
 @pytest.mark.asyncio
 @pytest.mark.parametrize("original_profile", [True, False])
 async def test_profiled_retained_handoff_uses_original_immutable_lineage(
-    db, original_profile,
+    db,
+    original_profile,
 ):
     from shared.vm_network_profile import NETWORK_PROFILE
 
     jobs, request, fresh, _ = await inherited(
-        db, network_profile=True, original_profile=original_profile,
+        db,
+        network_profile=True,
+        original_profile=original_profile,
     )
     store = VMCreationPreflightStore(db)
     if not original_profile:
         with pytest.raises(VMCreationRetryConflict, match="lineage_unproven"):
-            await store.begin(job_id=str(jobs[-1]), request=request, fresh_context=fresh)
+            await store.begin(
+                job_id=str(jobs[-1]), request=request, fresh_context=fresh
+            )
         return
-    frozen = await store.begin(job_id=str(jobs[-1]), request=request, fresh_context=fresh)
+    frozen = await store.begin(
+        job_id=str(jobs[-1]), request=request, fresh_context=fresh
+    )
     assert frozen["request"]["network_profile"] == NETWORK_PROFILE
     assert frozen["request"]["workspace_storage"] == request["workspace_storage"]
     assert "network_profile" not in request
@@ -205,7 +228,9 @@ async def test_profiled_retained_handoff_refuses_changed_original_image(db):
     request["vm_image"] = "registry.example/other@sha256:" + "b" * 64
     with pytest.raises(VMCreationRetryConflict, match="source_changed"):
         await VMCreationPreflightStore(db).begin(
-            job_id=str(jobs[-1]), request=request, fresh_context=fresh,
+            job_id=str(jobs[-1]),
+            request=request,
+            fresh_context=fresh,
         )
 
 
@@ -442,7 +467,9 @@ async def test_inherited_lost_reply_preserves_disk_and_exact_late_adoption(
     assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
     if lost == "vm":
         for _ in range(3):
-            assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+            assert (await ctrl._do_create_serialized(payload))[
+                "status"
+            ] == "creation_pending"
             if "VirtualMachine" in api.writes:
                 break
         assert api.writes.count("VirtualMachine") == 1
@@ -456,7 +483,9 @@ async def test_inherited_lost_reply_preserves_disk_and_exact_late_adoption(
             )
     from tests.test_vm_creation_actuation import poll_until_terminal
 
-    assert (await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5))[
+        "status"
+    ] == "created"
     assert "DataVolume" not in api.writes
     assert api.writes.count("VirtualMachine") == 1
     result = await store.inspect(request_id=str(row["request_id"]))

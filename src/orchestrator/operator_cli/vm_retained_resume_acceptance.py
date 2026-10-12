@@ -29,11 +29,21 @@ OUTPUT_ROOT = Path("/tmp/srw-vm-retained-resume-gate")
 _RUN_ID = re.compile(r"srw-a1-[a-z0-9][a-z0-9-]{2,50}")
 _OWNED_NAME = re.compile(r"srw-a1-[a-z0-9][a-z0-9-]{2,50}")
 _IMMUTABLE_RETRY_FIELDS = (
-    "request_id", "job_id", "provision_generation", "origin",
-    "canonical_request", "request_digest", "controller_configuration_digest",
-    "execution_id", "execution_revision", "execution_generation",
-    "admission_deadline", "expected_pvc_uid", "predecessor_evidence",
-    "predecessor_cleanup_admission_id", "created_at",
+    "request_id",
+    "job_id",
+    "provision_generation",
+    "origin",
+    "canonical_request",
+    "request_digest",
+    "controller_configuration_digest",
+    "execution_id",
+    "execution_revision",
+    "execution_generation",
+    "admission_deadline",
+    "expected_pvc_uid",
+    "predecessor_evidence",
+    "predecessor_cleanup_admission_id",
+    "created_at",
 )
 
 
@@ -60,13 +70,17 @@ def require_execution_guard(values: Mapping[str, Any], env: Mapping[str, str]) -
     if values.get("confirm") != CONFIRMATION or values.get("protocol_version") != 1:
         raise AcceptanceFailure("disposable confirmation or protocol changed")
     run_id, namespace, context = (
-        values.get("run_id"), values.get("namespace"), values.get("context")
+        values.get("run_id"),
+        values.get("namespace"),
+        values.get("context"),
     )
     if (
-        not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id)
+        not isinstance(run_id, str)
+        or not _RUN_ID.fullmatch(run_id)
         or not isinstance(namespace, str)
         or not (_OWNED_NAME.fullmatch(namespace) or namespace == "srw")
-        or not isinstance(context, str) or not _OWNED_NAME.fullmatch(context)
+        or not isinstance(context, str)
+        or not _OWNED_NAME.fullmatch(context)
     ):
         raise AcceptanceFailure("run, namespace or context is not gate-owned")
     _uuid(values.get("job_id"))
@@ -90,18 +104,26 @@ def require_execution_guard(values: Mapping[str, Any], env: Mapping[str, str]) -
 
 
 def validate_fixture_snapshot(
-    job: Mapping[str, Any], user: Mapping[str, Any], queue: Mapping[str, Any],
-    *, run_id: str, expected_owner_id: str, expected_pvc_uid: str,
-    expected_pause_hold_id: str, now: datetime,
+    job: Mapping[str, Any],
+    user: Mapping[str, Any],
+    queue: Mapping[str, Any],
+    *,
+    run_id: str,
+    expected_owner_id: str,
+    expected_pvc_uid: str,
+    expected_pause_hold_id: str,
+    now: datetime,
 ) -> None:
     from orchestrator.operator_cli.vm_retained_resume_pause import (
-        OwnerPauseHoldError, owned_pause_hold_id,
+        OwnerPauseHoldError,
+        owned_pause_hold_id,
     )
 
     context = _object(job.get("context"))
     try:
         owned_pause_hold_id(
-            context, owner_id=expected_owner_id,
+            context,
+            owner_id=expected_owner_id,
             expected_hold_id=expected_pause_hold_id,
         )
     except OwnerPauseHoldError as exc:
@@ -121,10 +143,15 @@ def validate_fixture_snapshot(
         or job.get("assigned_agent_id") is not None
         or context.get("vm_retained_resume_acceptance_gate") != run_id
         or context.get("_vm_creation_pending") is not None
-        or any(context.get(key) is not None for key in (
-            "_workspace_dispatch_authority", "_completion_control_claim",
-            "_stateless_control_claim", "last_operator_pause_hold",
-        ))
+        or any(
+            context.get(key) is not None
+            for key in (
+                "_workspace_dispatch_authority",
+                "_completion_control_claim",
+                "_stateless_control_claim",
+                "last_operator_pause_hold",
+            )
+        )
         or vm.get("status") != "ready"
         or _uuid(vm.get("rootdisk_pvc_uid")) != expected_pvc_uid
         or not isinstance(created, datetime)
@@ -139,8 +166,11 @@ def validate_fixture_snapshot(
 
 
 def validate_retained_retry(
-    before: Mapping[str, Any], after: Mapping[str, Any],
-    *, job_id: str, expected_pvc_uid: str,
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    *,
+    job_id: str,
+    expected_pvc_uid: str,
 ) -> None:
     if (
         str(before.get("job_id")) != job_id
@@ -160,13 +190,23 @@ def validate_retained_retry(
 
 
 def validate_retirement_retry_snapshot(
-    snapshot: Mapping[str, Any], *, job_id: str, owner_id: str,
-    generation: str, vm_uid: str, pvc_uid: str, cleanup_id: str,
-    request_id: str, hold_id: str, run_id: str, now: float,
+    snapshot: Mapping[str, Any],
+    *,
+    job_id: str,
+    owner_id: str,
+    generation: str,
+    vm_uid: str,
+    pvc_uid: str,
+    cleanup_id: str,
+    request_id: str,
+    hold_id: str,
+    run_id: str,
+    now: float,
 ) -> float:
     """Fence one acceptance-only retry to its paused owner and old runtime."""
     from orchestrator.operator_cli.vm_retained_resume_pause import (
-        OwnerPauseHoldError, owned_pause_hold_id,
+        OwnerPauseHoldError,
+        owned_pause_hold_id,
     )
 
     context = _object(snapshot.get("context"))
@@ -184,15 +224,25 @@ def validate_retirement_retry_snapshot(
         or snapshot.get("assigned_agent_id") is not None
         or context.get("vm_retained_resume_acceptance_gate") != run_id
         or context.get("_vm_creation_pending") is not None
-        or any(context.get(key) is not None for key in (
-            "_workspace_dispatch_authority", "_completion_control_claim",
-            "_stateless_control_claim", "last_operator_pause_hold",
-        ))
+        or any(
+            context.get(key) is not None
+            for key in (
+                "_workspace_dispatch_authority",
+                "_completion_control_claim",
+                "_stateless_control_claim",
+                "last_operator_pause_hold",
+            )
+        )
         or current.get("provision_generation") != generation
         or current.get("vm_uid") != vm_uid
         or current.get("rootdisk_pvc_uid") != pvc_uid
-        or current.get("status") not in {
-            "ready", "retiring_process_zero", "deleting", "delete_failed", "deleted",
+        or current.get("status")
+        not in {
+            "ready",
+            "retiring_process_zero",
+            "deleting",
+            "delete_failed",
+            "deleted",
         }
         or current.get("retirement_cleanup_pending") is not True
         or current.get("retirement_last_result") != "retry_pending"
@@ -210,17 +260,27 @@ def validate_retirement_retry_snapshot(
         or snapshot.get("cleanup_source") != "dispatcher_vm_recycle"
         or snapshot.get("cleanup_completed_at") is not None
         or snapshot.get("cleanup_outcome") is not None
-        or any(snapshot.get(key) is not False for key in (
-            "active_access", "active_remote", "active_recovery", "active_creation",
-        ))
+        or any(
+            snapshot.get(key) is not False
+            for key in (
+                "active_access",
+                "active_remote",
+                "active_recovery",
+                "active_creation",
+            )
+        )
     ):
         raise AcceptanceFailure("predecessor retirement retry authority changed")
     return float(retry_after)
 
 
 def validate_worker_evidence(
-    queue: Mapping[str, Any], attempt: Mapping[str, Any], pod: Mapping[str, Any],
-    *, job_id: str, run_id: str,
+    queue: Mapping[str, Any],
+    attempt: Mapping[str, Any],
+    pod: Mapping[str, Any],
+    *,
+    job_id: str,
+    run_id: str,
 ) -> None:
     del run_id  # The immutable Job/source marker binds the run, not a pool Pod label.
     metadata = _object(pod.get("metadata"))
@@ -239,7 +299,8 @@ def validate_worker_evidence(
         or not isinstance(attempt.get("authority_digest"), str)
         or not attempt["authority_digest"].startswith("sha256:")
         or not metadata.get("name")
-        or str(queue.get("last_leased_by") or queue.get("leased_by") or "") != metadata.get("name")
+        or str(queue.get("last_leased_by") or queue.get("leased_by") or "")
+        != metadata.get("name")
         or labels.get("srw/class") != "agent-stateless"
         or labels.get("app.kubernetes.io/component") != "agent-stateless"
         or _object(pod.get("status")).get("phase") not in {"Running", "Succeeded"}
@@ -295,7 +356,9 @@ class LiveScenario:
             or os.environ.get("VM_CREATION_RETRY_ENABLED") != "true"
             or os.environ.get("VM_NETWORK_PROFILE_ENABLED") != "true"
         ):
-            raise AcceptanceFailure("retained profiled creation protocol is unavailable")
+            raise AcceptanceFailure(
+                "retained profiled creation protocol is unavailable"
+            )
 
     async def close(self) -> None:
         await self.provisioner.disconnect()
@@ -326,18 +389,27 @@ class LiveScenario:
         job = await self.row(
             "SELECT id,user_id,status::text AS status,execution_lane,"
             "assigned_agent_id,created_at,context,config_override "
-            "FROM jobs WHERE id=$1", job_id,
+            "FROM jobs WHERE id=$1",
+            job_id,
         )
-        user = await self.row(
-            "SELECT id,display_name,is_approved,is_admin,can_use_vm FROM users WHERE id=$1",
-            job.get("user_id"),
-        ) if job else {}
+        user = (
+            await self.row(
+                "SELECT id,display_name,is_approved,is_admin,can_use_vm FROM users WHERE id=$1",
+                job.get("user_id"),
+            )
+            if job
+            else {}
+        )
         queue = await self.row(
             "SELECT state,leased_by,lease_token FROM run_queue "
-            "WHERE unit_id=$1 AND unit_kind='worker_batch'", job_id,
+            "WHERE unit_id=$1 AND unit_kind='worker_batch'",
+            job_id,
         )
         validate_fixture_snapshot(
-            job, user, queue, run_id=self.args.run_id,
+            job,
+            user,
+            queue,
+            run_id=self.args.run_id,
             expected_owner_id=self.args.expected_owner_id,
             expected_pvc_uid=self.args.expected_pvc_uid,
             expected_pause_hold_id=self.args.expected_pause_hold_id,
@@ -350,7 +422,8 @@ class LiveScenario:
             raise AcceptanceFailure("fixture has prior worker attempts")
         other_queued = await self.value(
             "SELECT count(*) FROM run_queue WHERE unit_kind='worker_batch' "
-            "AND state IN ('queued','leased') AND unit_id<>$1", job_id,
+            "AND state IN ('queued','leased') AND unit_id<>$1",
+            job_id,
         )
         if other_queued:
             raise AcceptanceFailure("unrelated worker batches are runnable")
@@ -367,21 +440,26 @@ class LiveScenario:
             or original.get("ready_at") is None
             or original.get("job_id") != job_id
             or str(original.get("observed_pvc_uid")) != self.args.expected_pvc_uid
-            or str(original.get("provision_generation")) != vm.get("provision_generation")
+            or str(original.get("provision_generation"))
+            != vm.get("provision_generation")
         ):
-            raise AcceptanceFailure("predecessor creation is not Ready under its frozen request")
+            raise AcceptanceFailure(
+                "predecessor creation is not Ready under its frozen request"
+            )
         return job, original
 
     async def exclusive_vm_creation(self) -> None:
         if await self.value(
             "SELECT EXISTS(SELECT 1 FROM vm_creation_retries "
             "WHERE state IN ('queued','reconciling','attention','cancel_requested') "
-            "AND job_id<>$1)", UUID(self.args.job_id),
+            "AND job_id<>$1)",
+            UUID(self.args.job_id),
         ):
             raise AcceptanceFailure("quota could affect another VM creation retry")
         if await self.value(
             "SELECT EXISTS(SELECT 1 FROM jobs WHERE id<>$1 "
-            "AND context ? '_vm_creation_pending')", UUID(self.args.job_id),
+            "AND context ? '_vm_creation_pending')",
+            UUID(self.args.job_id),
         ):
             raise AcceptanceFailure("quota could affect another pending VM Job")
 
@@ -393,14 +471,19 @@ class LiveScenario:
             "admission_deadline,expected_pvc_uid,predecessor_evidence,"
             "predecessor_cleanup_admission_id,created_at,state,reason,"
             "observed_vm_uid,observed_pvc_uid,ready_at "
-            "FROM vm_creation_retries WHERE request_id=$1", UUID(str(request_id)),
+            "FROM vm_creation_retries WHERE request_id=$1",
+            UUID(str(request_id)),
         )
 
     async def ready_identity(self, expected_generation: str) -> dict[str, Any] | None:
         from shared.vm_network_profile import NETWORK_PROFILE, reusable_profile_evidence
 
-        status = _object(await self.provisioner.query_status(self.args.job_id, timeout=10))
-        job = await self.row("SELECT context FROM jobs WHERE id=$1", UUID(self.args.job_id))
+        status = _object(
+            await self.provisioner.query_status(self.args.job_id, timeout=10)
+        )
+        job = await self.row(
+            "SELECT context FROM jobs WHERE id=$1", UUID(self.args.job_id)
+        )
         vm = _object(_object(job.get("context")).get("vm"))
         provisioning = _object(vm.get("provisioning"))
         proof = _object(provisioning.get("identity"))
@@ -429,21 +512,31 @@ class LiveScenario:
             or not identity["pod_ip"]
             or not identity["ssh_host_key_fingerprint"]
             or not reusable_profile_evidence(
-                vm.get("network_profile_evidence"), NETWORK_PROFILE,
+                vm.get("network_profile_evidence"),
+                NETWORK_PROFILE,
                 provision_generation=expected_generation,
-                vm_uid=identity["vm_uid"], pvc_uid=identity["root_pvc_uid"],
-                vmi_uid=identity["vmi_uid"], launcher_uid=identity["launcher_uid"],
+                vm_uid=identity["vm_uid"],
+                pvc_uid=identity["root_pvc_uid"],
+                vmi_uid=identity["vmi_uid"],
+                launcher_uid=identity["launcher_uid"],
             )
         ):
             return None
-        for key in ("provision_generation", "vm_uid", "vmi_uid", "launcher_uid", "root_pvc_uid"):
+        for key in (
+            "provision_generation",
+            "vm_uid",
+            "vmi_uid",
+            "launcher_uid",
+            "root_pvc_uid",
+        ):
             _uuid(identity[key])
         return identity
 
     async def pvc_pv_identity(self) -> dict[str, str]:
         pvc = await asyncio.to_thread(
             self.core.read_namespaced_persistent_volume_claim,
-            f"agent-vm-{self.args.job_id}-rootdisk", self.vm_namespace,
+            f"agent-vm-{self.args.job_id}-rootdisk",
+            self.vm_namespace,
         )
         if str(pvc.metadata.uid) != self.args.expected_pvc_uid:
             raise AcceptanceFailure("retained PVC UID changed")
@@ -453,54 +546,80 @@ class LiveScenario:
         pv = await asyncio.to_thread(self.core.read_persistent_volume, name)
         if not pv.metadata.uid or pv.spec.claim_ref.uid != pvc.metadata.uid:
             raise AcceptanceFailure("retained PV claim identity changed")
-        return {"pvc_uid": str(pvc.metadata.uid), "pv_uid": str(pv.metadata.uid),
-                "pv_name": name}
+        return {
+            "pvc_uid": str(pvc.metadata.uid),
+            "pv_uid": str(pv.metadata.uid),
+            "pv_name": name,
+        }
 
     async def revisions(self) -> dict[str, Any]:
         own = await asyncio.to_thread(
-            self.core.read_namespaced_pod, os.environ.get("HOSTNAME", ""),
+            self.core.read_namespaced_pod,
+            os.environ.get("HOSTNAME", ""),
             self.args.namespace,
         )
-        application = next((item.image_id for item in own.status.container_statuses or []
-                            if item.name == "orchestrator" and item.image_id), None)
+        application = next(
+            (
+                item.image_id
+                for item in own.status.container_statuses or []
+                if item.name == "orchestrator" and item.image_id
+            ),
+            None,
+        )
         controllers = await asyncio.to_thread(
-            self.core.list_namespaced_pod, namespace=self.vm_namespace,
+            self.core.list_namespaced_pod,
+            namespace=self.vm_namespace,
             label_selector="app.kubernetes.io/component=vm-controller",
         )
-        images = {item.image_id for pod in controllers.items
-                  for item in pod.status.container_statuses or []
-                  if item.name == "vm-controller" and item.image_id}
+        images = {
+            item.image_id
+            for pod in controllers.items
+            for item in pod.status.container_statuses or []
+            if item.name == "vm-controller" and item.image_id
+        }
         migration = await self.value(
             "SELECT filename FROM schema_migrations WHERE success=true "
             "ORDER BY filename DESC LIMIT 1",
         )
         if not application or len(images) != 1 or not migration:
             raise AcceptanceFailure("image or migration revision is unavailable")
-        return {"orchestrator_image_id": application,
-                "vm_controller_image_id": next(iter(images)),
-                "migration_head": migration,
-                "creation_retry_enabled": os.environ.get("VM_CREATION_RETRY_ENABLED"),
-                "network_profile_enabled": os.environ.get("VM_NETWORK_PROFILE_ENABLED"),
-                "idle_release_enabled": os.environ.get("WORKSPACE_IDLE_RELEASE_ENABLED")}
+        return {
+            "orchestrator_image_id": application,
+            "vm_controller_image_id": next(iter(images)),
+            "migration_head": migration,
+            "creation_retry_enabled": os.environ.get("VM_CREATION_RETRY_ENABLED"),
+            "network_profile_enabled": os.environ.get("VM_NETWORK_PROFILE_ENABLED"),
+            "idle_release_enabled": os.environ.get("WORKSPACE_IDLE_RELEASE_ENABLED"),
+        }
 
     async def ssh(self, identity: Mapping[str, Any], command: str) -> None:
         from orchestrator.services import resolve_ssh_key_path
         from orchestrator.services.ssh_helpers import pinned_agent_ssh_command
         from orchestrator.services.subprocess_effect import (
-            communicate_bounded, create_owned_subprocess_exec,
+            communicate_bounded,
+            create_owned_subprocess_exec,
         )
 
         async with pinned_agent_ssh_command(
-            str(identity["pod_ip"]), 22, command,
+            str(identity["pod_ip"]),
+            22,
+            command,
             expected_host_key_fingerprint=str(identity["ssh_host_key_fingerprint"]),
-            key_path=resolve_ssh_key_path(), connect_timeout_s=10, batch_mode=True,
+            key_path=resolve_ssh_key_path(),
+            connect_timeout_s=10,
+            batch_mode=True,
         ) as argv:
             process = await create_owned_subprocess_exec(
-                *argv, stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                *argv,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
             await communicate_bounded(
-                process, timeout=20, stdout_limit=2048, stderr_limit=2048,
+                process,
+                timeout=20,
+                stdout_limit=2048,
+                stderr_limit=2048,
             )
         if process.returncode != 0:
             raise AcceptanceFailure("pinned SSH sentinel operation failed")
@@ -509,38 +628,49 @@ class LiveScenario:
         value = secrets.token_hex(32)
         digest = hashlib.sha256(value.encode()).hexdigest()
         path = f"/home/agent-host/workspace/.srw-a1-gate/{self.args.run_id}/sentinel"
-        await self.ssh(identity, " && ".join((
-            f"mkdir -p {shlex.quote(str(Path(path).parent))}",
-            f"test ! -e {shlex.quote(path)}",
-            f"printf %s {shlex.quote(value)} > {shlex.quote(path)}",
-        )))
+        await self.ssh(
+            identity,
+            " && ".join(
+                (
+                    f"mkdir -p {shlex.quote(str(Path(path).parent))}",
+                    f"test ! -e {shlex.quote(path)}",
+                    f"printf %s {shlex.quote(value)} > {shlex.quote(path)}",
+                )
+            ),
+        )
         await self.sentinel_verify(identity, digest)
         return digest
 
     async def sentinel_verify(self, identity: Mapping[str, Any], digest: str) -> None:
         path = f"/home/agent-host/workspace/.srw-a1-gate/{self.args.run_id}/sentinel"
         relative = f".srw-a1-gate/{self.args.run_id}/sentinel"
-        command = " && ".join((
-            f"test -f {shlex.quote(path)}",
-            f"test \"$(sha256sum {shlex.quote(path)} | cut -d' ' -f1)\" = {shlex.quote(digest)}",
-            "test \"$(git -C /home/agent-host/workspace rev-parse --is-inside-work-tree)\" = true",
-            "! git -C /home/agent-host/workspace ls-files --error-unmatch -- "
-            f"{shlex.quote(relative)} >/dev/null 2>&1",
-        ))
+        command = " && ".join(
+            (
+                f"test -f {shlex.quote(path)}",
+                f"test \"$(sha256sum {shlex.quote(path)} | cut -d' ' -f1)\" = {shlex.quote(digest)}",
+                'test "$(git -C /home/agent-host/workspace rev-parse --is-inside-work-tree)" = true',
+                "! git -C /home/agent-host/workspace ls-files --error-unmatch -- "
+                f"{shlex.quote(relative)} >/dev/null 2>&1",
+            )
+        )
         await self.ssh(identity, command)
 
     async def owner_resume(self, *, expected_status: int) -> dict[str, Any]:
         """Use the public owner route with a short-lived, revocable user token."""
         import httpx
 
-        owner = await self.value("SELECT user_id FROM jobs WHERE id=$1", UUID(self.args.job_id))
+        owner = await self.value(
+            "SELECT user_id FROM jobs WHERE id=$1", UUID(self.args.job_id)
+        )
         if owner is None or str(owner) != self.args.expected_owner_id:
             raise AcceptanceFailure("fixture owner disappeared")
         raw_token = "srw_" + secrets.token_urlsafe(32)
         issued = await self.db.create_mcp_token(
-            user_id=str(owner), name=f"a1-{self.args.run_id}",
+            user_id=str(owner),
+            name=f"a1-{self.args.run_id}",
             token_hash=hashlib.sha256(raw_token.encode()).hexdigest(),
-            token_prefix=raw_token[:12], scope="user",
+            token_prefix=raw_token[:12],
+            scope="user",
             expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
             origin="vm-retained-resume-acceptance",
         )
@@ -549,20 +679,26 @@ class LiveScenario:
             async with httpx.AsyncClient(timeout=15) as client:
                 response = await client.post(
                     f"{base}/api/jobs/{self.args.job_id}/resume",
-                    headers={"Authorization": f"Bearer {raw_token}"}, json={},
+                    headers={"Authorization": f"Bearer {raw_token}"},
+                    json={},
                 )
             if response.status_code != expected_status:
-                raise AcceptanceFailure("ordinary owner Resume returned an unexpected status")
+                raise AcceptanceFailure(
+                    "ordinary owner Resume returned an unexpected status"
+                )
             return _object(response.json()) if expected_status == 200 else {}
         finally:
             if not await self.db.revoke_mcp_token(str(issued["id"]), str(owner)):
                 raise AcceptanceFailure("owner route token could not be revoked")
 
     async def verify_owner_pause_lift(self) -> None:
-        context = _object(await self.value(
-            "SELECT context FROM jobs WHERE id=$1 AND user_id=$2",
-            UUID(self.args.job_id), UUID(self.args.expected_owner_id),
-        ))
+        context = _object(
+            await self.value(
+                "SELECT context FROM jobs WHERE id=$1 AND user_id=$2",
+                UUID(self.args.job_id),
+                UUID(self.args.expected_owner_id),
+            )
+        )
         last = _object(context.get("last_operator_pause_hold"))
         if (
             "_operator_pause_hold" in context
@@ -602,22 +738,30 @@ class LiveScenario:
             "LEFT JOIN vm_workspace_cleanup_admissions c ON c.id=$2 "
             "AND c.owner_kind='job' AND c.owner_id=j.id "
             "WHERE j.id=$1",
-            UUID(self.args.job_id), UUID(cleanup_id),
+            UUID(self.args.job_id),
+            UUID(cleanup_id),
         )
 
     async def retire_predecessor(self, vm: dict[str, Any]) -> dict[str, Any]:
         """Pause only the gate call before the production physical-stop transport."""
-        from orchestrator.services.vm_provisioning_cleanup import recycle_provisioning_vm
-        from orchestrator.services.vm_workspace_recovery_store import VMWorkspaceRecoveryStore
+        from orchestrator.services.vm_provisioning_cleanup import (
+            recycle_provisioning_vm,
+        )
+        from orchestrator.services.vm_workspace_recovery_store import (
+            VMWorkspaceRecoveryStore,
+        )
 
         deadline = time.monotonic() + 900
         entered, release = asyncio.Event(), asyncio.Event()
         delegate = self.provisioner
 
         class PauseBeforeStop:
-            async def capture_vm_teardown_identity(self, owner_id: str, *, entity_type: str):
+            async def capture_vm_teardown_identity(
+                self, owner_id: str, *, entity_type: str
+            ):
                 return await delegate.capture_vm_teardown_identity(
-                    owner_id, entity_type=entity_type,
+                    owner_id,
+                    entity_type=entity_type,
                 )
 
             async def release_vm_captured(self, *args: Any, **kwargs: Any):
@@ -628,11 +772,17 @@ class LiveScenario:
             async def attest_vm_cleanup_stop(self, candidate):
                 return await delegate.attest_vm_cleanup_stop(candidate)
 
-        task = asyncio.create_task(recycle_provisioning_vm(
-            self.args.job_id, vm, db=self.db, provisioner=PauseBeforeStop(),
-            recovery_store=VMWorkspaceRecoveryStore(self.db),
-            now=time.time(), phase_timeout=False,
-        ))
+        task = asyncio.create_task(
+            recycle_provisioning_vm(
+                self.args.job_id,
+                vm,
+                db=self.db,
+                provisioner=PauseBeforeStop(),
+                recovery_store=VMWorkspaceRecoveryStore(self.db),
+                now=time.time(),
+                phase_timeout=False,
+            )
+        )
         open_cleanup: dict[str, Any] = {}
         try:
             await asyncio.wait_for(entered.wait(), timeout=30)
@@ -656,7 +806,8 @@ class LiveScenario:
             # the exception while still allowing its physical stop to settle.
             try:
                 result = await asyncio.wait_for(
-                    task, timeout=min(300, max(0, deadline - time.monotonic())),
+                    task,
+                    timeout=min(300, max(0, deadline - time.monotonic())),
                 )
             finally:
                 if not task.done():
@@ -664,14 +815,17 @@ class LiveScenario:
                     await asyncio.gather(task, return_exceptions=True)
         if result == "retry_pending":
             if not open_cleanup.get("request_id"):
-                raise AcceptanceFailure("predecessor cleanup request identity is unavailable")
+                raise AcceptanceFailure(
+                    "predecessor cleanup request identity is unavailable"
+                )
             previous_attempts = vm.get("retirement_attempts", 0)
             if type(previous_attempts) is not int or previous_attempts < 0:
                 raise AcceptanceFailure("predecessor retirement attempt is malformed")
             for _ in range(6):
                 snapshot = await self.retirement_retry_snapshot(str(open_cleanup["id"]))
                 retry_at = validate_retirement_retry_snapshot(
-                    snapshot, job_id=self.args.job_id,
+                    snapshot,
+                    job_id=self.args.job_id,
                     owner_id=self.args.expected_owner_id,
                     generation=str(vm["provision_generation"]),
                     vm_uid=str(vm["vm_uid"]),
@@ -679,7 +833,8 @@ class LiveScenario:
                     cleanup_id=str(open_cleanup["id"]),
                     request_id=str(open_cleanup["request_id"]),
                     hold_id=self.args.expected_pause_hold_id,
-                    run_id=self.args.run_id, now=time.time(),
+                    run_id=self.args.run_id,
+                    now=time.time(),
                 )
                 fresh_vm = _object(_object(snapshot["context"]).get("vm"))
                 attempts = fresh_vm["retirement_attempts"]
@@ -687,7 +842,9 @@ class LiveScenario:
                     raise AcceptanceFailure("predecessor retirement attempt changed")
                 delay = max(0.0, retry_at - time.time())
                 if time.monotonic() + delay >= deadline:
-                    raise AcceptanceFailure("predecessor retirement retry deadline elapsed")
+                    raise AcceptanceFailure(
+                        "predecessor retirement retry deadline elapsed"
+                    )
                 if delay:
                     await asyncio.sleep(delay)
                 # A worker, owner action or another cleanup actor could have
@@ -695,7 +852,8 @@ class LiveScenario:
                 # the old Ready snapshot or a stale read.
                 current = await self.retirement_retry_snapshot(str(open_cleanup["id"]))
                 current_retry_at = validate_retirement_retry_snapshot(
-                    current, job_id=self.args.job_id,
+                    current,
+                    job_id=self.args.job_id,
                     owner_id=self.args.expected_owner_id,
                     generation=str(vm["provision_generation"]),
                     vm_uid=str(vm["vm_uid"]),
@@ -703,23 +861,32 @@ class LiveScenario:
                     cleanup_id=str(open_cleanup["id"]),
                     request_id=str(open_cleanup["request_id"]),
                     hold_id=self.args.expected_pause_hold_id,
-                    run_id=self.args.run_id, now=time.time(),
+                    run_id=self.args.run_id,
+                    now=time.time(),
                 )
                 current_vm = _object(_object(current["context"]).get("vm"))
-                if (current_retry_at != retry_at
-                        or current_vm["retirement_attempts"] != attempts
-                        or time.time() < current_retry_at):
+                if (
+                    current_retry_at != retry_at
+                    or current_vm["retirement_attempts"] != attempts
+                    or time.time() < current_retry_at
+                ):
                     raise AcceptanceFailure("predecessor retirement clock changed")
                 remaining = min(300, deadline - time.monotonic())
                 if remaining <= 0:
-                    raise AcceptanceFailure("predecessor retirement retry deadline elapsed")
+                    raise AcceptanceFailure(
+                        "predecessor retirement retry deadline elapsed"
+                    )
                 result = await asyncio.wait_for(
                     recycle_provisioning_vm(
-                        self.args.job_id, current_vm, db=self.db,
+                        self.args.job_id,
+                        current_vm,
+                        db=self.db,
                         provisioner=self.provisioner,
                         recovery_store=VMWorkspaceRecoveryStore(self.db),
-                        now=time.time(), phase_timeout=False,
-                    ), timeout=remaining,
+                        now=time.time(),
+                        phase_timeout=False,
+                    ),
+                    timeout=remaining,
                 )
                 if result != "retry_pending":
                     break
@@ -728,7 +895,8 @@ class LiveScenario:
             raise AcceptanceFailure("supported predecessor retirement did not settle")
         settled = await self.row(
             "SELECT completed_at,outcome,pvc_uid FROM vm_workspace_cleanup_admissions "
-            "WHERE id=$1", open_cleanup["id"],
+            "WHERE id=$1",
+            open_cleanup["id"],
         )
         if (
             settled.get("completed_at") is None
@@ -740,13 +908,18 @@ class LiveScenario:
             "SELECT id,observed_at FROM managed_repository_process_zero_receipts "
             "WHERE owner_kind='job' AND owner_id=$1 AND scope='vm' "
             "AND provisioner='vm' AND runtime_incarnation=$2",
-            UUID(self.args.job_id), str(vm["provision_generation"]),
+            UUID(self.args.job_id),
+            str(vm["provision_generation"]),
         )
         if not process_zero or process_zero.get("observed_at") is None:
-            raise AcceptanceFailure("exact predecessor process-zero receipt is unavailable")
-        return {"cleanup_admission_id": str(open_cleanup["id"]),
-                "process_zero_receipt_id": str(process_zero["id"]),
-                "process_zero_observed_at": process_zero["observed_at"]}
+            raise AcceptanceFailure(
+                "exact predecessor process-zero receipt is unavailable"
+            )
+        return {
+            "cleanup_admission_id": str(open_cleanup["id"]),
+            "process_zero_receipt_id": str(process_zero["id"]),
+            "process_zero_observed_at": process_zero["observed_at"],
+        }
 
     async def begin_replacement(self, old_request: Mapping[str, Any]) -> dict[str, Any]:
         from orchestrator.services.retained_vm_workspaces import provision_authority
@@ -764,7 +937,8 @@ class LiveScenario:
         if (
             authority is None
             or authority.get("network_profile") != NETWORK_PROFILE
-            or _object(authority.get("storage")).get("pvc_uid") != self.args.expected_pvc_uid
+            or _object(authority.get("storage")).get("pvc_uid")
+            != self.args.expected_pvc_uid
         ):
             raise AcceptanceFailure("retained storage/profile authority changed")
         result = await self.provisioner.create_vm(
@@ -781,8 +955,13 @@ class LiveScenario:
             preparation=request.get("preparation"),
             network_profile=NETWORK_PROFILE,
         )
-        if not isinstance(result, Mapping) or result.get("status") != "creation_pending":
-            raise AcceptanceFailure("replacement did not enter durable creation preflight")
+        if (
+            not isinstance(result, Mapping)
+            or result.get("status") != "creation_pending"
+        ):
+            raise AcceptanceFailure(
+                "replacement did not enter durable creation preflight"
+            )
         request_id = _uuid(result.get("request_id"))
 
         async def admitted() -> dict[str, Any] | None:
@@ -795,7 +974,8 @@ class LiveScenario:
             or row.get("origin") != "resume"
             or row.get("predecessor_cleanup_admission_id") is None
             or row.get("admission_deadline") is None
-            or _object(row.get("canonical_request")).get("network_profile") != NETWORK_PROFILE
+            or _object(row.get("canonical_request")).get("network_profile")
+            != NETWORK_PROFILE
         ):
             raise AcceptanceFailure("new creation request is not retained-profiled")
         return row
@@ -808,7 +988,8 @@ class LiveScenario:
         return any(
             _object(effect.get("carrier_intent")).get("effect_kind") == "vm"
             and effect.get("state") == "rejected"
-            for effect in effects if isinstance(effect, Mapping)
+            for effect in effects
+            if isinstance(effect, Mapping)
         )
 
     async def capture_worker(self) -> dict[str, Any] | None:
@@ -817,7 +998,8 @@ class LiveScenario:
 
         queue = await self.row(
             "SELECT unit_id,unit_kind,state,lease_token,leased_by,last_leased_by "
-            "FROM run_queue WHERE unit_id=$1", UUID(self.args.job_id),
+            "FROM run_queue WHERE unit_id=$1",
+            UUID(self.args.job_id),
         )
         if queue.get("state") != "leased" or not queue.get("leased_by"):
             if queue.get("state") == "done" and queue.get("lease_token", 0) > 0:
@@ -827,13 +1009,16 @@ class LiveScenario:
             "SELECT job_id,lease_token,claimed_attempt,bundle_authorized_at,"
             "authority_digest FROM worker_batch_attempts "
             "WHERE job_id=$1 AND lease_token=$2",
-            UUID(self.args.job_id), queue["lease_token"],
+            UUID(self.args.job_id),
+            queue["lease_token"],
         )
         if attempt.get("bundle_authorized_at") is None:
             return None
         try:
             obj = await asyncio.to_thread(
-                self.core.read_namespaced_pod, queue["leased_by"], self.args.namespace,
+                self.core.read_namespaced_pod,
+                queue["leased_by"],
+                self.args.namespace,
             )
         except ApiException as exc:
             if exc.status == 404:
@@ -845,23 +1030,34 @@ class LiveScenario:
         metadata = _object(pod.get("metadata"))
         status = _object(pod.get("status"))
         evidence = {
-            "metadata": {"name": metadata.get("name"), "uid": metadata.get("uid"),
-                         "labels": metadata.get("labels")},
+            "metadata": {
+                "name": metadata.get("name"),
+                "uid": metadata.get("uid"),
+                "labels": metadata.get("labels"),
+            },
             "status": {"phase": status.get("phase")},
         }
-        validate_worker_evidence(queue, attempt, evidence,
-                                 job_id=self.args.job_id, run_id=self.args.run_id)
-        return {"queue": queue, "attempt": attempt,
-                "pod_uid": str(metadata["uid"]), "pod_name": str(metadata["name"])}
+        validate_worker_evidence(
+            queue, attempt, evidence, job_id=self.args.job_id, run_id=self.args.run_id
+        )
+        return {
+            "queue": queue,
+            "attempt": attempt,
+            "pod_uid": str(metadata["uid"]),
+            "pod_name": str(metadata["name"]),
+        }
 
-    async def terminal_worker(self, captured: Mapping[str, Any]) -> dict[str, Any] | None:
+    async def terminal_worker(
+        self, captured: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
         queue = await self.row(
             "SELECT unit_id,unit_kind,state,lease_token,leased_by,last_leased_by "
-            "FROM run_queue WHERE unit_id=$1", UUID(self.args.job_id),
+            "FROM run_queue WHERE unit_id=$1",
+            UUID(self.args.job_id),
         )
         job = await self.row(
-            "SELECT status::text AS status,completed_at,context "
-            "FROM jobs WHERE id=$1", UUID(self.args.job_id),
+            "SELECT status::text AS status,completed_at,context FROM jobs WHERE id=$1",
+            UUID(self.args.job_id),
         )
         if job.get("status") != "completed" or queue.get("state") != "done":
             return None
@@ -869,19 +1065,23 @@ class LiveScenario:
             "SELECT job_id,lease_token,claimed_attempt,bundle_authorized_at,"
             "authority_digest,refunded_at FROM worker_batch_attempts "
             "WHERE job_id=$1 AND lease_token=$2",
-            UUID(self.args.job_id), captured["queue"]["lease_token"],
+            UUID(self.args.job_id),
+            captured["queue"]["lease_token"],
         )
         command = await self.row(
             "SELECT id,state,outcome,finalized_at,accepted_lease_token "
             "FROM job_completion_commands WHERE job_id=$1 "
             "AND accepted_lease_token=$2 ORDER BY report_seq DESC LIMIT 1",
-            UUID(self.args.job_id), captured["queue"]["lease_token"],
+            UUID(self.args.job_id),
+            captured["queue"]["lease_token"],
         )
         if (
             queue.get("lease_token") != captured["queue"]["lease_token"]
             or queue.get("last_leased_by") != captured["pod_name"]
-            or attempt.get("authority_digest") != captured["attempt"]["authority_digest"]
-            or attempt.get("bundle_authorized_at") != captured["attempt"]["bundle_authorized_at"]
+            or attempt.get("authority_digest")
+            != captured["attempt"]["authority_digest"]
+            or attempt.get("bundle_authorized_at")
+            != captured["attempt"]["bundle_authorized_at"]
             or attempt.get("refunded_at") is not None
             or command.get("state") != "done"
             or command.get("outcome") is None
@@ -890,11 +1090,14 @@ class LiveScenario:
             or job.get("completed_at") is None
         ):
             raise AcceptanceFailure("terminal Job lacks its captured worker result")
-        return {"pod_name": captured["pod_name"], "pod_uid": captured["pod_uid"],
-                "lease_token": queue["lease_token"],
-                "authority_digest": attempt["authority_digest"],
-                "completion_command_id": str(command["id"]),
-                "completed_at": job["completed_at"]}
+        return {
+            "pod_name": captured["pod_name"],
+            "pod_uid": captured["pod_uid"],
+            "lease_token": queue["lease_token"],
+            "authority_digest": attempt["authority_digest"],
+            "completion_command_id": str(command["id"]),
+            "completed_at": job["completed_at"],
+        }
 
     async def execute(self) -> dict[str, Any]:
         from shared.vm_network_profile import NETWORK_PROFILE
@@ -903,8 +1106,12 @@ class LiveScenario:
         job, predecessor_retry = await self.fixture_snapshot()
         revisions = await self.revisions()
         old = _object(_object(job["context"]).get("vm"))
-        predecessor = await self.ready_identity(str(predecessor_retry["provision_generation"]))
-        if predecessor is None or predecessor["vm_uid"] != str(predecessor_retry["observed_vm_uid"]):
+        predecessor = await self.ready_identity(
+            str(predecessor_retry["provision_generation"])
+        )
+        if predecessor is None or predecessor["vm_uid"] != str(
+            predecessor_retry["observed_vm_uid"]
+        ):
             raise AcceptanceFailure("predecessor Ready identity changed")
         storage_before = await self.pvc_pv_identity()
         digest = await self.sentinel_write(predecessor)
@@ -917,7 +1124,8 @@ class LiveScenario:
         before = await self.begin_replacement(predecessor_retry)
         request_id = str(before["request_id"])
         await self.wait(
-            "quota-rejected VM POST", lambda: self.rejected_vm_effect(request_id),
+            "quota-rejected VM POST",
+            lambda: self.rejected_vm_effect(request_id),
             seconds=180,
         )
         resumed = await self.owner_resume(expected_status=200)
@@ -928,19 +1136,29 @@ class LiveScenario:
         if any(before.get(key) != held.get(key) for key in _IMMUTABLE_RETRY_FIELDS):
             raise AcceptanceFailure("ordinary Resume changed frozen creation intent")
         host_exchange("QUOTA_RELEASE", request_id)
-        worker_task = asyncio.create_task(self.wait(
-            "authorized real worker lease", self.capture_worker, seconds=900,
-        ))
+        worker_task = asyncio.create_task(
+            self.wait(
+                "authorized real worker lease",
+                self.capture_worker,
+                seconds=900,
+            )
+        )
 
         async def ready() -> dict[str, Any] | None:
             after = await self.retry_row(request_id)
             if after.get("state") != "succeeded" or after.get("ready_at") is None:
                 return None
             identity = await self.ready_identity(str(before["provision_generation"]))
-            if identity is None or identity["vm_uid"] != str(after.get("observed_vm_uid")):
+            if identity is None or identity["vm_uid"] != str(
+                after.get("observed_vm_uid")
+            ):
                 return None
-            validate_retained_retry(before, after, job_id=self.args.job_id,
-                                    expected_pvc_uid=self.args.expected_pvc_uid)
+            validate_retained_retry(
+                before,
+                after,
+                job_id=self.args.job_id,
+                expected_pvc_uid=self.args.expected_pvc_uid,
+            )
             return {"retry": after, "identity": identity}
 
         try:
@@ -962,15 +1180,21 @@ class LiveScenario:
                 except asyncio.CancelledError:
                     pass
         terminal = await self.wait(
-            "terminal Job result", lambda: self.terminal_worker(worker), seconds=900,
+            "terminal Job result",
+            lambda: self.terminal_worker(worker),
+            seconds=900,
         )
         host_exchange("PROVIDER_VERIFY", digest)
         return {
-            "protocol_version": 1, "run_id": self.args.run_id,
-            "outcome": "passed", "job_id": self.args.job_id,
+            "protocol_version": 1,
+            "run_id": self.args.run_id,
+            "outcome": "passed",
+            "job_id": self.args.job_id,
             "owner_id": self.args.expected_owner_id,
-            "cluster_uid": self.args.cluster_uid, "namespace": self.args.namespace,
-            "started_at": started, "completed_at": datetime.now(timezone.utc),
+            "cluster_uid": self.args.cluster_uid,
+            "namespace": self.args.namespace,
+            "started_at": started,
+            "completed_at": datetime.now(timezone.utc),
             "predecessor": predecessor,
             "predecessor_request_id": str(predecessor_retry["request_id"]),
             "predecessor_cleanup": cleanup,
@@ -980,7 +1204,9 @@ class LiveScenario:
             "replacement_request_id": request_id,
             "replacement_generation": str(before["provision_generation"]),
             "request_digest": before["request_digest"],
-            "controller_configuration_digest": before["controller_configuration_digest"],
+            "controller_configuration_digest": before[
+                "controller_configuration_digest"
+            ],
             "execution_id": str(before["execution_id"]),
             "execution_revision": before["execution_revision"],
             "execution_generation": before["execution_generation"],
@@ -1008,7 +1234,8 @@ class LiveScenario:
 
         job = await self.row(
             "SELECT id,user_id,status::text AS status,execution_lane,context "
-            "FROM jobs WHERE id=$1", UUID(self.args.job_id),
+            "FROM jobs WHERE id=$1",
+            UUID(self.args.job_id),
         )
         context = _object(job.get("context"))
         vm = _object(context.get("vm"))
@@ -1030,7 +1257,9 @@ class LiveScenario:
             "WHERE owner_kind='job' AND owner_id=$1 AND completed_at IS NULL)",
             UUID(self.args.job_id),
         ):
-            raise AcceptanceFailure("cleanup target has an open physical-stop admission")
+            raise AcceptanceFailure(
+                "cleanup target has an open physical-stop admission"
+            )
         if await self.value(
             "SELECT EXISTS(SELECT 1 FROM vm_creation_retries WHERE job_id=$1 "
             "AND state IN ('queued','reconciling','attention','cancel_requested'))",
@@ -1043,16 +1272,19 @@ class LiveScenario:
         )
         if (
             str(owner.get("id")) != self.args.expected_owner_id
-            or owner.get("display_name") != f"A1 retained Resume gate {self.args.run_id}"
+            or owner.get("display_name")
+            != f"A1 retained Resume gate {self.args.run_id}"
             or owner.get("is_approved") is not True
             or owner.get("is_admin") is not False
         ):
             raise AcceptanceFailure("cleanup owner changed")
         raw_token = "srw_" + secrets.token_urlsafe(32)
         issued = await self.db.create_mcp_token(
-            user_id=str(owner["id"]), name=f"a1-cleanup-{self.args.run_id}",
+            user_id=str(owner["id"]),
+            name=f"a1-cleanup-{self.args.run_id}",
             token_hash=hashlib.sha256(raw_token.encode()).hexdigest(),
-            token_prefix=raw_token[:12], scope="user",
+            token_prefix=raw_token[:12],
+            scope="user",
             expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
             origin="vm-retained-resume-acceptance",
         )
@@ -1068,17 +1300,26 @@ class LiveScenario:
         finally:
             if not await self.db.revoke_mcp_token(str(issued["id"]), str(owner["id"])):
                 raise AcceptanceFailure("cleanup route token could not be revoked")
-        return {"protocol_version": 1, "run_id": self.args.run_id,
-                "job_id": self.args.job_id, "outcome": "cleanup_requested",
-                "owner_id": self.args.expected_owner_id,
-                "route": "DELETE /api/jobs/{job_id}",
-                "physical_settlement": "pending_production_authority"}
+        return {
+            "protocol_version": 1,
+            "run_id": self.args.run_id,
+            "job_id": self.args.job_id,
+            "outcome": "cleanup_requested",
+            "owner_id": self.args.expected_owner_id,
+            "route": "DELETE /api/jobs/{job_id}",
+            "physical_settlement": "pending_production_authority",
+        }
 
 
 def host_exchange(stage: str, value: str) -> str:
     """One bounded host-owned control barrier; no token or content in stdout."""
-    if stage not in {"ARM", "QUOTA_INSTALL", "QUOTA_RELEASE",
-                     "PROVIDER_BARRIER", "PROVIDER_VERIFY"}:
+    if stage not in {
+        "ARM",
+        "QUOTA_INSTALL",
+        "QUOTA_RELEASE",
+        "PROVIDER_BARRIER",
+        "PROVIDER_VERIFY",
+    }:
         raise AcceptanceFailure("unsupported host barrier")
     if len(value) > 128 or "\n" in value or "\r" in value:
         raise AcceptanceFailure("host barrier value is malformed")
@@ -1120,11 +1361,16 @@ async def _async_main(args: argparse.Namespace) -> int:
         # Controller/API exceptions may contain signed URLs or credentials.
         # Persist only a closed error class and the run identity.
         if not args.output.exists():
-            _atomic_result(args.output, {
-                "protocol_version": 1, "run_id": args.run_id,
-                "job_id": args.job_id, "outcome": "held",
-                "error_class": type(exc).__name__,
-            })
+            _atomic_result(
+                args.output,
+                {
+                    "protocol_version": 1,
+                    "run_id": args.run_id,
+                    "job_id": args.job_id,
+                    "outcome": "held",
+                    "error_class": type(exc).__name__,
+                },
+            )
         return 1
     finally:
         await scenario.close()

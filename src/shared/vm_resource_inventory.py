@@ -149,9 +149,16 @@ def _installed_profile(value):
     _record(
         value,
         (
-            "uid", "namespace", "name", "generation", "observedGeneration",
-            "targetVersion", "observedVersion", "targetDeploymentID",
-            "observedDeploymentID", "profile",
+            "uid",
+            "namespace",
+            "name",
+            "generation",
+            "observedGeneration",
+            "targetVersion",
+            "observedVersion",
+            "targetDeploymentID",
+            "observedDeploymentID",
+            "profile",
         ),
     )
     _uuid(value["uid"])
@@ -193,7 +200,12 @@ def _node(value, label_keys, *, protocol):
     for taint in _list(value["taints"]):
         _record(taint, ("key", "value", "effect"))
     preferred_taint_count({"spec": {"taints": value["taints"]}}, [])
-    if protocol == 2 and labels.get("kubernetes.io/arch") not in {"amd64", "arm64", "ppc64le", "s390x"}:
+    if protocol == 2 and labels.get("kubernetes.io/arch") not in {
+        "amd64",
+        "arm64",
+        "ppc64le",
+        "s390x",
+    }:
         raise InventoryError("identity_unproven")
     _resources(value["allocatable"], protocol=protocol)
 

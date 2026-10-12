@@ -487,9 +487,13 @@ async def test_ready_identity_uses_matching_authenticated_nested_vmi(stored_as_j
 @pytest.mark.parametrize(
     "change",
     [
-        "missing_mac", "malformed_mac", "stale_live_vmi",
-        "stale_vmi_receipt", "stale_launcher_receipt",
-        "stale_receipt_mac", "missing_receipt",
+        "missing_mac",
+        "malformed_mac",
+        "stale_live_vmi",
+        "stale_vmi_receipt",
+        "stale_launcher_receipt",
+        "stale_receipt_mac",
+        "missing_receipt",
     ],
 )
 async def test_ready_identity_binds_controller_mac_and_stored_profile_receipt(change):
@@ -504,8 +508,10 @@ async def test_ready_identity_binds_controller_mac_and_stored_profile_receipt(ch
     receipt = {
         "profile": NETWORK_PROFILE,
         "provision_generation": generation,
-        "vm_uid": vm_uid, "pvc_uid": pvc_uid,
-        "vmi_uid": vmi_uid, "launcher_uid": launcher_uid,
+        "vm_uid": vm_uid,
+        "pvc_uid": pvc_uid,
+        "vmi_uid": vmi_uid,
+        "launcher_uid": launcher_uid,
         "guest_boot_id": str(uuid4()),
         "cloud_init_instance_id": "first-boot",
         "cloud_init_cached_instance_id": "first-boot",
@@ -514,7 +520,8 @@ async def test_ready_identity_binds_controller_mac_and_stored_profile_receipt(ch
     }
     vm = {
         "provision_generation": generation,
-        "vm_uid": vm_uid, "rootdisk_pvc_uid": pvc_uid,
+        "vm_uid": vm_uid,
+        "rootdisk_pvc_uid": pvc_uid,
         "active_pod_uid": launcher_uid,
         "pod_ip": "10.42.0.2",
         "ssh_registration_id": str(uuid4()),
@@ -525,7 +532,8 @@ async def test_ready_identity_binds_controller_mac_and_stored_profile_receipt(ch
     status = {
         "ready": True,
         "provision_generation": generation,
-        "vm_uid": vm_uid, "rootdisk_pvc_uid": pvc_uid,
+        "vm_uid": vm_uid,
+        "rootdisk_pvc_uid": pvc_uid,
         "active_pod_uid": launcher_uid,
         "vmi_uid": vmi_uid,
         "interface_mac": mac,
@@ -534,9 +542,7 @@ async def test_ready_identity_binds_controller_mac_and_stored_profile_receipt(ch
     scenario = object.__new__(LiveScenario)
     scenario.namespace = "agent-vms"
     scenario.profiled_fixture = True
-    scenario.provisioner = SimpleNamespace(
-        query_status=AsyncMock(return_value=status)
-    )
+    scenario.provisioner = SimpleNamespace(query_status=AsyncMock(return_value=status))
     scenario._row = AsyncMock(return_value={"context": {"vm": vm}})
     accepted = await scenario._ready_identity(acceptance.UUID(job))
     assert accepted is not None

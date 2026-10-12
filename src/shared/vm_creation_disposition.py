@@ -18,8 +18,11 @@ def disposition_identity(row):
     if row.get("owner_kind") == "thread":
         if row.get("thread_id") is None and row.get("job_id") is None:
             raise ValueError("Thread cancellation source is malformed")
-        if row.get("thread_id") is not None and row.get("job_id") is not None \
-                and str(row["thread_id"]) != str(row["job_id"]):
+        if (
+            row.get("thread_id") is not None
+            and row.get("job_id") is not None
+            and str(row["thread_id"]) != str(row["job_id"])
+        ):
             raise ValueError("Thread cancellation owner changed")
         result["job_id"] = str(row.get("thread_id") or row["job_id"])
     validate_disposition_request(result)

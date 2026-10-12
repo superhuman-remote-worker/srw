@@ -473,9 +473,7 @@ class TestDeleteJobGiteaCleanup:
         ):
             mock_db.has_child_jobs = AsyncMock(return_value=False)
             mock_db.prepare_stateless_job_for_delete = AsyncMock(return_value=True)
-            mock_db.quiesce_cancelled_stateless_vm_parent = AsyncMock(
-                return_value=True
-            )
+            mock_db.quiesce_cancelled_stateless_vm_parent = AsyncMock(return_value=True)
             mock_db.delete_checkpoint_thread = AsyncMock(return_value=0)
 
             async def cleanup_after_fence(_job_id):

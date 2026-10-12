@@ -283,29 +283,48 @@ class IdeProxyService:
                 getattr(provisioner, "attest_workspace_runtime", None)
             ):
                 raise IdeProxyUnavailable(
-                    "vm_ide_transport_unavailable", "VM IDE authority is unavailable",
+                    "vm_ide_transport_unavailable",
+                    "VM IDE authority is unavailable",
                 )
             try:
                 proof = await provisioner.attest_workspace_runtime(
-                    entity_id, entity_type=owner_kind,
+                    entity_id,
+                    entity_type=owner_kind,
                 )
             except Exception as exc:
                 raise IdeProxyUnavailable(
-                    "vm_ide_runtime_unproven", "VM IDE runtime is not ready",
+                    "vm_ide_runtime_unproven",
+                    "VM IDE runtime is not ready",
                 ) from exc
-            if not all(getattr(proof, name, None) for name in (
-                "vm_uid", "vmi_uid", "launcher_pod_uid", "rootdisk_pvc_uid",
-                "ssh_host_key_fingerprint", "host", "port",
-            )):
+            if not all(
+                getattr(proof, name, None)
+                for name in (
+                    "vm_uid",
+                    "vmi_uid",
+                    "launcher_pod_uid",
+                    "rootdisk_pvc_uid",
+                    "ssh_host_key_fingerprint",
+                    "host",
+                    "port",
+                )
+            ):
                 raise IdeProxyUnavailable(
-                    "vm_ide_transport_unavailable", "VM IDE runtime is not ready",
+                    "vm_ide_transport_unavailable",
+                    "VM IDE runtime is not ready",
                 )
             return IdeProxyTarget(
-                entity_id=entity_id, owner_kind=owner_kind, backend="vm",
-                scope="vm", host=proof.host, port=proof.port,
+                entity_id=entity_id,
+                owner_kind=owner_kind,
+                backend="vm",
+                scope="vm",
+                host=proof.host,
+                port=proof.port,
                 identity=(
-                    proof.workspace_generation, proof.vm_uid, proof.vmi_uid,
-                    proof.launcher_pod_uid, proof.rootdisk_pvc_uid,
+                    proof.workspace_generation,
+                    proof.vm_uid,
+                    proof.vmi_uid,
+                    proof.launcher_pod_uid,
+                    proof.rootdisk_pvc_uid,
                     proof.ssh_host_key_fingerprint,
                 ),
             )

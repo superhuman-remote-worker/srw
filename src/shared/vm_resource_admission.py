@@ -24,7 +24,14 @@ TUN_RESOURCE = "devices.kubevirt.io/tun"
 VHOST_NET_RESOURCE = "devices.kubevirt.io/vhost-net"
 EPHEMERAL_RESOURCE = "ephemeral-storage"
 _SUPPORTED_LAUNCHER_RESOURCES = frozenset(
-    {"cpu", "memory", EPHEMERAL_RESOURCE, KVM_RESOURCE, TUN_RESOURCE, VHOST_NET_RESOURCE}
+    {
+        "cpu",
+        "memory",
+        EPHEMERAL_RESOURCE,
+        KVM_RESOURCE,
+        TUN_RESOURCE,
+        VHOST_NET_RESOURCE,
+    }
 )
 HOST_COST_ALGORITHM = "srw-vm-host-cost-v1"
 WHOLE_LAUNCHER_HOST_COST_ALGORITHM = "srw-vm-host-cost-v2"
@@ -102,8 +109,12 @@ class ResourceVector:
     @classmethod
     def from_six_dict(cls, value):
         if not isinstance(value, dict) or set(value) != {
-            "cpu_millicores", "memory_bytes", "ephemeral_storage_bytes",
-            "kvm_devices", "tun_devices", "vhost_net_devices",
+            "cpu_millicores",
+            "memory_bytes",
+            "ephemeral_storage_bytes",
+            "kvm_devices",
+            "tun_devices",
+            "vhost_net_devices",
         }:
             raise ResourceAdmissionError("invalid_resource_vector")
         return cls(**value)
@@ -272,10 +283,16 @@ def _scalar_request(raw, resource):
     def demand(container):
         value = _request_value(container.get("resources", {}), resource)
         current = statuses.get(container.get("name"), {})
-        if "resources" in current and _request_value(current["resources"], resource) != value:
+        if (
+            "resources" in current
+            and _request_value(current["resources"], resource) != value
+        ):
             raise ResourceAdmissionError("unsupported_resource_resize")
         allocated = _mapping(current.get("allocatedResources", {}))
-        if resource in allocated and _resource_value(allocated[resource], resource) != value:
+        if (
+            resource in allocated
+            and _resource_value(allocated[resource], resource) != value
+        ):
             raise ResourceAdmissionError("unsupported_resource_resize")
         return value
 
@@ -295,37 +312,57 @@ def _scalar_request(raw, resource):
         total = _resource_value(pod_requests[resource], resource)
         pod_status = _mapping(status.get("resources", {}))
         status_requests = _mapping(pod_status.get("requests", {}))
-        if resource in status_requests and _resource_value(status_requests[resource], resource) != total:
+        if (
+            resource in status_requests
+            and _resource_value(status_requests[resource], resource) != total
+        ):
             raise ResourceAdmissionError("unsupported_resource_resize")
         allocated = _mapping(status.get("allocatedResources", {}))
-        if resource in allocated and _resource_value(allocated[resource], resource) != total:
+        if (
+            resource in allocated
+            and _resource_value(allocated[resource], resource) != total
+        ):
             raise ResourceAdmissionError("unsupported_resource_resize")
-    return _integer(total + _resource_value(_mapping(spec.get("overhead", {})).get(resource, 0), resource))
+    return _integer(
+        total
+        + _resource_value(_mapping(spec.get("overhead", {})).get(resource, 0), resource)
+    )
 
 
 def _launcher_resources_supported(raw):
     spec = _mapping(raw["spec"])
     status = _mapping(raw.get("status", {}))
+
     def supported(resources):
         resources = _mapping(resources)
         for source in ("requests", "limits"):
             if set(_mapping(resources.get(source, {}))) - _SUPPORTED_LAUNCHER_RESOURCES:
                 raise ResourceAdmissionError("unsupported_launcher_resource")
-    resources = [spec.get("resources", {}), *(
-        container.get("resources", {})
-        for kind in ("containers", "initContainers")
-        for container in spec.get(kind, [])
-    )]
+
+    resources = [
+        spec.get("resources", {}),
+        *(
+            container.get("resources", {})
+            for kind in ("containers", "initContainers")
+            for container in spec.get(kind, [])
+        ),
+    ]
     for entry in resources:
         supported(entry)
     supported(status.get("resources", {}))
-    if set(_mapping(status.get("allocatedResources", {}))) - _SUPPORTED_LAUNCHER_RESOURCES:
+    if (
+        set(_mapping(status.get("allocatedResources", {})))
+        - _SUPPORTED_LAUNCHER_RESOURCES
+    ):
         raise ResourceAdmissionError("unsupported_launcher_resource")
     for kind in ("containerStatuses", "initContainerStatuses"):
         for item in status.get(kind, []):
             item = _mapping(item)
             supported(item.get("resources", {}))
-            if set(_mapping(item.get("allocatedResources", {}))) - _SUPPORTED_LAUNCHER_RESOURCES:
+            if (
+                set(_mapping(item.get("allocatedResources", {})))
+                - _SUPPORTED_LAUNCHER_RESOURCES
+            ):
                 raise ResourceAdmissionError("unsupported_launcher_resource")
     if set(_mapping(spec.get("overhead", {}))) - _SUPPORTED_LAUNCHER_RESOURCES:
         raise ResourceAdmissionError("unsupported_launcher_resource")

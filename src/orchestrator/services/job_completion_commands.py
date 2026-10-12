@@ -440,13 +440,11 @@ async def accept_completion_command(
                     "job status changed before the report was admitted"
                 )
 
-            if (
-                job["execution_lane"] == "pinned"
-                and await conn.fetchval(
-                    "SELECT EXISTS(SELECT 1 FROM vm_idle_operations "
-                    "WHERE owner_kind='job' AND owner_id=$1 "
-                    "AND closed_at IS NULL)", job_uuid,
-                )
+            if job["execution_lane"] == "pinned" and await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_idle_operations "
+                "WHERE owner_kind='job' AND owner_id=$1 "
+                "AND closed_at IS NULL)",
+                job_uuid,
             ):
                 raise CompletionFenceRejected(
                     "pinned idle operation owns this Job's report authority"
@@ -505,7 +503,9 @@ async def accept_completion_command(
                 )
 
                 pinned_delivery = await accept_pinned_report_on_conn(
-                    conn, job_id=job_uuid, agent_id=accepted_agent,
+                    conn,
+                    job_id=job_uuid,
+                    agent_id=accepted_agent,
                     delivery_id=pinned_delivery_id,
                     projection_digest=pinned_projection_digest,
                     process_generation=pinned_process_generation,
@@ -613,10 +613,15 @@ async def accept_completion_command(
                     record_pinned_wait_receipt_on_conn,
                 )
 
-                if await record_pinned_wait_receipt_on_conn(
-                    conn, delivery=pinned_delivery, source_kind="completion",
-                    source_id=command["id"],
-                ) is None:
+                if (
+                    await record_pinned_wait_receipt_on_conn(
+                        conn,
+                        delivery=pinned_delivery,
+                        source_kind="completion",
+                        source_id=command["id"],
+                    )
+                    is None
+                ):
                     raise CompletionFenceRejected("pinned completion source changed")
             await conn.execute(
                 """

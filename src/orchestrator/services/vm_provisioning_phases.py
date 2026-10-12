@@ -68,7 +68,12 @@ class VMProvisioningPhaseStore:
         self.db = db
 
     async def publish_thread_ready(
-        self, thread_id, generation, registration, vm_uid, updates,
+        self,
+        thread_id,
+        generation,
+        registration,
+        vm_uid,
+        updates,
     ) -> bool | None:
         """Bind a typed thread charge before publishing the probed Ready VM.
 
@@ -78,9 +83,12 @@ class VMProvisioningPhaseStore:
         from orchestrator.services.vm_creation_readiness import _ready
         from orchestrator.services.vm_creation_retry_store import _creation_intent
         from orchestrator.services.vm_resource_job_runtime import (
-            configured_enforcement_policy, installed_job_resource_store,
+            configured_enforcement_policy,
+            installed_job_resource_store,
         )
-        from orchestrator.services.vm_workspace_recovery_store import cleanup_intent_digest
+        from orchestrator.services.vm_workspace_recovery_store import (
+            cleanup_intent_digest,
+        )
         from shared.vm_resource_admission import ResourceAdmissionError
         from shared.vm_resource_inventory import InventoryError
         from uuid import NAMESPACE_URL, uuid5
@@ -93,14 +101,16 @@ class VMProvisioningPhaseStore:
             return False
         async with self.db.acquire() as conn, conn.transaction():
             thread = await conn.fetchrow(
-                "SELECT * FROM threads WHERE id=$1 FOR UPDATE", UUID(thread_id),
+                "SELECT * FROM threads WHERE id=$1 FOR UPDATE",
+                UUID(thread_id),
             )
             if thread is None:
                 return False
             retry = await conn.fetchrow(
                 "SELECT * FROM vm_creation_retries WHERE owner_kind='thread' "
                 "AND thread_id=$1 AND provision_generation=$2 FOR UPDATE",
-                UUID(thread_id), UUID(generation),
+                UUID(thread_id),
+                UUID(generation),
             )
             if retry is None:
                 return None if configured_enforcement_policy() is None else False
@@ -111,12 +121,18 @@ class VMProvisioningPhaseStore:
                 and thread["agent_id"] == retry["thread_agent_id"]
                 and thread["runtime_attach_token"] == retry["thread_attach_token"]
             )
-            from orchestrator.services.vm_thread_network import confirmed_pre_setup_source
+            from orchestrator.services.vm_thread_network import (
+                confirmed_pre_setup_source,
+            )
 
             if not exact_actor and not await confirmed_pre_setup_source(
-                conn, thread_id=thread_id, request_id=retry["request_id"],
-                generation=generation, runtime_generation=thread["runtime_generation"],
-                agent_id=thread["agent_id"], attach_token=thread["runtime_attach_token"],
+                conn,
+                thread_id=thread_id,
+                request_id=retry["request_id"],
+                generation=generation,
+                runtime_generation=thread["runtime_generation"],
+                agent_id=thread["agent_id"],
+                attach_token=thread["runtime_attach_token"],
             ):
                 return False
             if (
@@ -137,7 +153,9 @@ class VMProvisioningPhaseStore:
             from shared.vm_network_profile import reusable_profile_evidence
 
             frozen = verified_source(
-                retry, thread_id=thread_id, generation=generation,
+                retry,
+                thread_id=thread_id,
+                generation=generation,
                 request_id=str(retry["request_id"]),
             )
             if frozen is None:
@@ -150,12 +168,14 @@ class VMProvisioningPhaseStore:
                 not isinstance(updates.get("interface_mac"), str)
                 or not updates["interface_mac"]
                 or not reusable_profile_evidence(
-                updates.get("network_profile_evidence"), profile,
-                provision_generation=generation, vm_uid=vm_uid,
-                pvc_uid=str(retry["observed_pvc_uid"]),
-                vmi_uid=vm.get("vmi_uid"),
-                launcher_uid=updates.get("active_pod_uid"),
-                interface_mac=updates["interface_mac"],
+                    updates.get("network_profile_evidence"),
+                    profile,
+                    provision_generation=generation,
+                    vm_uid=vm_uid,
+                    pvc_uid=str(retry["observed_pvc_uid"]),
+                    vmi_uid=vm.get("vmi_uid"),
+                    launcher_uid=updates.get("active_pod_uid"),
+                    interface_mac=updates["interface_mac"],
                 )
             ):
                 return False
@@ -167,7 +187,8 @@ class VMProvisioningPhaseStore:
                     retry["thread_wake_operation_id"],
                 )
                 if (
-                    wake is None or wake["owner_kind"] != "thread"
+                    wake is None
+                    or wake["owner_kind"] != "thread"
                     or wake["owner_id"] != thread["id"]
                     or wake["phase"] not in {"waking", "wake_held"}
                     or wake["closed_at"] is not None
@@ -182,24 +203,24 @@ class VMProvisioningPhaseStore:
                 retry["creation_admission_id"],
             )
             if (
-                permit is None or permit["completed_at"] is None
+                permit is None
+                or permit["completed_at"] is None
                 or permit["outcome"] != "adopted"
                 or permit["owner_kind"] != "thread"
                 or permit["owner_id"] != thread["id"]
                 or permit["source"] != "controller_vm_create"
                 or permit["pvc_uid"] != retry["observed_pvc_uid"]
-                or permit["request_id"] != uuid5(
-                    NAMESPACE_URL, "vm-create:" + str(retry["request_id"])
-                )
-                or permit["intent_digest"] != cleanup_intent_digest(
-                    _creation_intent(retry)
-                )
+                or permit["request_id"]
+                != uuid5(NAMESPACE_URL, "vm-create:" + str(retry["request_id"]))
+                or permit["intent_digest"]
+                != cleanup_intent_digest(_creation_intent(retry))
             ):
                 return False
             effect = await conn.fetchval(
                 "SELECT evidence FROM vm_creation_effects WHERE request_id=$1 "
                 "AND effect_kind='vm' AND state='observed' "
-                "ORDER BY effect_number DESC LIMIT 1", retry["request_id"],
+                "ORDER BY effect_number DESC LIMIT 1",
+                retry["request_id"],
             )
             evidence = _object(effect)
             if evidence.get("uid") != vm_uid or evidence.get("pvc_uid") != str(
@@ -225,11 +246,17 @@ class VMProvisioningPhaseStore:
             else:
                 try:
                     resource = await installed_job_resource_store(
-                        conn, self.db, retry["controller_configuration"], fresh=False,
+                        conn,
+                        self.db,
+                        retry["controller_configuration"],
+                        fresh=False,
                     )
                     if resource is None or not await resource.bind_ready_on_conn(
-                        conn, retry=retry, vm=vm,
-                        job_id=thread_id, generation=generation,
+                        conn,
+                        retry=retry,
+                        vm=vm,
+                        job_id=thread_id,
+                        generation=generation,
                     ):
                         return False
                 except (ResourceAdmissionError, InventoryError):
@@ -239,7 +266,8 @@ class VMProvisioningPhaseStore:
                 "UPDATE threads SET metadata=$2::jsonb,last_activity=clock_timestamp() "
                 "WHERE id=$1 AND runtime_generation=$3 "
                 "AND runtime_retirement_token IS NULL",
-                thread["id"], json.dumps(metadata),
+                thread["id"],
+                json.dumps(metadata),
                 thread["runtime_generation"],
             )
             if changed != "UPDATE 1":
@@ -340,7 +368,8 @@ class VMProvisioningPhaseStore:
                     resource_retry = await conn.fetchrow(
                         "SELECT * FROM vm_creation_retries WHERE job_id=$1 "
                         "AND provision_generation=$2 FOR UPDATE",
-                        UUID(job_id), UUID(generation),
+                        UUID(job_id),
+                        UUID(generation),
                     )
                     from orchestrator.services.vm_resource_job_runtime import (
                         installed_job_resource_store,
@@ -350,16 +379,21 @@ class VMProvisioningPhaseStore:
 
                     try:
                         resource = await installed_job_resource_store(
-                            conn, self.db,
+                            conn,
+                            self.db,
                             resource_retry["controller_configuration"]
-                            if resource_retry is not None else None,
+                            if resource_retry is not None
+                            else None,
                             fresh=False,
                         )
                         if resource is not None and (
                             resource_retry is None
                             or not await resource.bind_ready_on_conn(
-                                conn, retry=resource_retry, vm=vm,
-                                job_id=job_id, generation=generation,
+                                conn,
+                                retry=resource_retry,
+                                vm=vm,
+                                job_id=job_id,
+                                generation=generation,
                             )
                         ):
                             return False
@@ -631,7 +665,8 @@ class VMProvisioningPhaseStore:
                 )
                 expected_pvc = (
                     str(creation["expected_pvc_uid"])
-                    if creation and creation["expected_pvc_uid"] else None
+                    if creation and creation["expected_pvc_uid"]
+                    else None
                 )
                 if expected_pvc is not None and expected_pvc != status.get(
                     "rootdisk_pvc_uid"
@@ -709,9 +744,13 @@ class VMProvisioningPhaseStore:
                                     return "held"
                                 updates[field] = identity_updates[field]
                         if (
-                            disposition == "observed" and phase["phase"] == "boot"
+                            disposition == "observed"
+                            and phase["phase"] == "boot"
                             and creation is not None
-                            and _object(creation["controller_configuration"]).get("version") == 3
+                            and _object(creation["controller_configuration"]).get(
+                                "version"
+                            )
+                            == 3
                         ):
                             # Signed controller status identifies the VM/VMI;
                             # fresh signed inventory alone identifies its Pod.
@@ -720,23 +759,32 @@ class VMProvisioningPhaseStore:
                             from orchestrator.services.vm_resource_job_runtime import (
                                 installed_job_resource_store,
                             )
-                            from shared.vm_resource_admission import ResourceAdmissionError
+                            from shared.vm_resource_admission import (
+                                ResourceAdmissionError,
+                            )
                             from shared.vm_resource_inventory import InventoryError
 
                             try:
                                 resource = await installed_job_resource_store(
-                                    conn, self.db, creation["controller_configuration"],
+                                    conn,
+                                    self.db,
+                                    creation["controller_configuration"],
                                     fresh=False,
                                 )
                                 if resource is not None:
                                     await resource.bind_observed_runtime_on_conn(
-                                        conn, retry=creation,
+                                        conn,
+                                        retry=creation,
                                         vm={
                                             "status": vm.get("status"),
                                             "vm_uid": status.get("vm_uid"),
                                             "vmi_uid": status.get("vmi_uid"),
-                                            "rootdisk_pvc_uid": status.get("rootdisk_pvc_uid"),
-                                            "ssh_verified_at": vm.get("ssh_verified_at"),
+                                            "rootdisk_pvc_uid": status.get(
+                                                "rootdisk_pvc_uid"
+                                            ),
+                                            "ssh_verified_at": vm.get(
+                                                "ssh_verified_at"
+                                            ),
                                             "active_pod_uid": vm.get("active_pod_uid"),
                                         },
                                         job_id=str(token.job_id),

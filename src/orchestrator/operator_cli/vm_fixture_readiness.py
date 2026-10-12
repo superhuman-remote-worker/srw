@@ -16,10 +16,12 @@ from orchestrator.services.vm_creation_transport import validate_creation_resolu
 from shared.vm_creation_retry import canonical_request_digest
 
 
-_MARKERS = frozenset({
-    "vm_retained_resume_acceptance_gate",
-    "vm_workspace_recovery_acceptance_gate",
-})
+_MARKERS = frozenset(
+    {
+        "vm_retained_resume_acceptance_gate",
+        "vm_workspace_recovery_acceptance_gate",
+    }
+)
 
 
 def _object(value: object) -> dict:
@@ -73,7 +75,9 @@ def creation_source_matches(vm: dict, preflight: dict, retry: dict) -> bool:
                 "request": canonical,
                 "request_digest": digest,
                 "controller_configuration": snapshot["controller_configuration"],
-                "controller_configuration_digest": snapshot["controller_configuration_digest"],
+                "controller_configuration_digest": snapshot[
+                    "controller_configuration_digest"
+                ],
             },
             allow_legacy_floor=True,
         )
@@ -83,14 +87,23 @@ def creation_source_matches(vm: dict, preflight: dict, retry: dict) -> bool:
 
 
 async def _matches(
-    db, *, job_id: UUID, owner_id: UUID, run_id: str, marker_key: str,
-    request_id: UUID, generation: UUID, vm_uid: UUID, pvc_uid: UUID,
+    db,
+    *,
+    job_id: UUID,
+    owner_id: UUID,
+    run_id: str,
+    marker_key: str,
+    request_id: UUID,
+    generation: UUID,
+    vm_uid: UUID,
+    pvc_uid: UUID,
     released: bool,
 ) -> bool:
     async with db.acquire() as conn:
         job = await conn.fetchrow(
             "SELECT id,user_id,status::text AS status,execution_lane,"
-            "assigned_agent_id,context FROM jobs WHERE id=$1", job_id,
+            "assigned_agent_id,context FROM jobs WHERE id=$1",
+            job_id,
         )
         retry = await conn.fetchrow(
             "SELECT request_id,job_id,provision_generation,state,reason,"
@@ -98,11 +111,13 @@ async def _matches(
             "controller_configuration_digest,"
             "observed_vm_uid,observed_pvc_uid,execution_id,execution_revision,"
             "execution_generation,admission_deadline "
-            "FROM vm_creation_retries WHERE request_id=$1", request_id,
+            "FROM vm_creation_retries WHERE request_id=$1",
+            request_id,
         )
         queue = await conn.fetchrow(
             "SELECT state,leased_by,lease_token FROM run_queue "
-            "WHERE unit_kind='worker_batch' AND unit_id=$1", job_id,
+            "WHERE unit_kind='worker_batch' AND unit_id=$1",
+            job_id,
         )
         attempts = await conn.fetchval(
             "SELECT EXISTS(SELECT 1 FROM worker_batch_attempts WHERE job_id=$1)",
@@ -125,10 +140,15 @@ async def _matches(
         and job["execution_lane"] == "stateless"
         and job["assigned_agent_id"] is None
         and context.get(marker_key) == run_id
-        and not any(context.get(key) is not None for key in (
-            "_workspace_dispatch_authority", "_completion_control_claim",
-            "_stateless_control_claim", "_operator_pause_hold",
-        ))
+        and not any(
+            context.get(key) is not None
+            for key in (
+                "_workspace_dispatch_authority",
+                "_completion_control_claim",
+                "_stateless_control_claim",
+                "_operator_pause_hold",
+            )
+        )
         and context.get("_vm_creation_pending")
         == (None if released else str(request_id))
         and vm.get("status") == "ready"
@@ -143,9 +163,11 @@ async def _matches(
         and preflight["execution_id"] == str(retry["execution_id"])
         and preflight["execution_revision"] == retry["execution_revision"]
         and preflight["execution_generation"] == retry["execution_generation"]
-        and preflight["admission_deadline"] == (
+        and preflight["admission_deadline"]
+        == (
             retry["admission_deadline"].isoformat()
-            if retry["admission_deadline"] is not None else None
+            if retry["admission_deadline"] is not None
+            else None
         )
         and retry["job_id"] == job_id
         and retry["provision_generation"] == generation
@@ -161,22 +183,44 @@ async def _matches(
 
 
 async def settle_owned_fixture_ready(
-    *, db, job_id: str, owner_id: str, run_id: str, marker_key: str,
-    request_id: str, generation: str, vm_uid: str, pvc_uid: str,
+    *,
+    db,
+    job_id: str,
+    owner_id: str,
+    run_id: str,
+    marker_key: str,
+    request_id: str,
+    generation: str,
+    vm_uid: str,
+    pvc_uid: str,
 ) -> bool:
     """Ask the real writer once, then recheck the exact fixture authority."""
     if marker_key not in _MARKERS or not isinstance(run_id, str) or not run_id:
         return False
-    parsed = tuple(_uuid(value) for value in (
-        job_id, owner_id, request_id, generation, vm_uid, pvc_uid,
-    ))
+    parsed = tuple(
+        _uuid(value)
+        for value in (
+            job_id,
+            owner_id,
+            request_id,
+            generation,
+            vm_uid,
+            pvc_uid,
+        )
+    )
     if any(value is None for value in parsed):
         return False
     job, owner, request, gen, vm, pvc = parsed
     keys = dict(
-        db=db, job_id=job, owner_id=owner, run_id=run_id,
-        marker_key=marker_key, request_id=request, generation=gen,
-        vm_uid=vm, pvc_uid=pvc,
+        db=db,
+        job_id=job,
+        owner_id=owner,
+        run_id=run_id,
+        marker_key=marker_key,
+        request_id=request,
+        generation=gen,
+        vm_uid=vm,
+        pvc_uid=pvc,
     )
     if await _matches(**keys, released=True):
         return True

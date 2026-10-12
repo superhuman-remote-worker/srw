@@ -325,7 +325,8 @@ async def prepare_session(
             or await idle.get_pending_access_continuation(thread_id) is not None
         ):
             _require_supported_protected_prepare_override(
-                thread, body.config_override,
+                thread,
+                body.config_override,
             )
             if body.config_name is not None:
                 try:
@@ -336,11 +337,13 @@ async def prepare_session(
                 body.config_override,
             )
             wake = await idle.request_thread_wake(
-                thread_id, execution_requested=True,
+                thread_id,
+                execution_requested=True,
             )
             if wake is None:
                 raise HTTPException(
-                    status_code=409, detail={"code": "session_idle_wake_held"},
+                    status_code=409,
+                    detail={"code": "session_idle_wake_held"},
                 )
             return PrepareResponse(state="waking")
     _require_preparable_thread(thread)
@@ -743,7 +746,10 @@ async def _do_prepare(
 
 
 async def prepare_woken_pinned_session(
-    thread_id: str, operation_id: str, *, dependencies: SessionsDependencies,
+    thread_id: str,
+    operation_id: str,
+    *,
+    dependencies: SessionsDependencies,
 ) -> bool:
     """Replay the existing prepare path only for one Ready, authorized wake."""
     from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
@@ -760,7 +766,8 @@ async def prepare_woken_pinned_session(
         ):
             operation = await idle.get_operation(operation_id)
     if (
-        thread is None or operation is None
+        thread is None
+        or operation is None
         or str(operation["id"]) != operation_id
         or operation["release_kind"] != "pinned_thread"
         or operation["wake_ready_at"] is None
@@ -793,8 +800,10 @@ async def prepare_woken_pinned_session(
         except (TypeError, ValueError):
             return False
     if (
-        authority is None or thread.get("execution_lane") != LANE_PINNED
-        or not isinstance(vm, dict) or not isinstance(proof, dict)
+        authority is None
+        or thread.get("execution_lane") != LANE_PINNED
+        or not isinstance(vm, dict)
+        or not isinstance(proof, dict)
         or vm.get("status") != "ready"
         or vm.get("identity_authenticated") is not True
         or vm.get("provision_generation") != proof.get("generation")
@@ -813,10 +822,16 @@ async def prepare_woken_pinned_session(
         validate_config_name(boot_name)
     except (HTTPException, InvalidConfigNameError):
         return False
-    return bool(await _do_prepare(
-        thread_id, str(thread["user_id"]), boot_name, None, authority,
-        dependencies=dependencies,
-    ))
+    return bool(
+        await _do_prepare(
+            thread_id,
+            str(thread["user_id"]),
+            boot_name,
+            None,
+            authority,
+            dependencies=dependencies,
+        )
+    )
 
 
 async def _provision_agent_for_thread(

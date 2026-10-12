@@ -305,7 +305,9 @@ async def test_primary_resume_endpoint_hydrates_non_default_expert_tools(monkeyp
 @pytest.mark.parametrize("variant", ["primary", "dual"])
 @pytest.mark.parametrize("operator_feedback", [None, "Continue with the approved plan"])
 async def test_pinned_resume_delivers_delegation_results_to_agent(
-    monkeypatch, variant, operator_feedback,
+    monkeypatch,
+    variant,
+    operator_feedback,
 ):
     results = [{"job_id": "child-1", "status": "completed", "summary": "done"}]
     if variant == "dual":
@@ -320,17 +322,25 @@ async def test_pinned_resume_delivers_delegation_results_to_agent(
         monkeypatch.setattr(module, "_current_job_id", None)
         monkeypatch.setattr(module, "_current_job_task", None)
         monkeypatch.setattr(module, "_shutdown_requested", False)
-        monkeypatch.setattr(module, "_orchestrator_client", SimpleNamespace(
-            agent_id=AGENT_ID, dispatch_process_generation=PROCESS_GENERATION,
-        ))
+        monkeypatch.setattr(
+            module,
+            "_orchestrator_client",
+            SimpleNamespace(
+                agent_id=AGENT_ID,
+                dispatch_process_generation=PROCESS_GENERATION,
+            ),
+        )
         monkeypatch.setattr(module, "_setup_job_file_logging", MagicMock())
         monkeypatch.setattr(module, "_cleanup_job_file_handler", MagicMock())
         module._stop_requested.clear()
 
     request = JobResumeRequest(
-        job_id="j-delegation", previous_status="paused",
-        config_override=_sandbox_config(), workspace_runtime=_sandbox_runtime(),
-        recipient=_recipient("j-delegation"), delegation_results=results,
+        job_id="j-delegation",
+        previous_status="paused",
+        config_override=_sandbox_config(),
+        workspace_runtime=_sandbox_runtime(),
+        recipient=_recipient("j-delegation"),
+        delegation_results=results,
         feedback=operator_feedback,
         feedback_reason="Human approval" if operator_feedback else None,
         pinned_delivery_id=UUID("33333333-3333-4333-8333-333333333333"),
@@ -348,14 +358,21 @@ async def test_pinned_resume_delivers_delegation_results_to_agent(
 
     assert response.pinned_delivery_id == request.pinned_delivery_id
     assert response.pinned_projection_digest == digest
-    assert module._orchestrator_client.pinned_delivery_id == str(request.pinned_delivery_id)
-    assert agent.process_job.await_args.kwargs["metadata"]["delegation_results"] == results
+    assert module._orchestrator_client.pinned_delivery_id == str(
+        request.pinned_delivery_id
+    )
+    assert (
+        agent.process_job.await_args.kwargs["metadata"]["delegation_results"] == results
+    )
     assert '"job_id": "child-1"' in agent.process_job.await_args.kwargs["feedback"]
     if operator_feedback:
-        assert agent.process_job.await_args.kwargs["feedback"].startswith(operator_feedback)
+        assert agent.process_job.await_args.kwargs["feedback"].startswith(
+            operator_feedback
+        )
     assert agent.process_job.await_args.kwargs["feedback_reason"] == (
-        "Human approval" if operator_feedback else
-        "Completed delegated jobs returned to the parent."
+        "Human approval"
+        if operator_feedback
+        else "Completed delegated jobs returned to the parent."
     )
     # The actual checkpoint-resume consumer receives model-visible child
     # results; merely retaining them in process_job metadata would not do so.
@@ -365,10 +382,14 @@ async def test_pinned_resume_delivers_delegation_results_to_agent(
     consumer._graph = SimpleNamespace(aupdate_state=AsyncMock())
     call = agent.process_job.await_args.kwargs
     await consumer._inject_resume_feedback(
-        job_id="j-delegation", stateless_worker=False,
-        graph_input=None, thread_config={"configurable": {"thread_id": "j-delegation"}},
-        checkpoint_values={}, feedback=call["feedback"],
-        feedback_reason=call["feedback_reason"], metadata=call["metadata"],
+        job_id="j-delegation",
+        stateless_worker=False,
+        graph_input=None,
+        thread_config={"configurable": {"thread_id": "j-delegation"}},
+        checkpoint_values={},
+        feedback=call["feedback"],
+        feedback_reason=call["feedback_reason"],
+        metadata=call["metadata"],
     )
     injected = consumer._graph.aupdate_state.await_args.args[1]
     assert '"job_id": "child-1"' in injected["resume_feedback"]

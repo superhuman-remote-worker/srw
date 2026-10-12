@@ -1043,7 +1043,9 @@ async def test_carrier_completion_racing_parent_validation_does_not_reauthorize_
 
 
 @pytest.mark.asyncio
-async def test_carrier_completion_waits_for_owner_without_locking_child(db, monkeypatch):
+async def test_carrier_completion_waits_for_owner_without_locking_child(
+    db, monkeypatch
+):
     import asyncio
 
     case, physical = await settled(db, monkeypatch)
@@ -1068,6 +1070,7 @@ async def test_carrier_completion_waits_for_owner_without_locking_child(db, monk
                 )
             )
             async with db.acquire() as observer:
+
                 async def wait_for_blocked_completion():
                     while not await observer.fetchval(
                         "SELECT EXISTS(SELECT 1 FROM pg_stat_activity "
@@ -1084,11 +1087,14 @@ async def test_carrier_completion_waits_for_owner_without_locking_child(db, monk
                 # must be able to read/lock the child. Row-first completion
                 # deadlocks with the established owner-first validation path.
                 async with observer.transaction():
-                    assert await observer.fetchval(
-                        "SELECT id FROM vm_workspace_cleanup_admissions "
-                        "WHERE id=$1 FOR UPDATE NOWAIT",
-                        child.admission_id,
-                    ) == child.admission_id
+                    assert (
+                        await observer.fetchval(
+                            "SELECT id FROM vm_workspace_cleanup_admissions "
+                            "WHERE id=$1 FOR UPDATE NOWAIT",
+                            child.admission_id,
+                        )
+                        == child.admission_id
+                    )
         assert await asyncio.wait_for(task, 5)
     finally:
         if task is not None:

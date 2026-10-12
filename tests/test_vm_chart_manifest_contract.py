@@ -225,22 +225,30 @@ def test_vm_controller_datavolume_source_cas_permission_is_namespaced(
 ) -> None:
     rendered = documents(render_chart(MAIN, namespace=namespace))
     role = next(
-        doc for doc in rendered
+        doc
+        for doc in rendered
         if doc.get("kind") == "Role"
         and doc["metadata"]["name"].endswith("-vm-controller")
     )
     assert role["metadata"]["namespace"] == namespace
     datavolume_rules = [
-        rule for rule in role["rules"]
+        rule
+        for rule in role["rules"]
         if rule["apiGroups"] == ["cdi.kubevirt.io"]
         and rule["resources"] == ["datavolumes"]
     ]
     assert len(datavolume_rules) == 1
     assert set(datavolume_rules[0]["verbs"]) == {
-        "get", "list", "create", "delete", "patch", "update",
+        "get",
+        "list",
+        "create",
+        "delete",
+        "patch",
+        "update",
     }
     binding = next(
-        doc for doc in rendered
+        doc
+        for doc in rendered
         if doc.get("kind") == "RoleBinding"
         and doc["metadata"]["name"] == role["metadata"]["name"]
     )
@@ -248,7 +256,8 @@ def test_vm_controller_datavolume_source_cas_permission_is_namespaced(
     assert binding["subjects"][0]["namespace"] == namespace
     assert all(
         "datavolumes" not in rule.get("resources", [])
-        for doc in rendered if doc.get("kind") == "ClusterRole"
+        for doc in rendered
+        if doc.get("kind") == "ClusterRole"
         for rule in doc["rules"]
     )
 

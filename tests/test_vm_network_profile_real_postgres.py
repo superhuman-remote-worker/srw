@@ -25,7 +25,9 @@ IMAGE = "registry.example/srw-vm@sha256:" + "a" * 64
 
 
 @pytest.mark.asyncio
-async def test_new_ordinary_disk_freezes_selected_profile_and_lost_reply_replays(db, monkeypatch):
+async def test_new_ordinary_disk_freezes_selected_profile_and_lost_reply_replays(
+    db, monkeypatch
+):
     monkeypatch.setenv("VM_NETWORK_PROFILE_ENABLED", "true")
     monkeypatch.setenv("VM_NETWORK_PROFILE_IMAGE_ALLOWLIST", IMAGE)
     job = await initial_job(db)
@@ -45,7 +47,9 @@ async def test_new_ordinary_disk_freezes_selected_profile_and_lost_reply_replays
 
 
 @pytest.mark.asyncio
-async def test_default_off_and_mutable_image_leave_ordinary_first_create_unchanged(db, monkeypatch):
+async def test_default_off_and_mutable_image_leave_ordinary_first_create_unchanged(
+    db, monkeypatch
+):
     monkeypatch.setenv("VM_NETWORK_PROFILE_ENABLED", "false")
     monkeypatch.setenv("VM_NETWORK_PROFILE_IMAGE_ALLOWLIST", IMAGE)
     job = await initial_job(db)
@@ -71,15 +75,25 @@ async def test_native_instance_profile_is_closed_and_immutable(db):
         "INSERT INTO users(display_name,is_approved) VALUES('Profile owner',TRUE) RETURNING id"
     )
     uid = uuid4()
-    state = {"storage": {"uid": str(uid), "generation": 1, "pvc_uid": None,
-                         "owner_id": str(uuid4()), "owner_kind": "job"},
-             "network_profile": NETWORK_PROFILE}
+    state = {
+        "storage": {
+            "uid": str(uid),
+            "generation": 1,
+            "pvc_uid": None,
+            "owner_id": str(uuid4()),
+            "owner_kind": "job",
+        },
+        "network_profile": NETWORK_PROFILE,
+    }
     await db.execute(
         "INSERT INTO srw_workspace_instances "
         "(id,owner_id,recipe,revision,pvc_name,generation,backend_state) "
         "VALUES($1,$2,$3::jsonb,'profile',$4,1,$5::jsonb)",
-        uid, user, json.dumps({"backend": "vm", "retention": "Retain"}),
-        "srw-ws-" + uid.hex, json.dumps(state),
+        uid,
+        user,
+        json.dumps({"backend": "vm", "retention": "Retain"}),
+        "srw-ws-" + uid.hex,
+        json.dumps(state),
     )
     before = await db.fetchval(
         "SELECT backend_state FROM srw_workspace_instances WHERE id=$1", uid
@@ -91,29 +105,38 @@ async def test_native_instance_profile_is_closed_and_immutable(db):
         with pytest.raises(asyncpg.CheckViolationError):
             await db.execute(
                 "UPDATE srw_workspace_instances SET backend_state=$2::jsonb WHERE id=$1",
-                uid, json.dumps(altered),
+                uid,
+                json.dumps(altered),
             )
-    assert await db.fetchval(
-        "SELECT backend_state FROM srw_workspace_instances WHERE id=$1", uid
-    ) == before
+    assert (
+        await db.fetchval(
+            "SELECT backend_state FROM srw_workspace_instances WHERE id=$1", uid
+        )
+        == before
+    )
     legacy_uid = uuid4()
     await db.execute(
         "INSERT INTO srw_workspace_instances "
         "(id,owner_id,recipe,revision,pvc_name,generation,backend_state) "
         "VALUES($1,$2,$3::jsonb,'legacy',$4,1,$5::jsonb)",
-        legacy_uid, user, json.dumps({"backend": "vm", "retention": "Retain"}),
+        legacy_uid,
+        user,
+        json.dumps({"backend": "vm", "retention": "Retain"}),
         "srw-ws-" + legacy_uid.hex,
         json.dumps({"storage": {**state["storage"], "uid": str(legacy_uid)}}),
     )
     with pytest.raises(asyncpg.CheckViolationError):
         await db.execute(
             "UPDATE srw_workspace_instances SET backend_state=backend_state || $2::jsonb WHERE id=$1",
-            legacy_uid, json.dumps({"network_profile": NETWORK_PROFILE}),
+            legacy_uid,
+            json.dumps({"network_profile": NETWORK_PROFILE}),
         )
 
 
 @pytest.mark.asyncio
-async def test_idle_release_holds_legacy_and_unproven_profile_before_stop(db, monkeypatch):
+async def test_idle_release_holds_legacy_and_unproven_profile_before_stop(
+    db, monkeypatch
+):
     from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
     from tests.test_vm_idle_lifecycle_real_postgres import seed_wait, _schema
 
@@ -130,29 +153,50 @@ async def test_idle_release_holds_legacy_and_unproven_profile_before_stop(db, mo
     await _schema(db)
     store = VMIdleLifecycleStore(db)
     legacy, idle, identity = await seed_wait(db, proven_profile=False)
-    assert await store.admit_release(
-        str(legacy), episode_id=idle.episode_id,
-        revision=idle.revision, identity=identity,
-    ) is None
+    assert (
+        await store.admit_release(
+            str(legacy),
+            episode_id=idle.episode_id,
+            revision=idle.revision,
+            identity=identity,
+        )
+        is None
+    )
     monkeypatch.setenv("VM_NETWORK_PROFILE_ENABLED", "false")
-    assert await store.admit_release(
-        str(legacy), episode_id=idle.episode_id,
-        revision=idle.revision, identity=identity,
-    ) is None
+    assert (
+        await store.admit_release(
+            str(legacy),
+            episode_id=idle.episode_id,
+            revision=idle.revision,
+            identity=identity,
+        )
+        is None
+    )
     monkeypatch.setenv("VM_NETWORK_PROFILE_ENABLED", "true")
-    assert json.loads(await db.fetchval("SELECT context FROM jobs WHERE id=$1", legacy))["vm"]["status"] == "ready"
+    assert (
+        json.loads(await db.fetchval("SELECT context FROM jobs WHERE id=$1", legacy))[
+            "vm"
+        ]["status"]
+        == "ready"
+    )
     owner, idle, identity = await seed_wait(
-        db, original_options={"vm_image": IMAGE, "network_profile": NETWORK_PROFILE},
+        db,
+        original_options={"vm_image": IMAGE, "network_profile": NETWORK_PROFILE},
         proven_profile=False,
     )
-    context = json.loads(await db.fetchval("SELECT context FROM jobs WHERE id=$1", owner))
+    context = json.loads(
+        await db.fetchval("SELECT context FROM jobs WHERE id=$1", owner)
+    )
     preflight = context["vm"]["creation_preflight"]
     admission = uuid4()
     await db.execute(
         "INSERT INTO vm_workspace_cleanup_admissions "
         "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,completed_at,outcome) "
         "VALUES($1,'job',$2,$3,'network-profile-test',$4,'test',clock_timestamp(),'completed')",
-        admission, owner, identity["pvc_uid"], uuid4(),
+        admission,
+        owner,
+        identity["pvc_uid"],
+        uuid4(),
     )
     await db.execute(
         "INSERT INTO vm_creation_retries "
@@ -160,16 +204,29 @@ async def test_idle_release_holds_legacy_and_unproven_profile_before_stop(db, mo
         "controller_configuration_digest,execution_id,execution_revision,execution_generation,"
         "admission_deadline,creation_admission_id,state,observed_vm_uid,observed_pvc_uid,resolved_at) "
         "VALUES($1,$2,$3,'initial',$4,$5::jsonb,$6,$7,$8,$9,$10,$11,'succeeded',$12,$13,clock_timestamp())",
-        preflight["request_id"], owner, identity["generation"], preflight["request_digest"],
-        json.dumps(preflight["request"]), "sha256:" + "a" * 64,
-        preflight["execution_id"], preflight["execution_revision"],
-        preflight["execution_generation"], datetime.fromisoformat(preflight["admission_deadline"]),
-        admission, identity["vm_uid"], identity["pvc_uid"],
+        preflight["request_id"],
+        owner,
+        identity["generation"],
+        preflight["request_digest"],
+        json.dumps(preflight["request"]),
+        "sha256:" + "a" * 64,
+        preflight["execution_id"],
+        preflight["execution_revision"],
+        preflight["execution_generation"],
+        datetime.fromisoformat(preflight["admission_deadline"]),
+        admission,
+        identity["vm_uid"],
+        identity["pvc_uid"],
     )
-    assert await store.admit_release(
-        str(owner), episode_id=idle.episode_id,
-        revision=idle.revision, identity=identity,
-    ) is None
+    assert (
+        await store.admit_release(
+            str(owner),
+            episode_id=idle.episode_id,
+            revision=idle.revision,
+            identity=identity,
+        )
+        is None
+    )
     evidence = {
         "profile": NETWORK_PROFILE,
         "provision_generation": identity["generation"],
@@ -186,22 +243,35 @@ async def test_idle_release_holds_legacy_and_unproven_profile_before_stop(db, mo
     context["vm"]["network_profile_evidence"] = {
         key: value for key, value in evidence.items() if key != "network_file_sha256"
     }
-    await db.execute("UPDATE jobs SET context=$2::jsonb WHERE id=$1", owner, json.dumps(context))
-    assert await store.admit_release(
-        str(owner), episode_id=idle.episode_id,
-        revision=idle.revision, identity=identity,
-    ) is None
+    await db.execute(
+        "UPDATE jobs SET context=$2::jsonb WHERE id=$1", owner, json.dumps(context)
+    )
+    assert (
+        await store.admit_release(
+            str(owner),
+            episode_id=idle.episode_id,
+            revision=idle.revision,
+            identity=identity,
+        )
+        is None
+    )
     context["vm"]["network_profile_evidence"] = evidence
-    await db.execute("UPDATE jobs SET context=$2::jsonb WHERE id=$1", owner, json.dumps(context))
+    await db.execute(
+        "UPDATE jobs SET context=$2::jsonb WHERE id=$1", owner, json.dumps(context)
+    )
     operation = await store.admit_release(
-        str(owner), episode_id=idle.episode_id,
-        revision=idle.revision, identity=identity,
+        str(owner),
+        episode_id=idle.episode_id,
+        revision=idle.revision,
+        identity=identity,
     )
     assert operation is not None and operation["phase"] == "releasing"
 
 
 @pytest.mark.asyncio
-async def test_idle_release_holds_forged_original_profile_lineage_before_stop(db, monkeypatch):
+async def test_idle_release_holds_forged_original_profile_lineage_before_stop(
+    db, monkeypatch
+):
     from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
     from tests.test_vm_idle_lifecycle_real_postgres import seed_wait, _schema
 
@@ -216,16 +286,25 @@ async def test_idle_release_holds_forged_original_profile_lineage_before_stop(db
         monkeypatch.setenv(key, value)
     await _schema(db)
     owner, idle, identity = await seed_wait(db)
-    vm = json.loads(await db.fetchval("SELECT context->'vm' FROM jobs WHERE id=$1", owner))
+    vm = json.loads(
+        await db.fetchval("SELECT context->'vm' FROM jobs WHERE id=$1", owner)
+    )
     prior = vm["creation_preflight"]
-    legacy = {key: value for key, value in prior["request"].items() if key != "network_profile"}
+    legacy = {
+        key: value
+        for key, value in prior["request"].items()
+        if key != "network_profile"
+    }
     legacy["provision_generation"] = str(uuid4())
     admission = uuid4()
     await db.execute(
         "INSERT INTO vm_workspace_cleanup_admissions "
         "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,completed_at,outcome) "
         "VALUES($1,'job',$2,$3,'profile-lineage-test',$4,'test',clock_timestamp(),'completed')",
-        admission, owner, identity["pvc_uid"], uuid4(),
+        admission,
+        owner,
+        identity["pvc_uid"],
+        uuid4(),
     )
     await db.execute(
         "INSERT INTO vm_creation_retries "
@@ -235,14 +314,32 @@ async def test_idle_release_holds_forged_original_profile_lineage_before_stop(db
         "resolved_at,created_at) "
         "VALUES($1,$2,$3,'initial',$4,$5::jsonb,$6,$7,$8,$9,$10,$11,'succeeded',$12,$13,"
         "clock_timestamp(),clock_timestamp()-interval '1 hour')",
-        uuid4(), owner, legacy["provision_generation"], canonical_request_digest(legacy),
-        json.dumps(legacy), "sha256:" + "b" * 64, prior["execution_id"],
-        prior["execution_revision"], prior["execution_generation"],
-        datetime.fromisoformat(prior["admission_deadline"]), admission,
-        uuid4(), identity["pvc_uid"],
+        uuid4(),
+        owner,
+        legacy["provision_generation"],
+        canonical_request_digest(legacy),
+        json.dumps(legacy),
+        "sha256:" + "b" * 64,
+        prior["execution_id"],
+        prior["execution_revision"],
+        prior["execution_generation"],
+        datetime.fromisoformat(prior["admission_deadline"]),
+        admission,
+        uuid4(),
+        identity["pvc_uid"],
     )
-    assert await VMIdleLifecycleStore(db).admit_release(
-        str(owner), episode_id=idle.episode_id,
-        revision=idle.revision, identity=identity,
-    ) is None
-    assert json.loads(await db.fetchval("SELECT context->'vm' FROM jobs WHERE id=$1", owner))["status"] == "ready"
+    assert (
+        await VMIdleLifecycleStore(db).admit_release(
+            str(owner),
+            episode_id=idle.episode_id,
+            revision=idle.revision,
+            identity=identity,
+        )
+        is None
+    )
+    assert (
+        json.loads(
+            await db.fetchval("SELECT context->'vm' FROM jobs WHERE id=$1", owner)
+        )["status"]
+        == "ready"
+    )

@@ -41,16 +41,22 @@ from shared.connectors.builtin import needs_knowledge_profile
 from shared.runtime.core.loader import canonical_config_name
 from shared.workspace_contract import WORKSPACE_RUNTIME_CONTEXT_KEY
 from shared.pinned_job_delivery import (
-    pinned_job_delivery_proof, pinned_job_projection_digest,
+    pinned_job_delivery_proof,
+    pinned_job_projection_digest,
 )
 from shared.vm_lifecycle_auth import (
-    LifecycleAuthConfigurationError, configured_secret,
+    LifecycleAuthConfigurationError,
+    configured_secret,
 )
 
 
 async def _pinned_vm_delivery_intent(
-    dependencies: "JobDeliveryDependencies", *, job_id: str, agent_id: str,
-    recipient: Any, payload: dict[str, Any],
+    dependencies: "JobDeliveryDependencies",
+    *,
+    job_id: str,
+    agent_id: str,
+    recipient: Any,
+    payload: dict[str, Any],
     consumed_context: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Add a replayable exact delivery ID only for a supported VM recipient."""
@@ -72,15 +78,21 @@ async def _pinned_vm_delivery_intent(
         return payload, None
     digest = pinned_job_projection_digest(payload)
     intent = await dependencies.store.prepare_pinned_job_delivery(
-        job_id, agent_id, recipient=recipient, projection_digest=digest,
+        job_id,
+        agent_id,
+        recipient=recipient,
+        projection_digest=digest,
         consumed_context=consumed_context,
     )
     if intent is None:
         return None, None
     proof = pinned_job_delivery_proof(
-        secret, delivery_id=str(intent["id"]), agent_id=agent_id,
+        secret,
+        delivery_id=str(intent["id"]),
+        agent_id=agent_id,
         process_generation=recipient.expected_process_generation,
-        pod_uid=recipient.expected_pod_uid, projection_digest=digest,
+        pod_uid=recipient.expected_pod_uid,
+        projection_digest=digest,
     )
     return {
         **payload,
@@ -284,7 +296,9 @@ async def dispatch_job_to_agent(
             return False
         job_start = job_start.model_copy(update={"recipient": target.recipient})
         delivery_payload, delivery_intent = await _pinned_vm_delivery_intent(
-            dependencies, job_id=job_id, agent_id=agent_id,
+            dependencies,
+            job_id=job_id,
+            agent_id=agent_id,
             recipient=target.recipient,
             payload=job_start.model_dump(mode="json", exclude_none=True),
         )
@@ -315,9 +329,10 @@ async def dispatch_job_to_agent(
                 acknowledgement = {}
             if (
                 isinstance(acknowledgement, dict)
-                and acknowledgement.get("pinned_delivery_id") == str(delivery_intent["id"])
+                and acknowledgement.get("pinned_delivery_id")
+                == str(delivery_intent["id"])
                 and acknowledgement.get("pinned_projection_digest")
-                    == delivery_payload["pinned_projection_digest"]
+                == delivery_payload["pinned_projection_digest"]
             ):
                 accepted_delivery_id = str(delivery_intent["id"])
             else:
@@ -328,11 +343,13 @@ async def dispatch_job_to_agent(
 
         if dependencies.completion_commands_enabled():
             if not await dependencies.store.confirm_pinned_job_dispatch(
-                job_id, agent_id,
+                job_id,
+                agent_id,
                 pinned_delivery_id=accepted_delivery_id,
                 pinned_projection_digest=(
                     delivery_payload.get("pinned_projection_digest")
-                    if accepted_delivery_id else None
+                    if accepted_delivery_id
+                    else None
                 ),
             ):
                 dependencies.logger.warning(
@@ -965,19 +982,25 @@ async def resume_job_on_agent(
         delegation_results = job_context.pop("delegation_results", None)
         consumed_context = {}
         if queued_feedback:
-            consumed_context.update({
-                key: original_context[key]
-                for key in (
-                    "queued_feedback", "queued_feedback_reason",
-                    "queued_feedback_delivery_id",
-                ) if key in original_context
-            })
+            consumed_context.update(
+                {
+                    key: original_context[key]
+                    for key in (
+                        "queued_feedback",
+                        "queued_feedback_reason",
+                        "queued_feedback_delivery_id",
+                    )
+                    if key in original_context
+                }
+            )
         if delegation_results:
-            consumed_context.update({
-                key: original_context[key]
-                for key in ("delegation_results", "delegation_results_delivery_id")
-                if key in original_context
-            })
+            consumed_context.update(
+                {
+                    key: original_context[key]
+                    for key in ("delegation_results", "delegation_results_delivery_id")
+                    if key in original_context
+                }
+            )
 
         # The per-job Gitea remote. Without it the agent's pod-handoff clone
         # (resume onto a fresh workspace with no snapshot) can never fire and
@@ -1123,7 +1146,9 @@ async def resume_job_on_agent(
             return False
         resume_payload["recipient"] = target.recipient.model_dump(mode="json")
         delivery_payload, delivery_intent = await _pinned_vm_delivery_intent(
-            dependencies, job_id=job_id, agent_id=agent_id,
+            dependencies,
+            job_id=job_id,
+            agent_id=agent_id,
             recipient=target.recipient,
             payload={k: v for k, v in resume_payload.items() if v is not None},
             consumed_context=consumed_context,
@@ -1173,9 +1198,10 @@ async def resume_job_on_agent(
                 acknowledgement = {}
             if (
                 isinstance(acknowledgement, dict)
-                and acknowledgement.get("pinned_delivery_id") == str(delivery_intent["id"])
+                and acknowledgement.get("pinned_delivery_id")
+                == str(delivery_intent["id"])
                 and acknowledgement.get("pinned_projection_digest")
-                    == delivery_payload["pinned_projection_digest"]
+                == delivery_payload["pinned_projection_digest"]
             ):
                 accepted_delivery_id = str(delivery_intent["id"])
             else:
@@ -1196,7 +1222,8 @@ async def resume_job_on_agent(
                 pinned_delivery_id=accepted_delivery_id,
                 pinned_projection_digest=(
                     delivery_payload.get("pinned_projection_digest")
-                    if accepted_delivery_id else None
+                    if accepted_delivery_id
+                    else None
                 ),
             ):
                 dependencies.logger.warning(

@@ -97,7 +97,9 @@ async def test_attachment_real_authority_adopts_lost_vm_reply(db, attached, canc
     store, row = await bridge(db, attached)
     api.lost.add("VirtualMachine")
     for _ in range(4):
-        assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+        assert (await ctrl._do_create_serialized(payload))[
+            "status"
+        ] == "creation_pending"
         if "VirtualMachine" in api.writes:
             break
     assert api.writes == ["Lease", "Lease", "DataVolume", "Secret", "VirtualMachine"]

@@ -12,13 +12,18 @@ def _node_document(node):
     allocatable = node["allocatable"]
     return {
         "metadata": {
-            "uid": node["uid"], "name": node["name"], "labels": node["labels"],
+            "uid": node["uid"],
+            "name": node["name"],
+            "labels": node["labels"],
         },
         "spec": {"unschedulable": node["unschedulable"], "taints": node["taints"]},
         "status": {
-            "conditions": [{
-                "type": "Ready", "status": "True" if node["ready"] else "False",
-            }],
+            "conditions": [
+                {
+                    "type": "Ready",
+                    "status": "True" if node["ready"] else "False",
+                }
+            ],
             "allocatable": {
                 "cpu": str(allocatable["cpu_millicores"]) + "m",
                 "memory": str(allocatable["memory_bytes"]),
@@ -44,7 +49,8 @@ def validate_resource_effect_node(snapshot, *, grant, resource, expected_pvc_uid
         ):
             raise ValueError
         matches = [
-            node for node in snapshot["nodes"]
+            node
+            for node in snapshot["nodes"]
             if node["uid"] == grant["node_uid"] and node["name"] == grant["node_name"]
         ]
         if len(matches) != 1:
@@ -62,37 +68,49 @@ def validate_resource_effect_node(snapshot, *, grant, resource, expected_pvc_uid
             raise ValueError
         profile = resource["template_profile"]
         classes = [
-            item for item in snapshot["storage_classes"]
+            item
+            for item in snapshot["storage_classes"]
             if item["name"] == profile["storage_class"]
         ]
         if len(classes) != 1:
             raise ValueError
         selected = _node_document(node)
-        if node_exclusion(
-            selected, selector=profile["selector"],
-            tolerations=profile["tolerations"],
-            required_affinity=profile["required_affinity"],
-            pv_affinity=classes[0]["allowed_topology"],
-        ) is not None:
+        if (
+            node_exclusion(
+                selected,
+                selector=profile["selector"],
+                tolerations=profile["tolerations"],
+                required_affinity=profile["required_affinity"],
+                pv_affinity=classes[0]["allowed_topology"],
+            )
+            is not None
+        ):
             raise ValueError
         if expected_pvc_uid is not None:
             pvcs = [
-                item for item in snapshot["pvcs"]
-                if item["uid"] == expected_pvc_uid
+                item for item in snapshot["pvcs"] if item["uid"] == expected_pvc_uid
             ]
-            if len(pvcs) != 1 or pvcs[0]["phase"] != "Bound" or (
-                pvcs[0]["storage_class_uid"] != classes[0]["uid"]
+            if (
+                len(pvcs) != 1
+                or pvcs[0]["phase"] != "Bound"
+                or (pvcs[0]["storage_class_uid"] != classes[0]["uid"])
             ):
                 raise ValueError
             pvs = [
-                item for item in snapshot["pvs"]
+                item
+                for item in snapshot["pvs"]
                 if item["uid"] == pvcs[0]["pv_uid"]
                 and item["name"] == pvcs[0]["pv_name"]
                 and item["claim_uid"] == expected_pvc_uid
             ]
-            if len(pvs) != 1 or node_exclusion(
-                selected, pv_affinity=pvs[0]["required_affinity"],
-            ) is not None:
+            if (
+                len(pvs) != 1
+                or node_exclusion(
+                    selected,
+                    pv_affinity=pvs[0]["required_affinity"],
+                )
+                is not None
+            ):
                 raise ValueError
     except (ValueError, KeyError, TypeError, ResourceAdmissionError):
         raise ResourceAdmissionError("resource_node_changed") from None

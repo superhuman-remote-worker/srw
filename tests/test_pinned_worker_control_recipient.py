@@ -172,10 +172,12 @@ async def test_same_job_start_retry_refuses_a_different_delivery(worker_runtime)
     )
     module._orchestrator_client.pinned_projection_digest = digest
     module._orchestrator_client.pinned_delivery_proof = DELIVERY_PROOF
-    request = baseline.model_copy(update={
-        "pinned_delivery_id": UUID(OTHER_DELIVERY_ID),
-        "pinned_projection_digest": digest,
-    })
+    request = baseline.model_copy(
+        update={
+            "pinned_delivery_id": UUID(OTHER_DELIVERY_ID),
+            "pinned_projection_digest": digest,
+        }
+    )
 
     with pytest.raises(HTTPException) as refused:
         if module.__name__.endswith("dual_app"):
@@ -194,8 +196,10 @@ async def test_same_job_start_retry_refuses_a_different_delivery(worker_runtime)
 async def test_same_job_start_retry_echoes_only_its_exact_projection(worker_runtime):
     module, routes = worker_runtime
     baseline = JobStartRequest(
-        job_id=JOB_ID, description="exact accepted projection",
-        recipient=_recipient(), pinned_delivery_id=DELIVERY_ID,
+        job_id=JOB_ID,
+        description="exact accepted projection",
+        recipient=_recipient(),
+        pinned_delivery_id=DELIVERY_ID,
         pinned_delivery_proof=DELIVERY_PROOF,
     )
     digest = pinned_job_projection_digest(
@@ -229,8 +233,10 @@ async def test_same_job_start_retry_echoes_only_its_exact_projection(worker_runt
 async def test_same_job_resume_retry_echoes_only_its_exact_projection(worker_runtime):
     module, routes = worker_runtime
     baseline = JobResumeRequest(
-        job_id=JOB_ID, recipient=_recipient(),
-        pinned_delivery_id=DELIVERY_ID, pinned_delivery_proof=DELIVERY_PROOF,
+        job_id=JOB_ID,
+        recipient=_recipient(),
+        pinned_delivery_id=DELIVERY_ID,
+        pinned_delivery_proof=DELIVERY_PROOF,
     )
     digest = pinned_job_projection_digest(
         baseline.model_dump(mode="json", exclude_none=True)

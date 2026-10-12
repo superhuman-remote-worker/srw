@@ -40,7 +40,8 @@ def full_policy_values(tmp_path, *, mutate=None):
 
     policy = whole_launcher_policy()["policy"]
     policy.update(
-        stableClusterId="test-cluster", shadowEnabled=True,
+        stableClusterId="test-cluster",
+        shadowEnabled=True,
         enforcementEnabled=True,
     )
     policy["inventory"]["maxItems"] = 1000
@@ -64,29 +65,44 @@ def render_full_policy(tmp_path, *, mutate=None):
     path = full_policy_values(tmp_path, mutate=mutate)
     return subprocess.run(
         [
-            "helm", "template", "resource-test",
+            "helm",
+            "template",
+            "resource-test",
             str(Path(__file__).resolve().parents[1] / "helm"),
-            "-n", "control-plane", "-f",
+            "-n",
+            "control-plane",
+            "-f",
             str(Path(__file__).resolve().parents[1] / "helm/ci/test-values.yaml"),
-            "-f", str(path),
+            "-f",
+            str(path),
         ],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
 
 
 @pytest.mark.parametrize("kubevirt_version", ["v1.6.6", "v1.8.4"])
-def test_explicit_whole_resource_policy_renders_one_valid_shared_document(tmp_path, kubevirt_version):
+def test_explicit_whole_resource_policy_renders_one_valid_shared_document(
+    tmp_path, kubevirt_version
+):
     from shared.vm_resource_policy import validate_enforcement_resource_policy
     from tests.test_helm_vm_workspace_recovery import _env, _orchestrator
 
-    rendered = render_full_policy(tmp_path, mutate=lambda values: values["vm"]["resourceAdmission"]["launcherProfile"].update(
-        kubevirtVersion=kubevirt_version,
-        costAlgorithm=f"kubevirt-{kubevirt_version}-amd64-ordinary-pvc-v1",
-    ))
+    rendered = render_full_policy(
+        tmp_path,
+        mutate=lambda values: values["vm"]["resourceAdmission"][
+            "launcherProfile"
+        ].update(
+            kubevirtVersion=kubevirt_version,
+            costAlgorithm=f"kubevirt-{kubevirt_version}-amd64-ordinary-pvc-v1",
+        ),
+    )
     assert rendered.returncode == 0, rendered.stderr
     docs = [doc for doc in yaml.safe_load_all(rendered.stdout) if doc]
     controller = next(
-        doc for doc in docs if doc["kind"] == "Deployment"
+        doc
+        for doc in docs
+        if doc["kind"] == "Deployment"
         and doc["metadata"]["name"].endswith("vm-controller")
     )
     orchestrator = _orchestrator(docs)
@@ -104,9 +120,18 @@ def test_explicit_whole_resource_policy_renders_one_valid_shared_document(tmp_pa
 @pytest.mark.parametrize(
     "case",
     [
-        "shadow_only", "enforcement_only", "retry_disabled", "ack_missing",
-        "budget_missing", "host_cost_zero", "profile_missing",
-        "profile_unsupported", "profile_version_unknown", "profile_algorithm_mismatch", "arch_label_missing", "installation_missing",
+        "shadow_only",
+        "enforcement_only",
+        "retry_disabled",
+        "ack_missing",
+        "budget_missing",
+        "host_cost_zero",
+        "profile_missing",
+        "profile_unsupported",
+        "profile_version_unknown",
+        "profile_algorithm_mismatch",
+        "arch_label_missing",
+        "installation_missing",
     ],
 )
 def test_incomplete_whole_resource_policy_is_rejected(tmp_path, case):
@@ -130,7 +155,9 @@ def test_incomplete_whole_resource_policy_is_rejected(tmp_path, case):
             policy["launcherProfile"]["architecture"] = "arm64"
         elif case == "profile_version_unknown":
             policy["launcherProfile"]["kubevirtVersion"] = "v1.8.5"
-            policy["launcherProfile"]["costAlgorithm"] = "kubevirt-v1.8.5-amd64-ordinary-pvc-v1"
+            policy["launcherProfile"]["costAlgorithm"] = (
+                "kubevirt-v1.8.5-amd64-ordinary-pvc-v1"
+            )
         elif case == "profile_algorithm_mismatch":
             policy["launcherProfile"]["kubevirtVersion"] = "v1.8.4"
         elif case == "arch_label_missing":
@@ -152,10 +179,15 @@ def test_reused_values_without_resource_admission_map_render_disabled(tmp_path):
     values_path.write_text(values[:start] + values[end:])
     rendered = subprocess.run(
         [
-            "helm", "template", "legacy-resource", str(chart),
-            "-f", str(chart / "ci/test-values.yaml"),
+            "helm",
+            "template",
+            "legacy-resource",
+            str(chart),
+            "-f",
+            str(chart / "ci/test-values.yaml"),
         ],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     assert rendered.returncode == 0, rendered.stderr
     docs = [doc for doc in yaml.safe_load_all(rendered.stdout) if doc]
@@ -169,7 +201,8 @@ def test_default_off_has_no_broad_observer_role_or_policy_env():
     )
     assert "VM_RESOURCE_ADMISSION_CONFIG" not in _env(docs, _orchestrator(docs))
     assert not any(
-        doc["kind"] == "Role" and doc["metadata"]["name"].endswith("resource-installation")
+        doc["kind"] == "Role"
+        and doc["metadata"]["name"].endswith("resource-installation")
         for doc in docs
     )
 
@@ -194,13 +227,29 @@ def test_whole_launcher_policy_is_one_digest_and_exact_namespaced_rbac(tmp_path)
     path = tmp_path / "whole-resource-values.yaml"
     path.write_text(yaml.safe_dump(value))
     result = subprocess.run(
-        ["helm", "template", "native-test", str(Path(__file__).resolve().parents[1] / "helm"),
-         "-n", "control-plane", "-f", str(Path(__file__).resolve().parents[1] / "helm/ci/test-values.yaml"),
-         "-f", str(path)],
-        capture_output=True, text=True, check=True,
+        [
+            "helm",
+            "template",
+            "native-test",
+            str(Path(__file__).resolve().parents[1] / "helm"),
+            "-n",
+            "control-plane",
+            "-f",
+            str(Path(__file__).resolve().parents[1] / "helm/ci/test-values.yaml"),
+            "-f",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
     )
     docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
-    controller = next(doc for doc in docs if doc["kind"] == "Deployment" and doc["metadata"]["name"].endswith("vm-controller"))
+    controller = next(
+        doc
+        for doc in docs
+        if doc["kind"] == "Deployment"
+        and doc["metadata"]["name"].endswith("vm-controller")
+    )
     left = _env(docs, _orchestrator(docs))["VM_RESOURCE_ADMISSION_CONFIG"]
     right = _env(docs, controller)["VM_RESOURCE_ADMISSION_CONFIG"]
     assert left == right

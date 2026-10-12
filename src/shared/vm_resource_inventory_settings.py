@@ -35,7 +35,9 @@ _POLICY_FIELDS = {
     "fairness",
 }
 _WHOLE_POLICY_FIELDS = _POLICY_FIELDS | {
-    "launcherProfile", "installationBudget", "ownerBudget"
+    "launcherProfile",
+    "installationBudget",
+    "ownerBudget",
 }
 
 
@@ -106,7 +108,8 @@ class InventorySettings:
                 raise ValueError
             policy = value["policy"]
             if not isinstance(policy, dict) or set(policy) not in (
-                _POLICY_FIELDS, _WHOLE_POLICY_FIELDS
+                _POLICY_FIELDS,
+                _WHOLE_POLICY_FIELDS,
             ):
                 raise ValueError
             for field in (
@@ -159,8 +162,10 @@ class InventorySettings:
                 if (
                     not isinstance(kubevirt_namespace, str)
                     or not isinstance(kubevirt_name, str)
-                    or not kubevirt_namespace or not kubevirt_name
-                    or len(kubevirt_namespace) > 63 or len(kubevirt_name) > 253
+                    or not kubevirt_namespace
+                    or not kubevirt_name
+                    or len(kubevirt_namespace) > 63
+                    or len(kubevirt_name) > 253
                 ):
                     raise ValueError
             elif kubevirt_namespace is not None or kubevirt_name is not None:

@@ -122,11 +122,14 @@ async def test_thread_disposition_transport_uses_immutable_thread_source_identit
     row, _ = replay_fixture()
     thread_id = uuid4()
     row.update(
-        owner_kind="thread", thread_id=thread_id, job_id=None,
+        owner_kind="thread",
+        thread_id=thread_id,
+        job_id=None,
         state="cancel_requested",
     )
     row["canonical_request"].update(
-        entity_type="thread", job_id=str(thread_id),
+        entity_type="thread",
+        job_id=str(thread_id),
     )
     row["request_digest"] = canonical_request_digest(row["canonical_request"])
     expected = disposition_identity(row)
@@ -137,16 +140,26 @@ async def test_thread_disposition_transport_uses_immutable_thread_source_identit
         payload = unsigned_payload(json)
         assert payload == expected
         reply = sign_payload(
-            {**payload, "status": "creation_disposition_pending",
-             "reason": "creation_disposition_pending"},
-            direction="response", operation="creation_retry_dispose",
-            secret=SECRET, correlation_id=json[AUTH_FIELD]["request_id"],
+            {
+                **payload,
+                "status": "creation_disposition_pending",
+                "reason": "creation_disposition_pending",
+            },
+            direction="response",
+            operation="creation_retry_dispose",
+            secret=SECRET,
+            correlation_id=json[AUTH_FIELD]["request_id"],
         )
         return httpx.Response(
-            200, json=reply,
+            200,
+            json=reply,
             request=httpx.Request("POST", "http://controller" + path),
         )
 
-    assert (await dispose_vm_creation(
-        SimpleNamespace(post=post), row, secret=SECRET,
-    ))["outcome"] == "observation_wait"
+    assert (
+        await dispose_vm_creation(
+            SimpleNamespace(post=post),
+            row,
+            secret=SECRET,
+        )
+    )["outcome"] == "observation_wait"

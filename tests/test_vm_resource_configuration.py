@@ -94,7 +94,9 @@ def test_v3_inner_v2_recomputes_prediction_reserve_and_preserves_old_digest():
         with pytest.raises(ValueError):
             canonical_configuration_digest(changed)
     under = deepcopy(doc)
-    under["resource_admission"]["host_mapping"]["policy"]["ephemeralStorageReserveBytes"] = 1
+    under["resource_admission"]["host_mapping"]["policy"][
+        "ephemeralStorageReserveBytes"
+    ] = 1
     under["resource_admission"]["host_mapping"]["vector"]["ephemeral_storage_bytes"] = 1
     with pytest.raises(ValueError):
         canonical_configuration_digest(under)
@@ -261,7 +263,9 @@ def test_resolver_opt_in_is_private_typed_and_no_policy_keeps_v1(resolver_inputs
 
 @pytest.mark.parametrize("kubevirt_version", ["v1.6.6", "v1.8.4"])
 def test_operator_enforcement_selects_v3_on_actual_configuration_resolver(
-    resolver_inputs, monkeypatch, kubevirt_version,
+    resolver_inputs,
+    monkeypatch,
+    kubevirt_version,
 ):
     from tests.test_vm_resource_policy import whole_launcher_policy
     from vm_controller.creation_configuration import resolve_creation_configuration
@@ -279,14 +283,19 @@ def test_operator_enforcement_selects_v3_on_actual_configuration_resolver(
 
     assert result["controller_configuration"]["version"] == 3
     assert result["controller_configuration"]["resource_admission"]["version"] == 2
-    assert result["controller_configuration"]["resource_admission"]["cluster_id"] == "test-cluster"
+    assert (
+        result["controller_configuration"]["resource_admission"]["cluster_id"]
+        == "test-cluster"
+    )
     resource = result["controller_configuration"]["resource_admission"]
-    assert resource["launcher_prediction"]["algorithm"] == policy["policy"]["launcherProfile"]["costAlgorithm"]
+    assert (
+        resource["launcher_prediction"]["algorithm"]
+        == policy["policy"]["launcherProfile"]["costAlgorithm"]
+    )
     changed = deepcopy(result["controller_configuration"])
     changed["resource_admission"]["launcher_prediction"]["algorithm"] = "unknown"
     with pytest.raises(ValueError):
         canonical_configuration_digest(changed)
-
 
 
 @pytest.mark.parametrize("invalid", [{}, "sha256:" + "a" * 64, False])

@@ -372,7 +372,9 @@ async def test_kube_port_uses_installed_api_client_response_contract():
     from types import SimpleNamespace
 
     from kubernetes.client import ApiClient
-    from orchestrator.operator_cli.vm_recovery_gate_stop_control import KubernetesStopObjects
+    from orchestrator.operator_cli.vm_recovery_gate_stop_control import (
+        KubernetesStopObjects,
+    )
 
     assert "response_types_map" in inspect.signature(ApiClient.call_api).parameters
     doc, state = objects()
@@ -392,7 +394,9 @@ async def test_kube_port_uses_installed_api_client_response_contract():
     def request(method, url, **_kwargs):
         responses.append((method, url))
         if method == "DELETE":
-            return Response(delete_status, None if delete_status == 204 else {"kind": "Status"})
+            return Response(
+                delete_status, None if delete_status == 204 else {"kind": "Status"}
+            )
         if url.endswith("/pods"):
             return Response(200, {"metadata": {}, "items": [state["pod"]]})
         if url.endswith("/virtualmachineinstancemigrations"):
@@ -407,7 +411,9 @@ async def test_kube_port_uses_installed_api_client_response_contract():
     assert (await port.read(doc, "vm"))["metadata"]["uid"] == doc["vm_uid"]
     await port.assert_quiet(doc)
     assert (await port.fixture_objects(doc["namespace"], doc["job_id"]))["vm"]
-    assert (await port.patch(doc, "pod", {"metadata": {"finalizers": []}}))["metadata"]["uid"] == doc["pod_uid"]
+    assert (await port.patch(doc, "pod", {"metadata": {"finalizers": []}}))["metadata"][
+        "uid"
+    ] == doc["pod_uid"]
     for delete_status in (200, 202, 204):
         reply = await port._call(doc, "pod", "DELETE")
         assert reply == (None if delete_status == 204 else {"kind": "Status"})

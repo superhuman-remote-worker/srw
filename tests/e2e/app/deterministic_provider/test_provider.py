@@ -250,10 +250,10 @@ async def test_slow_nonstream_cancelled_client_keeps_response_unconsumed(
     inference: httpx.AsyncClient,
 ) -> None:
     run_id = "slow-nonstream-cancel-001"
-    await arm(control, run_id, scenario="slow-nonstream",
-              nonstream_delay_ms=15_000)
-    request = asyncio.create_task(inference.post(
-        "/v1/chat/completions", json=chat_request(run_id)))
+    await arm(control, run_id, scenario="slow-nonstream", nonstream_delay_ms=15_000)
+    request = asyncio.create_task(
+        inference.post("/v1/chat/completions", json=chat_request(run_id))
+    )
     pending = await _wait_for_pending(store, run_id)
     assert pending["reserved_required_responses"] == 1
     assert pending["remaining_required_responses"] == 0
@@ -280,10 +280,10 @@ async def test_slow_nonstream_releases_one_response_only_after_delay(
     inference: httpx.AsyncClient,
 ) -> None:
     run_id = "slow-nonstream-success-001"
-    await arm(control, run_id, scenario="slow-nonstream",
-              nonstream_delay_ms=15_000)
-    request = asyncio.create_task(inference.post(
-        "/v1/chat/completions", json=chat_request(run_id)))
+    await arm(control, run_id, scenario="slow-nonstream", nonstream_delay_ms=15_000)
+    request = asyncio.create_task(
+        inference.post("/v1/chat/completions", json=chat_request(run_id))
+    )
     pending = await _wait_for_pending(store, run_id)
     assert pending["reserved_required_responses"] == 1
     assert pending["consumed_required_responses"] == 0
@@ -304,24 +304,38 @@ async def test_slow_nonstream_arm_bounds_and_stream_refusal(
     inference: httpx.AsyncClient,
 ) -> None:
     for delay in (14_999, 30_001):
-        response = await control.post("/control/scenarios/slow-nonstream-bound-001/arm",
-            json={"scenario": "slow-nonstream", "required_responses": 1,
-                  "nonstream_delay_ms": delay})
+        response = await control.post(
+            "/control/scenarios/slow-nonstream-bound-001/arm",
+            json={
+                "scenario": "slow-nonstream",
+                "required_responses": 1,
+                "nonstream_delay_ms": delay,
+            },
+        )
         assert response.status_code == 422
     for body in (
         {"scenario": "slow-nonstream", "required_responses": 1},
-        {"scenario": "slow-nonstream", "required_responses": 2,
-         "nonstream_delay_ms": 15_000},
-        {"scenario": "reply", "required_responses": 1,
-         "nonstream_delay_ms": 15_000},
+        {
+            "scenario": "slow-nonstream",
+            "required_responses": 2,
+            "nonstream_delay_ms": 15_000,
+        },
+        {"scenario": "reply", "required_responses": 1, "nonstream_delay_ms": 15_000},
     ):
-        response = await control.post("/control/scenarios/slow-nonstream-bound-001/arm",
-                                      json=body)
+        response = await control.post(
+            "/control/scenarios/slow-nonstream-bound-001/arm", json=body
+        )
         assert response.status_code == 422
-    await arm(control, "slow-nonstream-bound-001", scenario="slow-nonstream",
-              nonstream_delay_ms=15_000)
-    response = await inference.post("/v1/chat/completions",
-        json=chat_request("slow-nonstream-bound-001", stream=True))
+    await arm(
+        control,
+        "slow-nonstream-bound-001",
+        scenario="slow-nonstream",
+        nonstream_delay_ms=15_000,
+    )
+    response = await inference.post(
+        "/v1/chat/completions",
+        json=chat_request("slow-nonstream-bound-001", stream=True),
+    )
     assert response.status_code == 422
     state = await store.state("slow-nonstream-bound-001")
     assert state["pending_calls"] == state["consumed_required_responses"] == 0
@@ -333,15 +347,19 @@ async def test_slow_nonstream_real_http_socket_disconnect_is_cancelled(
     control: httpx.AsyncClient,
 ) -> None:
     run_id = "slow-nonstream-socket-001"
-    await arm(control, run_id, scenario="slow-nonstream",
-              nonstream_delay_ms=15_000)
+    await arm(control, run_id, scenario="slow-nonstream", nonstream_delay_ms=15_000)
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
-    server = uvicorn.Server(uvicorn.Config(
-        create_inference_app(store, inference_api_key=INFERENCE_KEY),
-        host="127.0.0.1", port=port, log_level="critical", lifespan="off",
-    ))
+    server = uvicorn.Server(
+        uvicorn.Config(
+            create_inference_app(store, inference_api_key=INFERENCE_KEY),
+            host="127.0.0.1",
+            port=port,
+            log_level="critical",
+            lifespan="off",
+        )
+    )
     serving = asyncio.create_task(server.serve())
     writer = None
     try:
@@ -352,13 +370,16 @@ async def test_slow_nonstream_real_http_socket_disconnect_is_cancelled(
         assert server.started
         _reader, writer = await asyncio.open_connection("127.0.0.1", port)
         body = json.dumps(chat_request(run_id)).encode()
-        writer.write((
-            f"POST /v1/chat/completions HTTP/1.1\r\n"
-            f"Host: 127.0.0.1\r\n"
-            f"Authorization: Bearer {INFERENCE_KEY}\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: {len(body)}\r\n\r\n"
-        ).encode() + body)
+        writer.write(
+            (
+                f"POST /v1/chat/completions HTTP/1.1\r\n"
+                f"Host: 127.0.0.1\r\n"
+                f"Authorization: Bearer {INFERENCE_KEY}\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n\r\n"
+            ).encode()
+            + body
+        )
         await writer.drain()
         pending = await _wait_for_pending(store, run_id)
         assert pending["reserved_required_responses"] == 1
@@ -388,16 +409,24 @@ async def test_slow_nonstream_keeps_structured_nonrequired_calls_immediate(
     inference: httpx.AsyncClient,
 ) -> None:
     run_id = "slow-nonstream-structured-001"
-    await arm(control, run_id, scenario="slow-nonstream",
-              nonstream_delay_ms=15_000)
-    structured = chat_request(run_id, extra={"response_format": {
-        "type": "json_schema",
-        "json_schema": {"name": "ConversationTitle", "schema": {"type": "object"}},
-    }})
+    await arm(control, run_id, scenario="slow-nonstream", nonstream_delay_ms=15_000)
+    structured = chat_request(
+        run_id,
+        extra={
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "ConversationTitle",
+                    "schema": {"type": "object"},
+                },
+            }
+        },
+    )
     for streaming in (False, True):
         structured["stream"] = streaming
-        response = await asyncio.wait_for(inference.post(
-            "/v1/chat/completions", json=structured), timeout=2)
+        response = await asyncio.wait_for(
+            inference.post("/v1/chat/completions", json=structured), timeout=2
+        )
         assert response.status_code == 200
     state = await store.state(run_id)
     assert state["pending_calls"] == 0
@@ -823,7 +852,9 @@ async def test_worker_job_scenario_fails_closed_without_a_required_tool(
     assert response.json()["error"]["type"] == "required_tool_missing"
 
 
-@pytest.mark.parametrize("proof", ["valid", "reset", "wrong-run", "failed-command", "absent"])
+@pytest.mark.parametrize(
+    "proof", ["valid", "reset", "wrong-run", "failed-command", "absent"]
+)
 async def test_retained_sentinel_worker_requires_real_tool_result(
     control: httpx.AsyncClient,
     inference: httpx.AsyncClient,
@@ -840,12 +871,21 @@ async def test_retained_sentinel_worker_requires_real_tool_result(
         json={"scenario": "retained-sentinel-worker", "sentinel_sha256": digest},
     )
     assert armed.status_code == 201
-    assert (await control.post(
-        f"/control/scenarios/{run_id}/release-completion"
-    )).status_code == 409
+    assert (
+        await control.post(f"/control/scenarios/{run_id}/release-completion")
+    ).status_code == 409
     tools = [
-        {"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
-        for name in ("read_file", "todo_complete", "next_phase_todos", "job_complete", "run_command")
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object"}},
+        }
+        for name in (
+            "read_file",
+            "todo_complete",
+            "next_phase_todos",
+            "job_complete",
+            "run_command",
+        )
     ]
     for _ in range(7):
         response = await inference.post(
@@ -855,7 +895,9 @@ async def test_retained_sentinel_worker_requires_real_tool_result(
     call = response.json()["choices"][0]["message"]["tool_calls"][0]["function"]
     assert call["name"] == "run_command"
     command = json.loads(call["arguments"])["command"]
-    result = subprocess.run(["sh", "-c", command], cwd=tmp_path, capture_output=True, text=True)
+    result = subprocess.run(
+        ["sh", "-c", command], cwd=tmp_path, capture_output=True, text=True
+    )
     assert result.returncode == 0
     output = "Exit code: 0\n--- stdout ---\n" + result.stdout
     if proof == "wrong-run":
@@ -865,14 +907,20 @@ async def test_retained_sentinel_worker_requires_real_tool_result(
     elif proof == "absent":
         output = "Exit code: 0\n--- stdout ---\n"
     payload = chat_request(run_id, extra={"tools": tools})
-    payload["messages"].append({"role": "tool", "tool_call_id": "sentinel", "content": output})
+    payload["messages"].append(
+        {"role": "tool", "tool_call_id": "sentinel", "content": output}
+    )
     response = await inference.post("/v1/chat/completions", json=payload)
     if proof in {"valid", "reset"}:
         assert response.status_code == 200
-        assert response.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "todo_complete"
+        assert (
+            response.json()["choices"][0]["message"]["tool_calls"][0]["function"][
+                "name"
+            ]
+            == "todo_complete"
+        )
         remaining = [
-            await inference.post("/v1/chat/completions", json=payload)
-            for _ in range(2)
+            await inference.post("/v1/chat/completions", json=payload) for _ in range(2)
         ]
         waiting_completion = asyncio.create_task(
             inference.post("/v1/chat/completions", json=payload)
@@ -883,7 +931,9 @@ async def test_retained_sentinel_worker_requires_real_tool_result(
         assert held["worker_job_tool_steps"] == 10
         assert held["completion_released"] is False
         if proof == "reset":
-            assert (await control.delete(f"/control/scenarios/{run_id}")).status_code == 200
+            assert (
+                await control.delete(f"/control/scenarios/{run_id}")
+            ).status_code == 200
             refused = await asyncio.wait_for(waiting_completion, timeout=5)
             assert refused.status_code == 409
             assert refused.json()["error"]["type"] == "scenario_changed"
@@ -903,9 +953,9 @@ async def test_retained_sentinel_worker_requires_real_tool_result(
     else:
         assert response.status_code == 422
         assert response.json()["error"]["type"] == "workspace_proof_missing"
-        assert (await control.post(
-            f"/control/scenarios/{run_id}/release-completion"
-        )).status_code == 409
+        assert (
+            await control.post(f"/control/scenarios/{run_id}/release-completion")
+        ).status_code == 409
 
 
 async def test_search_job_scenario_drives_search_completion_and_todos(

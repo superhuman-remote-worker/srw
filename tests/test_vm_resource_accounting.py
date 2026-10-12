@@ -82,17 +82,28 @@ def test_exact_bound_launcher_charged_once_at_component_max():
 
 @pytest.mark.parametrize("deleting", [False, True])
 @pytest.mark.parametrize("launcher_present", [False, True])
-def test_unlabelled_srw_vm_never_becomes_external_only_capacity(deleting, launcher_present):
+def test_unlabelled_srw_vm_never_becomes_external_only_capacity(
+    deleting, launcher_present
+):
     value, reservation = setup()
     value["protocol"] = 2
-    value["vms"][0].update(name="agent-vm-" + str(uuid4()), owner_kind=None,
-                           owner_id=None, provision_generation=None, deleting=deleting)
-    value["pods"][0].update(reservation_id=None, provision_generation=None,
-                            requests=ResourceVector(1200, 512 * 1024**2, 1, 50000000, 1, 1).to_six_dict())
+    value["vms"][0].update(
+        name="agent-vm-" + str(uuid4()),
+        owner_kind=None,
+        owner_id=None,
+        provision_generation=None,
+        deleting=deleting,
+    )
+    value["pods"][0].update(
+        reservation_id=None,
+        provision_generation=None,
+        requests=ResourceVector(1200, 512 * 1024**2, 1, 50000000, 1, 1).to_six_dict(),
+    )
     if not launcher_present:
         value["pods"] = []
-    value["nodes"][0]["allocatable"].update(ephemeral_storage_bytes=1000000000,
-                                           tun_devices=8, vhost_net_devices=8)
+    value["nodes"][0]["allocatable"].update(
+        ephemeral_storage_bytes=1000000000, tun_devices=8, vhost_net_devices=8
+    )
     with pytest.raises(ResourceAdmissionError, match="legacy_occupancy_unclassified"):
         result(value, [])
 
@@ -101,14 +112,18 @@ def test_protocol_two_external_launcher_keeps_node_charge_without_srw_budget_ide
     value, reservation = setup()
     value["protocol"] = 2
     value["vms"][0].update(
-        owner_kind=None, owner_id=None, provision_generation=None,
+        owner_kind=None,
+        owner_id=None,
+        provision_generation=None,
     )
     request = ResourceVector(1200, 512 * 1024**2, 1, 50000000, 1, 1)
     value["pods"][0]["requests"] = request.to_six_dict()
     value["pods"][0]["reservation_id"] = None
     value["pods"][0]["provision_generation"] = None
     value["nodes"][0]["allocatable"].update(
-        ephemeral_storage_bytes=1000000000, tun_devices=8, vhost_net_devices=8,
+        ephemeral_storage_bytes=1000000000,
+        tun_devices=8,
+        vhost_net_devices=8,
     )
     node = result(value, []).nodes[reservation.node_uid]
     assert node.external == request
@@ -131,20 +146,32 @@ def test_protocol_two_retains_authenticated_high_water_across_missing_pod_and_ph
     value["label_keys"].append("kubernetes.io/arch")
     value["nodes"][0]["labels"]["kubernetes.io/arch"] = "amd64"
     value["nodes"][0]["allocatable"].update(
-        ephemeral_storage_bytes=1000000000, tun_devices=8, vhost_net_devices=8,
+        ephemeral_storage_bytes=1000000000,
+        tun_devices=8,
+        vhost_net_devices=8,
     )
     value["resource_versions"].update(kubevirt="10", limitranges="10")
     value["installed_profile"] = {
-        "uid": str(uuid4()), "namespace": "kubevirt", "name": "kubevirt",
-        "generation": 1, "observedGeneration": 1, "version": "v1.6.6",
-        "deploymentID": "settled", "profile": default_launcher_profile(),
+        "uid": str(uuid4()),
+        "namespace": "kubevirt",
+        "name": "kubevirt",
+        "generation": 1,
+        "observedGeneration": 1,
+        "version": "v1.6.6",
+        "deploymentID": "settled",
+        "profile": default_launcher_profile(),
     }
     value["pods"] = []
     reserved = ResourceVector(1000, 1024**3, 1, 50000000, 1, 1)
     high = ResourceVector(1200, 2 * 1024**3, 1, 70000000, 2, 1)
     for state in ("reserved", "active", "warm", "teardown"):
-        held = replace(reservation, state=state, version=2, vector=reserved,
-                       observed_high_water=high)
+        held = replace(
+            reservation,
+            state=state,
+            version=2,
+            vector=reserved,
+            observed_high_water=high,
+        )
         node = result(value, [held]).nodes[reservation.node_uid]
         assert node.held == high
         assert node.available.ephemeral_storage_bytes == 930000000
@@ -249,7 +276,9 @@ def test_missing_node_retains_observed_whole_launcher_high_water(state, replacem
     value, reservation = setup()
     value["protocol"] = 2
     reservation = replace(
-        reservation, version=2, state=state,
+        reservation,
+        version=2,
+        state=state,
         vector=ResourceVector(1000, 2 * 1024**3, 2, 50000000, 1, 2),
         observed_high_water=ResourceVector(1500, 1024**3, 1, 70000000, 2, 1),
     )
@@ -261,7 +290,12 @@ def test_missing_node_retains_observed_whole_launcher_high_water(state, replacem
     facts = result(value, [reservation])
     assert facts.orphaned_held == {
         reservation.reservation_id: ResourceVector(
-            1500, 2 * 1024**3, 2, 70000000, 2, 2,
+            1500,
+            2 * 1024**3,
+            2,
+            70000000,
+            2,
+            2,
         ),
     }
     if replacement:

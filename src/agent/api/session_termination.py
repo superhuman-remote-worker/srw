@@ -989,7 +989,9 @@ class SessionTerminationCoordinator:
             or not self.retirement_admission_token
         ):
             return False
-        return await self.terminate("thread_retirement_authorized") == "actuator_requested"
+        return (
+            await self.terminate("thread_retirement_authorized") == "actuator_requested"
+        )
 
     def start_watchdogs(self) -> None:
         """Start watchdog tasks for the active session. Safe to call repeatedly."""

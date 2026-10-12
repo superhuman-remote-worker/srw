@@ -91,7 +91,10 @@ class API:
     def replace(self, body):
         with self._mutation_lock:
             old = self.read("Lease", body["metadata"]["name"])
-            if old["metadata"]["resourceVersion"] != body["metadata"]["resourceVersion"]:
+            if (
+                old["metadata"]["resourceVersion"]
+                != body["metadata"]["resourceVersion"]
+            ):
                 raise ApiException(status=409)
             body = deepcopy(body)
             body["metadata"]["resourceVersion"] = str(
@@ -139,9 +142,10 @@ def test_fake_kubernetes_create_rejects_a_simultaneous_same_name_lease(monkeypat
     accepted = [value for value in outcomes if isinstance(value, dict)]
     assert len(accepted) == 1
     assert [value for value in outcomes if value == 409] == [409]
-    assert api.read("Lease", "same-carrier")["metadata"]["uid"] == accepted[0][
-        "metadata"
-    ]["uid"]
+    assert (
+        api.read("Lease", "same-carrier")["metadata"]["uid"]
+        == accepted[0]["metadata"]["uid"]
+    )
 
 
 def test_fake_kubernetes_replace_enforces_one_resource_version_winner(monkeypatch):
@@ -185,9 +189,7 @@ def test_fake_kubernetes_replace_enforces_one_resource_version_winner(monkeypatc
     accepted = [value for value in outcomes if isinstance(value, dict)]
     assert len(accepted) == 1
     assert [value for value in outcomes if value == 409] == [409]
-    assert original_read("Lease", "same-carrier")["metadata"][
-        "resourceVersion"
-    ] == "2"
+    assert original_read("Lease", "same-carrier")["metadata"]["resourceVersion"] == "2"
 
 
 class Authority:
@@ -254,7 +256,8 @@ class Authority:
                 "reason": payload["reason"],
             }
             self.row["state"] = (
-                "queued" if payload["reason"] == "resource_inventory_unavailable"
+                "queued"
+                if payload["reason"] == "resource_inventory_unavailable"
                 else "attention"
             )
             if self.surrender_reply_lost:
@@ -483,7 +486,8 @@ async def test_winning_unused_grant_surrenders_exact_guard_refusal(
             "effect_nonce": effect["carrier_intent"]["effect_nonce"],
             "carrier": api.read(
                 "Lease",
-                "srw-cleanup-" + authority.row["creation_admission_id"].replace("-", ""),
+                "srw-cleanup-"
+                + authority.row["creation_admission_id"].replace("-", ""),
             ),
             "issuer_receipt": ISSUER_RECEIPT,
             "reason": reason,
@@ -494,7 +498,9 @@ async def test_winning_unused_grant_surrenders_exact_guard_refusal(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["refused", "timeout", "lost_reply", "missing_receipt"])
+@pytest.mark.parametrize(
+    "failure", ["refused", "timeout", "lost_reply", "missing_receipt"]
+)
 async def test_guard_refusal_is_terminal_even_without_surrender_ack(
     setup, monkeypatch, failure
 ):
@@ -585,9 +591,7 @@ async def test_unsupported_post_grant_failure_keeps_issued_hold(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("site", ["carrier", "source"])
-async def test_unsupported_verifier_code_keeps_issued_hold(
-    setup, monkeypatch, site
-):
+async def test_unsupported_verifier_code_keeps_issued_hold(setup, monkeypatch, site):
     from vm_controller import creation_actuation
     from vm_controller.creation_actuation import CreationUnproven
     from vm_controller.creation_sources import GoldenSources
@@ -721,7 +725,9 @@ async def test_resource_final_proof_after_grant_before_post(
     result = await ctrl._do_create_serialized(payload)
 
     assert result["status"] == "creation_pending", (
-        result, api.writes, authority.row["effects"]
+        result,
+        api.writes,
+        authority.row["effects"],
     )
     assert [effect["state"] for effect in authority.row["effects"]] == [
         "observed" if final_state == "valid" else "rejected"
@@ -908,7 +914,9 @@ async def test_new_disk_secret_vm_each_have_one_durable_effect(setup, caplog):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("lock_kind", ["owner", "capacity"])
 async def test_busy_create_lock_returns_authenticated_pending_without_grant(
-    setup, monkeypatch, lock_kind,
+    setup,
+    monkeypatch,
+    lock_kind,
 ):
     ctrl, api, authority, payload = setup
     monkeypatch.setattr(settings, "CREATION_LOCK_WAIT_SECONDS", 0.01, raising=False)
@@ -1395,7 +1403,9 @@ async def test_lost_grant_never_creates_from_absence(setup):
 @pytest.mark.asyncio
 async def test_completed_source_missing_vm_never_recreates(setup):
     ctrl, api, authority, payload = setup
-    assert (await poll_until_terminal(ctrl._do_create_serialized, payload))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload))[
+        "status"
+    ] == "created"
     del api.objects["VirtualMachine", "agent-vm-" + payload["job_id"]]
     writes = list(api.writes)
     result = await ctrl._do_create_serialized(payload)
@@ -1530,7 +1540,9 @@ async def test_protocol_objects_retain_a2_disk_observation_associations(setup):
     from vm_controller.provisioning_observation import build_provisioning_observation
 
     ctrl, api, authority, payload = setup
-    assert (await poll_until_terminal(ctrl._do_create_serialized, payload))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload))[
+        "status"
+    ] == "created"
     name = "agent-vm-" + payload["job_id"]
     observed = build_provisioning_observation(
         vm=api.read("VirtualMachine", name),
@@ -1702,7 +1714,10 @@ async def test_periodic_carrier_observer_adopts_after_lost_vm_reply_without_post
 async def test_lost_vm_reply_marks_winning_nonce_before_create_and_in_later_observer(
     setup, monkeypatch, caplog
 ):
-    from vm_controller.creation_actuation import carrier_record, reconcile_creation_carrier
+    from vm_controller.creation_actuation import (
+        carrier_record,
+        reconcile_creation_carrier,
+    )
 
     caplog.set_level(logging.INFO, logger="vm_controller.creation_actuation")
     ctrl, api, authority, payload = setup
@@ -1740,7 +1755,9 @@ async def test_lost_vm_reply_marks_winning_nonce_before_create_and_in_later_obse
 
     monkeypatch.setattr(api, "create", record_before_create)
     for _ in range(3):
-        assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+        assert (await ctrl._do_create_serialized(payload))[
+            "status"
+        ] == "creation_pending"
     assert api.writes.count("VirtualMachine") == 1
     assert len(before_vm_send) == 1
     issued = authority.row["effects"][-1]
@@ -1752,7 +1769,8 @@ async def test_lost_vm_reply_marks_winning_nonce_before_create_and_in_later_obse
     ]
 
     lease = api.read(
-        "Lease", "srw-cleanup-" + authority.row["creation_admission_id"].replace("-", "")
+        "Lease",
+        "srw-cleanup-" + authority.row["creation_admission_id"].replace("-", ""),
     )
     carrier = carrier_record(lease, secret=SECRET)
     await reconcile_creation_carrier(ctrl, carrier)
@@ -1783,7 +1801,9 @@ async def test_vm_effect_marker_requires_winning_grant_and_validated_carrier(
     caplog.set_level(logging.INFO, logger="vm_controller.creation_actuation")
     ctrl, api, authority, payload = setup
     for _ in range(2):
-        assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+        assert (await ctrl._do_create_serialized(payload))[
+            "status"
+        ] == "creation_pending"
     assert api.writes == ["Lease", "DataVolume", "Secret"]
     caplog.clear()
 
@@ -1791,9 +1811,13 @@ async def test_vm_effect_marker_requires_winning_grant_and_validated_carrier(
         original_authority = ctrl._workspace_cleanup_authority_request
 
         async def deny_vm_grant(path, body, *, operation):
-            if path.endswith("begin-effect") and verify_creation_carrier(
-                body["carrier"], secret=SECRET
-            )["effect_kind"] == "vm":
+            if (
+                path.endswith("begin-effect")
+                and verify_creation_carrier(body["carrier"], secret=SECRET)[
+                    "effect_kind"
+                ]
+                == "vm"
+            ):
                 return {"actuation_allowed": False}
             return await original_authority(path, body, operation=operation)
 
@@ -1880,7 +1904,9 @@ async def test_protocol_specific_endpoint_cannot_fall_back_to_legacy(setup):
 
 
 @pytest.mark.asyncio
-async def test_busy_protocol_endpoint_signs_pending_after_owner_check(setup, monkeypatch):
+async def test_busy_protocol_endpoint_signs_pending_after_owner_check(
+    setup, monkeypatch
+):
     import json
     from shared.vm_lifecycle_auth import sign_payload, verify_payload, AUTH_FIELD
 
@@ -1894,7 +1920,9 @@ async def test_busy_protocol_endpoint_signs_pending_after_owner_check(setup, mon
     await lock.acquire()
     try:
         response = await asyncio.wait_for(
-            ctrl.http_creation_retry(SimpleNamespace(json=AsyncMock(return_value=signed))),
+            ctrl.http_creation_retry(
+                SimpleNamespace(json=AsyncMock(return_value=signed))
+            ),
             timeout=1,
         )
     finally:
@@ -1902,7 +1930,10 @@ async def test_busy_protocol_endpoint_signs_pending_after_owner_check(setup, mon
     assert response.status == 200
     body = json.loads(response.text)
     assert verify_payload(
-        body, direction="response", operation="creation_retry_create", secret=SECRET,
+        body,
+        direction="response",
+        operation="creation_retry_create",
+        secret=SECRET,
         expected_correlation_id=signed[AUTH_FIELD]["request_id"],
     )
     assert body["status"] == "creation_pending"
@@ -2056,4 +2087,6 @@ async def test_unexpected_vm_after_grant_prevents_fresh_effect(setup, stage, for
     replay = await ctrl._do_create_serialized(payload)
     assert replay["status"] == "creation_attention"
     assert api.writes == writes
-    assert authority.row["effects"][-1]["carrier_intent"]["effect_nonce"] == issued_nonce
+    assert (
+        authority.row["effects"][-1]["carrier_intent"]["effect_nonce"] == issued_nonce
+    )

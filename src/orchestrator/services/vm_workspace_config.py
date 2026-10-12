@@ -69,9 +69,7 @@ async def vm_provisioning_options(store, work_kind: str, work: dict, *, fallback
         ):
             from orchestrator.services.retained_vm_workspaces import provision_authority
 
-            authority = await provision_authority(
-                store, str(work["id"])
-            )
+            authority = await provision_authority(store, str(work["id"]))
             if authority is None:
                 raise HTTPException(
                     409, "Retained workspace reservation is unavailable."

@@ -50,9 +50,14 @@ def validate_resource_configuration(value, configuration):
         _object(
             value,
             {
-                "version", "cluster_id", "policy_digest", "profile_algorithm",
-                "template_profile", "host_mapping",
-            } | ({"launcher_profile", "launcher_prediction"} if version == 2 else set()),
+                "version",
+                "cluster_id",
+                "policy_digest",
+                "profile_algorithm",
+                "template_profile",
+                "host_mapping",
+            }
+            | ({"launcher_profile", "launcher_prediction"} if version == 2 else set()),
         )
         if (configuration["version"] == 2 and version != 1) or (
             configuration["version"] == 3 and version != 2
@@ -121,9 +126,7 @@ def validate_resource_configuration(value, configuration):
             policy = parse_whole_launcher_host_cost_policy(mapping["policy"])
             actual = ResourceVector.from_six_dict(mapping["vector"])
             launcher = validate_launcher_profile(value["launcher_profile"])
-            prediction = _object(
-                value["launcher_prediction"], {"algorithm", "vector"}
-            )
+            prediction = _object(value["launcher_prediction"], {"algorithm", "vector"})
             if prediction["algorithm"] != launcher["costAlgorithm"]:
                 raise ValueError
             predicted = predict_launcher(
@@ -131,12 +134,13 @@ def validate_resource_configuration(value, configuration):
                 guest_vcpus=profile["guest_vcpus"],
                 guest_memory_bytes=profile["guest_memory_bytes"],
             )
-            if (
-                ResourceVector.from_six_dict(prediction["vector"]) != predicted
-                or not predicted.fits(actual)
-            ):
+            if ResourceVector.from_six_dict(
+                prediction["vector"]
+            ) != predicted or not predicted.fits(actual):
                 raise ValueError
-        expected = policy.cost(profile["guest_vcpus"], str(profile["guest_memory_bytes"]))
+        expected = policy.cost(
+            profile["guest_vcpus"], str(profile["guest_memory_bytes"])
+        )
         if actual != expected:
             raise ValueError
     except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
@@ -168,12 +172,15 @@ def build_resource_configuration(snapshot, *, template, request, configuration):
         "host_mapping": {
             "algorithm": (
                 WHOLE_LAUNCHER_HOST_COST_ALGORITHM
-                if snapshot.inventory.protocol == 2 else HOST_COST_ALGORITHM
+                if snapshot.inventory.protocol == 2
+                else HOST_COST_ALGORITHM
             ),
             "policy": json.loads(snapshot.canonical_document)["policy"]["hostCost"],
             "vector": snapshot.host_cost.cost(
                 profile["guest_vcpus"], str(profile["guest_memory_bytes"])
-            ).to_six_dict() if snapshot.inventory.protocol == 2 else snapshot.host_cost.cost(
+            ).to_six_dict()
+            if snapshot.inventory.protocol == 2
+            else snapshot.host_cost.cost(
                 profile["guest_vcpus"], str(profile["guest_memory_bytes"])
             ).to_dict(),
         },

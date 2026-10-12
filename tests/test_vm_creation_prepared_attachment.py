@@ -315,7 +315,9 @@ async def test_ordinary_completed_source_preserves_legacy_binding_compatibility(
 @pytest.mark.asyncio
 async def test_never_issued_workspace_preparation_has_no_clone_hold(workspace):
     ctrl, _, _, payload, service = workspace
-    assert (await poll_until_preparation_wait(ctrl, payload))["reason"] == "preparation_wait"
+    assert (await poll_until_preparation_wait(ctrl, payload))[
+        "reason"
+    ] == "preparation_wait"
     allocation = await service.store.get(allocation_name(payload["preparation"]))
     assert allocation.state["workspace_source_issued"] is False
     assert "creation_source" not in allocation.state

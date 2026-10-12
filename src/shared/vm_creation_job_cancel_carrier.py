@@ -15,10 +15,21 @@ INTENT_ANNOTATION = "srw.io/vm-job-creation-cancel-intent"
 SIGNATURE_ANNOTATION = "srw.io/vm-job-creation-cancel-signature"
 LABEL = "srw.io/vm-job-creation-cancel-carrier"
 _FIELDS = {
-    "version", "kind", "source", "admission_id", "reservation_request_id",
-    "intent_digest", "retry_request_id", "job_id", "provision_generation",
-    "request_digest", "controller_configuration_digest", "reservation_id",
-    "reservation_revision", "reservation_cluster_id", "reservation_policy_digest",
+    "version",
+    "kind",
+    "source",
+    "admission_id",
+    "reservation_request_id",
+    "intent_digest",
+    "retry_request_id",
+    "job_id",
+    "provision_generation",
+    "request_digest",
+    "controller_configuration_digest",
+    "reservation_id",
+    "reservation_revision",
+    "reservation_cluster_id",
+    "reservation_policy_digest",
     "source_pin_key",
 }
 
@@ -33,7 +44,8 @@ def validate_intent(value):
         raise ValueError("Job cancellation intent is incomplete")
     value = dict(value)
     if (
-        type(value["version"]) is not int or value["version"] != 1
+        type(value["version"]) is not int
+        or value["version"] != 1
         or value["kind"] != "job_creation_cancel"
         or value["source"] != "controller_vm_create_cancel"
         or type(value["reservation_revision"]) is not int
@@ -44,12 +56,19 @@ def validate_intent(value):
     ):
         raise ValueError("Job cancellation intent has no authority")
     for key in (
-        "admission_id", "reservation_request_id", "retry_request_id", "job_id",
-        "provision_generation", "reservation_id", "source_pin_key",
+        "admission_id",
+        "reservation_request_id",
+        "retry_request_id",
+        "job_id",
+        "provision_generation",
+        "reservation_id",
+        "source_pin_key",
     ):
         _uuid(value[key])
     for key in (
-        "intent_digest", "request_digest", "controller_configuration_digest",
+        "intent_digest",
+        "request_digest",
+        "controller_configuration_digest",
         "reservation_policy_digest",
     ):
         if not isinstance(value[key], str) or not re.fullmatch(
@@ -69,7 +88,9 @@ def _signature(values, *, namespace, name, uid, secret):
         raise ValueError("Job cancellation signing key is missing")
     payload = json.dumps(
         ["srw-job-creation-cancel-v1", namespace, name, uid, values],
-        sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
     ).encode()
     return hmac.new(secret, payload, hashlib.sha256).hexdigest()
 
@@ -77,20 +98,33 @@ def _signature(values, *, namespace, name, uid, secret):
 def seal_cancel_carrier(values, *, namespace, uid, resource_version, secret):
     values = validate_intent(values)
     _uuid(uid)
-    if not isinstance(namespace, str) or not namespace or not isinstance(
-        resource_version, str
-    ) or not resource_version:
+    if (
+        not isinstance(namespace, str)
+        or not namespace
+        or not isinstance(resource_version, str)
+        or not resource_version
+    ):
         raise ValueError("Job cancellation Lease identity is incomplete")
     name = carrier_name(values["admission_id"])
     return {
-        "apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
+        "apiVersion": "coordination.k8s.io/v1",
+        "kind": "Lease",
         "metadata": {
-            "name": name, "namespace": namespace, "uid": uid,
-            "resourceVersion": resource_version, "labels": {LABEL: "true"},
+            "name": name,
+            "namespace": namespace,
+            "uid": uid,
+            "resourceVersion": resource_version,
+            "labels": {LABEL: "true"},
             "annotations": {
-                INTENT_ANNOTATION: json.dumps(values, sort_keys=True, separators=(",", ":")),
+                INTENT_ANNOTATION: json.dumps(
+                    values, sort_keys=True, separators=(",", ":")
+                ),
                 SIGNATURE_ANNOTATION: _signature(
-                    values, namespace=namespace, name=name, uid=uid, secret=secret,
+                    values,
+                    namespace=namespace,
+                    name=name,
+                    uid=uid,
+                    secret=secret,
                 ),
             },
         },
@@ -109,8 +143,11 @@ def verify_cancel_carrier(carrier, *, secret):
         metadata = carrier["metadata"]
         values = validate_intent(json.loads(metadata["annotations"][INTENT_ANNOTATION]))
         expected = seal_cancel_carrier(
-            values, namespace=metadata["namespace"], uid=metadata["uid"],
-            resource_version=metadata["resourceVersion"], secret=secret,
+            values,
+            namespace=metadata["namespace"],
+            uid=metadata["uid"],
+            resource_version=metadata["resourceVersion"],
+            secret=secret,
         )
         if (
             metadata.get("deletionTimestamp") is not None

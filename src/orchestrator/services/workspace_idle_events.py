@@ -58,9 +58,15 @@ async def record_human_route_wait_on_conn(conn, *, job_id, route_id):
             pinned_wait_receipt_on_conn,
         )
 
-        if await pinned_wait_receipt_on_conn(
-            conn, job=row, source_kind="route", source_id=UUID(str(route_id)),
-        ) is None:
+        if (
+            await pinned_wait_receipt_on_conn(
+                conn,
+                job=row,
+                source_kind="route",
+                source_id=UUID(str(route_id)),
+            )
+            is None
+        ):
             return False
     elif row["execution_lane"] != "stateless":
         return False

@@ -665,12 +665,13 @@ class LiveScenario:
             or stored_identity.get("vmi_uid") != live_vmi_uid
             or status.get("vmi_uid") != live_vmi_uid
             or not isinstance(live_mac, str)
-            or re.fullmatch(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", live_mac)
-            is None
+            or re.fullmatch(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", live_mac) is None
             or any(
                 status.get(key) != context.get(key)
                 for key in (
-                    "provision_generation", "vm_uid", "rootdisk_pvc_uid",
+                    "provision_generation",
+                    "vm_uid",
+                    "rootdisk_pvc_uid",
                     "active_pod_uid",
                 )
             )
@@ -726,7 +727,8 @@ class LiveScenario:
             )
 
             if not reusable_profile_evidence(
-                receipt, NETWORK_PROFILE,
+                receipt,
+                NETWORK_PROFILE,
                 provision_generation=identity["provision_generation"],
                 vm_uid=identity["vm_uid"],
                 pvc_uid=identity["root_pvc_uid"],
@@ -779,14 +781,21 @@ class LiveScenario:
             )
 
             if not self._fixture_authority_matches(
-                job_id, job, retry, identity, require_ready=False,
+                job_id,
+                job,
+                retry,
+                identity,
+                require_ready=False,
             ) or not await settle_owned_fixture_ready(
-                db=self.db, job_id=str(job_id), owner_id=str(self.gate_user_id),
+                db=self.db,
+                job_id=str(job_id),
+                owner_id=str(self.gate_user_id),
                 run_id=self.run_id,
                 marker_key="vm_workspace_recovery_acceptance_gate",
                 request_id=self.fixture_request_id,
                 generation=self.fixture_generation,
-                vm_uid=identity["vm_uid"], pvc_uid=identity["root_pvc_uid"],
+                vm_uid=identity["vm_uid"],
+                pvc_uid=identity["root_pvc_uid"],
             ):
                 return None
             # Re-read both rows and current runtime after the production
@@ -804,11 +813,14 @@ class LiveScenario:
         job: Mapping[str, Any],
         retry: Mapping[str, Any],
         identity: Mapping[str, Any],
-        *, require_ready: bool = True,
+        *,
+        require_ready: bool = True,
     ) -> bool:
         """Match one frozen, authenticated Ready result to this gate Job."""
         from orchestrator.services.vm_creation_preflight import _preflight
-        from orchestrator.operator_cli.vm_fixture_readiness import creation_source_matches
+        from orchestrator.operator_cli.vm_fixture_readiness import (
+            creation_source_matches,
+        )
         from shared.vm_network_profile import NETWORK_PROFILE, reusable_profile_evidence
 
         context = _object(job.get("context"))
@@ -1043,14 +1055,22 @@ class LiveScenario:
                 != self.run_id
                 or await conn.fetchval(
                     "SELECT EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs "
-                    "WHERE job_id=$1 AND resolved_at IS NULL)", job_id
+                    "WHERE job_id=$1 AND resolved_at IS NULL)",
+                    job_id,
                 )
                 or await conn.fetchval(
-                    _CAS_JOB_SQL, job_id, job["status"], worker,
-                    queue["lease_token"], queue["leased_until"],
-                ) != job_id
+                    _CAS_JOB_SQL,
+                    job_id,
+                    job["status"],
+                    worker,
+                    queue["lease_token"],
+                    queue["leased_until"],
+                )
+                != job_id
             ):
-                raise AcceptanceFailure("fixture lease reset lacks current claim authority")
+                raise AcceptanceFailure(
+                    "fixture lease reset lacks current claim authority"
+                )
             token = queue["lease_token"]
             await conn.execute(
                 "INSERT INTO worker_batch_attempts (job_id,lease_token,claimed_attempt) "

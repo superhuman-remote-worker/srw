@@ -86,8 +86,7 @@ def completion_runtime_evidence(job):
 
 
 async def capture_completion_wait_on_conn(
-    conn, *, job, report, lease_token, pinned_delivery=None,
-    decision_tool_call_id=None
+    conn, *, job, report, lease_token, pinned_delivery=None, decision_tool_call_id=None
 ):
     """Capture once at fresh admission, under the already-held queue/Job locks."""
     if os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower() != "true":
@@ -110,7 +109,9 @@ async def capture_completion_wait_on_conn(
             "AND bundle_authorized_at IS NOT NULL AND authority_digest=$3 "
             "AND refunded_at IS NULL AND recovery_id IS NULL AND NOT EXISTS ("
             "SELECT 1 FROM vm_workspace_recovery_jobs WHERE job_id=$1 AND resolved_at IS NULL)",
-            job["id"], lease_token, runtime["runtime_authority_digest"],
+            job["id"],
+            lease_token,
+            runtime["runtime_authority_digest"],
         )
         if authorized is None:
             return None
@@ -121,17 +122,18 @@ async def capture_completion_wait_on_conn(
         or pinned_delivery["agent_id"] != job["assigned_agent_id"]
         or pinned_delivery["accepted_at"] is None
         or str(pinned_delivery["provision_generation"])
-            != runtime["runtime_identity"]["runtime_generation"]
-        or str(pinned_delivery["vm_uid"])
-            != runtime["runtime_identity"]["runtime_uid"]
+        != runtime["runtime_identity"]["runtime_generation"]
+        or str(pinned_delivery["vm_uid"]) != runtime["runtime_identity"]["runtime_uid"]
         or str(pinned_delivery["launcher_uid"]) != runtime["launcher_uid"]
         or str(pinned_delivery["pvc_uid"]) != runtime["rootdisk_pvc_uid"]
         or pinned_delivery["runtime_authority_digest"]
-            != "sha256:" + runtime["runtime_authority_digest"]
+        != "sha256:" + runtime["runtime_authority_digest"]
     ):
         return None
     return {
-        "version": 1, "semantics": semantics, **runtime,
+        "version": 1,
+        "semantics": semantics,
+        **runtime,
         "pinned_delivery_id": str(pinned_delivery["id"]),
     }
 
@@ -198,17 +200,20 @@ async def record_completion_wait_on_conn(
         )
 
         linked = await pinned_wait_receipt_on_conn(
-            conn, job=row, source_kind="completion",
+            conn,
+            job=row,
+            source_kind="completion",
             source_id=UUID(str(command_id)),
         )
         if (
             linked is None
             or command["accepted_agent_id"] != row["assigned_agent_id"]
-            or source.get("pinned_delivery_id")
-                != str(linked["delivery"]["id"])
+            or source.get("pinned_delivery_id") != str(linked["delivery"]["id"])
         ):
             return False
-    elif row["execution_lane"] != "stateless" or command["accepted_lease_token"] is None:
+    elif (
+        row["execution_lane"] != "stateless" or command["accepted_lease_token"] is None
+    ):
         return False
     semantics = source.get("semantics")
     if not isinstance(semantics, dict) or semantics.get("branch") != branch:

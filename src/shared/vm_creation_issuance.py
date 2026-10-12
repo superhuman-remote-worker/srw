@@ -58,7 +58,8 @@ def validate_rootdisk_source(source, *, request, configuration, expected_pvc_uid
 
         if (
             request["network_profile"] != NETWORK_PROFILE
-            or configuration.get("network_profile_policy") != {
+            or configuration.get("network_profile_policy")
+            != {
                 "version": 1,
                 "image": request["vm_image"],
                 "profile": NETWORK_PROFILE,
@@ -283,8 +284,11 @@ def _values(value):
         fields |= {"resource_grant"}
     if thread_source:
         fields |= {
-            "owner_kind", "thread_runtime_generation", "thread_agent_id",
-            "thread_attach_token", "thread_wake_operation_id",
+            "owner_kind",
+            "thread_runtime_generation",
+            "thread_agent_id",
+            "thread_attach_token",
+            "thread_wake_operation_id",
         }
     if not isinstance(value, Mapping) or set(value) != fields:
         raise ValueError("Incomplete creation carrier intent")
@@ -296,11 +300,13 @@ def _values(value):
         if version not in (2, 4, 5):
             raise ValueError("Thread creation requires a rootdisk source")
         _uuid(value["thread_runtime_generation"])
-        if (value["thread_agent_id"] is None) != (
-            value["thread_attach_token"] is None
-        ):
+        if (value["thread_agent_id"] is None) != (value["thread_attach_token"] is None):
             raise ValueError("Thread creation agent identity is incomplete")
-        for key in ("thread_agent_id", "thread_attach_token", "thread_wake_operation_id"):
+        for key in (
+            "thread_agent_id",
+            "thread_attach_token",
+            "thread_wake_operation_id",
+        ):
             if value[key] is not None:
                 _uuid(value[key])
     if (
@@ -345,12 +351,27 @@ def _values(value):
         from shared.vm_resource_admission import ResourceVector
 
         grant = value["resource_grant"]
-        if not isinstance(grant, Mapping) or set(grant) != {
-            "version", "id", "revision", "cluster_id", "policy_digest",
-            "node_uid", "node_name", "vector", "snapshot_id", "snapshot_digest",
-            "headroom",
-        } or type(grant["version"]) is not int or grant["version"] != 1 or (
-            type(grant["revision"]) is not int or not 1 <= grant["revision"] < 2**63
+        if (
+            not isinstance(grant, Mapping)
+            or set(grant)
+            != {
+                "version",
+                "id",
+                "revision",
+                "cluster_id",
+                "policy_digest",
+                "node_uid",
+                "node_name",
+                "vector",
+                "snapshot_id",
+                "snapshot_digest",
+                "headroom",
+            }
+            or type(grant["version"]) is not int
+            or grant["version"] != 1
+            or (
+                type(grant["revision"]) is not int or not 1 <= grant["revision"] < 2**63
+            )
         ):
             raise ValueError("Resource creation grant is incomplete")
         for key in ("id", "node_uid", "snapshot_id"):
@@ -531,7 +552,12 @@ def validate_prepared_vm_metadata(source, obj):
 
 
 def public_effect_observation(
-    values, carrier, observation, *, rootdisk=None, cloud_init=None,
+    values,
+    carrier,
+    observation,
+    *,
+    rootdisk=None,
+    cloud_init=None,
     network_profile=None,
 ):
     """Extract exact public identities; never persist Secret data or API errors.
@@ -687,7 +713,8 @@ def public_effect_observation(
                     stamped = meta.get("annotations") or {}
                     if (
                         stamped.get("srw.io/vm-resource-reservation") != grant["id"]
-                        or stamped.get("srw.io/vm-resource-node-uid") != grant["node_uid"]
+                        or stamped.get("srw.io/vm-resource-node-uid")
+                        != grant["node_uid"]
                         or stamped.get("srw.io/provision-generation")
                         != values["provision_generation"]
                     ):
@@ -739,7 +766,10 @@ def public_effect_observation(
             ):
                 raise ValueError("VM does not reference the admitted cloud-init Secret")
             if network_profile is not None:
-                from shared.vm_network_profile import NETWORK_DATA, validate_network_profile
+                from shared.vm_network_profile import (
+                    NETWORK_DATA,
+                    validate_network_profile,
+                )
 
                 validate_network_profile(network_profile)
                 if cloud_volumes[0] != {
@@ -794,7 +824,11 @@ def canonical_configuration_digest(configuration):
         != (
             _CONFIGURATION_FIELDS
             | ({"resource_admission"} if configuration["version"] in (2, 3) else set())
-            | ({"network_profile_policy"} if "network_profile_policy" in configuration else set())
+            | (
+                {"network_profile_policy"}
+                if "network_profile_policy" in configuration
+                else set()
+            )
             | ({"disk_size_floor"} if "disk_size_floor" in configuration else set())
         )
     ):

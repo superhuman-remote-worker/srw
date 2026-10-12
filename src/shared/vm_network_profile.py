@@ -22,7 +22,8 @@ NETWORK_PROFILE = {
     "version": 1,
     "kind": "nocloud-dhcp-by-interface-name",
     "interface": "enp1s0",
-    "network_data_sha256": "sha256:" + hashlib.sha256(NETWORK_DATA.encode()).hexdigest(),
+    "network_data_sha256": "sha256:"
+    + hashlib.sha256(NETWORK_DATA.encode()).hexdigest(),
 }
 _IMAGE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
 
@@ -53,9 +54,15 @@ def selected_profile(image: object, *, prepared: bool = False) -> dict | None:
 
 
 def reusable_profile_evidence(
-    value: object, profile: object, *, provision_generation: object,
-    vm_uid: object, pvc_uid: object, vmi_uid: object = None,
-    launcher_uid: object = None, interface_mac: object = None,
+    value: object,
+    profile: object,
+    *,
+    provision_generation: object,
+    vm_uid: object,
+    pvc_uid: object,
+    vmi_uid: object = None,
+    launcher_uid: object = None,
+    interface_mac: object = None,
 ) -> bool:
     """A first-boot pinned-SSH receipt for this exact disk and runtime."""
     try:

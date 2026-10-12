@@ -39,13 +39,17 @@ class MessageSendRequest(BaseModel):
         description="Exact pinned agent assignment; ignored for stateless jobs",
     )
     pinned_delivery_id: UUID | None = Field(
-        None, description="Exact accepted pinned Job delivery intent",
+        None,
+        description="Exact accepted pinned Job delivery intent",
     )
     pinned_projection_digest: str | None = Field(
-        None, pattern=r"^sha256:[0-9a-f]{64}$",
+        None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
     )
     pinned_delivery_proof: str | None = Field(
-        None, repr=False, pattern=r"^[0-9a-f]{64}$",
+        None,
+        repr=False,
+        pattern=r"^[0-9a-f]{64}$",
     )
     pinned_process_generation: str | None = Field(None, max_length=128)
     pinned_pod_uid: str | None = Field(None, max_length=128)

@@ -681,7 +681,8 @@ async def test_prepare_drops_timeout_for_rotated_physical_binding(monkeypatch):
 @pytest.mark.parametrize("mutation_phase", ["post_ready", "post_route"])
 @pytest.mark.asyncio
 async def test_do_prepare_end_intent_fences_route_and_ready(
-    monkeypatch, mutation_phase,
+    monkeypatch,
+    mutation_phase,
 ):
     from orchestrator.routers import sessions as sessions_mod
 
@@ -710,17 +711,24 @@ async def test_do_prepare_end_intent_fences_route_and_ready(
     fake_main.session_router.teardown_route = AsyncMock(return_value=True)
     emitted = []
     monkeypatch.setattr(
-        sessions_mod, "lifecycle_emit",
+        sessions_mod,
+        "lifecycle_emit",
         lambda _uid, _tid, state, **_extra: emitted.append(state),
     )
-    assert await sessions_mod._do_prepare(
-        thread_id=CONNECTION_THREAD_ID,
-        user_id="u1", config_name="session_base", config_override=None,
-        runtime_authority=sessions_mod.ThreadRuntimeAuthority(
-            thread_id=CONNECTION_THREAD_ID, generation=CONNECTION_GENERATION,
-        ),
-        dependencies=fake_main.dependencies,
-    ) is None
+    assert (
+        await sessions_mod._do_prepare(
+            thread_id=CONNECTION_THREAD_ID,
+            user_id="u1",
+            config_name="session_base",
+            config_override=None,
+            runtime_authority=sessions_mod.ThreadRuntimeAuthority(
+                thread_id=CONNECTION_THREAD_ID,
+                generation=CONNECTION_GENERATION,
+            ),
+            dependencies=fake_main.dependencies,
+        )
+        is None
+    )
     assert emitted == ["provisioning", "booting"]
     if mutation_phase == "post_ready":
         fake_main.session_router.ensure_route.assert_not_awaited()

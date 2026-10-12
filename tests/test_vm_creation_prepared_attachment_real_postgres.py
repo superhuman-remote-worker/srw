@@ -40,7 +40,9 @@ async def test_prepared_workspace_adopts_lost_vm_reply_and_releases_completed_cl
     for _ in range(5):
         if "VirtualMachine" in api.writes:
             break
-        assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+        assert (await ctrl._do_create_serialized(payload))[
+            "status"
+        ] == "creation_pending"
     assert api.writes.count("VirtualMachine") == 1
     if cancelled:
         async with db.acquire() as conn:

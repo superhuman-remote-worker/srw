@@ -127,7 +127,9 @@ async def test_stale_inventory_keeps_held_demand_when_policy_is_not_enforcing(db
     assert value["available"] is False and value["reason"] == "inventory_stale"
     assert value["totals"] is None and value["nodes"] is None
     assert value["held"]["unbound"] == demand.to_six_dict()
-    assert value["admission_budget"]["installation"]["memory_bytes"] == demand.memory_bytes
+    assert (
+        value["admission_budget"]["installation"]["memory_bytes"] == demand.memory_bytes
+    )
     assert value["admission_budget"]["per_owner"]["cpu_millicores"] == 805
     assert value["count_backstop"]["observed"] is None
 

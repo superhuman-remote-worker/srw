@@ -77,13 +77,18 @@ async def seeded(db, *, delivered=False, monkeypatch=None):
         await db.execute(
             "UPDATE agents SET status='ready',pod_uid=$2,"
             "metadata=jsonb_build_object('dispatch_process_generation',$3::text) "
-            "WHERE id=$1", agent, str(pod_uid), str(process_generation),
+            "WHERE id=$1",
+            agent,
+            str(pod_uid),
+            str(process_generation),
         )
         digest = "sha256:" + "a" * 64
         intent = await db.prepare_pinned_job_delivery(
-            seed["job_id"], str(agent),
+            seed["job_id"],
+            str(agent),
             recipient=PinnedJobRecipient(
-                expected_agent_id=str(agent), expected_pod_uid=str(pod_uid),
+                expected_agent_id=str(agent),
+                expected_pod_uid=str(pod_uid),
                 expected_process_generation=str(process_generation),
                 expected_job_id=seed["job_id"],
             ),
@@ -91,13 +96,17 @@ async def seeded(db, *, delivered=False, monkeypatch=None):
         )
         assert intent is not None
         seed["delivery"] = {
-            "id": intent["id"], "digest": digest,
+            "id": intent["id"],
+            "digest": digest,
             "process_generation": str(process_generation),
             "pod_uid": str(pod_uid),
             "proof": pinned_job_delivery_proof(
-                b"x" * 64, delivery_id=str(intent["id"]),
-                agent_id=str(agent), process_generation=str(process_generation),
-                pod_uid=str(pod_uid), projection_digest=digest,
+                b"x" * 64,
+                delivery_id=str(intent["id"]),
+                agent_id=str(agent),
+                process_generation=str(process_generation),
+                pod_uid=str(pod_uid),
+                projection_digest=digest,
             ),
         }
     return seed, identities
@@ -164,7 +173,9 @@ async def test_human_route_records_episode_with_exact_vm_and_reply_closes_it(
 
 
 @pytest.mark.asyncio
-async def test_route_report_before_202_confirmation_joins_without_restamping(db, monkeypatch):
+async def test_route_report_before_202_confirmation_joins_without_restamping(
+    db, monkeypatch
+):
     monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
     monkeypatch.setenv("VM_MODE", "same-cluster")
     seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
@@ -173,13 +184,15 @@ async def test_route_report_before_202_confirmation_joins_without_restamping(db,
     before = await episode(db, seed["job_id"])
     assert before[1]["wait_key"] == route["route_id"]
     assert await db.confirm_pinned_job_dispatch(
-        seed["job_id"], seed["agent_id"],
+        seed["job_id"],
+        seed["agent_id"],
         pinned_delivery_id=str(seed["delivery"]["id"]),
         pinned_projection_digest=seed["delivery"]["digest"],
     )
     assert await episode(db, seed["job_id"]) == before
     assert not await db.confirm_pinned_job_dispatch(
-        seed["job_id"], seed["agent_id"],
+        seed["job_id"],
+        seed["agent_id"],
         pinned_delivery_id=str(uuid4()),
         pinned_projection_digest=seed["delivery"]["digest"],
     )
@@ -191,7 +204,8 @@ async def test_202_confirmation_before_route_keeps_same_delivery(db, monkeypatch
     monkeypatch.setenv("VM_MODE", "same-cluster")
     seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
     assert await db.confirm_pinned_job_dispatch(
-        seed["job_id"], seed["agent_id"],
+        seed["job_id"],
+        seed["agent_id"],
         pinned_delivery_id=str(seed["delivery"]["id"]),
         pinned_projection_digest=seed["delivery"]["digest"],
     )

@@ -30,8 +30,12 @@ class CreationDisposer:
     async def _publish_thread_cancel(self, values, *, expected_uid=None):
         """Publish/read one distinct cancellation Lease; never a create carrier."""
         from shared.vm_creation_cancel_carrier import (
-            INTENT_ANNOTATION, SIGNATURE_ANNOTATION, LABEL,
-            carrier_name, seal_cancel_carrier, validate_intent,
+            INTENT_ANNOTATION,
+            SIGNATURE_ANNOTATION,
+            LABEL,
+            carrier_name,
+            seal_cancel_carrier,
+            validate_intent,
             verify_cancel_carrier,
         )
 
@@ -42,21 +46,30 @@ class CreationDisposer:
             if expected_uid is not None:
                 raise ValueError("Thread cancellation Lease is missing")
             body = {
-                "apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
                 "metadata": {
-                    "name": name, "namespace": self.actuator.namespace,
+                    "name": name,
+                    "namespace": self.actuator.namespace,
                     "labels": {LABEL: "true"},
-                    "annotations": {INTENT_ANNOTATION: json.dumps(
-                        values, sort_keys=True, separators=(",", ":"),
-                    )},
+                    "annotations": {
+                        INTENT_ANNOTATION: json.dumps(
+                            values,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    },
                 },
                 "spec": {"holderIdentity": values["admission_id"]},
             }
             try:
-                lease = document(await asyncio.to_thread(
-                    self.controller.coordination_api.create_namespaced_lease,
-                    namespace=self.actuator.namespace, body=body,
-                ))
+                lease = document(
+                    await asyncio.to_thread(
+                        self.controller.coordination_api.create_namespaced_lease,
+                        namespace=self.actuator.namespace,
+                        body=body,
+                    )
+                )
             except Exception:
                 lease = await self.actuator.read("lease", name)
                 if lease is None:
@@ -72,22 +85,32 @@ class CreationDisposer:
                 raise ValueError("Thread cancellation Lease changed")
             return lease
         if (
-            annotations.get(INTENT_ANNOTATION) != json.dumps(
-                values, sort_keys=True, separators=(",", ":"),
+            annotations.get(INTENT_ANNOTATION)
+            != json.dumps(
+                values,
+                sort_keys=True,
+                separators=(",", ":"),
             )
             or metadata.get("labels", {}).get(LABEL) != "true"
             or lease.get("spec", {}).get("holderIdentity") != values["admission_id"]
         ):
             raise ValueError("Thread cancellation Lease changed")
         body = seal_cancel_carrier(
-            values, namespace=self.actuator.namespace, uid=metadata["uid"],
-            resource_version=metadata["resourceVersion"], secret=self.actuator.secret,
+            values,
+            namespace=self.actuator.namespace,
+            uid=metadata["uid"],
+            resource_version=metadata["resourceVersion"],
+            secret=self.actuator.secret,
         )
         try:
-            result = document(await asyncio.to_thread(
-                self.controller.coordination_api.replace_namespaced_lease,
-                name=name, namespace=self.actuator.namespace, body=body,
-            ))
+            result = document(
+                await asyncio.to_thread(
+                    self.controller.coordination_api.replace_namespaced_lease,
+                    name=name,
+                    namespace=self.actuator.namespace,
+                    body=body,
+                )
+            )
         except Exception:
             result = await self.actuator.read("lease", name)
             if result is None:
@@ -100,12 +123,20 @@ class CreationDisposer:
         return result
 
     async def _publish_job_cancel(
-        self, values, *, legacy_intent, expected_uid=None,
+        self,
+        values,
+        *,
+        legacy_intent,
+        expected_uid=None,
     ):
         """Convert only the exact signed v1 dummy, preserving its Lease UID."""
         from shared.vm_creation_job_cancel_carrier import (
-            INTENT_ANNOTATION, SIGNATURE_ANNOTATION, LABEL,
-            carrier_name, seal_cancel_carrier, validate_intent,
+            INTENT_ANNOTATION,
+            SIGNATURE_ANNOTATION,
+            LABEL,
+            carrier_name,
+            seal_cancel_carrier,
+            validate_intent,
             verify_cancel_carrier,
         )
 
@@ -116,21 +147,30 @@ class CreationDisposer:
             if expected_uid is not None:
                 raise ValueError("Job cancellation Lease is missing")
             body = {
-                "apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
                 "metadata": {
-                    "name": name, "namespace": self.actuator.namespace,
+                    "name": name,
+                    "namespace": self.actuator.namespace,
                     "labels": {LABEL: "true"},
-                    "annotations": {INTENT_ANNOTATION: json.dumps(
-                        values, sort_keys=True, separators=(",", ":"),
-                    )},
+                    "annotations": {
+                        INTENT_ANNOTATION: json.dumps(
+                            values,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    },
                 },
                 "spec": {"holderIdentity": values["admission_id"]},
             }
             try:
-                lease = document(await asyncio.to_thread(
-                    self.controller.coordination_api.create_namespaced_lease,
-                    namespace=self.actuator.namespace, body=body,
-                ))
+                lease = document(
+                    await asyncio.to_thread(
+                        self.controller.coordination_api.create_namespaced_lease,
+                        namespace=self.actuator.namespace,
+                        body=body,
+                    )
+                )
             except Exception:
                 lease = await self.actuator.read("lease", name)
                 if lease is None:
@@ -156,22 +196,32 @@ class CreationDisposer:
             ):
                 raise ValueError("Legacy Job cancellation Lease changed")
         elif (
-            annotations.get(INTENT_ANNOTATION) != json.dumps(
-                values, sort_keys=True, separators=(",", ":"),
+            annotations.get(INTENT_ANNOTATION)
+            != json.dumps(
+                values,
+                sort_keys=True,
+                separators=(",", ":"),
             )
             or metadata.get("labels", {}).get(LABEL) != "true"
             or lease.get("spec", {}).get("holderIdentity") != values["admission_id"]
         ):
             raise ValueError("Job cancellation Lease changed")
         body = seal_cancel_carrier(
-            values, namespace=self.actuator.namespace, uid=metadata["uid"],
-            resource_version=metadata["resourceVersion"], secret=self.actuator.secret,
+            values,
+            namespace=self.actuator.namespace,
+            uid=metadata["uid"],
+            resource_version=metadata["resourceVersion"],
+            secret=self.actuator.secret,
         )
         try:
-            result = document(await asyncio.to_thread(
-                self.controller.coordination_api.replace_namespaced_lease,
-                name=name, namespace=self.actuator.namespace, body=body,
-            ))
+            result = document(
+                await asyncio.to_thread(
+                    self.controller.coordination_api.replace_namespaced_lease,
+                    name=name,
+                    namespace=self.actuator.namespace,
+                    body=body,
+                )
+            )
         except Exception:
             result = await self.actuator.read("lease", name)
             if result is None:
@@ -237,7 +287,8 @@ class CreationDisposer:
                 raise ValueError("Cancellation carrier changed")
             if (
                 row.get("owner_kind") == "thread"
-                and row.get("disposition_carrier_uid") and lease is not None
+                and row.get("disposition_carrier_uid")
+                and lease is not None
             ):
                 raise ValueError("Competing original creation Lease appeared")
             cancel_carrier = False
@@ -255,9 +306,13 @@ class CreationDisposer:
             )
             legacy_dummy = False
             if job_v3 and CREATION_SIGNATURE_ANNOTATION in annotations:
-                legacy_dummy = verify_creation_carrier(
-                    lease, secret=self.actuator.secret,
-                )["version"] == 1
+                legacy_dummy = (
+                    verify_creation_carrier(
+                        lease,
+                        secret=self.actuator.secret,
+                    )["version"]
+                    == 1
+                )
             if job_v3 and (
                 lease is None or JOB_INTENT_ANNOTATION in annotations or legacy_dummy
             ):
@@ -283,7 +338,8 @@ class CreationDisposer:
                 if (
                     prepared.get("actuation_allowed") is not False
                     or prepared["namespace"] != self.actuator.namespace
-                    or prepared["carrier_intent"].get("kind") != "thread_creation_cancel"
+                    or prepared["carrier_intent"].get("kind")
+                    != "thread_creation_cancel"
                 ):
                     raise ValueError("Thread cancellation authority is unproven")
                 lease = await self._publish_thread_cancel(
@@ -293,9 +349,9 @@ class CreationDisposer:
                 cancel_carrier = "thread"
             elif not cancel_carrier and (
                 lease is None
-                or not lease["metadata"].get("annotations", {}).get(
-                    CREATION_SIGNATURE_ANNOTATION
-                )
+                or not lease["metadata"]
+                .get("annotations", {})
+                .get(CREATION_SIGNATURE_ANNOTATION)
             ):
                 if row.get("owner_kind") == "thread":
                     raise ValueError("Original thread creation Lease is unproven")
@@ -327,7 +383,9 @@ class CreationDisposer:
                 raise ValueError("Cancellation carrier identity changed")
             latest = row["effects"][-1] if row["effects"] else None
             if cancel_carrier and latest is not None:
-                raise ValueError("Cancellation-only carrier cannot observe creation effects")
+                raise ValueError(
+                    "Cancellation-only carrier cannot observe creation effects"
+                )
             if latest and (
                 latest["state"] == "issued"
                 or latest["state"] == "observed"
@@ -398,7 +456,10 @@ class CreationDisposer:
             settled = await self.actuator.authority(
                 "settle-disposition", request_id=row["request_id"], carrier=lease
             )
-            if settled.get("settled") is True and settled.get("disposition") == "creation_disposed":
+            if (
+                settled.get("settled") is True
+                and settled.get("disposition") == "creation_disposed"
+            ):
                 return {**identity, "status": "creation_disposed"}
             return {**pending, "disposition_id": disposition["disposition_id"]}
         return pending

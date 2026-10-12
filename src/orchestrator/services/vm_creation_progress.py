@@ -102,14 +102,29 @@ def _deadline_valid(value):
 def _owner_wait(raw, reason):
     """One request's bounded wait; no cluster budget, fleet count or queue rank."""
     if reason == "controller_unavailable":
-        return {"kind": "controller", "since": None, "size_nonfit": False,
-                "guest_vcpus": None, "guest_memory_bytes": None}
+        return {
+            "kind": "controller",
+            "since": None,
+            "size_nonfit": False,
+            "guest_vcpus": None,
+            "guest_memory_bytes": None,
+        }
     if reason == "controller_count_wait":
-        return {"kind": "count", "since": None, "size_nonfit": False,
-                "guest_vcpus": None, "guest_memory_bytes": None}
+        return {
+            "kind": "count",
+            "since": None,
+            "size_nonfit": False,
+            "guest_vcpus": None,
+            "guest_memory_bytes": None,
+        }
     if reason == "resource_unavailable":
-        return {"kind": "unknown", "since": None, "size_nonfit": False,
-                "guest_vcpus": None, "guest_memory_bytes": None}
+        return {
+            "kind": "unknown",
+            "since": None,
+            "size_nonfit": False,
+            "guest_vcpus": None,
+            "guest_memory_bytes": None,
+        }
     if reason not in {"resource_wait", "capacity_wait", "vm_creation_retry_pending"}:
         return None
     resource = raw.get("resource_wait")
@@ -122,10 +137,17 @@ def _owner_wait(raw, reason):
             "size_nonfit": resource["state"] == "nonfit"
             and resource.get("reason") == "resource_size_nonfit",
             "guest_vcpus": vcpus if type(vcpus) is int and vcpus > 0 else None,
-            "guest_memory_bytes": memory if type(memory) is int and memory > 0 else None,
+            "guest_memory_bytes": memory
+            if type(memory) is int and memory > 0
+            else None,
         }
-    return {"kind": "unknown", "since": None, "size_nonfit": False,
-            "guest_vcpus": None, "guest_memory_bytes": None}
+    return {
+        "kind": "unknown",
+        "since": None,
+        "size_nonfit": False,
+        "guest_vcpus": None,
+        "guest_memory_bytes": None,
+    }
 
 
 def vm_creation_projection(job):

@@ -85,7 +85,9 @@ def test_inventory_digest_is_canonical_without_changing_input():
 
 
 @pytest.mark.parametrize("kubevirt_version", ["v1.6.6", "v1.8.4"])
-def test_protocol_two_requires_all_six_dimensions_and_installed_profile_proof(kubevirt_version):
+def test_protocol_two_requires_all_six_dimensions_and_installed_profile_proof(
+    kubevirt_version,
+):
     from shared.vm_launcher_profile import default_launcher_profile
 
     raw = snapshot()
@@ -93,7 +95,9 @@ def test_protocol_two_requires_all_six_dimensions_and_installed_profile_proof(ku
     raw["label_keys"].append("kubernetes.io/arch")
     raw["nodes"][0]["labels"]["kubernetes.io/arch"] = "amd64"
     raw["nodes"][0]["allocatable"].update(
-        ephemeral_storage_bytes=1000000000, tun_devices=8, vhost_net_devices=8,
+        ephemeral_storage_bytes=1000000000,
+        tun_devices=8,
+        vhost_net_devices=8,
     )
     raw["resource_versions"].update(kubevirt="10", limitranges="10")
     raw["installed_profile"] = {
@@ -114,8 +118,12 @@ def test_protocol_two_requires_all_six_dimensions_and_installed_profile_proof(ku
     )
     assert validate(raw)["protocol"] == 2
     broken = deepcopy(raw)
-    broken["installed_profile"]["profile"]["kubevirtVersion"] = "v1.8.4" if kubevirt_version == "v1.6.6" else "v1.6.6"
-    broken["installed_profile"]["profile"]["costAlgorithm"] = f"kubevirt-{broken['installed_profile']['profile']['kubevirtVersion']}-amd64-ordinary-pvc-v1"
+    broken["installed_profile"]["profile"]["kubevirtVersion"] = (
+        "v1.8.4" if kubevirt_version == "v1.6.6" else "v1.6.6"
+    )
+    broken["installed_profile"]["profile"]["costAlgorithm"] = (
+        f"kubevirt-{broken['installed_profile']['profile']['kubevirtVersion']}-amd64-ordinary-pvc-v1"
+    )
     with pytest.raises(InventoryError):
         validate(broken)
 

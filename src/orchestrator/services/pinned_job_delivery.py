@@ -10,13 +10,18 @@ from typing import Any
 from uuid import UUID
 
 from orchestrator.services.vm_remote_operation import (
-    VMRemoteOperationUnavailable, _identity_from_row,
+    VMRemoteOperationUnavailable,
+    _identity_from_row,
 )
 from shared.pinned_job_delivery import (
-    pinned_job_delivery_proof, pinned_resume_consumed_keys,
+    pinned_job_delivery_proof,
+    pinned_resume_consumed_keys,
 )
 from shared.vm_lifecycle_auth import LifecycleAuthConfigurationError, configured_secret
-from shared.workspace_contract import vm_mode_from_env, workspace_runtime_authority_digest
+from shared.workspace_contract import (
+    vm_mode_from_env,
+    workspace_runtime_authority_digest,
+)
 
 
 def _object(value: Any) -> dict:
@@ -70,11 +75,14 @@ async def accept_pinned_report_on_conn(
     if secret is None:
         return None
     delivery_id, agent_id, job_id = (
-        UUID(str(delivery_id)), UUID(str(agent_id)), UUID(str(job_id))
+        UUID(str(delivery_id)),
+        UUID(str(agent_id)),
+        UUID(str(job_id)),
     )
     delivery = await conn.fetchrow(
         "SELECT * FROM pinned_job_deliveries WHERE id=$1 AND job_id=$2 FOR UPDATE",
-        delivery_id, job_id,
+        delivery_id,
+        job_id,
     )
     if delivery is None:
         return None
@@ -86,15 +94,19 @@ async def accept_pinned_report_on_conn(
     ):
         return None
     expected_proof = pinned_job_delivery_proof(
-        secret, delivery_id=str(delivery_id), agent_id=str(agent_id),
-        process_generation=process_generation, pod_uid=pod_uid,
+        secret,
+        delivery_id=str(delivery_id),
+        agent_id=str(agent_id),
+        process_generation=process_generation,
+        pod_uid=pod_uid,
         projection_digest=projection_digest,
     )
     if not hmac.compare_digest(delivery_proof, expected_proof):
         return None
     job = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1 FOR UPDATE", job_id)
     if (
-        job is None or job["execution_lane"] != "pinned"
+        job is None
+        or job["execution_lane"] != "pinned"
         or job["assigned_agent_id"] != agent_id
         or job["lease_expires_at"] is None
         or job["status"] not in {"processing", "waiting_for_reply", "pending_review"}
@@ -115,16 +127,22 @@ async def accept_pinned_report_on_conn(
         return None
     try:
         identity = _identity_from_row(
-            dict(job), owner_kind="job", owner_id=str(job_id),
+            dict(job),
+            owner_kind="job",
+            owner_id=str(job_id),
             operation_kind="idle_policy",
         )
     except VMRemoteOperationUnavailable:
         return None
-    identity_digest = "sha256:" + hashlib.sha256(
-        json.dumps(asdict(identity), sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    identity_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(asdict(identity), sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
     runtime_digest = workspace_runtime_authority_digest(
-        dict(job), vm_mode=vm_mode_from_env(),
+        dict(job),
+        vm_mode=vm_mode_from_env(),
     )
     if (
         runtime_digest is None
@@ -150,7 +168,9 @@ async def accept_pinned_report_on_conn(
             "UPDATE pinned_job_deliveries SET accepted_at=clock_timestamp(),"
             "accepted_via=$2,accepted_lease_expires_at=$3 WHERE id=$1 "
             "AND accepted_at IS NULL RETURNING *",
-            delivery_id, source_kind, job["lease_expires_at"],
+            delivery_id,
+            source_kind,
+            job["lease_expires_at"],
         )
         if delivery is None:
             return None
@@ -158,7 +178,11 @@ async def accept_pinned_report_on_conn(
 
 
 async def record_pinned_wait_receipt_on_conn(
-    conn: Any, *, delivery: dict, source_kind: str, source_id: UUID,
+    conn: Any,
+    *,
+    delivery: dict,
+    source_kind: str,
+    source_id: UUID,
 ) -> dict | None:
     """Link an accepted delivery to the exact immutable route or command."""
 
@@ -177,7 +201,8 @@ async def record_pinned_wait_receipt_on_conn(
         return None
     existing = await conn.fetchrow(
         "SELECT * FROM pinned_job_wait_receipts WHERE source_kind=$1 AND source_id=$2",
-        source_kind, UUID(str(source_id)),
+        source_kind,
+        UUID(str(source_id)),
     )
     if existing is not None:
         if existing["delivery_id"] != delivery["id"]:
@@ -188,23 +213,32 @@ async def record_pinned_wait_receipt_on_conn(
             "INSERT INTO pinned_job_wait_receipts "
             "(delivery_id,job_id,source_kind,source_id,lease_expires_at) "
             "VALUES($1,$2,$3,$4,$5) RETURNING *",
-            delivery["id"], delivery["job_id"], source_kind,
-            UUID(str(source_id)), job["lease_expires_at"],
+            delivery["id"],
+            delivery["job_id"],
+            source_kind,
+            UUID(str(source_id)),
+            job["lease_expires_at"],
         )
     consumed_keys = pinned_resume_consumed_keys(
-        _object(job["context"]), _object(delivery.get("consumed_context_digests")),
+        _object(job["context"]),
+        _object(delivery.get("consumed_context_digests")),
     )
     if consumed_keys:
         await conn.execute(
             "UPDATE jobs SET context=COALESCE(context,'{}'::jsonb) - $2::text[] "
             "WHERE id=$1",
-            delivery["job_id"], consumed_keys,
+            delivery["job_id"],
+            consumed_keys,
         )
     return dict(row)
 
 
 async def pinned_wait_receipt_on_conn(
-    conn: Any, *, job: Any, source_kind: str, source_id: UUID,
+    conn: Any,
+    *,
+    job: Any,
+    source_kind: str,
+    source_id: UUID,
     episode: Any = None,
 ) -> dict[str, Any] | None:
     """Read one accepted source and recheck the current exact assignment."""
@@ -217,13 +251,16 @@ async def pinned_wait_receipt_on_conn(
     receipt = await conn.fetchrow(
         "SELECT * FROM pinned_job_wait_receipts "
         "WHERE job_id=$1 AND source_kind=$2 AND source_id=$3",
-        job_id, source_kind, UUID(str(source_id)),
+        job_id,
+        source_kind,
+        UUID(str(source_id)),
     )
     if receipt is None:
         return None
     delivery = await conn.fetchrow(
         "SELECT * FROM pinned_job_deliveries WHERE id=$1 AND job_id=$2",
-        receipt["delivery_id"], job_id,
+        receipt["delivery_id"],
+        job_id,
     )
     if delivery is None or delivery["accepted_at"] is None:
         return None
@@ -239,23 +276,29 @@ async def pinned_wait_receipt_on_conn(
         job["assigned_agent_id"] != delivery["agent_id"]
         or job["lease_expires_at"] is None
         or _object(context.get("_workspace_dispatch_authority"))
-            != _object(delivery["original_dispatch_marker"])
+        != _object(delivery["original_dispatch_marker"])
         or vm.get("status") != "ready"
         or _uuid(vm.get("rootdisk_pvc_uid")) != delivery["pvc_uid"]
     ):
         return None
     try:
         identity = _identity_from_row(
-            dict(job), owner_kind="job", owner_id=str(job_id),
+            dict(job),
+            owner_kind="job",
+            owner_id=str(job_id),
             operation_kind="idle_policy",
         )
     except VMRemoteOperationUnavailable:
         return None
-    identity_digest = "sha256:" + hashlib.sha256(
-        json.dumps(asdict(identity), sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    identity_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(asdict(identity), sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
     runtime_digest = workspace_runtime_authority_digest(
-        dict(job), vm_mode=vm_mode_from_env(),
+        dict(job),
+        vm_mode=vm_mode_from_env(),
     )
     if original_runtime:
         if (
@@ -273,7 +316,9 @@ async def pinned_wait_receipt_on_conn(
 
         origin = {
             "runtime_identity": {
-                "owner_kind": "job", "owner_id": str(job_id), "backend": "vm",
+                "owner_kind": "job",
+                "owner_id": str(job_id),
+                "backend": "vm",
                 "runtime_generation": str(delivery["provision_generation"]),
                 "runtime_uid": str(delivery["vm_uid"]),
             },
@@ -281,8 +326,12 @@ async def pinned_wait_receipt_on_conn(
             "rootdisk_pvc_uid": str(delivery["pvc_uid"]),
         }
         if not await _source_runtime_continuity(
-            conn, job=job, episode=episode, source=origin,
-            generation=identity.workspace_generation, vm_uid=identity.vm_uid,
+            conn,
+            job=job,
+            episode=episode,
+            source=origin,
+            generation=identity.workspace_generation,
+            vm_uid=identity.vm_uid,
             vmi_uid=vm.get("vmi_uid"),
             launcher_uid=identity.launcher_pod_uid,
             pvc_uid=vm.get("rootdisk_pvc_uid"),
@@ -294,21 +343,26 @@ async def pinned_wait_receipt_on_conn(
     )
     metadata = _object(agent["metadata"]) if agent is not None else {}
     if (
-        agent is None or agent["hostname"] != delivery["pod_name"]
+        agent is None
+        or agent["hostname"] != delivery["pod_name"]
         or agent["pod_uid"] != delivery["pod_uid"]
-        or metadata.get("dispatch_process_generation")
-            != delivery["process_generation"]
+        or metadata.get("dispatch_process_generation") != delivery["process_generation"]
         or agent["current_job_id"] not in {None, job_id}
     ):
         return None
     return {
-        "receipt": dict(receipt), "delivery": dict(delivery),
+        "receipt": dict(receipt),
+        "delivery": dict(delivery),
         "access_rebound": not original_runtime,
     }
 
 
 async def pinned_source_origin_on_conn(
-    conn: Any, *, job_id: UUID, source_id: UUID, source: dict,
+    conn: Any,
+    *,
+    job_id: UUID,
+    source_id: UUID,
+    source: dict,
 ) -> bool:
     """Verify an immutable S17 pinned origin, including after access wakes."""
 
@@ -318,15 +372,19 @@ async def pinned_source_origin_on_conn(
     receipt = await conn.fetchrow(
         "SELECT * FROM pinned_job_wait_receipts WHERE job_id=$1 "
         "AND source_kind='completion' AND source_id=$2 AND delivery_id=$3",
-        job_id, source_id, delivery_id,
+        job_id,
+        source_id,
+        delivery_id,
     )
     delivery = await conn.fetchrow(
         "SELECT * FROM pinned_job_deliveries WHERE id=$1 AND job_id=$2",
-        delivery_id, job_id,
+        delivery_id,
+        job_id,
     )
     runtime = _object(source.get("runtime_identity"))
     return bool(
-        receipt is not None and delivery is not None
+        receipt is not None
+        and delivery is not None
         and delivery["accepted_at"] is not None
         and runtime.get("owner_kind") == "job"
         and runtime.get("owner_id") == str(job_id)
@@ -336,7 +394,7 @@ async def pinned_source_origin_on_conn(
         and source.get("launcher_uid") == str(delivery["launcher_uid"])
         and source.get("rootdisk_pvc_uid") == str(delivery["pvc_uid"])
         and source.get("runtime_authority_digest")
-            == delivery["runtime_authority_digest"].removeprefix("sha256:")
+        == delivery["runtime_authority_digest"].removeprefix("sha256:")
         and source.get("identity_digest")
-            == delivery["identity_digest"].removeprefix("sha256:")
+        == delivery["identity_digest"].removeprefix("sha256:")
     )

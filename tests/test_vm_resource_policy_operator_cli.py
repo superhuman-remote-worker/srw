@@ -1,4 +1,5 @@
 """Operator transitions use one exact policy and prior receipt on real PG."""
+# ruff: noqa: F811 -- imported pytest fixtures and their parameter names
 
 from dataclasses import asdict
 import json
@@ -25,7 +26,8 @@ def snapshot():
     document = whole_launcher_policy()
     document["namespace"] = "workers"
     document["policy"].update(
-        stableClusterId=f"d3i-{uuid4()}", shadowEnabled=True,
+        stableClusterId=f"d3i-{uuid4()}",
+        shadowEnabled=True,
         enforcementEnabled=True,
     )
     return validate_enforcement_resource_policy(document)
@@ -37,9 +39,13 @@ def _arguments(tmp_path, policy, action, receipt=None):
     policy_file = tmp_path / "resource-policy.json"
     policy_file.write_bytes(policy.canonical_document)
     arguments = [
-        action, "--policy-file", str(policy_file),
-        "--cluster-id", policy.inventory.cluster_id,
-        "--policy-digest", policy.policy_digest,
+        action,
+        "--policy-file",
+        str(policy_file),
+        "--cluster-id",
+        policy.inventory.cluster_id,
+        "--policy-digest",
+        policy.policy_digest,
     ]
     if receipt is not None:
         receipt_file = tmp_path / "resource-receipt.json"
@@ -77,7 +83,11 @@ def test_operator_input_refuses_duplicate_policy_key_and_foreign_receipt(tmp_pat
 
     policy = snapshot()
     foreign = ResourcePolicyReceipt(
-        "foreign", policy.inventory.namespace, policy.policy_digest, 1, "shadow",
+        "foreign",
+        policy.inventory.namespace,
+        policy.policy_digest,
+        1,
+        "shadow",
     )
     args = _arguments(tmp_path, policy, "activate-enforce", foreign)
     with pytest.raises(ResourceAdmissionError, match="resource_policy_changed"):
@@ -95,19 +105,29 @@ def test_operator_input_refuses_duplicate_policy_key_and_foreign_receipt(tmp_pat
 
 @pytest.mark.asyncio
 async def test_operator_transitions_require_receipts_and_preserve_shadow_on_refusal(
-    db, tmp_path,  # noqa: F811
+    db,
+    tmp_path,  # noqa: F811
 ):
     from orchestrator.operator_cli.vm_resource_policy import (
-        apply_transition, load_request,
+        apply_transition,
+        load_request,
     )
 
     policy = snapshot()
     loaded, expected = load_request(_arguments(tmp_path, policy, "ensure-shadow"))
-    shadow = await apply_transition(db, loaded, action="ensure-shadow", expected=expected)
+    shadow = await apply_transition(
+        db, loaded, action="ensure-shadow", expected=expected
+    )
     assert shadow.mode == "shadow" and shadow.revision == 1
-    assert await apply_transition(
-        db, loaded, action="ensure-shadow", expected=None,
-    ) == shadow
+    assert (
+        await apply_transition(
+            db,
+            loaded,
+            action="ensure-shadow",
+            expected=None,
+        )
+        == shadow
+    )
 
     loaded, expected = load_request(
         _arguments(tmp_path, policy, "activate-enforce", shadow)
@@ -120,26 +140,35 @@ async def test_operator_transitions_require_receipts_and_preserve_shadow_on_refu
     )
     assert (row["mode"], row["revision"]) == ("shadow", 1)
 
-    loaded, expected = load_request(
-        _arguments(tmp_path, policy, "begin-drain", shadow)
-    )
+    loaded, expected = load_request(_arguments(tmp_path, policy, "begin-drain", shadow))
     drained = await apply_transition(
-        db, loaded, action="begin-drain", expected=expected,
+        db,
+        loaded,
+        action="begin-drain",
+        expected=expected,
     )
     assert drained.mode == "drain" and drained.revision == 2
     with pytest.raises(ResourceAdmissionError, match="resource_policy_changed"):
         await apply_transition(
-            db, loaded, action="begin-drain", expected=shadow,
+            db,
+            loaded,
+            action="begin-drain",
+            expected=shadow,
         )
     with pytest.raises(ResourceAdmissionError, match="inventory_unavailable"):
         await apply_transition(
-            db, loaded, action="finalize-off", expected=drained,
+            db,
+            loaded,
+            action="finalize-off",
+            expected=drained,
         )
 
 
 @pytest.mark.asyncio
 async def test_operator_command_uses_application_connection_and_returns_only_receipt(
-    db, pg_dsn, tmp_path,  # noqa: F811
+    db,
+    pg_dsn,
+    tmp_path,  # noqa: F811
 ):
     from orchestrator.database.postgres import PostgresDB
     from orchestrator.operator_cli.vm_resource_policy import run
@@ -149,7 +178,9 @@ async def test_operator_command_uses_application_connection_and_returns_only_rec
     result = await run(
         args,
         db_factory=lambda: PostgresDB(
-            connection_string=pg_dsn, min_connections=1, max_connections=2,
+            connection_string=pg_dsn,
+            min_connections=1,
+            max_connections=2,
         ),
     )
     assert result == {
@@ -159,15 +190,20 @@ async def test_operator_command_uses_application_connection_and_returns_only_rec
         "revision": 1,
         "mode": "shadow",
     }
-    assert await db.fetchval(
-        "SELECT mode FROM vm_resource_admission_policy WHERE cluster_id=$1",
-        policy.inventory.cluster_id,
-    ) == "shadow"
+    assert (
+        await db.fetchval(
+            "SELECT mode FROM vm_resource_admission_policy WHERE cluster_id=$1",
+            policy.inventory.cluster_id,
+        )
+        == "shadow"
+    )
 
 
 @pytest.mark.asyncio
 async def test_operator_recovers_lost_transition_receipt_only_for_exact_policy(
-    db, pg_dsn, tmp_path,  # noqa: F811
+    db,
+    pg_dsn,
+    tmp_path,  # noqa: F811
 ):
     from orchestrator.database.postgres import PostgresDB
     from orchestrator.operator_cli.vm_resource_policy import run
@@ -178,7 +214,9 @@ async def test_operator_recovers_lost_transition_receipt_only_for_exact_policy(
 
     def connection():
         return PostgresDB(
-            connection_string=pg_dsn, min_connections=1, max_connections=2,
+            connection_string=pg_dsn,
+            min_connections=1,
+            max_connections=2,
         )
 
     policy = snapshot()
@@ -187,11 +225,15 @@ async def test_operator_recovers_lost_transition_receipt_only_for_exact_policy(
         await run(current_args, db_factory=connection)
 
     shadow = await run(
-        _arguments(tmp_path, policy, "ensure-shadow"), db_factory=connection,
+        _arguments(tmp_path, policy, "ensure-shadow"),
+        db_factory=connection,
     )
     await run(
         _arguments(
-            tmp_path, policy, "begin-drain", ResourcePolicyReceipt(**shadow),
+            tmp_path,
+            policy,
+            "begin-drain",
+            ResourcePolicyReceipt(**shadow),
         ),
         db_factory=connection,
     )  # The response is lost after the durable transition commits.
@@ -212,14 +254,20 @@ async def test_operator_recovers_lost_transition_receipt_only_for_exact_policy(
     with pytest.raises(ResourceAdmissionError, match="resource_policy_changed"):
         await run(
             _arguments(
-                tmp_path, policy, "finalize-off", ResourcePolicyReceipt(**shadow),
+                tmp_path,
+                policy,
+                "finalize-off",
+                ResourcePolicyReceipt(**shadow),
             ),
             db_factory=connection,
         )
     with pytest.raises(ResourceAdmissionError, match="inventory_unavailable"):
         await run(
             _arguments(
-                tmp_path, policy, "finalize-off", ResourcePolicyReceipt(**recovered),
+                tmp_path,
+                policy,
+                "finalize-off",
+                ResourcePolicyReceipt(**recovered),
             ),
             db_factory=connection,
         )
@@ -240,15 +288,23 @@ def test_operator_command_redacts_database_failure(monkeypatch, capsys, tmp_path
     policy = snapshot()
     args = _arguments(tmp_path, policy, "ensure-shadow")
     monkeypatch.setattr(
-        sys, "argv", [
-            "vm_resource_policy", args.action,
-            "--policy-file", str(args.policy_file),
-            "--cluster-id", args.cluster_id,
-            "--policy-digest", args.policy_digest,
+        sys,
+        "argv",
+        [
+            "vm_resource_policy",
+            args.action,
+            "--policy-file",
+            str(args.policy_file),
+            "--cluster-id",
+            args.cluster_id,
+            "--policy-digest",
+            args.policy_digest,
         ],
     )
     monkeypatch.setattr(
-        command, "run", AsyncMock(side_effect=RuntimeError("password=hidden")),
+        command,
+        "run",
+        AsyncMock(side_effect=RuntimeError("password=hidden")),
     )
     with pytest.raises(SystemExit) as exit_status:
         command.main()

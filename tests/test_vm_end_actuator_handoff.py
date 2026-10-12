@@ -89,11 +89,16 @@ def attach_native_session(monkeypatch, session, events, *, lose_response=False):
     async def acquire():
         yield SimpleNamespace(
             transaction=transaction,
-            fetchrow=AsyncMock(return_value={
-                "agent_id": owner, "execution_lane": "pinned",
-                "status": "ending", "runtime_generation": generation,
-                "runtime_attach_token": attach, "runtime_retirement_token": retirement,
-            }),
+            fetchrow=AsyncMock(
+                return_value={
+                    "agent_id": owner,
+                    "execution_lane": "pinned",
+                    "status": "ending",
+                    "runtime_generation": generation,
+                    "runtime_attach_token": attach,
+                    "runtime_retirement_token": retirement,
+                }
+            ),
         )
 
     session.postgres_conn = SimpleNamespace(acquire=acquire)
@@ -101,6 +106,7 @@ def attach_native_session(monkeypatch, session, events, *, lose_response=False):
     class Client:
         agent_id = owner
         dispatch_process_generation = str(uuid4())
+
         async def begin_thread_retirement(self, thread_id, **kwargs):
             events.append("begin")
             return {
@@ -198,9 +204,13 @@ async def test_native_terminal_vm_handoff_keeps_end_pending(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["shell", "browser", "mount", "backend", "writer", "background"])
+@pytest.mark.parametrize(
+    "failure", ["shell", "browser", "mount", "backend", "writer", "background"]
+)
 async def test_required_drain_failure_never_requests_vm_actuator(monkeypatch, failure):
-    session, backend, events = native_vm_session(monkeypatch, shell_failure=failure == "shell")
+    session, backend, events = native_vm_session(
+        monkeypatch, shell_failure=failure == "shell"
+    )
     accepted = attach_native_session(monkeypatch, session, events)
 
     def fail(*_args, **_kwargs):
@@ -208,22 +218,32 @@ async def test_required_drain_failure_never_requests_vm_actuator(monkeypatch, fa
 
     if failure == "browser":
         session.tool_context = SimpleNamespace(
-            close_browser=AsyncMock(side_effect=fail), citation_engine=None,
+            close_browser=AsyncMock(side_effect=fail),
+            citation_engine=None,
         )
     elif failure == "mount":
-        session.cloud_mount_manager = SimpleNamespace(aclose=AsyncMock(side_effect=fail))
+        session.cloud_mount_manager = SimpleNamespace(
+            aclose=AsyncMock(side_effect=fail)
+        )
     elif failure == "backend":
         monkeypatch.setattr(backend, "retire", fail)
     elif failure == "writer":
-        monkeypatch.setattr(app, "_event_writer", SimpleNamespace(close=AsyncMock(side_effect=fail)))
+        monkeypatch.setattr(
+            app, "_event_writer", SimpleNamespace(close=AsyncMock(side_effect=fail))
+        )
     elif failure == "background":
-        session.memory_service = SimpleNamespace(close_background=AsyncMock(side_effect=fail))
+        session.memory_service = SimpleNamespace(
+            close_background=AsyncMock(side_effect=fail)
+        )
 
     with pytest.raises((WorkspaceUnavailableError, app.EventJournalUnavailable)):
         await app._session_termination._terminate_inner("shutdown")
     assert accepted == []
     assert session.local_quiescence_protocol == ""
-    assert app._session is session and app._session_termination.retirement_admission_closed()
+    assert (
+        app._session is session
+        and app._session_termination.retirement_admission_closed()
+    )
 
 
 @pytest.mark.asyncio
@@ -245,13 +265,19 @@ async def test_required_drain_retry_does_not_replay_final_git(monkeypatch, failu
         monkeypatch.setattr(backend, "_exec_with_status", transport)
     elif failure == "browser":
         session.tool_context = SimpleNamespace(
-            close_browser=AsyncMock(side_effect=[OSError("browser stop unknown"), None]),
+            close_browser=AsyncMock(
+                side_effect=[OSError("browser stop unknown"), None]
+            ),
             citation_engine=None,
         )
     else:
-        monkeypatch.setattr(app, "_event_writer", SimpleNamespace(
-            close=AsyncMock(side_effect=[OSError("writer drain unknown"), None]),
-        ))
+        monkeypatch.setattr(
+            app,
+            "_event_writer",
+            SimpleNamespace(
+                close=AsyncMock(side_effect=[OSError("writer drain unknown"), None]),
+            ),
+        )
     with pytest.raises((WorkspaceUnavailableError, app.EventJournalUnavailable)):
         await app._session_termination._terminate_inner("shutdown")
     assert not backend._retired and accepted == []
@@ -279,9 +305,13 @@ async def test_archive_handoff_sends_pending_without_false_end(monkeypatch):
 async def test_suspended_vm_retirement_keeps_existing_proof_refusal(monkeypatch):
     session, backend, events = native_vm_session(monkeypatch)
     accepted = attach_native_session(monkeypatch, session, events)
-    monkeypatch.setattr(app._session_termination, "retirement_admission_disposition", "suspended")
+    monkeypatch.setattr(
+        app._session_termination, "retirement_admission_disposition", "suspended"
+    )
     with pytest.raises(WorkspaceUnavailableError):
-        await app._session_termination._terminate_inner("drain", mark_thread=False, preserve_shell=False)
+        await app._session_termination._terminate_inner(
+            "drain", mark_thread=False, preserve_shell=False
+        )
     assert not backend._retired and accepted == []
     assert session.local_quiescence_protocol == ""
     assert app._session is session
@@ -290,18 +320,22 @@ async def test_suspended_vm_retirement_keeps_existing_proof_refusal(monkeypatch)
 def test_public_projection_excludes_vm_actuator_request():
     from orchestrator.services.thread_projection import redact_thread_metadata
 
-    projected = redact_thread_metadata({
-        "runtime_retirement_actuator_request": {"process_generation": "private"},
-        "runtime_retirement_token": str(uuid4()),
-        "runtime_retirement_authorized_at": "now",
-        "runtime_retirement_context": {"settle_status": "ended"},
-    })
+    projected = redact_thread_metadata(
+        {
+            "runtime_retirement_actuator_request": {"process_generation": "private"},
+            "runtime_retirement_token": str(uuid4()),
+            "runtime_retirement_authorized_at": "now",
+            "runtime_retirement_context": {"settle_status": "ended"},
+        }
+    )
     assert "runtime_retirement_actuator_request" not in projected
     assert projected["runtime_retirement_pending"] is True
 
 
 @pytest.mark.asyncio
-async def test_partially_retired_backend_retries_only_unfinished_local_close(monkeypatch):
+async def test_partially_retired_backend_retries_only_unfinished_local_close(
+    monkeypatch,
+):
     session, backend, events = native_vm_session(monkeypatch)
     accepted = attach_native_session(monkeypatch, session, events)
     retire = backend.retire
@@ -312,7 +346,9 @@ async def test_partially_retired_backend_retries_only_unfinished_local_close(mon
         retire()
         if first:
             first = False
-            raise OSError("disconnect acknowledgement unavailable after admission retired")
+            raise OSError(
+                "disconnect acknowledgement unavailable after admission retired"
+            )
 
     monkeypatch.setattr(backend, "retire", retire_once_uncertain)
     with pytest.raises(WorkspaceUnavailableError):
@@ -323,7 +359,9 @@ async def test_partially_retired_backend_retries_only_unfinished_local_close(mon
 
 
 @pytest.mark.asyncio
-async def test_optional_flush_failures_are_logged_once_and_do_not_block_drain(monkeypatch, caplog):
+async def test_optional_flush_failures_are_logged_once_and_do_not_block_drain(
+    monkeypatch, caplog
+):
     session, backend, events = native_vm_session(monkeypatch)
     accepted = attach_native_session(monkeypatch, session, events, lose_response=True)
     ssh = backend._exec_with_status
@@ -337,7 +375,8 @@ async def test_optional_flush_failures_are_logged_once_and_do_not_block_drain(mo
     monkeypatch.setattr(backend, "_exec_with_status", unavailable_git)
     session.workspace_sync = SimpleNamespace(
         push_all=AsyncMock(side_effect=OSError("optional cloud unavailable")),
-        pull_all=AsyncMock(), aclose=AsyncMock(),
+        pull_all=AsyncMock(),
+        aclose=AsyncMock(),
     )
     assert await app._session_termination.terminate("shutdown") == "actuator_requested"
     assert len(accepted) == 2 and backend._retired
@@ -348,7 +387,9 @@ async def test_optional_flush_failures_are_logged_once_and_do_not_block_drain(mo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("missing", ["shell", "backend"])
-async def test_opt_in_requires_real_shell_and_backend_acknowledgements(monkeypatch, missing):
+async def test_opt_in_requires_real_shell_and_backend_acknowledgements(
+    monkeypatch, missing
+):
     session, _, _ = native_vm_session(monkeypatch)
     if missing == "shell":
         session.shell_manager = None
@@ -366,18 +407,25 @@ async def test_rest_detach_reports_pending_after_native_vm_drain(monkeypatch):
     session, backend, events = native_vm_session(monkeypatch)
     attach_native_session(monkeypatch, session, events)
     api = app.create_persistent_app("session_base", thread_id=session.thread_id)
-    endpoint = next(route.endpoint for route in api.routes if route.path == "/session/detach")
+    endpoint = next(
+        route.endpoint for route in api.routes if route.path == "/session/detach"
+    )
     fingerprint = app._session_identity.fingerprint()
     assert fingerprint
     response = await endpoint({"session_identity_fingerprint": fingerprint})
     assert response.status_code == 202
-    assert json.loads(response.body) == {"status": "ending", "thread_id": session.thread_id}
+    assert json.loads(response.body) == {
+        "status": "ending",
+        "thread_id": session.thread_id,
+    }
     assert app._session is session and backend._retired
     assert not app._session_ready()
 
 
 @pytest.mark.asyncio
-async def test_failed_vm_attach_observes_later_end_and_hands_off_after_retry(monkeypatch):
+async def test_failed_vm_attach_observes_later_end_and_hands_off_after_retry(
+    monkeypatch,
+):
     session, backend, events = native_vm_session(monkeypatch)
     accepted = attach_native_session(monkeypatch, session, events)
     generation = app._session_identity.session_generation
@@ -390,7 +438,9 @@ async def test_failed_vm_attach_observes_later_end_and_hands_off_after_retry(mon
         "retirement_admission_permanent",
     ):
         monkeypatch.setattr(app._session_termination, name, None)
-    monkeypatch.setattr(session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.01,))
+    monkeypatch.setattr(
+        session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.01,)
+    )
     import agent.api.session_attach as session_attach
 
     monkeypatch.setattr(session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.01,))
@@ -422,6 +472,7 @@ async def test_failed_vm_attach_observes_later_end_and_hands_off_after_retry(mon
         app._session_attach.cleanup_failed_attach_until_proven(session.thread_id)
     )
     try:
+
         async def marker_accepted():
             while not accepted:
                 await asyncio.sleep(0.01)
@@ -437,21 +488,23 @@ async def test_failed_vm_attach_observes_later_end_and_hands_off_after_retry(mon
             app._session_identity.session_generation,
             app._session_identity.attach_token,
         ) == (generation, attach_token)
-        assert accepted == [(
-            session.thread_id,
-            {
-                "pinned_agent_id": app._orchestrator_client.agent_id,
-                "pod_uid": app._session_identity.snapshot().pod_uid,
-                "process_generation": app._orchestrator_client.dispatch_process_generation,
-                "session_runtime_generation": generation,
-                "session_runtime_attach_token": attach_token,
-                "session_runtime_retirement_token": retirement_token,
-                "retirement_disposition": "ended",
-                "retirement_permanent": False,
-                "workspace_generation": session.workspace_generation,
-                "workspace_runtime_incarnation": session.workspace_runtime_incarnation,
-            },
-        )]
+        assert accepted == [
+            (
+                session.thread_id,
+                {
+                    "pinned_agent_id": app._orchestrator_client.agent_id,
+                    "pod_uid": app._session_identity.snapshot().pod_uid,
+                    "process_generation": app._orchestrator_client.dispatch_process_generation,
+                    "session_runtime_generation": generation,
+                    "session_runtime_attach_token": attach_token,
+                    "session_runtime_retirement_token": retirement_token,
+                    "retirement_disposition": "ended",
+                    "retirement_permanent": False,
+                    "workspace_generation": session.workspace_generation,
+                    "workspace_runtime_incarnation": session.workspace_runtime_incarnation,
+                },
+            )
+        ]
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -515,6 +568,7 @@ async def test_failed_vm_attach_keeps_owner_without_exact_ended_token(
         app._session_attach.cleanup_failed_attach_until_proven(session.thread_id)
     )
     try:
+
         async def cleanup_attempted():
             while "shell-stop" not in events:
                 await asyncio.sleep(0.01)

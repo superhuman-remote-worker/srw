@@ -164,9 +164,14 @@ class VMResourcePolicyLifecycleStore:
         head = await conn.fetchrow(
             "SELECT * FROM vm_resource_inventory_heads WHERE cluster_id=$1 "
             "AND policy_digest=$2 FOR UPDATE",
-            settings.cluster_id, settings.policy_digest,
+            settings.cluster_id,
+            settings.policy_digest,
         )
-        if head is None or head["current_snapshot_id"] is None or head["observation_conflict"]:
+        if (
+            head is None
+            or head["current_snapshot_id"] is None
+            or head["observation_conflict"]
+        ):
             raise ResourceAdmissionError("inventory_unavailable")
         observed = await conn.fetchrow(
             "SELECT * FROM vm_resource_inventory_snapshots WHERE snapshot_id=$1",
@@ -180,7 +185,9 @@ class VMResourcePolicyLifecycleStore:
         snapshot = inventory._snapshot(document, observed["digest"])
         now = await conn.fetchval("SELECT clock_timestamp()")
         if not snapshot["complete"] or not snapshot_is_fresh(
-            snapshot, received_at=observed["received_at"], now=now,
+            snapshot,
+            received_at=observed["received_at"],
+            now=now,
             stale_after_seconds=settings.stale_after_seconds,
         ):
             raise ResourceAdmissionError("inventory_unavailable")
@@ -219,7 +226,8 @@ class VMResourcePolicyLifecycleStore:
             updated = await conn.fetchrow(
                 "UPDATE vm_resource_admission_policy SET mode='enforce',"
                 "revision=revision+1 WHERE cluster_id=$1 AND revision=$2 RETURNING *",
-                current.cluster_id, current.revision,
+                current.cluster_id,
+                current.revision,
             )
             if updated is None:
                 raise ResourceAdmissionError("resource_policy_changed")
@@ -249,7 +257,8 @@ class VMResourcePolicyLifecycleStore:
             updated = await conn.fetchrow(
                 "UPDATE vm_resource_admission_policy SET mode='off',"
                 "revision=revision+1 WHERE cluster_id=$1 AND revision=$2 RETURNING *",
-                current.cluster_id, current.revision,
+                current.cluster_id,
+                current.revision,
             )
             if updated is None:
                 raise ResourceAdmissionError("resource_policy_changed")

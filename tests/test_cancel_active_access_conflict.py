@@ -74,7 +74,9 @@ def retirement_spies(monkeypatch):
 async def test_rejected_nonterminal_cancel_reports_workspace_conflict(
     monkeypatch, lane, active_access, detail
 ):
-    store = rejection_store(lane, _job("paused", lane=lane), active_access=active_access)
+    store = rejection_store(
+        lane, _job("paused", lane=lane), active_access=active_access
+    )
     main = _bind_runtime(monkeypatch, store, True)
     cleanup, cascade, settle, finish = retirement_spies(monkeypatch)
     async with _cancel_client(main, monkeypatch, store) as client:
@@ -157,8 +159,12 @@ async def test_accepted_cancel_does_not_classify_workspace_access(monkeypatch, l
 
 
 @pytest.mark.asyncio
-async def test_cancel_authorization_failure_does_not_query_workspace_access(monkeypatch):
-    store = rejection_store("stateless", _job("paused", lane="stateless"), active_access=True)
+async def test_cancel_authorization_failure_does_not_query_workspace_access(
+    monkeypatch,
+):
+    store = rejection_store(
+        "stateless", _job("paused", lane="stateless"), active_access=True
+    )
     main = _bind_runtime(monkeypatch, store, True)
 
     async def denied(*_args):

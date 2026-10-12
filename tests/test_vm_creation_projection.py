@@ -84,18 +84,23 @@ def test_owner_wait_keeps_only_exact_bounded_source(reason, resource, expected):
 
 def test_resource_wait_preserves_this_request_size_age_and_nonfit_only():
     raw = progress(
-        state="queued", reason="resource_wait",
+        state="queued",
+        reason="resource_wait",
         resource_wait={
-            "state": "nonfit", "reason": "resource_size_nonfit",
+            "state": "nonfit",
+            "reason": "resource_size_nonfit",
             "enqueued_at": "2026-09-24T04:00:00+00:00",
-            "guest_vcpus": 4, "guest_memory_bytes": 8 * 1024**3,
+            "guest_vcpus": 4,
+            "guest_memory_bytes": 8 * 1024**3,
             "installation_budget": "SECRET other tenants",
         },
     )
     wait = redact({"status": "created", "_vm_creation": raw})["vm_creation"]["wait"]
     assert wait == {
-        "kind": "resource", "since": "2026-09-24T04:00:00+00:00",
-        "size_nonfit": True, "guest_vcpus": 4,
+        "kind": "resource",
+        "since": "2026-09-24T04:00:00+00:00",
+        "size_nonfit": True,
+        "guest_vcpus": 4,
         "guest_memory_bytes": 8 * 1024**3,
     }
 

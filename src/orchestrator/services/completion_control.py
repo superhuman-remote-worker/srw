@@ -268,15 +268,19 @@ class CompletionControl:
         if expected_lane == "pinned" and bounded_source == "public_approve":
             async with self.db.acquire() as probe:
                 pinned_approve_agent = await probe.fetchval(
-                    "SELECT assigned_agent_id FROM jobs WHERE id=$1", canonical,
+                    "SELECT assigned_agent_id FROM jobs WHERE id=$1",
+                    canonical,
                 )
         async with self.db.acquire() as conn:
             async with conn.transaction():
                 if pinned_approve_agent is not None:
-                    if await conn.fetchval(
-                        "SELECT id FROM agents WHERE id=$1 FOR UPDATE",
-                        pinned_approve_agent,
-                    ) is None:
+                    if (
+                        await conn.fetchval(
+                            "SELECT id FROM agents WHERE id=$1 FOR UPDATE",
+                            pinned_approve_agent,
+                        )
+                        is None
+                    ):
                         raise CompletionControlClaimConflict(
                             "pinned approval agent changed"
                         )
@@ -309,8 +313,11 @@ class CompletionControl:
                 if (
                     str(job["status"]) != expected_status
                     or str(job["execution_lane"] or "pinned") != expected_lane
-                    or (expected_lane == "pinned" and bounded_source == "public_approve"
-                        and job["assigned_agent_id"] != pinned_approve_agent)
+                    or (
+                        expected_lane == "pinned"
+                        and bounded_source == "public_approve"
+                        and job["assigned_agent_id"] != pinned_approve_agent
+                    )
                 ):
                     raise CompletionControlClaimConflict(
                         "job changed while control was being claimed"
@@ -319,7 +326,8 @@ class CompletionControl:
                 if expected_lane == "pinned":
                     idle = await conn.fetchrow(
                         "SELECT * FROM vm_idle_operations WHERE owner_kind='job' "
-                        "AND owner_id=$1 AND closed_at IS NULL", canonical,
+                        "AND owner_id=$1 AND closed_at IS NULL",
+                        canonical,
                     )
                     if idle is not None:
                         if (
@@ -336,7 +344,10 @@ class CompletionControl:
                         from orchestrator.services.vm_idle_phase_approval import (
                             review_source_snapshot,
                         )
-                        if review_source_snapshot(dict(job)) != dict(terminal_review_source):
+
+                        if review_source_snapshot(dict(job)) != dict(
+                            terminal_review_source
+                        ):
                             raise CompletionControlClaimConflict(
                                 "pinned terminal review source changed"
                             )
@@ -426,8 +437,12 @@ class CompletionControl:
                     # worker claim and refuses it for lacking a dispatch marker.
                     release_agent_sql = (
                         ""
-                        if expected_lane == "stateless" or pinned_idle_approval
-                           or (expected_lane == "pinned" and terminal_review_source is not None)
+                        if expected_lane == "stateless"
+                        or pinned_idle_approval
+                        or (
+                            expected_lane == "pinned"
+                            and terminal_review_source is not None
+                        )
                         else "assigned_agent_id=NULL,"
                     )
                     updated = await conn.fetchrow(
@@ -481,7 +496,9 @@ class CompletionControl:
                         fence_kind=fence_kind,
                         fence_value=fence_value,
                         queue_state_before_claim=(
-                            str(queue["state"]) if expected_lane == "stateless" else None
+                            str(queue["state"])
+                            if expected_lane == "stateless"
+                            else None
                         ),
                     )
 
@@ -655,9 +672,13 @@ class CompletionControl:
                         raise CompletionControlClaimConflict(
                             "pinned approval agent identity invalid"
                         ) from exc
-                    if await conn.fetchval(
-                        "SELECT id FROM agents WHERE id=$1 FOR UPDATE", agent_id,
-                    ) is None:
+                    if (
+                        await conn.fetchval(
+                            "SELECT id FROM agents WHERE id=$1 FOR UPDATE",
+                            agent_id,
+                        )
+                        is None
+                    ):
                         raise CompletionControlClaimConflict(
                             "pinned approval agent changed"
                         )
@@ -682,7 +703,7 @@ class CompletionControl:
                         claim.expected_lane == "pinned"
                         and claim.source == "public_approve"
                         and str(job.get("assigned_agent_id") or "unassigned")
-                            != claim.fence_value
+                        != claim.fence_value
                     )
                     or not completion_control_claim_owned_active(
                         job["context"],

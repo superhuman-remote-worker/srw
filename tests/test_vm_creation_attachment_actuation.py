@@ -154,7 +154,9 @@ async def test_vm_attachment_label_drift_cannot_be_adopted(attached, location):
     ctrl, api, authority, payload = attached
     api.lost.add("VirtualMachine")
     for _ in range(4):
-        assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+        assert (await ctrl._do_create_serialized(payload))[
+            "status"
+        ] == "creation_pending"
     vm = api.objects["VirtualMachine", "agent-vm-" + payload["job_id"]]
     metadata = (
         vm["metadata"] if location == "metadata" else vm["spec"]["template"]["metadata"]
@@ -242,7 +244,9 @@ async def test_retained_attachment_cas_keeps_disk_and_recovers_lost_put(
     api.replace = replace
     assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
     assert api.writes == ["Lease"]
-    assert (await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5))[
+        "status"
+    ] == "created"
     assert len(puts) == 1
     assert puts[0]["metadata"]["uid"] == before["metadata"]["uid"]
     assert (
@@ -261,7 +265,9 @@ async def test_retained_attachment_cas_keeps_disk_and_recovers_lost_put(
     [("rv", False), ("uid", False), ("detached", False), ("rv", True)],
 )
 async def test_attachment_change_after_grant_cannot_reach_put(
-    attached, change, advance,
+    attached,
+    change,
+    advance,
 ):
     ctrl, api, authority, payload = attached
     name = retained_attachment(attached, advance=advance)
@@ -298,19 +304,24 @@ async def test_attachment_change_after_grant_cannot_reach_put(
         "reason": "workspace_attachment_unproven",
     }
     assert len(authority.surrenders) == 1
-    assert authority.surrenders[0]["effect_nonce"] == authority.row["effects"][0][
-        "carrier_intent"
-    ]["effect_nonce"]
+    assert (
+        authority.surrenders[0]["effect_nonce"]
+        == authority.row["effects"][0]["carrier_intent"]["effect_nonce"]
+    )
     assert authority.surrenders[0]["reason"] == "workspace_attachment_unproven"
     assert attachment_replaces == []
     if advance:
-        assert authority.row["effects"][0]["carrier_intent"]["workspace_attachment"][
-            "action"
-        ] == "replace"
+        assert (
+            authority.row["effects"][0]["carrier_intent"]["workspace_attachment"][
+                "action"
+            ]
+            == "replace"
+        )
         assert api.read("Lease", name)["metadata"]["uid"] == prior["metadata"]["uid"]
-        assert api.read("Lease", name)["metadata"]["annotations"] == prior[
-            "metadata"
-        ]["annotations"]
+        assert (
+            api.read("Lease", name)["metadata"]["annotations"]
+            == prior["metadata"]["annotations"]
+        )
     assert (await ctrl._do_create_serialized(payload))["status"] != "created"
     assert api.writes == ["Lease"]
     assert attachment_replaces == []

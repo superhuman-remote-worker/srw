@@ -17,10 +17,13 @@ class JobStartRequest(BaseModel):
     job_id: str
     pinned_delivery_id: UUID | None = None
     pinned_projection_digest: str | None = Field(
-        default=None, pattern=r"^sha256:[0-9a-f]{64}$",
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
     )
     pinned_delivery_proof: str | None = Field(
-        default=None, repr=False, pattern=r"^[0-9a-f]{64}$",
+        default=None,
+        repr=False,
+        pattern=r"^[0-9a-f]{64}$",
     )
     description: str
     upload_id: str | None = None
@@ -132,10 +135,13 @@ class JobCompleteRequest(BaseModel):
     )
     pinned_delivery_id: UUID | None = None
     pinned_projection_digest: str | None = Field(
-        default=None, pattern=r"^sha256:[0-9a-f]{64}$",
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
     )
     pinned_delivery_proof: str | None = Field(
-        default=None, repr=False, pattern=r"^[0-9a-f]{64}$",
+        default=None,
+        repr=False,
+        pattern=r"^[0-9a-f]{64}$",
     )
     pinned_process_generation: str | None = Field(default=None, max_length=128)
     pinned_pod_uid: str | None = Field(default=None, max_length=128)

@@ -488,7 +488,9 @@ async def test_capacity_route_requires_admin():
 
     snapshot = AsyncMock(return_value={"desired": 2})
     vm_snapshot = AsyncMock(return_value={"available": False, "clusters": []})
-    deps = routes.CapacityDependencies(snapshot=snapshot, require_admin=_deny, vm_snapshot=vm_snapshot)
+    deps = routes.CapacityDependencies(
+        snapshot=snapshot, require_admin=_deny, vm_snapshot=vm_snapshot
+    )
     with pytest.raises(HTTPException) as exc:
         await routes.get_capacity(MagicMock(), dependencies=deps)
     assert exc.value.status_code == 403
@@ -500,9 +502,12 @@ async def test_capacity_route_requires_admin():
 
     deps = routes.CapacityDependencies(snapshot=snapshot, require_admin=_allow)
     assert await routes.get_capacity(MagicMock(), dependencies=deps) == {"desired": 2}
-    deps = routes.CapacityDependencies(snapshot=snapshot, require_admin=_allow, vm_snapshot=vm_snapshot)
+    deps = routes.CapacityDependencies(
+        snapshot=snapshot, require_admin=_allow, vm_snapshot=vm_snapshot
+    )
     assert await routes.get_capacity(MagicMock(), dependencies=deps) == {
-        "desired": 2, "vm": {"available": False, "clusters": []},
+        "desired": 2,
+        "vm": {"available": False, "clusters": []},
     }
     vm_snapshot.assert_awaited_once()
 

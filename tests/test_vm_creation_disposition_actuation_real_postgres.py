@@ -32,10 +32,14 @@ async def runtime(db, setup, monkeypatch, *, unused_vm=False):
     ctrl, api, _, _ = setup
     monkeypatch.setattr(settings, "LIFECYCLE_HMAC_SECRET", SECRET)
     if unused_vm:
-        store, row, lease, observations, grant = await cancelled_unused_vm(db, monkeypatch)
+        store, row, lease, observations, grant = await cancelled_unused_vm(
+            db, monkeypatch
+        )
         assert await store.record_not_attempted(
-            request_id=str(row["request_id"]), effect_nonce=grant["effect_nonce"],
-            carrier=lease, issuer_receipt=grant["issuer_receipt"],
+            request_id=str(row["request_id"]),
+            effect_nonce=grant["effect_nonce"],
+            carrier=lease,
+            issuer_receipt=grant["issuer_receipt"],
             reason="resource_node_changed",
         ) == {"recorded": True, "effect_state": "rejected"}
     else:
@@ -140,19 +144,29 @@ async def runtime(db, setup, monkeypatch, *, unused_vm=False):
 
 @pytest.mark.asyncio
 async def test_unused_vm_grant_disposes_exact_partial_resources_before_parent_release(
-    db, setup, monkeypatch,
+    db,
+    setup,
+    monkeypatch,
 ):
     ctrl, api, store, row, lease = await runtime(
-        db, setup, monkeypatch, unused_vm=True,
+        db,
+        setup,
+        monkeypatch,
+        unused_vm=True,
     )
     frozen = await store.freeze_disposition(
-        request_id=str(row["request_id"]), carrier=lease,
+        request_id=str(row["request_id"]),
+        carrier=lease,
     )
     assert frozen["frozen"] is True
-    assert await db.fetchval(
-        "SELECT completed_at IS NULL FROM vm_workspace_cleanup_admissions "
-        "WHERE id=$1", UUID(frozen["disposition"]["admission_id"]),
-    ) is True
+    assert (
+        await db.fetchval(
+            "SELECT completed_at IS NULL FROM vm_workspace_cleanup_admissions "
+            "WHERE id=$1",
+            UUID(frozen["disposition"]["admission_id"]),
+        )
+        is True
+    )
     for _ in range(8):
         result = await CreationDisposer(ctrl).run(disposition_identity(row))
         if result["status"] == "creation_disposed":
@@ -161,15 +175,24 @@ async def test_unused_vm_grant_disposes_exact_partial_resources_before_parent_re
     state = await store.inspect(request_id=str(row["request_id"]))
     assert state["state"] == "settled"
     assert set(state["cancellation_completion"]) == {
-        "cloud_init", "rootdisk", "source", "workspace_attachment",
+        "cloud_init",
+        "rootdisk",
+        "source",
+        "workspace_attachment",
     }
     assert [kind for kind, _, _ in api.deletes if kind != "Lease"] == [
-        "Secret", "DataVolume", "PersistentVolumeClaim",
+        "Secret",
+        "DataVolume",
+        "PersistentVolumeClaim",
     ]
-    assert await db.fetchval(
-        "SELECT completed_at IS NOT NULL FROM vm_workspace_cleanup_admissions "
-        "WHERE id=$1", UUID(frozen["disposition"]["admission_id"]),
-    ) is True
+    assert (
+        await db.fetchval(
+            "SELECT completed_at IS NOT NULL FROM vm_workspace_cleanup_admissions "
+            "WHERE id=$1",
+            UUID(frozen["disposition"]["admission_id"]),
+        )
+        is True
+    )
 
 
 @pytest.mark.asyncio
@@ -188,7 +211,12 @@ async def test_fixed_partial_resources_are_disposed_once_and_parent_settles(
             break
     assert result["status"] == "creation_disposed"
     state = await store.inspect(request_id=str(row["request_id"]))
-    assert set(state["cancellation_completion"]) == {"cloud_init", "rootdisk", "source", "workspace_attachment"}
+    assert set(state["cancellation_completion"]) == {
+        "cloud_init",
+        "rootdisk",
+        "source",
+        "workspace_attachment",
+    }
     assert state["state"] == "settled"
     assert [item[0] for item in api.deletes if item[0] != "Lease"] == [
         "Secret",
@@ -318,7 +346,12 @@ async def test_lost_root_grant_progress_or_carrier_reply_replays_one_child(
     for _ in range(3):
         await CreationDisposer(ctrl).run(disposition_identity(row))
     current = await store.inspect(request_id=str(row["request_id"]))
-    assert set(current["cancellation_completion"]) == {"cloud_init", "rootdisk", "source", "workspace_attachment"}
+    assert set(current["cancellation_completion"]) == {
+        "cloud_init",
+        "rootdisk",
+        "source",
+        "workspace_attachment",
+    }
     assert current["state"] == "settled"
     assert len([value for value in api.deletes if value[0] != "Lease"]) == 3
     async with db.acquire() as conn:

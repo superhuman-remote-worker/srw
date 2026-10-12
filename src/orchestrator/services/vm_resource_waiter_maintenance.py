@@ -42,27 +42,41 @@ async def _scope(conn, request_id):
         raise VMCreationRetryConflict("retry_request_missing")
     if prior["owner_kind"] == "thread":
         thread = await conn.fetchrow(
-            "SELECT * FROM threads WHERE id=$1 FOR UPDATE", prior["thread_id"],
+            "SELECT * FROM threads WHERE id=$1 FOR UPDATE",
+            prior["thread_id"],
         )
-        retry = _record(await conn.fetchrow(
-            "SELECT * FROM vm_creation_retries WHERE request_id=$1 FOR UPDATE",
-            request_id,
-        ))
-        if retry is None or any(retry[key] != prior[key] for key in (
-            "owner_kind", "thread_id", "thread_runtime_generation",
-            "thread_agent_id", "thread_attach_token", "thread_wake_operation_id",
-            "provision_generation", "expected_pvc_uid", "observed_pvc_uid",
-        )):
+        retry = _record(
+            await conn.fetchrow(
+                "SELECT * FROM vm_creation_retries WHERE request_id=$1 FOR UPDATE",
+                request_id,
+            )
+        )
+        if retry is None or any(
+            retry[key] != prior[key]
+            for key in (
+                "owner_kind",
+                "thread_id",
+                "thread_runtime_generation",
+                "thread_agent_id",
+                "thread_attach_token",
+                "thread_wake_operation_id",
+                "provision_generation",
+                "expected_pvc_uid",
+                "observed_pvc_uid",
+            )
+        ):
             raise VMCreationRetryConflict("scope_raced")
         effects = await conn.fetch(
             "SELECT * FROM vm_creation_effects WHERE request_id=$1 "
-            "ORDER BY effect_number FOR UPDATE", request_id,
+            "ORDER BY effect_number FOR UPDATE",
+            request_id,
         )
         metadata = _json(thread["metadata"]) if thread is not None else None
         vm = metadata.get("vm") if isinstance(metadata, dict) else None
         blocker = None
         if (
-            thread is None or thread["execution_lane"] != "pinned"
+            thread is None
+            or thread["execution_lane"] != "pinned"
             or thread["runtime_generation"] != retry["thread_runtime_generation"]
             or thread["agent_id"] != retry["thread_agent_id"]
             or thread["runtime_attach_token"] != retry["thread_attach_token"]
@@ -79,7 +93,8 @@ async def _scope(conn, request_id):
             "OR EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
             "WHERE owner_kind='thread' AND owner_id=$1 AND completed_at IS NULL "
             "AND id IS DISTINCT FROM $2)",
-            retry["thread_id"], retry["creation_admission_id"],
+            retry["thread_id"],
+            retry["creation_admission_id"],
         ):
             blocker = "workspace_recovery_held"
         return retry, thread, None, effects, blocker
@@ -207,8 +222,10 @@ def _outcome(retry, job, execution, effects, blocker, policy_digest, waiter, now
             return "cancelled", "creation_cancelled"
         if retry["state"] == "attention":
             return "parked", "retry_attention"
-        return ("waiting", None) if retry["state"] in {"queued", "reconciling"} else (
-            "parked", "runtime_identity_unproven"
+        return (
+            ("waiting", None)
+            if retry["state"] in {"queued", "reconciling"}
+            else ("parked", "runtime_identity_unproven")
         )
     if blocker == "creation_attachment_lineage_unproven":
         # A narrower, known target scope can only remove eligibility. Full
@@ -321,9 +338,14 @@ class VMResourceWaiterMaintenance:
             != retry["owner_kind"]
             or (waiter["thread_id"] if "thread_id" in waiter else None)
             != retry["thread_id"]
-            or any(waiter[key] != retry[key] for key in (
-                "job_id", "provision_generation", "request_digest",
-            ))
+            or any(
+                waiter[key] != retry[key]
+                for key in (
+                    "job_id",
+                    "provision_generation",
+                    "request_digest",
+                )
+            )
             or waiter["cluster_id"] != policy["cluster_id"]
         ):
             raise ResourceAdmissionError("resource_waiter_changed")

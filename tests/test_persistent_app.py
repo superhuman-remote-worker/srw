@@ -1739,7 +1739,11 @@ class TestPersistentLoopMemoryOutboxWiring:
             patch.object(pa, "_loop_task", None),
             patch.object(pa, "_session_ready", return_value=True),
             patch.object(pa, "run_persistent_loop", new=fake_run),
-            patch.object(pa._session_termination, "loop_completion_handler", no_completion_cleanup),
+            patch.object(
+                pa._session_termination,
+                "loop_completion_handler",
+                no_completion_cleanup,
+            ),
         ):
             assert pa._ensure_persistent_loop_started("test") is True
             loop_task = pa._loop_task
@@ -2611,13 +2615,20 @@ class TestPollWorkspaceReady:
         client.get_thread_workspace.return_value = workspace
 
         result = await session_workspace.poll_workspace_ready(
-            client, "tid", timeout=5, require_vm=backend == "vm", session_runtime_generation=None
+            client,
+            "tid",
+            timeout=5,
+            require_vm=backend == "vm",
+            session_runtime_generation=None,
         )
 
         if identity == "exact":
-            assert app._session_identity.adopt_workspace_payload(
-                result, protected_required=False
-            ) == generation
+            assert (
+                app._session_identity.adopt_workspace_payload(
+                    result, protected_required=False
+                )
+                == generation
+            )
             assert pinned_status_identity_advertised(result)
         else:
             message = (
@@ -2626,7 +2637,9 @@ class TestPollWorkspaceReady:
                 else "generation changed during attach"
             )
             with pytest.raises(app.WorkspaceNotReady, match=message):
-                app._session_identity.adopt_workspace_payload(result, protected_required=False)
+                app._session_identity.adopt_workspace_payload(
+                    result, protected_required=False
+                )
 
     @pytest.mark.asyncio
     async def test_returns_none_when_workspace_not_found(self):
@@ -2634,7 +2647,9 @@ class TestPollWorkspaceReady:
         client = AsyncMock()
         client.get_thread_workspace.return_value = None
 
-        result = await poll_workspace_ready(client, "tid", timeout=5, session_runtime_generation=None)
+        result = await poll_workspace_ready(
+            client, "tid", timeout=5, session_runtime_generation=None
+        )
         assert result is None
         # Should have been called only once (no retry)
         assert client.get_thread_workspace.call_count == 1
@@ -2655,7 +2670,13 @@ class TestPollWorkspaceReady:
             )
         )
         with pytest.raises(SessionGrantDenied):
-            await poll_workspace_ready(client, "tid", timeout=5, raise_on_denied=True, session_runtime_generation=None)
+            await poll_workspace_ready(
+                client,
+                "tid",
+                timeout=5,
+                raise_on_denied=True,
+                session_runtime_generation=None,
+            )
         client.get_thread_workspace.assert_called_once_with("tid", raise_on_denied=True)
 
     @pytest.mark.asyncio
@@ -2673,7 +2694,9 @@ class TestPollWorkspaceReady:
             "canvas_shared_browser_available": True,
         }
 
-        result = await poll_workspace_ready(client, "tid", timeout=5, session_runtime_generation=None)
+        result = await poll_workspace_ready(
+            client, "tid", timeout=5, session_runtime_generation=None
+        )
 
         assert result is not None
         assert result["backend"] == "vm"
@@ -2702,7 +2725,9 @@ class TestPollWorkspaceReady:
             "canvas_shared_browser_available": True,
         }
 
-        result = await poll_workspace_ready(client, "tid", timeout=5, session_runtime_generation=None)
+        result = await poll_workspace_ready(
+            client, "tid", timeout=5, session_runtime_generation=None
+        )
 
         assert result is not None
         assert result["backend"] == "sandbox"
@@ -2728,7 +2753,9 @@ class TestPollWorkspaceReady:
             "workspace_ssh_host_key_fingerprint": "SHA256:orphaned",
         }
 
-        result = await poll_workspace_ready(client, "tid", timeout=5, session_runtime_generation=None)
+        result = await poll_workspace_ready(
+            client, "tid", timeout=5, session_runtime_generation=None
+        )
 
         assert result is not None
         assert result["backend"] == "sandbox"
@@ -2743,7 +2770,9 @@ class TestPollWorkspaceReady:
         client = AsyncMock()
         client.get_thread_workspace.return_value = {"status": "none"}
 
-        result = await poll_workspace_ready(client, "tid", timeout=5, session_runtime_generation=None)
+        result = await poll_workspace_ready(
+            client, "tid", timeout=5, session_runtime_generation=None
+        )
         assert result is None
 
     @pytest.mark.asyncio
@@ -2756,7 +2785,9 @@ class TestPollWorkspaceReady:
             "managed_repository_credentials": [{"private_key": private_material}],
         }
 
-        result = await poll_workspace_ready(client, "tid", timeout=5, session_runtime_generation=None)
+        result = await poll_workspace_ready(
+            client, "tid", timeout=5, session_runtime_generation=None
+        )
         assert result is None
         assert private_material not in caplog.text
 
@@ -2777,7 +2808,11 @@ class TestPollWorkspaceReady:
 
         with patch("agent.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
             result = await poll_workspace_ready(
-                client, "tid", timeout=30, poll_interval=0.01, session_runtime_generation=None
+                client,
+                "tid",
+                timeout=30,
+                poll_interval=0.01,
+                session_runtime_generation=None,
             )
 
         assert result is not None
@@ -2793,7 +2828,11 @@ class TestPollWorkspaceReady:
             # Use a very short timeout and mock time.monotonic to expire immediately
             with patch("time.monotonic", side_effect=[0, 100]):
                 result = await poll_workspace_ready(
-                    client, "tid", timeout=5, poll_interval=0.01, session_runtime_generation=None
+                    client,
+                    "tid",
+                    timeout=5,
+                    poll_interval=0.01,
+                    session_runtime_generation=None,
                 )
 
         assert result is None
@@ -2809,7 +2848,9 @@ class TestPollWorkspaceReady:
             "pod_ip": "pod-ip",
         }
 
-        result = await poll_workspace_ready(client, "tid", timeout=5, session_runtime_generation=None)
+        result = await poll_workspace_ready(
+            client, "tid", timeout=5, session_runtime_generation=None
+        )
         assert result["remote"]["host"] == "vm-host"
 
     @pytest.mark.asyncio
@@ -2837,7 +2878,12 @@ class TestPollWorkspaceReady:
             # polling so the second poll returns the ready VM.
             with patch("time.monotonic", side_effect=[0, 0.5, 2, 2]):
                 result = await poll_workspace_ready(
-                    client, "tid", timeout=1, vm_timeout=1000, poll_interval=0.01, session_runtime_generation=None
+                    client,
+                    "tid",
+                    timeout=1,
+                    vm_timeout=1000,
+                    poll_interval=0.01,
+                    session_runtime_generation=None,
                 )
 
         assert result is not None
@@ -2868,7 +2914,8 @@ class TestPollWorkspaceReady:
                     timeout=1,
                     vm_timeout=1,
                     poll_interval=0.01,
-                    require_vm=True, session_runtime_generation=None,
+                    require_vm=True,
+                    session_runtime_generation=None,
                 )
 
         assert result is None  # timed out waiting for the VM — never downgraded
@@ -2883,7 +2930,9 @@ class TestPollWorkspaceReady:
             "vm_ssh_port": 22,
         }
 
-        result = await poll_workspace_ready(client, "tid", timeout=5, require_vm=True, session_runtime_generation=None)
+        result = await poll_workspace_ready(
+            client, "tid", timeout=5, require_vm=True, session_runtime_generation=None
+        )
 
         assert result is not None
         assert result["backend"] == "vm"
@@ -2897,7 +2946,9 @@ class TestPollWorkspaceReady:
         client = AsyncMock()
         client.get_thread_workspace.return_value = {"vm_status": "failed"}
 
-        result = await poll_workspace_ready(client, "tid", timeout=5, require_vm=True, session_runtime_generation=None)
+        result = await poll_workspace_ready(
+            client, "tid", timeout=5, require_vm=True, session_runtime_generation=None
+        )
 
         assert result is None
         assert client.get_thread_workspace.call_count == 1  # no retry
@@ -2910,7 +2961,9 @@ class TestPollWorkspaceReady:
         client = AsyncMock()
         client.get_thread_workspace.return_value = {"status": "none"}
 
-        result = await poll_workspace_ready(client, "tid", timeout=5, require_vm=True, session_runtime_generation=None)
+        result = await poll_workspace_ready(
+            client, "tid", timeout=5, require_vm=True, session_runtime_generation=None
+        )
 
         assert result is None
         assert client.get_thread_workspace.call_count == 1  # no retry
@@ -2927,7 +2980,9 @@ class TestPollWorkspaceReady:
             "pod_ip": "10.42.2.32",
         }
 
-        result = await poll_workspace_ready(client, "tid", timeout=5, session_runtime_generation=None)
+        result = await poll_workspace_ready(
+            client, "tid", timeout=5, session_runtime_generation=None
+        )
 
         assert result is not None
         assert result["backend"] == "sandbox"
@@ -3326,7 +3381,8 @@ class TestHandleArchive:
     def _common_teardown(self):
         with (
             patch(
-                "agent.api.persistent_app._session_termination.terminate", new=AsyncMock()
+                "agent.api.persistent_app._session_termination.terminate",
+                new=AsyncMock(),
             ) as teardown,
             patch(
                 "agent.api.persistent_app._update_thread_status",
@@ -3501,7 +3557,10 @@ class TestHandleArchive:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._session_identity._thread_id", "test-thread-id"),
+            patch(
+                "agent.api.persistent_app._session_identity._thread_id",
+                "test-thread-id",
+            ),
         ):
             await _handle_archive(ws)
 
@@ -3534,7 +3593,10 @@ class TestHandleArchive:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._session_identity._thread_id", "test-thread-id"),
+            patch(
+                "agent.api.persistent_app._session_identity._thread_id",
+                "test-thread-id",
+            ),
             patch(
                 "agent.api.persistent_app._session_identity._session_generation",
                 "55555555-5555-4555-8555-555555555555",
@@ -3567,7 +3629,10 @@ class TestHandleArchive:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._session_identity._thread_id", "officer-thread"),
+            patch(
+                "agent.api.persistent_app._session_identity._thread_id",
+                "officer-thread",
+            ),
             patch(
                 "agent.api.persistent_app._session_identity._session_generation",
                 "55555555-5555-4555-8555-555555555555",
@@ -3605,7 +3670,10 @@ class TestHandleArchive:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._session_identity._thread_id", "test-thread-id"),
+            patch(
+                "agent.api.persistent_app._session_identity._thread_id",
+                "test-thread-id",
+            ),
         ):
             await _handle_archive(ws)
 
@@ -3627,7 +3695,10 @@ class TestHandleArchive:
 
         with (
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._session_identity._thread_id", "test-thread-id"),
+            patch(
+                "agent.api.persistent_app._session_identity._thread_id",
+                "test-thread-id",
+            ),
         ):
             await _handle_archive(ws)
 
@@ -3650,7 +3721,10 @@ class TestHandleArchive:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._session_identity._thread_id", "test-thread-id"),
+            patch(
+                "agent.api.persistent_app._session_identity._thread_id",
+                "test-thread-id",
+            ),
         ):
             await _handle_archive(ws)
 
@@ -3828,14 +3902,20 @@ async def test_child_quiescence_precedes_retirement_authority_revocation():
     with (
         patch.object(mod, "_session", session),
         patch.object(mod._session_identity, "_thread_id", "retirement-order-thread"),
-        patch.object(mod._session_identity, "_session_generation",
+        patch.object(
+            mod._session_identity,
+            "_session_generation",
             "88888888-8888-4888-8888-888888888888",
         ),
-        patch.object(mod._session_identity, "_attach_token",
+        patch.object(
+            mod._session_identity,
+            "_attach_token",
             "99999999-9999-4999-8999-999999999999",
         ),
         patch.object(mod._session_termination, "retirement_admission_identity", None),
-        patch.object(mod._session_termination, "retirement_admission_disposition", None),
+        patch.object(
+            mod._session_termination, "retirement_admission_disposition", None
+        ),
         patch.object(mod._session_termination, "retirement_admission_token", None),
         patch.object(mod._session_termination, "retirement_admission_permanent", None),
         patch.object(mod._session_identity, "_runtime_contract", False),
@@ -3864,14 +3944,20 @@ async def test_child_quiescence_failure_refuses_retirement_begin():
     with (
         patch.object(mod, "_session", session),
         patch.object(mod._session_identity, "_thread_id", "retirement-quiesce-failure"),
-        patch.object(mod._session_identity, "_session_generation",
+        patch.object(
+            mod._session_identity,
+            "_session_generation",
             "88888888-8888-4888-8888-888888888888",
         ),
-        patch.object(mod._session_identity, "_attach_token",
+        patch.object(
+            mod._session_identity,
+            "_attach_token",
             "99999999-9999-4999-8999-999999999999",
         ),
         patch.object(mod._session_termination, "retirement_admission_identity", None),
-        patch.object(mod._session_termination, "retirement_admission_disposition", None),
+        patch.object(
+            mod._session_termination, "retirement_admission_disposition", None
+        ),
         patch.object(mod._session_termination, "retirement_admission_token", None),
         patch.object(mod._session_termination, "retirement_admission_permanent", None),
         patch.object(mod._session_identity, "_runtime_contract", False),
@@ -3920,9 +4006,15 @@ async def test_an_authorized_retirement_leaves_the_children_to_it(left):
         patch.object(mod._session_identity, "_thread_id", identity[0]),
         patch.object(mod._session_identity, "_session_generation", identity[1]),
         patch.object(mod._session_identity, "_attach_token", identity[2]),
-        patch.object(mod._session_termination, "retirement_admission_identity", identity),
-        patch.object(mod._session_termination, "retirement_admission_disposition", "ended"),
-        patch.object(mod._session_termination, "retirement_admission_token",
+        patch.object(
+            mod._session_termination, "retirement_admission_identity", identity
+        ),
+        patch.object(
+            mod._session_termination, "retirement_admission_disposition", "ended"
+        ),
+        patch.object(
+            mod._session_termination,
+            "retirement_admission_token",
             "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         ),
         patch.object(mod._session_termination, "retirement_admission_permanent", False),
@@ -3958,10 +4050,16 @@ class TestExactRetirementBeginReconciliation:
             patch.object(mod._session_identity, "_session_generation", self.generation),
             patch.object(mod._session_identity, "_attach_token", self.attach_token),
             patch.object(mod._session_identity, "_runtime_contract", True),
-            patch.object(mod._session_termination, "retirement_admission_identity", None),
-            patch.object(mod._session_termination, "retirement_admission_disposition", None),
+            patch.object(
+                mod._session_termination, "retirement_admission_identity", None
+            ),
+            patch.object(
+                mod._session_termination, "retirement_admission_disposition", None
+            ),
             patch.object(mod._session_termination, "retirement_admission_token", None),
-            patch.object(mod._session_termination, "retirement_admission_permanent", None),
+            patch.object(
+                mod._session_termination, "retirement_admission_permanent", None
+            ),
             patch.object(mod, "_orchestrator_client", client),
             patch.object(mod, "_stateless_mode", return_value=False),
             patch.object(
@@ -4103,13 +4201,18 @@ class TestExactRetirementBeginReconciliation:
             ),
             patch.object(mod, "_set_pinned_control_admission", reopen),
         ):
-            assert await mod._session_termination.begin_retirement(retirement_permanent=True)
+            assert await mod._session_termination.begin_retirement(
+                retirement_permanent=True
+            )
             assert mod._session_termination.retirement_admission_identity == (
                 self.thread_id,
                 self.generation,
                 self.attach_token,
             )
-            assert mod._session_termination.retirement_admission_token == self.retirement_token
+            assert (
+                mod._session_termination.retirement_admission_token
+                == self.retirement_token
+            )
             assert mod._session_termination.retirement_admission_disposition == "ended"
             assert mod._session_termination.retirement_admission_permanent is True
 
@@ -4183,16 +4286,22 @@ async def test_loop_gone_terminal_begin_retries_without_reopening_controls():
         patch.object(mod, "_set_pinned_control_admission", reopen),
         patch.object(mod, "_close_pinned_control_inbox", new=close_controls),
         patch.object(mod, "_retire_announced_permission_rows", new=AsyncMock()),
-        patch.object(mod._session_termination, "stop_and_join_watchdogs", new=AsyncMock()),
+        patch.object(
+            mod._session_termination, "stop_and_join_watchdogs", new=AsyncMock()
+        ),
         patch.object(mod, "_stop_thread_interrupt_watcher", new=AsyncMock()),
         patch.object(mod, "_stop_thread_control_watcher", new=AsyncMock()),
-        patch.object(mod._session_termination, "quiesce_session_side_tasks", new=AsyncMock()),
+        patch.object(
+            mod._session_termination, "quiesce_session_side_tasks", new=AsyncMock()
+        ),
         patch.object(
             mod._session_termination,
             "settle_exact_retirement_after_quiescence",
             new=AsyncMock(return_value=True),
         ),
-        patch.object(session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)),
+        patch.object(
+            session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)
+        ),
     ]
     with ExitStack() as stack:
         for patcher in patchers:
@@ -4222,12 +4331,18 @@ async def test_authorized_retirement_transient_local_failure_keeps_exact_retry_o
         patch.object(mod._session_identity, "_session_generation", generation),
         patch.object(mod._session_identity, "_attach_token", attach_token),
         patch.object(mod._session_identity, "_runtime_contract", True),
-        patch.object(mod._session_termination, "retirement_admission_identity", identity),
-        patch.object(mod._session_termination, "retirement_admission_token", retirement_token),
+        patch.object(
+            mod._session_termination, "retirement_admission_identity", identity
+        ),
+        patch.object(
+            mod._session_termination, "retirement_admission_token", retirement_token
+        ),
         patch.object(mod._session_termination, "termination_task", None),
         patch.object(mod._session_termination, "terminating", False),
         patch.object(mod._session_termination, "_terminate_inner", inner),
-        patch.object(session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)),
+        patch.object(
+            session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)
+        ),
     ):
         await mod._session_termination.terminate("thread_retirement_authorized")
 
@@ -4243,7 +4358,9 @@ async def test_authorized_retirement_retry_never_crosses_successor_identity():
     identity = ("stale-retry-thread", generation, attach_token)
 
     async def move_then_fail(*_args, **_kwargs):
-        mod._session_identity._session_generation = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        mod._session_identity._session_generation = (
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        )
         raise mod.EventJournalUnavailable("old runtime cleanup failed")
 
     inner = AsyncMock(side_effect=move_then_fail)
@@ -4253,7 +4370,9 @@ async def test_authorized_retirement_retry_never_crosses_successor_identity():
         patch.object(mod._session_identity, "_session_generation", generation),
         patch.object(mod._session_identity, "_attach_token", attach_token),
         patch.object(mod._session_identity, "_runtime_contract", True),
-        patch.object(mod._session_termination, "retirement_admission_identity", identity),
+        patch.object(
+            mod._session_termination, "retirement_admission_identity", identity
+        ),
         patch.object(
             mod._session_termination,
             "retirement_admission_token",
@@ -4262,7 +4381,9 @@ async def test_authorized_retirement_retry_never_crosses_successor_identity():
         patch.object(mod._session_termination, "termination_task", None),
         patch.object(mod._session_termination, "terminating", False),
         patch.object(mod._session_termination, "_terminate_inner", inner),
-        patch.object(session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)),
+        patch.object(
+            session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)
+        ),
     ):
         with pytest.raises(mod.EventJournalUnavailable):
             await mod._session_termination.terminate("thread_retirement_authorized")
@@ -4294,7 +4415,9 @@ async def test_hidden_preflight_ttl_abort_then_exact_reopen():
             mod, "_close_pinned_control_inbox", new=AsyncMock(return_value=True)
         ),
         patch.object(mod, "_set_pinned_control_admission", reopen),
-        patch.object(session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0, 0.0)),
+        patch.object(
+            session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0, 0.0)
+        ),
     ):
         assert await mod._session_termination.begin_retirement() is False
 
@@ -5507,7 +5630,9 @@ class TestTerminateSession:
             patch.object(mod, "_control_owner_agent_id", None),
             patch.object(mod, "_registered_pinned_agent_id", return_value=None),
             patch.object(mod, "_update_thread_status", update),
-            patch.object(mod._session_termination, "stop_and_join_watchdogs", new=AsyncMock()),
+            patch.object(
+                mod._session_termination, "stop_and_join_watchdogs", new=AsyncMock()
+            ),
             patch.object(mod, "_stop_thread_interrupt_watcher", new=AsyncMock()),
             patch.object(mod, "_stop_thread_control_watcher", new=AsyncMock()),
             patch.object(
@@ -5516,7 +5641,9 @@ class TestTerminateSession:
                 new=AsyncMock(side_effect=block_side_tasks),
             ),
         ):
-            termination = asyncio.create_task(mod._session_termination.terminate("shutdown"))
+            termination = asyncio.create_task(
+                mod._session_termination.terminate("shutdown")
+            )
             await side_task_entered.wait()
             assert [call.args[0] for call in update.await_args_list] == ["ending"]
             session.cleanup.assert_not_awaited()
@@ -5570,7 +5697,9 @@ class TestTerminateSession:
             patch.object(mod, "_stop_thread_interrupt_watcher", new=AsyncMock()),
             patch.object(mod, "_stop_thread_control_watcher", new=AsyncMock()),
         ):
-            termination = asyncio.create_task(mod._session_termination.terminate("shutdown"))
+            termination = asyncio.create_task(
+                mod._session_termination.terminate("shutdown")
+            )
             await cancellation_seen.wait()
             assert [call.args[0] for call in update.await_args_list] == ["ending"]
             session.cleanup.assert_not_awaited()
@@ -5658,7 +5787,9 @@ class TestTerminateSession:
             patch.object(mod, "_control_owner_agent_id", None),
             patch.object(mod, "_registered_pinned_agent_id", return_value=None),
             patch.object(mod, "_update_thread_status", update),
-            patch.object(mod._session_termination, "stop_and_join_watchdogs", new=AsyncMock()),
+            patch.object(
+                mod._session_termination, "stop_and_join_watchdogs", new=AsyncMock()
+            ),
             patch.object(mod, "_stop_thread_interrupt_watcher", new=AsyncMock()),
             patch.object(mod, "_stop_thread_control_watcher", new=AsyncMock()),
         ):
@@ -5711,8 +5842,12 @@ class TestTerminateSession:
             patch.object(mod._session_identity, "_session_generation", generation),
             patch.object(mod._session_identity, "_attach_token", attach_token),
             patch.object(mod._session_identity, "_runtime_contract", True),
-            patch.object(mod._session_termination, "retirement_admission_identity", identity),
-            patch.object(mod._session_termination, "retirement_admission_token", retirement_token),
+            patch.object(
+                mod._session_termination, "retirement_admission_identity", identity
+            ),
+            patch.object(
+                mod._session_termination, "retirement_admission_token", retirement_token
+            ),
             patch.object(mod, "_orchestrator_client", client),
             patch.object(mod, "_update_thread_status", update),
             patch.object(
@@ -5721,11 +5856,13 @@ class TestTerminateSession:
                 (0.0, 0.0),
             ),
         ):
-            assert await mod._session_termination.settle_exact_retirement_after_quiescence(
-                pinned_agent_id="agent-a",
-                retirement_disposition="ended",
-                retirement_permanent=False,
-                expected_identity=identity,
+            assert (
+                await mod._session_termination.settle_exact_retirement_after_quiescence(
+                    pinned_agent_id="agent-a",
+                    retirement_disposition="ended",
+                    retirement_permanent=False,
+                    expected_identity=identity,
+                )
             )
 
         assert update.await_count == 2
@@ -5992,7 +6129,9 @@ class TestAttachSessionEventJournalFailure:
         mod._subscribers.clear()
 
         with patch.object(mod, "_stop_thread_control_watcher", new=AsyncMock()):
-            await mod._session_attach.cleanup_failed_attach(mod._session_identity.thread_id)
+            await mod._session_attach.cleanup_failed_attach(
+                mod._session_identity.thread_id
+            )
 
         session.cleanup.assert_awaited_once_with(
             preserve_shell=True,
@@ -6046,7 +6185,9 @@ class TestAttachSessionEventJournalFailure:
             patch.object(mod, "_agent", fake_agent),
             patch.object(mod, "_orchestrator_client", fake_orchestrator),
             patch.object(mod, "PersistentSession", FakeSession),
-            patch.object(session_workspace, "poll_workspace_ready",
+            patch.object(
+                session_workspace,
+                "poll_workspace_ready",
                 new=AsyncMock(return_value=workspace_override),
             ),
             patch.object(
@@ -6141,7 +6282,9 @@ class TestAttachSessionCloudMount:
             patch.object(mod, "_agent", fake_agent),
             patch.object(mod, "_orchestrator_client", fake_orchestrator),
             patch.object(mod, "PersistentSession", FakeSession),
-            patch.object(session_workspace, "poll_workspace_ready",
+            patch.object(
+                session_workspace,
+                "poll_workspace_ready",
                 new=AsyncMock(return_value=workspace_override),
             ),
             patch.object(mod, "_build_sync_coordinator") as build_sync,
@@ -6224,7 +6367,9 @@ class TestAttachSessionProtectedCloudFailClose:
             patch.object(mod, "_agent", fake_agent),
             patch.object(mod, "_orchestrator_client", fake_orchestrator),
             patch.object(mod, "PersistentSession", self._fake_session_cls()),
-            patch.object(session_workspace, "poll_workspace_ready",
+            patch.object(
+                session_workspace,
+                "poll_workspace_ready",
                 new=AsyncMock(return_value=workspace_override),
             ),
             patch.object(mod, "_build_sync_coordinator") as build_sync,
@@ -6280,7 +6425,9 @@ class TestAttachSessionProtectedCloudFailClose:
             patch.object(mod, "_agent", fake_agent),
             patch.object(mod, "_orchestrator_client", fake_orchestrator),
             patch.object(mod, "PersistentSession", self._fake_session_cls()),
-            patch.object(session_workspace, "poll_workspace_ready",
+            patch.object(
+                session_workspace,
+                "poll_workspace_ready",
                 new=AsyncMock(return_value=workspace_override),
             ),
             patch.object(mod, "_build_sync_coordinator") as build_sync,
@@ -6443,7 +6590,9 @@ class TestAttachSessionProtectedCloudSingletonIsolation:
             patch.object(mod, "_agent", fake_agent),
             patch.object(mod, "_orchestrator_client", fake_orchestrator),
             patch.object(mod, "PersistentSession", self._fake_session_cls(captured)),
-            patch.object(session_workspace, "poll_workspace_ready",
+            patch.object(
+                session_workspace,
+                "poll_workspace_ready",
                 new=AsyncMock(return_value=workspace_override),
             ),
             patch.object(mod, "_build_sync_coordinator"),
@@ -6545,7 +6694,9 @@ class TestHandlePersistentWebsocketReadiness:
             patch("agent.api.persistent_app._session", None),
             patch("agent.api.persistent_app._session_input._queue", None),
             patch("agent.api.persistent_app._loop_task", None),
-            patch("agent.api.persistent_app._session_termination.ws_connected_event", None),
+            patch(
+                "agent.api.persistent_app._session_termination.ws_connected_event", None
+            ),
         ):
             await _serve_session_websocket(ws)
             assert pa._loop_task is None
@@ -6566,7 +6717,9 @@ class TestHandlePersistentWebsocketReadiness:
             patch("agent.api.persistent_app._session", session),
             patch("agent.api.persistent_app._session_input._queue", None),
             patch("agent.api.persistent_app._loop_task", None),
-            patch("agent.api.persistent_app._session_termination.ws_connected_event", None),
+            patch(
+                "agent.api.persistent_app._session_termination.ws_connected_event", None
+            ),
             patch(
                 "agent.api.persistent_app._session_identity.fingerprint",
                 return_value=self.fingerprint,
@@ -6594,7 +6747,9 @@ class TestHandlePersistentWebsocketReadiness:
             patch("agent.api.persistent_app._session", session),
             patch("agent.api.persistent_app._session_input._queue", None),
             patch("agent.api.persistent_app._loop_task", None),
-            patch("agent.api.persistent_app._session_termination.ws_connected_event", None),
+            patch(
+                "agent.api.persistent_app._session_termination.ws_connected_event", None
+            ),
             patch(
                 "agent.api.persistent_app._session_identity.fingerprint",
                 return_value=self.fingerprint,
@@ -6618,7 +6773,9 @@ class TestHandlePersistentWebsocketReadiness:
             patch("agent.api.persistent_app._session", session),
             patch("agent.api.persistent_app._session_input._queue", None),
             patch("agent.api.persistent_app._loop_task", None),
-            patch("agent.api.persistent_app._session_termination.ws_connected_event", None),
+            patch(
+                "agent.api.persistent_app._session_termination.ws_connected_event", None
+            ),
             patch(
                 "agent.api.persistent_app._session_identity.fingerprint",
                 return_value=self.fingerprint,
@@ -6647,7 +6804,10 @@ class TestHandlePersistentWebsocketReadiness:
             patch("agent.api.persistent_app._session", session),
             patch("agent.api.persistent_app._session_input._queue", None),
             patch("agent.api.persistent_app._loop_task", None),
-            patch("agent.api.persistent_app._session_termination.ws_connected_event", connected),
+            patch(
+                "agent.api.persistent_app._session_termination.ws_connected_event",
+                connected,
+            ),
             patch(
                 "agent.api.persistent_app._session_identity.fingerprint",
                 return_value=self.fingerprint,
@@ -6700,7 +6860,9 @@ class TestHandlePersistentWebsocketReadiness:
             ),
             patch("agent.api.persistent_app._ensure_persistent_loop_started"),
             patch("agent.api.persistent_app._orchestrator_client", None),
-            patch("agent.api.persistent_app._session_termination.ws_connected_event", None),
+            patch(
+                "agent.api.persistent_app._session_termination.ws_connected_event", None
+            ),
             patch(
                 "agent.api.persistent_app._session_identity.fingerprint",
                 return_value=self.fingerprint,
@@ -6773,7 +6935,9 @@ class TestHandlePersistentWebsocketReadiness:
             ),
             patch("agent.api.persistent_app._ensure_persistent_loop_started"),
             patch("agent.api.persistent_app._orchestrator_client", None),
-            patch("agent.api.persistent_app._session_termination.ws_connected_event", None),
+            patch(
+                "agent.api.persistent_app._session_termination.ws_connected_event", None
+            ),
             patch(
                 "agent.api.persistent_app._session_identity.fingerprint",
                 return_value=self.fingerprint,
@@ -6812,7 +6976,9 @@ class TestHandlePersistentWebsocketReadiness:
         try:
             with (
                 patch("agent.api.persistent_app._session", session),
-                patch("agent.api.persistent_app._session_identity._thread_id", thread_id),
+                patch(
+                    "agent.api.persistent_app._session_identity._thread_id", thread_id
+                ),
                 patch("agent.api.persistent_app._turn_event_open", False),
                 patch(
                     "agent.api.persistent_app._turn_tool_execution_identity",
@@ -6870,7 +7036,10 @@ class TestHandlePersistentWebsocketReadiness:
                     "agent.api.persistent_app._session",
                     SimpleNamespace(turn_count=4),
                 ),
-                patch("agent.api.persistent_app._session_identity._thread_id", "wrong-thread"),
+                patch(
+                    "agent.api.persistent_app._session_identity._thread_id",
+                    "wrong-thread",
+                ),
                 patch(
                     "agent.api.persistent_app._turn_tool_execution_identity",
                     None,
@@ -6901,7 +7070,10 @@ class TestHandlePersistentWebsocketReadiness:
                     "agent.api.persistent_app._session",
                     SimpleNamespace(turn_count=2),
                 ),
-                patch("agent.api.persistent_app._session_identity._thread_id", "pinned-thread"),
+                patch(
+                    "agent.api.persistent_app._session_identity._thread_id",
+                    "pinned-thread",
+                ),
                 patch(
                     "agent.api.persistent_app._turn_tool_execution_identity",
                     None,
@@ -7168,7 +7340,9 @@ class TestHandleApiInterruptHardEvent:
         mod._tool_inflight = False  # no tool in flight ⇒ hard
         mod._session_input._hard_interrupt_event = _asyncio.Event()
 
-        with patch.object(mod._session_identity, "fingerprint",
+        with patch.object(
+            mod._session_identity,
+            "fingerprint",
             return_value=self.fingerprint,
         ):
             await _handle_api_interrupt(self._request())
@@ -7188,7 +7362,9 @@ class TestHandleApiInterruptHardEvent:
         mod._tool_inflight = True  # tool mid-ainvoke ⇒ graceful (never cancel)
         mod._session_input._hard_interrupt_event = _asyncio.Event()
 
-        with patch.object(mod._session_identity, "fingerprint",
+        with patch.object(
+            mod._session_identity,
+            "fingerprint",
             return_value=self.fingerprint,
         ):
             await _handle_api_interrupt(self._request())
@@ -7210,7 +7386,9 @@ class TestHandleApiInterruptHardEvent:
         mod._session_input._hard_interrupt_event = asyncio.Event()
         request = self._request(client_request_id="client-1", target_turn_id=7)
 
-        with patch.object(mod._session_identity, "fingerprint",
+        with patch.object(
+            mod._session_identity,
+            "fingerprint",
             return_value=self.fingerprint,
         ):
             response = await _handle_api_interrupt(request)
@@ -7240,7 +7418,9 @@ class TestHandleApiInterruptHardEvent:
         mod._session_input._hard_interrupt_event = asyncio.Event()
         request = self._request(client_request_id="client-1", target_turn_id=7)
 
-        with patch.object(mod._session_identity, "fingerprint",
+        with patch.object(
+            mod._session_identity,
+            "fingerprint",
             return_value=self.fingerprint,
         ):
             response = await _handle_api_interrupt(request)
@@ -7267,7 +7447,9 @@ class TestHandleApiInterruptHardEvent:
         mod._turn_event_open = False
         mod._session_input._hard_interrupt_event = asyncio.Event()
 
-        with patch.object(mod._session_identity, "fingerprint",
+        with patch.object(
+            mod._session_identity,
+            "fingerprint",
             return_value=self.fingerprint,
         ):
             response = await _handle_api_interrupt(self._request())
@@ -7287,7 +7469,9 @@ class TestHandleApiInterruptHardEvent:
         mod._session = SimpleNamespace(turn_count=7)
         request = self._request(client_request_id="client-1", target_turn_id=True)
 
-        with patch.object(mod._session_identity, "fingerprint",
+        with patch.object(
+            mod._session_identity,
+            "fingerprint",
             return_value=self.fingerprint,
         ):
             response = await _handle_api_interrupt(request)
@@ -7303,7 +7487,9 @@ class TestHandleApiInterruptHardEvent:
         mod._turn_event_open = True
         mod._session_input._hard_interrupt_event = asyncio.Event()
 
-        with patch.object(mod._session_identity, "fingerprint",
+        with patch.object(
+            mod._session_identity,
+            "fingerprint",
             return_value="sha256:" + ("b" * 64),
         ):
             response = await _handle_api_interrupt(self._request())
@@ -7510,7 +7696,9 @@ class TestRuntimeCanvasControlBinding:
         monkeypatch.setattr(mod, "_broadcast", broadcast)
         frames = []
         monkeypatch.setattr(mod, "_fan_out_live_frame", frames.append)
-        monkeypatch.setattr(mod._session_identity, "fingerprint",
+        monkeypatch.setattr(
+            mod._session_identity,
+            "fingerprint",
             lambda: self.fingerprint,
         )
         monkeypatch.setattr(mod._canvas_control, "validation_min_interval_s", 0)
@@ -8121,7 +8309,9 @@ class TestBootWsWatchdog:
         event = asyncio.Event()
         event.set()  # Pre-set so wait_for returns immediately
         with patch.object(pa._session_termination, "ws_connected_event", event):
-            with patch.object(pa._session_termination, "terminate", new=AsyncMock()) as detach:
+            with patch.object(
+                pa._session_termination, "terminate", new=AsyncMock()
+            ) as detach:
                 with patch.object(pa._session_termination, "schedule_exit") as exit_fn:
                     await pa._session_termination.boot_ws_watchdog(timeout_s=10)
         detach.assert_not_called()
@@ -8136,8 +8326,12 @@ class TestBootWsWatchdog:
         event = asyncio.Event()  # Never set
         with patch.object(pa._session_termination, "ws_connected_event", event):
             with patch.object(pa._session_identity, "_thread_id", "thread-xyz"):
-                with patch.object(pa._session_termination, "terminate", new=AsyncMock()) as detach:
-                    with patch.object(pa._session_termination, "schedule_exit") as exit_fn:
+                with patch.object(
+                    pa._session_termination, "terminate", new=AsyncMock()
+                ) as detach:
+                    with patch.object(
+                        pa._session_termination, "schedule_exit"
+                    ) as exit_fn:
                         # Tiny timeout so the test doesn't actually wait 10 min
                         await pa._session_termination.boot_ws_watchdog(timeout_s=0)
         detach.assert_awaited_once()
@@ -8157,7 +8351,9 @@ class TestBootWsWatchdog:
                     "terminate",
                     new=AsyncMock(side_effect=RuntimeError("detach failed")),
                 ):
-                    with patch.object(pa._session_termination, "schedule_exit") as exit_fn:
+                    with patch.object(
+                        pa._session_termination, "schedule_exit"
+                    ) as exit_fn:
                         await pa._session_termination.boot_ws_watchdog(timeout_s=0)
         # No process exit until strict local cleanup + exact settlement is
         # proven; the fenced runtime remains the retry owner.
@@ -8175,8 +8371,12 @@ class TestThreadStatusWatchdog:
         )
         with patch.object(pa, "_orchestrator_client", client):
             with patch.object(pa._session_identity, "_thread_id", "thread-xyz"):
-                with patch.object(pa._session_termination, "terminate", new=AsyncMock()) as detach:
-                    with patch.object(pa._session_termination, "schedule_exit") as exit_fn:
+                with patch.object(
+                    pa._session_termination, "terminate", new=AsyncMock()
+                ) as detach:
+                    with patch.object(
+                        pa._session_termination, "schedule_exit"
+                    ) as exit_fn:
                         # Tiny poll interval so test runs quickly
                         await pa._session_termination.thread_status_watchdog(poll_s=0)
         detach.assert_awaited_once()
@@ -8215,11 +8415,17 @@ class TestThreadStatusWatchdog:
         )
         with patch.object(pa, "_orchestrator_client", client):
             with patch.object(pa._session_identity, "_thread_id", "thread-xyz"):
-                with patch.object(pa._session_termination, "terminate", new=AsyncMock()) as detach:
-                    with patch.object(pa._session_termination, "schedule_exit") as exit_fn:
+                with patch.object(
+                    pa._session_termination, "terminate", new=AsyncMock()
+                ) as detach:
+                    with patch.object(
+                        pa._session_termination, "schedule_exit"
+                    ) as exit_fn:
                         # Run the watchdog briefly then cancel — it must not
                         # have triggered exit while status was active.
-                        task = asyncio.create_task(pa._session_termination.thread_status_watchdog(poll_s=0))
+                        task = asyncio.create_task(
+                            pa._session_termination.thread_status_watchdog(poll_s=0)
+                        )
                         await asyncio.sleep(0.05)
                         task.cancel()
                         try:
@@ -8249,7 +8455,9 @@ class TestThreadStatusWatchdog:
             patch.object(pa._session_identity, "_thread_id", "thread-xyz"),
             patch.object(pa._session_identity, "_session_generation", generation_a),
             patch.object(pa._session_identity, "_runtime_contract", True),
-            patch.object(pa._session_termination, "terminate", new=AsyncMock()) as detach,
+            patch.object(
+                pa._session_termination, "terminate", new=AsyncMock()
+            ) as detach,
             patch.object(pa._session_termination, "schedule_exit") as exit_fn,
         ):
             await pa._session_termination.thread_status_watchdog(poll_s=0)
@@ -8282,7 +8490,9 @@ class TestThreadStatusWatchdog:
             patch.object(pa._session_identity, "_session_generation", generation),
             patch.object(pa._session_identity, "_attach_token", token_a),
             patch.object(pa._session_identity, "_runtime_contract", True),
-            patch.object(pa._session_termination, "terminate", new=AsyncMock()) as detach,
+            patch.object(
+                pa._session_termination, "terminate", new=AsyncMock()
+            ) as detach,
             patch.object(pa._session_termination, "schedule_exit") as exit_fn,
         ):
             await pa._session_termination.thread_status_watchdog(poll_s=0)
@@ -8300,9 +8510,15 @@ class TestThreadStatusWatchdog:
         client.get_thread_lifecycle = AsyncMock(side_effect=RuntimeError("network"))
         with patch.object(pa, "_orchestrator_client", client):
             with patch.object(pa._session_identity, "_thread_id", "thread-xyz"):
-                with patch.object(pa._session_termination, "terminate", new=AsyncMock()) as detach:
-                    with patch.object(pa._session_termination, "schedule_exit") as exit_fn:
-                        task = asyncio.create_task(pa._session_termination.thread_status_watchdog(poll_s=0))
+                with patch.object(
+                    pa._session_termination, "terminate", new=AsyncMock()
+                ) as detach:
+                    with patch.object(
+                        pa._session_termination, "schedule_exit"
+                    ) as exit_fn:
+                        task = asyncio.create_task(
+                            pa._session_termination.thread_status_watchdog(poll_s=0)
+                        )
                         await asyncio.sleep(0.05)
                         task.cancel()
                         try:
@@ -8335,9 +8551,15 @@ class TestThreadStatusWatchdog:
         )
         with patch.object(pa, "_orchestrator_client", client):
             with patch.object(pa._session_identity, "_thread_id", "thread-xyz"):
-                with patch.object(pa._session_termination, "terminate", new=AsyncMock()) as detach:
-                    with patch.object(pa._session_termination, "schedule_exit") as exit_fn:
-                        task = asyncio.create_task(pa._session_termination.thread_status_watchdog(poll_s=0))
+                with patch.object(
+                    pa._session_termination, "terminate", new=AsyncMock()
+                ) as detach:
+                    with patch.object(
+                        pa._session_termination, "schedule_exit"
+                    ) as exit_fn:
+                        task = asyncio.create_task(
+                            pa._session_termination.thread_status_watchdog(poll_s=0)
+                        )
                         await asyncio.sleep(0.05)
                         task.cancel()
                         try:
@@ -8364,8 +8586,12 @@ class TestThreadStatusWatchdog:
         )
         with patch.object(pa, "_orchestrator_client", client):
             with patch.object(pa._session_identity, "_thread_id", "thread-xyz"):
-                with patch.object(pa._session_termination, "terminate", new=AsyncMock()) as detach:
-                    with patch.object(pa._session_termination, "schedule_exit") as exit_fn:
+                with patch.object(
+                    pa._session_termination, "terminate", new=AsyncMock()
+                ) as detach:
+                    with patch.object(
+                        pa._session_termination, "schedule_exit"
+                    ) as exit_fn:
                         await pa._session_termination.thread_status_watchdog(poll_s=0)
         detach.assert_awaited_once()
         exit_fn.assert_called_once()
@@ -8569,7 +8795,11 @@ class TestStartStopWatchdogs:
             finally:
                 pa._session_termination.stop_watchdogs()
                 await asyncio.gather(
-                    *[t for t in pa._session_termination.watchdog_tasks if not t.done()],
+                    *[
+                        t
+                        for t in pa._session_termination.watchdog_tasks
+                        if not t.done()
+                    ],
                     return_exceptions=True,
                 )
 
@@ -8591,7 +8821,11 @@ class TestStartStopWatchdogs:
             finally:
                 pa._session_termination.stop_watchdogs()
                 await asyncio.gather(
-                    *[t for t in pa._session_termination.watchdog_tasks if not t.done()],
+                    *[
+                        t
+                        for t in pa._session_termination.watchdog_tasks
+                        if not t.done()
+                    ],
                     return_exceptions=True,
                 )
 
@@ -8651,7 +8885,10 @@ class TestAttachSessionRaisesWorkspaceNotReady:
 
         with patch.object(pa, "_session", None):
             with patch.object(pa, "_orchestrator_client", mock_client):
-                with patch.object(session_workspace, "poll_workspace_ready", new=AsyncMock(return_value=None)
+                with patch.object(
+                    session_workspace,
+                    "poll_workspace_ready",
+                    new=AsyncMock(return_value=None),
                 ):
                     with pytest.raises(WorkspaceNotReady):
                         await pa._session_attach.attach("t1")
@@ -8665,7 +8902,10 @@ class TestAttachSessionRaisesWorkspaceNotReady:
 
         with patch.object(pa, "_session", None):
             with patch.object(pa, "_orchestrator_client", mock_client):
-                with patch.object(session_workspace, "poll_workspace_ready", new=AsyncMock(return_value=None)
+                with patch.object(
+                    session_workspace,
+                    "poll_workspace_ready",
+                    new=AsyncMock(return_value=None),
                 ):
                     with pytest.raises(WorkspaceNotReady, match="workspace"):
                         await pa._session_attach.attach("t1")
@@ -8709,7 +8949,9 @@ class TestExitDuplicateProvisionHelper:
             with patch.object(pa, "_heartbeat_task", None):
                 with patch("os._exit", side_effect=SystemExit(0)) as mock_exit:
                     with pytest.raises(SystemExit):
-                        await pa._session_termination.exit_duplicate_provision("thread-1")
+                        await pa._session_termination.exit_duplicate_provision(
+                            "thread-1"
+                        )
 
         mock_exit.assert_called_once_with(0)
 
@@ -8727,7 +8969,9 @@ class TestExitDuplicateProvisionHelper:
             with patch.object(pa, "_heartbeat_task", None):
                 with patch("os._exit", side_effect=SystemExit(0)):
                     with pytest.raises(SystemExit):
-                        await pa._session_termination.exit_duplicate_provision("thread-1")
+                        await pa._session_termination.exit_duplicate_provision(
+                            "thread-1"
+                        )
 
         mock_client.deregister.assert_awaited_once()
         mock_client.close.assert_awaited_once()
@@ -8753,7 +8997,9 @@ class TestExitWorkspaceNotReadyHelper:
             with patch.object(pa, "_heartbeat_task", None):
                 with patch("os._exit", side_effect=SystemExit(0)) as mock_exit:
                     with pytest.raises(SystemExit):
-                        await pa._session_termination.exit_workspace_not_ready("thread-1", exc)
+                        await pa._session_termination.exit_workspace_not_ready(
+                            "thread-1", exc
+                        )
 
         mock_exit.assert_called_once_with(0)
 
@@ -8775,7 +9021,9 @@ class TestExitWorkspaceNotReadyHelper:
             with patch.object(pa, "_heartbeat_task", mock_task):
                 with patch("os._exit", side_effect=SystemExit(0)) as mock_exit:
                     with pytest.raises(SystemExit):
-                        await pa._session_termination.exit_workspace_not_ready("thread-1", exc)
+                        await pa._session_termination.exit_workspace_not_ready(
+                            "thread-1", exc
+                        )
 
         mock_task.cancel.assert_called_once()
         mock_exit.assert_called_once_with(0)
@@ -8799,7 +9047,9 @@ class TestExitWorkspaceNotReadyHelper:
             with patch.object(pa, "_heartbeat_task", None):
                 with patch("os._exit", side_effect=SystemExit(0)):
                     with pytest.raises(SystemExit):
-                        await pa._session_termination.exit_workspace_not_ready("thread-1", exc)
+                        await pa._session_termination.exit_workspace_not_ready(
+                            "thread-1", exc
+                        )
 
         deregister.assert_awaited_once()
         close.assert_awaited_once()
@@ -8816,7 +9066,9 @@ class TestExitWorkspaceNotReadyHelper:
             with patch.object(pa, "_heartbeat_task", None):
                 with patch("os._exit", side_effect=SystemExit(0)) as mock_exit:
                     with pytest.raises(SystemExit):
-                        await pa._session_termination.exit_workspace_not_ready("thread-1", exc)
+                        await pa._session_termination.exit_workspace_not_ready(
+                            "thread-1", exc
+                        )
 
         mock_exit.assert_called_once_with(0)
 
@@ -8837,7 +9089,9 @@ class TestExitWorkspaceNotReadyHelper:
             with patch.object(pa, "_heartbeat_task", None):
                 with patch("os._exit", side_effect=SystemExit(0)) as mock_exit:
                     with pytest.raises(SystemExit):
-                        await pa._session_termination.exit_workspace_not_ready("thread-1", exc)
+                        await pa._session_termination.exit_workspace_not_ready(
+                            "thread-1", exc
+                        )
 
         mock_exit.assert_called_once_with(0)
 
@@ -8862,7 +9116,9 @@ class TestScheduleExitDeregisters:
         try:
             with patch("os._exit") as mock_exit:
                 pa._session_termination.schedule_exit(delay=0)
-                await asyncio.wait_for(pa._session_termination.pending_exit_task, timeout=2.0)
+                await asyncio.wait_for(
+                    pa._session_termination.pending_exit_task, timeout=2.0
+                )
             return mock_exit
         finally:
             pa._session_termination.pending_exit_task = saved
@@ -8893,7 +9149,9 @@ class TestScheduleExitDeregisters:
 
         with patch.object(pa, "_orchestrator_client", mock_client):
             with patch.object(pa, "_heartbeat_task", None):
-                with patch.object(session_termination, "_DEREGISTER_ON_EXIT_TIMEOUT_S", 0.05):
+                with patch.object(
+                    session_termination, "_DEREGISTER_ON_EXIT_TIMEOUT_S", 0.05
+                ):
                     mock_exit = await self._run_scheduled_exit(pa)
 
         mock_exit.assert_called_once_with(0)
@@ -9022,7 +9280,12 @@ async def test_vm_tier_poll_rides_out_a_transient_workspace_failure():
     )
 
     result = await poll_workspace_ready(
-        client, "tid", timeout=10, poll_interval=0.01, require_vm=True, session_runtime_generation=None
+        client,
+        "tid",
+        timeout=10,
+        poll_interval=0.01,
+        require_vm=True,
+        session_runtime_generation=None,
     )
 
     assert result is not None

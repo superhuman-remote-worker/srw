@@ -16,16 +16,32 @@ INTENT_ANNOTATION = "srw.io/vm-thread-creation-cancel-intent"
 SIGNATURE_ANNOTATION = "srw.io/vm-thread-creation-cancel-signature"
 LABEL = "srw.io/vm-thread-creation-cancel-carrier"
 _RESOURCE_FIELDS = {
-    "reservation_id", "reservation_revision", "reservation_cluster_id",
+    "reservation_id",
+    "reservation_revision",
+    "reservation_cluster_id",
     "reservation_policy_digest",
 }
 _FIELDS = {
-    "version", "kind", "source", "admission_id", "reservation_request_id",
-    "intent_digest", "retry_request_id", "thread_id",
-    "thread_runtime_generation", "thread_agent_id", "thread_attach_token",
-    "thread_wake_operation_id", "retirement_token", "provision_generation",
-    "request_digest", "controller_configuration_digest", "reservation_id",
-    "reservation_revision", "reservation_cluster_id", "reservation_policy_digest",
+    "version",
+    "kind",
+    "source",
+    "admission_id",
+    "reservation_request_id",
+    "intent_digest",
+    "retry_request_id",
+    "thread_id",
+    "thread_runtime_generation",
+    "thread_agent_id",
+    "thread_attach_token",
+    "thread_wake_operation_id",
+    "retirement_token",
+    "provision_generation",
+    "request_digest",
+    "controller_configuration_digest",
+    "reservation_id",
+    "reservation_revision",
+    "reservation_cluster_id",
+    "reservation_policy_digest",
     "source_pin_key",
 }
 
@@ -40,28 +56,35 @@ def validate_intent(value):
         raise ValueError("Thread cancellation intent is incomplete")
     value = dict(value)
     version = value.get("version")
-    if type(version) is not int or version not in {1, 2} or set(value) != (
-        _FIELDS if version == 1 else _FIELDS - _RESOURCE_FIELDS
+    if (
+        type(version) is not int
+        or version not in {1, 2}
+        or set(value) != (_FIELDS if version == 1 else _FIELDS - _RESOURCE_FIELDS)
     ):
         raise ValueError("Thread cancellation intent is incomplete")
     if (
         value["kind"] != "thread_creation_cancel"
         or value["source"] != "controller_vm_create_cancel"
-        or version == 1 and (
+        or version == 1
+        and (
             type(value["reservation_revision"]) is not int
             or value["reservation_revision"] <= 0
             or not isinstance(value["reservation_cluster_id"], str)
             or not value["reservation_cluster_id"]
         )
         or value["source_pin_key"] != value["retry_request_id"]
-        or (value["thread_agent_id"] is None)
-        != (value["thread_attach_token"] is None)
+        or (value["thread_agent_id"] is None) != (value["thread_attach_token"] is None)
     ):
         raise ValueError("Thread cancellation intent has no authority")
     for key in (
-        "admission_id", "reservation_request_id", "retry_request_id",
-        "thread_id", "thread_runtime_generation", "retirement_token",
-        "provision_generation", "source_pin_key",
+        "admission_id",
+        "reservation_request_id",
+        "retry_request_id",
+        "thread_id",
+        "thread_runtime_generation",
+        "retirement_token",
+        "provision_generation",
+        "source_pin_key",
     ):
         _uuid(value[key])
     if version == 1:
@@ -70,7 +93,9 @@ def validate_intent(value):
         if value[key] is not None:
             _uuid(value[key])
     for key in (
-        "intent_digest", "request_digest", "controller_configuration_digest",
+        "intent_digest",
+        "request_digest",
+        "controller_configuration_digest",
         *(["reservation_policy_digest"] if version == 1 else []),
     ):
         if not isinstance(value[key], str) or not re.fullmatch(
@@ -89,8 +114,16 @@ def _signature(values, *, namespace, name, uid, secret):
     if not isinstance(secret, bytes) or not secret:
         raise ValueError("Thread cancellation signing key is missing")
     payload = json.dumps(
-        [f"srw-thread-creation-cancel-v{values['version']}", namespace, name, uid, values],
-        sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        [
+            f"srw-thread-creation-cancel-v{values['version']}",
+            namespace,
+            name,
+            uid,
+            values,
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
     ).encode()
     return hmac.new(secret, payload, hashlib.sha256).hexdigest()
 
@@ -98,20 +131,33 @@ def _signature(values, *, namespace, name, uid, secret):
 def seal_cancel_carrier(values, *, namespace, uid, resource_version, secret):
     values = validate_intent(values)
     _uuid(uid)
-    if not isinstance(namespace, str) or not namespace or not isinstance(
-        resource_version, str
-    ) or not resource_version:
+    if (
+        not isinstance(namespace, str)
+        or not namespace
+        or not isinstance(resource_version, str)
+        or not resource_version
+    ):
         raise ValueError("Thread cancellation Lease identity is incomplete")
     name = carrier_name(values["admission_id"])
     return {
-        "apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
+        "apiVersion": "coordination.k8s.io/v1",
+        "kind": "Lease",
         "metadata": {
-            "name": name, "namespace": namespace, "uid": uid,
-            "resourceVersion": resource_version, "labels": {LABEL: "true"},
+            "name": name,
+            "namespace": namespace,
+            "uid": uid,
+            "resourceVersion": resource_version,
+            "labels": {LABEL: "true"},
             "annotations": {
-                INTENT_ANNOTATION: json.dumps(values, sort_keys=True, separators=(",", ":")),
+                INTENT_ANNOTATION: json.dumps(
+                    values, sort_keys=True, separators=(",", ":")
+                ),
                 SIGNATURE_ANNOTATION: _signature(
-                    values, namespace=namespace, name=name, uid=uid, secret=secret,
+                    values,
+                    namespace=namespace,
+                    name=name,
+                    uid=uid,
+                    secret=secret,
                 ),
             },
         },
@@ -121,13 +167,20 @@ def seal_cancel_carrier(values, *, namespace, uid, resource_version, secret):
 
 def verify_cancel_carrier(carrier, *, secret):
     try:
-        if not isinstance(carrier, Mapping) or carrier["apiVersion"] != "coordination.k8s.io/v1" or carrier["kind"] != "Lease":
+        if (
+            not isinstance(carrier, Mapping)
+            or carrier["apiVersion"] != "coordination.k8s.io/v1"
+            or carrier["kind"] != "Lease"
+        ):
             raise ValueError("Thread cancellation carrier kind changed")
         metadata = carrier["metadata"]
         values = validate_intent(json.loads(metadata["annotations"][INTENT_ANNOTATION]))
         expected = seal_cancel_carrier(
-            values, namespace=metadata["namespace"], uid=metadata["uid"],
-            resource_version=metadata["resourceVersion"], secret=secret,
+            values,
+            namespace=metadata["namespace"],
+            uid=metadata["uid"],
+            resource_version=metadata["resourceVersion"],
+            secret=secret,
         )
         if (
             metadata.get("deletionTimestamp") is not None

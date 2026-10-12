@@ -17,65 +17,125 @@ import pytest
 from orchestrator.operator_cli import vm_retained_resume_acceptance as gate
 
 
-def test_retirement_retry_snapshot_requires_exact_owner_runtime_queue_and_clock() -> None:
+def test_retirement_retry_snapshot_requires_exact_owner_runtime_queue_and_clock() -> (
+    None
+):
     job_id, owner_id, generation, vm_uid, pvc_uid, cleanup_id, request_id, hold_id = (
         str(uuid4()) for _ in range(8)
     )
     now = 1_790_000_000.0
     snapshot = {
-        "id": job_id, "user_id": owner_id, "status": "paused",
-        "execution_lane": "stateless", "assigned_agent_id": None,
+        "id": job_id,
+        "user_id": owner_id,
+        "status": "paused",
+        "execution_lane": "stateless",
+        "assigned_agent_id": None,
         "context": {
             "vm_retained_resume_acceptance_gate": "srw-a1-owned-20260923",
             "_operator_pause_hold": {
-                "version": 1, "hold_id": hold_id, "source": "public_pause",
+                "version": 1,
+                "hold_id": hold_id,
+                "source": "public_pause",
                 "paused_by": owner_id,
                 "paused_at": datetime.now(timezone.utc).isoformat(),
             },
             "vm": {
-                "provision_generation": generation, "vm_uid": vm_uid,
-                "rootdisk_pvc_uid": pvc_uid, "retirement_cleanup_pending": True,
+                "provision_generation": generation,
+                "vm_uid": vm_uid,
+                "rootdisk_pvc_uid": pvc_uid,
+                "retirement_cleanup_pending": True,
                 "retirement_last_result": "retry_pending",
-                "retirement_attempts": 1, "retirement_retry_after": now + 60,
+                "retirement_attempts": 1,
+                "retirement_retry_after": now + 60,
                 "status": "deleting",
             },
         },
-        "queue_state": "done", "queue_leased_by": None,
-        "queue_leased_until": None, "queue_lease_token": 0,
-        "cleanup_id": cleanup_id, "cleanup_request_id": request_id,
-        "cleanup_pvc_uid": pvc_uid, "cleanup_source": "dispatcher_vm_recycle",
-        "cleanup_completed_at": None, "cleanup_outcome": None,
-        "active_access": False, "active_remote": False,
-        "active_recovery": False, "active_creation": False,
+        "queue_state": "done",
+        "queue_leased_by": None,
+        "queue_leased_until": None,
+        "queue_lease_token": 0,
+        "cleanup_id": cleanup_id,
+        "cleanup_request_id": request_id,
+        "cleanup_pvc_uid": pvc_uid,
+        "cleanup_source": "dispatcher_vm_recycle",
+        "cleanup_completed_at": None,
+        "cleanup_outcome": None,
+        "active_access": False,
+        "active_remote": False,
+        "active_recovery": False,
+        "active_creation": False,
     }
-    bound = dict(job_id=job_id, owner_id=owner_id, generation=generation,
-                 vm_uid=vm_uid, pvc_uid=pvc_uid, cleanup_id=cleanup_id,
-                 request_id=request_id, hold_id=hold_id,
-                 run_id="srw-a1-owned-20260923", now=now)
+    bound = dict(
+        job_id=job_id,
+        owner_id=owner_id,
+        generation=generation,
+        vm_uid=vm_uid,
+        pvc_uid=pvc_uid,
+        cleanup_id=cleanup_id,
+        request_id=request_id,
+        hold_id=hold_id,
+        run_id="srw-a1-owned-20260923",
+        now=now,
+    )
     assert gate.validate_retirement_retry_snapshot(snapshot, **bound) == now + 60
     for change in (
-        {"user_id": str(uuid4())}, {"status": "processing"},
-        {"queue_state": "leased"}, {"queue_leased_by": "worker"},
+        {"user_id": str(uuid4())},
+        {"status": "processing"},
+        {"queue_state": "leased"},
+        {"queue_leased_by": "worker"},
         {"queue_lease_token": 1},
-        {"cleanup_id": str(uuid4())}, {"cleanup_request_id": str(uuid4())},
-        {"cleanup_pvc_uid": str(uuid4())}, {"active_access": True},
-        {"active_remote": True}, {"active_recovery": True},
+        {"cleanup_id": str(uuid4())},
+        {"cleanup_request_id": str(uuid4())},
+        {"cleanup_pvc_uid": str(uuid4())},
+        {"active_access": True},
+        {"active_remote": True},
+        {"active_recovery": True},
         {"active_creation": True},
-        {"context": {**snapshot["context"], "vm": {
-            **snapshot["context"]["vm"], "provision_generation": str(uuid4()),
-        }}},
-        {"context": {**snapshot["context"], "vm": {
-            **snapshot["context"]["vm"], "vm_uid": str(uuid4()),
-        }}},
-        {"context": {**snapshot["context"], "vm": {
-            **snapshot["context"]["vm"], "rootdisk_pvc_uid": str(uuid4()),
-        }}},
-        {"context": {**snapshot["context"], "vm": {
-            **snapshot["context"]["vm"], "status": "starting",
-        }}},
-        {"context": {**snapshot["context"], "vm": {
-            **snapshot["context"]["vm"], "retirement_retry_after": None,
-        }}},
+        {
+            "context": {
+                **snapshot["context"],
+                "vm": {
+                    **snapshot["context"]["vm"],
+                    "provision_generation": str(uuid4()),
+                },
+            }
+        },
+        {
+            "context": {
+                **snapshot["context"],
+                "vm": {
+                    **snapshot["context"]["vm"],
+                    "vm_uid": str(uuid4()),
+                },
+            }
+        },
+        {
+            "context": {
+                **snapshot["context"],
+                "vm": {
+                    **snapshot["context"]["vm"],
+                    "rootdisk_pvc_uid": str(uuid4()),
+                },
+            }
+        },
+        {
+            "context": {
+                **snapshot["context"],
+                "vm": {
+                    **snapshot["context"]["vm"],
+                    "status": "starting",
+                },
+            }
+        },
+        {
+            "context": {
+                **snapshot["context"],
+                "vm": {
+                    **snapshot["context"]["vm"],
+                    "retirement_retry_after": None,
+                },
+            }
+        },
     ):
         with pytest.raises(gate.AcceptanceFailure):
             gate.validate_retirement_retry_snapshot({**snapshot, **change}, **bound)
@@ -84,7 +144,8 @@ def test_retirement_retry_snapshot_requires_exact_owner_runtime_queue_and_clock(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("drift", [None, "queue", "cleanup", "owner", "clock"])
 async def test_retire_predecessor_retries_only_after_durable_clock(
-    monkeypatch, drift,
+    monkeypatch,
+    drift,
 ) -> None:
     from orchestrator.services import vm_provisioning_cleanup
 
@@ -93,30 +154,51 @@ async def test_retire_predecessor_retries_only_after_durable_clock(
     )
     clock = [1_790_000_000.0]
     calls: list[dict] = []
-    vm = {"status": "ready", "provision_generation": generation,
-          "vm_uid": vm_uid, "rootdisk_pvc_uid": pvc_uid}
-    retired = dict(vm, status="deleting", retirement_cleanup_pending=True,
-                   retirement_last_result="retry_pending", retirement_attempts=1,
-                   retirement_retry_after=clock[0] + 60)
+    vm = {
+        "status": "ready",
+        "provision_generation": generation,
+        "vm_uid": vm_uid,
+        "rootdisk_pvc_uid": pvc_uid,
+    }
+    retired = dict(
+        vm,
+        status="deleting",
+        retirement_cleanup_pending=True,
+        retirement_last_result="retry_pending",
+        retirement_attempts=1,
+        retirement_retry_after=clock[0] + 60,
+    )
     snapshot = {
-        "id": job_id, "user_id": owner_id, "status": "paused",
-        "execution_lane": "stateless", "assigned_agent_id": None,
+        "id": job_id,
+        "user_id": owner_id,
+        "status": "paused",
+        "execution_lane": "stateless",
+        "assigned_agent_id": None,
         "context": {
             "vm_retained_resume_acceptance_gate": "srw-a1-owned-20260923",
             "_operator_pause_hold": {
-                "version": 1, "hold_id": hold_id, "source": "public_pause",
+                "version": 1,
+                "hold_id": hold_id,
+                "source": "public_pause",
                 "paused_by": owner_id,
                 "paused_at": datetime.now(timezone.utc).isoformat(),
-            }, "vm": retired,
+            },
+            "vm": retired,
         },
-        "queue_state": "done", "queue_leased_by": None,
-        "queue_leased_until": None, "queue_lease_token": 0,
+        "queue_state": "done",
+        "queue_leased_by": None,
+        "queue_leased_until": None,
+        "queue_lease_token": 0,
         "cleanup_id": cleanup_id,
-        "cleanup_request_id": request_id, "cleanup_pvc_uid": pvc_uid,
+        "cleanup_request_id": request_id,
+        "cleanup_pvc_uid": pvc_uid,
         "cleanup_source": "dispatcher_vm_recycle",
-        "cleanup_completed_at": None, "cleanup_outcome": None,
-        "active_access": False, "active_remote": False,
-        "active_recovery": False, "active_creation": False,
+        "cleanup_completed_at": None,
+        "cleanup_outcome": None,
+        "active_access": False,
+        "active_remote": False,
+        "active_recovery": False,
+        "active_creation": False,
     }
 
     async def recycle(_job_id, current, *, provisioner, now, **_kwargs):
@@ -138,10 +220,13 @@ async def test_retire_predecessor_retries_only_after_durable_clock(
     monkeypatch.setattr(gate.time, "time", lambda: clock[0])
     monkeypatch.setattr(gate.asyncio, "sleep", sleep)
     scenario = gate.LiveScenario.__new__(gate.LiveScenario)
-    scenario.args = SimpleNamespace(job_id=job_id, expected_owner_id=owner_id,
-                                    expected_pvc_uid=pvc_uid,
-                                    expected_pause_hold_id=hold_id,
-                                    run_id="srw-a1-owned-20260923")
+    scenario.args = SimpleNamespace(
+        job_id=job_id,
+        expected_owner_id=owner_id,
+        expected_pvc_uid=pvc_uid,
+        expected_pause_hold_id=hold_id,
+        run_id="srw-a1-owned-20260923",
+    )
     scenario.db = object()
     scenario.provisioner = SimpleNamespace(release_vm_captured=AsyncMock())
     scenario.owner_resume = AsyncMock(return_value={})
@@ -153,21 +238,34 @@ async def test_retire_predecessor_retries_only_after_durable_clock(
     elif drift == "owner":
         changed["user_id"] = str(uuid4())
     elif drift == "clock":
-        changed["context"] = {**snapshot["context"], "vm": {
-            **retired, "retirement_retry_after": retired["retirement_retry_after"] + 1,
-        }}
+        changed["context"] = {
+            **snapshot["context"],
+            "vm": {
+                **retired,
+                "retirement_retry_after": retired["retirement_retry_after"] + 1,
+            },
+        }
     scenario.retirement_retry_snapshot = AsyncMock(side_effect=[snapshot, changed])
     observed = datetime.now(timezone.utc)
-    scenario.row = AsyncMock(side_effect=[
-        {"id": cleanup_id, "request_id": request_id, "pvc_uid": pvc_uid,
-         "completed_at": None},
-        {"pvc_uid": pvc_uid, "completed_at": observed, "outcome": "completed"},
-        {"id": uuid4(), "observed_at": observed},
-    ])
+    scenario.row = AsyncMock(
+        side_effect=[
+            {
+                "id": cleanup_id,
+                "request_id": request_id,
+                "pvc_uid": pvc_uid,
+                "completed_at": None,
+            },
+            {"pvc_uid": pvc_uid, "completed_at": observed, "outcome": "completed"},
+            {"id": uuid4(), "observed_at": observed},
+        ]
+    )
     if drift:
-        with pytest.raises(gate.AcceptanceFailure,
-                           match="retirement clock changed" if drift == "clock"
-                           else "retirement retry authority changed"):
+        with pytest.raises(
+            gate.AcceptanceFailure,
+            match="retirement clock changed"
+            if drift == "clock"
+            else "retirement retry authority changed",
+        ):
             await scenario.retire_predecessor(vm)
         assert len(calls) == 1
     else:
@@ -196,10 +294,14 @@ async def test_retire_predecessor_drains_initial_task_after_owner_refusal(
     scenario.args = SimpleNamespace(job_id=job_id, expected_pvc_uid=pvc_uid)
     scenario.db = object()
     scenario.provisioner = SimpleNamespace(release_vm_captured=AsyncMock())
-    scenario.row = AsyncMock(return_value={
-        "id": cleanup_id, "request_id": uuid4(), "pvc_uid": pvc_uid,
-        "completed_at": None,
-    })
+    scenario.row = AsyncMock(
+        return_value={
+            "id": cleanup_id,
+            "request_id": uuid4(),
+            "pvc_uid": pvc_uid,
+            "completed_at": None,
+        }
+    )
     scenario.owner_resume = AsyncMock(side_effect=gate.AcceptanceFailure("409 absent"))
     with pytest.raises(gate.AcceptanceFailure, match="409 absent"):
         await scenario.retire_predecessor({"provision_generation": generation})
@@ -333,19 +435,27 @@ async def test_retire_predecessor_forwards_charged_stop_attestation(
 def test_execution_guard_requires_exact_disposable_context(tmp_path: Path) -> None:
     job_id, pvc_uid, cluster_uid, hold_id = (str(uuid4()) for _ in range(4))
     values = dict(
-        run_id="srw-a1-owned-20260923", job_id=job_id,
-        expected_owner_id=str(uuid4()), expected_pvc_uid=pvc_uid,
+        run_id="srw-a1-owned-20260923",
+        job_id=job_id,
+        expected_owner_id=str(uuid4()),
+        expected_pvc_uid=pvc_uid,
         expected_pause_hold_id=hold_id,
-        cluster_uid=cluster_uid, namespace="srw-a1-owned", context="srw-a1-owned",
-        confirm=gate.CONFIRMATION, protocol_version=1,
+        cluster_uid=cluster_uid,
+        namespace="srw-a1-owned",
+        context="srw-a1-owned",
+        confirm=gate.CONFIRMATION,
+        protocol_version=1,
         output=gate.OUTPUT_ROOT / "srw-a1-owned-20260923" / "result.json",
     )
     env = {"VM_RETAINED_RESUME_ACCEPTANCE_GATE_ENABLED": "true"}
     gate.require_execution_guard(values, env)
     for key, invalid in (
-        ("run_id", "../other"), ("job_id", str(uuid4())),
-        ("namespace", "production"), ("context", "shared"),
-        ("protocol_version", 2), ("confirm", "yes"),
+        ("run_id", "../other"),
+        ("job_id", str(uuid4())),
+        ("namespace", "production"),
+        ("context", "shared"),
+        ("protocol_version", 2),
+        ("confirm", "yes"),
         ("expected_pause_hold_id", "bad-hold"),
         ("output", tmp_path / "result.json"),
     ):
@@ -362,74 +472,146 @@ def test_fixture_snapshot_refuses_historical_or_leased_job() -> None:
     job_id, owner, pvc_uid, gen, hold_id = (str(uuid4()) for _ in range(5))
     now = datetime.now(timezone.utc)
     job = {
-        "id": job_id, "user_id": owner, "status": "paused",
-        "execution_lane": "stateless", "assigned_agent_id": None,
-        "created_at": now, "context": {"vm_retained_resume_acceptance_gate": "srw-a1-owned-20260923", "_operator_pause_hold": {
-            "version": 1, "source": "public_pause", "paused_by": owner,
-            "hold_id": hold_id, "paused_at": now.isoformat(),
-        }, "vm": {
-            "status": "ready", "provision_generation": gen,
-            "rootdisk_pvc_uid": pvc_uid,
-        }},
+        "id": job_id,
+        "user_id": owner,
+        "status": "paused",
+        "execution_lane": "stateless",
+        "assigned_agent_id": None,
+        "created_at": now,
+        "context": {
+            "vm_retained_resume_acceptance_gate": "srw-a1-owned-20260923",
+            "_operator_pause_hold": {
+                "version": 1,
+                "source": "public_pause",
+                "paused_by": owner,
+                "hold_id": hold_id,
+                "paused_at": now.isoformat(),
+            },
+            "vm": {
+                "status": "ready",
+                "provision_generation": gen,
+                "rootdisk_pvc_uid": pvc_uid,
+            },
+        },
     }
-    user = {"id": owner, "display_name": "A1 retained Resume gate srw-a1-owned-20260923",
-            "is_approved": True, "is_admin": False, "can_use_vm": True}
+    user = {
+        "id": owner,
+        "display_name": "A1 retained Resume gate srw-a1-owned-20260923",
+        "is_approved": True,
+        "is_admin": False,
+        "can_use_vm": True,
+    }
     queue = {"state": "done", "leased_by": None, "lease_token": 0}
-    gate.validate_fixture_snapshot(job, user, queue, run_id="srw-a1-owned-20260923",
-                                   expected_owner_id=owner,
-                                   expected_pvc_uid=pvc_uid,
-                                   expected_pause_hold_id=hold_id, now=now)
+    gate.validate_fixture_snapshot(
+        job,
+        user,
+        queue,
+        run_id="srw-a1-owned-20260923",
+        expected_owner_id=owner,
+        expected_pvc_uid=pvc_uid,
+        expected_pause_hold_id=hold_id,
+        now=now,
+    )
     for changed_job, changed_queue in (
         ({**job, "created_at": now - timedelta(days=2)}, queue),
         ({**job, "context": {}}, queue),
         (job, {**queue, "state": "leased", "leased_by": "worker-x"}),
         (job, {**queue, "lease_token": 1}),
-        ({**job, "context": {**job["context"], "_operator_pause_hold": {
-            **job["context"]["_operator_pause_hold"], "hold_id": str(uuid4()),
-        }}}, queue),
+        (
+            {
+                **job,
+                "context": {
+                    **job["context"],
+                    "_operator_pause_hold": {
+                        **job["context"]["_operator_pause_hold"],
+                        "hold_id": str(uuid4()),
+                    },
+                },
+            },
+            queue,
+        ),
     ):
         with pytest.raises(gate.AcceptanceFailure):
-            gate.validate_fixture_snapshot(changed_job, user, changed_queue,
-                                           run_id="srw-a1-owned-20260923",
-                                           expected_owner_id=owner,
-                                           expected_pvc_uid=pvc_uid,
-                                           expected_pause_hold_id=hold_id, now=now)
+            gate.validate_fixture_snapshot(
+                changed_job,
+                user,
+                changed_queue,
+                run_id="srw-a1-owned-20260923",
+                expected_owner_id=owner,
+                expected_pvc_uid=pvc_uid,
+                expected_pause_hold_id=hold_id,
+                now=now,
+            )
 
 
 def test_retry_snapshot_exact_immutable_equality_and_retained_pvc() -> None:
     request_id, job_id, gen, pvc_uid = (str(uuid4()) for _ in range(4))
-    before = {"request_id": request_id, "job_id": job_id,
-              "provision_generation": gen, "expected_pvc_uid": pvc_uid,
-              "canonical_request": {"job_id": job_id, "provision_generation": gen},
-              "request_digest": "sha256:" + "a" * 64,
-              "controller_configuration_digest": "sha256:" + "b" * 64,
-              "execution_revision": "sha256:" + "c" * 64,
-              "admission_deadline": datetime.now(timezone.utc) + timedelta(minutes=15)}
-    after = dict(before, state="succeeded", observed_pvc_uid=pvc_uid,
-                 observed_vm_uid=str(uuid4()), ready_at=datetime.now(timezone.utc))
-    gate.validate_retained_retry(before, after, job_id=job_id,
-                                 expected_pvc_uid=pvc_uid)
+    before = {
+        "request_id": request_id,
+        "job_id": job_id,
+        "provision_generation": gen,
+        "expected_pvc_uid": pvc_uid,
+        "canonical_request": {"job_id": job_id, "provision_generation": gen},
+        "request_digest": "sha256:" + "a" * 64,
+        "controller_configuration_digest": "sha256:" + "b" * 64,
+        "execution_revision": "sha256:" + "c" * 64,
+        "admission_deadline": datetime.now(timezone.utc) + timedelta(minutes=15),
+    }
+    after = dict(
+        before,
+        state="succeeded",
+        observed_pvc_uid=pvc_uid,
+        observed_vm_uid=str(uuid4()),
+        ready_at=datetime.now(timezone.utc),
+    )
+    gate.validate_retained_retry(before, after, job_id=job_id, expected_pvc_uid=pvc_uid)
     with pytest.raises(gate.AcceptanceFailure):
-        gate.validate_retained_retry(before, {**after, "request_digest": "sha256:" + "d" * 64},
-                                     job_id=job_id, expected_pvc_uid=pvc_uid)
+        gate.validate_retained_retry(
+            before,
+            {**after, "request_digest": "sha256:" + "d" * 64},
+            job_id=job_id,
+            expected_pvc_uid=pvc_uid,
+        )
     with pytest.raises(gate.AcceptanceFailure):
-        gate.validate_retained_retry(before, {**after, "observed_pvc_uid": str(uuid4())},
-                                     job_id=job_id, expected_pvc_uid=pvc_uid)
+        gate.validate_retained_retry(
+            before,
+            {**after, "observed_pvc_uid": str(uuid4())},
+            job_id=job_id,
+            expected_pvc_uid=pvc_uid,
+        )
 
 
 def test_worker_evidence_rejects_synthetic_lease_or_missing_pod() -> None:
     job_id = str(uuid4())
-    queue = {"unit_id": job_id, "unit_kind": "worker_batch", "state": "done",
-             "lease_token": 7, "last_leased_by": "worker-owned", "leased_by": None}
-    attempt = {"job_id": job_id, "lease_token": 7, "claimed_attempt": 1,
-               "bundle_authorized_at": datetime.now(timezone.utc),
-               "authority_digest": "sha256:" + "a" * 64}
-    pod = {"metadata": {"name": "worker-owned", "uid": str(uuid4()),
-                        "labels": {"srw/class": "agent-stateless",
-                                   "app.kubernetes.io/component": "agent-stateless"}},
-           "status": {"phase": "Running"}}
-    gate.validate_worker_evidence(queue, attempt, pod, job_id=job_id,
-                                  run_id="srw-a1-owned-20260923")
+    queue = {
+        "unit_id": job_id,
+        "unit_kind": "worker_batch",
+        "state": "done",
+        "lease_token": 7,
+        "last_leased_by": "worker-owned",
+        "leased_by": None,
+    }
+    attempt = {
+        "job_id": job_id,
+        "lease_token": 7,
+        "claimed_attempt": 1,
+        "bundle_authorized_at": datetime.now(timezone.utc),
+        "authority_digest": "sha256:" + "a" * 64,
+    }
+    pod = {
+        "metadata": {
+            "name": "worker-owned",
+            "uid": str(uuid4()),
+            "labels": {
+                "srw/class": "agent-stateless",
+                "app.kubernetes.io/component": "agent-stateless",
+            },
+        },
+        "status": {"phase": "Running"},
+    }
+    gate.validate_worker_evidence(
+        queue, attempt, pod, job_id=job_id, run_id="srw-a1-owned-20260923"
+    )
     for bad_attempt, bad_pod in (
         ({**attempt, "bundle_authorized_at": None}, pod),
         ({**attempt, "authority_digest": None}, pod),
@@ -437,8 +619,13 @@ def test_worker_evidence_rejects_synthetic_lease_or_missing_pod() -> None:
         (attempt, {**pod, "metadata": {**pod["metadata"], "name": "other"}}),
     ):
         with pytest.raises(gate.AcceptanceFailure):
-            gate.validate_worker_evidence(queue, bad_attempt, bad_pod,
-                                          job_id=job_id, run_id="srw-a1-owned-20260923")
+            gate.validate_worker_evidence(
+                queue,
+                bad_attempt,
+                bad_pod,
+                job_id=job_id,
+                run_id="srw-a1-owned-20260923",
+            )
 
 
 def test_host_barrier_refuses_missing_or_wrong_ack(monkeypatch, capsys) -> None:
@@ -453,54 +640,84 @@ def test_host_barrier_refuses_missing_or_wrong_ack(monkeypatch, capsys) -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("missing", [None, "worker", "sentinel"])
 async def test_execute_proves_worker_sentinel_before_terminal_vm_teardown(
-    monkeypatch, missing,
+    monkeypatch,
+    missing,
 ) -> None:
     job_id, owner_id, pvc_uid, old_gen, old_vm_uid, new_gen, new_vm_uid, request_id = (
         str(uuid4()) for _ in range(8)
     )
     scenario = gate.LiveScenario.__new__(gate.LiveScenario)
     scenario.args = SimpleNamespace(
-        job_id=job_id, expected_owner_id=owner_id, expected_pvc_uid=pvc_uid,
+        job_id=job_id,
+        expected_owner_id=owner_id,
+        expected_pvc_uid=pvc_uid,
         expected_pause_hold_id=str(uuid4()),
-        run_id="srw-a1-owned-20260923", cluster_uid=str(uuid4()), namespace="srw",
+        run_id="srw-a1-owned-20260923",
+        cluster_uid=str(uuid4()),
+        namespace="srw",
     )
     before = {
-        "request_id": request_id, "job_id": job_id, "provision_generation": new_gen,
-        "origin": "resume", "expected_pvc_uid": pvc_uid,
+        "request_id": request_id,
+        "job_id": job_id,
+        "provision_generation": new_gen,
+        "origin": "resume",
+        "expected_pvc_uid": pvc_uid,
         "admission_deadline": datetime.now(timezone.utc) + timedelta(minutes=10),
-        "canonical_request": {"job_id": job_id}, "request_digest": "sha256:" + "a" * 64,
+        "canonical_request": {"job_id": job_id},
+        "request_digest": "sha256:" + "a" * 64,
         "controller_configuration_digest": "sha256:" + "b" * 64,
-        "execution_id": str(uuid4()), "execution_revision": "sha256:" + "c" * 64,
+        "execution_id": str(uuid4()),
+        "execution_revision": "sha256:" + "c" * 64,
         "execution_generation": str(uuid4()),
     }
-    after = {**before, "state": "succeeded", "observed_pvc_uid": pvc_uid,
-             "observed_vm_uid": new_vm_uid, "ready_at": datetime.now(timezone.utc)}
+    after = {
+        **before,
+        "state": "succeeded",
+        "observed_pvc_uid": pvc_uid,
+        "observed_vm_uid": new_vm_uid,
+        "ready_at": datetime.now(timezone.utc),
+    }
     storage = {"pvc_uid": pvc_uid, "pv_uid": str(uuid4())}
-    scenario.fixture_snapshot = AsyncMock(return_value=(
-        {"context": {"vm": {"provision_generation": old_gen}}},
-        {"provision_generation": old_gen, "observed_vm_uid": old_vm_uid,
-         "request_id": str(uuid4())},
-    ))
+    scenario.fixture_snapshot = AsyncMock(
+        return_value=(
+            {"context": {"vm": {"provision_generation": old_gen}}},
+            {
+                "provision_generation": old_gen,
+                "observed_vm_uid": old_vm_uid,
+                "request_id": str(uuid4()),
+            },
+        )
+    )
     scenario.revisions = AsyncMock(return_value={})
-    scenario.ready_identity = AsyncMock(side_effect=[
-        {"vm_uid": old_vm_uid}, {"vm_uid": new_vm_uid},
-    ])
+    scenario.ready_identity = AsyncMock(
+        side_effect=[
+            {"vm_uid": old_vm_uid},
+            {"vm_uid": new_vm_uid},
+        ]
+    )
     scenario.pvc_pv_identity = AsyncMock(return_value=storage)
     scenario.sentinel_write = AsyncMock(return_value="a" * 64)
-    scenario.retire_predecessor = AsyncMock(return_value={"cleanup_admission_id": str(uuid4())})
+    scenario.retire_predecessor = AsyncMock(
+        return_value={"cleanup_admission_id": str(uuid4())}
+    )
     scenario.exclusive_vm_creation = AsyncMock()
     scenario.begin_replacement = AsyncMock(return_value=before)
     scenario.rejected_vm_effect = AsyncMock(return_value=True)
-    scenario.owner_resume = AsyncMock(return_value={"vm_creation_retry_request_id": request_id})
+    scenario.owner_resume = AsyncMock(
+        return_value={"vm_creation_retry_request_id": request_id}
+    )
     scenario.verify_owner_pause_lift = AsyncMock()
     scenario.retry_row = AsyncMock(side_effect=[before, after])
     worker_name = "a1-worker-owned"
     authorized_at = datetime.now(timezone.utc)
     worker = {
         "queue": {"lease_token": 1},
-        "attempt": {"authority_digest": "sha256:" + "d" * 64,
-                    "bundle_authorized_at": authorized_at},
-        "pod_name": worker_name, "pod_uid": str(uuid4()),
+        "attempt": {
+            "authority_digest": "sha256:" + "d" * 64,
+            "bundle_authorized_at": authorized_at,
+        },
+        "pod_name": worker_name,
+        "pod_uid": str(uuid4()),
     }
     scenario.capture_worker = AsyncMock(return_value=worker)
     state = {"barrier": False, "vm_deleted": False, "reads": 0, "terminal": False}
@@ -517,13 +734,17 @@ async def test_execute_proves_worker_sentinel_before_terminal_vm_teardown(
         if "FROM jobs" in query:
             return {"status": "completed", "completed_at": authorized_at}
         if "FROM worker_batch_attempts" in query:
-            return {"authority_digest": worker["attempt"]["authority_digest"],
-                    "bundle_authorized_at": authorized_at, "refunded_at": None}
+            return {
+                "authority_digest": worker["attempt"]["authority_digest"],
+                "bundle_authorized_at": authorized_at,
+                "refunded_at": None,
+            }
         if "FROM job_completion_commands" in query:
             # Exercise the real S36 adapter with its exact purge intent. Its
             # external VM transport is the test's deleted-guest observation.
             from orchestrator.services.completion_effects import (
-                CompletionEffectDependencies, run_completion_workspace_teardown,
+                CompletionEffectDependencies,
+                run_completion_workspace_teardown,
             )
             from orchestrator.services.vm_provisioner import VMTeardownResult
             from orchestrator.services.vm_workspace_recovery_store import CleanupPermit
@@ -536,8 +757,10 @@ async def test_execute_proves_worker_sentinel_before_terminal_vm_teardown(
 
                 async def capture_intent(self, *_):
                     return {
-                        "kind": "vm", "provision_generation": new_gen,
-                        "vm_uid": new_vm_uid, "rootdisk_pvc_uid": pvc_uid,
+                        "kind": "vm",
+                        "provision_generation": new_gen,
+                        "vm_uid": new_vm_uid,
+                        "rootdisk_pvc_uid": pvc_uid,
                         "ssh_host_key_fingerprint": "SHA256:" + "A" * 43,
                     }
 
@@ -560,12 +783,19 @@ async def test_execute_proves_worker_sentinel_before_terminal_vm_teardown(
                 if query == "SELECT * FROM jobs WHERE id=$1":
                     assert tuple(map(str, args)) == (job_id,)
                     return {
-                        "id": job_id, "status": "completed",
-                        "execution_lane": "stateless", "assigned_agent_id": None,
-                        "parent_job_id": None, "context": {"vm": {
-                            "status": "ready", "provision_generation": new_gen,
-                            "vm_uid": new_vm_uid, "rootdisk_pvc_uid": pvc_uid,
-                        }},
+                        "id": job_id,
+                        "status": "completed",
+                        "execution_lane": "stateless",
+                        "assigned_agent_id": None,
+                        "parent_job_id": None,
+                        "context": {
+                            "vm": {
+                                "status": "ready",
+                                "provision_generation": new_gen,
+                                "vm_uid": new_vm_uid,
+                                "rootdisk_pvc_uid": pvc_uid,
+                            }
+                        },
                     }
                 assert "FROM vm_creation_retries" in query
                 assert tuple(map(str, args)) == (job_id, new_gen)
@@ -605,22 +835,31 @@ async def test_execute_proves_worker_sentinel_before_terminal_vm_teardown(
 
             cleanup = SimpleNamespace(
                 db=SimpleNamespace(acquire=acquire),
-                acquire_cleanup_permit=AsyncMock(return_value=CleanupPermit(
-                    allowed=True, admission_id=uuid4(),
-                )),
+                acquire_cleanup_permit=AsyncMock(
+                    return_value=CleanupPermit(
+                        allowed=True,
+                        admission_id=uuid4(),
+                    )
+                ),
                 complete_cleanup_permit=AsyncMock(),
             )
             dependencies = CompletionEffectDependencies(
-                store=SimpleNamespace(get_job=AsyncMock(return_value={}), acquire=acquire),
+                store=SimpleNamespace(
+                    get_job=AsyncMock(return_value={}), acquire=acquire
+                ),
                 container_provisioner=SimpleNamespace(),
                 vm_provisioner=SimpleNamespace(release_vm_captured=release_vm),
-                get_container_context=lambda _: {}, get_vm_context=lambda _: {},
+                get_container_context=lambda _: {},
+                get_vm_context=lambda _: {},
                 archive_and_cleanup_workspace=AsyncMock(return_value=[]),
                 s36_exact_absence_timeout_seconds=lambda: 5,
-                logger=logging.getLogger(__name__), recovery_store=cleanup,
+                logger=logging.getLogger(__name__),
+                recovery_store=cleanup,
             )
             teardown = await run_completion_workspace_teardown(
-                job_id, Runner(), dependencies=dependencies,
+                job_id,
+                Runner(),
+                dependencies=dependencies,
             )
             assert teardown["teardown_disposition"] == "completed"
             cleanup.complete_cleanup_permit.assert_awaited_once()
@@ -628,8 +867,13 @@ async def test_execute_proves_worker_sentinel_before_terminal_vm_teardown(
             assert connection.fetchval.await_count == 4
             assert connection.execute.await_count == 2
             state["terminal"] = True
-            return {"id": str(uuid4()), "state": "done", "outcome": {},
-                    "finalized_at": authorized_at, "accepted_lease_token": 1}
+            return {
+                "id": str(uuid4()),
+                "state": "done",
+                "outcome": {},
+                "finalized_at": authorized_at,
+                "accepted_lease_token": 1,
+            }
         raise AssertionError("unexpected terminal projection")
 
     async def wait(_, probe, *, seconds):
@@ -656,8 +900,12 @@ async def test_execute_proves_worker_sentinel_before_terminal_vm_teardown(
         assert result["outcome"] == "passed"
         assert result["assertions"]["pinned_ssh_sentinel_pre_terminal_worker"]
         assert result["assertions"]["normal_terminal_cleanup_allowed"]
-        assert state == {"barrier": True, "vm_deleted": True, "reads": 2,
-                         "terminal": True}
+        assert state == {
+            "barrier": True,
+            "vm_deleted": True,
+            "reads": 2,
+            "terminal": True,
+        }
         assert stages[-2:] == ["PROVIDER_BARRIER", "PROVIDER_VERIFY"]
     else:
         with pytest.raises(gate.AcceptanceFailure):
@@ -671,26 +919,39 @@ async def test_owner_resume_lift_observation_requires_exact_public_hold():
     job_id, owner_id, hold_id = (str(uuid4()) for _ in range(3))
     scenario = gate.LiveScenario.__new__(gate.LiveScenario)
     scenario.args = SimpleNamespace(
-        job_id=job_id, expected_owner_id=owner_id,
-        expected_pause_hold_id=hold_id, run_id="srw-a1-owned-20260923",
+        job_id=job_id,
+        expected_owner_id=owner_id,
+        expected_pause_hold_id=hold_id,
+        run_id="srw-a1-owned-20260923",
     )
     context = {
         "vm_retained_resume_acceptance_gate": scenario.args.run_id,
         "last_operator_pause_hold": {
-            "version": 1, "hold_id": hold_id, "paused_by": owner_id,
-            "source": "public_pause", "lifted_at": datetime.now(timezone.utc).isoformat(),
+            "version": 1,
+            "hold_id": hold_id,
+            "paused_by": owner_id,
+            "source": "public_pause",
+            "lifted_at": datetime.now(timezone.utc).isoformat(),
         },
     }
     scenario.value = AsyncMock(return_value=context)
     await scenario.verify_owner_pause_lift()
     for changed in (
         {**context, "_operator_pause_hold": {}},
-        {**context, "last_operator_pause_hold": {
-            **context["last_operator_pause_hold"], "hold_id": str(uuid4()),
-        }},
-        {**context, "last_operator_pause_hold": {
-            **context["last_operator_pause_hold"], "source": "internal_pause",
-        }},
+        {
+            **context,
+            "last_operator_pause_hold": {
+                **context["last_operator_pause_hold"],
+                "hold_id": str(uuid4()),
+            },
+        },
+        {
+            **context,
+            "last_operator_pause_hold": {
+                **context["last_operator_pause_hold"],
+                "source": "internal_pause",
+            },
+        },
     ):
         scenario.value.return_value = changed
         with pytest.raises(gate.AcceptanceFailure):
@@ -699,13 +960,16 @@ async def test_owner_resume_lift_observation_requires_exact_public_hold():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", [200, 409])
-async def test_owner_resume_uses_exact_http_route_and_revokes_token(monkeypatch, status) -> None:
+async def test_owner_resume_uses_exact_http_route_and_revokes_token(
+    monkeypatch, status
+) -> None:
     import httpx
 
     job_id, owner_id, token_id = (str(uuid4()) for _ in range(3))
     scenario = gate.LiveScenario.__new__(gate.LiveScenario)
-    scenario.args = SimpleNamespace(job_id=job_id, expected_owner_id=owner_id,
-                                    run_id="srw-a1-owned-20260923")
+    scenario.args = SimpleNamespace(
+        job_id=job_id, expected_owner_id=owner_id, run_id="srw-a1-owned-20260923"
+    )
     scenario.value = AsyncMock(return_value=owner_id)
     scenario.db = SimpleNamespace(
         create_mcp_token=AsyncMock(return_value={"id": token_id}),
@@ -716,42 +980,64 @@ async def test_owner_resume_uses_exact_http_route_and_revokes_token(monkeypatch,
     class Client:
         def __init__(self, **_):
             pass
+
         async def __aenter__(self):
             return self
+
         async def __aexit__(self, *_):
             return None
+
         async def post(self, url, *, headers, json):
             calls.append((url, headers, json))
-            return SimpleNamespace(status_code=status, json=lambda: {"vm_creation_retry_request_id": token_id})
+            return SimpleNamespace(
+                status_code=status,
+                json=lambda: {"vm_creation_retry_request_id": token_id},
+            )
 
     monkeypatch.setattr(httpx, "AsyncClient", Client)
     result = await scenario.owner_resume(expected_status=status)
     assert calls[0][0].endswith(f"/api/jobs/{job_id}/resume")
     assert calls[0][1]["Authorization"].startswith("Bearer srw_")
     assert calls[0][2] == {}
-    assert result == ({"vm_creation_retry_request_id": token_id} if status == 200 else {})
+    assert result == (
+        {"vm_creation_retry_request_id": token_id} if status == 200 else {}
+    )
     scenario.db.create_mcp_token.assert_awaited_once()
     scenario.db.revoke_mcp_token.assert_awaited_once_with(token_id, owner_id)
 
 
 @pytest.mark.asyncio
-async def test_cleanup_only_requests_owner_delete_and_reports_pending_settlement(monkeypatch) -> None:
+async def test_cleanup_only_requests_owner_delete_and_reports_pending_settlement(
+    monkeypatch,
+) -> None:
     import httpx
 
     job_id, owner_id, pvc_uid, token_id = (str(uuid4()) for _ in range(4))
     scenario = gate.LiveScenario.__new__(gate.LiveScenario)
-    scenario.args = SimpleNamespace(job_id=job_id, expected_owner_id=owner_id,
-                                    expected_pvc_uid=pvc_uid,
-                                    run_id="srw-a1-owned-20260923")
+    scenario.args = SimpleNamespace(
+        job_id=job_id,
+        expected_owner_id=owner_id,
+        expected_pvc_uid=pvc_uid,
+        run_id="srw-a1-owned-20260923",
+    )
     rows = [
-        {"id": job_id, "user_id": owner_id, "status": "completed",
-         "execution_lane": "stateless", "context": {
-             "vm_retained_resume_acceptance_gate": scenario.args.run_id,
-             "vm": {"rootdisk_pvc_uid": pvc_uid},
-         }},
+        {
+            "id": job_id,
+            "user_id": owner_id,
+            "status": "completed",
+            "execution_lane": "stateless",
+            "context": {
+                "vm_retained_resume_acceptance_gate": scenario.args.run_id,
+                "vm": {"rootdisk_pvc_uid": pvc_uid},
+            },
+        },
         {"state": "done", "leased_by": None},
-        {"id": owner_id, "display_name": "A1 retained Resume gate srw-a1-owned-20260923",
-         "is_approved": True, "is_admin": False},
+        {
+            "id": owner_id,
+            "display_name": "A1 retained Resume gate srw-a1-owned-20260923",
+            "is_approved": True,
+            "is_admin": False,
+        },
     ]
     scenario.row = AsyncMock(side_effect=rows)
     scenario.value = AsyncMock(return_value=False)
@@ -764,10 +1050,13 @@ async def test_cleanup_only_requests_owner_delete_and_reports_pending_settlement
     class Client:
         def __init__(self, **_):
             pass
+
         async def __aenter__(self):
             return self
+
         async def __aexit__(self, *_):
             return None
+
         async def delete(self, url, *, headers):
             calls.append((url, headers))
             return SimpleNamespace(status_code=200)
@@ -785,17 +1074,27 @@ async def test_cleanup_only_requests_owner_delete_and_reports_pending_settlement
 async def test_cleanup_only_holds_unresolved_replacement_before_owner_delete() -> None:
     job_id, owner_id, pvc_uid = (str(uuid4()) for _ in range(3))
     scenario = gate.LiveScenario.__new__(gate.LiveScenario)
-    scenario.args = SimpleNamespace(job_id=job_id, expected_owner_id=owner_id,
-                                    expected_pvc_uid=pvc_uid,
-                                    run_id="srw-a1-owned-20260923")
-    scenario.row = AsyncMock(side_effect=[
-        {"id": job_id, "user_id": owner_id, "status": "paused",
-         "execution_lane": "stateless", "context": {
-             "vm_retained_resume_acceptance_gate": scenario.args.run_id,
-             "vm": {"rootdisk_pvc_uid": pvc_uid},
-         }},
-        {"state": "done", "leased_by": None},
-    ])
+    scenario.args = SimpleNamespace(
+        job_id=job_id,
+        expected_owner_id=owner_id,
+        expected_pvc_uid=pvc_uid,
+        run_id="srw-a1-owned-20260923",
+    )
+    scenario.row = AsyncMock(
+        side_effect=[
+            {
+                "id": job_id,
+                "user_id": owner_id,
+                "status": "paused",
+                "execution_lane": "stateless",
+                "context": {
+                    "vm_retained_resume_acceptance_gate": scenario.args.run_id,
+                    "vm": {"rootdisk_pvc_uid": pvc_uid},
+                },
+            },
+            {"state": "done", "leased_by": None},
+        ]
+    )
     scenario.value = AsyncMock(side_effect=[False, True])
     scenario.db = SimpleNamespace(create_mcp_token=AsyncMock())
     with pytest.raises(gate.AcceptanceFailure, match="unresolved creation retry"):

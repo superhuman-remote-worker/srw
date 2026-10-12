@@ -24,11 +24,18 @@ from shared.vm_resource_policy import validate_enforcement_resource_policy
 
 
 _ACTIONS = (
-    "current-receipt", "ensure-shadow", "activate-enforce", "begin-drain",
+    "current-receipt",
+    "ensure-shadow",
+    "activate-enforce",
+    "begin-drain",
     "finalize-off",
 )
 _RECEIPT_FIELDS = {
-    "cluster_id", "namespace", "policy_digest", "revision", "mode",
+    "cluster_id",
+    "namespace",
+    "policy_digest",
+    "revision",
+    "mode",
 }
 
 
@@ -63,7 +70,8 @@ def load_request(args: argparse.Namespace):
         raise ResourceAdmissionError("resource_policy_changed")
     try:
         value = decode_document(
-            args.expected_receipt_file.read_bytes(), max_bytes=4096,
+            args.expected_receipt_file.read_bytes(),
+            max_bytes=4096,
         )
         if (
             not isinstance(value, dict)
@@ -104,13 +112,17 @@ async def run(args: argparse.Namespace, *, db_factory=None) -> dict:
 
     snapshot, expected = load_request(args)
     db = (
-        db_factory() if db_factory is not None
+        db_factory()
+        if db_factory is not None
         else PostgresDB(min_connections=1, max_connections=2)
     )
     await db.connect()
     try:
         receipt = await apply_transition(
-            db, snapshot, action=args.action, expected=expected,
+            db,
+            snapshot,
+            action=args.action,
+            expected=expected,
         )
     finally:
         await db.close()
@@ -123,10 +135,15 @@ def main() -> None:
         receipt = asyncio.run(run(args))
     except Exception as exc:
         # Database/configuration errors can contain endpoint or credential data.
-        print(json.dumps({
-            "error": "resource-policy-transition-failed",
-            "category": type(exc).__name__,
-        }, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "error": "resource-policy-transition-failed",
+                    "category": type(exc).__name__,
+                },
+                sort_keys=True,
+            )
+        )
         raise SystemExit(1) from None
     print(json.dumps(receipt, sort_keys=True))
 

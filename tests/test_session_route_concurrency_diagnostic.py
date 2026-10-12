@@ -44,7 +44,8 @@ class KubeBoundary:
                 },
             },
             "status": {
-                "phase": "Running", "podIP": "10.0.0.5",
+                "phase": "Running",
+                "podIP": "10.0.0.5",
                 "containerStatuses": [{"name": "agent", "ready": True}],
             },
         }
@@ -93,9 +94,11 @@ class KubeBoundary:
         if self.force_unrelated_422:
             self.history.append("unrelated-422")
             raise ApiException(status=422, reason="unrelated admission validation")
-        if (tests.get("/metadata/uid") != self.pod["metadata"]["uid"]
+        if (
+            tests.get("/metadata/uid") != self.pod["metadata"]["uid"]
             or tests.get("/metadata/resourceVersion")
-            != self.pod["metadata"]["resourceVersion"]):
+            != self.pod["metadata"]["resourceVersion"]
+        ):
             self.history.append("stale-or-uid-422")
             raise ApiException(status=422, reason="JSON Patch test failed")
         for op in body:
@@ -178,11 +181,16 @@ class KubeBoundary:
 
 def make_binding(**changes):
     values = dict(
-        thread_id=THREAD, runtime_generation=GENERATION,
+        thread_id=THREAD,
+        runtime_generation=GENERATION,
         agent_id="00000000-0000-4000-8000-0000000000a2",
         runtime_attach_token="00000000-0000-4000-8000-0000000000a3",
-        agent_hostname=POD_NAME, pod_namespace="srw", pod_uid=POD_UID,
-        pod_ip="10.0.0.5", pod_port=8001, agent_status="session",
+        agent_hostname=POD_NAME,
+        pod_namespace="srw",
+        pod_uid=POD_UID,
+        pod_ip="10.0.0.5",
+        pod_port=8001,
+        agent_status="session",
     )
     values.update(changes)
     return PinnedSessionBinding(**values)
@@ -190,41 +198,59 @@ def make_binding(**changes):
 
 def make_service(kube, db):
     return SessionRouterService(
-        namespace="srw", ingress_host="api.example.com", db=db,
-        core_api=kube, networking_api=kube,
+        namespace="srw",
+        ingress_host="api.example.com",
+        db=db,
+        core_api=kube,
+        networking_api=kube,
     )
 
 
 @pytest.mark.asyncio
-async def test_same_recipient_stale_rv_preserves_winner_and_emits_no_failure(monkeypatch):
+async def test_same_recipient_stale_rv_preserves_winner_and_emits_no_failure(
+    monkeypatch,
+):
     kube = KubeBoundary()
     kube.coordinate_patches = True
     binding = make_binding()
     db = MagicMock()
     db.get_pinned_session_binding = AsyncMock(return_value=binding)
-    db.get_thread = AsyncMock(return_value={
-        "id": THREAD, "execution_lane": "pinned", "status": "created",
-        "user_id": "u1", "agent_id": binding.agent_id,
-        "runtime_generation": GENERATION,
-        "runtime_attach_token": binding.runtime_attach_token,
-        "runtime_retirement_token": None, "metadata": {},
-    })
+    db.get_thread = AsyncMock(
+        return_value={
+            "id": THREAD,
+            "execution_lane": "pinned",
+            "status": "created",
+            "user_id": "u1",
+            "agent_id": binding.agent_id,
+            "runtime_generation": GENERATION,
+            "runtime_attach_token": binding.runtime_attach_token,
+            "runtime_retirement_token": None,
+            "metadata": {},
+        }
+    )
     advisory_lock = asyncio.Lock()
     db.thread_advisory_lock = MagicMock(return_value=advisory_lock)
     service = make_service(kube, db)
+
     async def ready(*_args, **_kwargs):
         return True
+
     monkeypatch.setattr(sessions, "wait_for_ready", ready)
     events = []
     monkeypatch.setattr(
-        sessions, "lifecycle_emit",
+        sessions,
+        "lifecycle_emit",
         lambda _uid, _tid, state, **extra: events.append({"state": state, **extra}),
     )
     noop = AsyncMock(return_value=None)
     deps = sessions.SessionsDependencies(
-        store=db, agent_provisioner=MagicMock(), container_provisioner=MagicMock(),
-        workspace_suspension_service=MagicMock(), session_router=service,
-        session_tokens=MagicMock(), ensure_session_workspace=noop,
+        store=db,
+        agent_provisioner=MagicMock(),
+        container_provisioner=MagicMock(),
+        workspace_suspension_service=MagicMock(),
+        session_router=service,
+        session_tokens=MagicMock(),
+        ensure_session_workspace=noop,
         await_late_cloud_setup=noop,
         await_protected_cloud_runtime_ready=AsyncMock(return_value=True),
         session_grant_violations=AsyncMock(return_value=[]),
@@ -233,9 +259,15 @@ async def test_same_recipient_stale_rv_preserves_winner_and_emits_no_failure(mon
         send_session_attach=AsyncMock(return_value=True),
     )
     authority = sessions.ThreadRuntimeAuthority(thread_id=THREAD, generation=GENERATION)
+
     async def prepare():
         return await sessions._do_prepare(
-            THREAD, "u1", "session_base", None, authority, dependencies=deps,
+            THREAD,
+            "u1",
+            "session_base",
+            None,
+            authority,
+            dependencies=deps,
         )
 
     winner = asyncio.create_task(prepare())
@@ -276,7 +308,10 @@ async def test_same_recipient_stale_rv_preserves_winner_and_emits_no_failure(mon
 @pytest.mark.asyncio
 async def test_unrelated_422_and_changed_recipient_fail_closed():
     for mode in (
-        "unrelated-422", "changed-uid", "changed-generation", "foreign-owner",
+        "unrelated-422",
+        "changed-uid",
+        "changed-generation",
+        "foreign-owner",
     ):
         kube = KubeBoundary()
         db = MagicMock()
@@ -293,8 +328,12 @@ async def test_unrelated_422_and_changed_recipient_fail_closed():
                 )
             else:
                 kube.services[ROUTE_NAME] = service._service_body(
-                    THREAD, ROUTE_NAME, POD_NAME, "foreign-pod-uid",
-                    GENERATION, namespace="srw",
+                    THREAD,
+                    ROUTE_NAME,
+                    POD_NAME,
+                    "foreign-pod-uid",
+                    GENERATION,
+                    namespace="srw",
                 )
                 kube.services[ROUTE_NAME]["metadata"]["uid"] = "foreign-service-uid"
         prior_services = deepcopy(kube.services)
@@ -377,7 +416,11 @@ async def test_foreign_service_appearing_during_contention_blocks_retry():
     def foreign_interference():
         _advance_pod_version(kube)
         kube.services[ROUTE_NAME] = service._service_body(
-            THREAD, ROUTE_NAME, POD_NAME, "foreign-pod-uid", GENERATION,
+            THREAD,
+            ROUTE_NAME,
+            POD_NAME,
+            "foreign-pod-uid",
+            GENERATION,
             namespace="srw",
         )
         kube.services[ROUTE_NAME]["metadata"]["uid"] = "foreign-service-uid"
@@ -420,17 +463,27 @@ async def test_old_generation_cleanup_preserves_successor_route():
     db.get_pinned_session_binding = AsyncMock(return_value=make_binding())
     service = make_service(kube, db)
     kube.services[ROUTE_NAME] = service._service_body(
-        THREAD, ROUTE_NAME, POD_NAME, "successor-pod-uid",
-        "22222222-2222-4222-8222-222222222222", namespace="srw",
+        THREAD,
+        ROUTE_NAME,
+        POD_NAME,
+        "successor-pod-uid",
+        "22222222-2222-4222-8222-222222222222",
+        namespace="srw",
     )
     kube.ingresses[ROUTE_NAME] = service._ingress_body(
-        THREAD, ROUTE_NAME, POD_NAME, "successor-pod-uid",
-        "22222222-2222-4222-8222-222222222222", namespace="srw",
+        THREAD,
+        ROUTE_NAME,
+        POD_NAME,
+        "successor-pod-uid",
+        "22222222-2222-4222-8222-222222222222",
+        namespace="srw",
     )
     kube.services[ROUTE_NAME]["metadata"]["uid"] = "successor-service-uid"
     kube.ingresses[ROUTE_NAME]["metadata"]["uid"] = "successor-ingress-uid"
     assert await service.teardown_route(
-        THREAD, expected_namespace="srw", expected_runtime_generation=GENERATION,
+        THREAD,
+        expected_namespace="srw",
+        expected_runtime_generation=GENERATION,
         expected_owner_uid=POD_UID,
     )
     assert ROUTE_NAME in kube.services and ROUTE_NAME in kube.ingresses

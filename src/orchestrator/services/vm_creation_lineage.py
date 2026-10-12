@@ -201,7 +201,8 @@ async def prove(conn, *, job_id, binding, scope=None, expected=None, adoption=Fa
             ledger = await conn.fetchrow(
                 "SELECT canonical_request,request_digest,state,expected_pvc_uid,observed_pvc_uid,observed_vm_uid "
                 "FROM vm_creation_retries WHERE job_id=$1 AND provision_generation=$2 FOR SHARE",
-                UUID(identity), UUID(vm["provision_generation"]),
+                UUID(identity),
+                UUID(vm["provision_generation"]),
             )
             request = _object(ledger["canonical_request"]) if ledger else {}
             if (
@@ -213,10 +214,13 @@ async def prove(conn, *, job_id, binding, scope=None, expected=None, adoption=Fa
                 or request.get("network_profile") != profile
                 or canonical_request_digest(request) != ledger["request_digest"]
                 or not reusable_profile_evidence(
-                    vm.get("network_profile_evidence"), profile,
+                    vm.get("network_profile_evidence"),
+                    profile,
                     provision_generation=vm["provision_generation"],
-                    vm_uid=vm["vm_uid"], pvc_uid=binding["pvc_uid"],
-                    vmi_uid=vm.get("vmi_uid"), launcher_uid=vm.get("active_pod_uid"),
+                    vm_uid=vm["vm_uid"],
+                    pvc_uid=binding["pvc_uid"],
+                    vmi_uid=vm.get("vmi_uid"),
+                    launcher_uid=vm.get("active_pod_uid"),
                 )
             ):
                 _refuse()

@@ -180,7 +180,9 @@ async def test_held_thread_reservation_blocks_later_job(db, same_owner):
         c for c in capacity["clusters"] if c["cluster_id"] == inventory.cluster_id
     )
     assert cluster["available"] is True
-    assert cluster["held"]["unbound"] == cluster["held"]["total"] == demand.to_six_dict()
+    assert (
+        cluster["held"]["unbound"] == cluster["held"]["total"] == demand.to_six_dict()
+    )
     assert cluster["waiting"]["count"] == 1
 
 

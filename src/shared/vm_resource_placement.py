@@ -69,7 +69,12 @@ def node_allocatable(node, *, six=False):
     try:
         if six and any(
             key not in values
-            for key in (EPHEMERAL_RESOURCE, KVM_RESOURCE, TUN_RESOURCE, VHOST_NET_RESOURCE)
+            for key in (
+                EPHEMERAL_RESOURCE,
+                KVM_RESOURCE,
+                TUN_RESOURCE,
+                VHOST_NET_RESOURCE,
+            )
         ):
             raise ResourceAdmissionError("invalid_placement")
         return ResourceVector(
@@ -77,7 +82,8 @@ def node_allocatable(node, *, six=False):
             normalize_byte_quantity(values["memory"]).normalized_value,
             normalize_kvm_devices(values.get(KVM_RESOURCE, 0)),
             normalize_byte_quantity(values[EPHEMERAL_RESOURCE]).normalized_value
-            if six else 0,
+            if six
+            else 0,
             normalize_kvm_devices(values[TUN_RESOURCE]) if six else 0,
             normalize_kvm_devices(values[VHOST_NET_RESOURCE]) if six else 0,
         )

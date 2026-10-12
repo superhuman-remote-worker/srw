@@ -851,11 +851,17 @@ def _strict_emptydir_release(*, reconciled: bool, ack_result, events: list):
         f"k8s-pod:agent-workspaces:{RUNTIME}"
     )
     closure = {
-        "state": "closed", "terminal_token": 8, "claimant_quiesced": True,
-        "claim_losses": [], "resident_cleanup_required": True,
-        "resident_acknowledged": True, "shell_retirement_required": True,
-        "remote_acknowledged": True, "permanent": False,
-        "workspace_absence_proven": False, "retry": True,
+        "state": "closed",
+        "terminal_token": 8,
+        "claimant_quiesced": True,
+        "claim_losses": [],
+        "resident_cleanup_required": True,
+        "resident_acknowledged": True,
+        "shell_retirement_required": True,
+        "remote_acknowledged": True,
+        "permanent": False,
+        "workspace_absence_proven": False,
+        "retry": True,
     }
 
     async def ack(*_args, **_kwargs):
@@ -889,8 +895,11 @@ def _strict_emptydir_release(*, reconciled: bool, ack_result, events: list):
         record_managed_repository_workspace_process_zero=AsyncMock(return_value=True),
     )
     identity = container_provisioner_module.WorkspaceTeardownIdentity(
-        pod_uid=RUNTIME, pvc_uid=None, service_uid=None,
-        pod_ip="10.0.0.8", ssh_host_key_fingerprint=FINGERPRINT
+        pod_uid=RUNTIME,
+        pvc_uid=None,
+        service_uid=None,
+        pod_ip="10.0.0.8",
+        ssh_host_key_fingerprint=FINGERPRINT,
     )
     provisioner = container_provisioner_module.ContainerProvisioner()
     provisioner._k8s_available = True
@@ -903,9 +912,13 @@ def _strict_emptydir_release(*, reconciled: bool, ack_result, events: list):
     provisioner._snapshot_service.capture_vm_snapshot = AsyncMock(return_value=True)
     provisioner.workspace_pod_authority = AsyncMock(return_value="exact_live")
     provisioner.capture_terminal_workspace_identity = AsyncMock(return_value=identity)
-    provisioner.get_workspace_status = AsyncMock(return_value={
-        "runtime_incarnation": RUNTIME, "pod_ip": "10.0.0.8", "ready": True,
-    })
+    provisioner.get_workspace_status = AsyncMock(
+        return_value={
+            "runtime_incarnation": RUNTIME,
+            "pod_ip": "10.0.0.8",
+            "ready": True,
+        }
+    )
     provisioner.prepare_workspace_cleanup_intent = AsyncMock(side_effect=prepare)
     provisioner._managed_repository_process_zero_replay_authority = AsyncMock(
         return_value=None
@@ -923,7 +936,9 @@ async def test_emptydir_live_end_uses_committed_snapshot_identity_before_teardow
     )
     with (
         patch.object(main.app.state.resources, "postgres_db", db),
-        patch.object(container_provisioner_module, "container_provisioner", provisioner),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
     ):
         result = await control_seams.reconcile_stateless_thread_retirement(
             THREAD_ID, force=True, permanent=False
@@ -931,15 +946,21 @@ async def test_emptydir_live_end_uses_committed_snapshot_identity_before_teardow
     assert result["state"] == "settled"
     assert events == ["ack", "intent", "process_zero", "delete"]
     assert provisioner._snapshot_service.capture_vm_snapshot.await_args.kwargs == {
-        "job_id": THREAD_ID, "ssh_host": "10.0.0.8", "ssh_port": 30022,
-        "source_type": "pod", "entity_type": "threads",
-        "expected_host_key_fingerprint": FINGERPRINT, "strict_terminal": True,
+        "job_id": THREAD_ID,
+        "ssh_host": "10.0.0.8",
+        "ssh_port": 30022,
+        "source_type": "pod",
+        "entity_type": "threads",
+        "expected_host_key_fingerprint": FINGERPRINT,
+        "strict_terminal": True,
         "terminal_generation": TERMINAL_SNAPSHOT,
         "terminal_created_at": ENDED_AT.isoformat(),
         "expected_runtime_incarnation": RUNTIME,
     }
     db.mark_stateless_thread_snapshot_restore_required.assert_awaited_once_with(
-        THREAD_ID, terminal_token=8, expected_runtime_incarnation=RUNTIME,
+        THREAD_ID,
+        terminal_token=8,
+        expected_runtime_incarnation=RUNTIME,
         expected_host_key_fingerprint=FINGERPRINT,
         expected_workspace_generation=GENERATION,
         expected_backing_id=f"k8s-pod:agent-workspaces:{RUNTIME}",
@@ -950,7 +971,8 @@ async def test_emptydir_live_end_uses_committed_snapshot_identity_before_teardow
 @pytest.mark.parametrize("reconciled", [False, True])
 @pytest.mark.parametrize("ack_result", [False, RuntimeError("lost ACK")])
 async def test_emptydir_archive_requires_ack_before_any_teardown(
-    reconciled, ack_result,
+    reconciled,
+    ack_result,
 ):
     events = []
     _, db, provisioner = _strict_emptydir_release(
@@ -958,7 +980,9 @@ async def test_emptydir_archive_requires_ack_before_any_teardown(
     )
     with (
         patch.object(main.app.state.resources, "postgres_db", db),
-        patch.object(container_provisioner_module, "container_provisioner", provisioner),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
         pytest.raises(HTTPException) as exc,
     ):
         await control_seams.reconcile_stateless_thread_retirement(
@@ -981,7 +1005,9 @@ async def test_emptydir_reconciled_retry_acks_same_generation_once_per_attempt()
     )
     with (
         patch.object(main.app.state.resources, "postgres_db", db),
-        patch.object(container_provisioner_module, "container_provisioner", provisioner),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
     ):
         with pytest.raises(HTTPException) as exc:
             await control_seams.reconcile_stateless_thread_retirement(
@@ -995,7 +1021,10 @@ async def test_emptydir_reconciled_retry_acks_same_generation_once_per_attempt()
     assert result["state"] == "settled"
     assert events == ["ack", "ack", "intent", "process_zero", "delete"]
     assert provisioner._snapshot_service.capture_vm_snapshot.await_count == 0
-    assert provisioner._snapshot_service.reconcile_terminal_snapshot_generation.await_count == 2
+    assert (
+        provisioner._snapshot_service.reconcile_terminal_snapshot_generation.await_count
+        == 2
+    )
     assert all(
         call.kwargs["terminal_generation"] == TERMINAL_SNAPSHOT
         for call in provisioner._snapshot_service.reconcile_terminal_snapshot_generation.await_args_list
@@ -1004,7 +1033,9 @@ async def test_emptydir_reconciled_retry_acks_same_generation_once_per_attempt()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ended_at", [None, "2026-10-07T06:05:04+00:00", datetime(2026, 10, 7, 6, 5, 4)])
+@pytest.mark.parametrize(
+    "ended_at", [None, "2026-10-07T06:05:04+00:00", datetime(2026, 10, 7, 6, 5, 4)]
+)
 async def test_emptydir_live_end_refuses_missing_or_naive_committed_time(ended_at):
     events = []
     thread, db, provisioner = _strict_emptydir_release(
@@ -1013,7 +1044,9 @@ async def test_emptydir_live_end_refuses_missing_or_naive_committed_time(ended_a
     thread["ended_at"] = ended_at
     with (
         patch.object(main.app.state.resources, "postgres_db", db),
-        patch.object(container_provisioner_module, "container_provisioner", provisioner),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
         pytest.raises(HTTPException) as exc,
     ):
         await control_seams.reconcile_stateless_thread_retirement(
@@ -1036,13 +1069,16 @@ async def test_emptydir_live_end_rejects_noncanonical_workspace_generation():
     state["workspace_container"]["_canvas_workspace_generation"] = "bad"
     state["_workspace_binding"]["generation"] = "bad"
     for ack_key in (
-        "_stateless_resident_retirement_ack", "_stateless_shell_retirement_ack"
+        "_stateless_resident_retirement_ack",
+        "_stateless_shell_retirement_ack",
     ):
         state[ack_key]["workspace_generation"] = "bad"
         state[ack_key]["endpoint_generation"] = "bad"
     with (
         patch.object(main.app.state.resources, "postgres_db", db),
-        patch.object(container_provisioner_module, "container_provisioner", provisioner),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
         pytest.raises(HTTPException) as exc,
     ):
         await control_seams.reconcile_stateless_thread_retirement(
@@ -1064,7 +1100,9 @@ async def test_emptydir_live_end_rejects_malformed_committed_token():
     )
     with (
         patch.object(main.app.state.resources, "postgres_db", db),
-        patch.object(container_provisioner_module, "container_provisioner", provisioner),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
         pytest.raises(HTTPException) as exc,
     ):
         await control_seams.reconcile_stateless_thread_retirement(
@@ -1084,7 +1122,9 @@ async def test_emptydir_partial_archive_cannot_arm_restore_or_delete():
     provisioner._snapshot_service.capture_vm_snapshot.return_value = False
     with (
         patch.object(main.app.state.resources, "postgres_db", db),
-        patch.object(container_provisioner_module, "container_provisioner", provisioner),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
         pytest.raises(HTTPException) as exc,
     ):
         await control_seams.reconcile_stateless_thread_retirement(
@@ -1103,13 +1143,16 @@ async def test_emptydir_captured_archive_needs_complete_cleanup_intent():
         reconciled=False, ack_result=True, events=events
     )
     provisioner.prepare_workspace_cleanup_intent.return_value = {
-        "intent_generation": 1, "resources_captured_at": None,
+        "intent_generation": 1,
+        "resources_captured_at": None,
         "reclaim_shared_resources": False,
     }
     provisioner.prepare_workspace_cleanup_intent.side_effect = None
     with (
         patch.object(main.app.state.resources, "postgres_db", db),
-        patch.object(container_provisioner_module, "container_provisioner", provisioner),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
         pytest.raises(HTTPException) as exc,
     ):
         await control_seams.reconcile_stateless_thread_retirement(

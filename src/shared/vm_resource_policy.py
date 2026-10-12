@@ -26,12 +26,19 @@ HOST_COST_FIELDS = (
     "memoryOverheadBasisPoints",
 )
 WHOLE_HOST_COST_FIELDS = HOST_COST_FIELDS + (
-    "version", "ephemeralStorageReserveBytes", "kvmDevices", "tunDevices",
+    "version",
+    "ephemeralStorageReserveBytes",
+    "kvmDevices",
+    "tunDevices",
     "vhostNetDevices",
 )
 SIX_BUDGET_FIELDS = (
-    "cpuMillicores", "memoryBytes", "ephemeralStorageBytes", "kvmDevices",
-    "tunDevices", "vhostNetDevices",
+    "cpuMillicores",
+    "memoryBytes",
+    "ephemeralStorageBytes",
+    "kvmDevices",
+    "tunDevices",
+    "vhostNetDevices",
 )
 
 
@@ -68,7 +75,9 @@ def parse_whole_launcher_host_cost_policy(value):
 def parse_six_budget(value):
     try:
         values = _fields(value, SIX_BUDGET_FIELDS)
-        return ResourceVector(values[0], values[1], values[3], values[2], values[4], values[5])
+        return ResourceVector(
+            values[0], values[1], values[3], values[2], values[4], values[5]
+        )
     except (ValueError, TypeError, KeyError):
         raise ResourceAdmissionError("invalid_resource_policy") from None
 
@@ -80,10 +89,14 @@ def parse_whole_launcher_policy_values(policy):
         installation = parse_six_budget(policy["installationBudget"])
         owner = parse_six_budget(policy["ownerBudget"])
         profile = validate_launcher_profile(policy["launcherProfile"])
-        bypasses, aging = _fields(policy["fairness"], ("maxBypasses", "priorityAgingSeconds"))
+        bypasses, aging = _fields(
+            policy["fairness"], ("maxBypasses", "priorityAgingSeconds")
+        )
         if (
-            type(bypasses) is not int or not 0 <= bypasses < 2**63
-            or type(aging) is not int or not 1 <= aging < 2**63
+            type(bypasses) is not int
+            or not 0 <= bypasses < 2**63
+            or type(aging) is not int
+            or not 1 <= aging < 2**63
         ):
             raise ValueError
         return cost, headroom, installation, owner, bypasses, aging, profile
@@ -164,7 +177,9 @@ def _validate_resource_policy(document, *, inventory_loader, snapshot_type):
                 parse_whole_launcher_policy_values(value["policy"])
             )
         else:
-            cost, headroom, bypasses, aging = parse_resource_policy_values(value["policy"])
+            cost, headroom, bypasses, aging = parse_resource_policy_values(
+                value["policy"]
+            )
             profile = installation = owner = None
         return snapshot_type(
             canonical,
@@ -244,8 +259,7 @@ def _same_typed_value(actual, expected):
         )
     if isinstance(expected, dict):
         return actual.keys() == expected.keys() and all(
-            _same_typed_value(actual[key], value)
-            for key, value in expected.items()
+            _same_typed_value(actual[key], value) for key, value in expected.items()
         )
     return actual == expected
 

@@ -11,7 +11,9 @@ import os
 from shared.vm_resource_admission import ResourceAdmissionError
 from shared.vm_resource_policy import validate_enforcement_resource_policy
 from orchestrator.services.vm_resource_inventory_store import VMResourceInventoryStore
-from orchestrator.services.vm_resource_reservation_store import VMResourceReservationStore
+from orchestrator.services.vm_resource_reservation_store import (
+    VMResourceReservationStore,
+)
 
 
 def configured_enforcement_policy(source=None):
@@ -62,9 +64,7 @@ async def installed_job_resource_store(conn, db, configuration, *, fresh=True):
             raise ValueError
         if selected is not None and selected.policy_digest != digest:
             raise ValueError
-        if row["mode"] != "enforce" and (
-            fresh or row["mode"] not in {"drain", "off"}
-        ):
+        if row["mode"] != "enforce" and (fresh or row["mode"] not in {"drain", "off"}):
             raise ValueError
     except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
         raise ResourceAdmissionError("resource_policy_changed") from None
@@ -84,6 +84,8 @@ async def installed_job_resource_store(conn, db, configuration, *, fresh=True):
         kubevirt_name=settings.kubevirt_name,
     )
     return VMResourceReservationStore(
-        db, inventory=inventory, policy_document=document,
+        db,
+        inventory=inventory,
+        policy_document=document,
         policy_revision=row["revision"],
     )

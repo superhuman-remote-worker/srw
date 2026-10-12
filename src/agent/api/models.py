@@ -300,14 +300,18 @@ class JobStartRequest(BaseModel):
 
     job_id: str = Field(..., description="Job UUID assigned by orchestrator")
     pinned_delivery_id: Optional[UUID] = Field(
-        default=None, description="Exact server-frozen pinned Job delivery intent",
+        default=None,
+        description="Exact server-frozen pinned Job delivery intent",
     )
     pinned_projection_digest: Optional[str] = Field(
-        default=None, pattern=r"^sha256:[0-9a-f]{64}$",
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
         description="Digest of the accepted pinned Job wire projection",
     )
     pinned_delivery_proof: Optional[str] = Field(
-        default=None, repr=False, pattern=r"^[0-9a-f]{64}$",
+        default=None,
+        repr=False,
+        pattern=r"^[0-9a-f]{64}$",
         description="Hidden proof to echo only in authenticated agent reports",
     )
     description: str = Field(
@@ -473,14 +477,18 @@ class JobResumeRequest(BaseModel):
 
     job_id: str = Field(..., description="Job ID to resume")
     pinned_delivery_id: Optional[UUID] = Field(
-        default=None, description="Exact server-frozen pinned Job delivery intent",
+        default=None,
+        description="Exact server-frozen pinned Job delivery intent",
     )
     pinned_projection_digest: Optional[str] = Field(
-        default=None, pattern=r"^sha256:[0-9a-f]{64}$",
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
         description="Digest of the accepted pinned Job wire projection",
     )
     pinned_delivery_proof: Optional[str] = Field(
-        default=None, repr=False, pattern=r"^[0-9a-f]{64}$",
+        default=None,
+        repr=False,
+        pattern=r"^[0-9a-f]{64}$",
         description="Hidden proof to echo only in authenticated agent reports",
     )
     config_name: Optional[str] = Field(

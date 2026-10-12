@@ -836,10 +836,7 @@ class IdeSessionService:
                 runtime = _canonical_runtime(
                     str(raw_runtime) if raw_runtime is not None else None
                 )
-                if (
-                    runtime is None
-                    or ide.get("_runtime_incarnation") != runtime
-                ):
+                if runtime is None or ide.get("_runtime_incarnation") != runtime:
                     continue
                 self._schedule_restore_task(
                     job_id,
@@ -904,7 +901,11 @@ class IdeSessionService:
             try:
                 token = int(session_ctx["_creation_claim_token"])
             except (TypeError, ValueError):
-                return {"status": "cleanup_pending", "job_id": job_id, "retryable": True}
+                return {
+                    "status": "cleanup_pending",
+                    "job_id": job_id,
+                    "retryable": True,
+                }
             cancelled = await self._container_provisioner.cancel_ide_restore_attempt(
                 job_id,
                 attempt_id=str(session_ctx["_restore_attempt_id"]),
@@ -927,7 +928,11 @@ class IdeSessionService:
                     job_id,
                     expected_runtime_incarnation=expected_runtime_incarnation,
                 )
-                pending = {"status": "cleanup_pending", "job_id": job_id, "retryable": True}
+                pending = {
+                    "status": "cleanup_pending",
+                    "job_id": job_id,
+                    "retryable": True,
+                }
                 if not (outcome.current_deleted or outcome.stale_target_settled):
                     return pending
                 reconcile = getattr(
@@ -935,9 +940,9 @@ class IdeSessionService:
                     "reconcile_ide_cleanup_intent",
                     None,
                 )
-                if _canonical_runtime(expected_runtime_incarnation) is None or not callable(
-                    reconcile
-                ):
+                if _canonical_runtime(
+                    expected_runtime_incarnation
+                ) is None or not callable(reconcile):
                     return pending
                 try:
                     cleanup = (
@@ -983,7 +988,11 @@ class IdeSessionService:
                     logger.warning("Failed to delete IDE VM %s: %s", vm_name, e)
         if not deleted:
             if restore_type == "k8s_container":
-                return {"status": "cleanup_pending", "job_id": job_id, "retryable": True}
+                return {
+                    "status": "cleanup_pending",
+                    "job_id": job_id,
+                    "retryable": True,
+                }
             updates = {
                 "status": "cleanup_pending",
                 "code_server_url": None,
@@ -1317,9 +1326,12 @@ class IdeSessionService:
         if expected_runtime is not None:
             if creation_reservation is not None:
                 reserved_runtime = creation_reservation.get("runtime_incarnation")
-                if _canonical_runtime(
-                    str(reserved_runtime) if reserved_runtime is not None else None
-                ) != expected_runtime:
+                if (
+                    _canonical_runtime(
+                        str(reserved_runtime) if reserved_runtime is not None else None
+                    )
+                    != expected_runtime
+                ):
                     return None
             elif operation_id is not None:
                 return None
@@ -2896,7 +2908,8 @@ class IdeSessionService:
                         )
                 elif disposition == "completed":
                     await complete_vm_cleanup_permit(
-                        self._workspace_recovery_store, permit,
+                        self._workspace_recovery_store,
+                        permit,
                         outcome=disposition,
                         provisioner=self._vm_provisioner,
                     )

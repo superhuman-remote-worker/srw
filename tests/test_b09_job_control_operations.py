@@ -315,7 +315,9 @@ async def test_dispatch_confirms_command_owner_after_exact_recipient_accepts():
         agent_id="agent-1", job_id="job-1", require_idle=True
     )
     store.confirm_pinned_job_dispatch.assert_awaited_once_with(
-        "job-1", "agent-1", pinned_delivery_id=None,
+        "job-1",
+        "agent-1",
+        pinned_delivery_id=None,
         pinned_projection_digest=None,
     )
     store.update_job_status.assert_not_awaited()

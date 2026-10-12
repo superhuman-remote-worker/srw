@@ -24,7 +24,12 @@ metadata = initial.metadata
 
 
 async def acknowledged_running_end(
-    database, actor, monkeypatch, *, permanent, physical_cleanup=True,
+    database,
+    actor,
+    monkeypatch,
+    *,
+    permanent,
+    physical_cleanup=True,
     pvc_enabled=True,
 ):
     case = await initial.workspace_attempt(
@@ -92,7 +97,11 @@ async def acknowledged_running_end(
 async def pending_emptydir_ack_case(database, actor, monkeypatch):
     """Keep real End/ACK rows; change only disposable fixture storage binding."""
     case, pending, _ = await acknowledged_running_end(
-        database, actor, monkeypatch, permanent=False, physical_cleanup=False,
+        database,
+        actor,
+        monkeypatch,
+        permanent=False,
+        physical_cleanup=False,
         pvc_enabled=False,
     )
     return case, pending
@@ -122,17 +131,22 @@ async def test_emptydir_pending_end_reuses_committed_token_and_time(
         f"srw:session-end-terminal-snapshot:v1:{old['terminal_token']}:{case.pod_uid}",
     )
     retry = await database.begin_stateless_thread_workspace_retirement(
-        case.thread_id, force=True, permanent=False,
+        case.thread_id,
+        force=True,
+        permanent=False,
         workspace_absence_proven=False,
     )
     again = await database.get_thread(case.thread_id)
     assert retry["terminal_token"] == old["terminal_token"]
     assert again["ended_at"] == ended_at
-    assert uuid5(
-        UUID(case.thread_id),
-        f"srw:session-end-terminal-snapshot:v1:{retry['terminal_token']}:"
-        f"{metadata(again)['_stateless_claim_retirement']['runtime_incarnation']}",
-    ) == generation
+    assert (
+        uuid5(
+            UUID(case.thread_id),
+            f"srw:session-end-terminal-snapshot:v1:{retry['terminal_token']}:"
+            f"{metadata(again)['_stateless_claim_retirement']['runtime_incarnation']}",
+        )
+        == generation
+    )
 
 
 @pytest.mark.asyncio
@@ -149,7 +163,8 @@ async def test_emptydir_snapshot_ack_fences_runtime_and_binding_in_real_postgres
         ("expected_backing_id", "k8s-pod:wrong:pod"),
     ):
         assert not await database.mark_stateless_thread_snapshot_restore_required(
-            case.thread_id, **{**identity, field: wrong},
+            case.thread_id,
+            **{**identity, field: wrong},
         ), field
     await database.execute(
         "UPDATE run_queue SET state='queued' WHERE unit_id=$1::uuid",
@@ -162,15 +177,21 @@ async def test_emptydir_snapshot_ack_fences_runtime_and_binding_in_real_postgres
         "UPDATE run_queue SET state='done' WHERE unit_id=$1::uuid",
         case.thread_id,
     )
-    assert metadata(await database.get_thread(case.thread_id))["workspace_container"].get(
-        "_snapshot_restore_required", False
-    ) is False
+    assert (
+        metadata(await database.get_thread(case.thread_id))["workspace_container"].get(
+            "_snapshot_restore_required", False
+        )
+        is False
+    )
     assert await database.mark_stateless_thread_snapshot_restore_required(
         case.thread_id, **identity
     )
-    assert metadata(await database.get_thread(case.thread_id))["workspace_container"][
-        "_snapshot_restore_required"
-    ] is True
+    assert (
+        metadata(await database.get_thread(case.thread_id))["workspace_container"][
+            "_snapshot_restore_required"
+        ]
+        is True
+    )
 
 
 @pytest.mark.asyncio
@@ -189,10 +210,13 @@ async def test_emptydir_rebase_clears_old_proof_and_rejects_old_ack(
     identity = await case.provisioner.capture_terminal_workspace_identity(case.owner)
     old_pod = deepcopy(case.cluster.objects["pod"])
     assert await case.provisioner.release_workspace(
-        case.owner, teardown_identity=identity,
+        case.owner,
+        teardown_identity=identity,
         expected_runtime_incarnation=case.pod_uid,
         expected_host_key_fingerprint=old["expected_host_key_fingerprint"],
-        reclaim_volume=False, capture_snapshot=False, strict=True,
+        reclaim_volume=False,
+        capture_snapshot=False,
+        strict=True,
     )
     successor_uid = str(uuid4())
     successor_generation = str(uuid4())
@@ -205,8 +229,11 @@ async def test_emptydir_rebase_clears_old_proof_and_rejects_old_ack(
         "VALUES($1::uuid,'thread',$2::uuid,$3::uuid,'workspace_container',"
         "'successor-test',$4,$5::uuid,$5::uuid,now()+interval '30 minutes',"
         "'runtime_bound') RETURNING claim_token",
-        reservation_id, case.thread_id, str(pending["runtime_generation"]),
-        "a" * 64, successor_uid,
+        reservation_id,
+        case.thread_id,
+        str(pending["runtime_generation"]),
+        "a" * 64,
+        successor_uid,
     )
     state = deepcopy(metadata(await database.get_thread(case.thread_id)))
     workspace = state["workspace_container"]
@@ -224,7 +251,8 @@ async def test_emptydir_rebase_clears_old_proof_and_rejects_old_ack(
     binding["ssh_host_key_fingerprint"] = successor_key
     await database.execute(
         "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
-        case.thread_id, json.dumps(state),
+        case.thread_id,
+        json.dumps(state),
     )
     from orchestrator.services.stateless_workspace_gate import (
         stateless_session_workspace_check,
@@ -243,14 +271,16 @@ async def test_emptydir_rebase_clears_old_proof_and_rejects_old_ack(
     historical["_workspace_binding"]["ssh_host_key_fingerprint"] = old[
         "expected_host_key_fingerprint"
     ]
-    assert stateless_retirement_release_authorized(historical)["terminal_token"] == old[
-        "terminal_token"
-    ]
+    assert (
+        stateless_retirement_release_authorized(historical)["terminal_token"]
+        == old["terminal_token"]
+    )
     assert await database.fetchval(
         "SELECT EXISTS(SELECT 1 FROM managed_repository_process_zero_receipts "
         "WHERE owner_kind='thread' AND owner_id=$1::uuid "
         "AND scope='workspace_container' AND runtime_incarnation=$2)",
-        case.thread_id, case.pod_uid,
+        case.thread_id,
+        case.pod_uid,
     )
     before_rebase = deepcopy(metadata(await database.get_thread(case.thread_id)))
     if terminal_successor:
@@ -259,29 +289,38 @@ async def test_emptydir_rebase_clears_old_proof_and_rejects_old_ack(
         state["workspace_container"]["status"] = "retiring_process_zero"
         await database.execute(
             "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
-            case.thread_id, json.dumps(state),
+            case.thread_id,
+            json.dumps(state),
         )
         assert not await database.rebase_stateless_thread_workspace_retirement(
-            case.thread_id, terminal_token=old["terminal_token"],
-            retired_runtime_incarnation=case.pod_uid, permanent=False,
+            case.thread_id,
+            terminal_token=old["terminal_token"],
+            retired_runtime_incarnation=case.pod_uid,
+            permanent=False,
         )
         # Production DB receipt admission represents the already-completed
         # external process-zero proof; physical retirement is covered by the
         # provisioner suite, while this case targets the SQL rebase trigger.
         assert await database.record_managed_repository_workspace_process_zero(
-            case.thread_id, owner_kind="thread", scope="workspace_container",
-            provisioner="k8s", runtime_incarnation=successor_uid,
+            case.thread_id,
+            owner_kind="thread",
+            scope="workspace_container",
+            provisioner="k8s",
+            runtime_incarnation=successor_uid,
         )
         assert await database.fetchval(
             "SELECT EXISTS(SELECT 1 FROM managed_repository_process_zero_receipts "
             "WHERE owner_kind='thread' AND owner_id=$1::uuid "
             "AND scope='workspace_container' AND runtime_incarnation=$2)",
-            case.thread_id, successor_uid,
+            case.thread_id,
+            successor_uid,
         )
         before_rebase = deepcopy(metadata(await database.get_thread(case.thread_id)))
     assert await database.rebase_stateless_thread_workspace_retirement(
-        case.thread_id, terminal_token=old["terminal_token"],
-        retired_runtime_incarnation=case.pod_uid, permanent=False,
+        case.thread_id,
+        terminal_token=old["terminal_token"],
+        retired_runtime_incarnation=case.pod_uid,
+        permanent=False,
     )
     rebased = await database.get_thread(case.thread_id)
     rebased_state = metadata(rebased)
@@ -314,7 +353,9 @@ async def test_emptydir_rebase_clears_old_proof_and_rejects_old_ack(
             assert not await database.fetchval(
                 "SELECT public.stateless_terminal_snapshot_flag_projection_authorized("
                 "$1::uuid,$2::jsonb,$3::jsonb)",
-                case.thread_id, json.dumps(malformed), json.dumps(rebased_state),
+                case.thread_id,
+                json.dumps(malformed),
+                json.dumps(rebased_state),
             )
         for malformed_kind in ("missing", None):
             malformed = deepcopy(before_rebase)
@@ -326,7 +367,9 @@ async def test_emptydir_rebase_clears_old_proof_and_rejects_old_ack(
             assert not await database.fetchval(
                 "SELECT public.stateless_terminal_snapshot_flag_projection_authorized("
                 "$1::uuid,$2::jsonb,$3::jsonb)",
-                case.thread_id, json.dumps(malformed), json.dumps(rebased_state),
+                case.thread_id,
+                json.dumps(malformed),
+                json.dumps(rebased_state),
             )
         for fields in (
             ("workspace_generation", "endpoint_generation"),
@@ -343,14 +386,19 @@ async def test_emptydir_rebase_clears_old_proof_and_rejects_old_ack(
             assert not await database.fetchval(
                 "SELECT public.stateless_terminal_snapshot_flag_projection_authorized("
                 "$1::uuid,$2::jsonb,$3::jsonb)",
-                case.thread_id, json.dumps(malformed), json.dumps(rebased_state),
+                case.thread_id,
+                json.dumps(malformed),
+                json.dumps(rebased_state),
             )
     assert not await database.mark_stateless_thread_snapshot_restore_required(
         case.thread_id, **old
     )
-    assert metadata(await database.get_thread(case.thread_id))["workspace_container"][
-        "_snapshot_restore_required"
-    ] is False
+    assert (
+        metadata(await database.get_thread(case.thread_id))["workspace_container"][
+            "_snapshot_restore_required"
+        ]
+        is False
+    )
     if not terminal_successor:
         old_pod.metadata.uid = successor_uid
         old_pod.status.pod_ip = "10.42.0.101"
@@ -366,18 +414,23 @@ async def test_emptydir_rebase_clears_old_proof_and_rejects_old_ack(
             case.thread_id, **old
         )
 
-    old_generation = str(uuid5(
-        UUID(case.thread_id),
-        f"srw:session-end-terminal-snapshot:v1:{old['terminal_token']}:{case.pod_uid}",
-    ))
+    old_generation = str(
+        uuid5(
+            UUID(case.thread_id),
+            f"srw:session-end-terminal-snapshot:v1:{old['terminal_token']}:{case.pod_uid}",
+        )
+    )
     with monkeypatch.context() as patch:
         retire = AsyncMock(return_value=True)
         patch.setattr(case.provisioner, "_retire_managed_repository_agents", retire)
         assert not await case.provisioner.release_workspace(
-            case.owner, teardown_identity=identity, require_snapshot=True,
+            case.owner,
+            teardown_identity=identity,
+            require_snapshot=True,
             expected_runtime_incarnation=case.pod_uid,
             expected_host_key_fingerprint=old["expected_host_key_fingerprint"],
-            on_snapshot_captured=old_ack, capture_snapshot=False,
+            on_snapshot_captured=old_ack,
+            capture_snapshot=False,
             strict_terminal_snapshot=True,
             terminal_snapshot_generation=old_generation,
             terminal_snapshot_created_at=pending["ended_at"].isoformat(),
@@ -405,9 +458,12 @@ async def test_emptydir_snapshot_flag_cannot_be_armed_by_unfenced_sql(
             "'true'::jsonb, true) WHERE id=$1::uuid",
             case.thread_id,
         )
-    assert metadata(await database.get_thread(case.thread_id))["workspace_container"].get(
-        "_snapshot_restore_required", False
-    ) is False
+    assert (
+        metadata(await database.get_thread(case.thread_id))["workspace_container"].get(
+            "_snapshot_restore_required", False
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio
@@ -423,7 +479,8 @@ async def test_emptydir_snapshot_ack_cannot_change_thread_runtime_generation(
             "metadata=jsonb_set(metadata, "
             "'{workspace_container,_snapshot_restore_required}', "
             "'true'::jsonb, true) WHERE id=$1::uuid",
-            case.thread_id, str(uuid4()),
+            case.thread_id,
+            str(uuid4()),
         )
 
 
@@ -445,7 +502,8 @@ async def test_emptydir_snapshot_trigger_rejects_drifted_end_proof(
         drifted[section][key] = wrong
         await database.execute(
             "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
-            case.thread_id, json.dumps(drifted),
+            case.thread_id,
+            json.dumps(drifted),
         )
         with pytest.raises(asyncpg.CheckViolationError):
             await database.execute(
@@ -456,14 +514,16 @@ async def test_emptydir_snapshot_trigger_rejects_drifted_end_proof(
             )
         await database.execute(
             "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
-            case.thread_id, json.dumps(original),
+            case.thread_id,
+            json.dumps(original),
         )
     wrong_binding = deepcopy(original)
     wrong_binding["_workspace_binding"]["backing_id"] = "k8s-pod:wrong:pod"
     with pytest.raises(asyncpg.CheckViolationError):
         await database.execute(
             "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
-            case.thread_id, json.dumps(wrong_binding),
+            case.thread_id,
+            json.dumps(wrong_binding),
         )
     await database.execute(
         "UPDATE run_queue SET state='queued' WHERE unit_id=$1::uuid",
@@ -476,9 +536,12 @@ async def test_emptydir_snapshot_trigger_rejects_drifted_end_proof(
             "'true'::jsonb, true) WHERE id=$1::uuid",
             case.thread_id,
         )
-    assert metadata(await database.get_thread(case.thread_id))["workspace_container"].get(
-        "_snapshot_restore_required", False
-    ) is False
+    assert (
+        metadata(await database.get_thread(case.thread_id))["workspace_container"].get(
+            "_snapshot_restore_required", False
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio

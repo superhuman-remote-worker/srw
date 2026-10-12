@@ -28,8 +28,12 @@ _LAUNCHER_ALGORITHMS = {
     "v1.8.4": "kubevirt-v1.8.4-amd64-ordinary-pvc-v1",
 }
 _SUPPORT_TYPES = (
-    "guest-console-log", "container-disk", "sidecar", "virtiofs",
-    "hotplug-disk", "vmexport",
+    "guest-console-log",
+    "container-disk",
+    "sidecar",
+    "virtiofs",
+    "hotplug-disk",
+    "vmexport",
 )
 _FEATURES = {
     "graphicsAttached": True,
@@ -53,7 +57,10 @@ _FEATURES = {
 
 
 def default_launcher_profile(kubevirt_version="v1.6.6"):
-    if type(kubevirt_version) is not str or kubevirt_version not in _LAUNCHER_ALGORITHMS:
+    if (
+        type(kubevirt_version) is not str
+        or kubevirt_version not in _LAUNCHER_ALGORITHMS
+    ):
         raise ResourceAdmissionError("unsupported_launcher_profile")
     support = {kind: None for kind in _SUPPORT_TYPES}
     support["guest-console-log"] = {
@@ -88,11 +95,19 @@ def validate_launcher_profile(profile):
         if not isinstance(profile, dict) or set(profile) != set(default):
             raise ValueError
         for name in (
-            "version", "kubevirtVersion", "architecture", "costAlgorithm",
-            "network", "additionalGuestMemoryOverheadRatio", "useEmulation",
+            "version",
+            "kubevirtVersion",
+            "architecture",
+            "costAlgorithm",
+            "network",
+            "additionalGuestMemoryOverheadRatio",
+            "useEmulation",
             "defaultRuntimeClass",
         ):
-            if type(profile[name]) is not type(default[name]) or profile[name] != default[name]:
+            if (
+                type(profile[name]) is not type(default[name])
+                or profile[name] != default[name]
+            ):
                 raise ValueError
         if type(profile["disableSerialConsoleLog"]) is not bool:
             raise ValueError
@@ -105,12 +120,18 @@ def validate_launcher_profile(profile):
             for key, value in _FEATURES.items()
         ):
             raise ValueError
-        if ResourceVector.from_six_dict(profile["podOverhead"]) != ResourceVector(0, 0, 0):
+        if ResourceVector.from_six_dict(profile["podOverhead"]) != ResourceVector(
+            0, 0, 0
+        ):
             raise ValueError
         support = profile["supportContainerResources"]
         if not isinstance(support, dict) or set(support) != set(_SUPPORT_TYPES):
             raise ValueError
-        if any(support[kind] is not None for kind in _SUPPORT_TYPES if kind != "guest-console-log"):
+        if any(
+            support[kind] is not None
+            for kind in _SUPPORT_TYPES
+            if kind != "guest-console-log"
+        ):
             # Other support containers belong to unmodeled feature branches.
             raise ValueError
         console = support["guest-console-log"]
@@ -118,7 +139,10 @@ def validate_launcher_profile(profile):
             raise ValueError
         for section in ("requests", "limits"):
             values = console[section]
-            if not isinstance(values, dict) or set(values) != {"cpuMillicores", "memoryBytes"}:
+            if not isinstance(values, dict) or set(values) != {
+                "cpuMillicores",
+                "memoryBytes",
+            }:
                 raise ValueError
             _integer(values["cpuMillicores"], positive=True)
             _integer(values["memoryBytes"], positive=True)
@@ -144,8 +168,7 @@ def predict_launcher(profile, *, guest_vcpus, guest_memory_bytes):
     # the ordinary PVC/KVM branch retains the same resource calculation.
     memory_overhead = (220 + 8 * guest_vcpus + 8 + 32) * 1024**2
     memory_request = (
-        guest_memory_bytes * 100 // profile["memoryOvercommit"]
-        + memory_overhead
+        guest_memory_bytes * 100 // profile["memoryOvercommit"] + memory_overhead
     )
     # KubeVirt defaults.go inserts cpuRequest only when it differs from 100m.
     cpu_request = (
@@ -169,14 +192,18 @@ def predict_launcher(profile, *, guest_vcpus, guest_memory_bytes):
     init = []
     if not profile["disableSerialConsoleLog"]:
         requests = profile["supportContainerResources"]["guest-console-log"]["requests"]
-        init.append({
-            "name": "guest-console-log",
-            "restartPolicy": "Always",
-            "resources": {"requests": {
-                "cpu": f"{requests['cpuMillicores']}m",
-                "memory": str(requests["memoryBytes"]),
-            }},
-        })
+        init.append(
+            {
+                "name": "guest-console-log",
+                "restartPolicy": "Always",
+                "resources": {
+                    "requests": {
+                        "cpu": f"{requests['cpuMillicores']}m",
+                        "memory": str(requests["memoryBytes"]),
+                    }
+                },
+            }
+        )
     overhead = profile["podOverhead"]
     pod = {
         "metadata": {
@@ -206,9 +233,12 @@ def normalize_installed_profile(raw, *, namespace="kubevirt", name="kubevirt"):
         meta, spec, status = raw["metadata"], raw["spec"], raw["status"]
         uid = meta["uid"]
         if (
-            type(uid) is not str or str(UUID(uid)) != uid
-            or meta["namespace"] != namespace or meta["name"] != name
-            or type(meta["generation"]) is not int or meta["generation"] < 1
+            type(uid) is not str
+            or str(UUID(uid)) != uid
+            or meta["namespace"] != namespace
+            or meta["name"] != name
+            or type(meta["generation"]) is not int
+            or meta["generation"] < 1
             or meta.get("deletionTimestamp") is not None
             or status["phase"] != "Deployed"
             or type(status["observedGeneration"]) is not int
@@ -237,7 +267,9 @@ def normalize_installed_profile(raw, *, namespace="kubevirt", name="kubevirt"):
         profile["memoryOvercommit"] = developer.get("memoryOvercommit", 100)
         profile["useEmulation"] = developer.get("useEmulation", False)
         if "cpuRequest" in config:
-            profile["cpuRequestMillicores"] = normalize_cpu_millicores(config["cpuRequest"]).normalized_value
+            profile["cpuRequestMillicores"] = normalize_cpu_millicores(
+                config["cpuRequest"]
+            ).normalized_value
         ratio = config.get("additionalGuestMemoryOverheadRatio")
         if ratio is not None:
             profile["additionalGuestMemoryOverheadRatio"] = ratio
@@ -254,13 +286,20 @@ def normalize_installed_profile(raw, *, namespace="kubevirt", name="kubevirt"):
         seen = set()
         for item in overrides:
             kind = item["type"]
-            if kind not in _SUPPORT_TYPES or kind in seen or set(item) != {"type", "resources"}:
+            if (
+                kind not in _SUPPORT_TYPES
+                or kind in seen
+                or set(item) != {"type", "resources"}
+            ):
                 raise ValueError
             seen.add(kind)
             if kind != "guest-console-log":
                 raise ValueError
             resources = item["resources"]
-            if not isinstance(resources, dict) or set(resources) - {"requests", "limits"}:
+            if not isinstance(resources, dict) or set(resources) - {
+                "requests",
+                "limits",
+            }:
                 raise ValueError
             for section in ("requests", "limits"):
                 if set(resources.get(section, {})) - {"cpu", "memory"}:
@@ -270,9 +309,9 @@ def normalize_installed_profile(raw, *, namespace="kubevirt", name="kubevirt"):
                     ("memory", "memoryBytes", normalize_byte_quantity),
                 ):
                     if source in resources.get(section, {}):
-                        profile["supportContainerResources"][kind][section][target] = normalizer(
-                            resources[section][source]
-                        ).normalized_value
+                        profile["supportContainerResources"][kind][section][target] = (
+                            normalizer(resources[section][source]).normalized_value
+                        )
         profile = validate_launcher_profile(profile)
         return {
             "uid": uid,
@@ -286,5 +325,11 @@ def normalize_installed_profile(raw, *, namespace="kubevirt", name="kubevirt"):
             "observedDeploymentID": status["observedDeploymentID"],
             "profile": profile,
         }
-    except (ValueError, TypeError, KeyError, AttributeError, QuantityNormalizationError):
+    except (
+        ValueError,
+        TypeError,
+        KeyError,
+        AttributeError,
+        QuantityNormalizationError,
+    ):
         raise ResourceAdmissionError("installed_launcher_unproven") from None

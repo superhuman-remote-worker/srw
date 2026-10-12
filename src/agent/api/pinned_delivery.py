@@ -25,11 +25,15 @@ def resume_feedback_with_delegation(
     if not delegation_results:
         return feedback, feedback_reason
     child_results = "Completed delegated jobs:\n" + json.dumps(
-        delegation_results, sort_keys=True, ensure_ascii=False,
+        delegation_results,
+        sort_keys=True,
+        ensure_ascii=False,
     )
     return (
         f"{feedback}\n\n{child_results}" if feedback else child_results,
-        feedback_reason if feedback else "Completed delegated jobs returned to the parent.",
+        feedback_reason
+        if feedback
+        else "Completed delegated jobs returned to the parent.",
     )
 
 

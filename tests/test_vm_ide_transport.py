@@ -24,9 +24,13 @@ def _proof():
         workspace_generation=str(uuid4()),
         runtime_incarnation=str(uuid4()),
         ssh_host_key_fingerprint="SHA256:" + "a" * 43,
-        host="10.42.0.7", pod_ip="10.42.0.7", port=22,
-        vm_uid=str(uuid4()), launcher_pod_uid=str(uuid4()),
-        vmi_uid=str(uuid4()), rootdisk_pvc_uid=str(uuid4()),
+        host="10.42.0.7",
+        pod_ip="10.42.0.7",
+        port=22,
+        vm_uid=str(uuid4()),
+        launcher_pod_uid=str(uuid4()),
+        vmi_uid=str(uuid4()),
+        rootdisk_pvc_uid=str(uuid4()),
     )
 
 
@@ -251,20 +255,32 @@ async def test_start_probes_guest_loopback_only_after_pinned_current_runtime():
     writer = _Writer()
     connection = SimpleNamespace(
         run=AsyncMock(return_value=SimpleNamespace(exit_status=0)),
-        open_connection=AsyncMock(return_value=(
-            _Reader(b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\n\r\n"
-                    b'{"status":"alive"}'), writer,
-        )),
+        open_connection=AsyncMock(
+            return_value=(
+                _Reader(
+                    b'HTTP/1.1 200 OK\r\nContent-Length: 18\r\n\r\n{"status":"alive"}'
+                ),
+                writer,
+            )
+        ),
     )
-    provisioner = SimpleNamespace(attest_workspace_runtime=AsyncMock(return_value=proof))
+    provisioner = SimpleNamespace(
+        attest_workspace_runtime=AsyncMock(return_value=proof)
+    )
     pool = _Pool(connection)
     transport = VMIDETransport(provisioner, pool=pool, key_path="/private/guest-key")
-    assert await transport.start_and_probe(
-        "job-1", owner_kind="job",
-        expected_generation=proof.workspace_generation, expected_vm_uid=proof.vm_uid,
-    ) == proof
+    assert (
+        await transport.start_and_probe(
+            "job-1",
+            owner_kind="job",
+            expected_generation=proof.workspace_generation,
+            expected_vm_uid=proof.vm_uid,
+        )
+        == proof
+    )
     connection.run.assert_awaited_once_with(
-        "systemctl --user start srw-code-server-user.service", check=False,
+        "systemctl --user start srw-code-server-user.service",
+        check=False,
     )
     connection.open_connection.assert_awaited_once_with("127.0.0.1", 8080)
     assert b"GET /healthz HTTP/1.1" in writer.data
@@ -273,13 +289,19 @@ async def test_start_probes_guest_loopback_only_after_pinned_current_runtime():
 
     connection.open_connection.reset_mock()
     connection.open_connection.return_value = (
-        _Reader(_health_response("expired")), _Writer(),
+        _Reader(_health_response("expired")),
+        _Writer(),
     )
     connection.run.reset_mock()
-    assert await transport.probe(
-        "job-1", owner_kind="job",
-        expected_generation=proof.workspace_generation, expected_vm_uid=proof.vm_uid,
-    ) == proof
+    assert (
+        await transport.probe(
+            "job-1",
+            owner_kind="job",
+            expected_generation=proof.workspace_generation,
+            expected_vm_uid=proof.vm_uid,
+        )
+        == proof
+    )
     connection.run.assert_not_awaited()
 
 
@@ -292,12 +314,18 @@ async def test_changed_attestation_and_missing_older_image_unit_refuse():
         run=AsyncMock(return_value=SimpleNamespace(exit_status=1)),
         open_connection=AsyncMock(),
     )
-    provisioner = SimpleNamespace(attest_workspace_runtime=AsyncMock(return_value=proof))
-    transport = VMIDETransport(provisioner, pool=_Pool(connection), key_path="/private/key")
+    provisioner = SimpleNamespace(
+        attest_workspace_runtime=AsyncMock(return_value=proof)
+    )
+    transport = VMIDETransport(
+        provisioner, pool=_Pool(connection), key_path="/private/key"
+    )
     with pytest.raises(VMIDEUnavailable, match="ide_guest_unit_unavailable"):
         await transport.start_and_probe(
-            "job-1", owner_kind="job",
-            expected_generation=proof.workspace_generation, expected_vm_uid=proof.vm_uid,
+            "job-1",
+            owner_kind="job",
+            expected_generation=proof.workspace_generation,
+            expected_vm_uid=proof.vm_uid,
         )
     connection.open_connection.assert_not_awaited()
 
@@ -307,8 +335,10 @@ async def test_changed_attestation_and_missing_older_image_unit_refuse():
     connection.run.reset_mock()
     with pytest.raises(VMIDEUnavailable, match="ide_runtime_changed"):
         await transport.start_and_probe(
-            "job-1", owner_kind="job",
-            expected_generation=proof.workspace_generation, expected_vm_uid=proof.vm_uid,
+            "job-1",
+            owner_kind="job",
+            expected_generation=proof.workspace_generation,
+            expected_vm_uid=proof.vm_uid,
         )
 
 
@@ -316,7 +346,8 @@ async def test_changed_attestation_and_missing_older_image_unit_refuse():
 @pytest.mark.parametrize("owner_kind", ["job", "thread"])
 @pytest.mark.parametrize("changed", ["vm_uid", "workspace_generation"])
 async def test_start_never_runs_guest_unit_for_a_successor_of_the_admitted_lease(
-    owner_kind, changed,
+    owner_kind,
+    changed,
 ):
     from orchestrator.services.vm_ide_transport import VMIDETransport, VMIDEUnavailable
 
@@ -326,10 +357,13 @@ async def test_start_never_runs_guest_unit_for_a_successor_of_the_admitted_lease
     provisioner = SimpleNamespace(
         attest_workspace_runtime=AsyncMock(return_value=successor)
     )
-    transport = VMIDETransport(provisioner, pool=_Pool(connection), key_path="/private/key")
+    transport = VMIDETransport(
+        provisioner, pool=_Pool(connection), key_path="/private/key"
+    )
     with pytest.raises(VMIDEUnavailable, match="ide_runtime_changed"):
         await transport.start_and_probe(
-            "owner-1", owner_kind=owner_kind,
+            "owner-1",
+            owner_kind=owner_kind,
             expected_generation=admitted.workspace_generation,
             expected_vm_uid=admitted.vm_uid,
         )
@@ -337,7 +371,8 @@ async def test_start_never_runs_guest_unit_for_a_successor_of_the_admitted_lease
     connection.open_connection.assert_not_awaited()
     with pytest.raises(VMIDEUnavailable, match="ide_runtime_changed"):
         await transport.probe(
-            "owner-1", owner_kind=owner_kind,
+            "owner-1",
+            owner_kind=owner_kind,
             expected_generation=admitted.workspace_generation,
             expected_vm_uid=admitted.vm_uid,
         )
@@ -351,21 +386,43 @@ async def test_http_bytes_only_enter_exact_guest_loopback_after_recheck():
 
     proof = _proof()
     target = IdeProxyTarget(
-        entity_id="job-1", owner_kind="job", backend="vm", scope="vm",
-        host=proof.host, port=proof.port,
-        identity=(proof.workspace_generation, proof.vm_uid, proof.vmi_uid,
-                  proof.launcher_pod_uid, proof.rootdisk_pvc_uid,
-                  proof.ssh_host_key_fingerprint),
+        entity_id="job-1",
+        owner_kind="job",
+        backend="vm",
+        scope="vm",
+        host=proof.host,
+        port=proof.port,
+        identity=(
+            proof.workspace_generation,
+            proof.vm_uid,
+            proof.vmi_uid,
+            proof.launcher_pod_uid,
+            proof.rootdisk_pvc_uid,
+            proof.ssh_host_key_fingerprint,
+        ),
     )
     writer = _Writer()
-    connection = SimpleNamespace(open_connection=AsyncMock(return_value=(
-        _Reader(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
-                b"Content-Length: 4\r\n\r\nbody"), writer,
-    )))
-    provisioner = SimpleNamespace(attest_workspace_runtime=AsyncMock(return_value=proof))
-    transport = VMIDETransport(provisioner, pool=_Pool(connection), key_path="/private/key")
+    connection = SimpleNamespace(
+        open_connection=AsyncMock(
+            return_value=(
+                _Reader(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                    b"Content-Length: 4\r\n\r\nbody"
+                ),
+                writer,
+            )
+        )
+    )
+    provisioner = SimpleNamespace(
+        attest_workspace_runtime=AsyncMock(return_value=proof)
+    )
+    transport = VMIDETransport(
+        provisioner, pool=_Pool(connection), key_path="/private/key"
+    )
     response = await transport.request_http(
-        target, method="GET", url="http://127.0.0.1:8080/workspace?folder=src",
+        target,
+        method="GET",
+        url="http://127.0.0.1:8080/workspace?folder=src",
         headers={"accept": "text/plain", "host": "untrusted.example"},
     )
     assert response.status_code == 200 and response.body == b"body"
@@ -379,9 +436,9 @@ async def test_http_bytes_only_enter_exact_guest_loopback_after_recheck():
     writer = _Writer()
     connection.open_connection.return_value = (_Reader(b""), writer)
     with pytest.raises(VMIDEUnavailable, match="ide_runtime_changed"):
-        await transport.request_http(target, method="GET",
-                                     url="http://127.0.0.1:8080/",
-                                     headers={})
+        await transport.request_http(
+            target, method="GET", url="http://127.0.0.1:8080/", headers={}
+        )
     assert writer.data == b""
 
 
@@ -396,11 +453,20 @@ async def test_direct_channel_websocket_upgrades_and_relays_frames():
 
     proof = _proof()
     target = IdeProxyTarget(
-        entity_id="job-1", owner_kind="job", backend="vm", scope="vm",
-        host=proof.host, port=proof.port,
-        identity=(proof.workspace_generation, proof.vm_uid, proof.vmi_uid,
-                  proof.launcher_pod_uid, proof.rootdisk_pvc_uid,
-                  proof.ssh_host_key_fingerprint),
+        entity_id="job-1",
+        owner_kind="job",
+        backend="vm",
+        scope="vm",
+        host=proof.host,
+        port=proof.port,
+        identity=(
+            proof.workspace_generation,
+            proof.vm_uid,
+            proof.vmi_uid,
+            proof.launcher_pod_uid,
+            proof.rootdisk_pvc_uid,
+            proof.ssh_host_key_fingerprint,
+        ),
     )
     async with websockets.serve(echo, "127.0.0.1", 0) as server:
         port = server.sockets[0].getsockname()[1]
@@ -410,8 +476,12 @@ async def test_direct_channel_websocket_upgrades_and_relays_frames():
             return await asyncio.open_connection("127.0.0.1", port)
 
         connection = SimpleNamespace(open_connection=open_channel)
-        provisioner = SimpleNamespace(attest_workspace_runtime=AsyncMock(return_value=proof))
-        transport = VMIDETransport(provisioner, pool=_Pool(connection), key_path="/private/key")
+        provisioner = SimpleNamespace(
+            attest_workspace_runtime=AsyncMock(return_value=proof)
+        )
+        transport = VMIDETransport(
+            provisioner, pool=_Pool(connection), key_path="/private/key"
+        )
         async with transport.open_websocket(target, path="/vscode") as channel:
             await channel.send("hello")
             assert await asyncio.wait_for(channel.recv(), timeout=5) == "hello"

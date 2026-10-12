@@ -4,7 +4,11 @@ from uuid import uuid4
 import pytest
 
 from shared.vm_resource_admission import ResourceAdmissionError
-from shared.vm_resource_placement import node_allocatable, node_exclusion, preferred_taint_count
+from shared.vm_resource_placement import (
+    node_allocatable,
+    node_exclusion,
+    preferred_taint_count,
+)
 
 
 def node():
@@ -32,11 +36,13 @@ def node():
 
 def test_six_field_node_allocatable_requires_real_ephemeral_and_devices():
     raw = node()
-    raw["status"]["allocatable"].update({
-        "ephemeral-storage": "100G",
-        "devices.kubevirt.io/tun": "8",
-        "devices.kubevirt.io/vhost-net": "8",
-    })
+    raw["status"]["allocatable"].update(
+        {
+            "ephemeral-storage": "100G",
+            "devices.kubevirt.io/tun": "8",
+            "devices.kubevirt.io/vhost-net": "8",
+        }
+    )
     assert node_allocatable(raw, six=True).to_six_dict() == {
         "cpu_millicores": 8000,
         "memory_bytes": 16 * 1024**3,

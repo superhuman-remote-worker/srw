@@ -164,7 +164,8 @@ def normalize_inventory(raw, *, namespace, label_keys, protocol=1):
                 ],
                 "allocatable": (
                     node_allocatable(value, six=True).to_six_dict()
-                    if protocol == 2 else node_allocatable(value).to_dict()
+                    if protocol == 2
+                    else node_allocatable(value).to_dict()
                 ),
             }
         )
@@ -210,9 +211,12 @@ def normalize_inventory(raw, *, namespace, label_keys, protocol=1):
         scheduled_pod_charge(value)
         vmi_uid = (
             _owner(value, "VirtualMachineInstance", vmis, "kubevirt.io")
-            if meta.get("namespace") == namespace else None
+            if meta.get("namespace") == namespace
+            else None
         )
-        request = effective_pod_request(value, managed_launcher=protocol == 2 and vmi_uid is not None)
+        request = effective_pod_request(
+            value, managed_launcher=protocol == 2 and vmi_uid is not None
+        )
         node_name = spec.get("nodeName") or None
         node_uid = _meta(nodes[node_name]).get("uid") if node_name in nodes else None
         annotations = _map(meta.get("annotations", {}))
@@ -223,7 +227,9 @@ def normalize_inventory(raw, *, namespace, label_keys, protocol=1):
                 "namespace": meta.get("namespace"),
                 "node_uid": node_uid,
                 "node_name": node_name,
-                "requests": request.to_six_dict() if protocol == 2 else request.to_dict(),
+                "requests": request.to_six_dict()
+                if protocol == 2
+                else request.to_dict(),
                 "terminal": status.get("phase") in {"Succeeded", "Failed"},
                 "deleting": meta.get("deletionTimestamp") is not None,
                 "vmi_uid": vmi_uid,
@@ -348,8 +354,10 @@ class ResourceInventoryCollector:
         if type(protocol) is not int or protocol not in (1, 2):
             raise InventoryError("invalid_inventory_configuration")
         if protocol == 2 and (
-            not isinstance(kubevirt_namespace, str) or not kubevirt_namespace
-            or not isinstance(kubevirt_name, str) or not kubevirt_name
+            not isinstance(kubevirt_namespace, str)
+            or not kubevirt_namespace
+            or not isinstance(kubevirt_name, str)
+            or not kubevirt_name
             or "kubernetes.io/arch" not in label_keys
         ):
             raise InventoryError("invalid_inventory_configuration")
@@ -646,7 +654,9 @@ class ResourceInventoryCollector:
                     )
                 snapshot.update(
                     normalize_inventory(
-                        raw, namespace=self.namespace, label_keys=self.label_keys,
+                        raw,
+                        namespace=self.namespace,
+                        label_keys=self.label_keys,
                         protocol=self.protocol,
                     )
                 )

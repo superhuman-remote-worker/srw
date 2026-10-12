@@ -46,7 +46,12 @@ async def test_real_list_and_detail_show_same_attention_without_private_history(
         ("capacity_wait", "capacity_wait", None, "controller_count_wait"),
         ("capacity_wait", "installation_budget", None, "capacity_wait"),
         ("capacity_wait", "resource_wait", "resource_admission", "resource_wait"),
-        ("capacity_wait", "resource_unavailable", "resource_admission", "resource_unavailable"),
+        (
+            "capacity_wait",
+            "resource_unavailable",
+            "resource_admission",
+            "resource_unavailable",
+        ),
         ("dependency_wait", "preparation_wait", None, "preparation_wait"),
         ("dependency_wait", "SECRET raw body", None, "creation_dependency_pending"),
         ("transport_unknown", "SECRET raw body", None, "controller_unavailable"),

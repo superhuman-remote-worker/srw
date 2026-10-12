@@ -134,9 +134,7 @@ async def test_ide_restore_attempt_commits_intent_and_creation_receipt_together(
     assert result["disposition"] == "accepted"
     reservation = result["reservation"]
     async with db.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT context FROM jobs WHERE id = $1", job_id
-        )
+        row = await conn.fetchrow("SELECT context FROM jobs WHERE id = $1", job_id)
     context = row["context"]
     if isinstance(context, str):
         context = json.loads(context)
@@ -166,8 +164,11 @@ async def test_ide_restore_attempt_zero_effect_delete_closes_exact_projection(db
         str(job_id),
         attempt_id=str(attempt_id),
         proposed_context={
-            "status": "restoring", "source": "gitea", "snapshot_type": "gitea",
-            "restore_type": "k8s_container", "started_at": "2026-09-28T00:00:00Z",
+            "status": "restoring",
+            "source": "gitea",
+            "snapshot_type": "gitea",
+            "restore_type": "k8s_container",
+            "started_at": "2026-09-28T00:00:00Z",
         },
         desired_manifest_digest="e" * 64,
         claimant="ide-issuer:cancel",
@@ -180,19 +181,27 @@ async def test_ide_restore_attempt_zero_effect_delete_closes_exact_projection(db
         claim_token=int(reservation["claim_token"]),
         claimant="ide-stop:cancel",
     )
-    assert await db.cancel_managed_ide_restore_attempt(str(job_id), **{
-        **exact, "attempt_id": str(uuid4())
-    }) is None
-    assert await db.cancel_managed_ide_restore_attempt(str(job_id), **{
-        **exact, "claim_token": exact["claim_token"] + 1
-    }) is None
+    assert (
+        await db.cancel_managed_ide_restore_attempt(
+            str(job_id), **{**exact, "attempt_id": str(uuid4())}
+        )
+        is None
+    )
+    assert (
+        await db.cancel_managed_ide_restore_attempt(
+            str(job_id), **{**exact, "claim_token": exact["claim_token"] + 1}
+        )
+        is None
+    )
     closed = await db.cancel_managed_ide_restore_attempt(str(job_id), **exact)
     assert closed is not None
     assert closed["result_kind"] == "aborted"
     assert closed["cancel_cleanup_completed_at"] is not None
     assert closed["cancel_projection_transaction_id"] is not None
     async with db.acquire() as conn:
-        raw = await conn.fetchval("SELECT context->'ide_session' FROM jobs WHERE id = $1", job_id)
+        raw = await conn.fetchval(
+            "SELECT context->'ide_session' FROM jobs WHERE id = $1", job_id
+        )
     ide = json.loads(raw) if isinstance(raw, str) else raw
     assert ide["status"] == "expired"
     assert ide["_restore_attempt_id"] == str(attempt_id)
@@ -207,8 +216,11 @@ async def test_ide_restore_attempt_zero_effect_delete_closes_exact_projection(db
         str(job_id),
         attempt_id=str(successor_id),
         proposed_context={
-            "status": "restoring", "source": "gitea", "snapshot_type": "gitea",
-            "restore_type": "k8s_container", "started_at": "2026-09-28T00:01:00Z",
+            "status": "restoring",
+            "source": "gitea",
+            "snapshot_type": "gitea",
+            "restore_type": "k8s_container",
+            "started_at": "2026-09-28T00:01:00Z",
         },
         desired_manifest_digest="f" * 64,
         claimant="ide-issuer:successor",
@@ -216,7 +228,9 @@ async def test_ide_restore_attempt_zero_effect_delete_closes_exact_projection(db
     assert successor["disposition"] == "accepted"
     assert successor["reservation"]["id"] != reservation["id"]
     async with db.acquire() as conn:
-        raw = await conn.fetchval("SELECT context->'ide_session' FROM jobs WHERE id = $1", job_id)
+        raw = await conn.fetchval(
+            "SELECT context->'ide_session' FROM jobs WHERE id = $1", job_id
+        )
     new_ide = json.loads(raw) if isinstance(raw, str) else raw
     assert new_ide["status"] == "restoring"
     assert new_ide["_restore_attempt_id"] == str(successor_id)
@@ -232,27 +246,39 @@ async def test_ide_restore_attempt_started_effect_delete_stays_reconcilable(db):
             job_id,
         )
     admitted = await db.begin_managed_ide_restore_attempt(
-        str(job_id), attempt_id=str(attempt_id),
+        str(job_id),
+        attempt_id=str(attempt_id),
         proposed_context={
-            "status": "restoring", "source": "gitea", "snapshot_type": "gitea",
-            "restore_type": "k8s_container", "started_at": "2026-09-28T00:00:00Z",
+            "status": "restoring",
+            "source": "gitea",
+            "snapshot_type": "gitea",
+            "restore_type": "k8s_container",
+            "started_at": "2026-09-28T00:00:00Z",
         },
-        desired_manifest_digest="a" * 64, claimant="ide-issuer:started",
+        desired_manifest_digest="a" * 64,
+        claimant="ide-issuer:started",
     )
     assert admitted["disposition"] == "accepted"
     reservation = admitted["reservation"]
     gate = dict(
-        owner_kind="job", scope="ide",
+        owner_kind="job",
+        scope="ide",
         reservation_generation=int(reservation["reservation_generation"]),
-        claimant="ide-issuer:started", claim_token=int(reservation["claim_token"]),
+        claimant="ide-issuer:started",
+        claim_token=int(reservation["claim_token"]),
     )
-    assert await db.mark_managed_repository_workspace_creation_started(str(job_id), **gate)
+    assert await db.mark_managed_repository_workspace_creation_started(
+        str(job_id), **gate
+    )
     assert await db.begin_managed_repository_workspace_creation_effect(
         str(job_id), **gate, resource_kind="seed"
     )
     cancelled = await db.cancel_managed_ide_restore_attempt(
-        str(job_id), attempt_id=str(attempt_id), reservation_id=str(reservation["id"]),
-        claim_token=int(reservation["claim_token"]), claimant="ide-stop:started",
+        str(job_id),
+        attempt_id=str(attempt_id),
+        reservation_id=str(reservation["id"]),
+        claim_token=int(reservation["claim_token"]),
+        claimant="ide-stop:started",
     )
     assert cancelled is not None
     assert cancelled["result_kind"] is None
@@ -260,18 +286,25 @@ async def test_ide_restore_attempt_started_effect_delete_stays_reconcilable(db):
     assert cancelled["cancel_cleanup_completed_at"] is None
     assert cancelled["claim_token"] != reservation["claim_token"]
     async with db.acquire() as conn:
-        raw = await conn.fetchval("SELECT context->'ide_session' FROM jobs WHERE id = $1", job_id)
+        raw = await conn.fetchval(
+            "SELECT context->'ide_session' FROM jobs WHERE id = $1", job_id
+        )
     ide = json.loads(raw) if isinstance(raw, str) else raw
     assert ide["status"] == "restoring"
     assert ide["_restore_attempt_id"] == str(attempt_id)
     assert ide["_creation_claim_token"] == str(cancelled["claim_token"])
     assert await db.begin_managed_ide_restore_attempt(
-        str(job_id), attempt_id=str(uuid4()),
+        str(job_id),
+        attempt_id=str(uuid4()),
         proposed_context={
-            "status": "restoring", "source": "gitea", "snapshot_type": "gitea",
-            "restore_type": "k8s_container", "started_at": "2026-09-28T00:01:00Z",
+            "status": "restoring",
+            "source": "gitea",
+            "snapshot_type": "gitea",
+            "restore_type": "k8s_container",
+            "started_at": "2026-09-28T00:01:00Z",
         },
-        desired_manifest_digest="b" * 64, claimant="ide-issuer:blocked",
+        desired_manifest_digest="b" * 64,
+        claimant="ide-issuer:blocked",
     ) == {"disposition": "held"}
 
 
@@ -285,31 +318,43 @@ async def test_ide_restore_ambiguous_creation_refuses_zero_effect_close(db):
             job_id,
         )
     admitted = await db.begin_managed_ide_restore_attempt(
-        str(job_id), attempt_id=str(attempt_id),
+        str(job_id),
+        attempt_id=str(attempt_id),
         proposed_context={
-            "status": "restoring", "source": "gitea", "snapshot_type": "gitea",
-            "restore_type": "k8s_container", "started_at": "2026-09-28T00:00:00Z",
+            "status": "restoring",
+            "source": "gitea",
+            "snapshot_type": "gitea",
+            "restore_type": "k8s_container",
+            "started_at": "2026-09-28T00:00:00Z",
         },
-        desired_manifest_digest="a" * 64, claimant="ide-issuer:ambiguous",
+        desired_manifest_digest="a" * 64,
+        claimant="ide-issuer:ambiguous",
     )
     assert admitted["disposition"] == "accepted"
     reservation = admitted["reservation"]
     async with db.acquire() as conn:
         await conn.execute(
             "UPDATE managed_repository_workspace_creation_reservations "
-            "SET phase = 'ambiguous' WHERE id = $1", reservation["id"]
+            "SET phase = 'ambiguous' WHERE id = $1",
+            reservation["id"],
         )
-    assert await db.cancel_managed_ide_restore_attempt(
-        str(job_id), attempt_id=str(attempt_id),
-        reservation_id=str(reservation["id"]),
-        claim_token=int(reservation["claim_token"]), claimant="ide-stop:ambiguous",
-    ) is None
+    assert (
+        await db.cancel_managed_ide_restore_attempt(
+            str(job_id),
+            attempt_id=str(attempt_id),
+            reservation_id=str(reservation["id"]),
+            claim_token=int(reservation["claim_token"]),
+            claimant="ide-stop:ambiguous",
+        )
+        is None
+    )
     async with db.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT j.context->'ide_session' AS ide, r.result_kind, r.cancel_requested_at "
             "FROM jobs j JOIN managed_repository_workspace_creation_reservations r "
             "ON r.owner_id = j.id WHERE j.id = $1 AND r.id = $2",
-            job_id, reservation["id"],
+            job_id,
+            reservation["id"],
         )
     ide = json.loads(row["ide"]) if isinstance(row["ide"], str) else row["ide"]
     assert ide["status"] == "restoring"
@@ -329,12 +374,17 @@ async def test_ide_pod_preeffect_refusal_closes_exact_attempt_not_row_alone(
             job_id,
         )
     admitted = await db.begin_managed_ide_restore_attempt(
-        str(job_id), attempt_id=str(attempt_id),
+        str(job_id),
+        attempt_id=str(attempt_id),
         proposed_context={
-            "status": "restoring", "source": "gitea", "snapshot_type": "gitea",
-            "restore_type": "k8s_container", "started_at": "2026-09-28T00:00:00Z",
+            "status": "restoring",
+            "source": "gitea",
+            "snapshot_type": "gitea",
+            "restore_type": "k8s_container",
+            "started_at": "2026-09-28T00:00:00Z",
         },
-        desired_manifest_digest="a" * 64, claimant="ide-issuer:preeffect",
+        desired_manifest_digest="a" * 64,
+        claimant="ide-issuer:preeffect",
     )
     assert admitted["disposition"] == "accepted"
     provisioner = ContainerProvisioner()
@@ -350,16 +400,20 @@ async def test_ide_pod_preeffect_refusal_closes_exact_attempt_not_row_alone(
         yield True
 
     provisioner._workspace_mutation_guard = owned
-    assert await provisioner.create_ide_pod(
-        str(job_id), creation_reservation=admitted["reservation"]
-    ) is None
+    assert (
+        await provisioner.create_ide_pod(
+            str(job_id), creation_reservation=admitted["reservation"]
+        )
+        is None
+    )
     async with db.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT j.context->'ide_session' AS ide, r.result_kind, "
             "r.cancel_cleanup_completed_at, r.cancel_projection_transaction_id "
             "FROM jobs j JOIN managed_repository_workspace_creation_reservations r "
             "ON r.owner_id = j.id WHERE j.id = $1 AND r.id = $2",
-            job_id, admitted["reservation"]["id"],
+            job_id,
+            admitted["reservation"]["id"],
         )
     ide = json.loads(row["ide"]) if isinstance(row["ide"], str) else row["ide"]
     assert ide["status"] == "expired"
@@ -457,13 +511,17 @@ async def test_ide_attempt_post_reservation_failure_rolls_back_both_rows(
     )
     with pytest.raises(RuntimeError, match="injected before final owner projection"):
         await db.begin_managed_ide_restore_attempt(
-            str(job_id), attempt_id=str(uuid4()),
+            str(job_id),
+            attempt_id=str(uuid4()),
             proposed_context={
-                "status": "restoring", "source": "gitea",
-                "snapshot_type": "gitea", "restore_type": "k8s_container",
+                "status": "restoring",
+                "source": "gitea",
+                "snapshot_type": "gitea",
+                "restore_type": "k8s_container",
                 "started_at": "2026-09-28T00:00:00Z",
             },
-            desired_manifest_digest="a" * 64, claimant="ide-issuer:rollback",
+            desired_manifest_digest="a" * 64,
+            claimant="ide-issuer:rollback",
         )
     async with db.acquire() as conn:
         context = await conn.fetchval("SELECT context FROM jobs WHERE id = $1", job_id)
@@ -486,22 +544,30 @@ async def test_ide_attempt_pod_snapshot_source_and_absent_source(db):
             "INSERT INTO jobs (id, description, status, context) VALUES "
             "($1, 'IDE Pod snapshot', 'completed', $3::jsonb), "
             "($2, 'IDE no source', 'completed', '{}'::jsonb)",
-            snapshot_job, empty_job,
+            snapshot_job,
+            empty_job,
             json.dumps({"snapshot": {"status": "available", "source_type": "pod"}}),
         )
     proposed = {
-        "status": "restoring", "source": "snapshot", "snapshot_type": "pod",
-        "restore_type": "k8s_container", "started_at": "2026-09-28T00:00:00Z",
+        "status": "restoring",
+        "source": "snapshot",
+        "snapshot_type": "pod",
+        "restore_type": "k8s_container",
+        "started_at": "2026-09-28T00:00:00Z",
     }
     accepted = await db.begin_managed_ide_restore_attempt(
-        str(snapshot_job), attempt_id=str(uuid4()),
-        proposed_context=proposed, desired_manifest_digest="a" * 64,
+        str(snapshot_job),
+        attempt_id=str(uuid4()),
+        proposed_context=proposed,
+        desired_manifest_digest="a" * 64,
         claimant="ide-issuer:snapshot",
     )
     assert accepted["disposition"] == "accepted"
     denied = await db.begin_managed_ide_restore_attempt(
-        str(empty_job), attempt_id=str(uuid4()),
-        proposed_context=proposed, desired_manifest_digest="a" * 64,
+        str(empty_job),
+        attempt_id=str(uuid4()),
+        proposed_context=proposed,
+        desired_manifest_digest="a" * 64,
         claimant="ide-issuer:absent",
     )
     assert denied == {"disposition": "definitively_denied"}
@@ -571,12 +637,17 @@ async def test_expired_ide_attempt_one_claimant_rotates_owner_receipt(db):
             job_id,
         )
     admitted = await db.begin_managed_ide_restore_attempt(
-        str(job_id), attempt_id=str(attempt_id),
+        str(job_id),
+        attempt_id=str(attempt_id),
         proposed_context={
-            "status": "restoring", "source": "gitea", "snapshot_type": "gitea",
-            "restore_type": "k8s_container", "started_at": "2026-09-28T00:00:00Z",
+            "status": "restoring",
+            "source": "gitea",
+            "snapshot_type": "gitea",
+            "restore_type": "k8s_container",
+            "started_at": "2026-09-28T00:00:00Z",
         },
-        desired_manifest_digest="a" * 64, claimant="ide-issuer:lost",
+        desired_manifest_digest="a" * 64,
+        claimant="ide-issuer:lost",
     )
     assert admitted["disposition"] == "accepted"
     first = admitted["reservation"]
@@ -588,46 +659,61 @@ async def test_expired_ide_attempt_one_claimant_rotates_owner_receipt(db):
             first["id"],
         )
     kwargs = dict(
-        owner_kind="job", scope="ide", operation_kind="restore",
+        owner_kind="job",
+        scope="ide",
+        operation_kind="restore",
         desired_manifest_digest="a" * 64,
         expected_existing_reservation_id=str(first["id"]),
         expected_existing_claim_token=int(first["claim_token"]),
         expected_restore_attempt_id=str(attempt_id),
     )
-    claims = await asyncio.gather(*(
-        db.reserve_managed_repository_workspace_creation(
-            str(job_id), claimant=f"ide-maintenance:{index}", **kwargs
-        ) for index in (1, 2)
-    ))
+    claims = await asyncio.gather(
+        *(
+            db.reserve_managed_repository_workspace_creation(
+                str(job_id), claimant=f"ide-maintenance:{index}", **kwargs
+            )
+            for index in (1, 2)
+        )
+    )
     accepted = [row for row in claims if row is not None]
     assert len(accepted) == 1
     winner = accepted[0]
     assert winner["id"] == first["id"]
     assert winner["claim_token"] != first["claim_token"]
     async with db.acquire() as conn:
-        raw = await conn.fetchval("SELECT context->'ide_session' FROM jobs WHERE id = $1", job_id)
+        raw = await conn.fetchval(
+            "SELECT context->'ide_session' FROM jobs WHERE id = $1", job_id
+        )
     ide = json.loads(raw) if isinstance(raw, str) else raw
     assert ide["_creation_claim_token"] == str(winner["claim_token"])
     assert ide["_restore_attempt_id"] == str(attempt_id)
-    assert await db.list_pending_ide_restore_attempts(
-        limit=10, after_generation=int(first["reservation_generation"]) - 1
-    ) == []
+    assert (
+        await db.list_pending_ide_restore_attempts(
+            limit=10, after_generation=int(first["reservation_generation"]) - 1
+        )
+        == []
+    )
 
 
 @pytest.mark.asyncio
 async def test_0300_refuses_unreceipted_uidless_ide_retirement(db):
     job_id = uuid4()
-    legacy = {"ide_session": {
-        "status": "restoring", "restore_type": "k8s_container",
-        "source": "gitea", "snapshot_type": "gitea",
-        "started_at": "2026-09-28T00:00:00Z",
-    }}
+    legacy = {
+        "ide_session": {
+            "status": "restoring",
+            "restore_type": "k8s_container",
+            "source": "gitea",
+            "snapshot_type": "gitea",
+            "started_at": "2026-09-28T00:00:00Z",
+        }
+    }
     async with db.acquire() as conn:
         await _execute_pre_0195(
             conn,
             "INSERT INTO jobs (id, description, status, repo_name, context) "
             "VALUES ($1, 'legacy UID-less IDE', 'completed', 'owned-repo', $2::jsonb)",
-            job_id, json.dumps(legacy),
+            job_id,
+            json.dumps(legacy),
         )
         with pytest.raises(asyncpg.CheckViolationError):
             await conn.execute(
@@ -636,9 +722,11 @@ async def test_0300_refuses_unreceipted_uidless_ide_retirement(db):
                 job_id,
             )
     assert await db.begin_managed_ide_restore_attempt(
-        str(job_id), attempt_id=str(uuid4()),
+        str(job_id),
+        attempt_id=str(uuid4()),
         proposed_context={**legacy["ide_session"], "status": "restoring"},
-        desired_manifest_digest="a" * 64, claimant="ide-issuer:legacy",
+        desired_manifest_digest="a" * 64,
+        claimant="ide-issuer:legacy",
     ) == {"disposition": "held"}
 
 
@@ -652,21 +740,30 @@ async def test_0300_refuses_live_runtime_ide_retirement_without_zero(db):
             job_id,
         )
     admitted = await db.begin_managed_ide_restore_attempt(
-        str(job_id), attempt_id=str(attempt_id),
+        str(job_id),
+        attempt_id=str(attempt_id),
         proposed_context={
-            "status": "restoring", "source": "gitea", "snapshot_type": "gitea",
-            "restore_type": "k8s_container", "started_at": "2026-09-28T00:00:00Z",
+            "status": "restoring",
+            "source": "gitea",
+            "snapshot_type": "gitea",
+            "restore_type": "k8s_container",
+            "started_at": "2026-09-28T00:00:00Z",
         },
-        desired_manifest_digest="a" * 64, claimant="ide-issuer:live",
+        desired_manifest_digest="a" * 64,
+        claimant="ide-issuer:live",
     )
     assert admitted["disposition"] == "accepted"
     reservation = admitted["reservation"]
     gate = dict(
-        owner_kind="job", scope="ide",
+        owner_kind="job",
+        scope="ide",
         reservation_generation=int(reservation["reservation_generation"]),
-        claimant="ide-issuer:live", claim_token=int(reservation["claim_token"]),
+        claimant="ide-issuer:live",
+        claim_token=int(reservation["claim_token"]),
     )
-    assert await db.mark_managed_repository_workspace_creation_started(str(job_id), **gate)
+    assert await db.mark_managed_repository_workspace_creation_started(
+        str(job_id), **gate
+    )
     assert await db.begin_managed_repository_workspace_creation_effect(
         str(job_id), **gate, resource_kind="pod"
     )
@@ -677,7 +774,8 @@ async def test_0300_refuses_live_runtime_ide_retirement_without_zero(db):
         await conn.execute(
             "UPDATE jobs SET context = jsonb_set(context, "
             "'{ide_session,_runtime_incarnation}', to_jsonb($2::text)) WHERE id = $1",
-            job_id, str(runtime),
+            job_id,
+            str(runtime),
         )
         with pytest.raises(asyncpg.CheckViolationError):
             await conn.execute(
@@ -685,11 +783,16 @@ async def test_0300_refuses_live_runtime_ide_retirement_without_zero(db):
                 "'\"expired\"'::jsonb) WHERE id = $1",
                 job_id,
             )
-    assert await db.cancel_managed_ide_restore_attempt(
-        str(job_id), attempt_id=str(attempt_id),
-        reservation_id=str(reservation["id"]),
-        claim_token=int(reservation["claim_token"]), claimant="ide-stop:live",
-    ) is None
+    assert (
+        await db.cancel_managed_ide_restore_attempt(
+            str(job_id),
+            attempt_id=str(attempt_id),
+            reservation_id=str(reservation["id"]),
+            claim_token=int(reservation["claim_token"]),
+            claimant="ide-stop:live",
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -872,12 +975,16 @@ async def test_settled_ide_db_uuid_allows_only_exact_owner_restore_work_claim(
         assert receipt is not None
         assert isinstance(receipt["runtime_incarnation"], UUID)
         assert await service._current_ide_restore_runtime(str(job_id)) == (
-            str(runtime), "10.42.0.31"
+            str(runtime),
+            "10.42.0.31",
         )
     if owner_change == "stale_claim":
-        assert await service._claim_ide_restore_work(
-            str(job_id), runtime_incarnation=str(uuid4())
-        ) is None
+        assert (
+            await service._claim_ide_restore_work(
+                str(job_id), runtime_incarnation=str(uuid4())
+            )
+            is None
+        )
         async with db.acquire() as conn:
             claimed_by = await conn.fetchval(
                 "SELECT restore_work_claimed_by FROM "
@@ -895,6 +1002,7 @@ async def test_settled_ide_db_uuid_allows_only_exact_owner_restore_work_claim(
     else:
         stale_reservation = None
     if owner_change == "bound_replay":
+
         async def settle_exact_bound_pod(_job_id, *, creation_reservation):
             assert creation_reservation["id"] == reservation["id"]
             assert await db.settle_managed_repository_workspace_creation_reservation(
@@ -921,9 +1029,7 @@ async def test_settled_ide_db_uuid_allows_only_exact_owner_restore_work_claim(
             else str(runtime)
         ),
         creation_reservation=(
-            reservation
-            if owner_change == "bound_replay"
-            else stale_reservation
+            reservation if owner_change == "bound_replay" else stale_reservation
         ),
     )
     if owner_change == "bound_replay":
@@ -2861,9 +2967,12 @@ async def test_stale_workspace_restore_callback_does_not_claim_successor_lease(
     service = WorkspaceSuspensionService()
     service._container_provisioner = provisioner
 
-    assert await service._claim_workspace_restore_work(
-        owner, runtime_incarnation=stale_runtime
-    ) is None
+    assert (
+        await service._claim_workspace_restore_work(
+            owner, runtime_incarnation=stale_runtime
+        )
+        is None
+    )
     async with db.acquire() as conn:
         unclaimed = await conn.fetchrow(
             "SELECT restore_work_claimed_by, restore_work_claim_token "
@@ -4423,7 +4532,6 @@ async def test_0300_stale_cancel_receipt_cannot_clear_malformed_ide(db, restore_
             )
 
 
-
 @pytest.mark.asyncio
 async def test_post_reclaims_only_expired_exact_ide_attempt(db, monkeypatch):
     job_id, attempt_id = uuid4(), uuid4()
@@ -4491,7 +4599,6 @@ async def test_post_reclaims_only_expired_exact_ide_attempt(db, monkeypatch):
     assert len(rows) == 1 and rows[0]["id"] == first["id"]
     assert ide["_restore_attempt_id"] == str(attempt_id)
     assert ide["_creation_claim_token"] == str(claimed["claim_token"])
-
 
 
 @pytest.mark.asyncio
@@ -4563,7 +4670,6 @@ async def test_post_refuses_stale_or_changed_ide_attempt(db, monkeypatch, mutati
     assert row["claim_token"] == admitted["reservation"]["claim_token"]
 
 
-
 async def _legacy_runtime_bound_ide(db):
     job_id, runtime = uuid4(), uuid4()
     session = {
@@ -4621,7 +4727,6 @@ async def _legacy_runtime_bound_ide(db):
             ),
         )
     return job_id, row, runtime
-
 
 
 @pytest.mark.asyncio
@@ -4711,7 +4816,6 @@ async def test_post_legacy_runtime_bound_replays_only_exact_receipt(
         assert rows[0]["claim_token"] == first["claim_token"]
 
 
-
 @pytest.mark.asyncio
 async def test_post_keeps_uidless_legacy_projection_held(db, monkeypatch):
     job_id = uuid4()
@@ -4754,7 +4858,6 @@ async def test_post_keeps_uidless_legacy_projection_held(db, monkeypatch):
             )
             == 0
         )
-
 
 
 @pytest.mark.asyncio
@@ -4846,7 +4949,6 @@ async def test_post_reclaims_new_attempt_after_exact_runtime_publication(
     assert ide["_runtime_incarnation"] == str(runtime)
     assert ide["_restore_attempt_id"] == str(attempt_id)
     assert ide["_creation_claim_token"] == str(claimed["claim_token"])
-
 
 
 @pytest.mark.asyncio

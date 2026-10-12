@@ -21,9 +21,13 @@ def _args(tmp_path):
     output_dir.mkdir(mode=0o700)
     run = "srw-a1-owned-20260923a"
     return Namespace(
-        run_id=run, context=run, cluster_uid="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        namespace=run, deployment=f"{run}-orchestrator",
-        pod=f"{run}-orchestrator-abc", pod_uid="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        run_id=run,
+        context=run,
+        cluster_uid="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        namespace=run,
+        deployment=f"{run}-orchestrator",
+        pod=f"{run}-orchestrator-abc",
+        pod_uid="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
         image_id="containerd://sha256:" + "c" * 64,
         vm_image="registry.example/a1@sha256:" + "d" * 64,
         model_id="e2e-vm-a1-20260923a",
@@ -48,7 +52,9 @@ def test_host_factory_requires_exact_owned_source_and_private_fresh_output(tmp_p
 def test_host_factory_does_not_call_kubectl_for_shared_namespace(tmp_path, monkeypatch):
     args = _args(tmp_path)
     args.context = "shared"
-    monkeypatch.setattr(HOST, "_kubectl", lambda *_a, **_kw: pytest.fail("kubectl called"))
+    monkeypatch.setattr(
+        HOST, "_kubectl", lambda *_a, **_kw: pytest.fail("kubectl called")
+    )
     with pytest.raises(HOST.FixtureHostRefusal):
         HOST.run(args)
 
@@ -56,6 +62,8 @@ def test_host_factory_does_not_call_kubectl_for_shared_namespace(tmp_path, monke
 def test_host_factory_requires_private_inference_key_before_exec(tmp_path, monkeypatch):
     args = _args(tmp_path)
     monkeypatch.setattr(HOST, "verify_host_source", lambda _args: None)
-    monkeypatch.setattr(HOST, "_kubectl", lambda *_a, **_kw: pytest.fail("kubectl called"))
+    monkeypatch.setattr(
+        HOST, "_kubectl", lambda *_a, **_kw: pytest.fail("kubectl called")
+    )
     with pytest.raises(HOST.FixtureHostRefusal, match="key file"):
         HOST.run(args)

@@ -84,7 +84,8 @@ def fixture(*, max_items=100, max_bytes=100000):
     "stage", ("_document", "normalize_inventory", "canonical_snapshot")
 )
 async def test_cpu_conversion_keeps_controller_event_loop_responsive(
-    monkeypatch, stage,
+    monkeypatch,
+    stage,
 ):
     collector, _, _ = fixture()
     loop = asyncio.get_running_loop()
@@ -110,9 +111,7 @@ async def test_cpu_conversion_keeps_controller_event_loop_responsive(
 @pytest.mark.parametrize("stage", ("_document", "normalize_inventory"))
 async def test_cancellation_drains_cpu_conversion_worker(monkeypatch, stage):
     collector, _, _ = fixture()
-    entered, release, exited = (
-        threading.Event(), threading.Event(), threading.Event()
-    )
+    entered, release, exited = (threading.Event(), threading.Event(), threading.Event())
     original = getattr(resource_inventory, stage)
 
     def blocked(*args, **kwargs):
@@ -142,12 +141,12 @@ async def test_cancellation_drains_cpu_conversion_worker(monkeypatch, stage):
 @pytest.mark.parametrize("stage", ("_document", "normalize_inventory"))
 @pytest.mark.parametrize("worker_fails", (False, True))
 async def test_repeated_cancellation_drains_conversion_worker(
-    monkeypatch, stage, worker_fails,
+    monkeypatch,
+    stage,
+    worker_fails,
 ):
     collector, _, _ = fixture()
-    entered, release, exited = (
-        threading.Event(), threading.Event(), threading.Event()
-    )
+    entered, release, exited = (threading.Event(), threading.Event(), threading.Event())
     original = getattr(resource_inventory, stage)
 
     def blocked(*args, **kwargs):
@@ -211,23 +210,29 @@ async def test_collects_complete_scope_without_serializing_private_fields():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kubevirt_version", ["v1.6.6", "v1.8.4"])
-async def test_protocol_two_gets_exact_installed_cr_and_limitranges_without_raw_dump(kubevirt_version):
+async def test_protocol_two_gets_exact_installed_cr_and_limitranges_without_raw_dump(
+    kubevirt_version,
+):
     from tests.test_vm_launcher_profile import installed_cr
 
     collector, pages, calls = fixture()
     node = pages["nodes"][0]["items"][0]
     node["metadata"]["labels"]["kubernetes.io/arch"] = "amd64"
-    node["status"]["allocatable"].update({
-        "ephemeral-storage": "100G",
-        "devices.kubevirt.io/tun": "8",
-        "devices.kubevirt.io/vhost-net": "8",
-    })
+    node["status"]["allocatable"].update(
+        {
+            "ephemeral-storage": "100G",
+            "devices.kubevirt.io/tun": "8",
+            "devices.kubevirt.io/vhost-net": "8",
+        }
+    )
     collector.protocol = 2
     collector.kubevirt_namespace = "kubevirt"
     collector.kubevirt_name = "kubevirt"
     collector.label_keys.append("kubernetes.io/arch")
     raw_cr = installed_cr()
-    raw_cr["status"].update(targetKubeVirtVersion=kubevirt_version, observedKubeVirtVersion=kubevirt_version)
+    raw_cr["status"].update(
+        targetKubeVirtVersion=kubevirt_version, observedKubeVirtVersion=kubevirt_version
+    )
     raw_cr["metadata"]["resourceVersion"] = "11"
     raw_cr["spec"]["private"] = "DO_NOT_EMIT"
     observed = []

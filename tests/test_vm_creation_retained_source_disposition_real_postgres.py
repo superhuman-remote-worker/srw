@@ -40,9 +40,13 @@ async def prepared_at_cloud_init_refusal(workspace, store):
 
     async def authority(path, body, *, operation):
         nonlocal blocked
-        if path.endswith("begin-effect") and verify_creation_carrier(
-            body["carrier"], secret=CreationActuator(ctrl).secret
-        )["effect_kind"] == "cloud_init":
+        if (
+            path.endswith("begin-effect")
+            and verify_creation_carrier(
+                body["carrier"], secret=CreationActuator(ctrl).secret
+            )["effect_kind"]
+            == "cloud_init"
+        ):
             blocked = True
             raise TimeoutError("before cloud-init grant")
         return await original(path, body, operation=operation)
@@ -129,9 +133,7 @@ async def test_retained_completed_clone_releases_source_but_keeps_exact_attachme
     assert final_lease["metadata"]["uid"] == original_lease["metadata"]["uid"]
     assert final_lease["metadata"]["labels"] == original_lease["metadata"]["labels"]
     assert final_lease["metadata"]["annotations"]["srw.io/detached"] == "true"
-    assert (await store.inspect(request_id=current["request_id"]))[
-        "state"
-    ] == "settled"
+    assert (await store.inspect(request_id=current["request_id"]))["state"] == "settled"
     assert (
         pins(api.read("DataVolume", source["name"]))[current["request_id"]]["state"]
         == "disposed"
@@ -147,10 +149,12 @@ async def test_missing_retained_pvc_cannot_acquire_root_completion(db, workspace
     assert await store.db.cancel_job(current["job_id"])
     root = storage_name(payload["workspace_storage"])
     ctrl.k8s_client.list_namespaced_custom_object = lambda **_: {
-        "metadata": {"resourceVersion": "1"}, "items": []
+        "metadata": {"resourceVersion": "1"},
+        "items": [],
     }
     ctrl.core_api.list_namespaced_pod = lambda **_: {
-        "metadata": {"resourceVersion": "1"}, "items": []
+        "metadata": {"resourceVersion": "1"},
+        "items": [],
     }
     await CreationDisposer(ctrl).run(disposition_identity(current))
     api.objects["DataVolume", root]["status"] = {"phase": "Succeeded"}
@@ -158,10 +162,15 @@ async def test_missing_retained_pvc_cannot_acquire_root_completion(db, workspace
     from vm_controller.creation_disposition_resources import DispositionResources
 
     inspected = await store.inspect(request_id=current["request_id"])
-    carrier = api.read("Lease", "srw-cleanup-" + UUID(inspected["creation_admission_id"]).hex)
+    carrier = api.read(
+        "Lease", "srw-cleanup-" + UUID(inspected["creation_admission_id"]).hex
+    )
     with pytest.raises(CreationUnproven, match="retained_disk_changed"):
         await DispositionResources(
-            CreationActuator(ctrl), inspected, carrier, inspected["cancellation_disposition"]
+            CreationActuator(ctrl),
+            inspected,
+            carrier,
+            inspected["cancellation_disposition"],
         ).run()
     inspected = await store.inspect(request_id=current["request_id"])
     assert "rootdisk" not in inspected["cancellation_completion"]

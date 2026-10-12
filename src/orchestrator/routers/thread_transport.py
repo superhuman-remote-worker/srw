@@ -144,7 +144,9 @@ async def thread_input(
         )
 
     if not body.content or not isinstance(body.content, str):
-        raise HTTPException(status_code=400, detail="content must be a non-empty string")
+        raise HTTPException(
+            status_code=400, detail="content must be a non-empty string"
+        )
     from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
 
     idle = VMIdleLifecycleStore(store)
@@ -164,16 +166,19 @@ async def thread_input(
     continuation = await idle.get_pending_access_continuation(thread_id)
     if open_idle is not None or retained_ready or continuation is not None:
         wake = await idle.request_thread_wake(
-            thread_id, execution_requested=True,
+            thread_id,
+            execution_requested=True,
         )
         if wake is None:
             raise HTTPException(
-                status_code=409, detail={"code": "session_idle_wake_held"},
+                status_code=409,
+                detail={"code": "session_idle_wake_held"},
             )
         return JSONResponse(
             status_code=202,
             content={
-                "accepted": False, "state": "waking",
+                "accepted": False,
+                "state": "waking",
                 "wake_id": str(wake["wake_id"]),
                 "thread_id": thread_id,
             },

@@ -110,7 +110,9 @@ async def first(database, actor):
 
 @pytest.mark.asyncio
 async def test_reservation_selects_immutable_network_profile_and_handoff_keeps_it(
-    database, actor, monkeypatch,
+    database,
+    actor,
+    monkeypatch,
 ):
     from orchestrator.services.retained_vm_workspaces import provision_authority
     from shared.vm_network_profile import NETWORK_PROFILE
@@ -134,13 +136,18 @@ async def test_reservation_selects_immutable_network_profile_and_handoff_keeps_i
     }
     assert await vm_provisioning_options(
         database, "Job", await database.get_job(next_job)
-    ) == {**OPTIONS, "workspace_storage": successor["storage"],
-          "network_profile": NETWORK_PROFILE}
+    ) == {
+        **OPTIONS,
+        "workspace_storage": successor["storage"],
+        "network_profile": NETWORK_PROFILE,
+    }
 
 
 @pytest.mark.asyncio
 async def test_profiled_retained_first_preflight_requires_selected_source(
-    database, actor, monkeypatch,
+    database,
+    actor,
+    monkeypatch,
 ):
     from orchestrator.services.vm_creation_preflight import VMCreationPreflightStore
     from orchestrator.services.vm_creation_retry_store import VMCreationRetryConflict
@@ -155,18 +162,26 @@ async def test_profiled_retained_first_preflight_requires_selected_source(
     )
     fresh = VMProvisioner._fresh_provision_ctx()
     request = build_vm_creation_request(
-        job_id=str(job_id), provision_generation=fresh["provision_generation"],
-        agent_config="worker_base", description="", network_tier="restricted",
+        job_id=str(job_id),
+        provision_generation=fresh["provision_generation"],
+        agent_config="worker_base",
+        description="",
+        network_tier="restricted",
         **options,
     )
     with pytest.raises(VMCreationRetryConflict, match="source_changed"):
         await VMCreationPreflightStore(database).begin(
             job_id=str(job_id),
-            request={**request, "vm_image": "registry.example/other@sha256:" + "b" * 64},
+            request={
+                **request,
+                "vm_image": "registry.example/other@sha256:" + "b" * 64,
+            },
             fresh_context=fresh,
         )
     frozen = await VMCreationPreflightStore(database).begin(
-        job_id=str(job_id), request=request, fresh_context=fresh,
+        job_id=str(job_id),
+        request=request,
+        fresh_context=fresh,
     )
     assert frozen["request"]["network_profile"] == options["network_profile"]
 

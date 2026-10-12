@@ -10,12 +10,18 @@ from typing import Any
 from uuid import uuid4
 
 
-_DELIVERY_FIELDS = frozenset({
-    "pinned_delivery_id", "pinned_projection_digest", "pinned_delivery_proof",
-})
+_DELIVERY_FIELDS = frozenset(
+    {
+        "pinned_delivery_id",
+        "pinned_projection_digest",
+        "pinned_delivery_proof",
+    }
+)
 _INPUT_GROUPS = {
     "feedback": (
-        "queued_feedback", "queued_feedback_reason", "queued_feedback_delivery_id",
+        "queued_feedback",
+        "queued_feedback_reason",
+        "queued_feedback_delivery_id",
     ),
     "delegation": ("delegation_results", "delegation_results_delivery_id"),
 }
@@ -29,11 +35,13 @@ def stamp_pinned_resume_input_ids(
     if updates is None:
         return None
     stamped = dict(updates)
-    if (stamped.get("queued_feedback") is not None
-            and not stamped.get("queued_feedback_delivery_id")):
+    if stamped.get("queued_feedback") is not None and not stamped.get(
+        "queued_feedback_delivery_id"
+    ):
         stamped["queued_feedback_delivery_id"] = str(uuid4())
-    if (stamped.get("delegation_results") is not None
-            and not stamped.get("delegation_results_delivery_id")):
+    if stamped.get("delegation_results") is not None and not stamped.get(
+        "delegation_results_delivery_id"
+    ):
         stamped["delegation_results_delivery_id"] = str(uuid4())
     return stamped
 
@@ -45,15 +53,20 @@ def pinned_job_projection_digest(payload: Mapping[str, Any]) -> str:
         key: value for key, value in payload.items() if key not in _DELIVERY_FIELDS
     }
     encoded = json.dumps(
-        material, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        material,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
     ).encode("utf-8")
-    return "sha256:" + hashlib.sha256(
-        b"srw:pinned-job-delivery:v1\0" + encoded
-    ).hexdigest()
+    return (
+        "sha256:"
+        + hashlib.sha256(b"srw:pinned-job-delivery:v1\0" + encoded).hexdigest()
+    )
 
 
 def pinned_resume_input_digests(
-    current: Mapping[str, Any], delivered: Mapping[str, Any] | None,
+    current: Mapping[str, Any],
+    delivered: Mapping[str, Any] | None,
 ) -> dict[str, str] | None:
     """Freeze hashes of the exact one-shot context groups sent on a resume."""
 
@@ -71,12 +84,15 @@ def pinned_resume_input_digests(
             for key in group
         ):
             return None
-        result[kind] = _input_digest(kind, {key: delivered[key] for key in group if key in delivered})
+        result[kind] = _input_digest(
+            kind, {key: delivered[key] for key in group if key in delivered}
+        )
     return result
 
 
 def pinned_resume_consumed_keys(
-    current: Mapping[str, Any], digests: Mapping[str, str] | None,
+    current: Mapping[str, Any],
+    digests: Mapping[str, str] | None,
 ) -> list[str]:
     """Match only frozen input generations; newer values remain queued."""
 
@@ -94,11 +110,17 @@ def pinned_resume_consumed_keys(
 
 def _input_digest(kind: str, material: Mapping[str, Any]) -> str:
     encoded = json.dumps(
-        material, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        material,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
     ).encode("utf-8")
-    return "sha256:" + hashlib.sha256(
-        b"srw:pinned-job-resume-input:v1\0" + kind.encode() + b"\0" + encoded
-    ).hexdigest()
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            b"srw:pinned-job-resume-input:v1\0" + kind.encode() + b"\0" + encoded
+        ).hexdigest()
+    )
 
 
 def pinned_job_delivery_proof(
@@ -112,9 +134,17 @@ def pinned_job_delivery_proof(
 ) -> str:
     """Mint a process-bound report acknowledgment from an orchestrator-only key."""
 
-    material = "\0".join((
-        delivery_id, agent_id, process_generation, pod_uid, projection_digest,
-    )).encode("utf-8")
+    material = "\0".join(
+        (
+            delivery_id,
+            agent_id,
+            process_generation,
+            pod_uid,
+            projection_digest,
+        )
+    ).encode("utf-8")
     return hmac.new(
-        secret, b"srw:pinned-job-report:v1\0" + material, hashlib.sha256,
+        secret,
+        b"srw:pinned-job-report:v1\0" + material,
+        hashlib.sha256,
     ).hexdigest()

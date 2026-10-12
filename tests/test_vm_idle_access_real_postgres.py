@@ -311,7 +311,12 @@ async def test_cancel_waiting_on_writer_owner_lock_sees_committed_lease(db, path
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "kind,claim",
-    [("ide", "tab"), ("ide", "operation"), ("ssh", "connection"), ("sftp", "connection")],
+    [
+        ("ide", "tab"),
+        ("ide", "operation"),
+        ("ssh", "connection"),
+        ("sftp", "connection"),
+    ],
 )
 async def test_cancel_rejection_access_read_counts_all_exact_owner_live_leases(
     db, kind, claim
@@ -332,7 +337,9 @@ async def test_cancel_rejection_access_read_counts_all_exact_owner_live_leases(
         kind,
         f"{uuid4()}:{claim}:{uuid4()}",
     )
-    before = await db.fetchrow("SELECT * FROM vm_idle_access_leases WHERE id=$1", lease_id)
+    before = await db.fetchrow(
+        "SELECT * FROM vm_idle_access_leases WHERE id=$1", lease_id
+    )
     assert await db.has_active_job_workspace_access(str(owner)) is True
     assert await db.has_active_job_workspace_access(str(uuid4())) is False
     assert (
@@ -377,7 +384,9 @@ async def test_cancel_rejection_access_read_does_not_count_inactive_or_other_own
             "UPDATE vm_idle_access_leases SET closed_at=clock_timestamp() WHERE id=$1",
             lease_id,
         )
-    before = await db.fetchrow("SELECT * FROM vm_idle_access_leases WHERE id=$1", lease_id)
+    before = await db.fetchrow(
+        "SELECT * FROM vm_idle_access_leases WHERE id=$1", lease_id
+    )
     assert await db.has_active_job_workspace_access(str(owner)) is False
     assert (
         await db.fetchrow("SELECT * FROM vm_idle_access_leases WHERE id=$1", lease_id)
@@ -541,13 +550,18 @@ async def test_connected_ide_socket_renews_old_tab_and_close_does_not_kill_write
     # sliding TTL. A live socket, rather than an HTTP poll, must keep it usable.
     await db.execute(
         "UPDATE vm_idle_access_leases SET acquired_at=clock_timestamp()-interval '3 minutes', "
-        "expires_at=clock_timestamp()+interval '5 seconds' WHERE id=$1", tab["id"],
+        "expires_at=clock_timestamp()+interval '5 seconds' WHERE id=$1",
+        tab["id"],
     )
     entered = asyncio.Event()
+
     async def socket():
         async with access.ide_operation(
-            str(tab["id"]), owner_kind="job", owner_id=str(owner),
-            user_id=user, heartbeat_seconds=0.02,
+            str(tab["id"]),
+            owner_kind="job",
+            owner_id=str(owner),
+            user_id=user,
+            heartbeat_seconds=0.02,
         ):
             entered.set()
             await asyncio.sleep(10)
@@ -559,60 +573,88 @@ async def test_connected_ide_socket_renews_old_tab_and_close_does_not_kill_write
         assert not task.done()
         assert await db.fetchval(
             "SELECT expires_at>clock_timestamp()+interval '1 minute' "
-            "FROM vm_idle_access_leases WHERE id=$1", tab["id"],
+            "FROM vm_idle_access_leases WHERE id=$1",
+            tab["id"],
         )
         second_writer = await access.begin_ide_operation(
-            str(tab["id"]), owner_kind="job", owner_id=str(owner), user_id=user,
+            str(tab["id"]),
+            owner_kind="job",
+            owner_id=str(owner),
+            user_id=user,
         )
         assert second_writer is not None
         assert await access.close(
-            str(second_writer["id"]), owner_kind="job", owner_id=str(owner),
-            kind="ide", claimant=second_writer["claimed_by"],
+            str(second_writer["id"]),
+            owner_kind="job",
+            owner_id=str(owner),
+            kind="ide",
+            claimant=second_writer["claimed_by"],
         )
         writer_row = await db.fetchrow(
             "SELECT id,claimed_by FROM vm_idle_access_leases WHERE owner_id=$1 "
             "AND claimed_by LIKE $2 AND closed_at IS NULL ORDER BY acquired_at LIMIT 1",
-            owner, f"{user}:operation:%",
+            owner,
+            f"{user}:operation:%",
         )
         writer = writer_row["id"]
         other_tab = await access.acquire(
-            owner_kind="job", owner_id=str(owner), kind="ide",
+            owner_kind="job",
+            owner_id=str(owner),
+            kind="ide",
             claimant=f"{user}:other-tab",
         )
         assert other_tab is not None
         assert not await access.renew_tab_for_operation(
-            str(other_tab["id"]), operation_id=str(writer),
+            str(other_tab["id"]),
+            operation_id=str(writer),
             operation_claimant=writer_row["claimed_by"],
             tab_claimant=other_tab["claimed_by"],
-            owner_kind="job", owner_id=str(owner),
+            owner_kind="job",
+            owner_id=str(owner),
         )
         assert await access.close_for_user(
-            str(tab["id"]), owner_kind="job", owner_id=str(owner),
-            kind="ide", user_id=user,
+            str(tab["id"]),
+            owner_kind="job",
+            owner_id=str(owner),
+            kind="ide",
+            user_id=user,
         )
         closed_expiry = await db.fetchval(
-            "SELECT expires_at FROM vm_idle_access_leases WHERE id=$1", tab["id"],
+            "SELECT expires_at FROM vm_idle_access_leases WHERE id=$1",
+            tab["id"],
         )
         await asyncio.sleep(0.08)
         assert not task.done()
         assert await db.fetchval(
-            "SELECT closed_at IS NULL FROM vm_idle_access_leases WHERE id=$1", writer,
+            "SELECT closed_at IS NULL FROM vm_idle_access_leases WHERE id=$1",
+            writer,
         )
-        assert await access.begin_ide_operation(
-            str(tab["id"]), owner_kind="job", owner_id=str(owner), user_id=user,
-        ) is None
+        assert (
+            await access.begin_ide_operation(
+                str(tab["id"]),
+                owner_kind="job",
+                owner_id=str(owner),
+                user_id=user,
+            )
+            is None
+        )
         assert await db.fetchval(
             "SELECT closed_at IS NOT NULL FROM vm_idle_access_leases WHERE id=$1",
             tab["id"],
         )
-        assert await db.fetchval(
-            "SELECT expires_at FROM vm_idle_access_leases WHERE id=$1", tab["id"],
-        ) == closed_expiry
+        assert (
+            await db.fetchval(
+                "SELECT expires_at FROM vm_idle_access_leases WHERE id=$1",
+                tab["id"],
+            )
+            == closed_expiry
+        )
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     assert await db.fetchval(
-        "SELECT closed_at IS NOT NULL FROM vm_idle_access_leases WHERE id=$1", writer,
+        "SELECT closed_at IS NOT NULL FROM vm_idle_access_leases WHERE id=$1",
+        writer,
     )
 
 
@@ -628,37 +670,54 @@ async def test_job_ide_start_runtime_swap_refuses_active_url_after_transport(db)
     job = await db.get_job(str(owner))
     entered, resume = asyncio.Event(), asyncio.Event()
     admitted = replace(
-        _proof(), workspace_generation=identity["generation"], vm_uid=identity["vm_uid"],
+        _proof(),
+        workspace_generation=identity["generation"],
+        vm_uid=identity["vm_uid"],
     )
     successor = replace(admitted, vm_uid=str(uuid4()))
+
     async def swap(*args, **kwargs):
         entered.set()
         await resume.wait()
         return successor
+
     connection = SimpleNamespace(run=AsyncMock(), open_connection=AsyncMock())
     transport = VMIDETransport(
         SimpleNamespace(attest_workspace_runtime=AsyncMock(side_effect=swap)),
-        pool=_Pool(connection), key_path="/private/key",
+        pool=_Pool(connection),
+        key_path="/private/key",
     )
     deps = IdeDependencies(
-        store=db, ide_sessions=object(), ide_proxy=SimpleNamespace(_vm_provisioner=object()),
+        store=db,
+        ide_sessions=object(),
+        ide_proxy=SimpleNamespace(_vm_provisioner=object()),
         vm_ide_transport=transport,
         require_job_access=AsyncMock(return_value=(user, job)),
     )
-    task = asyncio.create_task(start_ide_session(SimpleNamespace(), str(owner), dependencies=deps))
+    task = asyncio.create_task(
+        start_ide_session(SimpleNamespace(), str(owner), dependencies=deps)
+    )
     await asyncio.wait_for(entered.wait(), 2)
     await db.execute(
         "UPDATE jobs SET context=jsonb_set(context,'{vm,vm_uid}',to_jsonb($2::text)) "
-        "WHERE id=$1", owner, str(uuid4()),
+        "WHERE id=$1",
+        owner,
+        str(uuid4()),
     )
     resume.set()
     response = await asyncio.wait_for(task, 2)
-    assert response == {"status": "unavailable", "code_server_url": None,
-                        "code": "ide_runtime_changed"}
-    assert await db.fetchval(
-        "SELECT count(*) FROM vm_idle_access_leases WHERE owner_id=$1 AND closed_at IS NOT NULL",
-        owner,
-    ) == 1
+    assert response == {
+        "status": "unavailable",
+        "code_server_url": None,
+        "code": "ide_runtime_changed",
+    }
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_idle_access_leases WHERE owner_id=$1 AND closed_at IS NOT NULL",
+            owner,
+        )
+        == 1
+    )
     connection.run.assert_not_awaited()
 
 
@@ -834,11 +893,13 @@ async def test_job_ide_actual_entrypoints_do_not_renew_on_status_poll(db):
     owner, _, _ = await seed_wait(db)
     user = {"id": uuid4(), "is_approved": True}
     job = await db.get_job(str(owner))
+
     def admitted_proof(*args, **kwargs):
         return SimpleNamespace(
             workspace_generation=str(kwargs["expected_generation"]),
             vm_uid=str(kwargs["expected_vm_uid"]),
         )
+
     transport = SimpleNamespace(
         start_and_probe=AsyncMock(side_effect=admitted_proof),
         probe=AsyncMock(side_effect=admitted_proof),
@@ -890,7 +951,10 @@ async def test_job_ide_actual_entrypoints_do_not_renew_on_status_poll(db):
         vm_uid=str(uuid4()),
     )
     wrong_proof = await get_ide_session(
-        SimpleNamespace(), str(owner), lease_id=str(lease_id), dependencies=deps,
+        SimpleNamespace(),
+        str(owner),
+        lease_id=str(lease_id),
+        dependencies=deps,
     )
     assert wrong_proof["status"] == "unavailable"
     assert wrong_proof["code"] == "ide_runtime_changed"
@@ -901,15 +965,22 @@ async def test_job_ide_actual_entrypoints_do_not_renew_on_status_poll(db):
         )
         == before
     )
+
     async def switch_during_probe(*args, **kwargs):
         await db.execute(
             "UPDATE jobs SET context=jsonb_set(context,'{vm,vm_uid}',to_jsonb($2::text)) "
-            "WHERE id=$1", owner, str(uuid4()),
+            "WHERE id=$1",
+            owner,
+            str(uuid4()),
         )
         return admitted_proof(*args, **kwargs)
+
     transport.probe.side_effect = switch_during_probe
     stale = await get_ide_session(
-        SimpleNamespace(), str(owner), lease_id=str(lease_id), dependencies=deps,
+        SimpleNamespace(),
+        str(owner),
+        lease_id=str(lease_id),
+        dependencies=deps,
     )
     assert stale["status"] == "unavailable"
     assert stale["code"] == "ide_runtime_changed"

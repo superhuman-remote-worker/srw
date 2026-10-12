@@ -14,14 +14,15 @@ def root_cleanup(disposition):
     owner_id = (
         disposition.get("thread_id")
         if owner_kind == "thread"
-        else disposition.get("job_id") if owner_kind == "job" else None
+        else disposition.get("job_id")
+        if owner_kind == "job"
+        else None
     )
     if (
         type(disposition.get("version")) is not int
         or disposition["version"] != 1
-        or disposition.get("disk_policy") != (
-            "purge_new_thread_disk" if owner_kind == "thread" else "purge_new_job_disk"
-        )
+        or disposition.get("disk_policy")
+        != ("purge_new_thread_disk" if owner_kind == "thread" else "purge_new_job_disk")
         or owner_kind not in {"job", "thread"}
         or owner_id is None
         or (owner_kind == "thread" and disposition.get("job_id") != owner_id)
@@ -168,15 +169,17 @@ async def validate_disposition_child(
         expected = root_cleanup(disposition)
         return (
             expected_vm_uid is None
-            and disposition["job_id"] == str(
-                row["thread_id"] if row["owner_kind"] == "thread" else row["job_id"]
-            )
+            and disposition["job_id"]
+            == str(row["thread_id"] if row["owner_kind"] == "thread" else row["job_id"])
             and disposition.get("owner_kind", "job") == row["owner_kind"]
-            and (row["owner_kind"] != "thread" or (
-                disposition.get("thread_id") == str(row["thread_id"])
-                and disposition.get("thread_runtime_generation")
-                == str(row["thread_runtime_generation"])
-            ))
+            and (
+                row["owner_kind"] != "thread"
+                or (
+                    disposition.get("thread_id") == str(row["thread_id"])
+                    and disposition.get("thread_runtime_generation")
+                    == str(row["thread_runtime_generation"])
+                )
+            )
             and disposition["provision_generation"] == str(row["provision_generation"])
             and disposition["carrier_uid"] == str(row["creation_carrier_uid"])
             and disposition["namespace"] == row["creation_carrier_namespace"]
@@ -228,9 +231,8 @@ async def child_disposition_identity(conn, child):
         or parent["completed_at"] is not None
         or parent["parent_admission_id"] is not None
         or parent["owner_kind"] != row["owner_kind"]
-        or parent["owner_id"] != (
-            row["thread_id"] if row["owner_kind"] == "thread" else row["job_id"]
-        )
+        or parent["owner_id"]
+        != (row["thread_id"] if row["owner_kind"] == "thread" else row["job_id"])
         or parent["pvc_uid"] != row["observed_pvc_uid"]
     ):
         raise ValueError("Creation disposition child changed")

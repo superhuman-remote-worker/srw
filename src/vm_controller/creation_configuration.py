@@ -111,9 +111,7 @@ def resolve_creation_configuration(
         frozen_thread_candidate = (
             payload["entity_type"] == "thread"
             and isinstance(_resource_policy_snapshot, EnforcementResourcePolicySnapshot)
-            and compatible_image(
-                payload["vm_image"], allowlist=payload["vm_image"]
-            )
+            and compatible_image(payload["vm_image"], allowlist=payload["vm_image"])
         )
         if (
             not (compatible_image(payload["vm_image"]) or frozen_thread_candidate)

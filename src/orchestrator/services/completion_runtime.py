@@ -220,7 +220,10 @@ class CompletionControlBoundary:
             raise HTTPException(status_code=409, detail="completion finalizing")
 
     async def claim(
-        self, job: Mapping[str, Any], *, source: str,
+        self,
+        job: Mapping[str, Any],
+        *,
+        source: str,
         terminal_review_source: Mapping[str, Any] | None = None,
     ) -> Any:
         if not self._enabled:
@@ -237,7 +240,8 @@ class CompletionControlBoundary:
                 expected_lane=str(job.get("execution_lane") or "pinned"),
                 **(
                     {"terminal_review_source": terminal_review_source}
-                    if terminal_review_source is not None else {}
+                    if terminal_review_source is not None
+                    else {}
                 ),
             )
         except CompletionControlClaimConflict as exc:

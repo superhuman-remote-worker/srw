@@ -501,7 +501,8 @@ async def test_store_backoff_uses_db_time_and_capacity_clears_transport_outage(d
     assert await store.claim_due(limit=1) == []
     async with db.acquire() as conn:
         held = await conn.fetchrow(
-            "SELECT state,claim_token,claim_expires_at FROM vm_creation_retries WHERE job_id=$1", job,
+            "SELECT state,claim_token,claim_expires_at FROM vm_creation_retries WHERE job_id=$1",
+            job,
         )
         assert held["state"] == "reconciling"
         assert held["claim_token"] == claim["claim_token"]
@@ -560,11 +561,13 @@ async def test_transport_loss_keeps_original_claim_for_authorize_until_expiry(db
         )
     replacement = (await store.claim_due(limit=1))[0]
     assert replacement["claim_token"] != claim["claim_token"]
-    assert not (await store.authorize_controller(
-        request_id=str(retry["request_id"]),
-        claim_token=str(claim["claim_token"]),
-        observed=observed(job, generation, proposal),
-    ))["allowed"]
+    assert not (
+        await store.authorize_controller(
+            request_id=str(retry["request_id"]),
+            claim_token=str(claim["claim_token"]),
+            observed=observed(job, generation, proposal),
+        )
+    )["allowed"]
 
 
 @pytest.mark.asyncio
@@ -603,7 +606,10 @@ async def test_transport_outage_attention_revokes_original_claim(db):
     ],
 )
 async def test_controller_capacity_provenance_is_bounded_for_owner(
-    db, observation_reason, stored_reason, wait_kind,
+    db,
+    observation_reason,
+    stored_reason,
+    wait_kind,
 ):
     job, generation, proposal = await admitted_job(db)
     await admit(db, job, generation, proposal)

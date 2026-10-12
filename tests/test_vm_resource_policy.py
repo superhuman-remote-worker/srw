@@ -60,7 +60,9 @@ def whole_launcher_policy():
         vhostNetDevices=1,
     )
     value["policy"]["nodeHeadroom"].update(
-        ephemeralStorageBytes=0, tunDevices=0, vhostNetDevices=0,
+        ephemeralStorageBytes=0,
+        tunDevices=0,
+        vhostNetDevices=0,
     )
     budget = {
         "cpuMillicores": 10000,
@@ -95,7 +97,9 @@ def test_whole_launcher_policy_freezes_independent_reserve_and_budgets():
     }
     assert result.installation_budget.cpu_millicores == 10000
     value["policy"]["ownerBudget"]["cpuMillicores"] = 9999
-    assert validate_complete_resource_policy(value).policy_digest != result.policy_digest
+    assert (
+        validate_complete_resource_policy(value).policy_digest != result.policy_digest
+    )
 
 
 def enforcement_snapshot(value=None):

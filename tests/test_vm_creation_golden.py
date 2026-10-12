@@ -164,7 +164,9 @@ async def test_completed_clone_releases_pin_with_tombstone_and_fences_stale_writ
     import json
 
     ctrl, api, authority, payload, name = golden
-    assert (await poll_until_terminal(ctrl._do_create_serialized, payload))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload))[
+        "status"
+    ] == "created"
     sources = GoldenSources(ctrl)
     stale = api.read("DataVolume", name)
     await sources.release_completed(authority.row)
@@ -203,7 +205,9 @@ async def test_completed_replacement_clone_does_not_release_original_pin(golden)
     from vm_controller.creation_sources import GoldenSources, pins
 
     ctrl, api, authority, payload, name = golden
-    assert (await poll_until_terminal(ctrl._do_create_serialized, payload))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload))[
+        "status"
+    ] == "created"
     rootname = "agent-vm-" + payload["job_id"] + "-rootdisk"
     api.objects["DataVolume", rootname]["metadata"]["uid"] = str(uuid4())
     api.objects["DataVolume", rootname]["status"] = {"phase": "Succeeded"}
@@ -252,7 +256,9 @@ async def test_lost_pin_reply_is_exactly_observed_and_never_rechooses_source(gol
     api.lost.add("DataVolume")
     assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
     source = deepcopy(authority.row["effects"][0]["carrier_intent"]["rootdisk_source"])
-    assert (await poll_until_terminal(ctrl._do_create_serialized, payload))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload))[
+        "status"
+    ] == "created"
     assert all(
         effect["carrier_intent"]["rootdisk_source"] == source
         for effect in authority.row["effects"]
@@ -298,7 +304,9 @@ async def test_released_tombstone_allows_source_delete_once_clone_is_gone(golden
     from vm_controller.creation_sources import GoldenSources
 
     ctrl, api, authority, payload, name = golden
-    assert (await poll_until_terminal(ctrl._do_create_serialized, payload))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload))[
+        "status"
+    ] == "created"
     rootname = "agent-vm-" + payload["job_id"] + "-rootdisk"
     api.objects["DataVolume", rootname]["status"] = {"phase": "Succeeded"}
     api.objects["PersistentVolumeClaim", rootname]["status"] = {"phase": "Bound"}
@@ -317,7 +325,9 @@ async def test_long_lived_golden_compacts_tombstones_without_reviving_old_reques
 
     ctrl, api, authority, payload, name = golden
     row_before_creation = deepcopy(authority.row)
-    assert (await poll_until_terminal(ctrl._do_create_serialized, payload))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload))[
+        "status"
+    ] == "created"
     rootname = "agent-vm-" + payload["job_id"] + "-rootdisk"
     api.objects["DataVolume", rootname]["status"] = {"phase": "Succeeded"}
     api.objects["PersistentVolumeClaim", rootname]["status"] = {"phase": "Bound"}

@@ -114,7 +114,11 @@ def creation_preflight_response(value):
 
 
 def idle_wake_predecessor(
-    vm, *, job_id: str, pvc_uid: str, max_attempts: int,
+    vm,
+    *,
+    job_id: str,
+    pvc_uid: str,
+    max_attempts: int,
     current_storage: dict | None = None,
 ):
     """Validate the immutable first-create intent before retiring a usable VM.
@@ -166,10 +170,13 @@ def idle_wake_predecessor(
         from shared.vm_network_profile import reusable_profile_evidence
 
         if not reusable_profile_evidence(
-            vm.get("network_profile_evidence"), prior["request"]["network_profile"],
+            vm.get("network_profile_evidence"),
+            prior["request"]["network_profile"],
             provision_generation=vm.get("provision_generation"),
-            vm_uid=vm.get("vm_uid"), pvc_uid=pvc_uid,
-            vmi_uid=vm.get("vmi_uid"), launcher_uid=vm.get("active_pod_uid"),
+            vm_uid=vm.get("vm_uid"),
+            pvc_uid=pvc_uid,
+            vmi_uid=vm.get("vmi_uid"),
+            launcher_uid=vm.get("active_pod_uid"),
         ):
             raise VMCreationRetryConflict("retained_network_profile_unproven")
     return prior
@@ -201,25 +208,38 @@ def idle_wake_source_request(vm, source):
             or not isinstance(request.get("disk_size"), str)
             or (quantity_bytes(request.get("disk_size")) or 0) <= 0
             or canonical_request_digest(request) != source["request_digest"]
-            or any(source[key] != value for key, value in _execution_binding(prior).items())
+            or any(
+                source[key] != value for key, value in _execution_binding(prior).items()
+            )
         ):
             raise ValueError("creation source changed")
         if request != prior["request"]:
-            from orchestrator.services.vm_creation_transport import validate_creation_resolution
+            from orchestrator.services.vm_creation_transport import (
+                validate_creation_resolution,
+            )
 
-            validate_creation_resolution(prior["request"], {
-                "creation_retry_protocol": 1,
-                "request": request,
-                "request_digest": source["request_digest"],
-                "controller_configuration": _object(source["controller_configuration"]),
-                "controller_configuration_digest": source["controller_configuration_digest"],
-            })
+            validate_creation_resolution(
+                prior["request"],
+                {
+                    "creation_retry_protocol": 1,
+                    "request": request,
+                    "request_digest": source["request_digest"],
+                    "controller_configuration": _object(
+                        source["controller_configuration"]
+                    ),
+                    "controller_configuration_digest": source[
+                        "controller_configuration_digest"
+                    ],
+                },
+            )
         return deepcopy(request)
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
         raise VMCreationRetryConflict("idle_wake_predecessor_unproven") from exc
 
 
-def idle_wake_request(prior, *, resolved_request, generation: str, current_storage=None):
+def idle_wake_request(
+    prior, *, resolved_request, generation: str, current_storage=None
+):
     """Build a successor from captured options, changing only its generation.
 
     A retained binding may gain the controller-attested PVC UID after its
@@ -339,7 +359,8 @@ class VMCreationPreflightStore:
             and old.get("workspace_storage") is None
             and await conn.fetchval(
                 "SELECT public.job_vm_creation_never_issued_terminal_source($1,$2)",
-                job["id"], old.get("provision_generation"),
+                job["id"],
+                old.get("provision_generation"),
             )
         ):
             return {"expected_pvc_uid": None}
@@ -402,15 +423,22 @@ class VMCreationPreflightStore:
                         UUID(lineage["binding"]["owner_id"]),
                         UUID(lineage["original_vm"]["provision_generation"]),
                     )
-                    prior_request = _object(original["canonical_request"]) if original else {}
+                    prior_request = (
+                        _object(original["canonical_request"]) if original else {}
+                    )
                     if (
                         not original
-                        or canonical_request_digest(prior_request) != original["request_digest"]
+                        or canonical_request_digest(prior_request)
+                        != original["request_digest"]
                         or prior_request.get("vm_image") != request.get("vm_image")
                     ):
-                        raise VMCreationRetryConflict("retained_network_profile_source_changed")
+                        raise VMCreationRetryConflict(
+                            "retained_network_profile_source_changed"
+                        )
                 elif pvc_uid is None:
-                    from orchestrator.services.manifest_execution_snapshot import srw_snapshot_config
+                    from orchestrator.services.manifest_execution_snapshot import (
+                        srw_snapshot_config,
+                    )
 
                     snapshot = await conn.fetchrow(
                         "SELECT resolved,harness_adapter FROM srw_execution_specs "
@@ -419,13 +447,22 @@ class VMCreationPreflightStore:
                     )
                     try:
                         _, policy = srw_snapshot_config(dict(snapshot))
-                        source_image = (policy.get("workspace") or {}).get("vm", {}).get("image")
+                        source_image = (
+                            (policy.get("workspace") or {}).get("vm", {}).get("image")
+                        )
                     except (TypeError, KeyError, ValueError, HTTPException) as exc:
-                        raise VMCreationRetryConflict("retained_network_profile_source_changed") from exc
+                        raise VMCreationRetryConflict(
+                            "retained_network_profile_source_changed"
+                        ) from exc
                     if source_image != request.get("vm_image"):
-                        raise VMCreationRetryConflict("retained_network_profile_source_changed")
-            if (pvc_uid is not None and expected is None
-                    and os.getenv("VM_NETWORK_PROFILE_ENABLED", "false").lower() == "true"):
+                        raise VMCreationRetryConflict(
+                            "retained_network_profile_source_changed"
+                        )
+            if (
+                pvc_uid is not None
+                and expected is None
+                and os.getenv("VM_NETWORK_PROFILE_ENABLED", "false").lower() == "true"
+            ):
                 raise VMCreationRetryConflict("retained_network_profile_unproven")
         elif lineage:
             raise VMCreationRetryConflict("creation_attachment_lineage_unproven")
@@ -443,7 +480,8 @@ class VMCreationPreflightStore:
                 "FROM vm_creation_retries WHERE job_id=$1 AND "
                 "(observed_pvc_uid=$2 OR expected_pvc_uid=$2) "
                 "ORDER BY created_at,request_id FOR SHARE",
-                job["id"], UUID(pvc_uid),
+                job["id"],
+                UUID(pvc_uid),
             )
             if (
                 os.getenv("VM_NETWORK_PROFILE_ENABLED", "false").lower() != "true"
@@ -459,9 +497,14 @@ class VMCreationPreflightStore:
             original = _object(rows[0]["canonical_request"])
             expected = original.get("network_profile")
             if expected is None:
-                if (os.getenv("VM_NETWORK_PROFILE_ENABLED", "false").lower() == "true"
-                        or "network_profile" in request
-                        or any("network_profile" in _object(row["canonical_request"]) for row in rows)):
+                if (
+                    os.getenv("VM_NETWORK_PROFILE_ENABLED", "false").lower() == "true"
+                    or "network_profile" in request
+                    or any(
+                        "network_profile" in _object(row["canonical_request"])
+                        for row in rows
+                    )
+                ):
                     raise VMCreationRetryConflict("retained_network_profile_unproven")
                 return request
             validate_network_profile(expected)
@@ -470,26 +513,38 @@ class VMCreationPreflightStore:
                 or str(rows[0]["observed_pvc_uid"]) != pvc_uid
                 or any(
                     _object(row["canonical_request"]).get("network_profile") != expected
-                    or canonical_request_digest(_object(row["canonical_request"])) != row["request_digest"]
+                    or canonical_request_digest(_object(row["canonical_request"]))
+                    != row["request_digest"]
                     for row in rows
                 )
-                or ("network_profile" in request and request["network_profile"] != expected)
+                or (
+                    "network_profile" in request
+                    and request["network_profile"] != expected
+                )
             ):
                 raise VMCreationRetryConflict("retained_network_profile_unproven")
             request["network_profile"] = expected
             from shared.vm_network_profile import reusable_profile_evidence
 
             if not reusable_profile_evidence(
-                old.get("network_profile_evidence"), expected,
+                old.get("network_profile_evidence"),
+                expected,
                 provision_generation=old.get("provision_generation"),
-                vm_uid=old.get("vm_uid"), pvc_uid=pvc_uid,
-                vmi_uid=old.get("vmi_uid"), launcher_uid=old.get("active_pod_uid"),
+                vm_uid=old.get("vm_uid"),
+                pvc_uid=pvc_uid,
+                vmi_uid=old.get("vmi_uid"),
+                launcher_uid=old.get("active_pod_uid"),
             ):
                 raise VMCreationRetryConflict("retained_network_profile_unproven")
         return request
 
     async def begin(
-        self, *, job_id, request, fresh_context, max_attempts=3,
+        self,
+        *,
+        job_id,
+        request,
+        fresh_context,
+        max_attempts=3,
         idle_wake_id: str | None = None,
     ):
         """Freeze a first initial request, or return the existing preflight."""
@@ -539,7 +594,8 @@ class VMCreationPreflightStore:
                     idle_wake = await conn.fetchrow(
                         "SELECT * FROM vm_idle_operations WHERE id=$1 AND owner_kind='job' "
                         "AND owner_id=$2 AND closed_at IS NULL FOR UPDATE",
-                        wake_uuid, owner,
+                        wake_uuid,
+                        owner,
                     )
                     if (
                         idle_wake is None
@@ -548,8 +604,9 @@ class VMCreationPreflightStore:
                         or idle_wake["retained_kind"] != "rootdisk"
                         or idle_wake["wake_generation"] is None
                         or str(idle_wake["wake_generation"])
-                           != fresh_context.get("provision_generation")
-                        or old_vm.get("idle_wake_operation_id") not in {None, idle_wake_id}
+                        != fresh_context.get("provision_generation")
+                        or old_vm.get("idle_wake_operation_id")
+                        not in {None, idle_wake_id}
                         or (
                             old_vm.get("status") == "suspended"
                             and (
@@ -565,22 +622,29 @@ class VMCreationPreflightStore:
                 idle_first = bool(
                     idle_wake is not None
                     and old_vm.get("status") == "suspended"
-                    and job["status"] in {"waiting_for_reply", "pending_review", "paused"}
+                    and job["status"]
+                    in {"waiting_for_reply", "pending_review", "paused"}
                 )
                 if idle_first:
                     current_storage = None
                     if prior and prior["request"].get("workspace_storage") is not None:
-                        from orchestrator.services.retained_vm_workspaces import provision_binding
+                        from orchestrator.services.retained_vm_workspaces import (
+                            provision_binding,
+                        )
 
                         current_storage = await provision_binding(conn, job_id)
                     predecessor = idle_wake_predecessor(
-                        old_vm, job_id=job_id, pvc_uid=str(idle_wake["pvc_uid"]),
-                        max_attempts=max_attempts, current_storage=current_storage,
+                        old_vm,
+                        job_id=job_id,
+                        pvc_uid=str(idle_wake["pvc_uid"]),
+                        max_attempts=max_attempts,
+                        current_storage=current_storage,
                     )
                     source = await conn.fetchrow(
                         "SELECT * FROM vm_creation_retries "
                         "WHERE job_id=$1 AND provision_generation=$2 FOR SHARE",
-                        owner, UUID(old_vm["provision_generation"]),
+                        owner,
+                        UUID(old_vm["provision_generation"]),
                     )
                     if request != idle_wake_request(
                         predecessor,
@@ -596,7 +660,11 @@ class VMCreationPreflightStore:
                     old_vm.get("status") == "deleted"
                     and old_vm.get("retirement_cleanup_pending") is not True
                 )
-                if prior and not idle_first and not (retired and prior["state"] == "admitted"):
+                if (
+                    prior
+                    and not idle_first
+                    and not (retired and prior["state"] == "admitted")
+                ):
                     if (old_vm.get("idle_wake_operation_id") or idle_wake_id) and (
                         old_vm.get("idle_wake_operation_id") != idle_wake_id
                     ):
@@ -611,8 +679,11 @@ class VMCreationPreflightStore:
                 if idle_wake is not None and not idle_first:
                     raise VMCreationRetryConflict("idle_wake_unproven")
                 pinned_idle_owner = False
-                if (idle_first and "release_kind" in idle_wake
-                        and idle_wake["release_kind"] == "pinned_job"):
+                if (
+                    idle_first
+                    and "release_kind" in idle_wake
+                    and idle_wake["release_kind"] == "pinned_job"
+                ):
                     from orchestrator.services.vm_idle_lifecycle import (
                         _pinned_stop_valid_on_conn,
                     )
@@ -627,7 +698,8 @@ class VMCreationPreflightStore:
                 ):
                     raise VMCreationRetryConflict("job_changed")
                 if old_vm and (
-                    old_vm.get("status") != "deleted" and not idle_first
+                    old_vm.get("status") != "deleted"
+                    and not idle_first
                     or old_vm.get("retirement_cleanup_pending") is True
                 ):
                     raise VMCreationRetryConflict("creation_request_unproven")
@@ -923,7 +995,9 @@ class VMCreationPreflightStore:
                 job, value, _ = await self._claimed(conn, claim)
                 resolved = validate_creation_resolution(value["request"], resolved)
                 if (
-                    _object(_object(job["context"]).get("vm")).get("idle_wake_operation_id")
+                    _object(_object(job["context"]).get("vm")).get(
+                        "idle_wake_operation_id"
+                    )
                     and resolved["request"] != value["request"]
                 ):
                     # A retained disk uses its proven original sizing. A new

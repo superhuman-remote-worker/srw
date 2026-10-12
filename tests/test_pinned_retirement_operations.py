@@ -415,7 +415,8 @@ async def test_vm_recovery_stops_exact_pod_before_releasing_captured_vm(
     }
     store.get_thread.side_effect = [completed, completed]
     agent_provisioner.agent_pod_authority.side_effect = [
-        "exact_absent", "exact_absent",
+        "exact_absent",
+        "exact_absent",
     ]
     assert await operations.recover_captured_process_zero(_vm_retirement())
     vm_provisioner.release_vm_captured.assert_awaited_once()
@@ -437,9 +438,12 @@ async def test_idle_soft_retirement_stops_captured_pod_before_vm_effect() -> Non
     retirement["context"]["generation"] = RUNTIME_GENERATION
     retirement["context"]["settle_status"] = "suspended"
     store = MagicMock()
-    store.get_thread = AsyncMock(return_value={
-        **_current_vm_thread(), "runtime_retirement_permanent": False,
-    })
+    store.get_thread = AsyncMock(
+        return_value={
+            **_current_vm_thread(),
+            "runtime_retirement_permanent": False,
+        }
+    )
     actor = MagicMock()
     actor.is_available = True
 
@@ -460,7 +464,9 @@ async def test_idle_soft_retirement_stops_captured_pod_before_vm_effect() -> Non
     vm.lifecycle_available = True
     vm.release_vm_captured = AsyncMock(side_effect=release_vm)
     operations = _operations(
-        store=store, agent_provisioner=actor, vm_provisioner=vm,
+        store=store,
+        agent_provisioner=actor,
+        vm_provisioner=vm,
     )
     operations.dependencies.session_router.teardown_route = AsyncMock(
         return_value=True,
@@ -472,19 +478,24 @@ async def test_idle_soft_retirement_stops_captured_pod_before_vm_effect() -> Non
             AsyncMock(return_value=False),
         ),
         patch.object(
-            PinnedRetirementOperations, "_admit_vm_cleanup",
+            PinnedRetirementOperations,
+            "_admit_vm_cleanup",
             AsyncMock(return_value=SimpleNamespace(allowed=True)),
         ),
         patch.object(
-            PinnedRetirementOperations, "_complete_vm_cleanup", AsyncMock(),
+            PinnedRetirementOperations,
+            "_complete_vm_cleanup",
+            AsyncMock(),
         ),
         patch.object(
             PinnedRetirementOperations,
-            "_reconcile_agent_workspace_claim_for_retirement", AsyncMock(),
+            "_reconcile_agent_workspace_claim_for_retirement",
+            AsyncMock(),
         ),
     ):
         await operations.cleanup_pinned_thread_retirement(
-            retirement, cleanup_agent_pod=True,
+            retirement,
+            cleanup_agent_pod=True,
             stop_agent_before_workspace=True,
         )
     assert events == ["agent_stop", "vm_stop"]
@@ -501,9 +512,7 @@ async def test_direct_vm_end_refuses_conflicting_alias_before_vm_effect() -> Non
     retirement["context"]["vm"]["_runtime_incarnation"] = "different-vm-uid"
     store = MagicMock()
     store.get_thread = AsyncMock(return_value=_current_vm_thread())
-    store.pinned_retirement_external_cleanup_complete = AsyncMock(
-        return_value=False
-    )
+    store.pinned_retirement_external_cleanup_complete = AsyncMock(return_value=False)
     vm = MagicMock()
     vm.lifecycle_available = True
     vm.release_vm_captured = AsyncMock(
@@ -516,9 +525,12 @@ async def test_direct_vm_end_refuses_conflicting_alias_before_vm_effect() -> Non
         "_reconcile_workspace_provision_intent_for_retirement",
         AsyncMock(return_value=False),
     ):
-        with pytest.raises(RuntimeError, match="exact VM cleanup authority is incomplete"):
+        with pytest.raises(
+            RuntimeError, match="exact VM cleanup authority is incomplete"
+        ):
             await operations.cleanup_pinned_thread_retirement(
-                retirement, cleanup_agent_pod=False,
+                retirement,
+                cleanup_agent_pod=False,
             )
     vm.release_vm_captured.assert_not_awaited()
 
@@ -662,9 +674,10 @@ async def test_vm_recovery_requires_rootdisk_uid_only_for_permanent_end() -> Non
     retirement["context"]["vm"]["rootdisk_pvc_uid"] = None
     operations = _operations()
 
-    assert operations._captured_vm_recovery_identity(
-        retirement["context"], permanent=True
-    ) is None
+    assert (
+        operations._captured_vm_recovery_identity(retirement["context"], permanent=True)
+        is None
+    )
     soft_identity = operations._captured_vm_recovery_identity(
         retirement["context"], permanent=False
     )

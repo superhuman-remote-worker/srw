@@ -1075,7 +1075,9 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
 
         if _current_job_id == request.job_id:
             acknowledgement = accepted_pinned_job_delivery(
-                request, _orchestrator_client, retry=True,
+                request,
+                _orchestrator_client,
+                retry=True,
             )
             return JobStartResponse(
                 job_id=request.job_id,
@@ -1101,7 +1103,9 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             )
 
         acknowledgement = accepted_pinned_job_delivery(
-            request, _orchestrator_client, retry=False,
+            request,
+            _orchestrator_client,
+            retry=False,
         )
 
         # Accept the job — reset stop state
@@ -1319,12 +1323,15 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             raise HTTPException(status_code=503, detail="Agent is shutting down")
 
         from agent.api.pinned_delivery import (
-            accepted_pinned_job_delivery, resume_feedback_with_delegation,
+            accepted_pinned_job_delivery,
+            resume_feedback_with_delegation,
         )
 
         if _current_job_id == request.job_id:
             acknowledgement = accepted_pinned_job_delivery(
-                request, _orchestrator_client, retry=True,
+                request,
+                _orchestrator_client,
+                retry=True,
             )
             return JobStartResponse(
                 job_id=request.job_id,
@@ -1358,13 +1365,17 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
 
         # Accept the resume request
         acknowledgement = accepted_pinned_job_delivery(
-            request, _orchestrator_client, retry=False,
+            request,
+            _orchestrator_client,
+            retry=False,
         )
         _current_job_id = request.job_id
 
         # Capture for closure
         feedback, feedback_reason = resume_feedback_with_delegation(
-            request.feedback, request.feedback_reason, request.delegation_results,
+            request.feedback,
+            request.feedback_reason,
+            request.delegation_results,
         )
         config_name = request.config_name
         previous_status = request.previous_status

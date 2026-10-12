@@ -19,7 +19,9 @@ import sys
 
 def command(*argv):
     try:
-        result = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=5)
+        result = subprocess.run(
+            argv, check=False, capture_output=True, text=True, timeout=5
+        )
     except (OSError, subprocess.TimeoutExpired):
         return None
     return result.stdout.strip() if result.returncode == 0 else None
@@ -147,46 +149,70 @@ def collect(challenge, *, root=Path("/"), run=command):
     for item in raw_interfaces:
         if not isinstance(item, dict):
             continue
-        lease = dhcp4_lease(root, item.get("ifindex")) if item.get("ifname") == "enp1s0" else None
+        lease = (
+            dhcp4_lease(root, item.get("ifindex"))
+            if item.get("ifname") == "enp1s0"
+            else None
+        )
         address_info = item.get("addr_info", [])
         if not isinstance(address_info, list):
             continue
-        ipv4_addresses = [entry.get("local") for entry in address_info
-                          if isinstance(entry, dict) and entry.get("family") == "inet"]
-        local = (
-            lease[0] if lease and ipv4_addresses == [lease[0]] else None
-        )
+        ipv4_addresses = [
+            entry.get("local")
+            for entry in address_info
+            if isinstance(entry, dict) and entry.get("family") == "inet"
+        ]
+        local = lease[0] if lease and ipv4_addresses == [lease[0]] else None
         if local is None:
             local = next(
-                (entry.get("local") for entry in address_info
-                 if isinstance(entry, dict) and entry.get("local")), None
+                (
+                    entry.get("local")
+                    for entry in address_info
+                    if isinstance(entry, dict) and entry.get("local")
+                ),
+                None,
             )
         if item.get("ifname") != "lo" and local and item.get("address"):
-            interfaces.append({
-                "ifname": item["ifname"], "address": local, "mac": item["address"]
-            })
+            interfaces.append(
+                {"ifname": item["ifname"], "address": local, "mac": item["address"]}
+            )
         if lease and local == lease[0] and ipv4_addresses == [lease[0]]:
-            default_ipv4_routes = [route for route in routes if isinstance(route, dict)
-                                   and route.get("dst") in ("default", "0.0.0.0/0")]
-            if (len(default_ipv4_routes) == 1
-                    and default_ipv4_routes[0].get("dev") == "enp1s0"
-                    and default_ipv4_routes[0].get("protocol") == "dhcp"
-                    and default_ipv4_routes[0].get("gateway") in lease[1]):
+            default_ipv4_routes = [
+                route
+                for route in routes
+                if isinstance(route, dict)
+                and route.get("dst") in ("default", "0.0.0.0/0")
+            ]
+            if (
+                len(default_ipv4_routes) == 1
+                and default_ipv4_routes[0].get("dev") == "enp1s0"
+                and default_ipv4_routes[0].get("protocol") == "dhcp"
+                and default_ipv4_routes[0].get("gateway") in lease[1]
+            ):
                 selected_address = local
                 selected_route = default_ipv4_routes[0]
                 lease_proof = (item["ifindex"], lease[2])
     default_route = selected_route or next(
-        (route for route in routes if isinstance(route, dict) and
-         route.get("dst") in ("default", "0.0.0.0/0", "::/0")), None
+        (
+            route
+            for route in routes
+            if isinstance(route, dict)
+            and route.get("dst") in ("default", "0.0.0.0/0", "::/0")
+        ),
+        None,
     )
     status = run("networkctl", "status", "enp1s0", "--no-pager", "--full")
     selected = re.search(r"(?m)^\s*Network File:\s*(\S+)\s*$", status or "")
     rule_path = selected.group(1) if selected else None
     rule_text = None
-    if rule_path and (
-        rule_path.startswith("/run/systemd/network/")
-        or rule_path.startswith("/etc/systemd/network/")
-    ) and ".." not in PurePosixPath(rule_path).parts:
+    if (
+        rule_path
+        and (
+            rule_path.startswith("/run/systemd/network/")
+            or rule_path.startswith("/etc/systemd/network/")
+        )
+        and ".." not in PurePosixPath(rule_path).parts
+    ):
         rule_text = safe_text(root / rule_path.lstrip("/"))
     selected_rule = parse_networkd_rule(status, rule_text)
     cache_link = root / "var/lib/cloud/instance"
@@ -203,13 +229,16 @@ def collect(challenge, *, root=Path("/"), run=command):
         **readable_hashes(str(root / "etc/systemd/network/*")),
         **readable_hashes(str(root / "run/systemd/network/*.network")),
     }
-    rule_hash = networkd.get(str(root / selected_rule.lstrip("/"))) if selected_rule else None
+    rule_hash = (
+        networkd.get(str(root / selected_rule.lstrip("/"))) if selected_rule else None
+    )
     return {
         "challenge": challenge,
         "boot_id": safe_text(root / "proc/sys/kernel/random/boot_id"),
         "machine_id": safe_text(root / "etc/machine-id"),
         "interfaces": interfaces,
-        "address": selected_address or (interfaces[0]["address"] if interfaces else None),
+        "address": selected_address
+        or (interfaces[0]["address"] if interfaces else None),
         "routes": routes,
         "default_route": default_route,
         "dns": safe_text(root / "etc/resolv.conf"),

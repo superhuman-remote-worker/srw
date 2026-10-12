@@ -225,19 +225,30 @@ def test_replacement_requires_observed_changed_vmi_and_mac(field, value) -> None
         ("resume_successor", "vmi_uid", "126b3b28-81ca-4841-97bf-8806cc53e772"),
         ("resume_successor", "interface_mac", "02:00:00:00:00:43"),
         ("resume_receipt", "stop_receipt_digest", "sha256:" + "b" * 64),
-        ("network_profile_receipt_before", "vmi_uid", "9cb0c155-e71b-4e35-9282-cbcb846b1c0e"),
-        ("network_profile_receipt_after", "launcher_uid", "e73090a6-9bc6-4c75-9548-b1cae1e9785b"),
+        (
+            "network_profile_receipt_before",
+            "vmi_uid",
+            "9cb0c155-e71b-4e35-9282-cbcb846b1c0e",
+        ),
+        (
+            "network_profile_receipt_after",
+            "launcher_uid",
+            "e73090a6-9bc6-4c75-9548-b1cae1e9785b",
+        ),
         ("network_profile_receipt_after", "interface_mac", "02:00:00:00:00:43"),
     ],
 )
 def test_replacement_rejects_stale_stop_resume_or_network_receipt(
-    section, field, value,
+    section,
+    field,
+    value,
 ) -> None:
     evidence = _passing_evidence()
     replacement = evidence["replacement"]
     target = (
         replacement["resume_receipt"]["successor"]
-        if section == "resume_successor" else replacement[section]
+        if section == "resume_successor"
+        else replacement[section]
     )
     target[field] = value
     with pytest.raises(gate.GateFailure):

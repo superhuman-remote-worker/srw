@@ -62,7 +62,11 @@ def _expert_config(model_id: str) -> dict[str, Any]:
 
 
 async def seed_model(
-    db: Any, *, run_id: str, namespace: str, model_id: str,
+    db: Any,
+    *,
+    run_id: str,
+    namespace: str,
+    model_id: str,
     inference_key: str,
 ) -> str:
     """Register/replay only the run-owned authenticated provider transport."""
@@ -84,16 +88,21 @@ async def seed_model(
     base_url = f"http://srw-a1-provider.{namespace}.svc.cluster.local:8000/v1"
     existing_model = await db.resolve_catalog_model(model_id, capability="chat")
     endpoint_row = await db.fetchrow(
-        "SELECT id FROM llm_endpoints WHERE label=$1", label,
+        "SELECT id FROM llm_endpoints WHERE label=$1",
+        label,
     )
     if endpoint_row is None:
         if existing_model or await db.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM models WHERE model_id=$1)", model_id,
+            "SELECT EXISTS(SELECT 1 FROM models WHERE model_id=$1)",
+            model_id,
         ):
             raise FixtureRefusal("A1 model has no matching owned endpoint")
         endpoint = await db.create_system_llm_endpoint(
-            label=label, base_url=base_url, api_key=inference_key,
-            key_prefix=None, source="ui",
+            label=label,
+            base_url=base_url,
+            api_key=inference_key,
+            key_prefix=None,
+            source="ui",
         )
     else:
         endpoint = await db.get_system_llm_endpoint(str(endpoint_row["id"]))
@@ -109,13 +118,18 @@ async def seed_model(
     endpoint_id = str(endpoint["id"])
     if existing_model is None:
         if await db.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM models WHERE model_id=$1)", model_id,
+            "SELECT EXISTS(SELECT 1 FROM models WHERE model_id=$1)",
+            model_id,
         ):
             raise FixtureRefusal("A1 model authority changed")
         await db.create_model(
-            provider_kind="endpoint", provider_ref=endpoint_id,
-            model_id=model_id, display_label=f"A1 deterministic model {run_id}",
-            capabilities=["chat", "auxiliary"], family="e2e", source="ui",
+            provider_kind="endpoint",
+            provider_ref=endpoint_id,
+            model_id=model_id,
+            display_label=f"A1 deterministic model {run_id}",
+            capabilities=["chat", "auxiliary"],
+            family="e2e",
+            source="ui",
         )
     model = await db.resolve_catalog_model(model_id, capability="chat")
     if (
@@ -145,7 +159,8 @@ async def prepare_fixture(
 ) -> dict[str, str]:
     """Create/replay one paused owner Job, then enter the real VM preflight."""
     from orchestrator.services.manifest_execution_snapshot import (
-        read_execution, srw_snapshot_config,
+        read_execution,
+        srw_snapshot_config,
     )
     from orchestrator.services.vm_creation_preflight import _preflight
     from shared.vm_network_profile import NETWORK_PROFILE, compatible_image
@@ -182,7 +197,8 @@ async def prepare_fixture(
         raise FixtureRefusal("A1 fixture database contains another Job")
     if await db.fetchval(
         "SELECT EXISTS(SELECT 1 FROM run_queue WHERE unit_kind='worker_batch' "
-        "AND state IN ('queued','leased') AND unit_id<>$1)", job_id,
+        "AND state IN ('queued','leased') AND unit_id<>$1)",
+        job_id,
     ):
         raise FixtureRefusal("another worker batch is runnable")
     if await db.fetchval(
@@ -195,13 +211,15 @@ async def prepare_fixture(
     async with db.acquire() as conn, conn.transaction():
         owner = await conn.fetchrow(
             "SELECT id,display_name,is_approved,is_admin,can_use_vm "
-            "FROM users WHERE id=$1 FOR UPDATE", owner_id,
+            "FROM users WHERE id=$1 FOR UPDATE",
+            owner_id,
         )
         if owner is None:
             await conn.execute(
                 "INSERT INTO users(id,display_name,is_approved,is_admin,can_use_vm) "
                 "VALUES ($1,$2,true,false,true)",
-                owner_id, f"A1 retained Resume gate {run_id}",
+                owner_id,
+                f"A1 retained Resume gate {run_id}",
             )
             for key, value in (
                 ("vm_workspace", "true"),
@@ -210,7 +228,10 @@ async def prepare_fixture(
             ):
                 await conn.execute(
                     "INSERT INTO capability_grants(scope_kind,scope_id,key,value_json) "
-                    "VALUES ('user',$1,$2,$3::jsonb)", owner_id, key, value,
+                    "VALUES ('user',$1,$2,$3::jsonb)",
+                    owner_id,
+                    key,
+                    value,
                 )
         elif (
             owner["display_name"] != f"A1 retained Resume gate {run_id}"
@@ -221,11 +242,13 @@ async def prepare_fixture(
             raise FixtureRefusal("A1 run owner identity changed")
         grants = await conn.fetch(
             "SELECT key,value_json FROM capability_grants WHERE scope_kind='user' "
-            "AND scope_id=$1", owner_id,
+            "AND scope_id=$1",
+            owner_id,
         )
         if {
             row["key"]: json.loads(row["value_json"])
-            if isinstance(row["value_json"], str) else row["value_json"]
+            if isinstance(row["value_json"], str)
+            else row["value_json"]
             for row in grants
         } != {
             "vm_workspace": True,
@@ -238,16 +261,20 @@ async def prepare_fixture(
     expected_config = _expert_config(model_id)
     expert_row = await db.fetchrow(
         "SELECT id FROM experts WHERE name=$1 AND owner_id=$2",
-        expert_name, owner_id,
+        expert_name,
+        owner_id,
     )
     expert = (
         await db.get_expert_by_id(str(expert_row["id"]))
-        if expert_row is not None else None
+        if expert_row is not None
+        else None
     )
     if expert is None:
         created = await db.create_expert(
-            name=expert_name, display_name=f"A1 expert {run_id}",
-            expert_type="worker", owner_id=str(owner_id),
+            name=expert_name,
+            display_name=f"A1 expert {run_id}",
+            expert_type="worker",
+            owner_id=str(owner_id),
             config=expected_config,
             prompts={"persona": "Use only the run-owned deterministic provider."},
         )
@@ -263,20 +290,27 @@ async def prepare_fixture(
 
     job = await db.fetchrow(
         "SELECT id,user_id,expert_id,status::text AS status,execution_lane,"
-        "context,config_override FROM jobs WHERE id=$1", job_id,
+        "context,config_override FROM jobs WHERE id=$1",
+        job_id,
     )
     override = {
-        "workspace": {"backend": "vm", "vm": {
-            "image": vm_image, "cpu_cores": 2,
-            "memory": "2Gi", "disk_size": "12Gi",
-        }},
+        "workspace": {
+            "backend": "vm",
+            "vm": {
+                "image": vm_image,
+                "cpu_cores": 2,
+                "memory": "2Gi",
+                "disk_size": "12Gi",
+            },
+        },
     }
     if job is None:
         # The new paused row is invisible until its real execution snapshot and
         # closed queue tombstone have both committed. No worker can lease it.
         async with db.acquire() as conn, conn.transaction():
             if await conn.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM jobs WHERE id<>$1)", job_id,
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE id<>$1)",
+                job_id,
             ):
                 raise FixtureRefusal("A1 fixture database contains another Job")
             await db.create_job(
@@ -284,12 +318,18 @@ async def prepare_fixture(
                 context={"vm_retained_resume_acceptance_gate": run_id},
                 config_override=override,
                 requested_workspace_backend="vm",
-                status="paused", execution_lane="stateless",
-                user_id=str(owner_id), expert_id=str(expert_id),
-                origin="lifecycle", job_id=job_id, conn=conn,
+                status="paused",
+                execution_lane="stateless",
+                user_id=str(owner_id),
+                expert_id=str(expert_id),
+                origin="lifecycle",
+                job_id=job_id,
+                conn=conn,
             )
             await hold_worker_batch_for_preflight(
-                conn, job_id=job_id, preserve_attempts=True,
+                conn,
+                job_id=job_id,
+                preserve_attempts=True,
             )
     elif (
         job["user_id"] != owner_id
@@ -313,10 +353,13 @@ async def prepare_fixture(
         raise FixtureRefusal("A1 frozen image or model changed")
     queue = await db.fetchrow(
         "SELECT state,leased_by,lease_token FROM run_queue WHERE unit_id=$1 "
-        "AND unit_kind='worker_batch'", job_id,
+        "AND unit_kind='worker_batch'",
+        job_id,
     )
     if not queue or (queue["state"], queue["leased_by"], queue["lease_token"]) != (
-        "done", None, 0,
+        "done",
+        None,
+        0,
     ):
         raise FixtureRefusal("A1 fixture queue is not never-leased")
     if await db.fetchval(
@@ -330,7 +373,10 @@ async def prepare_fixture(
     preflight = _preflight(_json(context.get("vm")))
     if preflight is None:
         ack = await provisioner.create_vm(
-            str(job_id), cpu_cores=2, memory="2Gi", disk_size="12Gi",
+            str(job_id),
+            cpu_cores=2,
+            memory="2Gi",
+            disk_size="12Gi",
             vm_image=vm_image,
         )
         if (
@@ -354,20 +400,27 @@ async def prepare_fixture(
     ):
         raise FixtureRefusal("A1 real creation request changed frozen authority")
     return {
-        "job_id": str(job_id), "owner_id": str(owner_id),
-        "expert_id": str(expert_id), "request_id": preflight["request_id"],
+        "job_id": str(job_id),
+        "owner_id": str(owner_id),
+        "expert_id": str(expert_id),
+        "request_id": preflight["request_id"],
         "provision_generation": preflight["request"]["provision_generation"],
     }
 
 
 async def probe_ready_fixture(
-    db: Any, provisioner: Any, *, run_id: str, vm_image: str,
+    db: Any,
+    provisioner: Any,
+    *,
+    run_id: str,
+    vm_image: str,
     prepared: dict[str, str],
 ) -> dict[str, str] | None:
     """Read authenticated controller state; never manufacture Ready authority."""
     from orchestrator.services.vm_creation_preflight import _preflight
     from orchestrator.operator_cli.vm_retained_resume_pause import (
-        OwnerPauseHoldError, owned_pause_hold_id,
+        OwnerPauseHoldError,
+        owned_pause_hold_id,
     )
     from shared.vm_creation_retry import canonical_request_digest
     from shared.vm_network_profile import NETWORK_PROFILE, reusable_profile_evidence
@@ -375,7 +428,8 @@ async def probe_ready_fixture(
     job_id = UUID(prepared["job_id"])
     row = await db.fetchrow(
         "SELECT id,user_id,status::text AS status,execution_lane,"
-        "assigned_agent_id,context,config_override FROM jobs WHERE id=$1", job_id,
+        "assigned_agent_id,context,config_override FROM jobs WHERE id=$1",
+        job_id,
     )
     if not row:
         raise FixtureRefusal("A1 fixture Job disappeared")
@@ -394,10 +448,14 @@ async def probe_ready_fixture(
         or row["assigned_agent_id"] is not None
         or context.get("vm_retained_resume_acceptance_gate") != run_id
         or context.get("last_operator_pause_hold") is not None
-        or any(context.get(key) is not None for key in (
-            "_workspace_dispatch_authority", "_completion_control_claim",
-            "_stateless_control_claim",
-        ))
+        or any(
+            context.get(key) is not None
+            for key in (
+                "_workspace_dispatch_authority",
+                "_completion_control_claim",
+                "_stateless_control_claim",
+            )
+        )
         or workspace.get("backend") != "vm"
         or _json(workspace.get("vm")).get("image") != vm_image
         or preflight is None
@@ -423,8 +481,7 @@ async def probe_ready_fixture(
         status.get("ready") is not True
         or vm.get("status") != "ready"
         or vm.get("identity_authenticated") is not True
-        or vm.get("identity_provision_generation")
-        != prepared["provision_generation"]
+        or vm.get("identity_provision_generation") != prepared["provision_generation"]
         or vm.get("creation_request_id") != prepared["request_id"]
         or vm.get("provision_generation") != prepared["provision_generation"]
         or identity["vm_uid"] != status.get("vm_uid")
@@ -434,10 +491,13 @@ async def probe_ready_fixture(
         or not identity["pod_ip"]
         or not identity["ssh_host_key_fingerprint"]
         or not reusable_profile_evidence(
-            vm.get("network_profile_evidence"), NETWORK_PROFILE,
+            vm.get("network_profile_evidence"),
+            NETWORK_PROFILE,
             provision_generation=prepared["provision_generation"],
-            vm_uid=identity["vm_uid"], pvc_uid=identity["pvc_uid"],
-            vmi_uid=identity["vmi_uid"], launcher_uid=identity["launcher_uid"],
+            vm_uid=identity["vm_uid"],
+            pvc_uid=identity["pvc_uid"],
+            vmi_uid=identity["vmi_uid"],
+            launcher_uid=identity["launcher_uid"],
         )
     ):
         return None
@@ -460,8 +520,7 @@ async def probe_ready_fixture(
     if (
         str(retry["request_id"]) != prepared["request_id"]
         or retry["job_id"] != job_id
-        or str(retry["provision_generation"])
-        != prepared["provision_generation"]
+        or str(retry["provision_generation"]) != prepared["provision_generation"]
         or retry["state"] != "succeeded"
         or retry["reason"] != "creation_adopted"
         or str(retry["observed_vm_uid"]) != identity["vm_uid"]
@@ -475,12 +534,21 @@ async def probe_ready_fixture(
         return None
     queue = await db.fetchrow(
         "SELECT state,leased_by,lease_token FROM run_queue "
-        "WHERE unit_kind='worker_batch' AND unit_id=$1", job_id,
+        "WHERE unit_kind='worker_batch' AND unit_id=$1",
+        job_id,
     )
-    if not queue or (queue["state"], queue["leased_by"], queue["lease_token"]) != (
-        "done", None, 0,
-    ) or await db.fetchval(
-        "SELECT EXISTS(SELECT 1 FROM worker_batch_attempts WHERE job_id=$1)", job_id,
+    if (
+        not queue
+        or (queue["state"], queue["leased_by"], queue["lease_token"])
+        != (
+            "done",
+            None,
+            0,
+        )
+        or await db.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM worker_batch_attempts WHERE job_id=$1)",
+            job_id,
+        )
     ):
         raise FixtureRefusal("A1 fixture acquired a worker before acceptance")
     if retry["ready_at"] is None:
@@ -491,17 +559,24 @@ async def probe_ready_fixture(
         if context.get("_vm_creation_pending") != prepared["request_id"]:
             return None
         if not await settle_owned_fixture_ready(
-            db=db, job_id=str(job_id), owner_id=prepared["owner_id"],
-            run_id=run_id, marker_key="vm_retained_resume_acceptance_gate",
+            db=db,
+            job_id=str(job_id),
+            owner_id=prepared["owner_id"],
+            run_id=run_id,
+            marker_key="vm_retained_resume_acceptance_gate",
             request_id=prepared["request_id"],
             generation=prepared["provision_generation"],
-            vm_uid=identity["vm_uid"], pvc_uid=identity["pvc_uid"],
+            vm_uid=identity["vm_uid"],
+            pvc_uid=identity["pvc_uid"],
         ):
             return None
         # The production writer has changed only the pending/Ready receipt.
         # Re-read every live, source and queue predicate before returning it.
         return await probe_ready_fixture(
-            db, provisioner, run_id=run_id, vm_image=vm_image,
+            db,
+            provisioner,
+            run_id=run_id,
+            vm_image=vm_image,
             prepared=prepared,
         )
     if context.get("_vm_creation_pending") is not None:
@@ -510,40 +585,55 @@ async def probe_ready_fixture(
 
 
 async def wait_ready_fixture(
-    db: Any, provisioner: Any, core: Any, *, run_id: str,
-    namespace: str, vm_image: str, prepared: dict[str, str],
+    db: Any,
+    provisioner: Any,
+    core: Any,
+    *,
+    run_id: str,
+    namespace: str,
+    vm_image: str,
+    prepared: dict[str, str],
     timeout_seconds: int = 900,
 ) -> dict[str, str]:
     """Wait for real first-boot proof, then bind the retained PVC to its PV."""
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         identity = await probe_ready_fixture(
-            db, provisioner, run_id=run_id, vm_image=vm_image,
+            db,
+            provisioner,
+            run_id=run_id,
+            vm_image=vm_image,
             prepared=prepared,
         )
         if identity is not None:
             pvc = await asyncio.to_thread(
                 core.read_namespaced_persistent_volume_claim,
-                f"agent-vm-{prepared['job_id']}-rootdisk", namespace,
+                f"agent-vm-{prepared['job_id']}-rootdisk",
+                namespace,
             )
             if str(pvc.metadata.uid) != identity["pvc_uid"]:
                 raise FixtureRefusal("A1 retained PVC UID changed")
             if pvc.spec.volume_name:
                 pv = await asyncio.to_thread(
-                    core.read_persistent_volume, pvc.spec.volume_name,
+                    core.read_persistent_volume,
+                    pvc.spec.volume_name,
                 )
-                if (
-                    pv.metadata.uid
-                    and pv.spec.claim_ref.uid == pvc.metadata.uid
-                ):
-                    return {**identity, "pv_uid": str(pv.metadata.uid),
-                            "pv_name": pvc.spec.volume_name}
+                if pv.metadata.uid and pv.spec.claim_ref.uid == pvc.metadata.uid:
+                    return {
+                        **identity,
+                        "pv_uid": str(pv.metadata.uid),
+                        "pv_name": pvc.spec.volume_name,
+                    }
         await asyncio.sleep(2)
     raise FixtureRefusal("A1 first-boot Ready proof did not arrive")
 
 
 async def pause_ready_fixture(
-    db: Any, provisioner: Any, *, run_id: str, vm_image: str,
+    db: Any,
+    provisioner: Any,
+    *,
+    run_id: str,
+    vm_image: str,
     prepared: dict[str, str],
 ) -> str:
     """Use the real owner route to hold the proved, never-leased Ready Job."""
@@ -554,15 +644,24 @@ async def pause_ready_fixture(
     import httpx
 
     from orchestrator.operator_cli.vm_retained_resume_pause import (
-        OwnerPauseHoldError, owned_pause_hold_id,
+        OwnerPauseHoldError,
+        owned_pause_hold_id,
     )
 
     if os.environ.get("STATELESS_WORKER_ENABLED") != "false":
-        raise FixtureRefusal("A1 stateless admission must remain disabled during fixture")
-    if await probe_ready_fixture(
-        db, provisioner, run_id=run_id, vm_image=vm_image,
-        prepared=prepared,
-    ) is None:
+        raise FixtureRefusal(
+            "A1 stateless admission must remain disabled during fixture"
+        )
+    if (
+        await probe_ready_fixture(
+            db,
+            provisioner,
+            run_id=run_id,
+            vm_image=vm_image,
+            prepared=prepared,
+        )
+        is None
+    ):
         raise FixtureRefusal("A1 first-boot Ready source changed before owner Pause")
     job_id, owner_id = UUID(prepared["job_id"]), UUID(prepared["owner_id"])
     context = _json(await db.fetchval("SELECT context FROM jobs WHERE id=$1", job_id))
@@ -575,9 +674,11 @@ async def pause_ready_fixture(
     if existing is None:
         raw_token = "srw_" + secrets.token_urlsafe(32)
         issued = await db.create_mcp_token(
-            user_id=str(owner_id), name=f"a1-fixture-pause-{run_id}",
+            user_id=str(owner_id),
+            name=f"a1-fixture-pause-{run_id}",
             token_hash=hashlib.sha256(raw_token.encode()).hexdigest(),
-            token_prefix=raw_token[:12], scope="user",
+            token_prefix=raw_token[:12],
+            scope="user",
             expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
             origin="vm-retained-resume-fixture",
         )
@@ -589,17 +690,24 @@ async def pause_ready_fixture(
                     headers={"Authorization": f"Bearer {raw_token}"},
                 )
             if response.status_code != 200 or _json(response.json()) != {
-                "status": "paused", "job_id": str(job_id),
+                "status": "paused",
+                "job_id": str(job_id),
             }:
                 raise FixtureRefusal("A1 owner Pause route refused the fixture")
         finally:
             if not await db.revoke_mcp_token(str(issued["id"]), str(owner_id)):
                 raise FixtureRefusal("A1 owner Pause token could not be revoked")
     # This also checks current runtime/profile, adoption, queue and attempts.
-    if await probe_ready_fixture(
-        db, provisioner, run_id=run_id, vm_image=vm_image,
-        prepared=prepared,
-    ) is None:
+    if (
+        await probe_ready_fixture(
+            db,
+            provisioner,
+            run_id=run_id,
+            vm_image=vm_image,
+            prepared=prepared,
+        )
+        is None
+    ):
         raise FixtureRefusal("A1 first-boot Ready source changed after owner Pause")
     context = _json(await db.fetchval("SELECT context FROM jobs WHERE id=$1", job_id))
     try:
@@ -634,10 +742,10 @@ async def _async_main(args: argparse.Namespace) -> int:
         or args.namespace != args.run_id
         or os.environ.get("VM_NAMESPACE", args.namespace) != args.namespace
         or Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-        .read_text(encoding="utf-8").strip() != args.namespace
-        or args.output.parent != Path(
-            f"/tmp/srw-vm-retained-resume-gate/{args.run_id}"
-        )
+        .read_text(encoding="utf-8")
+        .strip()
+        != args.namespace
+        or args.output.parent != Path(f"/tmp/srw-vm-retained-resume-gate/{args.run_id}")
         or args.output.name != "fixture.json"
         or os.environ.get("STATELESS_WORKER_ENABLED") != "false"
     ):
@@ -653,34 +761,59 @@ async def _async_main(args: argparse.Namespace) -> int:
         core = client.CoreV1Api(api_client)
         inference_key = sys.stdin.readline(258).strip()
         await seed_model(
-            db, run_id=args.run_id, namespace=args.namespace,
-            model_id=args.model_id, inference_key=inference_key,
+            db,
+            run_id=args.run_id,
+            namespace=args.namespace,
+            model_id=args.model_id,
+            inference_key=inference_key,
         )
         prepared = await prepare_fixture(
-            db, provisioner, run_id=args.run_id, namespace=args.namespace,
-            vm_image=args.vm_image, model_id=args.model_id,
+            db,
+            provisioner,
+            run_id=args.run_id,
+            namespace=args.namespace,
+            vm_image=args.vm_image,
+            model_id=args.model_id,
         )
         ready = await wait_ready_fixture(
-            db, provisioner, core, run_id=args.run_id,
-            namespace=args.namespace, vm_image=args.vm_image,
+            db,
+            provisioner,
+            core,
+            run_id=args.run_id,
+            namespace=args.namespace,
+            vm_image=args.vm_image,
             prepared=prepared,
         )
         pause_hold_id = await pause_ready_fixture(
-            db, provisioner, run_id=args.run_id, vm_image=args.vm_image,
+            db,
+            provisioner,
+            run_id=args.run_id,
+            vm_image=args.vm_image,
             prepared=prepared,
         )
-        _atomic_result(args.output, {
-            "protocol_version": 1, "run_id": args.run_id,
-            "outcome": "ready", **prepared, **ready,
-            "pause_hold_id": pause_hold_id,
-        })
+        _atomic_result(
+            args.output,
+            {
+                "protocol_version": 1,
+                "run_id": args.run_id,
+                "outcome": "ready",
+                **prepared,
+                **ready,
+                "pause_hold_id": pause_hold_id,
+            },
+        )
         return 0
     except Exception as exc:
         # Database, Kubernetes, and controller errors may contain credentials.
-        _atomic_result(args.output, {
-            "protocol_version": 1, "run_id": args.run_id,
-            "outcome": "held", "error_class": type(exc).__name__,
-        })
+        _atomic_result(
+            args.output,
+            {
+                "protocol_version": 1,
+                "run_id": args.run_id,
+                "outcome": "held",
+                "error_class": type(exc).__name__,
+            },
+        )
         return 1
     finally:
         await provisioner.disconnect()

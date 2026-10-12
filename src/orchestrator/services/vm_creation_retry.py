@@ -78,15 +78,24 @@ class VMCreationRetryService:
                         claim["request_id"],
                     )
                     resource = (
-                        None if issued else await installed_job_resource_store(
-                            conn, self.db, claim.get("controller_configuration"),
+                        None
+                        if issued
+                        else await installed_job_resource_store(
+                            conn,
+                            self.db,
+                            claim.get("controller_configuration"),
                         )
                     )
                 if resource is not None:
-                    admission = await resource.admit(request_id=str(claim["request_id"]))
+                    admission = await resource.admit(
+                        request_id=str(claim["request_id"])
+                    )
                     if admission["action"] != "admitted":
                         local_wait = admission["action"] in {
-                            "wait", "nonfit", "protected", "nominate",
+                            "wait",
+                            "nonfit",
+                            "protected",
+                            "nominate",
                         }
                         await self.store.apply_observation(
                             request_id=str(claim["request_id"]),
@@ -96,7 +105,8 @@ class VMCreationRetryService:
                                 "outcome": "capacity_wait",
                                 "source": "resource_admission",
                                 "reason": (
-                                    "resource_wait" if local_wait
+                                    "resource_wait"
+                                    if local_wait
                                     else "resource_unavailable"
                                 ),
                             },
@@ -107,7 +117,10 @@ class VMCreationRetryService:
                     request_id=str(claim["request_id"]),
                     claim_token=str(claim["claim_token"]),
                     expected_revision=claim["revision"],
-                    observation={"outcome": "blocked", "reason": "resource_policy_changed"},
+                    observation={
+                        "outcome": "blocked",
+                        "reason": "resource_policy_changed",
+                    },
                 )
                 return
             try:
@@ -179,13 +192,16 @@ class VMCreationRetryService:
                 if mode not in {"enforce", "drain"}:
                     return
                 resource = await installed_job_resource_store(
-                    conn, self.db, {
+                    conn,
+                    self.db,
+                    {
                         "version": 3,
                         "resource_admission": {
                             "cluster_id": selected.inventory.cluster_id,
                             "policy_digest": selected.policy_digest,
                         },
-                    }, fresh=False,
+                    },
+                    fresh=False,
                 )
             maintenance = VMResourceWaiterMaintenance(resource)
             candidates = await maintenance.candidates(limit=8)
@@ -195,10 +211,9 @@ class VMCreationRetryService:
             # grants until the installed policy matches.
             logger.warning("VM resource waiter maintenance held (policy changed)")
             return
-        await self._bounded([
-            maintenance.maintain(request_id=request_id)
-            for request_id in candidates
-        ])
+        await self._bounded(
+            [maintenance.maintain(request_id=request_id) for request_id in candidates]
+        )
 
     async def reconcile_once(self):
         # Feature-off blocks new admission in the caller. Existing intent must

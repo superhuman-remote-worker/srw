@@ -39,7 +39,13 @@ class StatusCommitted(BaseException):
 
 
 async def through_status(
-    monkeypatch, db, runner, report, *, before_status=None, forge=None,
+    monkeypatch,
+    db,
+    runner,
+    report,
+    *,
+    before_status=None,
+    forge=None,
     agent_id=None,
 ):
     monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
@@ -70,7 +76,8 @@ async def through_status(
             None,
             str(runner.command["job_id"]),
             JobCompleteRequest(
-                **report, lease_token=None if agent_id else 71,
+                **report,
+                lease_token=None if agent_id else 71,
                 agent_id=agent_id,
             ),
             dependencies=dependencies,
@@ -120,7 +127,9 @@ async def test_actual_phase_completion_publishes_once_with_status_and_effect(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("missing_at", ["capture", "finalization"])
 async def test_missing_retained_pvc_never_publishes_s17_wait(
-    pg, monkeypatch, missing_at,
+    pg,
+    monkeypatch,
+    missing_at,
 ):
     from tests._previous_release_seed import seed_previous_release_row
 
@@ -129,8 +138,11 @@ async def test_missing_retained_pvc_never_publishes_s17_wait(
         vm["rootdisk_pvc_uid"] = None
         async with pg.acquire() as conn:
             await seed_previous_release_row(
-                conn, "jobs", "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
-                job_id, json.dumps({"vm": vm}),
+                conn,
+                "jobs",
+                "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
+                job_id,
+                json.dumps({"vm": vm}),
             )
     accepted = await accept(pg, job_id, report)
     if missing_at == "capture":
@@ -143,15 +155,19 @@ async def test_missing_retained_pvc_never_publishes_s17_wait(
             vm["rootdisk_pvc_uid"] = None
             async with pg.acquire() as conn:
                 await seed_previous_release_row(
-                    conn, "jobs", "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
-                    job_id, json.dumps({"vm": vm}),
+                    conn,
+                    "jobs",
+                    "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
+                    job_id,
+                    json.dumps({"vm": vm}),
                 )
 
     await through_status(monkeypatch, db, runner, report, before_status=lose_pvc)
     async with pg.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT status::text,workspace_idle_revision,workspace_idle_episode "
-            "FROM jobs WHERE id=$1", job_id,
+            "FROM jobs WHERE id=$1",
+            job_id,
         )
         assert row["status"] == "pending_review"
         assert row["workspace_idle_revision"] == 0

@@ -106,36 +106,54 @@ def test_captured_ordinary_launcher_has_all_six_requests():
 
 def test_ephemeral_and_device_peaks_follow_restartable_init_and_overhead():
     pod = _pod(
-        containers=[{
-            "name": "main",
-            "resources": {"requests": {
-                "cpu": "100m", "memory": "100",
-                "ephemeral-storage": "10M",
-                "devices.kubevirt.io/kvm": "1",
-                "devices.kubevirt.io/tun": "1",
-            }},
-        }],
+        containers=[
+            {
+                "name": "main",
+                "resources": {
+                    "requests": {
+                        "cpu": "100m",
+                        "memory": "100",
+                        "ephemeral-storage": "10M",
+                        "devices.kubevirt.io/kvm": "1",
+                        "devices.kubevirt.io/tun": "1",
+                    }
+                },
+            }
+        ],
         init_containers=[
-            {"name": "sidecar", "restartPolicy": "Always", "resources": {
-                "requests": {"ephemeral-storage": "2M", "devices.kubevirt.io/tun": "1"}
-            }},
-            {"name": "init", "resources": {
-                "requests": {"ephemeral-storage": "20M", "devices.kubevirt.io/vhost-net": "2"}
-            }},
+            {
+                "name": "sidecar",
+                "restartPolicy": "Always",
+                "resources": {
+                    "requests": {
+                        "ephemeral-storage": "2M",
+                        "devices.kubevirt.io/tun": "1",
+                    }
+                },
+            },
+            {
+                "name": "init",
+                "resources": {
+                    "requests": {
+                        "ephemeral-storage": "20M",
+                        "devices.kubevirt.io/vhost-net": "2",
+                    }
+                },
+            },
         ],
         overhead={"ephemeral-storage": "1M"},
     )
-    assert effective_pod_request(pod) == ResourceVector(
-        100, 100, 1, 23000000, 2, 2
-    )
+    assert effective_pod_request(pod) == ResourceVector(100, 100, 1, 23000000, 2, 2)
 
 
 def test_managed_launcher_refuses_unknown_device_even_in_status_allocation():
     pod = _pod()
-    pod["status"]["containerStatuses"] = [{
-        "name": pod["spec"]["containers"][0]["name"],
-        "allocatedResources": {"vendor.example/gpu": "1"},
-    }]
+    pod["status"]["containerStatuses"] = [
+        {
+            "name": pod["spec"]["containers"][0]["name"],
+            "allocatedResources": {"vendor.example/gpu": "1"},
+        }
+    ]
     with pytest.raises(ResourceAdmissionError, match="unsupported_launcher_resource"):
         effective_pod_request(pod, managed_launcher=True)
 

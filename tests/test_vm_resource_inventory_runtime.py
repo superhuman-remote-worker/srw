@@ -149,7 +149,9 @@ async def test_disabled_context_initializes_no_clients_or_tasks(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_enabled_context_yields_active_observer_until_resources_close(monkeypatch):
+async def test_enabled_context_yields_active_observer_until_resources_close(
+    monkeypatch,
+):
     entered, joined = asyncio.Event(), asyncio.Event()
     collector = object()
 

@@ -102,7 +102,8 @@ async def list_threads(
         owner_ids=[str(thread["id"]) for thread in result["threads"]],
         current_thread_creations={
             str(thread["id"]): thread["vm_creation"]
-            for thread in result["threads"] if thread.get("vm_creation") is not None
+            for thread in result["threads"]
+            if thread.get("vm_creation") is not None
         },
     )
     for thread in result["threads"]:

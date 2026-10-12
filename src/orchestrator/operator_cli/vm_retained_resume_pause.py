@@ -12,7 +12,9 @@ class OwnerPauseHoldError(ValueError):
 
 
 def owned_pause_hold_id(
-    context: Mapping | None, *, owner_id: str,
+    context: Mapping | None,
+    *,
+    owner_id: str,
     expected_hold_id: str | None = None,
 ) -> str | None:
     """Return a real public Pause hold ID, optionally bound to its prior output."""
@@ -23,7 +25,11 @@ def owned_pause_hold_id(
             raise OwnerPauseHoldError("A1 owner Pause hold is absent")
         return None
     if not isinstance(marker, Mapping) or set(marker) != {
-        "version", "hold_id", "source", "paused_by", "paused_at",
+        "version",
+        "hold_id",
+        "source",
+        "paused_by",
+        "paused_at",
     }:
         raise OwnerPauseHoldError("A1 owner Pause hold has an unknown shape")
     try:

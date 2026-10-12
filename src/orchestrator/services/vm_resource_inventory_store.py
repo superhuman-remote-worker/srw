@@ -48,8 +48,10 @@ class VMResourceInventoryStore:
         self.kubevirt_namespace = kubevirt_namespace
         self.kubevirt_name = kubevirt_name
         if protocol == 2 and (
-            not kubevirt_namespace or not kubevirt_name
-            or type(kubevirt_namespace) is not str or type(kubevirt_name) is not str
+            not kubevirt_namespace
+            or not kubevirt_name
+            or type(kubevirt_namespace) is not str
+            or type(kubevirt_name) is not str
         ):
             raise InventoryError("invalid_inventory_configuration")
         for limit in (max_items, max_bytes, stale_after_seconds, history_limit):

@@ -836,6 +836,7 @@ async def test_failed_vm_setup_handoff_does_not_reenter_outer_release_cleanup(
 
     task = asyncio.create_task(_exact_attach(monkeypatch))
     try:
+
         async def handoff_reached():
             while handoff.await_count == 0:
                 await asyncio.sleep(0.01)

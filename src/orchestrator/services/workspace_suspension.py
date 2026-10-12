@@ -1016,7 +1016,8 @@ class WorkspaceSuspensionService:
                         )
                 if replayed == "completed":
                     await complete_vm_cleanup_permit(
-                        self._workspace_recovery_store, cleanup,
+                        self._workspace_recovery_store,
+                        cleanup,
                         outcome=replayed,
                         provisioner=self._vm_provisioner,
                     )
@@ -1788,14 +1789,17 @@ class WorkspaceSuspensionService:
         ):
             wake_kwargs = (
                 {"wake_operation_id": wake_operation_id}
-                if wake_operation_id is not None else {}
+                if wake_operation_id is not None
+                else {}
             )
             if not _pinned_runtime_lock_held:
                 return await self.restore_thread_workspace(
-                    owner.id, **wake_kwargs,
+                    owner.id,
+                    **wake_kwargs,
                 )
             return await self.restore_thread_workspace(
-                owner.id, **wake_kwargs,
+                owner.id,
+                **wake_kwargs,
                 _pinned_runtime_lock_held=True,
             )
         if wake_operation_id is not None:
@@ -2121,18 +2125,19 @@ class WorkspaceSuspensionService:
                 # that state only from a fresh controller-attested exact live
                 # VM/VMI/launcher and unchanged retained PVC.
                 ready = await self._vm_provisioner.attest_workspace_runtime(
-                    thread_id, entity_type="thread",
+                    thread_id,
+                    entity_type="thread",
                 )
                 if (
                     ready.workspace_generation == vm_identity.provision_generation
                     and ready.vm_uid == vm_identity.vm_uid
                     and ready.rootdisk_pvc_uid == vm_identity.rootdisk_pvc_uid
                     and ready.vmi_uid == vm_attestation.vmi_uid
-                    and ready.launcher_pod_uid
-                        == vm_attestation.launcher_pod_uid
+                    and ready.launcher_pod_uid == vm_attestation.launcher_pod_uid
                 ):
                     await self._db.merge_thread_vm_context_if_provision_generation(
-                        thread_id, vm_identity.provision_generation,
+                        thread_id,
+                        vm_identity.provision_generation,
                         {"status": "ready", "_suspend_remote_io_closed": None},
                     )
             except Exception:
@@ -2155,9 +2160,7 @@ class WorkspaceSuspensionService:
 
         Returns True if provisioning + snapshot extraction succeeded.
         """
-        if not self._db or (
-            wake_operation_id is None and not self.is_enabled
-        ):
+        if not self._db or (wake_operation_id is None and not self.is_enabled):
             return False
 
         thread = await self._db.get_thread(thread_id)
@@ -2227,18 +2230,19 @@ class WorkspaceSuspensionService:
         # lifecycle rather than the suspend that put the thread here.
         rootdisk_kept = vm_ctx.get("rootdisk") == "kept"
         if (
-            rootdisk_kept and thread.get("execution_lane") == "pinned"
+            rootdisk_kept
+            and thread.get("execution_lane") == "pinned"
             and callable(getattr(type(self._db), "fetchval", None))
         ):
             open_idle = await self._db.fetchval(
                 "SELECT id FROM vm_idle_operations WHERE owner_kind='thread' "
-                "AND owner_id=$1::uuid AND closed_at IS NULL", thread_id,
+                "AND owner_id=$1::uuid AND closed_at IS NULL",
+                thread_id,
             )
             if open_idle is not None and str(open_idle) != wake_operation_id:
                 return False
         if wake_operation_id is not None and (
-            not is_vm or not rootdisk_kept
-            or thread.get("execution_lane") != "pinned"
+            not is_vm or not rootdisk_kept or thread.get("execution_lane") != "pinned"
         ):
             return False
 
