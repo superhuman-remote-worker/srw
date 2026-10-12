@@ -33,6 +33,7 @@ expert cannot start a session, and a session expert cannot run a job.
 | **Bug Hunter** | Worker | Adversarial testing with a reproduction for each finding; it hunts rather than fixes. |
 | **Product QA Tester** | Worker | Product-level usability and integration auditing with evidence-backed issue candidates; it does not fix them. |
 | **Writer** | Worker | User-facing prose — reports, documentation, guides, release notes, and copy — written for a named reader from the brief, the knowledge base, and cited sources. |
+| **Phone Desk** | Worker | The back office for one live phone call on a configured phone line: answers the questions the voice assistant hands over while the call lasts, then carries out the follow-ups. Started by the phone line, not chosen by hand. |
 
 Choose **General Worker** or **Assistant** when the task does not need a
 specialized role. Choose the role from the work you want performed, not from
