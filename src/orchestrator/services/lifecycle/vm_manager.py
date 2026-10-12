@@ -1364,6 +1364,8 @@ class VMInstanceManager:
             and pinned_retention_held
             and await pinned_retention_held(self._db, owner_id)
         ):
+            if isinstance(permit, LifecycleActionPermit):
+                permit.skip("pinned_ready_cancel_retention_held", settled=True)
             return None
 
         if purge_disk and owner_kind == "job":
@@ -1380,6 +1382,8 @@ class VMInstanceManager:
                 logger.info(
                     "Kept rootdisk purge held for terminal review job %s", owner_id
                 )
+                if isinstance(permit, LifecycleActionPermit):
+                    permit.skip("retained_terminal_rootdisk", settled=True)
                 return None
 
         parsed_owner_id, parsed_pvc_uid, request_id, resource_intent = (
