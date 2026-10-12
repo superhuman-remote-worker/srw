@@ -582,6 +582,7 @@ class PhoneDriver:
 
         backlog = await self._record.events(self.settings.call_id)
         answered: Set[str] = set()
+        noted: Set[str] = set()
         delegations: List[Dict[str, Any]] = []
         for row in backlog.get("events") or []:
             kind = row.get("kind")
@@ -601,22 +602,25 @@ class PhoneDriver:
                         "event_id": event_id,
                     }
                 )
-            elif kind in ("answer", "fallback", "follow_up") and row.get(
-                "delegation_id"
-            ):
+            elif kind in ("answer", "follow_up") and row.get("delegation_id"):
                 answered.add(str(row["delegation_id"]))
+            elif kind == "fallback" and row.get("delegation_id"):
+                noted.add(str(row["delegation_id"]))
             if event_id:
                 self._seen_event_ids.add(str(event_id))
         for item in delegations:
             if item["delegation_id"] in answered:
                 continue
+            if item["delegation_id"] in noted:
+                # The recorder told the caller it is noted before we attached:
+                # nothing to answer live, but it is a follow-up for after the call.
+                self._note_follow_up(item["delegation_id"], upto_turn=item["turn"])
+                continue
             await self._raise_question(item["delegation_id"], upto_turn=item["turn"])
 
-    async def _raise_question(
-        self, delegation_id: str, *, upto_turn: Optional[int] = None
-    ) -> None:
-        if delegation_id in self.questions:
-            return
+    def _request_upto(self, upto_turn: Optional[int]) -> str:
+        """What the caller said since the previous delegation (advances the mark)."""
+
         end = len(self.transcript.turns) if upto_turn is None else upto_turn
         request = (
             " ".join(
@@ -627,6 +631,28 @@ class PhoneDriver:
             or self.transcript.last_caller_text()
         )
         self._last_delegation_turn = end
+        return request
+
+    def _note_follow_up(self, delegation_id: str, *, upto_turn: Optional[int]) -> None:
+        if delegation_id in self.questions:
+            return
+        now = _utcnow().isoformat()
+        self.questions[delegation_id] = {
+            "delegation_id": delegation_id,
+            "request": self._request_upto(upto_turn),
+            "transcript_tail": self.transcript.render(last=_TRANSCRIPT_TAIL_TURNS),
+            "asked_at": now,
+            "answer_by": now,
+            "status": "follow_up",
+            "surfaced": True,
+        }
+
+    async def _raise_question(
+        self, delegation_id: str, *, upto_turn: Optional[int] = None
+    ) -> None:
+        if delegation_id in self.questions:
+            return
+        request = self._request_upto(upto_turn)
         now = _utcnow()
         question: Dict[str, Any] = {
             "delegation_id": delegation_id,

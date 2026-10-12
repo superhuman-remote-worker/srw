@@ -479,3 +479,48 @@ class TestPhoneJob:
         assert {"wait_agent", "message_agent", "delegate_agent"} <= set(
             cfg.tools.delegation
         )
+
+
+class TestBackfillFollowUps:
+    @pytest.mark.asyncio
+    async def test_a_request_the_recorder_noted_is_a_follow_up(
+        self, tmp_path, fake, monkeypatch
+    ):
+        session_id = await accepted_call(fake)
+        backlog = FakeRecord(
+            [
+                {
+                    "id": 1,
+                    "kind": "transcript",
+                    "speaker": "caller",
+                    "text": "Bitte rufen Sie mich zurück.",
+                    "event_id": "b1",
+                },
+                {
+                    "id": 2,
+                    "kind": "delegation",
+                    "delegation_id": "item_noted",
+                    "event_id": "b2",
+                },
+                {
+                    "id": 3,
+                    "kind": "fallback",
+                    "speaker": "recorder",
+                    "delegation_id": "item_noted",
+                    "event_id": "b3",
+                },
+            ]
+        )
+        monkeypatch.setattr(
+            phone_mod.CallRecordClient, "from_env", classmethod(lambda cls: backlog)
+        )
+        ctx = parent_with_call(tmp_path, fake, session_id)
+        runtime = runtime_for(ctx, ledger=StrictLedger())
+        handle = await start_phone(runtime)
+        await wait_attached(fake, session_id)
+        await fake.remote_hangup(session_id)
+        waited = await runtime.wait_agent(handle, 10)
+        assert waited["result"] == "ready"  # never surfaced as a live question
+        report = runtime._background[handle].envelope
+        assert "[follow_up] Bitte rufen Sie mich zurück." in report
+        await runtime.close()
