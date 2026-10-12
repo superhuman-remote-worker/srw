@@ -424,6 +424,20 @@ async def test_a_persons_end_leaves_a_live_batch_to_the_retirement(
 
             # --- the person's End reaches the orchestrator first ---
             begun = await _persons_end(orchestrator, seed)
+            # An already-admitted child transcript write can finish between
+            # _until_rows and End. Authorization serializes on the parent row,
+            # so this is the stable baseline for writes after the End.
+            fenced_rows = await _child_rows(pool, seed)
+            assert set(fenced_rows) == {finished, *running}
+            for call_id in fenced_rows:
+                for field in ("id", "runtime_generation", "parent_tool_call_id"):
+                    assert fenced_rows[call_id][field] == rows[call_id][field]
+            for call_id in running:
+                assert (
+                    fenced_rows[call_id]["status"],
+                    fenced_rows[call_id]["subagent_status"],
+                    fenced_rows[call_id]["subagent_outcome"],
+                ) == ("active", "running", None)
             owner = _watchdog_saw_the_end(monkeypatch, seed, begun, runtime)
 
             # --- the termination's Begin leaves the children to it ---
@@ -437,9 +451,9 @@ async def test_a_persons_end_leaves_a_live_batch_to_the_retirement(
             assert await _tool_rows(pool, seed) == []
             after = await _child_rows(pool, seed)
             assert set(after) == {finished, *running}
-            assert after[finished]["subagent_outcome"] == "completed"
+            assert after[finished] == fenced_rows[finished]
             for call_id in running:
-                assert after[call_id] == rows[call_id]  # still running, unwritten
+                assert after[call_id] == fenced_rows[call_id]  # unwritten after End
 
             # --- the termination cancels the turn: it writes nothing ---
             dying.turn.cancel()
