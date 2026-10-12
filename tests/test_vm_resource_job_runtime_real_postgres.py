@@ -22,6 +22,9 @@ from orchestrator.services.vm_creation_disposition_store import (
 from orchestrator.services.vm_resource_job_runtime import installed_job_resource_store
 from orchestrator.services.vm_workspace_recovery_store import VMWorkspaceRecoveryStore
 from orchestrator.services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
+from orchestrator.services.lifecycle.vm_manager import VMInstanceManager
+from orchestrator.services.lifecycle.reconciler import InstanceLifecycleReconciler
+from orchestrator.services.lifecycle.types import Instance
 from orchestrator.services.job_controls import JobControlOperations
 from shared.vm_creation_issuance import seal_creation_carrier
 from shared.vm_lifecycle_auth import AUTH_FIELD, sign_payload
@@ -59,6 +62,149 @@ from shared.pinned_session_identity import PinnedJobRecipient
 controller_setup = _controller_setup
 
 PROFILED_IMAGE = "registry.example/charged-idle@sha256:" + "a" * 64
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stop_case",
+    [
+        "exact",
+        "proof_missing",
+        "runtime_remnant",
+        "wrong_vmi",
+        "process_zero_missing",
+        "lost_claim",
+    ],
+)
+async def test_reaper_resumes_open_purge_after_controller_child_deleted(
+    db, monkeypatch, stop_case
+):
+    _, retry, admitted, _, ids = await charged_idle_wait(db, monkeypatch, lane="pinned")
+    owner_id = retry["job_id"]
+    await db.execute(
+        "UPDATE jobs SET status='pending_review',"
+        "context=jsonb_set(context,'{vm,status}',"
+        "'\"retiring_process_zero\"'::jsonb) WHERE id=$1",
+        owner_id,
+    )
+    if stop_case != "process_zero_missing":
+        await db.execute(
+            "INSERT INTO managed_repository_process_zero_receipts "
+            "(owner_kind,owner_id,scope,provisioner,runtime_incarnation) "
+            "VALUES('job',$1,'vm','vm',$2)",
+            owner_id,
+            ids["generation"],
+        )
+    identity = VMTeardownIdentity(ids["generation"], ids["vm_uid"], ids["pvc_uid"])
+    proof = {
+        "version": 1,
+        "kind": "vm_cleanup_physical_stop",
+        "job_id": str(owner_id),
+        "provision_generation": ids["generation"],
+        "vm_uid": ids["vm_uid"],
+        "vmi_uid": ids["vmi_uid"],
+        "launcher_uid": ids["launcher_uid"],
+        "pvc_uid": ids["pvc_uid"],
+        "vm_absent": True,
+        "vmi_absent": True,
+        "launcher_absent": True,
+        "same_generation_replacement": False,
+        "pvc_disposition": "purged",
+        "controller_authenticated": True,
+    }
+    if stop_case == "runtime_remnant":
+        proof["launcher_absent"] = False
+    if stop_case == "wrong_vmi":
+        proof["vmi_uid"] = str(uuid4())
+    provisioner = SimpleNamespace(
+        lifecycle_available=True,
+        capture_vm_teardown_identity=AsyncMock(return_value=identity),
+        attest_vm_cleanup_stop=AsyncMock(
+            return_value=None if stop_case == "proof_missing" else proof
+        ),
+        release_vm_captured=AsyncMock(),
+    )
+    store = VMWorkspaceRecoveryStore(db)
+    manager = VMInstanceManager(
+        provisioner, None, None, db, workspace_recovery_store=store
+    )
+    parent = await manager._admit_destructive_cleanup(
+        owner_kind="job",
+        owner_id=str(owner_id),
+        identity=identity,
+        source="delete",
+        purge_disk=True,
+    )
+    assert parent is not None and parent.allowed
+    child = await store.acquire_cleanup_permit(
+        owner_kind="job",
+        owner_id=owner_id,
+        pvc_uid=UUID(ids["pvc_uid"]),
+        request_id=uuid4(),
+        source="controller_rootdisk_delete",
+        intent_digest="sha256:controller-child-deleted",
+        parent_cleanup=parent.parent_cleanup,
+        parent_provision_generation=ids["generation"],
+        expected_vm_uid=ids["vm_uid"],
+    )
+    assert child.allowed
+    assert await store.complete_cleanup_permit(child.admission_id, outcome="deleted")
+    inst = Instance(
+        kind="vm",
+        id=f"agent-vm-{owner_id}",
+        bound_to=str(owner_id),
+        metadata={
+            "scope": "job",
+            "execution_lane": "pinned",
+            "job_status": "pending_review",
+            "vm_status": "retiring_process_zero",
+        },
+    )
+    if stop_case == "lost_claim":
+        from orchestrator.services.completion_lifecycle import (
+            LifecycleActionPermit,
+            LifecycleRouteDecision,
+        )
+
+        inst.metadata["_completion_lifecycle_permit"] = LifecycleActionPermit(
+            LifecycleRouteDecision(str(owner_id), "claimed")
+        )
+        manager._permit_external = AsyncMock(side_effect=[True, False])
+    manager.is_dirty = AsyncMock(return_value=True)
+    manager.give_up = AsyncMock()
+    stats = {"reaped": 0, "reap_forced": 0, "reap_attempts": 0}
+    await InstanceLifecycleReconciler([manager])._reap(manager, inst, stats)
+
+    charge = await db.fetchrow(
+        "SELECT state,release_evidence FROM vm_resource_reservations WHERE id=$1",
+        UUID(admitted["reservation_id"]),
+    )
+    parent_row = await db.fetchrow(
+        "SELECT completed_at,outcome FROM vm_workspace_cleanup_admissions WHERE id=$1",
+        parent.admission_id,
+    )
+    completed = stop_case == "exact"
+    assert stats["reaped"] == int(completed)
+    assert stats["reap_forced"] == 0
+    manager.is_dirty.assert_not_awaited()
+    manager.give_up.assert_not_awaited()
+    assert charge["state"] == ("released" if completed else "teardown")
+    assert (charge["release_evidence"] is not None) is completed
+    assert (parent_row["completed_at"] is not None) is completed
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_resource_cleanup_stop_receipts "
+        "WHERE cleanup_admission_id=$1",
+        parent.admission_id,
+    ) == int(completed)
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_workspace_cleanup_admissions WHERE "
+            "owner_kind='job' AND owner_id=$1 AND source='lifecycle_vm_delete'",
+            owner_id,
+        )
+        == 1
+    )
+    provisioner.release_vm_captured.assert_not_awaited()
 
 
 async def charged_idle_wait(db, monkeypatch, *, lane="stateless"):

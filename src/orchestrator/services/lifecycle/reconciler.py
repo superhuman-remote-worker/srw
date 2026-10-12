@@ -280,6 +280,17 @@ class InstanceLifecycleReconciler:
             if not await manager.is_reapable(inst):
                 permit.complete()
                 return
+            resume = getattr(manager, "resume_pending_cleanup", None)
+            if resume is not None:
+                disposition = await resume(inst)
+                if disposition == "completed":
+                    permit.complete()
+                    stats["reaped"] += 1
+                    return
+                if disposition == "held":
+                    # Preserve the original purge and avoid a second keep
+                    # intent for its deterministic request ID.
+                    return
             if not await manager.is_dirty(inst):
                 await manager.delete(inst, grace_s=0)
                 if permit.local:

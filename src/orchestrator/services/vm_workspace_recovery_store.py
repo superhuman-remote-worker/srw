@@ -9,7 +9,7 @@ import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Any, Mapping
+from typing import Any, Awaitable, Callable, Mapping
 from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
 
 from orchestrator.services.vm_workspace_recovery_telemetry import (
@@ -393,6 +393,48 @@ def cleanup_intent_digest(intent: Mapping[str, Any]) -> str:
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def lifecycle_vm_cleanup_identity(
+    *,
+    owner_kind: str,
+    owner_id: str,
+    identity: Any,
+    source: str,
+    purge_disk: bool,
+) -> tuple[UUID, UUID | None, UUID, dict[str, Any]]:
+    """The historical lifecycle request and its complete resource intent."""
+    try:
+        parsed_owner_id = UUID(str(owner_id))
+    except (TypeError, ValueError, AttributeError):
+        parsed_owner_id = uuid5(
+            NAMESPACE_URL, f"workspace-cleanup-owner:{owner_kind}:{owner_id}"
+        )
+    try:
+        parsed_pvc_uid = (
+            UUID(str(identity.rootdisk_pvc_uid))
+            if identity.rootdisk_pvc_uid is not None
+            else None
+        )
+    except (TypeError, ValueError, AttributeError):
+        parsed_pvc_uid = None
+    request_id = uuid5(
+        NAMESPACE_URL,
+        "workspace-cleanup:"
+        f"{source}:{owner_kind}:{owner_id}:{identity.provision_generation}:"
+        f"{identity.vm_uid}:{identity.rootdisk_pvc_uid}",
+    )
+    resource_intent = {
+        "owner_kind": owner_kind,
+        "owner_id": str(parsed_owner_id),
+        "provision_generation": identity.provision_generation,
+        "vm_uid": identity.vm_uid or "",
+        "pvc_uid": str(parsed_pvc_uid or ""),
+        "purge_disk": bool(purge_disk),
+        "resource": "vm_workspace",
+        "source": f"lifecycle_vm_{source}"[:64],
+    }
+    return parsed_owner_id, parsed_pvc_uid, request_id, resource_intent
+
+
 def completed_cleanup_outcome(permit: Any) -> str | None:
     """Read a durable replay outcome without trusting loose test doubles."""
 
@@ -757,6 +799,7 @@ async def complete_vm_cleanup_permit(
     *,
     outcome: str,
     provisioner: Any = None,
+    claim_current: Callable[[], Awaitable[bool]] | None = None,
 ) -> None:
     admission_id = getattr(permit, "admission_id", None)
     if admission_id is None:
@@ -800,6 +843,8 @@ async def complete_vm_cleanup_permit(
         # A caller's completed-outcome hint is not durable source authority.
         # The store refuses retained-disk parents unless the bound dedicated
         # path above validated their purge receipt; ordinary replay is a no-op.
+        if claim_current is not None and not await claim_current():
+            raise ResourceAdmissionError("lifecycle_claim_changed")
         await recovery_store.complete_cleanup_permit(admission_id, outcome=outcome)
         return
     if provisioner is None:
@@ -809,6 +854,8 @@ async def complete_vm_cleanup_permit(
     evidence = await provisioner.attest_vm_cleanup_stop(candidate)
     if evidence is None:
         raise ResourceAdmissionError("resource_cleanup_stop_unproven")
+    if claim_current is not None and not await claim_current():
+        raise ResourceAdmissionError("lifecycle_claim_changed")
     async with recovery_store.db.acquire() as conn, conn.transaction():
         scope = await _vm_cleanup_resource_scope(conn, recovery_store, permit)
         if scope is None:
@@ -1701,6 +1748,121 @@ class VMWorkspaceRecoveryStore:
                     purge_successor=purge_successor,
                 )
 
+    async def resume_open_lifecycle_vm_delete(
+        self,
+        *,
+        owner_id: UUID,
+        identity: Any,
+        request_id: UUID,
+        intent_digest: str,
+    ) -> CleanupPermit | None:
+        """Reacquire an existing, exact Job VM purge; never issue a new admission.
+
+        A later ordinary reaper may otherwise try to keep the same disk under
+        the purge's deterministic request ID.  Select and lock the open parent
+        first so this path cannot turn an absent or changed parent into a grant.
+        """
+        canonical_owner, expected_pvc_uid, expected_request_id, expected_intent = (
+            lifecycle_vm_cleanup_identity(
+                owner_kind="job",
+                owner_id=str(owner_id),
+                identity=identity,
+                source="delete",
+                purge_disk=True,
+            )
+        )
+        if (
+            canonical_owner != owner_id
+            or expected_pvc_uid is None
+            or expected_request_id != request_id
+            or cleanup_intent_digest(expected_intent) != intent_digest
+        ):
+            return CleanupPermit(
+                allowed=False, reason="cleanup_parent_identity_changed"
+            )
+        async with self.db.acquire() as conn, conn.transaction():
+            # Match ordinary admission's owner/PVC advisory and owner-row lock
+            # order before taking the admission row lock.
+            for lock_key in (
+                f"workspace-recovery:job:{owner_id}",
+                f"workspace-recovery-pvc:{expected_pvc_uid}",
+            ):
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    lock_key,
+                )
+            job = await conn.fetchrow(
+                "SELECT parent_job_id,context FROM jobs WHERE id=$1 FOR UPDATE",
+                owner_id,
+            )
+            rows = await conn.fetch(
+                "SELECT id,request_id,pvc_uid,source,intent_digest,"
+                "parent_admission_id FROM vm_workspace_cleanup_admissions "
+                "WHERE owner_kind='job' AND owner_id=$1 AND completed_at IS NULL "
+                "FOR UPDATE",
+                owner_id,
+            )
+            if not rows:
+                return None
+            if len(rows) != 1:
+                return CleanupPermit(allowed=False, reason="cleanup_parent_ambiguous")
+            row = rows[0]
+            try:
+                generation = str(UUID(str(identity.provision_generation)))
+                vm_uid = str(UUID(str(identity.vm_uid)))
+                pvc_uid = UUID(str(identity.rootdisk_pvc_uid))
+            except (AttributeError, TypeError, ValueError):
+                return CleanupPermit(allowed=False, reason="cleanup_identity_unproven")
+            if (
+                row["source"] != "lifecycle_vm_delete"
+                or row["request_id"] != request_id
+                or row["pvc_uid"] != pvc_uid
+                or row["pvc_uid"] != expected_pvc_uid
+                or row["intent_digest"] != intent_digest
+                or row["parent_admission_id"] is not None
+            ):
+                return CleanupPermit(
+                    allowed=False, reason="cleanup_parent_identity_changed"
+                )
+            canonical_owner, ambiguous = _job_workspace_owner(owner_id, job)
+            context = _json(job["context"]) if job is not None else None
+            vm = context.get("vm") if isinstance(context, dict) else None
+            if (
+                ambiguous
+                or canonical_owner != owner_id
+                or not isinstance(vm, dict)
+                or vm.get("identity_authenticated") is not True
+                or vm.get("identity_provision_generation") != generation
+                or vm.get("provision_generation") != generation
+                or vm.get("vm_uid") != vm_uid
+                or vm.get("rootdisk_pvc_uid") != str(pvc_uid)
+            ):
+                return CleanupPermit(allowed=False, reason="cleanup_identity_unproven")
+            # The normal admission method rechecks recovery, IDE leases and
+            # owner locks inside this transaction.  It can only return the
+            # selected row, which remains locked until the transaction ends.
+            return await self.acquire_cleanup_permit_on_conn(
+                conn,
+                owner_kind="job",
+                owner_id=owner_id,
+                pvc_uid=pvc_uid,
+                request_id=request_id,
+                source="lifecycle_vm_delete",
+                intent_digest=intent_digest,
+            )
+
+    async def has_open_lifecycle_vm_delete(self, owner_id: UUID) -> bool:
+        """Read-only selector before an authenticated external identity capture."""
+        async with self.db.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
+                    "WHERE owner_kind='job' AND owner_id=$1 "
+                    "AND source='lifecycle_vm_delete' AND completed_at IS NULL)",
+                    owner_id,
+                )
+            )
+
     async def acquire_cancelled_container_completion_replay(
         self, replay: Any
     ) -> CleanupPermit:
@@ -1998,9 +2160,15 @@ class VMWorkspaceRecoveryStore:
 
         try:
             await guard_retention_cleanup_on_conn(
-                conn, owner_kind=owner_kind, owner_id=owner_id, pvc_uid=pvc_uid,
-                source=source, request_id=request_id, intent_digest=intent_digest,
-                parent_admission_id=parent_id, bootstrap=_retained_purge_bootstrap,
+                conn,
+                owner_kind=owner_kind,
+                owner_id=owner_id,
+                pvc_uid=pvc_uid,
+                source=source,
+                request_id=request_id,
+                intent_digest=intent_digest,
+                parent_admission_id=parent_id,
+                bootstrap=_retained_purge_bootstrap,
             )
         except ResourceAdmissionError as exc:
             return CleanupPermit(allowed=False, reason=str(exc))
@@ -2255,7 +2423,9 @@ class VMWorkspaceRecoveryStore:
                     "FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
                     admission_id,
                 )
-                if row is None or any(row[key] != identity[key] for key in identity.keys()):
+                if row is None or any(
+                    row[key] != identity[key] for key in identity.keys()
+                ):
                     return False
                 if (
                     row is not None
@@ -2666,16 +2836,22 @@ class VMWorkspaceRecoveryStore:
                     admission_id,
                 )
                 if row is None:
-                    return CleanupPermit(allowed=False, reason="cleanup_reservation_changed")
+                    return CleanupPermit(
+                        allowed=False, reason="cleanup_reservation_changed"
+                    )
                 from orchestrator.services.vm_job_cancel_retention import (
                     guard_retention_cleanup_on_conn,
                 )
 
                 try:
                     await guard_retention_cleanup_on_conn(
-                        conn, owner_kind=row["owner_kind"], owner_id=row["owner_id"],
-                        pvc_uid=row["pvc_uid"], source=row["source"],
-                        request_id=row["request_id"], intent_digest=row["intent_digest"],
+                        conn,
+                        owner_kind=row["owner_kind"],
+                        owner_id=row["owner_id"],
+                        pvc_uid=row["pvc_uid"],
+                        source=row["source"],
+                        request_id=row["request_id"],
+                        intent_digest=row["intent_digest"],
                         parent_admission_id=row["parent_admission_id"],
                     )
                 except ResourceAdmissionError as exc:

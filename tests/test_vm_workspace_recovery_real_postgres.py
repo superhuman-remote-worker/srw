@@ -122,7 +122,10 @@ async def _schema_applied(pg_dsn: str) -> None:
             "SELECT to_regclass('public.vm_job_cancel_retention_authorities') IS NOT NULL"
         ):
             await conn.execute(
-                (SCHEMA_FILE.parent / "migrations/app/0338_vm_job_cancel_retention.sql").read_text()
+                (
+                    SCHEMA_FILE.parent
+                    / "migrations/app/0338_vm_job_cancel_retention.sql"
+                ).read_text()
             )
     finally:
         await conn.close()
@@ -554,6 +557,175 @@ async def test_cleanup_replay_binds_keep_vs_purge_and_returns_completed_outcome(
     assert replay.admission_id == permit.admission_id
     assert replay.completed_outcome == "completed"
     assert replay.reason == "cleanup_request_already_completed"
+
+
+@pytest.mark.asyncio
+async def test_open_lifecycle_vm_purge_resumes_only_exact_authenticated_parent(app_pg):
+    """An open purge may settle after its controller child; no keep is admitted."""
+    from uuid import NAMESPACE_URL, uuid5
+
+    from orchestrator.services.vm_provisioner import VMTeardownIdentity
+    from orchestrator.services.vm_workspace_recovery_store import cleanup_intent_digest
+
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
+    owner_id = await insert_cleanup_owner_job(app_pg)
+    generation, vm_uid, pvc_uid = (uuid4() for _ in range(3))
+    identity = VMTeardownIdentity(str(generation), str(vm_uid), str(pvc_uid))
+    request_id = uuid5(
+        NAMESPACE_URL,
+        f"workspace-cleanup:delete:job:{owner_id}:{generation}:{vm_uid}:{pvc_uid}",
+    )
+    intent = {
+        "owner_kind": "job",
+        "owner_id": str(owner_id),
+        "provision_generation": str(generation),
+        "vm_uid": str(vm_uid),
+        "pvc_uid": str(pvc_uid),
+        "purge_disk": True,
+        "resource": "vm_workspace",
+        "source": "lifecycle_vm_delete",
+    }
+    digest = cleanup_intent_digest(intent)
+    await app_pg.execute(
+        "UPDATE jobs SET context=jsonb_build_object('vm',jsonb_build_object("
+        "'provision_generation',$2::text,'identity_authenticated',true,"
+        "'identity_provision_generation',$2::text,'vm_uid',$3::text,"
+        "'rootdisk_pvc_uid',$4::text)) WHERE id=$1",
+        owner_id,
+        str(generation),
+        str(vm_uid),
+        str(pvc_uid),
+    )
+    original = await store.acquire_cleanup_permit(
+        owner_kind="job",
+        owner_id=owner_id,
+        pvc_uid=pvc_uid,
+        request_id=request_id,
+        source="lifecycle_vm_delete",
+        intent_digest=digest,
+    )
+    assert original.allowed
+    # A later keep would collide. The resumed permit must be the original row.
+    with pytest.raises(WorkspaceRecoveryControlConflict):
+        await store.acquire_cleanup_permit(
+            owner_kind="job",
+            owner_id=owner_id,
+            pvc_uid=pvc_uid,
+            request_id=request_id,
+            source="lifecycle_vm_delete",
+            intent_digest=cleanup_intent_digest({**intent, "purge_disk": False}),
+        )
+    resumed = await store.resume_open_lifecycle_vm_delete(
+        owner_id=owner_id,
+        identity=identity,
+        request_id=request_id,
+        intent_digest=digest,
+    )
+    assert resumed is not None and resumed.allowed
+    assert resumed.admission_id == original.admission_id
+    assert (
+        await app_pg.fetchval(
+            "SELECT count(*) FROM vm_workspace_cleanup_admissions WHERE owner_id=$1",
+            owner_id,
+        )
+        == 1
+    )
+
+    for changed in (
+        {"request_id": uuid4()},
+        {"intent_digest": "sha256:" + "0" * 64},
+        {"identity": VMTeardownIdentity(str(uuid4()), str(vm_uid), str(pvc_uid))},
+        {"identity": VMTeardownIdentity(str(generation), str(uuid4()), str(pvc_uid))},
+        {"identity": VMTeardownIdentity(str(generation), str(vm_uid), str(uuid4()))},
+        {"owner_id": uuid4()},
+    ):
+        result = await store.resume_open_lifecycle_vm_delete(
+            **{
+                "owner_id": owner_id,
+                "identity": identity,
+                "request_id": request_id,
+                "intent_digest": digest,
+                **changed,
+            }
+        )
+        assert result is None or not result.allowed
+    await app_pg.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,identity_authenticated}',"
+        "'false'::jsonb) WHERE id=$1",
+        owner_id,
+    )
+    refused = await store.resume_open_lifecycle_vm_delete(
+        owner_id=owner_id,
+        identity=identity,
+        request_id=request_id,
+        intent_digest=digest,
+    )
+    assert refused is not None and not refused.allowed
+    for key, wrong in (
+        ("identity_provision_generation", str(uuid4())),
+        ("vm_uid", str(uuid4())),
+        ("rootdisk_pvc_uid", str(uuid4())),
+    ):
+        await app_pg.execute(
+            "UPDATE jobs SET context=jsonb_set(jsonb_set(context,"
+            "'{vm,identity_authenticated}','true'::jsonb),"
+            "ARRAY['vm',$2],to_jsonb($3::text)) WHERE id=$1",
+            owner_id,
+            key,
+            wrong,
+        )
+        changed = await store.resume_open_lifecycle_vm_delete(
+            owner_id=owner_id,
+            identity=identity,
+            request_id=request_id,
+            intent_digest=digest,
+        )
+        assert changed is not None and not changed.allowed
+        await app_pg.execute(
+            "UPDATE jobs SET context=jsonb_set(context,ARRAY['vm',$2],"
+            "to_jsonb($3::text)) WHERE id=$1",
+            owner_id,
+            key,
+            {
+                "identity_provision_generation": str(generation),
+                "vm_uid": str(vm_uid),
+                "rootdisk_pvc_uid": str(pvc_uid),
+            }[key],
+        )
+
+    other_owner = await insert_cleanup_owner_job(app_pg)
+    other_pvc = uuid4()
+    await app_pg.execute(
+        "UPDATE jobs SET context=jsonb_set((SELECT context FROM jobs WHERE id=$1),"
+        "'{vm,rootdisk_pvc_uid}',to_jsonb($3::text)) WHERE id=$2",
+        owner_id,
+        other_owner,
+        str(other_pvc),
+    )
+    other_identity = VMTeardownIdentity(str(generation), str(vm_uid), str(other_pvc))
+    other_request = uuid5(
+        NAMESPACE_URL,
+        f"workspace-cleanup:delete:job:{other_owner}:{generation}:{vm_uid}:{other_pvc}",
+    )
+    other_digest = cleanup_intent_digest(
+        {**intent, "owner_id": str(other_owner), "pvc_uid": str(other_pvc)}
+    )
+    wrong_source = await store.acquire_cleanup_permit(
+        owner_kind="job",
+        owner_id=other_owner,
+        pvc_uid=other_pvc,
+        request_id=other_request,
+        source="lifecycle_vm_give_up",
+        intent_digest=other_digest,
+    )
+    assert wrong_source.allowed
+    selected = await store.resume_open_lifecycle_vm_delete(
+        owner_id=other_owner,
+        identity=other_identity,
+        request_id=other_request,
+        intent_digest=other_digest,
+    )
+    assert selected is not None and not selected.allowed
 
 
 @pytest.mark.asyncio
