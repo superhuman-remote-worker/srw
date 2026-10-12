@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
+import time
 
 import pytest
 
@@ -277,11 +278,22 @@ def test_digest_refuses_common_credential_spellings(field):
         "--token=secret",
         "Authorization: Bearer secret",
         "curl https://user:secret@example.com",
+        "curl 1+https://user:secret@example.com",
     ],
 )
 def test_digest_refuses_recognizable_credentials_in_command_arguments(argument):
     with pytest.raises(ValueError):
         canonical_request_digest({"initialization": {"command": [argument]}})
+
+
+@pytest.mark.parametrize("tail", ["", "://", " ://x"])
+def test_digest_scans_a_long_scheme_run_in_linear_time(tail):
+    # The URL scan once restarted at every letter of a run with no "://"
+    # after it: about 20 s for this argument, against milliseconds now.
+    argument = "a" * 200_000 + tail
+    started = time.perf_counter()
+    canonical_request_digest({"initialization": {"command": [argument]}})
+    assert time.perf_counter() - started < 1.0
 
 
 def test_digest_refuses_cycles_and_invalid_unicode_without_coercing_them():

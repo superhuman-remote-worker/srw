@@ -163,7 +163,13 @@ def _validate_json(value: object, depth: int = 0) -> None:
             or (value.startswith("--") and _sensitive_key(value[2:]))
         ):
             raise ValueError("Create options must not contain credentials.")
-        for url in re.findall(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+", value):
+        # A match starts only where a run of scheme characters starts (its
+        # first letter, as before): restarting inside every run made a long
+        # run without "://" quadratic.
+        for url in re.findall(
+            r"(?<![A-Za-z0-9+.-])[0-9+.-]*([A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+)",
+            value,
+        ):
             parsed = urlsplit(url)
             if (
                 parsed.username is not None
