@@ -27,6 +27,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 
+from orchestrator.services.telephony.jobs import dispatch_config
 from orchestrator.services.model_availability import (
     ModelUnavailable,
     UnavailableModel,
@@ -609,4 +610,7 @@ async def inject_dispatch_credentials(
             job_id,
             [entry.as_dict() for entry in unavailable],
         )
+    telephony = await dispatch_config(postgres_db, job)
+    if telephony is not None:
+        config_override["telephony"] = telephony
     return config_override

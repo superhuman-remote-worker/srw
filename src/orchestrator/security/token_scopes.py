@@ -155,6 +155,7 @@ _RULES: tuple[_Rule, ...] = (
     # -- PATs never ---------------------------------------------------------
     *(_prefix(path, _REFUSED) for path in _INTERNAL_ROUTES),
     _prefix("/api/internal", _REFUSED),
+    _prefix("/api/telephony", _REFUSED),
     _prefix("/api/runtime-actors", _REFUSED),
     # -- Reads that write -----------------------------------------------------
     *(

@@ -559,6 +559,10 @@ async def inject_blob_credentials(
         agent["research"] = copy.deepcopy(co["research"])
     else:
         agent.pop("research", None)
+    if isinstance(co.get("telephony"), dict):
+        agent["telephony"] = copy.deepcopy(co["telephony"])
+    else:
+        agent.pop("telephony", None)
     co_sub = co.get("subagents")
     if isinstance(co_sub, dict) and isinstance(agent.get("subagents"), dict):
         sub = agent["subagents"]
