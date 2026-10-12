@@ -286,6 +286,15 @@ ruff format --check src/ tests/
 ./scripts/pytest-fast.sh tests/ -q --tb=short --maxfail=0
 ```
 
+CI never formats code for you: main's lint refuses unformatted files, and
+develop's lint only reports them. Install the repository's pre-commit hook
+once per clone, and it formats the staged Python files under `src/` and
+`tests/` before each commit:
+
+```bash
+git config core.hooksPath scripts/git-hooks
+```
+
 The runner defaults to the smaller of the detected CPU count and eight workers.
 It uses `--dist loadfile`, keeping all tests from a file on the same worker so
 module-scoped fixtures retain their normal lifetime. Both `main` and `develop`

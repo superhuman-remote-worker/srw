@@ -3,7 +3,8 @@ name: develop
 # Lightweight CI for the develop branch.
 #
 # Key differences from the main (Production) pipeline:
-#   - Lint is non-blocking — ruff format auto-commits fixes on push
+#   - Lint gates nothing, but turns red on code main's blocking lint would
+#     refuse; scripts/git-hooks/pre-commit formats before a commit
 #   - Tests and builds are change-based (only run when relevant files change)
 #   - Images get SHA + :experimental tags (no version tags)
 #   - Helm chart published as "srw-dev" with monotonic 0.0.<run_number> versions
@@ -107,14 +108,17 @@ jobs:
         run: lint-imports --verbose
 
   # ---------------------------------------------------------------------------
-  # Auto-format + lint (non-blocking — failures don't gate builds)
-  # On push: auto-commits ruff format fixes so develop stays clean.
+  # Lint — the same ruff checks as main's blocking lint. A failure turns this
+  # job red and gates nothing here. Formatting happens before a commit
+  # (scripts/git-hooks/pre-commit), never in CI: the ruleset refuses a direct
+  # push to develop, and that is how an auto-format push failed silently from
+  # 2026-09-14 until the develop -> main PR went red.
   # ---------------------------------------------------------------------------
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -129,13 +133,13 @@ jobs:
 
       - name: Ruff lint check
         run: ruff check src/ tests/
-        continue-on-error: true
 
       - name: Ruff format check
+        if: ${{ !cancelled() }}
         run: ruff format --check src/ tests/
-        continue-on-error: true
 
       - name: Verify Playwright pin consistency
+        if: ${{ !cancelled() }}
         run: |
           # The agent image has no Playwright; the pin only feeds the
           # workspace/VM builds (.playwright-version is the source of truth,
@@ -147,19 +151,6 @@ jobs:
           grep -q "^PLAYWRIGHT_VERSION=${PIN}$" .env.example \
             || { echo "::error::PLAYWRIGHT_VERSION in .env.example does not match .playwright-version (${PIN})"; exit 1; }
         continue-on-error: true
-
-      - name: Auto-format and commit
-        if: github.event_name == 'push'
-        continue-on-error: true
-        run: |
-          ruff format src/ tests/
-          if ! git diff --quiet; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add src/ tests/
-            git commit -m "style: ruff auto-format"
-            git push origin HEAD:develop
-          fi
 
   # ---------------------------------------------------------------------------
   # Chart correctness gates (Phase 1) — render matrix + schema validation.
@@ -526,7 +517,6 @@ jobs:
   # audit job above remains the blocking policy gate.
   # ---------------------------------------------------------------------------
   license-inventory:
-    needs: [lint]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 12
