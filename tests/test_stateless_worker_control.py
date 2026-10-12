@@ -1657,6 +1657,11 @@ async def test_resume_retries_pinned_verb_after_vm_lane_repair(monkeypatch):
     monkeypatch.setattr(
         main.app.state.resources.postgres_db, "supports_vm_creation_retry", False
     )
+    monkeypatch.setattr(
+        PostgresDB,
+        "pinned_ready_cancel_retention_held",
+        AsyncMock(return_value=False),
+    )
 
     job = {
         "id": JOB_ID,
@@ -1989,7 +1994,9 @@ async def test_flag_on_completed_pinned_cancel_stays_completed_without_cleanup(
 async def test_pinned_cancel_linearizer_has_terminal_status_parity_guard():
     conn = AsyncMock()
     conn.transaction = MagicMock(return_value=_AsyncCM())
-    conn.fetchrow = AsyncMock(return_value={"id": UUID(JOB_ID)})
+    conn.fetchrow = AsyncMock(
+        side_effect=lambda sql, *_: {"context": {}} if "FROM jobs" in sql else None
+    )
     conn.fetchval = AsyncMock(return_value=False)
     conn.execute.return_value = "UPDATE 0"
     db = _db_with_conn(conn)
@@ -2015,6 +2022,10 @@ async def test_cancel_sql_names_control_marker_only_when_completion_flag_on():
             return {"state": "queued"}
         if normalized.startswith("SELECT unit_id FROM run_queue"):
             return {"unit_id": UUID(JOB_ID)}
+        if normalized.startswith("SELECT * FROM jobs"):
+            return {"context": {}}
+        if normalized.startswith("SELECT * FROM vm_creation_retries"):
+            return None
         if normalized.startswith("SELECT id FROM jobs"):
             return {"id": UUID(JOB_ID)}
         if normalized.startswith("UPDATE run_queue"):

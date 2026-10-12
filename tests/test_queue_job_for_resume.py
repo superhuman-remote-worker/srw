@@ -23,6 +23,9 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import CompletionDecisionBlocked, PostgresDB
+from tests._container_recovery_schema import (
+    create_undischarged_pinned_cancel_retention_ledger,
+)
 from shared.subagent_parent_authority import (
     ParentExecutionAuthority,
     ParentExecutionAuthorityRefused,
@@ -147,6 +150,7 @@ async def db(pg_dsn):
             )
             """
         )
+        await create_undischarged_pinned_cancel_retention_ledger(conn)
         await conn.execute("TRUNCATE threads, agents, jobs, vm_idle_operations")
         await conn.execute(
             """
@@ -182,6 +186,25 @@ async def test_reply_resume_clears_freeze_so_dispatcher_sees_job(db):
         "a job resumed by a human reply must satisfy the dispatcher's "
         "freeze_data IS NULL contract"
     )
+
+
+@pytest.mark.asyncio
+async def test_pending_pinned_cancel_retention_blocks_resume_without_shedding(db):
+    """The SQL CAS must preserve a held Job even if the route guard is skipped."""
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO vm_job_cancel_retention_authorities "
+            "(cleanup_admission_id,job_id,policy_version) VALUES(gen_random_uuid(),$1,4)",
+            UUID(JOB),
+        )
+    assert not await db.queue_job_for_resume(JOB, {"queued_feedback": "later"})
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status,freeze_data,context FROM jobs WHERE id=$1", UUID(JOB)
+        )
+    assert row["status"] == "waiting_for_reply"
+    assert row["freeze_data"] is not None
+    assert "queued_feedback" not in json.loads(row["context"])
 
 
 @pytest.mark.asyncio

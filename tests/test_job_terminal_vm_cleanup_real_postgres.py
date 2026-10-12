@@ -146,6 +146,17 @@ async def test_pinned_cancel_marks_intent_without_purging_historical_terminal_vm
 
     # A terminal status alone is not a new instruction to purge a disk.
     assert await db.list_terminal_vm_cleanup_jobs(limit=4) == []
+    # This legacy fixture has no exact Ready creation/reservation proof. It
+    # must remain untouched until its VM is known to be non-Ready.
+    assert not await db.linearize_pinned_cancel(
+        str(cancelled), expected_status="paused", completion_commands_enabled=True
+    )
+    assert await db.list_terminal_vm_cleanup_jobs(limit=4) == []
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',"
+        "'\"failed\"'::jsonb) WHERE id=$1",
+        cancelled,
+    )
     assert await db.linearize_pinned_cancel(
         str(cancelled),
         expected_status="paused",
@@ -385,7 +396,7 @@ async def test_self_owned_child_pinned_and_stateless_cleanup_select_null_safe(db
         ("true", True),
     ):
         vm = {
-            "status": "ready",
+            "status": "failed",
             "provision_generation": str(uuid4()),
             "rootdisk_pvc_uid": str(uuid4()),
         }

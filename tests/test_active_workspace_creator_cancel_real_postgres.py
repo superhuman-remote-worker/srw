@@ -281,7 +281,7 @@ async def _wait_for_row_contender(conn, task):
             if await conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM pg_stat_activity "
                 "WHERE datname=current_database() AND pid<>pg_backend_pid() "
-                "AND wait_event_type='Lock' AND query LIKE '%SELECT id FROM jobs%FOR UPDATE%')"
+                "AND wait_event_type='Lock' AND query LIKE '%FROM jobs WHERE id=$1 FOR UPDATE%')"
             ):
                 return
             await asyncio.sleep(0.01)

@@ -23,7 +23,10 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
-from tests._container_recovery_schema import create_empty_container_recovery_ledger
+from tests._container_recovery_schema import (
+    create_empty_container_recovery_ledger,
+    create_undischarged_pinned_cancel_retention_ledger,
+)
 
 JOB = "4435994d-b029-444d-8a3c-26c64abd456a"
 
@@ -59,6 +62,7 @@ async def db(pg_dsn):
             """
         )
         await create_empty_container_recovery_ledger(conn)
+        await create_undischarged_pinned_cancel_retention_ledger(conn)
         await conn.execute("TRUNCATE jobs")
         await conn.execute(
             "INSERT INTO jobs (id, status, context) VALUES ($1, 'failed', $2::jsonb)",

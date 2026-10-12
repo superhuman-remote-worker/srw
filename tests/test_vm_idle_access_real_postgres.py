@@ -244,6 +244,16 @@ async def test_pinned_cancel_conflicts_with_live_ide_writer_then_wins_after_clos
         kind="ide",
         claimant=writer["claimed_by"],
     )
+    # seed_wait's synthetic Ready row has no ready_at/reservation proof. The
+    # new retention admission correctly refuses it even after the IDE closes.
+    assert not await db.linearize_pinned_cancel(
+        str(owner), expected_status="waiting_for_reply"
+    )
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',"
+        "'\"failed\"'::jsonb) WHERE id=$1",
+        owner,
+    )
     assert await db.linearize_pinned_cancel(
         str(owner),
         expected_status="waiting_for_reply",

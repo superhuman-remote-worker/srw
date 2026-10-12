@@ -27,3 +27,24 @@ async def create_empty_container_recovery_ledger(conn):
         TRUNCATE managed_repository_workspace_cleanup_intents;
         """
     )
+
+
+async def create_undischarged_pinned_cancel_retention_ledger(conn):
+    """Model the pending policy-4 CAS dependency in partial Job schemas.
+
+    The production discharge proof lives in migration 0528. These fixtures
+    exercise unrelated resume/context writes and only need its conservative
+    undischarged state; full-chain tests cover actual settlement/discharge.
+    """
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS vm_job_cancel_retention_authorities (
+            cleanup_admission_id uuid PRIMARY KEY,
+            job_id uuid NOT NULL,
+            policy_version integer NOT NULL
+        );
+        CREATE OR REPLACE FUNCTION public.vm_job_cancel_retention_discharged(uuid)
+        RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT false $$;
+        TRUNCATE vm_job_cancel_retention_authorities;
+        """
+    )

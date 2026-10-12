@@ -189,7 +189,11 @@ class _FakeAsyncClient:
 @pytest.fixture
 def fake_conn(monkeypatch):
     """postgres_db.acquire() -> conn with a recorded execute()."""
-    conn = SimpleNamespace(execute=AsyncMock(), fetchrow=AsyncMock(return_value=None))
+    conn = SimpleNamespace(
+        execute=AsyncMock(),
+        fetchrow=AsyncMock(return_value=None),
+        fetchval=AsyncMock(return_value=False),
+    )
 
     @asynccontextmanager
     async def _acquire():
@@ -876,6 +880,22 @@ def endpoint_collaborators(monkeypatch, fake_conn):
 
 
 class TestResumeEndpointDelegation:
+    @pytest.mark.asyncio
+    async def test_pending_pinned_retention_blocks_resume_before_delivery(
+        self, endpoint_collaborators
+    ):
+        endpoint_collaborators.conn.fetchval.return_value = True
+
+        with pytest.raises(HTTPException) as denied:
+            await control_seams.resume_job(
+                MagicMock(), JOB_ID, job_controls_module.JobResumeRequest()
+            )
+
+        assert denied.value.status_code == 409
+        assert denied.value.detail["code"] == "pinned_ready_cancel_retention_held"
+        endpoint_collaborators.delegate.assert_not_awaited()
+        endpoint_collaborators.queue_for_resume.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_uidless_k8s_runtime_queues_for_live_adoption_without_shedding(
         self, endpoint_collaborators, monkeypatch
