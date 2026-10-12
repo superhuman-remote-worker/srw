@@ -8,6 +8,7 @@ class OwnerAsyncio:
     def __init__(self, *, advance_clock=False):
         self.elapsed = 0.0
         self.advance_clock = advance_clock
+        self._origin = None
 
     def __getattr__(self, name):
         return getattr(asyncio, name)
@@ -15,7 +16,9 @@ class OwnerAsyncio:
     def get_running_loop(self):
         loop = asyncio.get_running_loop()
         if self.advance_clock:
-            return SimpleNamespace(time=lambda: loop.time() + self.elapsed)
+            if self._origin is None:
+                self._origin = loop.time()
+            return SimpleNamespace(time=lambda: self._origin + self.elapsed)
         return loop
 
     async def sleep(self, delay):

@@ -710,6 +710,20 @@ async def test_acceptance_and_unknown_pod_keep_real_resource_charge(db, monkeypa
     assert not await db.resume_thread(thread_id)
 
 
+def test_accelerated_owner_clock_excludes_real_loop_time(monkeypatch):
+    from tests import _asyncio_clock
+
+    times = iter((1000.0, 1000.5, 1001.0))
+    loop = NS(time=lambda: next(times))
+    monkeypatch.setattr(_asyncio_clock, "asyncio", NS(get_running_loop=lambda: loop))
+    clock = _asyncio_clock.OwnerAsyncio(advance_clock=True)
+
+    origin = clock.get_running_loop().time()
+    assert clock.get_running_loop().time() == origin
+    clock.elapsed = 60.0
+    assert clock.get_running_loop().time() == origin + 60.0
+
+
 # ---------------------------------------------------------------------------
 # Soft End keeps the root disk; a later permanent Delete reclaims it
 # ---------------------------------------------------------------------------
