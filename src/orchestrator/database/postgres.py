@@ -6225,6 +6225,15 @@ class PostgresDB:
                                   AND a.completed_at IS NOT NULL AND a.outcome='completed'
                             )
                         )
+                        OR (
+                            j.status='completed' AND j.execution_lane='pinned'
+                            AND j.context->'vm'->>'status'='deleted'
+                            AND j.context->'_job_terminal_vm_cleanup'=jsonb_build_object(
+                                'version',1,'source','approve','provision_generation',
+                                j.context->'vm'->>'provision_generation')
+                            AND j.context->'vm'->>'vm_uid' IS NOT NULL
+                            AND j.context->'vm'->>'rootdisk_pvc_uid' IS NOT NULL
+                        )
                       )
                     )
                   )
@@ -6327,6 +6336,73 @@ class PostgresDB:
                           j.context->'vm'->>'rootdisk_pvc_uid'
                       AND a.completed_at IS NOT NULL AND a.outcome='completed'
                   )
+                RETURNING j.id
+                """,
+                owner_id,
+                str(generation),
+            )
+        return row is not None
+
+    async def complete_lifecycle_terminal_vm_cleanup_marker(
+        self,
+        job_id: str,
+        *,
+        expected_generation: str,
+    ) -> bool:
+        """Close an unbound approval marker only for its proven lifecycle purge.
+
+        The packet projector authenticates the completed parent, canonical
+        request and digest, process-zero, physical stop, and released charge.
+        The older admission-bound terminal-release path remains separate.
+        """
+        try:
+            owner_id, generation = UUID(job_id), UUID(expected_generation)
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE jobs j
+                SET context=j.context - '_job_terminal_vm_cleanup',
+                    updated_at=clock_timestamp()
+                FROM vm_creation_retries r,
+                     vm_workspace_cleanup_admissions a,
+                     LATERAL vm_job_terminal_packet_evidence(r.request_id) packet(p)
+                WHERE j.id=$1 AND j.status='completed'
+                  AND j.execution_lane='pinned'
+                  AND j.context->'_job_terminal_vm_cleanup'=jsonb_build_object(
+                      'version',1,'source','approve',
+                      'provision_generation',$2::text)
+                  AND j.context->'vm'->>'status'='deleted'
+                  AND j.context->'vm'->>'provision_generation'=$2::text
+                  AND r.owner_kind='job' AND r.job_id=j.id
+                  AND r.provision_generation=$2::uuid
+                  AND r.state='succeeded' AND r.resolved_at IS NOT NULL
+                  AND r.observed_vm_uid::text=j.context->'vm'->>'vm_uid'
+                  AND r.observed_pvc_uid::text=j.context->'vm'->>'rootdisk_pvc_uid'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM vm_creation_retries other
+                      WHERE other.job_id=j.id
+                        AND other.provision_generation=r.provision_generation
+                        AND other.request_id<>r.request_id)
+                  AND a.id::text=packet.p->>'cleanup_admission_id'
+                  AND a.owner_kind='job' AND a.owner_id=j.id
+                  AND a.source='lifecycle_vm_delete'
+                  AND a.parent_admission_id IS NULL
+                  AND a.pvc_uid=r.observed_pvc_uid
+                  AND a.completed_at IS NOT NULL AND a.outcome='completed'
+                  AND a.request_id=uuid_generate_v5(uuid_ns_url(),
+                      'workspace-cleanup:delete:job:' || j.id::text || ':' ||
+                      r.provision_generation::text || ':' ||
+                      r.observed_vm_uid::text || ':' || r.observed_pvc_uid::text)
+                  AND a.intent_digest=packet.p->>'cleanup_intent_digest'
+                  AND packet.p->>'kind'='physical_stop'
+                  AND packet.p->>'job_id'=j.id::text
+                  AND packet.p->>'request_id'=r.request_id::text
+                  AND packet.p->>'provision_generation'=r.provision_generation::text
+                  AND packet.p->>'vm_uid'=r.observed_vm_uid::text
+                  AND packet.p->>'pvc_uid'=r.observed_pvc_uid::text
+                  AND packet.p->>'reservation_count'='1'
                 RETURNING j.id
                 """,
                 owner_id,

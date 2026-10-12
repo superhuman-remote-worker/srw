@@ -8,6 +8,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 import asyncpg
 import pytest
 
+from orchestrator.database.postgres import JobVMAuditNotReady
 from orchestrator.services.lifecycle.reconciler import InstanceLifecycleReconciler
 from orchestrator.services.lifecycle.types import Instance
 from orchestrator.services.lifecycle.vm_manager import VMInstanceManager
@@ -187,6 +188,120 @@ async def test_completed_lifecycle_vm_delete_yields_exact_physical_terminal_pack
     if isinstance(receipt, str):
         receipt = json.loads(receipt)
     assert receipt["generations"] == [prior]
+
+
+@pytest.mark.asyncio
+async def test_completed_lifecycle_parent_closes_exact_unbound_approval_marker(
+    db,  # noqa: F811
+    monkeypatch,
+):
+    retry, _, _ = await _completed_lifecycle_purge(db, monkeypatch)
+    marker = {
+        "version": 1,
+        "source": "approve",
+        "provision_generation": str(retry["provision_generation"]),
+    }
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,"
+        "'{_job_terminal_vm_cleanup}',$2::jsonb,true) WHERE id=$1",
+        retry["job_id"],
+        json.dumps(marker),
+    )
+    assert (
+        await db.fetchval(
+            "SELECT vm_job_terminal_packet_evidence($1)", retry["request_id"]
+        )
+        is not None
+    )
+    candidates = await db.list_terminal_vm_cleanup_jobs(limit=25)
+    assert str(retry["job_id"]) in {row["id"] for row in candidates}
+    with pytest.raises(JobVMAuditNotReady, match="active workspace authority"):
+        await db.delete_job(str(retry["job_id"]))
+    assert await db.complete_lifecycle_terminal_vm_cleanup_marker(
+        str(retry["job_id"]),
+        expected_generation=str(retry["provision_generation"]),
+    )
+    assert not await db.fetchval(
+        "SELECT context ? '_job_terminal_vm_cleanup' FROM jobs WHERE id=$1",
+        retry["job_id"],
+    )
+    assert await db.delete_job(str(retry["job_id"])) is True
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_marker_rejects_changed_marker(
+    db,  # noqa: F811
+    monkeypatch,
+):
+    retry, _, _ = await _completed_lifecycle_purge(db, monkeypatch)
+    job_id = str(retry["job_id"])
+    generation = str(retry["provision_generation"])
+    marker = {"version": 1, "source": "approve", "provision_generation": generation}
+    original_context = await db.fetchval(
+        "SELECT context FROM jobs WHERE id=$1", retry["job_id"]
+    )
+    if isinstance(original_context, str):
+        original_context = json.loads(original_context)
+    changes = (
+        ("marker source", {**marker, "source": "cancel"}),
+        ("marker version", {**marker, "version": 2}),
+        ("marker generation", {**marker, "provision_generation": str(uuid4())}),
+        ("foreign admission", {**marker, "admission_id": str(uuid4())}),
+        ("extra marker field", {**marker, "unexpected": True}),
+    )
+    for label, changed_marker in changes:
+        context = dict(original_context)
+        context["_job_terminal_vm_cleanup"] = changed_marker
+        await db.execute(
+            "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
+            retry["job_id"],
+            json.dumps(context),
+        )
+        assert not await db.complete_lifecycle_terminal_vm_cleanup_marker(
+            job_id, expected_generation=generation
+        ), label
+        assert await db.fetchval(
+            "SELECT context ? '_job_terminal_vm_cleanup' FROM jobs WHERE id=$1",
+            retry["job_id"],
+        ), label
+    await db.execute(
+        "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
+        retry["job_id"],
+        json.dumps({**original_context, "_job_terminal_vm_cleanup": marker}),
+    )
+    assert await db.complete_lifecycle_terminal_vm_cleanup_marker(
+        job_id, expected_generation=generation
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changed_field", ["vm_uid", "rootdisk_pvc_uid", "provision_generation"]
+)
+async def test_lifecycle_marker_refuses_changed_vm_identity(
+    db,  # noqa: F811
+    monkeypatch,
+    changed_field,
+):
+    retry, _, _ = await _completed_lifecycle_purge(db, monkeypatch)
+    generation = str(retry["provision_generation"])
+    context = await db.fetchval("SELECT context FROM jobs WHERE id=$1", retry["job_id"])
+    if isinstance(context, str):
+        context = json.loads(context)
+    context["vm"][changed_field] = str(uuid4())
+    context["_job_terminal_vm_cleanup"] = {
+        "version": 1,
+        "source": "approve",
+        "provision_generation": generation,
+    }
+    await db.execute(
+        "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
+        retry["job_id"],
+        json.dumps(context),
+    )
+    assert not await db.complete_lifecycle_terminal_vm_cleanup_marker(
+        str(retry["job_id"]), expected_generation=generation
+    )
 
 
 @pytest.mark.asyncio

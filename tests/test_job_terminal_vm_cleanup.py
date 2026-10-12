@@ -497,6 +497,86 @@ async def test_completed_exact_parent_clears_marker_without_restarting_teardown(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("packet_proven", [False, True])
+async def test_deleted_lifecycle_marker_never_restarts_teardown(packet_proven):
+    marker = {
+        "version": 1,
+        "source": "approve",
+        "provision_generation": VM["provision_generation"],
+    }
+    job = {
+        "id": JOB_ID,
+        "status": "completed",
+        "execution_lane": "pinned",
+        "context": {
+            "vm": {**VM, "status": "deleted"},
+            "_job_terminal_vm_cleanup": marker,
+        },
+    }
+
+    @asynccontextmanager
+    async def lock(_job_id):
+        yield True
+
+    store = SimpleNamespace(
+        list_terminal_vm_cleanup_jobs=AsyncMock(return_value=[job]),
+        get_job=AsyncMock(return_value=job),
+        stateless_cancel_cleanup_lock=lock,
+        complete_terminal_vm_cleanup_marker=AsyncMock(return_value=False),
+        complete_lifecycle_terminal_vm_cleanup_marker=AsyncMock(
+            return_value=packet_proven
+        ),
+    )
+    archive = AsyncMock(side_effect=AssertionError("completed VM teardown restarted"))
+    operation = controls(store=store, archive=archive)
+
+    assert await operation.reconcile_terminal_vm_cleanups() == int(packet_proven)
+    archive.assert_not_awaited()
+    store.complete_lifecycle_terminal_vm_cleanup_marker.assert_awaited_once_with(
+        JOB_ID, expected_generation=VM["provision_generation"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_deleted_marker_with_foreign_admission_holds_without_teardown():
+    job = {
+        "id": JOB_ID,
+        "status": "completed",
+        "execution_lane": "pinned",
+        "context": {
+            "vm": {**VM, "status": "deleted"},
+            "_job_terminal_vm_cleanup": {
+                "version": 1,
+                "source": "approve",
+                "provision_generation": VM["provision_generation"],
+                "admission_id": "77777777-8888-4999-8aaa-bbbbbbbbbbbb",
+            },
+        },
+    }
+
+    @asynccontextmanager
+    async def lock(_job_id):
+        yield True
+
+    store = SimpleNamespace(
+        list_terminal_vm_cleanup_jobs=AsyncMock(return_value=[job]),
+        get_job=AsyncMock(return_value=job),
+        stateless_cancel_cleanup_lock=lock,
+        complete_terminal_vm_cleanup_marker=AsyncMock(return_value=False),
+        complete_lifecycle_terminal_vm_cleanup_marker=AsyncMock(),
+    )
+    archive = AsyncMock(
+        side_effect=AssertionError("foreign admission restarted teardown")
+    )
+    assert (
+        await controls(store=store, archive=archive).reconcile_terminal_vm_cleanups()
+        == 0
+    )
+    archive.assert_not_awaited()
+    store.complete_lifecycle_terminal_vm_cleanup_marker.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_hung_descendant_is_bounded_and_does_not_hide_next_candidate(monkeypatch):
     from orchestrator.services import job_mutation_controls as module
 

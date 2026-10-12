@@ -257,6 +257,24 @@ class JobControlOperations:
                     # A completed exact parent may have survived a crash just
                     # before marker finalization. Never restart its teardown.
                     return 1
+                if (
+                    marker is not None
+                    and fresh["status"] == "completed"
+                    and fresh.get("execution_lane") == "pinned"
+                    and isinstance(fresh_context.get("vm"), dict)
+                    and fresh_context["vm"].get("status") == "deleted"
+                ):
+                    # A physically completed lifecycle purge needs its exact
+                    # terminal packet, not another workspace teardown. A
+                    # changed or missing packet keeps this marker held.
+                    if marker.get("admission_id") is None:
+                        return int(
+                            await d.store.complete_lifecycle_terminal_vm_cleanup_marker(
+                                job_id,
+                                expected_generation=marker["provision_generation"],
+                            )
+                        )
+                    return 0
                 if fresh["status"] == "cancelled":
                     if not await self.cascade_cancel_to_children(job_id):
                         return 0
