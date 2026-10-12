@@ -49,6 +49,37 @@ def _make_db(mock_conn):
 
 class TestDeleteCheckpointThread:
     @pytest.mark.asyncio
+    async def test_strict_prune_refuses_unavailable_authority(self, monkeypatch):
+        monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+        conn = AsyncMock()
+        db = _make_db(conn)
+        db._acquire_checkpoint_prune_authority = AsyncMock(
+            return_value=_CheckpointPruneAuthority(allowed=False, coordinated=True)
+        )
+
+        with pytest.raises(RuntimeError, match="strict checkpoint prune authority"):
+            await db.delete_checkpoint_thread(_JOB_ID, strict=True)
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_strict_completed_admission_rechecks_surviving_rows(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+        conn = AsyncMock()
+        conn.fetchval = AsyncMock(return_value=True)
+        db = _make_db(conn)
+        db._acquire_checkpoint_prune_authority = AsyncMock(
+            return_value=_CheckpointPruneAuthority(
+                allowed=True, coordinated=True, completed=True
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="strict checkpoint prune left rows"):
+            await db.delete_checkpoint_thread(_JOB_ID, strict=True)
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_noop_when_backend_not_postgres(self, monkeypatch):
         monkeypatch.delenv("CHECKPOINTER_BACKEND", raising=False)  # default sqlite
         conn = AsyncMock()

@@ -213,6 +213,10 @@ class JobVMAuditNotReady(RuntimeError):
     """Final Job deletion lacks an exact terminal VM audit disposition."""
 
 
+class JobCheckpointPruneNotReady(RuntimeError):
+    """Final owner deletion still has durable checkpoint rows."""
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -5325,7 +5329,7 @@ class PostgresDB:
                     uuid_val,
                 )
                 deleting_job = await conn.fetchrow(
-                    "SELECT status, completion_outcome_kind, "
+                    "SELECT status, execution_lane, completion_outcome_kind, "
                     "(SELECT execution.harness_adapter FROM srw_execution_specs execution "
                     " WHERE execution.work_kind='Job' AND execution.work_id=jobs.id) "
                     "AS execution_harness_adapter "
@@ -5338,6 +5342,36 @@ class PostgresDB:
                     )
 
                     require_srw_runtime(deleting_job)
+                    if (
+                        deletion_reason == "authorized_api_delete"
+                        and deleting_job["execution_lane"] == "pinned"
+                    ):
+                        # Strict prune runs before this transaction, keeping
+                        # recovery admission and Job lock order intact. This
+                        # final check catches a write after that prune and
+                        # before this locked deletion. Worker quiescence must
+                        # already have been proved by the owner cleanup; the
+                        # Job lock alone does not fence LangGraph writers.
+                        for table in (
+                            "checkpoint_writes",
+                            "checkpoint_blobs",
+                            "checkpoints",
+                        ):
+                            try:
+                                async with conn.transaction():
+                                    remains = await conn.fetchval(
+                                        f"SELECT EXISTS (SELECT 1 FROM {table} "
+                                        "WHERE thread_id = $1)",
+                                        str(uuid_val),
+                                    )
+                            except Exception as exc:
+                                if type(exc).__name__ == "UndefinedTableError":
+                                    continue
+                                raise
+                            if remains:
+                                raise JobCheckpointPruneNotReady(
+                                    "final pinned Job checkpoint prune is incomplete"
+                                )
                     await self._capture_vm_job_delete_audit(
                         conn,
                         uuid_val,
@@ -9040,7 +9074,7 @@ class PostgresDB:
         scarce. Correctness never depended on it being one statement.
         knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 6).
 
-        ``strict=True`` is reserved for permanent stateless job deletion. It
+        ``strict=True`` is used by permanent Job deletion. It
         raises on a real deletion failure and verifies that every surviving
         checkpoint table is empty before its jobs-row cleanup anchor may be
         removed. Ordinary terminal transitions retain best-effort behavior.
@@ -9063,6 +9097,8 @@ class PostgresDB:
             strict=strict,
         )
         if not authority.allowed:
+            if strict:
+                raise RuntimeError("strict checkpoint prune authority unavailable")
             return 0
 
         async def _delete(conn: Any) -> _CheckpointPruneResult:
@@ -9158,6 +9194,26 @@ class PostgresDB:
                 type(exc).__name__,
                 exc,
             )
+        if strict:
+            # An earlier best-effort prune may already have completed its
+            # admission. A later owner Delete still has to prove that no
+            # checkpoint rows were written after that completion.
+            async with self.acquire() as conn:
+                for table in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
+                    try:
+                        remains = await conn.fetchval(
+                            f"SELECT EXISTS (SELECT 1 FROM {table} WHERE thread_id = $1)",
+                            thread_id,
+                        )
+                    except Exception as exc:
+                        if type(exc).__name__ == "UndefinedTableError":
+                            continue
+                        raise
+                    if remains:
+                        raise RuntimeError(
+                            "strict checkpoint prune left rows behind "
+                            f"(table={table}, thread_id={thread_id})"
+                        )
         return result.deleted
 
     async def _delete_thread_rows_batched(
