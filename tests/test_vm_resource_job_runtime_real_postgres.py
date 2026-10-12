@@ -122,7 +122,7 @@ async def test_reaper_resumes_open_purge_after_controller_child_deleted(
         attest_vm_cleanup_stop=AsyncMock(
             return_value=None if stop_case == "proof_missing" else proof
         ),
-        release_vm_captured=AsyncMock(),
+        release_vm_captured=AsyncMock(return_value=VMTeardownResult("completed", True)),
     )
     store = VMWorkspaceRecoveryStore(db)
     manager = VMInstanceManager(
@@ -169,7 +169,7 @@ async def test_reaper_resumes_open_purge_after_controller_child_deleted(
         inst.metadata["_completion_lifecycle_permit"] = LifecycleActionPermit(
             LifecycleRouteDecision(str(owner_id), "claimed")
         )
-        manager._permit_external = AsyncMock(side_effect=[True, False])
+        manager._permit_external = AsyncMock(side_effect=[True, True, False])
     manager.is_dirty = AsyncMock(return_value=True)
     manager.give_up = AsyncMock()
     stats = {"reaped": 0, "reap_forced": 0, "reap_attempts": 0}
@@ -204,7 +204,150 @@ async def test_reaper_resumes_open_purge_after_controller_child_deleted(
         )
         == 1
     )
-    provisioner.release_vm_captured.assert_not_awaited()
+    provisioner.release_vm_captured.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_charged_open_purge_busy_before_delete_replays_exact_parent(
+    db, monkeypatch
+):
+    from orchestrator.services.completion_lifecycle import (
+        LifecycleActionPermit,
+        LifecycleRouteDecision,
+    )
+
+    _, retry, admitted, _, ids = await charged_idle_wait(db, monkeypatch, lane="pinned")
+    owner_id = retry["job_id"]
+    await db.execute(
+        "UPDATE jobs SET status='pending_review',"
+        "context=jsonb_set(context,'{vm,status}',"
+        "'\"retiring_process_zero\"'::jsonb) WHERE id=$1",
+        owner_id,
+    )
+    identity = VMTeardownIdentity(ids["generation"], ids["vm_uid"], ids["pvc_uid"])
+    proof = {
+        "version": 1,
+        "kind": "vm_cleanup_physical_stop",
+        "job_id": str(owner_id),
+        "provision_generation": ids["generation"],
+        "vm_uid": ids["vm_uid"],
+        "vmi_uid": ids["vmi_uid"],
+        "launcher_uid": ids["launcher_uid"],
+        "pvc_uid": ids["pvc_uid"],
+        "vm_absent": True,
+        "vmi_absent": True,
+        "launcher_absent": True,
+        "same_generation_replacement": False,
+        "pvc_disposition": "purged",
+        "controller_authenticated": True,
+    }
+
+    async def release(*_args, **_kwargs):
+        if provisioner.release_vm_captured.await_count == 1:
+            return VMTeardownResult("remote_operation_busy", False)
+        await db.execute(
+            "INSERT INTO managed_repository_process_zero_receipts "
+            "(owner_kind,owner_id,scope,provisioner,runtime_incarnation) "
+            "VALUES('job',$1,'vm','vm',$2)",
+            owner_id,
+            ids["generation"],
+        )
+        return VMTeardownResult("completed", True)
+
+    provisioner = SimpleNamespace(
+        lifecycle_available=True,
+        capture_vm_teardown_identity=AsyncMock(return_value=identity),
+        attest_vm_cleanup_stop=AsyncMock(return_value=proof),
+        release_vm_captured=AsyncMock(side_effect=release),
+    )
+    store = VMWorkspaceRecoveryStore(db)
+    manager = VMInstanceManager(
+        provisioner, None, None, db, workspace_recovery_store=store
+    )
+    parent = await manager._admit_destructive_cleanup(
+        owner_kind="job",
+        owner_id=str(owner_id),
+        identity=identity,
+        source="delete",
+        purge_disk=True,
+    )
+    assert parent is not None and parent.allowed
+    manager.is_reapable = AsyncMock(return_value=True)
+    manager.is_dirty = AsyncMock(return_value=True)
+    manager.give_up = AsyncMock()
+    inst = Instance(
+        kind="vm",
+        id=f"agent-vm-{owner_id}",
+        bound_to=str(owner_id),
+        metadata={"scope": "job", "execution_lane": "pinned"},
+    )
+    stats = {"reaped": 0, "reap_forced": 0, "reap_attempts": 0}
+    first = LifecycleActionPermit(LifecycleRouteDecision(str(owner_id), "claimed"))
+    inst.metadata["_completion_lifecycle_permit"] = first
+
+    await InstanceLifecycleReconciler([manager])._reap(manager, inst, stats)
+
+    assert first.completed and first.skip_reason == "vm_remote_operation_busy"
+    assert stats["reaped"] == stats["reap_forced"] == 0
+    manager.give_up.assert_not_awaited()
+    assert await db.fetchval(
+        "SELECT completed_at IS NULL FROM vm_workspace_cleanup_admissions WHERE id=$1",
+        parent.admission_id,
+    )
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE id=$1",
+            UUID(admitted["reservation_id"]),
+        )
+        == "teardown"
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_workspace_cleanup_admissions "
+            "WHERE owner_kind='job' AND owner_id=$1 AND source='lifecycle_vm_delete'",
+            owner_id,
+        )
+        == 1
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_resource_cleanup_stop_receipts "
+            "WHERE cleanup_admission_id=$1",
+            parent.admission_id,
+        )
+        == 0
+    )
+
+    second = LifecycleActionPermit(LifecycleRouteDecision(str(owner_id), "claimed"))
+    inst.metadata["_completion_lifecycle_permit"] = second
+    await InstanceLifecycleReconciler([manager])._reap(manager, inst, stats)
+
+    assert provisioner.release_vm_captured.await_count == 2
+    assert all(
+        call.kwargs["parent_cleanup"]["admission_id"] == str(parent.admission_id)
+        and call.kwargs["purge_disk"] is True
+        for call in provisioner.release_vm_captured.await_args_list
+    )
+    assert stats["reaped"] == 1
+    assert await db.fetchval(
+        "SELECT completed_at IS NOT NULL FROM vm_workspace_cleanup_admissions WHERE id=$1",
+        parent.admission_id,
+    )
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE id=$1",
+            UUID(admitted["reservation_id"]),
+        )
+        == "released"
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_workspace_cleanup_admissions "
+            "WHERE owner_kind='job' AND owner_id=$1 AND source='lifecycle_vm_delete'",
+            owner_id,
+        )
+        == 1
+    )
 
 
 async def charged_idle_wait(db, monkeypatch, *, lane="stateless"):

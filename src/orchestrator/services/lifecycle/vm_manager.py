@@ -654,6 +654,7 @@ class VMInstanceManager:
                 permit.skip(reason, settled=True)
             return "held"
 
+        external_attempted = False
         try:
             try:
                 owner_id = UUID(str(inst.bound_to))
@@ -704,31 +705,40 @@ class VMInstanceManager:
                 prepare_vm_cleanup_resource,
             )
 
-            candidate = await prepare_vm_cleanup_resource(
-                self._workspace_recovery_store, bound
-            )
-            if candidate is None:
-                # A legacy/unmetered parent has no v3 charge to attest. Its
-                # original purge still needs the authenticated controller
-                # completion path; an empty resource candidate is not proof
-                # that the disk or VM stopped.
-                async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                    outcome = await self._provisioner.release_vm_captured(
-                        str(owner_id),
-                        identity,
-                        purge_disk=True,
-                        entity_type="job",
-                        capture_snapshot=False,
-                        **vm_cleanup_kwargs(bound),
-                    )
-                if outcome.disposition != "completed":
-                    return known_hold("vm_cleanup_delete_pending")
-                if isinstance(
-                    permit, LifecycleActionPermit
-                ) and not await self._permit_external(permit):
-                    # The controller may have accepted the exact purge, but a
-                    # lost lifecycle term cannot authorize parent settlement.
-                    return "held"
+            await prepare_vm_cleanup_resource(self._workspace_recovery_store, bound)
+            if isinstance(
+                permit, LifecycleActionPermit
+            ) and not await self._permit_external(permit):
+                return "held"
+            # Resource preparation fences a charged cleanup; it is not a
+            # physical stop receipt. The first attempt may have stopped at a
+            # remote-operation lease before sending the original purge, so
+            # replay that exact signed parent for charged and legacy owners.
+            external_attempted = True
+            async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                outcome = await self._provisioner.release_vm_captured(
+                    str(owner_id),
+                    identity,
+                    purge_disk=True,
+                    entity_type="job",
+                    capture_snapshot=False,
+                    **vm_cleanup_kwargs(bound),
+                )
+            if outcome.disposition == "remote_operation_busy":
+                return known_hold("vm_remote_operation_busy")
+            if outcome.disposition == "retry_pending":
+                # The exact guarded delete attempt did not prove absence.
+                # Release this lifecycle term so the next tick can recheck
+                # physical completion promptly.
+                return known_hold("vm_cleanup_delete_pending")
+            if outcome.disposition != "completed":
+                return "held"
+            if isinstance(
+                permit, LifecycleActionPermit
+            ) and not await self._permit_external(permit):
+                # The controller may have accepted the exact purge, but a
+                # lost lifecycle term cannot authorize parent settlement.
+                return "held"
             await complete_vm_cleanup_permit(
                 self._workspace_recovery_store,
                 bound,
@@ -743,7 +753,9 @@ class VMInstanceManager:
             return "completed"
         except ResourceAdmissionError:
             logger.info("Open VM purge stop proof held for job %s", inst.bound_to)
-            return known_hold("vm_cleanup_stop_unproven")
+            return (
+                "held" if external_attempted else known_hold("vm_cleanup_stop_unproven")
+            )
         except Exception:
             logger.exception(
                 "Open VM purge could not be settled for job %s", inst.bound_to
@@ -992,14 +1004,17 @@ class VMInstanceManager:
                 if isinstance(permit, LifecycleActionPermit):
                     permit.skip("vm_identity_superseded", settled=True)
                 return True
-            if outcome.disposition == "retry_pending":
+            if outcome.disposition in {"retry_pending", "remote_operation_busy"}:
                 if isinstance(permit, LifecycleActionPermit):
-                    # The controller accepted the exact-generation delete and
-                    # the immediate absence probe still saw it terminating.
-                    # This is a conclusive incomplete attempt, not ambiguous
-                    # ownership: release the term so the next lifecycle tick
-                    # or authorized control can retry promptly.
-                    permit.skip("vm_retirement_retry_pending", settled=True)
+                    # Both outcomes conclusively left this attempt incomplete:
+                    # the remote-operation collision precedes external delete,
+                    # while retry_pending is an accepted exact-generation delete.
+                    permit.skip(
+                        "vm_remote_operation_busy"
+                        if outcome.disposition == "remote_operation_busy"
+                        else "vm_retirement_retry_pending",
+                        settled=True,
+                    )
                 return False
             if outcome.disposition == "completed":
                 await self._complete_destructive_cleanup(cleanup, outcome="completed")
