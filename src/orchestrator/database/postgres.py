@@ -6908,12 +6908,55 @@ class PostgresDB:
                 or vm.get("vm_uid") != str(authority["vm_uid"])
                 or vm.get("rootdisk_pvc_uid") != str(authority["pvc_uid"])
                 or vm.get("compute_released") is not True
-                or vm.get("disk_kept") is not True
                 or not await conn.fetchval(
                     "SELECT public.vm_job_cancel_retention_settled($1)",
                     authority["cleanup_admission_id"],
                 )
             ):
+                return False
+            if vm.get("disk_kept") is False:
+                # A prior owner Delete may have completed the exact typed disk
+                # purge before its terminal audit/tombstone committed. Only
+                # that signed, fully validated parent can resume this preflight.
+                if (
+                    vm.get("status") != "deleted"
+                    or context.get("_pinned_retained_delete_pending") is not True
+                    or not await conn.fetchval(
+                        "SELECT public.vm_job_cancel_retention_discharged($1)",
+                        authority["cleanup_admission_id"],
+                    )
+                ):
+                    return False
+                purges = await conn.fetch(
+                    "SELECT d.cleanup_admission_id FROM "
+                    "vm_job_retained_disk_purge_predecessors link "
+                    "JOIN vm_job_retained_disk_purge_authorities d "
+                    "ON d.cleanup_admission_id=link.cleanup_admission_id "
+                    "JOIN vm_workspace_cleanup_admissions c "
+                    "ON c.id=d.cleanup_admission_id "
+                    "WHERE link.old_cleanup_admission_id=$1 "
+                    "AND link.source_request_id=$2 "
+                    "AND d.final_request_id=$2 AND d.job_id=$3 "
+                    "AND d.provision_generation=$4 AND d.vm_uid=$5 "
+                    "AND d.vmi_uid=$6 AND d.launcher_uid=$7 AND d.pvc_uid=$8 "
+                    "AND c.owner_kind='job' AND c.owner_id=$3 "
+                    "AND c.source='public_vm_delete' AND c.pvc_uid=$8 "
+                    "AND c.completed_at IS NOT NULL AND c.outcome='completed'",
+                    authority["cleanup_admission_id"],
+                    authority["creation_request_id"],
+                    owner,
+                    authority["provision_generation"],
+                    authority["vm_uid"],
+                    authority["vmi_uid"],
+                    authority["launcher_uid"],
+                    authority["pvc_uid"],
+                )
+                if len(purges) != 1 or not await conn.fetchval(
+                    "SELECT public.validate_vm_job_retained_disk_purge($1,true)",
+                    purges[0]["cleanup_admission_id"],
+                ):
+                    return False
+            elif vm.get("disk_kept") is not True:
                 return False
             if await conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases WHERE "

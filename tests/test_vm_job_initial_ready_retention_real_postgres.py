@@ -676,12 +676,19 @@ async def test_pinned_ready_cancel_ordinary_retirement_selects_retaining_stop(
 
 
 @pytest.mark.asyncio
-async def test_pinned_ready_owner_job_delete_uses_typed_disk_purge(pinned_ready_db):
+@pytest.mark.parametrize(
+    "delete_outcome", ["single", "retry", "missing_receipt", "wrong_digest", "wrong_vm"]
+)
+async def test_pinned_ready_owner_job_delete_uses_typed_disk_purge(
+    pinned_ready_db, monkeypatch, delete_outcome
+):
     import logging
     from contextlib import asynccontextmanager
     from functools import partial
+    from fastapi import HTTPException
 
     from orchestrator.services.job_mutation_controls import JobControlOperations
+    from orchestrator.database.postgres import JobVMAuditNotReady
     from orchestrator.services.thread_retirement import archive_and_cleanup_workspace
     from orchestrator.services.vm_workspace_policy import vm_needs_release
 
@@ -737,6 +744,58 @@ async def test_pinned_ready_owner_job_delete_uses_typed_disk_purge(pinned_ready_
         )
     )
     job = await db.get_job(state["job_id"])
+    if delete_outcome != "single":
+        real_delete_job = db.delete_job
+        first = True
+
+        async def terminal_audit_once_held(*args, **kwargs):
+            nonlocal first
+            if first:
+                first = False
+                raise JobVMAuditNotReady("synthetic terminal-audit refusal after purge")
+            return await real_delete_job(*args, **kwargs)
+
+        monkeypatch.setattr(db, "delete_job", terminal_audit_once_held)
+        with pytest.raises(HTTPException) as held:
+            await control.delete(
+                state["job_id"], caller={"id": job["user_id"]}, job=job
+            )
+        assert held.value.status_code == 503
+        retained = await db.get_job(state["job_id"])
+        assert retained is not None
+        assert json.loads(retained["context"])["vm"]["disk_kept"] is False
+        assert len(purge_parents) == 1
+        job = retained
+        if delete_outcome != "retry":
+            purge_id = UUID(purge_parents[0])
+            async with db.acquire() as conn, conn.transaction():
+                await conn.execute("SET LOCAL session_replication_role=replica")
+                if delete_outcome == "missing_receipt":
+                    await conn.execute(
+                        "DELETE FROM vm_job_retained_disk_purge_receipts "
+                        "WHERE cleanup_admission_id=$1",
+                        purge_id,
+                    )
+                elif delete_outcome == "wrong_digest":
+                    await conn.execute(
+                        "UPDATE vm_job_retained_disk_purge_receipts "
+                        "SET chain_digest=$2 WHERE cleanup_admission_id=$1",
+                        purge_id,
+                        "sha256:" + "0" * 64,
+                    )
+                else:
+                    await conn.execute(
+                        "UPDATE vm_job_retained_disk_purge_authorities "
+                        "SET vm_uid=$2 WHERE cleanup_admission_id=$1",
+                        purge_id,
+                        uuid4(),
+                    )
+            assert (
+                await db.prepare_pinned_retained_job_for_delete(state["job_id"])
+                is False
+            )
+            assert len(purge_parents) == 1
+            return
     result = await control.delete(
         state["job_id"], caller={"id": job["user_id"]}, job=job
     )
