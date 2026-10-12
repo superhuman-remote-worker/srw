@@ -12,7 +12,7 @@ from orchestrator.database.postgres import JobVMAuditNotReady
 from orchestrator.services.lifecycle.reconciler import InstanceLifecycleReconciler
 from orchestrator.services.lifecycle.types import Instance
 from orchestrator.services.lifecycle.vm_manager import VMInstanceManager
-from orchestrator.services.vm_provisioner import VMTeardownIdentity
+from orchestrator.services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
 from orchestrator.services.vm_workspace_recovery_store import VMWorkspaceRecoveryStore
 from tests.test_vm_resource_job_runtime_real_postgres import (
     charged_idle_wait,
@@ -67,7 +67,7 @@ async def _completed_lifecycle_purge(store_db, monkeypatch, *, process_zero=True
         lifecycle_available=True,
         capture_vm_teardown_identity=AsyncMock(return_value=identity),
         attest_vm_cleanup_stop=AsyncMock(return_value=proof),
-        release_vm_captured=AsyncMock(),
+        release_vm_captured=AsyncMock(return_value=VMTeardownResult("completed", True)),
     )
     store = VMWorkspaceRecoveryStore(store_db)
     manager = VMInstanceManager(
@@ -113,6 +113,15 @@ async def _completed_lifecycle_purge(store_db, monkeypatch, *, process_zero=True
     assert stats["reap_forced"] == 0
     manager.is_dirty.assert_not_awaited()
     manager.give_up.assert_not_awaited()
+    # A missing stop receipt may still reach the exact guarded delete attempt,
+    # but the store must refuse parent/charge settlement afterward.
+    provisioner.release_vm_captured.assert_awaited_once()
+    call = provisioner.release_vm_captured.await_args
+    assert call.args == (str(owner_id), identity)
+    assert call.kwargs["purge_disk"] is True
+    assert call.kwargs["entity_type"] == "job"
+    assert call.kwargs["capture_snapshot"] is False
+    assert call.kwargs["parent_cleanup"] == parent.parent_cleanup
     row = await store_db.fetchrow(
         "SELECT id,request_id,source,intent_digest,completed_at,outcome "
         "FROM vm_workspace_cleanup_admissions WHERE id=$1",
