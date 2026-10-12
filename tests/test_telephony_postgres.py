@@ -539,3 +539,123 @@ class TestPostgresJobAndRoutes:
         assert (
             await phone.http.delete(f"/api/telephony/settings/{phone.settings['id']}")
         ).status_code == 200
+
+
+class TestTelephonyLineCli:
+    """``python -m orchestrator.operator_cli.telephony_line`` (in-pod setup)."""
+
+    @pytest.mark.asyncio
+    async def test_settings_and_line_upsert_by_name_with_secrets_from_stdin(self, db):
+        import io
+
+        from orchestrator.operator_cli.telephony_line import run
+
+        owner = await db.create_user("Line CLI owner")
+        project = await db.create_project("Line CLI")
+        created = await run(
+            [
+                "settings",
+                "--name",
+                "Demo",
+                "--openai-project-id",
+                "proj_demo",
+                "--project-id",
+                str(project["id"]),
+            ],
+            stdin=io.StringIO(SECRET + "\nsk-demo-key\n"),
+            db=db,
+        )
+        assert created["webhook_secret_set"] is True and created["api_key_set"] is True
+        assert SECRET not in json.dumps(created, default=str)
+        async with db.acquire() as conn:
+            stored = await conn.fetchrow(
+                "SELECT webhook_secret_encrypted, api_key_encrypted FROM telephony_settings WHERE name='Demo'"
+            )
+        assert (
+            SECRET not in stored["webhook_secret_encrypted"]
+            and "sk-demo-key" not in stored["api_key_encrypted"]
+        )
+        # A second run without secrets keeps them and updates the rest.
+        updated = await run(
+            ["settings", "--name", "Demo", "--openai-project-id", "proj_demo2"],
+            stdin=io.StringIO(""),
+            db=db,
+        )
+        assert (
+            updated["id"] == created["id"]
+            and updated["openai_project_id"] == "proj_demo2"
+        )
+        assert updated["webhook_secret_set"] is True
+
+        line_json = json.dumps(
+            {
+                "number": "+4960521829990",
+                "is_default": True,
+                "greeting": "Guten Tag.",
+                "persona": "Sie sind die Rezeption.",
+                "fact_sheet": "Bad: 32 Grad.",
+            }
+        )
+        argv = [
+            "line",
+            "--name",
+            "Empfang",
+            "--settings-name",
+            "Demo",
+            "--project-id",
+            str(project["id"]),
+            "--owner-id",
+            str(owner["id"]),
+        ]
+        line = await run(argv, stdin=io.StringIO(line_json), db=db)
+        again = await run(
+            argv, stdin=io.StringIO(json.dumps({"voice": "cedar"})), db=db
+        )
+        assert (
+            again["id"] == line["id"]
+            and again["voice"] == "cedar"
+            and again["number"] == "+4960521829990"
+        )
+        listed = await run(["show"], stdin=io.StringIO(""), db=db)
+        assert [entry["name"] for entry in listed["lines"]] == ["Empfang"]
+        assert listed["lines"][0]["fact_sheet_chars"] == len("Bad: 32 Grad.")
+
+    @pytest.mark.asyncio
+    async def test_line_rejects_unknown_fields_and_new_settings_need_a_secret(self, db):
+        import io
+
+        from orchestrator.operator_cli.telephony_line import run
+
+        with pytest.raises(SystemExit):
+            await run(
+                ["settings", "--name", "No secret", "--openai-project-id", "proj_x"],
+                stdin=io.StringIO(""),
+                db=db,
+            )
+        with pytest.raises(SystemExit):
+            await run(
+                ["settings", "--name", "Bad secret", "--openai-project-id", "proj_x"],
+                stdin=io.StringIO("not-a-whsec\n"),
+                db=db,
+            )
+        await run(
+            ["settings", "--name", "S", "--openai-project-id", "proj_x"],
+            stdin=io.StringIO(SECRET + "\n"),
+            db=db,
+        )
+        with pytest.raises(SystemExit):
+            await run(
+                [
+                    "line",
+                    "--name",
+                    "L",
+                    "--settings-name",
+                    "S",
+                    "--project-id",
+                    "00000000-0000-0000-0000-000000000000",
+                    "--owner-id",
+                    "00000000-0000-0000-0000-000000000000",
+                ],
+                stdin=io.StringIO(json.dumps({"api_key": "nope"})),
+                db=db,
+            )
