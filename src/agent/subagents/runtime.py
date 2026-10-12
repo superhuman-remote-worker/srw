@@ -61,6 +61,12 @@ from agent.subagents.envelope import build_envelope, build_replay_envelope, repo
 from agent.subagents.fork import seed_fork_history
 from agent.subagents.host import ParentHost, ParentRef
 from agent.subagents.limiter import LiveConcurrencyLimit
+from agent.subagents.phone import (
+    PARENT_STOP_REASON,
+    PhoneCallSettings,
+    PhoneDriver,
+    is_phone_entry,
+)
 from agent.subagents.ledger import (
     SUBAGENT_STATUSES,
     NullLedger,
@@ -245,6 +251,9 @@ class BackgroundRun:
     revived: bool = False
     reviving: bool = False
     revival_task: Optional[asyncio.Task] = None
+    #: Phone children only: the questions the call handed to the parent
+    #: (``PhoneDriver`` owns each dict; ``wait_agent`` surfaces open ones).
+    questions: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def _handle_base(subagent_type: str) -> str:
@@ -733,6 +742,11 @@ class SubagentRuntime:
             name, entry = self.resolve_entry(call.subagent_type)
         except SpawnRefused as refused:
             return f"Error: {refused}"
+        if is_phone_entry(entry):
+            return (
+                f"Error: {name} is a phone call; delegate it with "
+                "run_in_background=true and follow it with wait_agent"
+            )
 
         if key is None:
             return await self._spawn(key, name, entry, call)
@@ -1181,6 +1195,12 @@ class SubagentRuntime:
                 return answer
 
             isolation = str(call.isolation or entry.get("isolation") or "shared")
+            if is_phone_entry(entry) and (call.fork or isolation != "shared"):
+                answer = (
+                    f"Error: {name} is a phone call; it takes no fork and no "
+                    "worktree isolation"
+                )
+                return answer
             if isolation not in {"shared", "worktree"}:
                 answer = (
                     f"Error: background subagent: unknown isolation {isolation!r} "
@@ -1339,25 +1359,28 @@ class SubagentRuntime:
                     run.call.isolation or run.entry.get("isolation") or "shared"
                 )
                 try:
-                    build = await build_child(
-                        run.entry,
-                        parent_context=self.parent_context,
-                        host=self.host,
-                        handle=run.handle,
-                        subagent_type=run.subagent_type,
-                        isolation=isolation,
-                        write_policy=run.call.write_policy,
-                        owned_paths=list(run.call.owned_paths or []),
-                        writer_guard=self._writer_guard,
-                        llm_factory=self._llm_factory,
-                        worktree_index=(
-                            self.next_worktree_index()
-                            if isolation == "worktree"
-                            else None
-                        ),
-                        reuse_worktree=run.revived,
-                        budgets=budgets,
-                    )
+                    if is_phone_entry(run.entry):
+                        build = None
+                    else:
+                        build = await build_child(
+                            run.entry,
+                            parent_context=self.parent_context,
+                            host=self.host,
+                            handle=run.handle,
+                            subagent_type=run.subagent_type,
+                            isolation=isolation,
+                            write_policy=run.call.write_policy,
+                            owned_paths=list(run.call.owned_paths or []),
+                            writer_guard=self._writer_guard,
+                            llm_factory=self._llm_factory,
+                            worktree_index=(
+                                self.next_worktree_index()
+                                if isolation == "worktree"
+                                else None
+                            ),
+                            reuse_worktree=run.revived,
+                            budgets=budgets,
+                        )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -1366,39 +1389,42 @@ class SubagentRuntime:
                     terminal_status = "error"
                     terminal_outcome = "error"
                 else:
-                    messages = None
-                    messages_already_persisted = False
-                    initial_turn_count = 0
-                    if run.resume_messages is not None:
-                        messages = sanitize_history_for_provider_boundary(
-                            list(run.resume_messages),
-                            getattr(getattr(build.config, "llm", None), "model", "")
-                            or "",
+                    if build is None:
+                        driver = self._make_phone_driver(run)
+                    else:
+                        messages = None
+                        messages_already_persisted = False
+                        initial_turn_count = 0
+                        if run.resume_messages is not None:
+                            messages = sanitize_history_for_provider_boundary(
+                                list(run.resume_messages),
+                                getattr(getattr(build.config, "llm", None), "model", "")
+                                or "",
+                            )
+                            messages_already_persisted = True
+                            initial_turn_count = max(0, int(run.resume_turn_number))
+                        elif run.call.fork:
+                            messages = seed_fork_history(
+                                self.host.fork_source(),
+                                child_model=getattr(
+                                    getattr(build.config, "llm", None), "model", None
+                                ),
+                                parent_model=self._parent_model(),
+                            )
+                        driver = SubagentDriver(
+                            build,
+                            host=self.host,
+                            parent_context=self.parent_context,
+                            subagent_id=run.subagent_id,
+                            budgets=budgets,
+                            ledger=self.ledger,
+                            clock=self.clock,
+                            parent_tool_call_id=run.call.tool_call_id or None,
+                            messages=messages,
+                            messages_already_persisted=messages_already_persisted,
+                            initial_turn_count=initial_turn_count,
+                            **self._driver_kwargs,
                         )
-                        messages_already_persisted = True
-                        initial_turn_count = max(0, int(run.resume_turn_number))
-                    elif run.call.fork:
-                        messages = seed_fork_history(
-                            self.host.fork_source(),
-                            child_model=getattr(
-                                getattr(build.config, "llm", None), "model", None
-                            ),
-                            parent_model=self._parent_model(),
-                        )
-                    driver = SubagentDriver(
-                        build,
-                        host=self.host,
-                        parent_context=self.parent_context,
-                        subagent_id=run.subagent_id,
-                        budgets=budgets,
-                        ledger=self.ledger,
-                        clock=self.clock,
-                        parent_tool_call_id=run.call.tool_call_id or None,
-                        messages=messages,
-                        messages_already_persisted=messages_already_persisted,
-                        initial_turn_count=initial_turn_count,
-                        **self._driver_kwargs,
-                    )
                     await self._strict_ledger_update(run.subagent_id, status="running")
                     async with self._state_lock:
                         if run.stop_requested:
@@ -1524,6 +1550,74 @@ class SubagentRuntime:
             run.delivery_pending = True
         await self._commit_background_terminal(run)
         await self._notify_changed()
+
+    def _make_phone_driver(self, run: BackgroundRun) -> PhoneDriver:
+        """The driver of a phone child: the live call named in ``config.telephony``."""
+
+        config = getattr(self.parent_context, "config", None) or {}
+        settings = PhoneCallSettings.from_config(config, run.entry)
+        parent = self._parent_ref()
+
+        async def on_question(question: Dict[str, Any]) -> None:
+            async with self._state_lock:
+                run.questions.append(question)
+            await self._notify_changed()
+
+        return PhoneDriver(
+            settings,
+            handle=run.handle,
+            subagent_type=run.subagent_type,
+            subagent_id=run.subagent_id,
+            job_id=parent.id if parent.kind == "job" else None,
+            on_question=on_question,
+            on_change=self._notify_changed,
+            clock=self.clock,
+        )
+
+    @staticmethod
+    def _unsurfaced_questions(run: BackgroundRun) -> List[Dict[str, Any]]:
+        return [
+            q
+            for q in run.questions
+            if q.get("status") == "open" and not q.get("surfaced")
+        ]
+
+    def _question_view(self, run: BackgroundRun) -> Optional[Dict[str, Any]]:
+        """Surface the oldest unsurfaced open question of ``run`` (marks it)."""
+
+        pending = self._unsurfaced_questions(run)
+        if not pending:
+            return None
+        question = pending[0]
+        question["surfaced"] = True
+        still_open = [
+            q["delegation_id"]
+            for q in run.questions
+            if q.get("status") == "open" and q is not question
+        ]
+        return {
+            "result": "question",
+            "handle": run.handle,
+            "subagent_type": run.subagent_type,
+            "status": run.status,
+            "question": {
+                key: question.get(key)
+                for key in (
+                    "delegation_id",
+                    "request",
+                    "transcript_tail",
+                    "asked_at",
+                    "answer_by",
+                )
+            },
+            "other_open_questions": still_open,
+            "how_to_answer": (
+                "message_agent(handle, message=<the answer in plain words for "
+                "the caller>, reply_to=<delegation_id>) before answer_by; "
+                "after that the caller is told it is noted and it becomes a "
+                "follow-up."
+            ),
+        }
 
     async def _commit_background_terminal(self, run: BackgroundRun) -> bool:
         """Commit terminal state + Lane B and only then mirror it locally."""
@@ -1738,6 +1832,10 @@ class SubagentRuntime:
             view["tokens"] = run.result.tokens
         if run.error:
             view["error"] = run.error
+        if run.questions:
+            view["open_questions"] = sum(
+                1 for q in run.questions if q.get("status") == "open"
+            )
         return view
 
     async def list_agents(self) -> List[Dict[str, Any]]:
@@ -1755,6 +1853,14 @@ class SubagentRuntime:
         async with self._state_lock:
             if selected is not None and selected not in self._background:
                 return {"result": "not_found", "handle": selected}
+            for candidate in (
+                [self._background[selected]]
+                if selected is not None
+                else list(self._background.values())
+            ):
+                surfaced = self._question_view(candidate)
+                if surfaced is not None:
+                    return surfaced
             if selected is not None:
                 current = self._background[selected]
                 if current.status not in {"queued", "running", "delivery_pending"}:
@@ -1773,8 +1879,11 @@ class SubagentRuntime:
         def changed() -> bool:
             return self._change_sequence != sequence and any(
                 h in self._background
-                and self._background[h].status
-                not in {"queued", "running", "delivery_pending"}
+                and (
+                    self._background[h].status
+                    not in {"queued", "running", "delivery_pending"}
+                    or bool(self._unsurfaced_questions(self._background[h]))
+                )
                 for h in watched
             )
 
@@ -1785,6 +1894,11 @@ class SubagentRuntime:
             except asyncio.TimeoutError:
                 timed_out = True
         async with self._state_lock:
+            for h in sorted(watched):
+                if h in self._background:
+                    surfaced = self._question_view(self._background[h])
+                    if surfaced is not None:
+                        return surfaced
             ready = [
                 self._status_view(self._background[h])
                 for h in watched
@@ -1805,12 +1919,36 @@ class SubagentRuntime:
                 "agents": ready,
             }
 
-    async def message_agent(self, handle: str, message: str) -> Dict[str, Any]:
-        """Steer a live child or durably revive one terminal generation."""
+    async def message_agent(
+        self,
+        handle: str,
+        message: str,
+        *,
+        reply_to: Optional[str] = None,
+        call_action: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Steer a live child or durably revive one terminal generation.
+
+        For a phone child, ``reply_to`` answers one of its questions (the
+        voice speaks ``message``), no ``reply_to`` steers the voice, and
+        ``call_action="transfer"`` hands the call to the line's human after
+        ``message`` is spoken. A finished call is never revived.
+        """
         name = str(handle or "").strip()
         text = str(message or "").strip()
         if not text:
             return {"result": "invalid", "handle": name, "error": "empty message"}
+
+        async with self._state_lock:
+            phone_run = self._background.get(name)
+        if phone_run is not None and is_phone_entry(phone_run.entry):
+            return await self._message_phone(phone_run, text, reply_to, call_action)
+        if reply_to or call_action:
+            return {
+                "result": "invalid",
+                "handle": name,
+                "error": "reply_to and call_action apply to phone subagents only",
+            }
 
         async with self._state_lock:
             run = self._background.get(name)
@@ -1827,6 +1965,12 @@ class SubagentRuntime:
                 }
         if run is None:
             return {"result": "not_found", "handle": name}
+        if is_phone_entry(run.entry):
+            return {
+                "result": "call_ended",
+                **self._status_view(run),
+                "error": "a finished call cannot be revived; handle it as a follow-up",
+            }
 
         notify = False
         revival_task: Optional[asyncio.Task] = None
@@ -1880,6 +2024,36 @@ class SubagentRuntime:
             return {"result": "accepted", "handle": name, "status": run.status}
         assert revival_task is not None
         return await asyncio.shield(revival_task)
+
+    async def _message_phone(
+        self,
+        run: BackgroundRun,
+        text: str,
+        reply_to: Optional[str],
+        call_action: Optional[str],
+    ) -> Dict[str, Any]:
+        driver = run.driver
+        if not isinstance(driver, PhoneDriver) or not driver.running:
+            return {
+                "result": "call_ended",
+                **self._status_view(run),
+                "error": "the call is over; handle this as a follow-up after the call",
+            }
+        if call_action not in (None, "", "transfer"):
+            return {
+                "result": "invalid",
+                "handle": run.handle,
+                "error": f"unknown call_action {call_action!r} (only 'transfer')",
+            }
+        if reply_to:
+            outcome = await driver.answer(str(reply_to).strip(), text)
+        else:
+            sent = await driver.instruct(text)
+            outcome = {"result": "steered" if sent else "error"}
+        if call_action == "transfer":
+            outcome["transfer"] = await driver.transfer()
+        await self._notify_changed()
+        return {"handle": run.handle, **outcome}
 
     async def _hydrate_terminal_handle(self, handle: str) -> Optional[BackgroundRun]:
         """Cold-load one terminal background child under exact parent authority."""
@@ -2230,7 +2404,7 @@ class SubagentRuntime:
             async with self._state_lock:
                 return {"result": "stopped", **self._status_view(run)}
         if driver is not None:
-            await driver.graceful_stop("parent requested stop", timeout=grace)
+            await driver.graceful_stop(PARENT_STOP_REASON, timeout=grace)
         if task is not None:
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=grace + 1.0)

@@ -10,7 +10,7 @@ so the tools registry does not close the registry -> delegation -> subagents
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from agent.tools.context import ToolContext
 
@@ -69,7 +69,24 @@ def create_control_plane_tools(context: ToolContext) -> List[Any]:
             min_length=1,
             description=(
                 "A concise follow-up or correction for the child. Include "
-                "enough context to act without reading the parent transcript."
+                "enough context to act without reading the parent transcript. "
+                "For a phone call: what the voice should tell the caller, in "
+                "plain words."
+            ),
+        )
+        reply_to: Optional[str] = Field(
+            default=None,
+            description=(
+                "Phone calls only: the delegation_id of the question this "
+                "message answers (from wait_agent). Omit to steer the call "
+                "instead."
+            ),
+        )
+        call_action: Optional[Literal["transfer"]] = Field(
+            default=None,
+            description=(
+                "Phone calls only: 'transfer' hands the caller to the line's "
+                "human contact after the message is spoken."
             ),
         )
 
@@ -98,8 +115,20 @@ def create_control_plane_tools(context: ToolContext) -> List[Any]:
             float(timeout_s),
         )
 
-    async def _message_agent(handle: str, message: str) -> Dict[str, Any]:
+    async def _message_agent(
+        handle: str,
+        message: str,
+        reply_to: Optional[str] = None,
+        call_action: Optional[str] = None,
+    ) -> Dict[str, Any]:
         runtime = ensure_runtime(context)
+        if reply_to or call_action:
+            return await runtime.message_agent(
+                str(handle).strip(),
+                str(message),
+                reply_to=str(reply_to).strip() if reply_to else None,
+                call_action=call_action,
+            )
         return await runtime.message_agent(str(handle).strip(), str(message))
 
     async def _stop_agent(
