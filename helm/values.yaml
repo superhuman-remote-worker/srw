@@ -3035,13 +3035,16 @@ nextcloud:
         limits:
           memory: "64Mi"
           cpu: "100m"
+  # Idle is cheap, but every authenticated request costs ~0.7 CPU-s (Argon2id
+  # login + PHP bootstrap), so a 500m cap stretched each WebDAV/OCS call to
+  # ~1.5 s and serialised concurrent session creates and cloud pushes.
   resources:
     requests:
       memory: "256Mi"
-      cpu: "100m"
+      cpu: "200m"
     limits:
       memory: "1Gi"
-      cpu: "500m"
+      cpu: "2"
 
 opencloud:
   enabled: true
